@@ -30,6 +30,22 @@ warn() { echo -e "  ${YELLOW}⚠${NC}  $*"; }
 err()  { echo -e "  ${RED}✗${NC} $*"; }
 step() { echo -e "\n${BLUE}[$1]${NC} $2"; }
 
+# Poll the health endpoint for up to N seconds (default 15). Returns 0 once the
+# server responds, 1 on timeout. launchd/systemd spawn asynchronously, so a
+# single fixed sleep races the startup; poll instead.
+wait_for_health() {
+    local timeout="${1:-15}"
+    local i=0
+    while [ "$i" -lt "$timeout" ]; do
+        if curl -s "http://localhost:$SERVICE_PORT/api/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # ── OS Detection ──────────────────────────────────────────────────────────────
 detect_os() {
     case "$(uname -s)" in
@@ -259,13 +275,13 @@ install_launchagent() {
         "$SCRIPT_DIR/com.zellijconnect.session-status-server.plist" \
         > "$PLIST_DEST"
 
-    launchctl load "$PLIST_DEST"
-    sleep 2
+    launchctl load "$PLIST_DEST" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/com.zellijconnect.session-status-server" 2>/dev/null || true
 
-    if curl -s "http://localhost:$SERVICE_PORT/api/health" >/dev/null 2>&1; then
+    if wait_for_health 15; then
         ok "LaunchAgent installed and running"
     else
-        warn "LaunchAgent loaded but server may not be ready yet"
+        warn "LaunchAgent loaded but server not responding on port $SERVICE_PORT"
         warn "Check: tail /tmp/session-status-server.error.log"
     fi
 }
@@ -300,12 +316,11 @@ EOF
     systemctl --user daemon-reload
     systemctl --user enable session-status-server
     systemctl --user restart session-status-server
-    sleep 2
 
-    if curl -s "http://localhost:$SERVICE_PORT/api/health" >/dev/null 2>&1; then
+    if wait_for_health 15; then
         ok "systemd user service installed and running"
     else
-        warn "Service may not be ready yet"
+        warn "Service not responding on port $SERVICE_PORT"
         warn "Check: journalctl --user -u session-status-server -n 20"
     fi
 }
@@ -314,15 +329,19 @@ EOF
 restart_service() {
     if [ "$OS" = "macos" ]; then
         local PLIST="$HOME/Library/LaunchAgents/com.zellijconnect.session-status-server.plist"
+        local LABEL="com.zellijconnect.session-status-server"
         if [ -f "$PLIST" ]; then
             launchctl unload "$PLIST" 2>/dev/null || true
             sleep 1
-            launchctl load "$PLIST"
-            sleep 2
-            if curl -s "http://localhost:$SERVICE_PORT/api/health" >/dev/null 2>&1; then
+            launchctl load "$PLIST" 2>/dev/null || true
+            # `load` does not reliably (re)spawn a service that was just
+            # replaced; kickstart -k force-restarts it now.
+            launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+            if wait_for_health 15; then
                 ok "Service restarted successfully"
             else
-                warn "Service may not be ready yet, check logs"
+                err "Server not responding on port $SERVICE_PORT after restart"
+                warn "Check: tail /tmp/session-status-server.error.log"
             fi
         else
             warn "LaunchAgent not installed. Run ./install.sh first."
@@ -330,11 +349,11 @@ restart_service() {
     elif [ "$OS" = "linux" ]; then
         if systemctl --user is-enabled session-status-server >/dev/null 2>&1; then
             systemctl --user restart session-status-server
-            sleep 2
-            if curl -s "http://localhost:$SERVICE_PORT/api/health" >/dev/null 2>&1; then
+            if wait_for_health 15; then
                 ok "Service restarted successfully"
             else
-                warn "Service may not be ready yet, check logs"
+                err "Server not responding on port $SERVICE_PORT after restart"
+                warn "Check: journalctl --user -u session-status-server -n 20"
             fi
         else
             warn "systemd service not installed. Run ./install.sh first."
@@ -434,7 +453,7 @@ EOF
 
 # ── Server Test ───────────────────────────────────────────────────────────────
 test_server() {
-    if curl -s "http://localhost:$SERVICE_PORT/api/health" >/dev/null 2>&1; then
+    if wait_for_health 15; then
         local SESSION_COUNT
         SESSION_COUNT=$(curl -s "http://localhost:$SERVICE_PORT/api/sessions" | \
             "$PYTHON3" -c "import sys,json; d=json.load(sys.stdin); print(len(d['sessions']))" 2>/dev/null || echo "?")
