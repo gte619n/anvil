@@ -24,10 +24,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import http.server
 import socketserver
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -46,31 +48,131 @@ _cache = {
 }
 
 
-def run_command(cmd, cwd=None, timeout=5):
-    """Run a shell command and return stdout, or None on error."""
+# Serializes read-modify-write of the session->cwd map now that the server is
+# multi-threaded (concurrent DELETEs would otherwise clobber each other).
+_cwd_map_lock = threading.Lock()
+
+
+def _run_raw(cmd, cwd=None, timeout=5):
+    """Run a shell command, reaping the WHOLE process group on timeout.
+
+    Returns (stdout, stderr, returncode); returncode is None if the command
+    timed out (and was force-killed) or never launched.
+
+    start_new_session=True puts the shell *and any binary it spawns* (e.g. a
+    `zellij` client blocking on a wedged server) in a dedicated process group,
+    so a timeout kills the entire tree via killpg. The old subprocess.run()
+    timeout only killed the /bin/sh wrapper, orphaning the `zellij` grandchild —
+    those dangling clients are what fueled the duplicate-server storm and
+    required screen-sharing in to recover.
+    """
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=cwd
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
-        return result.stdout.strip() if result.returncode == 0 else None
-    except Exception:
-        return None
+    except Exception as e:
+        return '', str(e), None
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return out.strip(), err.strip(), proc.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            out, err = proc.communicate(timeout=2)
+        except Exception:
+            out, err = '', ''
+        return (out or '').strip(), (err or '').strip(), None
+    except Exception as e:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        return '', str(e), None
+
+
+def run_command(cmd, cwd=None, timeout=5):
+    """Run a shell command and return stdout, or None on error/timeout."""
+    out, _err, rc = _run_raw(cmd, cwd=cwd, timeout=timeout)
+    return out if rc == 0 else None
 
 
 def run_command_verbose(cmd, cwd=None, timeout=5):
     """Run a shell command, return (stdout, stderr, success)."""
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd
-        )
-        return result.stdout.strip(), result.stderr.strip(), result.returncode == 0
-    except Exception as e:
-        return '', str(e), False
+    out, err, rc = _run_raw(cmd, cwd=cwd, timeout=timeout)
+    return out, err, rc == 0
+
+
+def _zellij_base_dir():
+    return Path(tempfile.gettempdir()) / f'zellij-{os.getuid()}'
+
+
+def _session_socket_paths(session_name):
+    """Existing socket paths for a session across all version/contract dirs."""
+    base_dir = _zellij_base_dir()
+    paths = []
+    if base_dir.exists():
+        for entry in base_dir.iterdir():
+            if entry.is_dir() and re.match(r'^(\d+\.\d+|contract_version_\d+)', entry.name):
+                sock = entry / session_name
+                if sock.exists():
+                    paths.append(sock)
+    return paths
+
+
+def _pids_holding(path):
+    """PIDs with the given file/socket open, via lsof. Empty on any error."""
+    out = run_command(f'lsof -t "{path}" 2>/dev/null', timeout=5)
+    if not out:
+        return []
+    return [int(p) for p in out.split('\n') if p.strip().isdigit()]
+
+
+def _kill_pids(pids, grace=0.5):
+    """SIGTERM then SIGKILL a set of PIDs, never touching our own process."""
+    pids = [p for p in dict.fromkeys(pids) if p and p != os.getpid()]
+    if not pids:
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    time.sleep(grace)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def filesystem_delete_session(session_name):
+    """Remove a session at the filesystem level, bypassing zellij IPC.
+
+    Kills whatever process holds the session socket, then removes the socket
+    file. This is the fallback for when `zellij kill-session`/`delete-session`
+    hang because the server is wedged — exactly when IPC-based deletion is
+    least reliable. Returns True if no socket remains afterward.
+    """
+    sockets = _session_socket_paths(session_name)
+    if not sockets:
+        return True  # already gone
+    for sock in sockets:
+        _kill_pids(_pids_holding(sock))
+    for sock in _session_socket_paths(session_name):
+        try:
+            sock.unlink()
+        except Exception:
+            if sock.is_dir():
+                shutil.rmtree(sock, ignore_errors=True)
+    return not _session_socket_paths(session_name)
 
 
 def get_zellij_sessions():
@@ -352,23 +454,43 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({'error': 'Not found'}).encode())
 
     def _handle_restart_zellij(self):
-        """Kill all Zellij sessions and orphaned processes, then verify recovery."""
+        """Kill all Zellij sessions and reap orphaned processes — safely.
+
+        A blanket `pkill -f zellij` also kills the web server on port 7600 (so
+        the Android terminal dies and needs a screen-share to recover) and any
+        unrelated process whose command line merely contains "zellij". Instead
+        we tear down each session at the filesystem level and then reap stray
+        zellij processes while explicitly PRESERVING the web server.
+        """
         errors = []
 
-        # Step 1: Kill all zellij sessions
+        # Identify the web server (port 7600) so we never kill it.
+        web_pids = set()
+        web_out = run_command('lsof -ti tcp:7600 2>/dev/null', timeout=5)
+        if web_out:
+            web_pids = {int(p) for p in web_out.split() if p.strip().isdigit()}
+
+        # Step 1: kill every discoverable session (IPC best-effort + filesystem).
         sessions = get_zellij_sessions()
         for name in sessions:
-            result = run_command(f'zellij kill-session {name}', timeout=5)
-            if result is None:
-                errors.append(f'Failed to kill session: {name}')
+            run_command_verbose(f'zellij kill-session {name}', timeout=7)
+            run_command_verbose(f'zellij delete-session --force {name}', timeout=7)
+            if not filesystem_delete_session(name):
+                errors.append(f'Failed to remove session: {name}')
 
-        # Step 2: Kill any orphaned zellij processes (except the web UI server if separate)
-        run_command('pkill -f "zellij" 2>/dev/null', timeout=5)
+        # Step 2: reap orphaned zellij processes, but NOT the web server or us.
+        # The [z] bracket keeps the pattern from matching our own helper shell.
+        pgrep = run_command("pgrep -f '[z]ellij' 2>/dev/null", timeout=5)
+        if pgrep:
+            orphan_pids = [
+                int(p) for p in pgrep.split('\n')
+                if p.strip().isdigit() and int(p) not in web_pids
+            ]
+            _kill_pids(orphan_pids)
 
-        # Step 3: Brief wait for processes to die
-        time.sleep(2)
+        time.sleep(1)
 
-        # Step 4: Clean up all status files
+        # Step 3: Clean up all status files
         if STATUS_DIR.exists():
             for f in STATUS_DIR.iterdir():
                 try:
@@ -376,37 +498,34 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-        # Step 5: Clear session CWD map
-        if SESSION_CWD_MAP_FILE.exists():
+        # Step 4: Clear session CWD map
+        with _cwd_map_lock:
             try:
                 save_session_cwd_map({})
             except Exception:
                 pass
 
-        # Step 6: Invalidate cache
+        # Step 5: Invalidate cache
         _cache['data'] = None
         _cache['timestamp'] = 0
 
-        # Step 7: Verify zellij is responsive (list-sessions should work even with 0 sessions)
-        verify = run_command('zellij list-sessions -n 2>/dev/null', timeout=5)
-        zellij_responsive = verify is not None or verify == ''
+        # Step 6: Verify via the filesystem (NOT `zellij list-sessions`, which
+        # can spawn a fresh server and hang). Any remaining socket is a failure.
+        remaining = get_zellij_sessions()
+        recovered = not remaining and not errors
 
-        if zellij_responsive and not errors:
-            self._set_headers(200)
-            self.wfile.write(json.dumps({
-                'success': True,
-                'sessionsKilled': len(sessions),
-                'message': f'Killed {len(sessions)} session(s). Zellij is responsive.'
-            }).encode())
-        else:
-            self._set_headers(200)
-            self.wfile.write(json.dumps({
-                'success': True,
-                'sessionsKilled': len(sessions),
-                'message': f'Killed {len(sessions)} session(s). Errors: {"; ".join(errors)}' if errors
-                    else f'Killed {len(sessions)} session(s). Zellij may need manual restart.',
-                'errors': errors
-            }).encode())
+        self._set_headers(200)
+        self.wfile.write(json.dumps({
+            'success': recovered,
+            'sessionsKilled': len(sessions),
+            'remaining': remaining,
+            'message': (
+                f'Killed {len(sessions)} session(s). Zellij is clean.' if recovered
+                else f'Killed {len(sessions)} session(s); '
+                     f'{len(remaining)} socket(s) remain. Errors: {"; ".join(errors)}'
+            ),
+            'errors': errors
+        }).encode())
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
@@ -431,18 +550,25 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
         if session_cwd and os.path.isdir(session_cwd):
             session_branch = run_command('git branch --show-current', cwd=session_cwd)
 
-        # Kill the zellij session
-        print(f'[DELETE] Killing session: {session_name}', flush=True)
-        _, kill_stderr, kill_ok = run_command_verbose(f'zellij kill-session {session_name}', timeout=10)
+        # 1) Graceful kill via IPC. Short timeout: if the server is wedged we
+        #    fall through to the filesystem path fast instead of blocking.
+        print(f'[DELETE] kill-session: {session_name}', flush=True)
+        _, kill_stderr, kill_ok = run_command_verbose(
+            f'zellij kill-session {session_name}', timeout=7)
         if not kill_ok:
             print(f'[DELETE] kill-session stderr: {kill_stderr}', flush=True)
 
-        # Wait for processes to exit, then delete the zombie socket
-        time.sleep(1)
-        print(f'[DELETE] Deleting session socket: {session_name}', flush=True)
-        _, del_stderr, del_ok = run_command_verbose(f'zellij delete-session {session_name}', timeout=10)
+        # 2) Force-delete the (now exited) session socket via IPC, one shot.
+        #    --force kills+deletes even if the session hasn't fully exited yet,
+        #    so we no longer need the fragile sleep-then-delete dance.
+        _, del_stderr, del_ok = run_command_verbose(
+            f'zellij delete-session --force {session_name}', timeout=7)
         if not del_ok:
             print(f'[DELETE] delete-session stderr: {del_stderr}', flush=True)
+
+        # 3) Guarantee removal at the filesystem level even if IPC was wedged.
+        session_removed = filesystem_delete_session(session_name)
+        print(f'[DELETE] filesystem cleanup, socket_gone={session_removed}', flush=True)
 
         # Clean up status files
         status_json = STATUS_DIR / f'{session_name}.json'
@@ -452,10 +578,12 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
         if status_desc.exists():
             status_desc.unlink()
 
-        # Remove from CWD map
-        if session_name in cwd_map:
-            del cwd_map[session_name]
-            save_session_cwd_map(cwd_map)
+        # Remove from CWD map (locked read-modify-write — concurrent deletes)
+        with _cwd_map_lock:
+            cwd_map = get_session_cwd_map()
+            if session_name in cwd_map:
+                del cwd_map[session_name]
+                save_session_cwd_map(cwd_map)
 
         worktree_removed = False
         branch_deleted = False
@@ -503,11 +631,13 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
         _cache['data'] = None
         _cache['timestamp'] = 0
 
-        print(f'[DELETE] Done: {session_name} worktreeRemoved={worktree_removed} branchDeleted={branch_deleted}', flush=True)
+        print(f'[DELETE] Done: {session_name} removed={session_removed} '
+              f'worktreeRemoved={worktree_removed} branchDeleted={branch_deleted}', flush=True)
         self._set_headers(200)
         self.wfile.write(json.dumps({
-            'success': True,
+            'success': session_removed,
             'killed': session_name,
+            'sessionRemoved': session_removed,
             'worktreeRemoved': worktree_removed,
             'branchDeleted': branch_deleted
         }).encode())
@@ -521,8 +651,12 @@ def main():
     # Ensure status directory exists
     STATUS_DIR.mkdir(exist_ok=True)
 
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(('127.0.0.1', PORT), SessionStatusHandler) as httpd:
+    # Threaded so a slow request (e.g. a DELETE that waits on zellij IPC or a
+    # worktree removal) can't freeze every other request — that single-threaded
+    # head-of-line block is what made the whole app appear hung.
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer(('127.0.0.1', PORT), SessionStatusHandler) as httpd:
+        httpd.daemon_threads = True
         print(f'Session Status Server running on port {PORT}', flush=True)
         print(f'Status directory: {STATUS_DIR}', flush=True)
         print(f'Session CWD map: {SESSION_CWD_MAP_FILE}', flush=True)
