@@ -8,24 +8,18 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
-import android.os.PowerManager;
-import android.util.Log;
 
 public class KeepAliveService extends Service {
 
-    private static final String TAG = "ZellijConnect";
     private static final String CHANNEL_ID = "zellij_sessions";
     private static final int NOTIFICATION_ID = 1;
     private static final String ACTION_UPDATE = "com.zellijconnect.app.UPDATE_NOTIFICATION";
     private static final String EXTRA_TAB_COUNT = "tab_count";
 
-    private PowerManager.WakeLock wakeLock;
-
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        acquireWakeLock();
     }
 
     @Override
@@ -43,32 +37,12 @@ public class KeepAliveService extends Service {
 
     @Override
     public void onDestroy() {
-        releaseWakeLock();
         super.onDestroy();
     }
 
     @Override
     public IBinder onBind(Intent intent) {
         return null;
-    }
-
-    private void acquireWakeLock() {
-        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        if (pm != null) {
-            wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "ZellijConnect::KeepAlive"
-            );
-            wakeLock.acquire();
-            Log.d(TAG, "Wake lock acquired");
-        }
-    }
-
-    private void releaseWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) {
-            wakeLock.release();
-            Log.d(TAG, "Wake lock released");
-        }
     }
 
     private void createNotificationChannel() {
