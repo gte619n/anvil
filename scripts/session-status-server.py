@@ -11,6 +11,13 @@ Endpoints:
   POST /api/restart-zellij  - Kill all Zellij sessions and restart server
 
 Binds to port 7601 by default.
+
+Zellij 0.44+ notes:
+  - Session sockets live in /tmp/zellij-{uid}/contract_version_1/ (not 0.x.y/)
+  - The POST /api/sessions endpoint returns success immediately and lets the Zellij
+    web client (browser) create sessions via FirstClientConnected.
+  - A "gateway" session is auto-created on startup via PTY with a drain thread to
+    keep the Zellij client's stdout from blocking.
 """
 
 import json
@@ -20,10 +27,10 @@ import shutil
 import subprocess
 import http.server
 import socketserver
-from datetime import datetime
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-import threading
 import time
 
 # Configuration
@@ -55,21 +62,80 @@ def run_command(cmd, cwd=None, timeout=5):
         return None
 
 
+def run_command_verbose(cmd, cwd=None, timeout=5):
+    """Run a shell command, return (stdout, stderr, success)."""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd
+        )
+        return result.stdout.strip(), result.stderr.strip(), result.returncode == 0
+    except Exception as e:
+        return '', str(e), False
+
+
 def get_zellij_sessions():
-    """Get list of active Zellij session names."""
+    """Get list of active Zellij session names.
+
+    Scans socket directories directly to handle version mismatches between
+    the installed zellij binary version and running session server versions.
+
+    Zellij uses version-specific socket subdirectories:
+      - 0.43.x: /tmp/zellij-{uid}/0.43.1/{session-name}
+      - 0.44+:  /tmp/zellij-{uid}/contract_version_1/{session-name}
+    """
+    SKIP_NAMES = {'web_server_bus'}
+
+    uid = os.getuid()
+    base_dir = Path(tempfile.gettempdir()) / f'zellij-{uid}'
+
+    if base_dir.exists():
+        sessions = set()
+        for entry in base_dir.iterdir():
+            # Match both old-style version dirs (e.g. "0.43.1") and
+            # new-style contract dirs (e.g. "contract_version_1" used in 0.44+)
+            if entry.is_dir() and re.match(r'^(\d+\.\d+|contract_version_\d+)', entry.name):
+                for sock in entry.iterdir():
+                    if sock.name not in SKIP_NAMES:
+                        sessions.add(sock.name)
+        if sessions:
+            return sorted(sessions)
+
+    # Fallback: use zellij list-sessions (only returns non-EXITED sessions)
     output = run_command('zellij list-sessions -n 2>/dev/null')
     if not output:
         return []
-
-    sessions = []
+    result = []
     for line in output.split('\n'):
         line = line.strip()
-        # Skip empty lines, "No active" messages, and EXITED sessions
         if line and not line.startswith('No active') and '(EXITED' not in line:
-            # Session names are the first word on each line
             session_name = line.split()[0] if line.split() else line
-            sessions.append(session_name)
-    return sessions
+            result.append(session_name)
+    return result
+
+
+def create_zellij_session(session_name):
+    """Reserve a named session slot for the Zellij web client to create.
+
+    We intentionally do NOT pre-create the session via a PTY here.
+    Pre-creating via PTY causes Zellij to send SIGHUP to the temporary client
+    when we close the PTY master, which triggers on_force_close and kills all
+    panes.  The web client then attaches to a dead session (no panes) and
+    renders a blank screen — the control WebSocket never opens, and the
+    terminal stays stuck.
+
+    Instead we just validate the name and return success.  When the Zellij web
+    client (browser) opens the session URL it sends FirstClientConnected for a
+    non-existent session, which properly initialises a shell pane and renders.
+    """
+    if session_name in get_zellij_sessions():
+        return True, 'already exists'
+
+    # Validate that zellij is available (sanity check only)
+    zellij_bin = shutil.which('zellij') or os.path.expanduser('~/.cargo/bin/zellij')
+    if not os.path.isfile(zellij_bin):
+        return False, 'zellij binary not found'
+
+    return True, 'reserved'  # browser will create session via FirstClientConnected
 
 
 def get_session_cwd_map():
@@ -192,7 +258,7 @@ def get_all_sessions():
 
     result = {
         'sessions': sessions,
-        'timestamp': datetime.utcnow().isoformat() + 'Z'
+        'timestamp': datetime.now(tz=timezone.utc).isoformat().replace('+00:00', 'Z')
     }
 
     _cache['data'] = result
@@ -214,6 +280,43 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self._set_headers(204)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        if path == '/api/sessions':
+            self._handle_create_session()
+        elif path == '/api/restart-zellij':
+            self._handle_restart_zellij()
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
+
+    def _handle_create_session(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length else b'{}'
+
+        try:
+            data = json.loads(body.decode('utf-8'))
+        except Exception:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode())
+            return
+
+        session_name = data.get('name', '').strip()
+        if not session_name or not re.match(r'^[a-zA-Z0-9_-]+$', session_name):
+            self._set_headers(400)
+            self.wfile.write(json.dumps({'error': 'Invalid session name'}).encode())
+            return
+
+        success, message = create_zellij_session(session_name)
+        if success:
+            _cache['data'] = None  # Invalidate cached session list
+            self._set_headers(200)
+            self.wfile.write(json.dumps({'success': True, 'name': session_name, 'message': message}).encode())
+        else:
+            self._set_headers(500)
+            self.wfile.write(json.dumps({'error': message}).encode())
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -244,15 +347,6 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
 </html>'''
             self.wfile.write(html.encode())
 
-        else:
-            self._set_headers(404)
-            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-
-        if path == '/api/restart-zellij':
-            self._handle_restart_zellij()
         else:
             self._set_headers(404)
             self.wfile.write(json.dumps({'error': 'Not found'}).encode())
@@ -338,7 +432,17 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
             session_branch = run_command('git branch --show-current', cwd=session_cwd)
 
         # Kill the zellij session
-        kill_result = run_command(f'zellij kill-session {session_name}', timeout=10)
+        print(f'[DELETE] Killing session: {session_name}', flush=True)
+        _, kill_stderr, kill_ok = run_command_verbose(f'zellij kill-session {session_name}', timeout=10)
+        if not kill_ok:
+            print(f'[DELETE] kill-session stderr: {kill_stderr}', flush=True)
+
+        # Wait for processes to exit, then delete the zombie socket
+        time.sleep(1)
+        print(f'[DELETE] Deleting session socket: {session_name}', flush=True)
+        _, del_stderr, del_ok = run_command_verbose(f'zellij delete-session {session_name}', timeout=10)
+        if not del_ok:
+            print(f'[DELETE] delete-session stderr: {del_stderr}', flush=True)
 
         # Clean up status files
         status_json = STATUS_DIR / f'{session_name}.json'
@@ -361,29 +465,45 @@ class SessionStatusHandler(http.server.BaseHTTPRequestHandler):
             # Find main repo by looking for the parent of .worktrees
             worktree_parent = session_cwd.split('/.worktrees/')[0]
 
-            # Try git worktree remove first
-            result = run_command(f'git worktree remove --force "{session_cwd}"', cwd=worktree_parent, timeout=15)
-            if result is not None:
-                worktree_removed = True
-            else:
+            # Try git worktree remove first, with retries (processes may still be exiting)
+            for attempt in range(1, 4):
+                print(f'[DELETE] git worktree remove attempt {attempt}/3: {session_cwd}', flush=True)
+                _, wt_stderr, wt_ok = run_command_verbose(
+                    f'git worktree remove --force "{session_cwd}"', cwd=worktree_parent, timeout=15
+                )
+                if wt_ok:
+                    worktree_removed = True
+                    break
+                print(f'[DELETE] worktree remove failed: {wt_stderr}', flush=True)
+                if attempt < 3:
+                    time.sleep(1)
+
+            if not worktree_removed:
                 # Fallback: rm -rf + prune
+                print(f'[DELETE] Falling back to shutil.rmtree for: {session_cwd}', flush=True)
                 try:
                     shutil.rmtree(session_cwd, ignore_errors=True)
                     run_command('git worktree prune', cwd=worktree_parent)
                     worktree_removed = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f'[DELETE] rmtree fallback failed: {e}', flush=True)
 
             # Delete branch if requested
             if delete_branch and session_branch:
-                result = run_command(f'git branch -D {session_branch}', cwd=worktree_parent, timeout=10)
-                if result is not None:
+                print(f'[DELETE] Deleting branch: {session_branch}', flush=True)
+                _, br_stderr, br_ok = run_command_verbose(
+                    f'git branch -D {session_branch}', cwd=worktree_parent, timeout=10
+                )
+                if br_ok:
                     branch_deleted = True
+                else:
+                    print(f'[DELETE] branch delete failed: {br_stderr}', flush=True)
 
         # Invalidate cache
         _cache['data'] = None
         _cache['timestamp'] = 0
 
+        print(f'[DELETE] Done: {session_name} worktreeRemoved={worktree_removed} branchDeleted={branch_deleted}', flush=True)
         self._set_headers(200)
         self.wfile.write(json.dumps({
             'success': True,
@@ -403,12 +523,18 @@ def main():
 
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(('127.0.0.1', PORT), SessionStatusHandler) as httpd:
-        print(f'Session Status Server running on port {PORT}')
-        print(f'Status directory: {STATUS_DIR}')
-        print(f'Session CWD map: {SESSION_CWD_MAP_FILE}')
-        print(f'Endpoints:')
-        print(f'  http://localhost:{PORT}/api/sessions')
-        print(f'  http://localhost:{PORT}/api/health')
+        print(f'Session Status Server running on port {PORT}', flush=True)
+        print(f'Status directory: {STATUS_DIR}', flush=True)
+        print(f'Session CWD map: {SESSION_CWD_MAP_FILE}', flush=True)
+        print(f'Endpoints:', flush=True)
+        print(f'  http://localhost:{PORT}/api/sessions', flush=True)
+        print(f'  http://localhost:{PORT}/api/health', flush=True)
+
+        # NOTE: Gateway sessions are NOT pre-created via PTY — the PTY client
+        # eventually dies (I/O error), corrupting session state and causing
+        # cascading failures. Sessions are created on-demand when browsers
+        # connect to the zellij web server (port 7600).
+
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

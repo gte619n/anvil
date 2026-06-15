@@ -34,6 +34,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
@@ -356,9 +357,7 @@ public class MainActivity extends AppCompatActivity implements TabManager.Listen
         SessionPickerDialog dialog = new SessionPickerDialog(this, new SessionPickerDialog.SessionPickerListener() {
             @Override
             public void onCreateSession(String sessionName) {
-                // Create a new named session
-                String sessionUrl = AppConfig.getBaseUrl(MainActivity.this) + "/" + sessionName + "?action=create";
-                tabManager.addTab(sessionUrl);
+                createSessionAndNavigate(sessionName);
             }
 
             @Override
@@ -378,6 +377,44 @@ public class MainActivity extends AppCompatActivity implements TabManager.Listen
 
         // Fetch sessions from the status API
         fetchSessions(dialog);
+    }
+
+    private void createSessionAndNavigate(String sessionName) {
+        String sessionUrl = AppConfig.getBaseUrl(this) + "/" + sessionName;
+        executor.execute(() -> {
+            try {
+                Uri baseUri = Uri.parse(AppConfig.getBaseUrl(MainActivity.this));
+                int metadataPort = AppConfig.getMetadataPort(MainActivity.this);
+                String apiUrl = "https://" + baseUri.getHost() + ":" + metadataPort + "/api/sessions";
+
+                URL url = new URL(apiUrl);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(5000);
+                conn.setReadTimeout(10000); // server sleeps 600 ms while spawning
+
+                JSONObject body = new JSONObject();
+                body.put("name", sessionName);
+                byte[] bodyBytes = body.toString().getBytes("UTF-8");
+                conn.setFixedLengthStreamingMode(bodyBytes.length);
+                try (OutputStream out = conn.getOutputStream()) {
+                    out.write(bodyBytes);
+                }
+
+                int responseCode = conn.getResponseCode();
+                conn.disconnect();
+
+                if (responseCode != 200 && responseCode != 201) {
+                    Log.w(TAG, "Session create API returned " + responseCode + " for " + sessionName);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error creating session via API", e);
+            }
+            // Navigate regardless — if the API failed the web client is the last resort
+            runOnUiThread(() -> tabManager.addTab(sessionUrl));
+        });
     }
 
     private void deleteSession(String sessionName, boolean deleteWorktree, boolean deleteBranch,

@@ -15,6 +15,8 @@
     <dict>
         <key>SESSION_SERVER_PORT</key>
         <string>7601</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
         <key>PATH</key>
         <string>CARGO_BIN_PATH:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
