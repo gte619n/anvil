@@ -23,11 +23,8 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** Command types in the contract but not built until later milestones (M5+). */
+/** Command types in the contract but not built until later milestones. */
 const PENDING: ReadonlySet<string> = new Set([
-  "prompt.send",
-  "permission.respond",
-  "interrupt",
   "fs.list",
   "fs.read",
   "fs.watch",
@@ -122,6 +119,32 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "session.set_autonomy":
         deps.supervisor.setAutonomy(cmd.sessionId, cmd.policy);
+        if (cid) send(ack(cid));
+        return;
+
+      case "prompt.send": {
+        // attach so this connection receives the streamed turn (arch §6.4)
+        conn.attached.add(cmd.sessionId);
+        let text = cmd.text;
+        if (cmd.cites?.length) {
+          const ctx = cmd.cites
+            .map((c) => `> ${c.path}:${c.startLine}-${c.endLine}\n${c.excerpt}`)
+            .join("\n\n");
+          text = `${ctx}\n\n${text}`;
+        }
+        // NOTE: attachmentIds are accepted but not yet materialized (REST upload is §6.5).
+        deps.supervisor.prompt(cmd.sessionId, text);
+        if (cid) send(ack(cid));
+        return;
+      }
+
+      case "interrupt":
+        deps.supervisor.interrupt(cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
+      case "permission.respond":
+        deps.supervisor.resolvePermission(cmd.requestId, cmd.decision, cmd.updatedInput);
         if (cid) send(ack(cid));
         return;
 

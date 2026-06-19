@@ -1,4 +1,10 @@
-import { PROTOCOL_VERSION, type ServerEvent, type Session as SessionData, type SessionStatus } from "@protocol";
+import {
+  PROTOCOL_VERSION,
+  type PermissionSuggestion,
+  type ServerEvent,
+  type Session as SessionData,
+  type SessionStatus,
+} from "@protocol";
 import { now } from "../util/envelope";
 import { killGroup, type Group } from "./procgroup";
 
@@ -48,6 +54,18 @@ export class Session {
     this.data.status = status;
     this.data.lastActivityAt = now();
     this.emit({ type: "status", status });
+  }
+
+  /** Surface an agent/turn error to attached clients (arch §6.2). */
+  emitError(message: string, fatal: boolean): void {
+    if (fatal) this.data.status = "error";
+    this.emit({ type: "error", message, fatal });
+  }
+
+  /** Block on a permission decision (arch §6.6): flips to awaiting_permission + emits the request. */
+  requestPermission(requestId: string, tool: string, input: unknown, suggestions: PermissionSuggestion[]): void {
+    this.setStatus("awaiting_permission");
+    this.emit({ type: "permission.request", requestId, tool, input, suggestions });
   }
 
   /** Attach the agent's process group (M5) so kill can reap it. */

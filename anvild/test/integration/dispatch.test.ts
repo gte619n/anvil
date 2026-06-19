@@ -53,7 +53,7 @@ test("unknown command type → command.error, cid echoed", async () => {
 });
 
 test("recognized-but-unbuilt command → command.error 'pending'", async () => {
-  const r = await rpc({ ...base, type: "prompt.send", cid: "c2", sessionId: "x", text: "hi" });
+  const r = await rpc({ ...base, type: "terminal.open", cid: "c2", sessionId: "x", cols: 80, rows: 24 });
   expect(r.type).toBe("command.error");
   expect(r.cid).toBe("c2");
   expect(r.message).toContain("not implemented yet");

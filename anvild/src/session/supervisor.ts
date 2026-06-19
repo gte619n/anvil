@@ -3,6 +3,7 @@ import {
   PROTOCOL_VERSION,
   type AutonomyPolicy,
   type Model,
+  type PermissionDecision,
   type ServerEvent,
   type Session as SessionData,
   type SessionCreateCmd,
@@ -14,6 +15,10 @@ import type { ConnectionRegistry } from "../server/registry";
 import { Session } from "./session";
 import { SessionStore } from "./store";
 import { createWorktree, gitStatus, removeWorktree } from "./worktree";
+import { AgentDriver } from "../agent/driver";
+import { buildAgentEnv } from "../agent/env";
+import { PermissionBroker } from "../agent/permissions";
+import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 
 /** A client command that can't be honored (bad args, no such session). → command.error. */
 export class BadCommand extends Error {}
@@ -31,6 +36,10 @@ export interface SupervisorConfig {
 export class Supervisor {
   private readonly store: SessionStore;
   private readonly sessions = new Map<string, Session>();
+  private readonly drivers = new Map<string, AgentDriver>();
+  private readonly broker = new PermissionBroker();
+  private readonly renderer: MarkdownRenderer = new PassthroughRenderer();
+  private readonly agentEnv = buildAgentEnv();
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.store = new SessionStore(cfg.stateDir);
@@ -84,10 +93,36 @@ export class Supervisor {
     return session; // dispatch announces session.created (creator gets the cid; others via registry)
   }
 
+  /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
+  prompt(id: string, text: string): void {
+    const s = this.require(id);
+    let driver = this.drivers.get(id);
+    if (!driver) {
+      driver = new AgentDriver(s, this.renderer, this.broker, this.agentEnv);
+      this.drivers.set(id, driver);
+    }
+    driver.prompt(text);
+  }
+
+  interrupt(id: string): void {
+    this.require(id);
+    void this.drivers.get(id)?.interrupt();
+  }
+
+  /** Answer a parked permission prompt (arch §6.6) — may come from any device. */
+  resolvePermission(requestId: string, decision: PermissionDecision, updatedInput?: unknown): void {
+    const sessionId = this.broker.sessionFor(requestId);
+    if (!this.broker.resolve(requestId, decision, updatedInput)) {
+      throw new BadCommand(`no pending permission request: ${requestId}`);
+    }
+    if (sessionId) this.sessions.get(sessionId)?.setStatus(decision === "deny" ? "thinking" : "running_tool");
+  }
+
   setModel(id: string, model: Model): void {
     const s = this.require(id);
     s.data.model = model;
     s.data.lastActivityAt = now();
+    void this.drivers.get(id)?.setModel(model);
     this.persist();
     this.broadcastUpdated(s.data);
   }
@@ -101,7 +136,9 @@ export class Supervisor {
 
   async kill(id: string): Promise<void> {
     const s = this.require(id);
-    await s.stop(); // reap the process group (no-op until M5 attaches one)
+    await this.drivers.get(id)?.stop(); // interrupt the agent SDK query + close its input
+    this.drivers.delete(id);
+    await s.stop(); // reap any attached process group (PTY in Phase 3)
     if (s.data.source === "fresh-worktree" && s.data.worktree) {
       removeWorktree(s.data.worktree.repoRoot, s.data.cwd);
     }
