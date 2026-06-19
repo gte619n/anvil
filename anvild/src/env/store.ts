@@ -1,0 +1,60 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Environment } from "@protocol";
+import { newId } from "../util/ids";
+
+/**
+ * Registry of project repos (arch §8). Persisted to `<stateDir>/environments.json`. An
+ * environment is just a named git repo; picking one + a session name spins up a fresh
+ * worktree off it. Adding validates that the path is actually a git repo.
+ */
+export class EnvironmentStore {
+  private readonly file: string;
+  private environments: Environment[] = [];
+
+  constructor(stateDir: string) {
+    mkdirSync(stateDir, { recursive: true });
+    this.file = join(stateDir, "environments.json");
+    this.load();
+  }
+
+  list(): Environment[] {
+    return [...this.environments];
+  }
+  get(id: string): Environment | undefined {
+    return this.environments.find((e) => e.id === id);
+  }
+
+  /** @throws if `repoRoot` is not a git repository. */
+  add(name: string, repoRoot: string, defaultBase?: string): Environment {
+    if (!existsSync(join(repoRoot, ".git"))) {
+      throw new Error(`not a git repository: ${repoRoot}`);
+    }
+    const env: Environment = {
+      id: newId("env"),
+      name: name.trim() || (repoRoot.split("/").filter(Boolean).pop() ?? "environment"),
+      repoRoot,
+      defaultBase,
+    };
+    this.environments.push(env);
+    this.save();
+    return env;
+  }
+
+  remove(id: string): void {
+    this.environments = this.environments.filter((e) => e.id !== id);
+    this.save();
+  }
+
+  private load(): void {
+    if (!existsSync(this.file)) return;
+    try {
+      this.environments = (JSON.parse(readFileSync(this.file, "utf8")).environments ?? []) as Environment[];
+    } catch {
+      /* start empty on a corrupt file */
+    }
+  }
+  private save(): void {
+    writeFileSync(this.file, JSON.stringify({ environments: this.environments }, null, 2));
+  }
+}

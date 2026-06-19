@@ -108,6 +108,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         registry.add(ws);
         ws.send(JSON.stringify(supervisor.sessionListEvent()));
         ws.send(JSON.stringify(supervisor.budgetEvent()));
+        ws.send(JSON.stringify(supervisor.environmentsEvent()));
       },
       close(ws: ServerWebSocket<ConnState>) {
         registry.remove(ws);

@@ -6,6 +6,8 @@ import {
   type AutonomyPolicy,
   type Budget,
   type BudgetEvent,
+  type Environment,
+  type EnvironmentsEvent,
   type Model,
   type PermissionDecision,
   type ServerEvent,
@@ -25,6 +27,7 @@ import { PermissionBroker } from "../agent/permissions";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { BudgetTracker } from "../budget/tracker";
+import { EnvironmentStore } from "../env/store";
 
 /** A client command that can't be honored (bad args, no such session). → command.error. */
 export class BadCommand extends Error {}
@@ -51,10 +54,12 @@ export class Supervisor {
   private readonly renderer: MarkdownRenderer;
   private readonly agentEnv = buildAgentEnv();
   private readonly budgetTracker: BudgetTracker;
+  private readonly envStore: EnvironmentStore;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
     this.store = new SessionStore(cfg.stateDir);
+    this.envStore = new EnvironmentStore(cfg.stateDir);
     this.budgetTracker = new BudgetTracker({
       stateDir: cfg.stateDir,
       warnFraction: cfg.warnFraction ?? 0.8,
@@ -68,6 +73,25 @@ export class Supervisor {
   }
   budgetEvent(): BudgetEvent {
     return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.budgetTracker.snapshot() };
+  }
+
+  environmentsEvent(): EnvironmentsEvent {
+    return { v: PROTOCOL_VERSION, type: "environments", ts: now(), environments: this.envStore.list() };
+  }
+  getEnvironment(id: string): Environment | undefined {
+    return this.envStore.get(id);
+  }
+  addEnvironment(name: string, repoRoot: string, defaultBase?: string): void {
+    try {
+      this.envStore.add(name, repoRoot, defaultBase);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    this.registry.toAll(this.environmentsEvent());
+  }
+  removeEnvironment(id: string): void {
+    this.envStore.remove(id);
+    this.registry.toAll(this.environmentsEvent());
   }
 
   /** Events to send a (re)attaching connection (arch §6.4): replay seq > lastSeq, else snapshot. */
@@ -108,6 +132,7 @@ export class Supervisor {
     const data: SessionData = {
       id,
       title: cmd.title ?? deriveTitle(cwd),
+      environmentId: cmd.environmentId,
       cwd,
       source: cmd.source,
       worktree,

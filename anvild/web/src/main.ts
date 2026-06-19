@@ -4,6 +4,7 @@ import type {
   ContentBlock,
   ConversationEvent,
   DirsListResultEvent,
+  Environment,
   PermissionSuggestion,
   ServerEvent,
   Session,
@@ -19,6 +20,7 @@ const scrollDown = () => {
 
 // ── State ────────────────────────────────────────────────────────────────────
 const sessions = new Map<string, Session>();
+const environments = new Map<string, Environment>();
 let activeId: string | null = null;
 let streaming: HTMLElement | null = null;
 
@@ -84,6 +86,9 @@ function onEvent(e: ServerEvent): void {
       return;
     case "budget":
       renderBudget(e.budget);
+      return;
+    case "environments":
+      onEnvironments(e.environments);
       return;
     case "dirs.list.result":
       onDirs?.(e);
@@ -230,10 +235,18 @@ function renderSessions(): void {
   for (const s of sessions.values()) {
     const li = document.createElement("li");
     li.className = `session${s.id === activeId ? " active" : ""}`;
-    li.innerHTML = `<div class="title">${esc(s.title)}</div><div class="meta">${esc(s.git?.branch ?? s.source)} · ${esc(s.status)} · ${esc(s.model)}</div>`;
+    const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
+    const where = envName ?? s.git?.branch ?? s.source;
+    li.innerHTML = `<div class="title">${esc(s.title)}</div><div class="meta">${esc(where)} · ${esc(s.status)} · ${esc(s.model)}</div>`;
     li.onclick = () => selectSession(s.id);
     ul.appendChild(li);
   }
+}
+function onEnvironments(list: Environment[]): void {
+  environments.clear();
+  for (const e of list) environments.set(e.id, e);
+  renderSessions();
+  if (document.getElementById("ns-modal")) showNewSession(); // refresh an open new-session modal
 }
 function renderBudget(b: Budget): void {
   const el = $("#budget");
@@ -270,32 +283,24 @@ let onDirs: ((e: DirsListResultEvent) => void) | null = null;
 const browse = { path: "", parent: undefined as string | undefined };
 
 $("#new-session").addEventListener("click", showNewSession);
-function showNewSession(): void {
-  const root = $("#modal-root");
-  const m = document.createElement("div");
-  m.className = "modal";
-  m.innerHTML = `<div class="modal-box"><h3>New session</h3>
-    <label>Source<select id="ns-source">
-      <option value="existing-dir">Existing directory</option>
-      <option value="fresh-worktree">Fresh git worktree (off this repo)</option>
-    </select></label>
-    <div class="browser">
-      <div class="browser-path"><button id="ns-up" title="Up">⬆</button><code id="ns-cur">…</code></div>
-      <ul id="ns-dirs" class="browser-list"></ul>
-    </div>
-    <div class="row">
-      <label>Model<select id="ns-model"><option value="opus">Opus</option><option value="sonnet">Sonnet</option></select></label>
-      <label>Autonomy<select id="ns-auto"><option value="mostly-autonomous">Mostly autonomous</option><option value="allowlist">Allowlist</option><option value="prompt-all">Prompt all</option></select></label>
-    </div>
-    <div class="btns"><button id="ns-cancel">Cancel</button><button id="ns-create">Create here</button></div></div>`;
-  root.innerHTML = "";
-  root.appendChild(m);
 
-  const close = () => {
-    onDirs = null;
-    root.innerHTML = "";
-  };
+const closeModal = (): void => {
+  onDirs = null;
+  $("#modal-root").innerHTML = "";
+};
+const MODEL_AUTONOMY = `<div class="row">
+  <label>Model<select id="ns-model"><option value="opus">Opus</option><option value="sonnet">Sonnet</option></select></label>
+  <label>Autonomy<select id="ns-auto"><option value="mostly-autonomous">Mostly autonomous</option><option value="allowlist">Allowlist</option><option value="prompt-all">Prompt all</option></select></label>
+</div>`;
 
+/** A reusable directory browser (used by add-environment and one-off). */
+function browserMarkup(): string {
+  return `<div class="browser">
+    <div class="browser-path"><button type="button" id="ns-up" title="Up">⬆</button><code id="ns-cur">…</code></div>
+    <ul id="ns-dirs" class="browser-list"></ul>
+  </div>`;
+}
+function wireBrowser(): void {
   onDirs = (e) => {
     browse.path = e.path;
     browse.parent = e.parent;
@@ -310,24 +315,108 @@ function showNewSession(): void {
       ul.appendChild(li);
     }
   };
-
   $<HTMLButtonElement>("#ns-up").onclick = () => {
     if (browse.parent) sock.send({ type: "dirs.list", path: browse.parent });
   };
-  $<HTMLButtonElement>("#ns-cancel").onclick = close;
-  $<HTMLButtonElement>("#ns-create").onclick = () => {
-    if (!browse.path) return;
-    const source = $<HTMLSelectElement>("#ns-source").value;
-    const common = { model: $<HTMLSelectElement>("#ns-model").value, autonomy: $<HTMLSelectElement>("#ns-auto").value };
-    if (source === "fresh-worktree") {
-      sock.send({ type: "session.create", source, repoRoot: browse.path, base: "HEAD", ...common });
-    } else {
-      sock.send({ type: "session.create", source, cwd: browse.path, ...common });
-    }
-    close();
-  };
+  sock.send({ type: "dirs.list" });
+}
 
-  sock.send({ type: "dirs.list" }); // start browsing at the daemon user's home
+/** Primary flow: pick an environment + name → fresh worktree. */
+function showNewSession(): void {
+  const root = $("#modal-root");
+  const envs = [...environments.values()];
+  const m = document.createElement("div");
+  m.className = "modal";
+  if (envs.length === 0) {
+    m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
+      <p class="muted">No environments yet — register a project repo to get started.</p>
+      <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-addenv">＋ Add environment</button></div>
+      <p class="small muted"><a id="ns-oneoff" href="#">or work in a one-off folder…</a></p></div>`;
+  } else {
+    const opts = envs.map((e) => `<option value="${esc(e.id)}">${esc(e.name)}</option>`).join("");
+    m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
+      <label>Environment<div class="env-row"><select id="ns-env">${opts}</select><button type="button" id="ns-addenv" title="Add environment">＋</button></div></label>
+      <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
+      ${MODEL_AUTONOMY}
+      <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-create">Create worktree</button></div>
+      <p class="small muted"><a id="ns-oneoff" href="#">or work in a one-off folder…</a></p></div>`;
+  }
+  root.innerHTML = "";
+  root.appendChild(m);
+  onDirs = null; // this modal has no browser
+
+  document.getElementById("ns-cancel")?.addEventListener("click", closeModal);
+  document.getElementById("ns-addenv")?.addEventListener("click", () => showAddEnvironment());
+  document.getElementById("ns-oneoff")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    showOneOff();
+  });
+  document.getElementById("ns-name")?.focus();
+  document.getElementById("ns-create")?.addEventListener("click", () => {
+    const env = environments.get($<HTMLSelectElement>("#ns-env").value);
+    const name = $<HTMLInputElement>("#ns-name").value.trim();
+    if (!env || !name) return;
+    sock.send({
+      type: "session.create",
+      source: "fresh-worktree",
+      repoRoot: env.repoRoot,
+      base: env.defaultBase ?? "HEAD",
+      title: name,
+      environmentId: env.id,
+      model: $<HTMLSelectElement>("#ns-model").value,
+      autonomy: $<HTMLSelectElement>("#ns-auto").value,
+    });
+    closeModal();
+  });
+}
+
+/** Register a project repo as an environment. */
+function showAddEnvironment(): void {
+  const root = $("#modal-root");
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>Add environment</h3>
+    <label>Name<input id="ae-name" placeholder="e.g. OXOS Bots" /></label>
+    <p class="small muted">Pick the project's git repo (look for the “git” badge):</p>
+    ${browserMarkup()}
+    <div class="btns"><button type="button" id="ae-back">Back</button><button type="button" id="ae-save">Add</button></div></div>`;
+  root.innerHTML = "";
+  root.appendChild(m);
+  wireBrowser();
+  $<HTMLButtonElement>("#ae-back").onclick = () => showNewSession();
+  $<HTMLButtonElement>("#ae-save").onclick = () => {
+    if (!browse.path) return;
+    const name = $<HTMLInputElement>("#ae-name").value.trim() || (browse.path.split("/").pop() ?? browse.path);
+    sock.send({ type: "env.add", name, repoRoot: browse.path });
+    showNewSession(); // the environments broadcast will populate the new env
+  };
+}
+
+/** One-off: work directly in a folder, no worktree. */
+function showOneOff(): void {
+  const root = $("#modal-root");
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>One-off session</h3>
+    <p class="small muted">Work directly in a folder (no worktree):</p>
+    ${browserMarkup()}
+    ${MODEL_AUTONOMY}
+    <div class="btns"><button type="button" id="oo-back">Back</button><button type="button" id="oo-create">Open here</button></div></div>`;
+  root.innerHTML = "";
+  root.appendChild(m);
+  wireBrowser();
+  $<HTMLButtonElement>("#oo-back").onclick = () => showNewSession();
+  $<HTMLButtonElement>("#oo-create").onclick = () => {
+    if (!browse.path) return;
+    sock.send({
+      type: "session.create",
+      source: "existing-dir",
+      cwd: browse.path,
+      model: $<HTMLSelectElement>("#ns-model").value,
+      autonomy: $<HTMLSelectElement>("#ns-auto").value,
+    });
+    closeModal();
+  };
 }
 function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[]): void {
   const root = $("#modal-root");

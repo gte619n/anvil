@@ -31,7 +31,7 @@ function rpc(payload: object): Promise<any> {
     ws.onopen = () => ws.send(JSON.stringify(payload));
     ws.onmessage = (ev) => {
       const m = JSON.parse(String(ev.data));
-      if (m.type === "session.list" || m.type === "budget") return; // ignore connect snapshots
+      if (m.type === "session.list" || m.type === "budget" || m.type === "environments") return; // ignore connect snapshots
       clearTimeout(timer);
       resolve(m);
       ws.close();
@@ -82,6 +82,12 @@ test("connecting client receives a session.list on open", async () => {
   expect(Array.isArray(list.sessions)).toBe(true);
 });
 
+test("env.add rejects a non-git path", async () => {
+  const r = await rpc({ ...base, type: "env.add", cid: "e1", name: "x", repoRoot: stateDir });
+  expect(r.type).toBe("command.error");
+  expect(r.message).toContain("not a git repository");
+});
+
 test("push.register with cid → ack", async () => {
   const r = await rpc({ ...base, type: "push.register", cid: "c3", platform: "fcm", token: "tok-1" });
   expect(r.type).toBe("ack");
@@ -101,7 +107,7 @@ test("invalid JSON → command.error", async () => {
     ws.onopen = () => ws.send("{not json");
     ws.onmessage = (ev) => {
       const m = JSON.parse(String(ev.data));
-      if (m.type === "session.list" || m.type === "budget") return;
+      if (m.type === "session.list" || m.type === "budget" || m.type === "environments") return;
       clearTimeout(timer);
       resolve(m);
       ws.close();

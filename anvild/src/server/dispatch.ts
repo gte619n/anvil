@@ -164,6 +164,21 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
       }
 
+      case "env.list":
+        send(deps.supervisor.environmentsEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "env.add":
+        deps.supervisor.addEnvironment(cmd.name, cmd.repoRoot, cmd.defaultBase);
+        if (cid) send(ack(cid));
+        return;
+
+      case "env.remove":
+        deps.supervisor.removeEnvironment(cmd.id);
+        if (cid) send(ack(cid));
+        return;
+
       default: {
         const type = record.type;
         if (PENDING.has(type)) {

@@ -1,7 +1,9 @@
 /**
  * Anvil wire protocol — shared contract between `anvild` (daemon) and all clients.
  *
- * Status: 0.3-draft (2026-06-19). Companion to `anvil-native-architecture.md` (§6, §8).
+ * Status: 0.4-draft (2026-06-19). Companion to `anvil-native-architecture.md` (§6, §8).
+ *   0.4: added Environment registry — environments event + env.list/env.add/env.remove,
+ *        Session/SessionCreateCmd.environmentId. Pick an environment + name → fresh worktree.
  *   0.3: added dirs.list/dirs.list.result (browse the host FS to pick a cwd/repoRoot at
  *        session-create time) + DirEntry.isRepo.
  *   0.2: added fs.list.result/fs.read.result (typed responses), push.unregister,
@@ -81,6 +83,17 @@ export interface Worktree {
   base: string; // branch/commit it was created from
 }
 
+/**
+ * A registered project repo (arch §8). Pick an environment + name a session → the daemon
+ * spins up a fresh git worktree off `repoRoot` and starts a session there.
+ */
+export interface Environment {
+  id: string;
+  name: string; // display name, e.g. "OXOS Bots"
+  repoRoot: string; // absolute path to the git repo
+  defaultBase?: string; // branch/commit to branch worktrees from (default "HEAD")
+}
+
 /** Live git state for the worktree panel (§8); pushed via `session.updated`. */
 export interface GitStatus {
   branch: string;
@@ -112,6 +125,7 @@ export interface PoolUsage {
 export interface Session {
   id: SessionId;
   title: string;
+  environmentId?: string; // the Environment this session was created from, if any
   cwd: string;
   source: SessionSource;
   worktree?: Worktree; // present when source === "fresh-worktree"
@@ -222,6 +236,10 @@ export interface SessionDeletedEvent extends Envelope {
 export interface BudgetEvent extends Envelope {
   type: "budget";
   budget: Budget;
+}
+export interface EnvironmentsEvent extends Envelope {
+  type: "environments";
+  environments: Environment[];
 }
 /** Generic ack for a correlated command that has no richer response. */
 export interface AckEvent extends Envelope {
@@ -350,6 +368,7 @@ export type ServerEvent =
   | SessionUpdatedEvent
   | SessionDeletedEvent
   | BudgetEvent
+  | EnvironmentsEvent
   | AckEvent
   | CommandErrorEvent
   // conversation
@@ -391,6 +410,7 @@ export interface SessionCreateCmd extends Envelope, Correlated {
   repoRoot?: string; // required when source === "fresh-worktree"
   base?: string; // base branch/commit for a fresh worktree
   title?: string;
+  environmentId?: string; // the Environment this came from (for grouping/labeling)
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "mostly-autonomous"
 }
@@ -468,6 +488,21 @@ export interface DirsListCmd extends Envelope, Correlated {
   path?: string; // default: the daemon user's home directory
 }
 
+// Environments (registered project repos).
+export interface EnvListCmd extends Envelope, Correlated {
+  type: "env.list"; // request the current environments (also sent on connect)
+}
+export interface EnvAddCmd extends Envelope, Correlated {
+  type: "env.add";
+  name: string;
+  repoRoot: string; // must be a git repo
+  defaultBase?: string;
+}
+export interface EnvRemoveCmd extends Envelope, Correlated {
+  type: "env.remove";
+  id: string;
+}
+
 // 5d. Terminal (§7)
 
 export interface TerminalOpenCmd extends Envelope, Correlated {
@@ -523,6 +558,9 @@ export type ClientCommand =
   | FsWatchCmd
   | FsUnwatchCmd
   | DirsListCmd
+  | EnvListCmd
+  | EnvAddCmd
+  | EnvRemoveCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd
