@@ -51,8 +51,31 @@ The daemon **refuses to start** if `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 
       Shiki/`data-line` HTML (CSS-var theming survives sanitization). `PassthroughRenderer`
       remains the fallback when no renderer is injected.
 
-Remaining: the WebView bundle (plan 2, client side, ships with the clients); terminal + file
-browser (plan 4); clients (plans 3, 5); push/ops (plan 6).
+- [x] **Web client** (`web/`) — a browser client and the reusable rendering core for the
+      future native shells. Vanilla TS + the daemon's server-rendered HTML; streaming via a
+      live bubble that snaps to rendered HTML on completion; mermaid loads lazily; KaTeX is
+      server-rendered (CSS only on the client). Session list + budget gauge, native textarea
+      (Shift+Enter = newline), permission dialogs, reconnect + `session.attach` resume. Served
+      by the daemon at `/` behind a CSP. Builds + serves; **interactive UI to be eyeballed in a browser.**
+
+Remaining: streaming morph polish + select-to-cite in the web client; terminal + file
+browser (plan 4); native clients (plans 3, 5); push/ops (plan 6).
+
+## Web client
+
+```sh
+bun run build:web     # bundle web/src → web/dist
+bun run start         # daemon serves the app at http://localhost:7701/
+```
+
+Over Tailscale (use from your phone + desktop):
+
+```sh
+tailscale serve --bg --https=443 http://localhost:7701
+# then open https://<your-magicdns-host>/   (WS connects same-origin to /ws)
+```
+
+Rebuild with `bun run build:web` after editing `web/src`. Typecheck with `bun run typecheck:web`.
 
 Note: the daemon runs with `settingSources: []` so it does NOT inherit your ambient Claude
 Code allow-rules — the daemon is the permission authority (arch §6.6). Trade-off: the repo's

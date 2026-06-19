@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Anvil</title>
+    <link rel="stylesheet" href="/katex/katex.min.css" />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div id="conn" class="conn">connecting…</div>
+        <div id="budget" class="budget"></div>
+        <button id="new-session">+ New session</button>
+        <ul id="session-list"></ul>
+      </aside>
+      <main id="main">
+        <header id="header"><span id="header-title">Anvil</span><span id="status"></span></header>
+        <div id="conversation"></div>
+        <form id="composer">
+          <textarea id="input" rows="3" placeholder="Message Claude…  (Enter to send · Shift+Enter for newline)"></textarea>
+          <button type="submit" id="send">Send</button>
+        </form>
+      </main>
+    </div>
+    <div id="modal-root"></div>
+    <div id="toast"></div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>
