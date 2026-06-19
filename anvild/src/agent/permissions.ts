@@ -1,86 +1,103 @@
-import type { CanUseTool, PermissionResult, PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
+import type { HookCallback, PreToolUseHookInput } from "@anthropic-ai/claude-agent-sdk";
 import type { PermissionDecision, PermissionSuggestion } from "@protocol";
 import { newId } from "../util/ids";
 import { isDangerous, isReadOnly } from "./danger-list";
 import type { Session } from "../session/session";
 
+interface ResolvedDecision {
+  decision: PermissionDecision;
+  updatedInput?: Record<string, unknown>;
+}
 interface Pending {
-  resolve: (r: PermissionResult) => void;
+  resolve: (d: ResolvedDecision) => void;
   sessionId: string;
-  defaultInput: Record<string, unknown>;
-  suggestions: PermissionUpdate[];
 }
 
 /**
- * Holds permission prompts blocked in `canUseTool` until a client answers (arch §6.6).
- * Keyed by `requestId`; resolved by `permission.respond` (possibly from another device).
+ * Holds permission prompts blocked in the PreToolUse hook until a client answers (arch §6.6).
+ * Keyed by `requestId`; resolved by `permission.respond` — possibly from another device.
  */
 export class PermissionBroker {
   private readonly pending = new Map<string, Pending>();
 
-  add(requestId: string, p: Pending): void {
-    this.pending.set(requestId, p);
+  request(requestId: string, sessionId: string): Promise<ResolvedDecision> {
+    return new Promise((resolve) => this.pending.set(requestId, { resolve, sessionId }));
   }
   sessionFor(requestId: string): string | undefined {
     return this.pending.get(requestId)?.sessionId;
   }
-
   resolve(requestId: string, decision: PermissionDecision, updatedInput?: unknown): boolean {
     const p = this.pending.get(requestId);
     if (!p) return false;
     this.pending.delete(requestId);
-
-    if (decision === "deny") {
-      p.resolve({ behavior: "deny", message: "Denied by user" });
-      return true;
-    }
-    const result: PermissionResult = {
-      behavior: "allow",
-      updatedInput: (updatedInput as Record<string, unknown> | undefined) ?? p.defaultInput,
-    };
-    // "allow_always" → persist the SDK's suggested rules so it won't re-ask this session.
-    if (decision === "allow_always") result.updatedPermissions = p.suggestions;
-    p.resolve(result);
+    p.resolve({ decision, updatedInput: updatedInput as Record<string, unknown> | undefined });
     return true;
   }
 }
 
-const PROMPT_SUGGESTIONS = (tool: string): PermissionSuggestion[] => [
+const SUGGESTIONS = (tool: string): PermissionSuggestion[] => [
   { decision: "allow", label: "Allow once" },
-  { decision: "allow_always", label: `Always allow ${tool}` },
+  { decision: "allow_always", label: `Always allow ${tool} this session` },
   { decision: "deny", label: "Deny" },
 ];
 
 /**
- * Build the `canUseTool` callback for a session, applying its autonomy policy:
- *  - mostly-autonomous: auto-allow unless the danger list trips;
- *  - allowlist: auto-allow read-only tools, prompt for the rest;
- *  - prompt-all: always prompt.
- * When a prompt is needed, park on the broker until `permission.respond` arrives.
+ * The authoritative permission gate (arch §6.6). Registered as a `PreToolUse` hook so it
+ * fires on EVERY tool — making the daemon's autonomy policy + danger list govern all tools,
+ * rather than deferring to the CLI's own heuristics (which `canUseTool` alone does not).
  */
-export function makeCanUseTool(session: Session, broker: PermissionBroker): CanUseTool {
-  return async (toolName, input, { suggestions }) => {
-    const policy = session.data.autonomy;
-    const verdict = isDangerous(toolName, input, session.data.cwd);
-
-    const mustPrompt =
-      policy === "prompt-all" ||
-      (policy === "allowlist" && !isReadOnly(toolName)) ||
-      (policy === "mostly-autonomous" && verdict.danger);
-
-    if (!mustPrompt) {
-      return { behavior: "allow", updatedInput: input };
-    }
-
-    const requestId = newId("perm");
-    return new Promise<PermissionResult>((resolve) => {
-      broker.add(requestId, {
-        resolve,
-        sessionId: session.id,
-        defaultInput: input,
-        suggestions: suggestions ?? [],
-      });
-      session.requestPermission(requestId, toolName, input, PROMPT_SUGGESTIONS(toolName));
-    });
+export function makePreToolUseHook(session: Session, broker: PermissionBroker): HookCallback {
+  return async (input) => {
+    const i = input as PreToolUseHookInput;
+    const tool = i.tool_name;
+    const toolInput = (i.tool_input ?? {}) as Record<string, unknown>;
+    const out = await decide(session, broker, tool, toolInput);
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: out.behavior,
+        permissionDecisionReason: out.reason,
+        ...(out.updatedInput ? { updatedInput: out.updatedInput } : {}),
+      },
+    };
   };
+}
+
+interface Decision {
+  behavior: "allow" | "deny";
+  updatedInput?: Record<string, unknown>;
+  reason?: string;
+}
+
+async function decide(
+  session: Session,
+  broker: PermissionBroker,
+  tool: string,
+  input: Record<string, unknown>,
+): Promise<Decision> {
+  if (session.isAlwaysAllowed(tool)) {
+    return { behavior: "allow", updatedInput: input, reason: "remembered allow" };
+  }
+
+  const policy = session.data.autonomy;
+  const verdict = isDangerous(tool, input, session.data.cwd);
+  const mustPrompt =
+    policy === "prompt-all" ||
+    (policy === "allowlist" && !isReadOnly(tool)) ||
+    (policy === "mostly-autonomous" && verdict.danger);
+
+  if (!mustPrompt) {
+    return { behavior: "allow", updatedInput: input, reason: "auto-allowed by autonomy policy" };
+  }
+
+  const requestId = newId("perm");
+  const answer = broker.request(requestId, session.id);
+  session.requestPermission(requestId, tool, input, SUGGESTIONS(tool));
+  const ans = await answer;
+
+  if (ans.decision === "deny") {
+    return { behavior: "deny", reason: verdict.reason ? `denied (${verdict.reason})` : "denied by user" };
+  }
+  if (ans.decision === "allow_always") session.rememberAllow(tool);
+  return { behavior: "allow", updatedInput: ans.updatedInput ?? input };
 }

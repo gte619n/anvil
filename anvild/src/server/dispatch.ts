@@ -94,7 +94,8 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         }
         conn.attached.add(cmd.sessionId);
         if (cid) send(ack(cid));
-        // M6: replay events with seq > lastSeq, or send conversation.snapshot
+        // replay events with seq > lastSeq, or a conversation.snapshot (arch §6.4)
+        for (const event of deps.supervisor.resume(cmd.sessionId, cmd.lastSeq)) send(event);
         return;
       }
 

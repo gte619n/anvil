@@ -31,17 +31,23 @@ The daemon **refuses to start** if `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 
       streaming `assistant.delta` → `assistant.message`, `tool.use`/`tool.result`, status
       transitions, `claudeSessionId` capture for resume, usage accounting. Verified live
       (`test/tools/live-prompt.ts`): plain reply + Bash tool execution both stream correctly.
-- [ ] **M6** — event-log persistence (`events.ndjson`) + resume replay / `conversation.snapshot`
-- [ ] **M7** — authoritative permissions + autonomy + danger list. **Finding:** `canUseTool`
-      only fires for ops the CLI itself flags; to make the daemon's danger-list the universal
-      gate (catch e.g. secret-path reads / out-of-worktree writes the CLI would allow), use a
-      **`PreToolUse` hook** (fires on every tool). Broker + danger-list + permission round-trip
-      are already built (`src/agent/permissions.ts`, `danger-list.ts`); M7 rewires them onto the hook.
-- [ ] **M8** — budget tracker + warn/soft-stop (driver already feeds usage in)
+- [x] **M6** — event-log persistence (`events.ndjson`) + resume: `session.attach{lastSeq}`
+      replays `seq > lastSeq`, cold attach folds a `conversation.snapshot` (incl. `message.user`).
+      Deltas/terminal events excluded from the durable log. Verified live (reconnect → snapshot + replay).
+- [x] **M7** — authoritative permissions via a **`PreToolUse` hook** (fires on every tool, so the
+      daemon's autonomy policy + danger list govern all tools — `canUseTool` alone only sees ops
+      the CLI already flags). `permission.request`/`respond` round-trip + per-session `allow_always`.
+      Verified live: a benign tool prompts under `prompt-all`; auto-allowed under `mostly-autonomous`.
+- [x] **M8** — budget tracker: accumulates per-model USD-equivalent cost over a rolling 7-day
+      window, converts to an hours-estimate (calibratable), emits `budget` on connect + per turn,
+      `warn` threshold + one-shot soft-stop advisory. Verified live (budget event after each turn).
+
+**Daemon core (M1–M8) complete.** Next: the markdown rendering pipeline (impl plan 2) replaces
+`PassthroughRenderer`; then terminal + file browser (plan 4); clients (plans 3, 5); push/ops (plan 6).
 
 Note: the daemon runs with `settingSources: []` so it does NOT inherit your ambient Claude
-Code allow-rules — the daemon is meant to be the permission authority (arch §6.6). Trade-off:
-the repo's `CLAUDE.md` isn't auto-loaded; project context injection is a later item.
+Code allow-rules — the daemon is the permission authority (arch §6.6). Trade-off: the repo's
+`CLAUDE.md` isn't auto-loaded; project-context injection is a later item.
 
 ## Layout
 

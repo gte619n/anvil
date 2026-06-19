@@ -1,9 +1,13 @@
 import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
+import type { Model } from "@protocol";
 import { InputQueue, userMessage } from "./input-queue";
 import { extractResultUsage, extractSessionId, mapMessage } from "./map";
-import { makeCanUseTool, type PermissionBroker } from "./permissions";
+import { makePreToolUseHook, type PermissionBroker } from "./permissions";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
+
+/** Called once per completed turn with the turn's USD-equivalent cost (for the budget tracker). */
+export type ResultRecorder = (model: Model, costUsd: number) => void;
 
 /**
  * Drives one Claude Code session via the Agent SDK in streaming-input mode (arch §2).
@@ -19,6 +23,7 @@ export class AgentDriver {
     private readonly renderer: MarkdownRenderer,
     private readonly broker: PermissionBroker,
     private readonly env: Record<string, string>,
+    private readonly onResult: ResultRecorder,
   ) {}
 
   prompt(text: string): void {
@@ -61,11 +66,16 @@ export class AgentDriver {
         includePartialMessages: true,
         permissionMode: "default",
         // Load NO on-disk settings, so the daemon — not the user's ambient Claude Code
-        // allow-rules — is the permission authority. This is what makes the autonomy
-        // policy + danger list (arch §6.6) actually govern every tool. (Trade-off: the
-        // repo's CLAUDE.md isn't auto-loaded; project context can be injected later.)
+        // allow-rules — is the permission authority (arch §6.6). (Trade-off: the repo's
+        // CLAUDE.md isn't auto-loaded; project context can be injected later.)
         settingSources: [],
-        canUseTool: makeCanUseTool(s, this.broker),
+        // PreToolUse fires on EVERY tool → the autonomy policy + danger list govern all
+        // tools, and a blocked prompt parks here (timeout high enough to answer from a
+        // phone). This is the authoritative gate (M7); canUseTool alone only sees ops the
+        // CLI already flags.
+        hooks: {
+          PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker)], timeout: 3600 }],
+        },
         executable: "bun",
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
       },
@@ -98,6 +108,8 @@ export class AgentDriver {
             this.session.data.usage.outputTokens += usage.outputTokens;
             this.session.data.usage.turns += usage.turns;
           }
+          const costUsd = Number((m as any).total_cost_usd ?? 0);
+          this.onResult(this.session.data.model, costUsd);
           this.session.setStatus("idle");
         }
       }

@@ -28,6 +28,22 @@ test("each session has an independent seq starting at 1", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("resume replays events after lastSeq, and snapshots from scratch", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir));
+  s.setStatus("thinking"); // seq 1 (persisted)
+  s.setStatus("idle"); // seq 2
+
+  const replay = sup.resume(s.id, 1);
+  expect(replay.map((e) => (e as any).seq)).toEqual([2]);
+
+  const snap = sup.resume(s.id, undefined);
+  expect(snap).toHaveLength(1);
+  expect(snap[0]!.type).toBe("conversation.snapshot");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("supervisor persists sessions and a fresh instance restores them", () => {
   const dir = tempState();
   const reg = new ConnectionRegistry();

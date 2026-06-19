@@ -3,6 +3,7 @@
  * streamed events until `result`.
  *   bun run test/tools/live-prompt.ts [ws-url] [cwd] [model] [prompt]
  */
+export {};
 const url = process.argv[2] ?? "ws://localhost:7701/ws";
 const cwd = process.argv[3] ?? process.cwd();
 const model = process.argv[4] ?? "sonnet";

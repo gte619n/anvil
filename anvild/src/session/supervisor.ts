@@ -1,7 +1,11 @@
 import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync as ensureDir } from "node:fs";
 import {
   PROTOCOL_VERSION,
+  type AttachmentRef,
   type AutonomyPolicy,
+  type Budget,
+  type BudgetEvent,
   type Model,
   type PermissionDecision,
   type ServerEvent,
@@ -19,12 +23,16 @@ import { AgentDriver } from "../agent/driver";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
+import { EventLog } from "../eventlog/log";
+import { BudgetTracker } from "../budget/tracker";
 
 /** A client command that can't be honored (bad args, no such session). → command.error. */
 export class BadCommand extends Error {}
 
 export interface SupervisorConfig {
   stateDir: string;
+  warnFraction?: number;
+  softStopFraction?: number;
 }
 
 /**
@@ -37,13 +45,36 @@ export class Supervisor {
   private readonly store: SessionStore;
   private readonly sessions = new Map<string, Session>();
   private readonly drivers = new Map<string, AgentDriver>();
+  private readonly logs = new Map<string, EventLog>();
   private readonly broker = new PermissionBroker();
   private readonly renderer: MarkdownRenderer = new PassthroughRenderer();
   private readonly agentEnv = buildAgentEnv();
+  private readonly budgetTracker: BudgetTracker;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.store = new SessionStore(cfg.stateDir);
+    this.budgetTracker = new BudgetTracker({
+      stateDir: cfg.stateDir,
+      warnFraction: cfg.warnFraction ?? 0.8,
+      softStopFraction: cfg.softStopFraction ?? 0.95,
+    });
     this.restore();
+  }
+
+  budget(): Budget {
+    return this.budgetTracker.snapshot();
+  }
+  budgetEvent(): BudgetEvent {
+    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.budgetTracker.snapshot() };
+  }
+
+  /** Events to send a (re)attaching connection (arch §6.4): replay seq > lastSeq, else snapshot. */
+  resume(id: string, lastSeq?: number): ServerEvent[] {
+    const s = this.require(id);
+    const log = this.logs.get(id);
+    if (!log) return [];
+    if (lastSeq === undefined) return [log.snapshot(id, s.lastSeq)];
+    return log.since(lastSeq);
   }
 
   list(): SessionData[] {
@@ -94,11 +125,15 @@ export class Supervisor {
   }
 
   /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
-  prompt(id: string, text: string): void {
+  prompt(id: string, text: string, attachments: AttachmentRef[] = []): void {
     const s = this.require(id);
+    // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4)
+    s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
     let driver = this.drivers.get(id);
     if (!driver) {
-      driver = new AgentDriver(s, this.renderer, this.broker, this.agentEnv);
+      driver = new AgentDriver(s, this.renderer, this.broker, this.agentEnv, (model, costUsd) =>
+        this.onAgentResult(id, model, costUsd),
+      );
       this.drivers.set(id, driver);
     }
     driver.prompt(text);
@@ -144,6 +179,7 @@ export class Supervisor {
     }
     rmSync(this.store.sessionDir(id), { recursive: true, force: true });
     this.sessions.delete(id);
+    this.logs.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
   }
@@ -151,12 +187,31 @@ export class Supervisor {
   // ── internals ──────────────────────────────────────────────────────────────
 
   private wrap(data: SessionData, lastSeq: number): Session {
+    const dir = this.store.sessionDir(data.id);
+    ensureDir(dir, { recursive: true });
+    const log = new EventLog(dir);
+    this.logs.set(data.id, log);
     return new Session(
       data,
       lastSeq,
       (sessionId, event) => this.registry.toAttached(sessionId, event),
       () => this.persist(),
+      (event) => log.append(event),
     );
+  }
+
+  /** Per-turn cost → budget tracker; broadcast the new budget; advise once at soft-stop. */
+  private onAgentResult(sessionId: string, model: Model, costUsd: number): void {
+    const { budget, crossedSoftStop } = this.budgetTracker.record(model, costUsd);
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "budget", ts: now(), budget });
+    if (crossedSoftStop) {
+      this.sessions
+        .get(sessionId)
+        ?.emitError(
+          `Budget soft-stop: weekly Opus usage near the limit (~${budget.opus.usedHrs}/${budget.opus.limitHrs} hrs). Consider switching sessions to Sonnet.`,
+          false,
+        );
+    }
   }
 
   private restore(): void {

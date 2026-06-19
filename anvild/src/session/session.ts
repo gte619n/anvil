@@ -24,12 +24,14 @@ export type EventSink = (sessionId: string, event: ServerEvent) => void;
 export class Session {
   private nextSeq: number;
   private group: Group | undefined;
+  private readonly alwaysAllow = new Set<string>();
 
   constructor(
     public data: SessionData,
     lastSeq: number,
     private readonly sink: EventSink,
     private readonly onChange: () => void,
+    private readonly append: (event: ServerEvent) => void = () => {},
   ) {
     this.nextSeq = lastSeq + 1;
   }
@@ -41,13 +43,22 @@ export class Session {
     return this.nextSeq - 1;
   }
 
-  /** Mint `seq`, broadcast to attached connections, mark the session dirty for persistence. */
+  /** Mint `seq`, persist to the event log, broadcast to attached connections, mark dirty. */
   emit(body: SessionEventBody): ServerEvent {
     const seq = this.nextSeq++;
     const event = { ...body, v: PROTOCOL_VERSION, ts: now(), sessionId: this.data.id, seq } as ServerEvent;
+    this.append(event); // durable log (arch §6.4); skips deltas/terminal internally
     this.sink(this.data.id, event);
     this.onChange();
     return event;
+  }
+
+  /** Per-session "always allow" set for allow_always decisions (arch §6.6). */
+  rememberAllow(tool: string): void {
+    this.alwaysAllow.add(tool);
+  }
+  isAlwaysAllowed(tool: string): boolean {
+    return this.alwaysAllow.has(tool);
   }
 
   setStatus(status: SessionStatus): void {

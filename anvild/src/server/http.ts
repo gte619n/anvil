@@ -1,7 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import type { rest } from "@protocol";
 import { checkAuth } from "../auth/guard";
-import { budgetSnapshot } from "../budget/tracker";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
@@ -19,6 +18,8 @@ export interface ServerHandle {
 export interface ServerOptions {
   port: number;
   stateDir: string;
+  warnFraction?: number;
+  softStopFraction?: number;
 }
 
 /**
@@ -30,7 +31,10 @@ export interface ServerOptions {
 export function createServer(opts: ServerOptions): ServerHandle {
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
-  const supervisor = new Supervisor({ stateDir: opts.stateDir }, registry);
+  const supervisor = new Supervisor(
+    { stateDir: opts.stateDir, warnFraction: opts.warnFraction, softStopFraction: opts.softStopFraction },
+    registry,
+  );
 
   const server = Bun.serve<ConnState>({
     port: opts.port,
@@ -43,7 +47,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
           ok: true,
           subscriptionAuthOk: auth.subscriptionAuthOk,
           version: VERSION,
-          budget: budgetSnapshot(),
+          budget: supervisor.budget(),
         };
         return Response.json(body);
       }
@@ -60,6 +64,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       open(ws: ServerWebSocket<ConnState>) {
         registry.add(ws);
         ws.send(JSON.stringify(supervisor.sessionListEvent()));
+        ws.send(JSON.stringify(supervisor.budgetEvent()));
       },
       close(ws: ServerWebSocket<ConnState>) {
         registry.remove(ws);

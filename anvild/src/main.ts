@@ -6,7 +6,12 @@ import { createServer, VERSION } from "./server/http";
 assertSubscriptionAuth();
 
 const config = loadConfig();
-const { port } = createServer({ port: config.port, stateDir: config.stateDir });
+const { port } = createServer({
+  port: config.port,
+  stateDir: config.stateDir,
+  warnFraction: config.warnFraction,
+  softStopFraction: config.softStopFraction,
+});
 
 console.log(
   `[anvild ${VERSION}] listening on http://localhost:${port}  ` +
