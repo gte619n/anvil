@@ -246,6 +246,15 @@ function handleSessionEvent(e: ServerEvent): void {
   }
 }
 
+// file links in the conversation (Read/Edit/… tool calls) open the reader
+conversation.addEventListener("click", (e) => {
+  const link = (e.target as HTMLElement).closest(".file-link") as HTMLElement | null;
+  if (!link) return;
+  e.preventDefault();
+  const path = link.dataset.path;
+  if (path && activeId) openFile(path);
+});
+
 // replay/snapshot events fold into the same renderers
 function renderConversationEvent(ev: ConversationEvent): void {
   if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments);
@@ -315,13 +324,35 @@ function commitAssistant(blocks: ContentBlock[]): void {
   streamText = "";
   scrollDown();
 }
+const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
+function toolPath(input: unknown): string | undefined {
+  const i = input as Record<string, unknown> | undefined;
+  for (const k of ["file_path", "path", "notebook_path"]) {
+    if (typeof i?.[k] === "string") return i[k] as string;
+  }
+  return undefined;
+}
 function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
-  return `<div class="tool">🔧 <b>${esc(b.name)}</b> <code>${esc(JSON.stringify(b.input)).slice(0, 200)}</code></div>`;
+  const path = toolPath(b.input);
+  if (FILE_TOOLS.has(b.name) && path) {
+    const base = path.split("/").pop() || path;
+    return `<div class="tool">${icon("description")} <b>${esc(b.name)}</b> <a href="#" class="file-link" data-path="${esc(path)}" title="${esc(path)}">${esc(base)}</a></div>`;
+  }
+  const i = b.input as Record<string, unknown> | undefined;
+  if (b.name === "Bash" && typeof i?.command === "string") {
+    return `<div class="tool">${icon("terminal")} <code>${esc(i.command.slice(0, 240))}</code></div>`;
+  }
+  return `<div class="tool">${icon("build")} <b>${esc(b.name)}</b> <code>${esc(JSON.stringify(b.input)).slice(0, 160)}</code></div>`;
 }
 function appendToolResult(content: string, isError: boolean): void {
-  const el = document.createElement("div");
+  const text = content.trim();
+  const lineCount = text ? text.split("\n").length : 0;
+  const first = text.split("\n").find((l) => l.trim()) ?? "(no output)";
+  const el = document.createElement("details");
   el.className = `bubble tool-result ${isError ? "error" : ""}`;
-  el.textContent = content.slice(0, 4000);
+  el.innerHTML =
+    `<summary>${icon(isError ? "error" : "check")} ${isError ? "error" : "result"} · ${lineCount} line${lineCount === 1 ? "" : "s"} · ${esc(first.slice(0, 80))}</summary>` +
+    `<pre>${esc(text.slice(0, 8000))}${text.length > 8000 ? "\n… (truncated)" : ""}</pre>`;
   conversation.appendChild(el);
   scrollDown();
 }
@@ -680,6 +711,8 @@ function renderFiles(entries: DirEntry[]): void {
 }
 function openFile(path: string): void {
   if (!activeId) return;
+  disposeTerminal();
+  panel.classList.add("open"); // a file link may open the reader while the panel is closed
   readerPath = path;
   panelView = "reader";
   setPanelTabs();

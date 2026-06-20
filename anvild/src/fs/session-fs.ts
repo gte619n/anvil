@@ -32,7 +32,19 @@ const extOf = (p: string): string => (p.includes(".") ? p.split(".").pop()!.toLo
 const mimeFor = (p: string): string => MIME[extOf(p)] ?? "application/octet-stream";
 const isBinary = (mime: string): boolean => mime.startsWith("image/") || mime === "application/pdf" || mime === "application/octet-stream";
 
+// ext → Shiki language id (unknowns fall back to plain "text" in the renderer)
+const LANG: Record<string, string> = {
+  ts: "typescript", tsx: "tsx", js: "javascript", jsx: "jsx", mjs: "javascript", cjs: "javascript",
+  py: "python", rs: "rust", go: "go", java: "java", c: "c", h: "c", cpp: "cpp", cc: "cpp", hpp: "cpp",
+  kt: "kotlin", kts: "kotlin", swift: "swift", sh: "bash", bash: "bash", zsh: "bash",
+  yml: "yaml", yaml: "yaml", toml: "toml", json: "json", jsonc: "jsonc", html: "html", css: "css",
+  sql: "sql", diff: "diff", patch: "diff",
+};
+const langForExt = (ext: string): string => LANG[ext] ?? ext;
+const longestBacktickRun = (s: string): number => Math.max(0, ...(s.match(/`+/g) ?? []).map((m) => m.length));
+
 const TEXT_CAP = 256 * 1024;
+const HIGHLIGHT_CAP = 100 * 1024; // above this, skip Shiki (too slow) and serve plain text
 const SKIP = new Set([".git", "node_modules", ".DS_Store"]);
 
 /** List a directory within the worktree (folders first). Paths are worktree-relative. */
@@ -77,6 +89,12 @@ export function readFile(
   const raw = readFileSync(file, "utf8");
   if (raw.length > TEXT_CAP) {
     return { path: userPath, rev, mime, text: raw.slice(0, TEXT_CAP), truncated: true };
+  }
+  // Syntax-highlight code by routing it through the markdown pipeline (Shiki) as a fenced
+  // block; the fence is one backtick longer than any run in the file so it can't break out.
+  if (raw.length <= HIGHLIGHT_CAP && mime !== "text/plain") {
+    const fence = "`".repeat(Math.max(3, longestBacktickRun(raw) + 1));
+    return { path: userPath, rev, mime, markdown: renderer.render(`${fence}${langForExt(extOf(userPath))}\n${raw}\n${fence}`) };
   }
   return { path: userPath, rev, mime, text: raw };
 }

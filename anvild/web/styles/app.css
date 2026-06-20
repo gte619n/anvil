@@ -121,25 +121,34 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .git-output a { color: var(--accent); }
 .session.archived { opacity: 0.55; }
 
-#conversation { flex: 1; min-height: 0; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+#conversation { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
 .empty-state { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 16px; color: var(--muted); text-align: center; }
 .empty-art { color: var(--muted); opacity: 0.3; }
 .empty-state p { margin: 0; font-size: 14px; }
-.bubble { max-width: 760px; align-self: flex-start; }
+.bubble { max-width: min(760px, 100%); min-width: 0; align-self: flex-start; overflow-wrap: anywhere; }
 .bubble.user { align-self: flex-end; background: var(--user-bg); padding: 10px 14px; border-radius: 14px; }
 .bubble .md { line-height: 1.55; }
 .bubble .md :first-child { margin-top: 0; }
 .bubble .md :last-child { margin-bottom: 0; }
 #quote-btn { position: absolute; z-index: 30; padding: 4px 10px; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-size: 12px; cursor: pointer; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
-.tool { font-size: 13px; color: var(--muted); margin: 6px 0; }
-.tool code { background: var(--tool-bg); padding: 1px 5px; border-radius: 5px; }
-.tool-result { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--tool-bg); padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; color: var(--muted); max-width: 760px; }
-.tool-result.error { color: var(--danger); }
+.tool { font-size: 13px; color: var(--muted); margin: 6px 0; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tool .msym { font-size: 16px; flex-shrink: 0; }
+.tool code { background: var(--tool-bg); padding: 1px 5px; border-radius: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.tool .file-link { color: var(--accent); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.tool .file-link:hover { text-decoration: underline; }
+details.tool-result { font-size: 12px; color: var(--muted); margin: 4px 0; max-width: 100%; }
+details.tool-result > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; padding: 3px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+details.tool-result > summary::-webkit-details-marker { display: none; }
+details.tool-result > summary .msym { font-size: 16px; flex-shrink: 0; }
+details.tool-result pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; background: var(--tool-bg); padding: 8px 10px; border-radius: 8px; margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 340px; overflow: auto; }
+details.tool-result.error > summary { color: var(--danger); }
 
-.md pre { background: var(--code-bg); padding: 12px; border-radius: 8px; overflow-x: auto; }
+.md { min-width: 0; overflow-wrap: anywhere; }
+.md pre { background: var(--code-bg); padding: 12px; border-radius: 8px; overflow-x: auto; max-width: 100%; }
+.md pre code { overflow-wrap: normal; white-space: pre; } /* code scrolls, never breaks mid-token */
 .md code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
 .md :not(pre) > code { background: var(--tool-bg); padding: 1px 5px; border-radius: 5px; }
-.md table { border-collapse: collapse; }
+.md table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
 .md th, .md td { border: 1px solid var(--border); padding: 4px 8px; }
 .md pre.mermaid { background: transparent; }
 
