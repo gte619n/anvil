@@ -117,6 +117,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .git-panel textarea, .git-panel input, .git-panel select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background: var(--bg); color: var(--text); resize: vertical; }
 .git-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .git-row select { width: auto; }
+.git-stages { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.git-stages button { justify-content: center; }
 .git-panel button { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; }
 .git-panel button .msym { font-size: 18px; }
 .git-panel button:disabled { opacity: 0.5; cursor: default; }

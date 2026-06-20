@@ -24,7 +24,6 @@ import type {
   DirsListResultEvent,
   Environment,
   FileContent,
-  GitOp,
   GitResultEvent,
   GitStatus,
   PermissionSuggestion,
@@ -302,6 +301,7 @@ function handleSessionEvent(e: ServerEvent): void {
       setStatus("idle");
       streaming = null;
       saveConvoCache();
+      if (panelView === "git" && e.sessionId === activeId) requestGitStatus(); // refresh the SCM buttons
       return;
     case "permission.request":
       showPermission(e.requestId, e.tool, e.input, e.suggestions);
@@ -846,33 +846,55 @@ function askClaude(instruction: string): void {
   toast("Asked Claude →");
   closePanel(); // jump to the conversation to watch it work
 }
-const ASK = {
-  commit: "Stage and commit all current changes in this worktree with a clear, conventional commit message based on what changed.",
-  push: "Push the current branch to its origin remote (set the upstream with -u if it isn't set).",
-  createPr: "Create a GitHub pull request for the current branch using the gh CLI, with a concise title and a description summarizing the changes, then give me the PR URL.",
-  mergePr: "Merge the open pull request for this branch with `gh pr merge --squash --delete-branch`, and confirm when it's merged.",
+type Stage = "commit" | "push" | "pr" | "merge";
+// Each stage tells Claude to do EVERYTHING up to and including that stage.
+const STAGE_PROMPT: Record<Stage, string> = {
+  commit: "In this worktree, stage and commit all current changes with a clear, conventional commit message based on what changed. If there's nothing to commit, say so.",
+  push: "In this worktree: commit all current changes with a clear conventional message (if any are uncommitted), then push the branch to its origin remote (set the upstream with -u if needed).",
+  pr: "In this worktree, take the branch to an open PR: commit any uncommitted changes (good conventional message), push to origin, then create a GitHub pull request with the gh CLI (concise title + summary) if one doesn't already exist. Give me the PR URL.",
+  merge: "In this worktree, take the branch all the way to merged: commit any uncommitted changes (good message), push to origin, create a GitHub PR with gh if none exists, then merge it into the repo's default branch with `gh pr merge --squash --delete-branch`. Report each step and confirm when it's merged.",
 };
-function prButtonHtml(pr: GitStatus["prState"]): string {
-  if (pr === "open") return `<button type="button" id="ga-pr">${icon("merge")} Merge PR</button>`;
-  if (pr === "merged") return `<button type="button" id="ga-pr" disabled>${icon("check_circle")} PR merged</button>`;
-  return `<button type="button" id="ga-pr">${icon("rocket_launch")} Create PR</button>`;
+const STAGE_META: { key: Stage; icon: string; label: string }[] = [
+  { key: "commit", icon: "commit", label: "Commit" },
+  { key: "push", icon: "cloud_upload", label: "Push" },
+  { key: "pr", icon: "rocket_launch", label: "PR" },
+  { key: "merge", icon: "merge", label: "Merge" },
+];
+/** Which stages still have work to do, given the current source-control state. */
+function gitStageEnabled(g: GitStatus | undefined): Record<Stage, boolean> {
+  const dirty = g?.dirtyFileCount ?? 0;
+  const ahead = g?.ahead ?? 0;
+  const pr = g?.prState;
+  return {
+    commit: dirty > 0, // something uncommitted
+    push: dirty > 0 || ahead > 0, // something not on the remote
+    pr: pr !== "open" && pr !== "merged", // no PR yet
+    merge: pr !== "merged", // not already merged
+  };
+}
+function applyGitButtons(): void {
+  const en = gitStageEnabled(activeId ? sessions.get(activeId)?.git : undefined);
+  for (const { key } of STAGE_META) {
+    const btn = document.getElementById(`ga-${key}`) as HTMLButtonElement | null;
+    if (btn) btn.disabled = !en[key];
+  }
+}
+function requestGitStatus(): void {
+  if (activeId) sock.send({ type: "git", sessionId: activeId, op: "status" });
 }
 function renderGit(): void {
   panelView = "git";
   setPanelTabs();
   const s = activeId ? sessions.get(activeId) : undefined;
   const wt = s?.worktree;
+  const stageBtns = STAGE_META.map((m) => `<button type="button" id="ga-${m.key}">${icon(m.icon)} ${m.label}</button>`).join("");
   panelContent.innerHTML = `<div class="git-panel">
     <div class="git-status"><span id="git-status-text">${gitStatusLine(s)}</span>
       <button type="button" class="mini" id="git-refresh" title="Refresh">${icon("refresh")}</button>
       <button type="button" class="mini" id="git-view-diff" title="View diff">${icon("difference")}</button></div>
     <div class="small muted git-worktree">${wt ? `worktree at <code>${esc(s!.cwd)}</code><br/>off <code>${esc(wt.base)}</code>` : esc(s?.cwd ?? "")}</div>
     <hr />
-    <div class="git-row">
-      <button type="button" id="ga-commit">${icon("commit")} Commit</button>
-      <button type="button" id="ga-push">${icon("cloud_upload")} Push</button>
-      ${prButtonHtml(s?.git?.prState)}
-    </div>
+    <div class="git-row git-stages">${stageBtns}</div>
     <hr />
     <div class="git-row">
       <button type="button" id="ga-cleanup">${icon("cleaning_services")} Cleanup</button>
@@ -881,26 +903,34 @@ function renderGit(): void {
     <pre class="git-output" id="git-output"></pre>
   </div>`;
 
-  const info = (o: GitOp): void => {
-    if (!activeId) return;
-    setGitOutput(`running ${o}…`);
-    sock.send({ type: "git", sessionId: activeId, op: o });
+  $("#git-refresh").onclick = () => {
+    setGitOutput("refreshing…");
+    requestGitStatus();
   };
-  $("#git-refresh").onclick = () => info("status");
-  $("#git-view-diff").onclick = () => info("diff");
-  $("#ga-commit").onclick = () => askClaude(ASK.commit);
-  $("#ga-push").onclick = () => askClaude(ASK.push);
-  const prBtn = document.getElementById("ga-pr");
-  if (prBtn) {
-    prBtn.onclick = () => {
-      const pr = activeId ? sessions.get(activeId)?.git?.prState : undefined;
-      if (pr === "merged") return;
-      askClaude(pr === "open" ? ASK.mergePr : ASK.createPr);
-    };
+  $("#git-view-diff").onclick = () => {
+    if (!activeId) return;
+    setGitOutput("loading diff…");
+    sock.send({ type: "git", sessionId: activeId, op: "diff" });
+  };
+  for (const m of STAGE_META) {
+    const btn = document.getElementById(`ga-${m.key}`) as HTMLButtonElement | null;
+    if (btn) btn.onclick = () => runStage(m.key, m.label);
   }
   $("#ga-cleanup").onclick = cleanupSession;
   $("#ga-abandon").onclick = abandonSession;
-  info("status"); // refresh status + PR state on open
+  applyGitButtons();
+  requestGitStatus(); // sync status + PR state on open
+}
+/** Run all stages up to `key`: lock the buttons immediately, refresh when the turn ends. */
+function runStage(key: Stage, label: string): void {
+  if (!activeId) return;
+  for (const m of STAGE_META) {
+    const b = document.getElementById(`ga-${m.key}`) as HTMLButtonElement | null;
+    if (b) b.disabled = true; // immediate response; re-evaluated on the next status
+  }
+  setGitOutput(`Working… asked Claude to ${label.toLowerCase()}.`);
+  sock.send({ type: "prompt.send", sessionId: activeId, text: STAGE_PROMPT[key] });
+  toast(`${label} →`);
 }
 function gitStatusLine(s: Session | undefined): string {
   const g = s?.git;
@@ -913,12 +943,7 @@ function updateGitPanelMeta(): void {
   const s = activeId ? sessions.get(activeId) : undefined;
   const txt = document.getElementById("git-status-text");
   if (txt) txt.innerHTML = gitStatusLine(s);
-  const prBtn = document.getElementById("ga-pr") as HTMLButtonElement | null;
-  if (prBtn) {
-    const pr = s?.git?.prState;
-    prBtn.innerHTML = pr === "open" ? `${icon("merge")} Merge PR` : pr === "merged" ? `${icon("check_circle")} PR merged` : `${icon("rocket_launch")} Create PR`;
-    prBtn.disabled = pr === "merged";
-  }
+  applyGitButtons();
 }
 /** Outstanding work that removing the session would lose. */
 function outstandingWork(s: Session | undefined): string[] {
@@ -990,9 +1015,9 @@ function showOutstandingDialog(outstanding: string[]): void {
     root.innerHTML = "";
     askClaude(t);
   };
-  $<HTMLButtonElement>("#od-commit").onclick = () => handle(ASK.commit);
-  $<HTMLButtonElement>("#od-push").onclick = () => handle(ASK.push);
-  $<HTMLButtonElement>("#od-pr").onclick = () => handle(pr === "open" ? ASK.mergePr : ASK.createPr);
+  $<HTMLButtonElement>("#od-commit").onclick = () => handle(STAGE_PROMPT.commit);
+  $<HTMLButtonElement>("#od-push").onclick = () => handle(STAGE_PROMPT.push);
+  $<HTMLButtonElement>("#od-pr").onclick = () => handle(pr === "open" ? STAGE_PROMPT.merge : STAGE_PROMPT.pr);
   $<HTMLButtonElement>("#od-cancel").onclick = () => (root.innerHTML = "");
   $<HTMLButtonElement>("#od-remove").onclick = () => {
     root.innerHTML = "";
