@@ -218,6 +218,18 @@ $("#scroll-bottom").addEventListener("click", () => {
   $("#scroll-bottom").hidden = true;
 });
 
+// Native Android shell bridge (present only inside the app): ADB-wifi connect, etc.
+const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
+if (nativeBridge) {
+  nativeBridge.onmessage = (e) => {
+    try {
+      toast((JSON.parse(e.data) as { message?: string }).message ?? "done");
+    } catch {
+      /* ignore */
+    }
+  };
+}
+
 // ── Connection status ────────────────────────────────────────────────────────
 function onStatus(status: "connecting" | "connected" | "disconnected"): void {
   const dot = $("#conn-dot");
@@ -616,6 +628,18 @@ async function renderServerCards(): Promise<void> {
     <p class="small muted">Multi-server (managing anvild on your other Macs from here) is on the roadmap — see the fleet design.</p>`;
   } catch {
     host.innerHTML = `<p class="small muted">Couldn't reach the server.</p>`;
+  }
+  if (nativeBridge) {
+    host.insertAdjacentHTML(
+      "beforeend",
+      `<div class="card"><div class="card-main">${icon("smartphone")} <b>This phone</b></div>
+      <div class="small muted">Connect the Mac to this phone over wifi for app installs/debugging. Turn on <b>Wireless debugging</b> in Developer options first (pair once manually; after that it's one tap).</div>
+      <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-connect">${icon("wifi")} Connect via ADB (wifi)</button></div></div>`,
+    );
+    $("#adb-connect").addEventListener("click", () => {
+      nativeBridge.postMessage(JSON.stringify({ type: "adb.connect" }));
+      toast("Discovering phone…");
+    });
   }
 }
 function renderEnvCards(): void {

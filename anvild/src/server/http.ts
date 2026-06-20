@@ -29,6 +29,22 @@ const CSP = [
   "base-uri 'none'",
 ].join("; ");
 
+/** Run `adb` (from PATH or the common SDK locations); returns its combined output. */
+function runAdb(args: string[]): { ok: boolean; output: string } {
+  const home = process.env.HOME ?? "";
+  const candidates = ["adb", "/opt/homebrew/bin/adb", "/usr/local/bin/adb", join(home, "Library/Android/sdk/platform-tools/adb"), join(home, "Android/Sdk/platform-tools/adb")];
+  for (const adb of candidates) {
+    try {
+      const r = Bun.spawnSync([adb, ...args], { stdout: "pipe", stderr: "pipe" });
+      const output = `${r.stdout.toString()}${r.stderr.toString()}`.trim();
+      return { ok: /connected to/i.test(output) && !/failed|cannot|unable/i.test(output), output: output || "(no output)" };
+    } catch {
+      /* not at this path — try the next */
+    }
+  }
+  return { ok: false, output: "adb not found on the server (install Android platform-tools)" };
+}
+
 /** Serve a file from the built web client; `/` → index.html. Returns null if not found. */
 async function serveWeb(pathname: string): Promise<Response | null> {
   const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
@@ -91,6 +107,18 @@ export function createServer(opts: ServerOptions): ServerHandle {
           budget: supervisor.budget(),
         };
         return Response.json(body);
+      }
+
+      // ADB wifi (Android client): connect the Mac to a phone's wireless-debugging endpoint
+      if (url.pathname === "/api/adb/connect" && req.method === "POST") {
+        try {
+          const { host, port } = (await req.json()) as { host?: string; port?: number };
+          if (!host || !port) return new Response("host and port required", { status: 400 });
+          const target = host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`; // IPv6 needs brackets
+          return Response.json(runAdb(["connect", target]));
+        } catch {
+          return new Response("bad request", { status: 400 });
+        }
       }
 
       // environment README (arch §8): rendered markdown for the settings/management view
