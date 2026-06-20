@@ -32,6 +32,9 @@ What's actually running today (branch `anvil-daemon`):
 Nearest-term candidates: (a) real push delivery, (b) make the web client an installable PWA,
 or (c) start the native clients. See §10.
 
+**Future direction:** a **multi-server fleet** (one client managing `anvild` on several Macs, one Max
+token across all) is designed in `anvil-multi-server.md` (status: design, not started).
+
 ---
 
 ## 1. Motivation
