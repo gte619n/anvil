@@ -2,6 +2,7 @@ plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
     id 'com.google.gms.google-services'
+    id 'com.google.firebase.appdistribution'
 }
 
 // Load local.properties for the daemon URL (overridable per machine; not committed)
@@ -49,6 +50,16 @@ android {
     buildFeatures {
         buildConfig true
     }
+}
+
+// Firebase App Distribution: `./gradlew :app:appDistributionUploadDebug` builds + emails the
+// debug APK to the testers below. Auth via the service-account key (needs the
+// "Firebase App Distribution Admin" role on that service account).
+firebaseAppDistribution {
+    appId = "1:1059574278871:android:f2a67ca798f942ade8de92"
+    serviceCredentialsFile = "${System.getProperty('user.home')}/.config/anvil/fcm-service-account.json"
+    testers = "evan.ruff@gmail.com"
+    releaseNotes = "Anvil Android shell — debug build."
 }
 
 dependencies {
