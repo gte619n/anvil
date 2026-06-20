@@ -168,7 +168,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 
 #conversation { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
 .empty-state { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 18px; color: var(--muted); text-align: center; }
-.empty-art { width: 132px; height: 132px; opacity: 0.9; }
+.empty-art { width: 172px; height: 172px; opacity: 0.3; filter: grayscale(1); }
 .empty-state p { margin: 0; font-size: 14px; }
 
 .thinking { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; align-self: flex-start; padding: 2px 0; }
