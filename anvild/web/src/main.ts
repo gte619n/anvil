@@ -684,21 +684,26 @@ function renderGit(): void {
   panelView = "git";
   setPanelTabs();
   const s = activeId ? sessions.get(activeId) : undefined;
+  const wt = s?.worktree;
   panelContent.innerHTML = `<div class="git-panel">
     <div class="git-status"><span id="git-status-text">${gitStatusLine(s)}</span>
       <button type="button" class="mini" id="git-refresh">↻</button>
       <button type="button" class="mini" id="git-view-diff">diff</button></div>
-    <label class="small muted">Commit message<textarea id="git-msg" rows="2" placeholder="describe the change"></textarea></label>
-    <div class="git-row"><button type="button" id="git-commit">Commit</button><button type="button" id="git-push">Push</button></div>
+    <div class="small muted git-worktree">${wt ? `worktree at <code>${esc(s!.cwd)}</code><br/>branched off <code>${esc(wt.base)}</code>` : esc(s?.cwd ?? "")}</div>
     <hr />
-    <label class="small muted">PR title<input id="git-pr-title" placeholder="${esc(s?.title ?? "")}" /></label>
-    <label class="small muted">PR body (optional)<textarea id="git-pr-body" rows="2"></textarea></label>
+    <div class="small muted">Ask Claude to…</div>
     <div class="git-row">
-      <button type="button" id="git-pr">Create PR</button>
-      <select id="git-merge-method"><option value="squash">squash</option><option value="merge">merge</option><option value="rebase">rebase</option></select>
-      <button type="button" id="git-merge">Merge PR</button>
+      <button type="button" id="ga-commit">Commit</button>
+      <button type="button" id="ga-push">Push</button>
+      <button type="button" id="ga-sync">Sync w/ main</button>
+    </div>
+    <label class="small muted">Notes for the commit / PR (optional)<textarea id="git-notes" rows="2"></textarea></label>
+    <div class="git-row">
+      <button type="button" id="ga-pr">Create PR</button>
+      <button type="button" id="ga-merge">Merge PR</button>
     </div>
     <hr />
+    <div class="small muted">Session</div>
     <div class="git-row">
       <button type="button" id="git-archive">${s?.archived ? "Unarchive" : "Archive"}</button>
       <button type="button" class="danger" id="git-delete">Delete session</button>
@@ -706,17 +711,28 @@ function renderGit(): void {
     <pre class="git-output" id="git-output"></pre>
   </div>`;
 
-  const op = (o: GitOp, extra: Record<string, unknown> = {}): void => {
+  // read-only info straight from the daemon (no side effects)
+  const info = (o: GitOp): void => {
     if (!activeId) return;
     setGitOutput(`running ${o}…`);
-    sock.send({ type: "git", sessionId: activeId, op: o, ...extra });
+    sock.send({ type: "git", sessionId: activeId, op: o });
   };
-  $("#git-refresh").onclick = () => op("status");
-  $("#git-view-diff").onclick = () => op("diff");
-  $("#git-commit").onclick = () => op("commit", { message: $<HTMLTextAreaElement>("#git-msg").value });
-  $("#git-push").onclick = () => op("push");
-  $("#git-pr").onclick = () => op("create-pr", { title: $<HTMLInputElement>("#git-pr-title").value, body: $<HTMLTextAreaElement>("#git-pr-body").value });
-  $("#git-merge").onclick = () => op("merge-pr", { method: $<HTMLSelectElement>("#git-merge-method").value });
+  // actions = instruct Claude, then jump to the conversation to watch it work
+  const ask = (instruction: string): void => {
+    if (!activeId) return;
+    const notes = $<HTMLTextAreaElement>("#git-notes").value.trim();
+    sock.send({ type: "prompt.send", sessionId: activeId, text: notes ? `${instruction}\n\nNotes: ${notes}` : instruction });
+    toast("Asked Claude →");
+    closePanel();
+  };
+
+  $("#git-refresh").onclick = () => info("status");
+  $("#git-view-diff").onclick = () => info("diff");
+  $("#ga-commit").onclick = () => ask("Stage and commit all current changes in this worktree with a clear, conventional commit message based on what changed.");
+  $("#ga-push").onclick = () => ask("Push the current branch to its origin remote (set the upstream with -u if it isn't set).");
+  $("#ga-sync").onclick = () => ask("Fetch origin and rebase this branch onto the latest upstream default branch (origin/main, or the repo's actual default). Flag any conflicts you can't safely resolve instead of forcing them.");
+  $("#ga-pr").onclick = () => ask("Create a GitHub pull request for the current branch using the gh CLI, with a concise title and a description summarizing the changes, then give me the PR URL.");
+  $("#ga-merge").onclick = () => ask("Merge the open pull request for this branch with `gh pr merge --squash --delete-branch`, and confirm when it's merged.");
   $("#git-archive").onclick = () => {
     if (!activeId) return;
     const archived = sessions.get(activeId)?.archived;
@@ -727,7 +743,7 @@ function renderGit(): void {
       sock.send({ type: "session.kill", sessionId: activeId });
     }
   };
-  op("status");
+  info("status");
 }
 function gitStatusLine(s: Session | undefined): string {
   const g = s?.git;
