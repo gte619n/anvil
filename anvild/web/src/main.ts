@@ -81,6 +81,8 @@ if (activeId) {
     conversation.innerHTML = cached;
     conversation.scrollTop = conversation.scrollHeight;
   }
+} else {
+  renderEmptyState();
 }
 
 // ── Theme (system default + persisted toggle) ────────────────────────────────
@@ -166,12 +168,8 @@ function onEvent(e: ServerEvent): void {
     case "session.deleted":
       sessions.delete(e.sessionId);
       localStorage.removeItem(`anvil.convo.${e.sessionId}`);
-      if (activeId === e.sessionId) {
-        activeId = null;
-        localStorage.removeItem("anvil.active");
-        clearConversation();
-      }
-      renderSessions();
+      if (activeId === e.sessionId) deselectSession();
+      else renderSessions();
       return;
     case "budget":
       renderBudget(e.budget);
@@ -330,6 +328,24 @@ function appendToolResult(content: string, isError: boolean): void {
 function clearConversation(): void {
   conversation.innerHTML = "";
   streaming = null;
+}
+const EMPTY_ART = `<svg class="empty-art" viewBox="0 0 200 130" width="150" height="98" aria-hidden="true" fill="currentColor">
+  <rect x="30" y="40" width="140" height="22" rx="6" />
+  <path d="M30 42 L8 51 L30 60 Z" />
+  <rect x="86" y="60" width="28" height="34" />
+  <rect x="54" y="92" width="92" height="16" rx="5" />
+</svg>`;
+function renderEmptyState(): void {
+  streaming = null;
+  conversation.innerHTML = `<div class="empty-state">${EMPTY_ART}<p>Select a session, or create a new one.</p></div>`;
+}
+/** No session selected: reset the title, show the empty state, drop the persisted active id. */
+function deselectSession(): void {
+  activeId = null;
+  localStorage.removeItem("anvil.active");
+  setHeaderTitle(undefined);
+  renderEmptyState();
+  renderSessions();
 }
 function setStatus(status: string): void {
   $("#status").textContent = status === "idle" ? "" : status.replace("_", " ") + "…";
@@ -815,6 +831,7 @@ async function abandonSession(): Promise<void> {
 function killSession(id: string): void {
   sock.send({ type: "session.kill", sessionId: id });
   if (panelView) closePanel();
+  if (activeId === id) deselectSession(); // don't wait for the (possibly slow) round-trip
 }
 /** Cleanup found outstanding work — offer to handle it first, or remove anyway. */
 function showOutstandingDialog(outstanding: string[]): void {
