@@ -55,9 +55,25 @@ conversation.addEventListener("scroll", () => {
 // ── State ────────────────────────────────────────────────────────────────────
 const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
-// a notification-click deep link (/?session=ID) wins over the last-active session
-let activeId: string | null = new URLSearchParams(location.search).get("session") || localStorage.getItem("anvil.active");
-if (location.search) history.replaceState({}, "", location.pathname);
+// URL routing: the active session lives in the hash (#s/<id>) so Back/Forward works and a
+// session is deep-linkable / openable in its own tab. A ?session= query (old push links) still works.
+const sessionFromHash = (): string | null => {
+  const m = location.hash.match(/^#s\/(.+)$/);
+  return m ? decodeURIComponent(m[1]!) : null;
+};
+const sessionHref = (id: string): string => `${location.pathname}#s/${encodeURIComponent(id)}`;
+function setSessionHash(id: string | null, push: boolean): void {
+  const url = id ? sessionHref(id) : location.pathname;
+  if (push) history.pushState({}, "", url);
+  else history.replaceState({}, "", url);
+}
+let activeId: string | null = sessionFromHash() || new URLSearchParams(location.search).get("session") || localStorage.getItem("anvil.active");
+setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
+window.addEventListener("popstate", () => {
+  const id = sessionFromHash();
+  if (id && sessions.has(id)) selectSession(id, false);
+  else deselectSession();
+});
 let streaming: HTMLElement | null = null;
 const snapshotLoaded = new Set<string>(); // sessions with a full snapshot loaded this page-load
 
@@ -476,6 +492,7 @@ function renderEmptyState(): void {
 function deselectSession(): void {
   activeId = null;
   localStorage.removeItem("anvil.active");
+  setSessionHash(null, false);
   setHeaderTitle(undefined);
   renderEmptyState();
   renderSessions();
@@ -524,8 +541,25 @@ function renderSessions(): void {
     const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
     const where = envName ?? s.git?.branch ?? s.source;
     const tag = s.archived ? "archived" : esc(s.status);
-    li.innerHTML = `<div class="title">${icon(sessIcon(s))}<span class="t">${esc(s.title)}</span></div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
-    li.onclick = () => selectSession(s.id);
+    const a = document.createElement("a");
+    a.className = "srow";
+    a.href = sessionHref(s.id);
+    a.innerHTML = `<div class="title">${icon(sessIcon(s))}<span class="t">${esc(s.title)}</span></div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
+    a.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
+      e.preventDefault();
+      selectSession(s.id);
+    });
+    const open = document.createElement("button");
+    open.className = "open-tab";
+    open.title = "Open in new tab";
+    open.innerHTML = icon("open_in_new");
+    open.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      window.open(sessionHref(s.id), "_blank");
+    });
+    li.append(a, open);
     ul.appendChild(li);
   }
 }
@@ -543,9 +577,10 @@ function renderBudget(b: Budget): void {
   el.classList.toggle("warn", b.warn);
   el.textContent = `Opus ${b.opus.usedHrs}/${b.opus.limitHrs}h · Sonnet ${b.sonnet.usedHrs}/${b.sonnet.limitHrs}h`;
 }
-function selectSession(id: string): void {
+function selectSession(id: string, push = true): void {
   activeId = id;
   localStorage.setItem("anvil.active", id);
+  setSessionHash(id, push); // reflect in the URL (history entry unless restoring via Back/Forward)
   stickToBottom = true; // a freshly opened session starts pinned to the latest
   clearConversation();
   const cached = localStorage.getItem(`anvil.convo.${id}`);

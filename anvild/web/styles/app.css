@@ -73,9 +73,13 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #new-session .msym { font-size: 18px; }
 #theme-toggle { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; }
 #session-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
-.session { padding: 8px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+.session { display: flex; align-items: center; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
 .session:hover { background: var(--bg); }
 .session.active { background: var(--bg); border-color: var(--accent); }
+.session .srow { flex: 1; min-width: 0; display: block; padding: 8px 10px; text-decoration: none; color: inherit; }
+.session .open-tab { display: none; background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px 8px; align-self: center; }
+.session .open-tab .msym { font-size: 16px; }
+.session:hover .open-tab, .session.active .open-tab { display: flex; }
 .session .title { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .session .title .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session .title .msym { font-size: 17px; color: var(--muted); flex-shrink: 0; }

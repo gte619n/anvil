@@ -36,7 +36,7 @@ self.addEventListener("notificationclick", (event) => {
           return c.focus();
         }
       }
-      return self.clients.openWindow(sessionId ? `/?session=${encodeURIComponent(sessionId)}` : "/");
+      return self.clients.openWindow(sessionId ? `/#s/${encodeURIComponent(sessionId)}` : "/");
     })(),
   );
 });
