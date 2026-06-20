@@ -66,7 +66,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); }
 .bubble .md { line-height: 1.55; }
 .bubble .md :first-child { margin-top: 0; }
 .bubble .md :last-child { margin-bottom: 0; }
-.bubble.assistant .stream { white-space: pre-wrap; font-family: inherit; margin: 0; }
+#quote-btn { position: absolute; z-index: 30; padding: 4px 10px; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-size: 12px; cursor: pointer; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
 .tool { font-size: 13px; color: var(--muted); margin: 6px 0; }
 .tool code { background: var(--tool-bg); padding: 1px 5px; border-radius: 5px; }
 .tool-result { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--tool-bg); padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; color: var(--muted); max-width: 760px; }

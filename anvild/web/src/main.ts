@@ -1,3 +1,4 @@
+import MarkdownIt from "markdown-it";
 import { AnvilSocket } from "./ws";
 import type {
   AttachmentRef,
@@ -172,18 +173,32 @@ function appendUser(html: string, attachments: AttachmentRef[] = []): void {
   }
   scrollDown();
 }
+// Lightweight client renderer for the in-flight turn (the daemon ships authoritative,
+// Shiki-highlighted HTML on assistant.message; this just makes streaming readable).
+const streamMd = new MarkdownIt({ html: false, linkify: true, typographer: true });
+let streamText = "";
+let streamRaf = 0;
+
 function appendDelta(text: string): void {
   if (!streaming) {
     streaming = bubble("assistant");
-    const pre = document.createElement("pre");
-    pre.className = "stream";
-    streaming.appendChild(pre);
+    streaming.innerHTML = '<div class="md"></div>';
+    streamText = "";
   }
-  const pre = streaming.querySelector(".stream");
-  if (pre) pre.textContent += text;
+  streamText += text;
+  if (!streamRaf) streamRaf = requestAnimationFrame(renderStream);
+}
+function renderStream(): void {
+  streamRaf = 0;
+  const md = streaming?.querySelector(".md");
+  if (md) md.innerHTML = streamMd.render(streamText);
   scrollDown();
 }
 function commitAssistant(blocks: ContentBlock[]): void {
+  if (streamRaf) {
+    cancelAnimationFrame(streamRaf);
+    streamRaf = 0;
+  }
   const b = streaming ?? bubble("assistant");
   b.innerHTML = "";
   const md = document.createElement("div");
@@ -192,6 +207,7 @@ function commitAssistant(blocks: ContentBlock[]): void {
   b.appendChild(md);
   void runMermaid(md);
   streaming = null;
+  streamText = "";
   scrollDown();
 }
 function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
@@ -355,6 +371,37 @@ composerEl.addEventListener("drop", (e) => {
   for (const f of Array.from((e as DragEvent).dataTransfer?.files ?? [])) {
     if (f.type.startsWith("image/")) void uploadAttachment(f);
   }
+});
+
+// ── Select-to-quote (highlight any message text → quote into the composer) ─────────
+const quoteBtn = document.createElement("button");
+quoteBtn.id = "quote-btn";
+quoteBtn.textContent = "❝ Quote";
+quoteBtn.style.display = "none";
+document.body.appendChild(quoteBtn);
+document.addEventListener("selectionchange", () => {
+  const sel = window.getSelection();
+  const text = sel?.toString().trim() ?? "";
+  const node = sel && sel.rangeCount > 0 ? sel.anchorNode : null;
+  const el = node ? (node.nodeType === 1 ? (node as Element) : node.parentElement) : null;
+  if (!text || !el?.closest("#conversation")) {
+    quoteBtn.style.display = "none";
+    return;
+  }
+  const rect = sel!.getRangeAt(0).getBoundingClientRect();
+  quoteBtn.style.display = "block";
+  quoteBtn.style.top = `${window.scrollY + rect.top - 36}px`;
+  quoteBtn.style.left = `${window.scrollX + rect.left}px`;
+});
+quoteBtn.addEventListener("mousedown", (e) => {
+  e.preventDefault(); // keep the selection alive through the click
+  const text = window.getSelection()?.toString().trim() ?? "";
+  if (!text) return;
+  const quoted = text.split("\n").map((l) => `> ${l}`).join("\n");
+  input.value = input.value ? `${quoted}\n\n${input.value}` : `${quoted}\n\n`;
+  input.focus();
+  quoteBtn.style.display = "none";
+  window.getSelection()?.removeAllRanges();
 });
 
 // ── Modals ─────────────────────────────────────────────────────────────────────
