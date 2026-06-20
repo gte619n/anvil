@@ -55,7 +55,10 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   width: 280px; flex: 0 0 280px; border-right: 1px solid var(--border);
   background: var(--panel); display: flex; flex-direction: column; padding: 12px; gap: 10px;
 }
-.side-head { display: flex; align-items: center; justify-content: space-between; }
+.side-head { display: flex; align-items: center; gap: 8px; }
+.side-head-spacer { flex: 1; }
+.icon-btn { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; display: inline-flex; }
+.icon-btn .msym { font-size: 20px; }
 .brand { font-weight: 700; font-size: 15px; letter-spacing: 0.3px; display: inline-flex; align-items: center; gap: 8px; }
 .brand-logo { width: 22px; height: 22px; display: block; }
 .theme-toggle { background: none; border: none; cursor: pointer; font-size: 16px; padding: 0; }

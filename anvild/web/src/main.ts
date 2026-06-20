@@ -128,11 +128,15 @@ function applySidebar(): void {
   $("#sidebar").classList.toggle("collapsed", sidebarCollapsed);
 }
 applySidebar();
-$("#btn-sidebar").addEventListener("click", () => {
+function toggleSidebar(): void {
   sidebarCollapsed = !sidebarCollapsed;
   localStorage.setItem("anvil.sidebar", sidebarCollapsed ? "collapsed" : "open");
   applySidebar();
-});
+}
+// both the header ☰ and an in-sidebar button toggle it — the in-sidebar one stays reachable
+// when the open sidebar overlays the header (e.g. unfolding a foldable).
+$("#btn-sidebar").addEventListener("click", toggleSidebar);
+$("#sidebar-collapse").addEventListener("click", toggleSidebar);
 
 const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 const sock = new AnvilSocket(wsUrl, onEvent, onStatus);
