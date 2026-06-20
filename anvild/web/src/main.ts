@@ -42,13 +42,41 @@ const scrollDown = () => {
 // ── State ────────────────────────────────────────────────────────────────────
 const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
-let activeId: string | null = null;
+let activeId: string | null = localStorage.getItem("anvil.active");
 let streaming: HTMLElement | null = null;
+const snapshotLoaded = new Set<string>(); // sessions with a full snapshot loaded this page-load
 
 const seqStore = {
   get: (id: string): number => Number(localStorage.getItem(`anvil.seq.${id}`) ?? 0),
   set: (id: string, seq: number): void => localStorage.setItem(`anvil.seq.${id}`, String(seq)),
 };
+
+// Cache the rendered conversation per session so it shows instantly on reload, before the WS
+// even connects. Best-effort (skipped if it exceeds the localStorage quota).
+let cacheTimer = 0;
+function saveConvoCache(): void {
+  const id = activeId;
+  if (!id) return;
+  clearTimeout(cacheTimer);
+  cacheTimer = window.setTimeout(() => {
+    try {
+      const html = conversation.innerHTML;
+      if (html.length < 1_500_000) localStorage.setItem(`anvil.convo.${id}`, html);
+      else localStorage.removeItem(`anvil.convo.${id}`);
+    } catch {
+      /* quota exceeded — the snapshot still loads from the daemon */
+    }
+  }, 600);
+}
+
+// instant restore: paint the cached conversation immediately on load
+if (activeId) {
+  const cached = localStorage.getItem(`anvil.convo.${activeId}`);
+  if (cached) {
+    conversation.innerHTML = cached;
+    conversation.scrollTop = conversation.scrollHeight;
+  }
+}
 
 // ── Theme (system default + persisted toggle) ────────────────────────────────
 function currentTheme(): "light" | "dark" {
@@ -89,9 +117,7 @@ function onStatus(status: "connecting" | "connected" | "disconnected"): void {
   const el = $("#conn");
   el.textContent = status;
   el.className = `conn ${status}`;
-  if (status === "connected" && activeId) {
-    sock.send({ type: "session.attach", sessionId: activeId, lastSeq: seqStore.get(activeId) });
-  }
+  // (re)attach happens in the session.list handler, which the daemon sends on every connect.
 }
 
 // ── Event routing ──────────────────────────────────────────────────────────────
@@ -102,6 +128,20 @@ function onEvent(e: ServerEvent): void {
     case "session.list":
       e.sessions.forEach((s) => sessions.set(s.id, s));
       renderSessions();
+      if (activeId && sessions.has(activeId)) {
+        $("#header-title").textContent = sessions.get(activeId)!.title;
+        // first attach this page-load → full snapshot (DOM was reloaded); a later reconnect
+        // (DOM intact) → resume only new events from the watermark.
+        if (snapshotLoaded.has(activeId)) {
+          sock.send({ type: "session.attach", sessionId: activeId, lastSeq: seqStore.get(activeId) });
+        } else {
+          sock.send({ type: "session.attach", sessionId: activeId });
+        }
+      } else if (activeId) {
+        activeId = null; // the remembered session is gone
+        localStorage.removeItem("anvil.active");
+        clearConversation();
+      }
       return;
     case "session.created":
       sessions.set(e.session.id, e.session);
@@ -114,8 +154,10 @@ function onEvent(e: ServerEvent): void {
       return;
     case "session.deleted":
       sessions.delete(e.sessionId);
+      localStorage.removeItem(`anvil.convo.${e.sessionId}`);
       if (activeId === e.sessionId) {
         activeId = null;
+        localStorage.removeItem("anvil.active");
         clearConversation();
       }
       renderSessions();
@@ -151,6 +193,8 @@ function handleSessionEvent(e: ServerEvent): void {
     case "conversation.snapshot":
       clearConversation();
       e.events.forEach(renderConversationEvent);
+      snapshotLoaded.add(e.sessionId);
+      saveConvoCache();
       return;
     case "message.user":
       appendUser(e.rendered.html, e.attachments);
@@ -170,6 +214,7 @@ function handleSessionEvent(e: ServerEvent): void {
     case "result":
       setStatus("idle");
       streaming = null;
+      saveConvoCache();
       return;
     case "permission.request":
       showPermission(e.requestId, e.tool, e.input, e.suggestions);
@@ -219,6 +264,7 @@ function appendUser(html: string, attachments: AttachmentRef[] = []): void {
     }
   }
   scrollDown();
+  saveConvoCache();
 }
 // Lightweight client renderer for the in-flight turn (the daemon ships authoritative,
 // Shiki-highlighted HTML on assistant.message; this just makes streaming readable).
@@ -330,11 +376,18 @@ function renderBudget(b: Budget): void {
 }
 function selectSession(id: string): void {
   activeId = id;
+  localStorage.setItem("anvil.active", id);
   clearConversation();
+  const cached = localStorage.getItem(`anvil.convo.${id}`);
+  if (cached) {
+    conversation.innerHTML = cached; // instant, replaced by the snapshot below
+    scrollDown();
+  }
   renderSessions();
   const s = sessions.get(id);
   $("#header-title").textContent = s?.title ?? "Anvil";
-  sock.send({ type: "session.attach", sessionId: id, lastSeq: seqStore.get(id) });
+  snapshotLoaded.delete(id);
+  sock.send({ type: "session.attach", sessionId: id }); // full snapshot (always show history)
   if (isNarrow() && !sidebarCollapsed) {
     sidebarCollapsed = true;
     applySidebar(); // on a phone, get out of the way once you've picked a session
