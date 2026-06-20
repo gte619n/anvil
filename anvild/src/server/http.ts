@@ -143,6 +143,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
           return new Response("bad subscription", { status: 400 });
         }
       }
+      if (url.pathname === "/api/push/fcm/register" && req.method === "POST") {
+        try {
+          const { token } = (await req.json()) as { token?: string };
+          if (token) supervisor.fcm.register(token);
+          return Response.json({ ok: true });
+        } catch {
+          return new Response("bad request", { status: 400 });
+        }
+      }
+      if (url.pathname === "/api/push/fcm/unregister" && req.method === "POST") {
+        try {
+          const { token } = (await req.json()) as { token?: string };
+          if (token) supervisor.fcm.unregister(token);
+          return Response.json({ ok: true });
+        } catch {
+          return new Response("bad request", { status: 400 });
+        }
+      }
       if (url.pathname === "/api/push/unsubscribe" && req.method === "POST") {
         try {
           const { endpoint } = (await req.json()) as { endpoint?: string };

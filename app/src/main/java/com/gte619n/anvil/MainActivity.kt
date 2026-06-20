@@ -1,8 +1,11 @@
 package com.gte619n.anvil
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
 import android.webkit.PermissionRequest
@@ -20,6 +23,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import com.google.firebase.messaging.FirebaseMessaging
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -32,6 +36,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var web: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private val adbWifi by lazy { AdbWifi(this) }
+
+    private val notifPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* result ignored */ }
 
     private val fileChooser =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -120,8 +127,32 @@ class MainActivity : ComponentActivity() {
             }
         })
 
-        if (savedInstanceState == null) web.loadUrl(BuildConfig.ANVIL_BASE_URL) else web.restoreState(savedInstanceState)
+        // Push (FCM): notification channel, runtime permission, and register this device's token.
+        Notifications.ensureChannel(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+            Net.postJson(BuildConfig.ANVIL_BASE_URL, "/api/push/fcm/register", JSONObject().put("token", token))
+        }
+
+        if (savedInstanceState != null) {
+            web.restoreState(savedInstanceState)
+        } else {
+            val sessionId = intent?.getStringExtra("sessionId") // notification-tap deep link
+            web.loadUrl(if (sessionId != null) sessionUrl(sessionId) else BuildConfig.ANVIL_BASE_URL)
+        }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra("sessionId")?.let { web.loadUrl(sessionUrl(it)) }
+    }
+
+    private fun sessionUrl(sessionId: String): String = "${BuildConfig.ANVIL_BASE_URL}#s/${Uri.encode(sessionId)}"
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)

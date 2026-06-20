@@ -37,7 +37,8 @@ import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
 import { pickIcon } from "../agent/icon";
-import { WebPush } from "../push/webpush";
+import { WebPush, type PushPayload } from "../push/webpush";
+import { Fcm } from "../push/fcm";
 
 /** A client command that can't be honored (bad args, no such session). → command.error. */
 export class BadCommand extends Error {}
@@ -67,6 +68,7 @@ export class Supervisor {
   private readonly envStore: EnvironmentStore;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
+  readonly fcm: Fcm;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
@@ -74,6 +76,7 @@ export class Supervisor {
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
+    this.fcm = new Fcm(cfg.stateDir);
     this.budgetTracker = new BudgetTracker({
       stateDir: cfg.stateDir,
       warnFraction: cfg.warnFraction ?? 0.8,
@@ -512,10 +515,12 @@ export class Supervisor {
   /** Push a notification on the events that mean "your turn" (arch §6.7). */
   private maybeNotify(sessionId: string, event: ServerEvent): void {
     const title = this.sessions.get(sessionId)?.data.title ?? "Anvil";
-    if (event.type === "permission.request") {
-      void this.webpush.notify({ title, body: `Needs approval: ${event.tool}`, sessionId, tag: `perm-${sessionId}` });
-    } else if (event.type === "result") {
-      void this.webpush.notify({ title, body: "Claude finished — your turn.", sessionId, tag: `done-${sessionId}` });
+    let payload: PushPayload | undefined;
+    if (event.type === "permission.request") payload = { title, body: `Needs approval: ${event.tool}`, sessionId, tag: `perm-${sessionId}` };
+    else if (event.type === "result") payload = { title, body: "Claude finished — your turn.", sessionId, tag: `done-${sessionId}` };
+    if (payload) {
+      void this.webpush.notify(payload); // desktop browsers
+      void this.fcm.notify(payload); // Android client
     }
   }
 
