@@ -58,6 +58,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 #header-title { font-weight: 600; }
+#header-left { display: flex; align-items: center; gap: 10px; }
 #header-actions { display: flex; align-items: center; gap: 8px; }
 #status { font-size: 12px; color: var(--accent); }
 .hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
@@ -143,7 +144,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1c2024; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
 #toast.show { opacity: 1; }
 
+#sidebar.collapsed { display: none; }
+
 @media (max-width: 720px) {
-  #sidebar { position: absolute; z-index: 5; height: 100%; transform: translateX(-100%); transition: transform .2s; }
-  #sidebar.open { transform: none; }
+  /* on narrow screens the sidebar overlays the conversation instead of squishing it */
+  #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
 }

@@ -65,6 +65,21 @@ $("#theme-toggle").addEventListener("click", () => {
   localStorage.setItem("anvil.theme", next);
 });
 
+// ── Sidebar collapse ─────────────────────────────────────────────────────────────
+const isNarrow = (): boolean => matchMedia("(max-width: 720px)").matches;
+let sidebarCollapsed =
+  localStorage.getItem("anvil.sidebar") === "collapsed" ||
+  (localStorage.getItem("anvil.sidebar") === null && isNarrow());
+function applySidebar(): void {
+  $("#sidebar").classList.toggle("collapsed", sidebarCollapsed);
+}
+applySidebar();
+$("#btn-sidebar").addEventListener("click", () => {
+  sidebarCollapsed = !sidebarCollapsed;
+  localStorage.setItem("anvil.sidebar", sidebarCollapsed ? "collapsed" : "open");
+  applySidebar();
+});
+
 const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 const sock = new AnvilSocket(wsUrl, onEvent, onStatus);
 sock.connect();
@@ -320,6 +335,10 @@ function selectSession(id: string): void {
   const s = sessions.get(id);
   $("#header-title").textContent = s?.title ?? "Anvil";
   sock.send({ type: "session.attach", sessionId: id, lastSeq: seqStore.get(id) });
+  if (isNarrow() && !sidebarCollapsed) {
+    sidebarCollapsed = true;
+    applySidebar(); // on a phone, get out of the way once you've picked a session
+  }
   // reset the side panel for the new session's worktree
   filesPath = "";
   readerPath = "";
