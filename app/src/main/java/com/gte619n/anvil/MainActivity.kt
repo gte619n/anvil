@@ -17,9 +17,11 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -49,6 +51,7 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
         web = WebView(this).apply {
@@ -94,6 +97,10 @@ class MainActivity : ComponentActivity() {
             }
         }
         setContentView(web)
+        // The status/nav-bar strips show the WebView background (brand color) with light icons,
+        // so app content never sits under the notification bar.
+        web.setBackgroundColor(0xFF2F2739.toInt())
+        WindowInsetsControllerCompat(window, web).isAppearanceLightStatusBars = false
 
         // Native bridge: the web app (Settings) posts {type:"adb.connect"} → we discover the
         // wireless-debugging endpoint and tell the daemon to `adb connect`, then reply.
@@ -111,10 +118,11 @@ class MainActivity : ComponentActivity() {
         // targetSdk 35 forces edge-to-edge; pad the WebView by the system bars + keyboard so the
         // composer rides above the keyboard and content clears the status/nav bars.
         ViewCompat.setOnApplyWindowInsetsListener(web) { v, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime() or WindowInsetsCompat.Type.displayCutout())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }
+        ViewCompat.requestApplyInsets(web)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
