@@ -40,9 +40,18 @@ const slugify = (s: string): string =>
 const icon = (name: string): string => `<span class="msym">${name}</span>`;
 const sessIcon = (s: Session): string => s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder");
 const conversation = $("#conversation");
-const scrollDown = () => {
-  conversation.scrollTop = conversation.scrollHeight;
+// Scroll lock: only auto-follow new content when the user is already at the bottom.
+let stickToBottom = true;
+const scrollDown = (force = false): void => {
+  if (force) stickToBottom = true;
+  if (stickToBottom) conversation.scrollTop = conversation.scrollHeight;
 };
+conversation.addEventListener("scroll", () => {
+  const dist = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
+  stickToBottom = dist < 60; // within 60px of the bottom counts as "following"
+  const btn = document.getElementById("scroll-bottom");
+  if (btn) (btn as HTMLElement).hidden = stickToBottom;
+});
 
 // ── State ────────────────────────────────────────────────────────────────────
 const sessions = new Map<string, Session>();
@@ -183,6 +192,12 @@ async function toggleNotify(): Promise<void> {
   void refreshBell();
 }
 void initPush();
+
+$("#scroll-bottom").addEventListener("click", () => {
+  stickToBottom = true;
+  conversation.scrollTop = conversation.scrollHeight;
+  $("#scroll-bottom").hidden = true;
+});
 
 // ── Connection status ────────────────────────────────────────────────────────
 function onStatus(status: "connecting" | "connected" | "disconnected"): void {
@@ -527,6 +542,7 @@ function renderBudget(b: Budget): void {
 function selectSession(id: string): void {
   activeId = id;
   localStorage.setItem("anvil.active", id);
+  stickToBottom = true; // a freshly opened session starts pinned to the latest
   clearConversation();
   const cached = localStorage.getItem(`anvil.convo.${id}`);
   if (cached) {
