@@ -184,7 +184,7 @@ $("#btn-sidebar").addEventListener("click", toggleSidebar);
 $("#sidebar-collapse").addEventListener("click", toggleSidebar);
 
 const sock = new AnvilSocket(wsUrl(), onEvent, onStatus);
-sock.connect();
+// sock.connect() is called after the outbox state below is declared (onStatus reads it).
 
 // ── Outbox: writes made offline are queued and flushed, in order, on reconnect (arch §8) ──────
 interface OutboxItem {
@@ -305,6 +305,7 @@ function updateOutboxBadge(): void {
   const retry = document.getElementById("offline-retry");
   if (retry) retry.onclick = () => sock.connectNow();
 }
+sock.connect(); // start connecting now that the outbox state onStatus reads is initialized
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
