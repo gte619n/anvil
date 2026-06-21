@@ -35,7 +35,15 @@ export class EventLog {
 
   append(event: ServerEvent): void {
     if (SKIP_PERSIST.has(event.type)) return;
-    appendFileSync(this.file, `${JSON.stringify(event)}\n`);
+    try {
+      appendFileSync(this.file, `${JSON.stringify(event)}\n`);
+    } catch (e) {
+      // A killed session's dir is removed while its agent turn may still be draining (driver.stop
+      // can't synchronously halt an in-flight consume()). A late emit then targets a gone file —
+      // dropping it is correct (the session is dead). MUST NOT throw: this runs inside emit(), off
+      // the async turn loop, so an uncaught ENOENT here would crash the whole daemon (all sessions).
+      if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") throw e;
+    }
   }
 
   private readAll(): ServerEvent[] {
