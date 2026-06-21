@@ -1,11 +1,17 @@
 /** Build the web client into web/dist. Run: bun run build:web */
-import { cpSync, mkdirSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 const root = import.meta.dir; // anvild/web
 const dist = join(root, "dist");
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });
+
+// Version shown next to the brand. The native build passes APP_VERSION (the APK's versionName),
+// so bumping the app version surfaces the same number in the UI; the PWA falls back to the
+// daemon package.json version.
+const pkgVersion = (JSON.parse(readFileSync(join(root, "../package.json"), "utf8")) as { version: string }).version;
+const appVersion = process.env.APP_VERSION || pkgVersion;
 
 const result = await Bun.build({
   entrypoints: [join(root, "src/main.ts")],
@@ -15,6 +21,7 @@ const result = await Bun.build({
   splitting: true, // mermaid loads as a lazy chunk
   minify: true,
   sourcemap: "linked",
+  define: { __APP_VERSION__: JSON.stringify(appVersion) },
 });
 if (!result.success) {
   for (const log of result.logs) console.error(log);

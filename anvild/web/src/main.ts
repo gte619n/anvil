@@ -32,12 +32,18 @@ import type {
   Session,
 } from "../../protocol";
 
+// App version, replaced at build time (native: the APK versionName; PWA: package.json version).
+declare const __APP_VERSION__: string;
+
 // ── DOM helpers ──────────────────────────────────────────────────────────────
 const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => document.querySelector(sel) as T;
 const esc = (s: string): string => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
 const slugify = (s: string): string =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 const icon = (name: string): string => `<span class="msym">${name}</span>`;
+
+// Show the build version next to the brand so it's obvious which app/bundle is running.
+$("#brand-version").textContent = `v${__APP_VERSION__}`;
 const sessIcon = (s: Session): string => (s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder"));
 const conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
@@ -947,8 +953,25 @@ const input = $<HTMLTextAreaElement>("#input");
 const pendingAttachments: { id: string; name: string; dataUrl: string }[] = [];
 const attachRow = $("#attach-row");
 
+// Uploads are async (read file → POST → push to pendingAttachments). If the user sends text
+// before an image upload lands, the attachment id wouldn't be in pendingAttachments yet and the
+// image would be silently dropped. Track in-flight uploads so send() can wait for them.
+let uploadsInFlight = 0;
+const uploadWaiters: Array<() => void> = [];
+function uploadsSettled(): Promise<void> {
+  return uploadsInFlight === 0 ? Promise.resolve() : new Promise((resolve) => uploadWaiters.push(resolve));
+}
+
 $<HTMLFormElement>("#composer").addEventListener("submit", (e) => {
   e.preventDefault();
+  void sendComposer();
+});
+async function sendComposer(): Promise<void> {
+  // Never send ahead of an image that's still uploading — wait for it to land first.
+  if (uploadsInFlight > 0) {
+    toast("Finishing image upload…");
+    await uploadsSettled();
+  }
   const text = input.value;
   if (!activeId || (!text.trim() && pendingAttachments.length === 0)) return;
   const s = sessions.get(activeId);
@@ -965,7 +988,7 @@ $<HTMLFormElement>("#composer").addEventListener("submit", (e) => {
   renderAttachRow();
   autoGrow();
   updateSendState();
-});
+}
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -988,11 +1011,19 @@ function updateSendState(): void {
 const fileInput = $<HTMLInputElement>("#file-input");
 $("#btn-attach").addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
-  for (const f of Array.from(fileInput.files ?? [])) {
-    if (f.type.startsWith("image/")) void uploadAttachment(f);
-  }
+  attachImageFiles(Array.from(fileInput.files ?? []));
   fileInput.value = "";
 });
+
+/** Upload the image files; tell the user about any non-image files we dropped (only images are supported). */
+function attachImageFiles(files: File[]): void {
+  let skipped = 0;
+  for (const f of files) {
+    if (f.type.startsWith("image/")) void uploadAttachment(f);
+    else skipped++;
+  }
+  if (skipped) toast(skipped === 1 ? "Only images can be attached" : `Skipped ${skipped} non-image files`);
+}
 
 function renderAttachRow(): void {
   attachRow.innerHTML = "";
@@ -1013,14 +1044,16 @@ async function uploadAttachment(file: File): Promise<void> {
     toast("Open a session first");
     return;
   }
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result));
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(file);
-  });
-  const base64 = dataUrl.split(",")[1] ?? "";
+  uploadsInFlight++;
+  updateSendState();
   try {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+    const base64 = dataUrl.split(",")[1] ?? "";
     const res = await apiFetch(`/api/sessions/${activeId}/attachments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1035,6 +1068,10 @@ async function uploadAttachment(file: File): Promise<void> {
     renderAttachRow();
   } catch {
     toast("Upload failed");
+  } finally {
+    uploadsInFlight--;
+    if (uploadsInFlight === 0) for (const resolve of uploadWaiters.splice(0)) resolve();
+    updateSendState();
   }
 }
 input.addEventListener("paste", (e) => {
@@ -1052,9 +1089,7 @@ const composerEl = $("#composer");
 composerEl.addEventListener("dragover", (e) => e.preventDefault());
 composerEl.addEventListener("drop", (e) => {
   e.preventDefault();
-  for (const f of Array.from((e as DragEvent).dataTransfer?.files ?? [])) {
-    if (f.type.startsWith("image/")) void uploadAttachment(f);
-  }
+  attachImageFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []));
 });
 
 // ── Select-to-quote (highlight any message text → quote into the composer) ─────────
