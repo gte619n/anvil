@@ -1,3 +1,4 @@
+Sources/Anvil/web/
 .build/
 .swiftpm/
 DerivedData/

@@ -10,7 +10,7 @@ enum AppConfig {
 
 struct ContentView: View {
     var body: some View {
-        WebView(url: AppConfig.baseURL)
+        WebView(daemonURL: AppConfig.baseURL)
             .ignoresSafeArea()
     }
 }
