@@ -13,6 +13,7 @@ import android.widget.FrameLayout
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -20,11 +21,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.JavaScriptReplyProxy
+import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.google.firebase.messaging.FirebaseMessaging
@@ -40,7 +41,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var web: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private val adbWifi by lazy { AdbWifi(this) }
-    private var webReady = false
 
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* result ignored */ }
@@ -54,10 +54,15 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
-        val splash = installSplashScreen() // brand icon until the web app is ready (no white flash)
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        splash.setKeepOnScreenCondition { !webReady }
+
+        // Serve the bundled web client from assets/web over a secure local origin. The UI shell +
+        // fonts always load offline; only the daemon data connection (WS/REST over Tailscale) needs
+        // the network, and the web app degrades gracefully when it's down.
+        val assetLoader = WebViewAssetLoader.Builder()
+            .addPathHandler("/", AssetsWebHandler(this))
+            .build()
 
         web = WebView(this).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -72,20 +77,25 @@ class MainActivity : ComponentActivity() {
                 mediaPlaybackRequiresUserGesture = false
                 allowFileAccess = false
                 allowContentAccess = false
-                cacheMode = android.webkit.WebSettings.LOAD_DEFAULT // HTTP cache + service worker
+                cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
             }
-            setBackgroundColor(0xFF2F2739.toInt())
+            setBackgroundColor(themeBackground())
             webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+                    assetLoader.shouldInterceptRequest(request.url)
+
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val host = request.url.host ?: return false
-                    if (host == BASE_HOST) return false // keep our origin in the app
-                    startActivity(Intent(Intent.ACTION_VIEW, request.url)) // external links → browser
+                    if (host == ASSET_HOST) return false // our bundled UI stays in the app
+                    startActivity(Intent(Intent.ACTION_VIEW, request.url)) // external/daemon links → browser
                     return true
                 }
-
-                override fun onPageFinished(view: WebView, url: String) {
-                    webReady = true // dismiss the splash once the shell is loaded
-                }
+            }
+            // Inject the daemon URL before any page script runs, so the bundled UI knows where the
+            // daemon is (the page itself is served locally, not from the daemon).
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                val js = "window.ANVIL_DAEMON_URL=${JSONObject.quote(BuildConfig.ANVIL_BASE_URL)};"
+                WebViewCompat.addDocumentStartJavaScript(this, js, setOf("https://$ASSET_HOST"))
             }
             webChromeClient = object : WebChromeClient() {
                 override fun onShowFileChooser(
@@ -107,30 +117,24 @@ class MainActivity : ComponentActivity() {
                 override fun onPermissionRequest(request: PermissionRequest) = request.deny()
             }
         }
-        // Root container painted the brand color; padding it by the system bars physically insets
-        // the WebView child, so app content never sits under the status/nav bars. The strips show
-        // the brand color, with light status-bar icons.
-        val root = FrameLayout(this).apply { setBackgroundColor(0xFF2F2739.toInt()) }
+        // Root painted with the theme-correct background (no white flash; correct dark/light from
+        // the first frame). Padding it by the system bars physically insets the WebView so app
+        // content never sits under the status/nav bars.
+        val root = FrameLayout(this).apply { setBackgroundColor(themeBackground()) }
         root.addView(web)
         setContentView(root)
-        WindowInsetsControllerCompat(window, root).isAppearanceLightStatusBars = false
+        WindowInsetsControllerCompat(window, root).isAppearanceLightStatusBars = !isDark()
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime() or WindowInsetsCompat.Type.displayCutout())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             WindowInsetsCompat.CONSUMED
         }
         ViewCompat.requestApplyInsets(root)
-        root.postDelayed({ webReady = true }, 5_000) // safety: never hang on the splash
 
-        // Native bridge: the web app (Settings) posts {type:"adb.connect"} → we discover the
+        // Native bridge: the bundled UI posts {type:"adb.connect"} → we discover the
         // wireless-debugging endpoint and tell the daemon to `adb connect`, then reply.
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-            val uri = Uri.parse(BuildConfig.ANVIL_BASE_URL)
-            val origin = buildString {
-                append(uri.scheme).append("://").append(uri.host)
-                if (uri.port != -1) append(":").append(uri.port)
-            }
-            WebViewCompat.addWebMessageListener(web, "AnvilNative", setOf(origin)) { _, message, _, _, replyProxy ->
+            WebViewCompat.addWebMessageListener(web, "AnvilNative", setOf("https://$ASSET_HOST")) { _, message, _, _, replyProxy ->
                 handleBridge(message.data ?: "", replyProxy)
             }
         }
@@ -161,9 +165,15 @@ class MainActivity : ComponentActivity() {
             web.restoreState(savedInstanceState)
         } else {
             val sessionId = intent?.getStringExtra("sessionId") // notification-tap deep link
-            web.loadUrl(if (sessionId != null) sessionUrl(sessionId) else BuildConfig.ANVIL_BASE_URL)
+            web.loadUrl(if (sessionId != null) sessionUrl(sessionId) else APP_URL)
         }
     }
+
+    private fun isDark(): Boolean =
+        resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+    private fun themeBackground(): Int = if (isDark()) 0xFF1A1B1E.toInt() else 0xFFFFFFFF.toInt()
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -171,7 +181,7 @@ class MainActivity : ComponentActivity() {
         intent.getStringExtra("sessionId")?.let { web.loadUrl(sessionUrl(it)) }
     }
 
-    private fun sessionUrl(sessionId: String): String = "${BuildConfig.ANVIL_BASE_URL}#s/${Uri.encode(sessionId)}"
+    private fun sessionUrl(sessionId: String): String = "$APP_URL#s/${Uri.encode(sessionId)}"
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
@@ -250,6 +260,36 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
-        val BASE_HOST: String? = Uri.parse(BuildConfig.ANVIL_BASE_URL).host
+        const val ASSET_HOST = "appassets.androidplatform.net" // WebViewAssetLoader's secure origin
+        const val APP_URL = "https://$ASSET_HOST/index.html"
+    }
+}
+
+/** Serves the bundled web client from assets/web/ (so "/" → assets/web/index.html, "/main.js" →
+ *  assets/web/main.js). Lets the UI use absolute paths while living under an assets subdir. */
+private class AssetsWebHandler(context: android.content.Context) : WebViewAssetLoader.PathHandler {
+    private val assets = context.assets
+    override fun handle(path: String): WebResourceResponse? {
+        val rel = "web/" + path.removePrefix("/").ifEmpty { "index.html" }
+        return try {
+            val mime = guessMime(rel)
+            WebResourceResponse(mime, null, assets.open(rel))
+        } catch (_: java.io.FileNotFoundException) {
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun guessMime(p: String): String = when (p.substringAfterLast('.', "")) {
+        "html" -> "text/html"
+        "js", "mjs" -> "text/javascript"
+        "css" -> "text/css"
+        "json", "map" -> "application/json"
+        "svg" -> "image/svg+xml"
+        "woff2" -> "font/woff2"
+        "png" -> "image/png"
+        "wasm" -> "application/wasm"
+        else -> "application/octet-stream"
     }
 }

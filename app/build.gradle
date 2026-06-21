@@ -52,6 +52,21 @@ android {
     }
 }
 
+// Bundle the web client into app assets (built + native-prepped with local fonts) before every
+// build, so the UI loads offline from the app and never depends on the network/CDN.
+def anvild = "${rootDir}/anvild"
+tasks.register("bundleWebAssets", Exec) {
+    workingDir anvild
+    def out = "${projectDir}/src/main/assets/web"
+    commandLine "bash", "-lc", "bun run build:web && bun run web/bundle-native.ts '${out}'"
+    inputs.dir("${anvild}/web/src")
+    inputs.file("${anvild}/web/index.html")
+    outputs.dir(out)
+}
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn "bundleWebAssets"
+}
+
 // Firebase App Distribution: `./gradlew :app:appDistributionUploadDebug` builds + emails the
 // debug APK to the testers below. Auth via the service-account key (needs the
 // "Firebase App Distribution Admin" role on that service account).
@@ -64,7 +79,6 @@ firebaseAppDistribution {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.15.0'
-    implementation 'androidx.core:core-splashscreen:1.0.1'
     implementation 'androidx.activity:activity-ktx:1.10.0'
     implementation 'androidx.webkit:webkit:1.12.1'
     implementation 'com.google.android.material:material:1.12.0'

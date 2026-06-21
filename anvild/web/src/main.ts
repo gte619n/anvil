@@ -2,6 +2,7 @@ import MarkdownIt from "markdown-it";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
+import { apiFetch, apiUrl, wsUrl } from "./api";
 
 const strToB64 = (s: string): string => {
   const bytes = new TextEncoder().encode(s);
@@ -154,9 +155,23 @@ function toggleSidebar(): void {
 $("#btn-sidebar").addEventListener("click", toggleSidebar);
 $("#sidebar-collapse").addEventListener("click", toggleSidebar);
 
-const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
-const sock = new AnvilSocket(wsUrl, onEvent, onStatus);
+const sock = new AnvilSocket(wsUrl(), onEvent, onStatus);
 sock.connect();
+
+// Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
+const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
+if (nativeBridge) {
+  nativeBridge.onmessage = (e) => {
+    try {
+      const r = JSON.parse(e.data) as { ok?: boolean; message?: string };
+      const out = document.getElementById("adb-output");
+      if (out) out.textContent = `${r.ok ? "✓ " : "⚠ "}${r.message ?? ""}`;
+      else toast(r.message ?? "done");
+    } catch {
+      /* ignore */
+    }
+  };
+}
 
 // ── Web Push (arch §6.7) ──────────────────────────────────────────────────────────
 let swReg: ServiceWorkerRegistration | null = null;
@@ -169,6 +184,7 @@ function urlB64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return arr;
 }
 async function initPush(): Promise<void> {
+  if (nativeBridge) return; // native shells use platform push (FCM/APNs), not web push / service worker
   if (!pushSupported) return; // unsupported (e.g. iOS Safari until installed as a PWA)
   const bell = $("#btn-notify");
   bell.hidden = false;
@@ -195,7 +211,7 @@ async function toggleNotify(): Promise<void> {
   if (!swReg) return;
   const existing = await swReg.pushManager.getSubscription();
   if (existing) {
-    await fetch("/api/push/unsubscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: existing.endpoint }) });
+    await apiFetch("/api/push/unsubscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: existing.endpoint }) });
     await existing.unsubscribe();
     toast("Notifications off");
   } else {
@@ -203,9 +219,9 @@ async function toggleNotify(): Promise<void> {
       toast("Notifications blocked in browser settings");
       return;
     }
-    const { publicKey } = (await (await fetch("/api/push/key")).json()) as { publicKey: string };
+    const { publicKey } = (await (await apiFetch("/api/push/key")).json()) as { publicKey: string };
     const sub = await swReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToBytes(publicKey) });
-    await fetch("/api/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(sub) });
+    await apiFetch("/api/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(sub) });
     toast("Notifications on");
   }
   void refreshBell();
@@ -217,21 +233,6 @@ $("#scroll-bottom").addEventListener("click", () => {
   conversation.scrollTop = conversation.scrollHeight;
   $("#scroll-bottom").hidden = true;
 });
-
-// Native Android shell bridge (present only inside the app): ADB-wifi connect, etc.
-const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
-if (nativeBridge) {
-  nativeBridge.onmessage = (e) => {
-    try {
-      const r = JSON.parse(e.data) as { ok?: boolean; message?: string };
-      const out = document.getElementById("adb-output");
-      if (out) out.textContent = `${r.ok ? "✓ " : "⚠ "}${r.message ?? ""}`;
-      else toast(r.message ?? "done");
-    } catch {
-      /* ignore */
-    }
-  };
-}
 
 // ── Connection status ────────────────────────────────────────────────────────
 function onStatus(status: "connecting" | "connected" | "disconnected"): void {
@@ -390,7 +391,7 @@ function appendUser(html: string, attachments: AttachmentRef[] = []): void {
     if (att.kind === "image" && activeId) {
       const img = document.createElement("img");
       img.className = "att-img";
-      img.src = `/api/sessions/${activeId}/attachments/${att.id}`;
+      img.src = apiUrl(`/api/sessions/${activeId}/attachments/${att.id}`);
       b.appendChild(img);
     }
   }
@@ -621,12 +622,13 @@ function closeSettings(): void {
 async function renderServerCards(): Promise<void> {
   const host = $("#server-cards");
   try {
-    const h = (await (await fetch("/api/health")).json()) as { serverName?: string; version?: string; budget?: Budget };
+    const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string; budget?: Budget };
     const b = h.budget;
     const budgetLine = b ? `Opus ${b.opus.usedHrs.toFixed(1)}/${b.opus.limitHrs}h · Sonnet ${b.sonnet.usedHrs.toFixed(1)}/${b.sonnet.limitHrs}h` : "";
+    const daemonHost = new URL(apiUrl("/")).host;
     host.innerHTML = `<div class="card server-card">
-      <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? location.host)}</b> <span class="small muted">(this server)</span></div>
-      <div class="small muted"><code>${esc(location.host)}</code> · anvild ${esc(h.version ?? "?")}</div>
+      <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? daemonHost)}</b> <span class="small muted">(this server)</span></div>
+      <div class="small muted"><code>${esc(daemonHost)}</code> · anvild ${esc(h.version ?? "?")}</div>
       <div class="small muted">${esc(budgetLine)}</div>
     </div>
     <p class="small muted">Multi-server (managing anvild on your other Macs from here) is on the roadmap — see the fleet design.</p>`;
@@ -664,7 +666,7 @@ async function renderServerCards(): Promise<void> {
       setOut("Pairing… (keep the pairing dialog open on the phone)");
       nativeBridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
     });
-    void fetch("/api/adb/info")
+    void apiFetch("/api/adb/info")
       .then((r) => r.json())
       .then((d: { serverIps?: string[]; devices?: string }) => {
         const el = document.getElementById("adb-info");
@@ -712,7 +714,7 @@ async function toggleReadme(id: string): Promise<void> {
   if (body.hidden || readmeLoaded.has(id)) return;
   body.innerHTML = `<p class="small muted">Loading README…</p>`;
   try {
-    const r = (await (await fetch(`/api/environments/${encodeURIComponent(id)}/readme`)).json()) as { markdown?: { html: string }; text?: string; missing?: boolean };
+    const r = (await (await apiFetch(`/api/environments/${encodeURIComponent(id)}/readme`)).json()) as { markdown?: { html: string }; text?: string; missing?: boolean };
     if (r.missing) body.innerHTML = `<p class="small muted">No README found in this repo.</p>`;
     else if (r.markdown) {
       body.innerHTML = `<div class="md reader-md">${r.markdown.html}</div>`;
@@ -826,7 +828,7 @@ async function uploadAttachment(file: File): Promise<void> {
   });
   const base64 = dataUrl.split(",")[1] ?? "";
   try {
-    const res = await fetch(`/api/sessions/${activeId}/attachments`, {
+    const res = await apiFetch(`/api/sessions/${activeId}/attachments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: file.name || "pasted-image.png", mediaType: file.type || "image/png", dataBase64: base64 }),
@@ -1023,8 +1025,9 @@ function renderReader(content: FileContent): void {
   } else if (content.text !== undefined) {
     panelContent.innerHTML = head + `<pre class="reader-text">${esc(content.text)}</pre>` + (content.truncated ? '<p class="muted small">(truncated)</p>' : "");
   } else if (content.binaryUrl) {
+    const burl = apiUrl(content.binaryUrl); // daemon-relative → absolute (bundled native shells)
     panelContent.innerHTML =
-      head + (content.mime.startsWith("image/") ? `<img src="${content.binaryUrl}" style="max-width:100%" />` : `<a href="${content.binaryUrl}" target="_blank">Open ${esc(content.path)}</a>`);
+      head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank">Open ${esc(content.path)}</a>`);
   }
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };

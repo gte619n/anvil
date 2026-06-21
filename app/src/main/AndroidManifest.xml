@@ -17,7 +17,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.App.Starting"
+            android:theme="@style/Theme.ZellijConnect"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="keyboard|keyboardHidden|screenSize|smallestScreenSize|screenLayout|orientation|density|uiMode"
             android:launchMode="singleTask">
