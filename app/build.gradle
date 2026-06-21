@@ -20,8 +20,8 @@ android {
         applicationId "com.gte619n.anvil"
         minSdk 33
         targetSdk 35
-        versionCode 5
-        versionName "2.0.0"
+        versionCode 6
+        versionName "2.0.1"
 
         // The Anvil web client URL this shell loads (Tailscale HTTPS by default).
         buildConfigField "String", "ANVIL_BASE_URL",
@@ -74,7 +74,7 @@ firebaseAppDistribution {
     appId = "1:1059574278871:android:f2a67ca798f942ade8de92"
     serviceCredentialsFile = "${System.getProperty('user.home')}/.config/anvil/fcm-service-account.json"
     testers = "evan.ruff@gmail.com"
-    releaseNotes = "Anvil Android shell — debug build."
+    releaseNotes = "v2.0.1 — Back button now closes the open dialog/menu/settings/panel and returns to the previous screen instead of exiting the app. Includes latest permission-approval and session-stability fixes."
 }
 
 dependencies {

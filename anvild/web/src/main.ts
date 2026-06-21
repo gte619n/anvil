@@ -87,18 +87,64 @@ const sessionFromHash = (): string | null => {
   const m = location.hash.match(/^#s\/(.+)$/);
   return m ? decodeURIComponent(m[1]!) : null;
 };
+
+// ── Back-stack: device/browser Back dismisses the top UI layer before leaving ─────────
+// Modals/dialogs, the settings view, the side panel and the (mobile) expanded sidebar are
+// all "soft" layers. Each pushes a history entry when it opens, so Back has somewhere to go
+// instead of exiting the app: Android routes the device button through web.goBack(), macOS
+// uses the swipe gesture, the PWA/browser uses its own Back — all surface as `popstate`,
+// which closes the topmost layer. Each entry records how many layers were open (`anvilDepth`)
+// so a single popstate can unwind to exactly the right place.
+type OverlayName = "modal" | "settings" | "panel" | "sidebar";
+interface Overlay {
+  name: OverlayName;
+  close: () => void; // pure DOM/state teardown — must NOT touch history itself
+}
+const overlays: Overlay[] = [];
+let suppressPop = 0; // popstates from our own dismissOverlay() unwind — teardown already done
+const overlayOpen = (name: OverlayName): boolean => overlays.some((o) => o.name === name);
+function openOverlay(name: OverlayName, close: () => void): void {
+  if (overlayOpen(name)) return; // already open (e.g. swapping a modal's contents in place)
+  overlays.push({ name, close });
+  history.pushState({ anvilDepth: overlays.length }, ""); // keep the current URL (session hash)
+}
+/** Programmatically dismiss `name` and anything stacked above it (Cancel / X / backdrop). Tears
+ *  down synchronously, then unwinds our own history entries (the resulting popstate is swallowed
+ *  by the guard). Closing layers via the device/browser Back goes through popstate directly. */
+function dismissOverlay(name: OverlayName): void {
+  const idx = overlays.map((o) => o.name).lastIndexOf(name);
+  if (idx < 0) return; // already gone — keeps redundant/double closes harmless
+  const n = overlays.length - idx;
+  for (let i = 0; i < n; i++) overlays.pop()!.close();
+  suppressPop++;
+  history.go(-n); // drop our history entries; the one popstate this fires is suppressed below
+}
+
 const sessionHref = (id: string): string => `${location.pathname}#s/${encodeURIComponent(id)}`;
 function setSessionHash(id: string | null, push: boolean): void {
   const url = id ? sessionHref(id) : location.pathname;
-  if (push) history.pushState({}, "", url);
-  else history.replaceState({}, "", url);
+  const state = { anvilDepth: overlays.length };
+  if (push) history.pushState(state, "", url);
+  else history.replaceState(state, "", url);
 }
 let activeId: string | null = sessionFromHash() || new URLSearchParams(location.search).get("session") || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
 window.addEventListener("popstate", () => {
+  if (suppressPop > 0) {
+    suppressPop--; // our own dismissOverlay() unwind — the layer is already torn down
+    return;
+  }
+  // Device/browser Back: close every layer stacked above the depth we landed on (dialogs/menus/
+  // panels dismiss before we navigate sessions or leave the app).
+  const depth = typeof (history.state as { anvilDepth?: number } | null)?.anvilDepth === "number" ? (history.state as { anvilDepth: number }).anvilDepth : 0;
+  while (overlays.length > depth) overlays.pop()!.close();
+  // Then reflect the session hash (Back/Forward between sessions, then out of the app).
   const id = sessionFromHash();
-  if (id && sessions.has(id)) selectSession(id, false);
-  else deselectSession();
+  if (id && sessions.has(id)) {
+    if (id !== activeId) selectSession(id, false);
+  } else if (activeId) {
+    deselectSession();
+  }
 });
 let streaming: HTMLElement | null = null;
 const snapshotLoaded = new Set<string>(); // sessions with a full snapshot loaded this page-load
@@ -177,6 +223,11 @@ function toggleSidebar(): void {
   sidebarCollapsed = !sidebarCollapsed;
   localStorage.setItem("anvil.sidebar", sidebarCollapsed ? "collapsed" : "open");
   applySidebar();
+  // On a phone the open sidebar overlays the conversation — make Back close it.
+  if (isNarrow()) {
+    if (!sidebarCollapsed) openOverlay("sidebar", () => { sidebarCollapsed = true; applySidebar(); });
+    else dismissOverlay("sidebar");
+  }
 }
 // both the header ☰ and an in-sidebar button toggle it — the in-sidebar one stays reachable
 // when the open sidebar overlays the header (e.g. unfolding a foldable).
@@ -796,11 +847,13 @@ function openSettings(): void {
       </section>
     </div>
   </div>`;
-  $("#settings-close").addEventListener("click", closeSettings);
+  $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
+  openOverlay("settings", closeSettings); // Back closes Settings (no-op if it's already a layer)
   renderServerCards();
   renderEnvCards();
 }
+/** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
   $("#settings-root").innerHTML = "";
 }
@@ -916,9 +969,16 @@ function renderBudget(b: Budget): void {
   el.textContent = `Opus ${b.opus.usedHrs}/${b.opus.limitHrs}h · Sonnet ${b.sonnet.usedHrs}/${b.sonnet.limitHrs}h`;
 }
 function selectSession(id: string, push = true): void {
+  // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
+  // the session (replace, don't push) so Back stays balanced.
+  let reuseSidebarEntry = false;
+  if (push && isNarrow() && overlayOpen("sidebar")) {
+    overlays.pop(); // drop the sidebar layer; the collapse happens below
+    reuseSidebarEntry = true;
+  }
   activeId = id;
   localStorage.setItem("anvil.active", id);
-  setSessionHash(id, push); // reflect in the URL (history entry unless restoring via Back/Forward)
+  setSessionHash(id, push && !reuseSidebarEntry); // reflect in the URL (history entry unless restoring via Back/Forward)
   stickToBottom = true; // a freshly opened session starts pinned to the latest
   clearConversation();
   const cached = localStorage.getItem(`anvil.convo.${id}`);
@@ -1120,13 +1180,15 @@ function openPanel(view: "files" | "reader" | "git" | "terminal"): void {
   if (view !== "terminal") disposeTerminal();
   panelView = view;
   panel.classList.add("open");
+  openOverlay("panel", closePanelDom); // Back closes the panel (no-op if it's already a layer)
   setPanelTabs();
   if (view === "files") requestFiles(filesPath);
   else if (view === "reader" && !readerPath) requestFiles(filesPath);
   else if (view === "git") renderGit();
   else if (view === "terminal") mountTerminal();
 }
-function closePanel(): void {
+/** Tear down the panel (DOM/state only). Reached via Back (popstate) or closePanel(). */
+function closePanelDom(): void {
   if (readerWatch && activeId) sock.send({ type: "fs.unwatch", sessionId: activeId, path: readerWatch });
   readerWatch = "";
   disposeTerminal();
@@ -1134,6 +1196,7 @@ function closePanel(): void {
   panel.classList.remove("open");
   setPanelTabs();
 }
+const closePanel = (): void => dismissOverlay("panel"); // programmatic close → unwind the back-stack
 function mountTerminal(): void {
   disposeTerminal();
   panelContent.innerHTML = '<div id="term-host" style="height:100%;width:100%"></div>';
@@ -1198,6 +1261,7 @@ function openFile(path: string): void {
   if (!activeId) return;
   disposeTerminal();
   panel.classList.add("open"); // a file link may open the reader while the panel is closed
+  openOverlay("panel", closePanelDom); // Back closes it (no-op if the panel is already a layer)
   readerPath = path;
   panelView = "reader";
   setPanelTabs();
@@ -1381,7 +1445,6 @@ function killSession(id: string): void {
 function showOutstandingDialog(outstanding: string[]): void {
   const s = activeId ? sessions.get(activeId) : undefined;
   const pr = s?.git?.prState;
-  const root = $("#modal-root");
   const m = document.createElement("div");
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>${icon("warning")} Outstanding work</h3>
@@ -1395,18 +1458,17 @@ function showOutstandingDialog(outstanding: string[]): void {
     </div>
     <div class="btns"><button type="button" class="danger" id="od-remove">${icon("delete_forever")} Remove anyway</button><span style="flex:1"></span><button type="button" id="od-cancel">Cancel</button></div>
   </div>`;
-  root.innerHTML = "";
-  root.appendChild(m);
+  showModal(m);
   const handle = (t: string) => {
-    root.innerHTML = "";
+    closeModal();
     askClaude(t);
   };
   $<HTMLButtonElement>("#od-commit").onclick = () => handle(STAGE_PROMPT.commit);
   $<HTMLButtonElement>("#od-push").onclick = () => handle(STAGE_PROMPT.push);
   $<HTMLButtonElement>("#od-pr").onclick = () => handle(pr === "open" ? STAGE_PROMPT.merge : STAGE_PROMPT.pr);
-  $<HTMLButtonElement>("#od-cancel").onclick = () => (root.innerHTML = "");
+  $<HTMLButtonElement>("#od-cancel").onclick = () => closeModal();
   $<HTMLButtonElement>("#od-remove").onclick = () => {
-    root.innerHTML = "";
+    closeModal();
     if (activeId) killSession(activeId); // "Remove anyway" — the listed outstanding work IS the warning
   };
 }
@@ -1434,10 +1496,20 @@ const browse = { path: "", parent: undefined as string | undefined };
 $("#new-session").addEventListener("click", showNewSession);
 $("#open-settings").addEventListener("click", openSettings);
 
-const closeModal = (): void => {
+/** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so
+ *  Back/Cancel dismisses it. Swapping one modal's contents for another reuses the same layer. */
+function showModal(el: HTMLElement): void {
+  const root = $("#modal-root");
+  root.innerHTML = "";
+  root.appendChild(el);
+  openOverlay("modal", closeModalDom); // no-op if a modal layer is already open (content swap)
+}
+/** Tear down the modal (DOM/state only). Reached via Back (popstate) or closeModal(). */
+function closeModalDom(): void {
   onDirs = null;
   $("#modal-root").innerHTML = "";
-};
+}
+const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
 const MODEL_AUTONOMY = `<div class="row">
   <label>Model<select id="ns-model"><option value="opus">Opus</option><option value="sonnet">Sonnet</option></select></label>
   <label>Autonomy<select id="ns-auto"><option value="mostly-autonomous">Mostly autonomous</option><option value="allowlist">Allowlist</option><option value="prompt-all">Prompt all</option></select></label>
@@ -1473,7 +1545,6 @@ function wireBrowser(): void {
 
 /** Primary flow: pick an environment + name → fresh worktree. */
 function showNewSession(): void {
-  const root = $("#modal-root");
   const envs = [...environments.values()];
   const m = document.createElement("div");
   m.className = "modal";
@@ -1493,15 +1564,17 @@ function showNewSession(): void {
       <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-create">Create</button></div>
       <p class="small muted"><a id="ns-manage" href="#">⚙ Manage environments…</a> · <a id="ns-oneoff" href="#">one-off folder…</a></p></div>`;
   }
-  root.innerHTML = "";
-  root.appendChild(m);
+  showModal(m);
   onDirs = null; // this modal has no browser
 
   document.getElementById("ns-cancel")?.addEventListener("click", closeModal);
   document.getElementById("ns-manage")?.addEventListener("click", (e) => {
     e.preventDefault();
-    closeModal();
-    openSettings();
+    // Swap the modal for the Settings view in place, reusing this back-stack entry (so we don't
+    // race an async history unwind against a fresh push).
+    closeModalDom();
+    if (overlays.length) overlays[overlays.length - 1] = { name: "settings", close: closeSettings };
+    openSettings(); // builds the DOM; its openOverlay("settings") is now a no-op
   });
   document.getElementById("ns-oneoff")?.addEventListener("click", (e) => {
     e.preventDefault();
@@ -1587,7 +1660,6 @@ function createOfflineSession(cmd: Record<string, unknown> & { type: string }, e
 
 /** Register a project repo as an environment. */
 function showAddEnvironment(): void {
-  const root = $("#modal-root");
   const m = document.createElement("div");
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>Add environment</h3>
@@ -1596,8 +1668,7 @@ function showAddEnvironment(): void {
     <p class="small muted">Pick a project <b>git repository</b> (environments must be git repos):</p>
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
-  root.innerHTML = "";
-  root.appendChild(m);
+  showModal(m);
   wireBrowser();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
   $<HTMLButtonElement>("#ae-save").onclick = () => {
@@ -1613,7 +1684,6 @@ function showAddEnvironment(): void {
 function showEditEnvironment(id: string): void {
   const env = environments.get(id);
   if (!env) return;
-  const root = $("#modal-root");
   const m = document.createElement("div");
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
@@ -1621,8 +1691,7 @@ function showEditEnvironment(id: string): void {
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
-  root.innerHTML = "";
-  root.appendChild(m);
+  showModal(m);
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
     sock.send({ type: "env.update", id, name: $<HTMLInputElement>("#ee-name").value, defaultBase: $<HTMLInputElement>("#ee-base").value });
@@ -1645,7 +1714,6 @@ function showEditEnvironment(id: string): void {
 
 /** One-off: work directly in a folder, no worktree. */
 function showOneOff(): void {
-  const root = $("#modal-root");
   const m = document.createElement("div");
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>One-off session</h3>
@@ -1653,8 +1721,7 @@ function showOneOff(): void {
     ${browserMarkup()}
     ${MODEL_AUTONOMY}
     <div class="btns"><button type="button" id="oo-back">Back</button><button type="button" id="oo-create">Open here</button></div></div>`;
-  root.innerHTML = "";
-  root.appendChild(m);
+  showModal(m);
   wireBrowser();
   $<HTMLButtonElement>("#oo-back").onclick = () => showNewSession();
   $<HTMLButtonElement>("#oo-create").onclick = () => {
@@ -1730,7 +1797,6 @@ function toast(msg: string): void {
 /** Themed replacement for window.confirm — resolves true if confirmed. */
 function confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean> {
   return new Promise((resolve) => {
-    const root = $("#modal-root");
     const m = document.createElement("div");
     m.className = "modal";
     m.innerHTML = `<div class="modal-box">
@@ -1738,10 +1804,9 @@ function confirmDialog(opts: { title: string; body?: string; confirmLabel?: stri
       ${opts.body ? `<p class="small muted">${esc(opts.body)}</p>` : ""}
       <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
     </div>`;
-    root.innerHTML = "";
-    root.appendChild(m);
+    showModal(m);
     const done = (v: boolean): void => {
-      root.innerHTML = "";
+      closeModal();
       resolve(v);
     };
     $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
