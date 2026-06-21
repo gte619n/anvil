@@ -101,12 +101,47 @@ export function createServer(opts: ServerOptions): ServerHandle {
     registry,
   );
 
+  // The bundled native clients serve their UI from a local origin and call the daemon's REST API
+  // cross-origin, so /api/* needs permissive CORS. (The daemon is Tailscale-gated; no cookies are
+  // used, so `*` is safe.) The PWA is same-origin and unaffected.
+  const CORS: Record<string, string> = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+  };
+
+  const WS = {
+    open(ws: ServerWebSocket<ConnState>) {
+      registry.add(ws);
+      ws.send(JSON.stringify(supervisor.sessionListEvent()));
+      ws.send(JSON.stringify(supervisor.budgetEvent()));
+      ws.send(JSON.stringify(supervisor.environmentsEvent()));
+    },
+    close(ws: ServerWebSocket<ConnState>) {
+      registry.remove(ws);
+    },
+    message(ws: ServerWebSocket<ConnState>, message: string | Buffer) {
+      const raw = typeof message === "string" ? message : message.toString("utf8");
+      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry });
+    },
+  };
+
   const server = Bun.serve<ConnState>({
     hostname: opts.host ?? "127.0.0.1",
     port: opts.port,
     async fetch(req, srv) {
       const url = new URL(req.url);
+      const isApi = url.pathname.startsWith("/api/");
+      if (isApi && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+      const res = await handle(req, srv, url);
+      if (isApi && res) for (const [k, v] of Object.entries(CORS)) res.headers.set(k, v);
+      return res;
+    },
+    websocket: WS,
+  });
 
+  async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
       if (req.method === "GET" && url.pathname === "/api/health") {
         const auth = checkAuth();
         const body: rest.HealthResponse = {
@@ -242,23 +277,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (web) return web;
 
       return new Response("not found", { status: 404 });
-    },
-    websocket: {
-      open(ws: ServerWebSocket<ConnState>) {
-        registry.add(ws);
-        ws.send(JSON.stringify(supervisor.sessionListEvent()));
-        ws.send(JSON.stringify(supervisor.budgetEvent()));
-        ws.send(JSON.stringify(supervisor.environmentsEvent()));
-      },
-      close(ws: ServerWebSocket<ConnState>) {
-        registry.remove(ws);
-      },
-      message(ws: ServerWebSocket<ConnState>, message: string | Buffer) {
-        const raw = typeof message === "string" ? message : message.toString("utf8");
-        dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry });
-      },
-    },
-  });
+  }
 
   return {
     port: server.port ?? opts.port,
