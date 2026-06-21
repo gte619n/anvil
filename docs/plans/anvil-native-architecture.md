@@ -26,8 +26,12 @@ What's actually running today (branch `anvil-daemon`):
   (`web-push`), service worker, a notify-toggle bell, and pushes on permission requests + turn
   completion (SW suppresses if a window is focused; click deep-links to the session). FCM/APNs
   for *native* clients still pending.
-- ❌ **Native clients** — Android (Compose), Mac/iPhone (SwiftUI) not started. The web client
-  currently fills the "daily driver" role the native Android app was meant to.
+- ✅ **Android client** — hybrid: a Kotlin WebView shell (`app/`, com.gte619n.anvil) hosting the
+  web client over Tailscale + native modules: ADB-over-Tailscale (mDNS discover → connect/pair),
+  FCM push, offline app-shell cache + splash, brand icon. Distributed via Firebase App Distribution.
+- 🚧 **Apple clients** — hybrid, macOS first (`apple/`): SwiftUI + WKWebView shell (compiles;
+  XcodeGen project + brand icon). iOS + APNs pending an Apple Developer account. (Decision: hybrid,
+  not the full-native impl-5 rewrite, matching Android.)
 
 Nearest-term candidates: (a) real push delivery, (b) make the web client an installable PWA,
 or (c) start the native clients. See §10.
