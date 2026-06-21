@@ -7,14 +7,24 @@ type StatusHandler = (status: "connecting" | "connected" | "disconnected") => vo
 export class AnvilSocket {
   private ws: WebSocket | undefined;
   private backoff = 500;
+  private reconnectTimer = 0;
 
   constructor(
     private readonly url: string,
     private readonly onEvent: EventHandler,
     private readonly onStatus: StatusHandler,
-  ) {}
+  ) {
+    // Reconnect promptly when the device/network comes back, instead of waiting out the backoff.
+    if (typeof window !== "undefined") {
+      window.addEventListener("online", () => this.connectNow());
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") this.connectNow();
+      });
+    }
+  }
 
   connect(): void {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     this.onStatus("connecting");
     const ws = new WebSocket(this.url);
     this.ws = ws;
@@ -31,7 +41,8 @@ export class AnvilSocket {
     };
     ws.onclose = () => {
       this.onStatus("disconnected");
-      setTimeout(() => this.connect(), this.backoff);
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = window.setTimeout(() => this.connect(), this.backoff);
       this.backoff = Math.min(this.backoff * 2, 15000);
     };
     ws.onerror = () => {
@@ -43,9 +54,22 @@ export class AnvilSocket {
     };
   }
 
-  /** Send a client command; the envelope (v, ts) is stamped here. */
-  send(cmd: Record<string, unknown> & { type: string }): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+  /** Force an immediate reconnect attempt (e.g. user tapped Retry, or the network returned). */
+  connectNow(): void {
+    if (this.isOpen()) return;
+    clearTimeout(this.reconnectTimer);
+    this.backoff = 500;
+    this.connect();
+  }
+
+  isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  /** Send a client command; the envelope (v, ts) is stamped here. Returns false if not connected. */
+  send(cmd: Record<string, unknown> & { type: string }): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
     this.ws.send(JSON.stringify({ v: PROTOCOL_VERSION, ts: new Date().toISOString(), ...cmd }));
+    return true;
   }
 }

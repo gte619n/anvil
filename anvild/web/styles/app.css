@@ -165,6 +165,18 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .git-output { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 11px; background: var(--panel); padding: 8px; border-radius: 8px; max-height: 260px; overflow: auto; margin: 0; }
 .git-output a { color: var(--accent); }
 .session.archived { opacity: 0.55; }
+.session.pending .title .msym { color: var(--warn); }
+
+/* Offline / queued status banner under the header */
+.offline-banner { display: flex; align-items: center; gap: 8px; padding: 6px 14px; font-size: 13px; background: var(--warn-bg, #4a3f1e); color: var(--warn, #e0b341); border-bottom: 1px solid var(--border); }
+.offline-banner[hidden] { display: none; }
+.offline-banner .msym { font-size: 18px; }
+.offline-banner button { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; background: none; border: 1px solid currentColor; color: inherit; border-radius: 6px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
+
+/* Optimistic (queued-offline) user bubble */
+.bubble.user.queued { opacity: 0.8; }
+.queued-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--muted); margin-top: 4px; }
+.queued-badge .msym { font-size: 13px; }
 
 #conversation { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
 .empty-state { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 18px; color: var(--muted); text-align: center; }

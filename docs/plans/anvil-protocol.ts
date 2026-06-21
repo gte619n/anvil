@@ -131,6 +131,7 @@ export interface PoolUsage {
 export interface Session {
   id: SessionId;
   title: string;
+  pending?: boolean; // client-only: created offline, not yet realized on the daemon (never set by the server)
   icon?: string; // Material Symbols name chosen by Sonnet from the session title (arch §5)
   environmentId?: string; // the Environment this session was created from, if any
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted

@@ -38,7 +38,7 @@ const esc = (s: string): string => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "
 const slugify = (s: string): string =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 const icon = (name: string): string => `<span class="msym">${name}</span>`;
-const sessIcon = (s: Session): string => s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder");
+const sessIcon = (s: Session): string => (s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder"));
 const conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
 let stickToBottom = true;
@@ -56,6 +56,31 @@ conversation.addEventListener("scroll", () => {
 // ── State ────────────────────────────────────────────────────────────────────
 const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
+
+// Offline cache (arch §8): persist the session + environment lists so they're browsable with no
+// connection. Hydrated synchronously below, kept in sync on every change.
+function persistSessions(): void {
+  try {
+    localStorage.setItem("anvil.sessions", JSON.stringify([...sessions.values()]));
+  } catch {
+    /* quota */
+  }
+}
+function persistEnvironments(): void {
+  try {
+    localStorage.setItem("anvil.environments", JSON.stringify([...environments.values()]));
+  } catch {
+    /* quota */
+  }
+}
+(function hydrateOffline() {
+  try {
+    for (const s of JSON.parse(localStorage.getItem("anvil.sessions") ?? "[]") as Session[]) sessions.set(s.id, s);
+    for (const e of JSON.parse(localStorage.getItem("anvil.environments") ?? "[]") as Environment[]) environments.set(e.id, e);
+  } catch {
+    /* corrupt cache — start empty, the daemon repopulates on connect */
+  }
+})();
 // URL routing: the active session lives in the hash (#s/<id>) so Back/Forward works and a
 // session is deep-linkable / openable in its own tab. A ?session= query (old push links) still works.
 const sessionFromHash = (): string | null => {
@@ -105,8 +130,11 @@ function saveConvoCache(): void {
   }, 600);
 }
 
-// instant restore: paint the cached conversation immediately on load
+// instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
+// fully offline; the daemon refreshes everything once the WS connects).
+renderSessions();
 if (activeId) {
+  if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
   const cached = localStorage.getItem(`anvil.convo.${activeId}`);
   if (cached) {
     conversation.innerHTML = cached;
@@ -157,6 +185,126 @@ $("#sidebar-collapse").addEventListener("click", toggleSidebar);
 
 const sock = new AnvilSocket(wsUrl(), onEvent, onStatus);
 sock.connect();
+
+// ── Outbox: writes made offline are queued and flushed, in order, on reconnect (arch §8) ──────
+interface OutboxItem {
+  cid: string;
+  cmd: Record<string, unknown> & { type: string };
+  tempId?: string; // for session.create: the optimistic local session id to reconcile
+}
+const newCid = (): string => (crypto.randomUUID ? crypto.randomUUID() : `c_${Date.now()}_${Math.floor(Math.random() * 1e9)}`);
+let outbox: OutboxItem[] = (() => {
+  try {
+    return JSON.parse(localStorage.getItem("anvil.outbox") ?? "[]") as OutboxItem[];
+  } catch {
+    return [];
+  }
+})();
+const saveOutbox = (): void => {
+  try {
+    localStorage.setItem("anvil.outbox", JSON.stringify(outbox));
+  } catch {
+    /* quota */
+  }
+};
+function enqueue(item: OutboxItem): void {
+  outbox.push(item);
+  saveOutbox();
+  updateOutboxBadge();
+}
+const cidWaiters = new Map<string, (e: ServerEvent) => void>();
+function sendAwait(cmd: Record<string, unknown> & { type: string; cid: string }): Promise<ServerEvent> {
+  return new Promise((resolve, reject) => {
+    const t = window.setTimeout(() => {
+      cidWaiters.delete(cmd.cid);
+      reject(new Error("timeout"));
+    }, 20_000);
+    cidWaiters.set(cmd.cid, (e) => {
+      clearTimeout(t);
+      resolve(e);
+    });
+    if (!sock.send(cmd)) {
+      clearTimeout(t);
+      cidWaiters.delete(cmd.cid);
+      reject(new Error("offline"));
+    }
+  });
+}
+const tempMap = new Map<string, string>(); // optimistic id → real id
+let flushing = false;
+async function flushOutbox(): Promise<void> {
+  if (flushing || !sock.isOpen()) return;
+  flushing = true;
+  let touchedActive = false;
+  try {
+    while (outbox.length && sock.isOpen()) {
+      const item = outbox[0]!;
+      const sid = item.cmd.sessionId as string | undefined;
+      if (sid && tempMap.has(sid)) item.cmd.sessionId = tempMap.get(sid); // rewrite temp → real
+      if (sid === activeId || item.cmd.sessionId === activeId) touchedActive = true;
+      try {
+        const res = await sendAwait({ ...item.cmd, cid: item.cid });
+        if (res.type === "command.error") {
+          toast(`Queued ${item.cmd.type} failed: ${res.message}`);
+          if (item.tempId) failTemp(item.tempId);
+        } else if (item.tempId && res.type === "session.created") {
+          tempMap.set(item.tempId, res.session.id);
+          reconcileTemp(item.tempId, res.session.id);
+          if (activeId === res.session.id) touchedActive = true;
+        }
+      } catch {
+        break; // disconnected/timeout mid-flush — retry on next connect
+      }
+      outbox.shift();
+      saveOutbox();
+    }
+  } finally {
+    flushing = false;
+    updateOutboxBadge();
+    // re-pull authoritative history for the active session so optimistic bubbles are replaced
+    if (touchedActive && activeId && sock.isOpen()) {
+      snapshotLoaded.delete(activeId);
+      sock.send({ type: "session.attach", sessionId: activeId });
+    }
+  }
+}
+/** A created-offline session was realized on the daemon: migrate its cache + active selection. */
+function reconcileTemp(tempId: string, realId: string): void {
+  const conv = localStorage.getItem(`anvil.convo.${tempId}`);
+  if (conv) localStorage.setItem(`anvil.convo.${realId}`, conv);
+  localStorage.removeItem(`anvil.convo.${tempId}`);
+  sessions.delete(tempId);
+  if (activeId === tempId) {
+    activeId = realId;
+    localStorage.setItem("anvil.active", realId);
+    setSessionHash(realId, false);
+    setHeaderTitle(sessions.get(realId));
+  }
+  persistSessions();
+  renderSessions();
+}
+/** A queued create was rejected: drop the pending session + its queued prompts. */
+function failTemp(tempId: string): void {
+  sessions.delete(tempId);
+  localStorage.removeItem(`anvil.convo.${tempId}`);
+  outbox = outbox.filter((i) => i.cmd.sessionId !== tempId && i.tempId !== tempId);
+  saveOutbox();
+  persistSessions();
+  if (activeId === tempId) deselectSession();
+  else renderSessions();
+}
+function updateOutboxBadge(): void {
+  const el = document.getElementById("offline-banner");
+  if (!el) return;
+  const queued = outbox.length;
+  const online = sock.isOpen();
+  el.hidden = online && queued === 0;
+  el.innerHTML = online
+    ? `${icon("sync")} Syncing ${queued} queued change${queued === 1 ? "" : "s"}…`
+    : `${icon("cloud_off")} Offline${queued ? ` · ${queued} change${queued === 1 ? "" : "s"} queued` : ""} <button id="offline-retry" class="mini">${icon("refresh")} Retry</button>`;
+  const retry = document.getElementById("offline-retry");
+  if (retry) retry.onclick = () => sock.connectNow();
+}
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
@@ -227,6 +375,7 @@ async function toggleNotify(): Promise<void> {
   void refreshBell();
 }
 void initPush();
+updateOutboxBadge(); // reflect any queued-offline writes on load
 
 $("#scroll-bottom").addEventListener("click", () => {
   stickToBottom = true;
@@ -239,16 +388,26 @@ function onStatus(status: "connecting" | "connected" | "disconnected"): void {
   const dot = $("#conn-dot");
   dot.className = `conn-dot ${status}`;
   dot.title = status === "connected" ? "Connected" : status === "connecting" ? "Connecting…" : "Disconnected";
+  updateOutboxBadge();
+  if (status === "connected") void flushOutbox(); // push anything queued while offline
   // (re)attach happens in the session.list handler, which the daemon sends on every connect.
 }
 
 // ── Event routing ──────────────────────────────────────────────────────────────
 function onEvent(e: ServerEvent): void {
   if ("seq" in e && "sessionId" in e && typeof e.seq === "number") seqStore.set(e.sessionId, e.seq);
+  const cid = (e as { cid?: string }).cid;
+  if (cid && cidWaiters.has(cid)) {
+    cidWaiters.get(cid)!(e); // resolve an outbox flush awaiting this command's response
+    cidWaiters.delete(cid);
+  }
 
   switch (e.type) {
     case "session.list":
+      // server is now the source of truth — drop optimistic/pending locals it doesn't know about
+      for (const id of [...sessions.keys()]) if (!sessions.get(id)?.pending) sessions.delete(id);
       e.sessions.forEach((s) => sessions.set(s.id, s));
+      persistSessions();
       renderSessions();
       if (activeId && sessions.has(activeId)) {
         setHeaderTitle(sessions.get(activeId));
@@ -267,17 +426,20 @@ function onEvent(e: ServerEvent): void {
       return;
     case "session.created":
       sessions.set(e.session.id, e.session);
+      persistSessions();
       renderSessions();
       if (!activeId) selectSession(e.session.id);
       return;
     case "session.updated":
       sessions.set(e.session.id, e.session);
+      persistSessions();
       renderSessions();
       if (e.session.id === activeId) updateGitPanelMeta();
       return;
     case "session.deleted":
       sessions.delete(e.sessionId);
       localStorage.removeItem(`anvil.convo.${e.sessionId}`);
+      persistSessions();
       if (activeId === e.sessionId) deselectSession();
       else renderSessions();
       return;
@@ -395,6 +557,22 @@ function appendUser(html: string, attachments: AttachmentRef[] = []): void {
       b.appendChild(img);
     }
   }
+  scrollDown();
+  saveConvoCache();
+}
+/** Optimistically render a queued (offline) user message; the authoritative copy replaces it
+ *  when the outbox flushes and the session re-snapshots. */
+function appendOptimisticUser(text: string): void {
+  const b = bubble("user");
+  b.classList.add("queued");
+  const md = document.createElement("div");
+  md.className = "md";
+  md.textContent = text; // plain text is safe; full markdown render comes from the daemon on flush
+  b.appendChild(md);
+  const badge = document.createElement("span");
+  badge.className = "queued-badge";
+  badge.innerHTML = `${icon("schedule")} queued`;
+  b.appendChild(badge);
   scrollDown();
   saveConvoCache();
 }
@@ -554,10 +732,10 @@ function renderSessions(): void {
   const items = [...sessions.values()].sort((a, b) => Number(!!a.archived) - Number(!!b.archived));
   for (const s of items) {
     const li = document.createElement("li");
-    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}`;
+    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}`;
     const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
     const where = envName ?? s.git?.branch ?? s.source;
-    const tag = s.archived ? "archived" : esc(s.status);
+    const tag = s.pending ? "pending sync" : s.archived ? "archived" : esc(s.status);
     const a = document.createElement("a");
     a.className = "srow";
     a.href = sessionHref(s.id);
@@ -586,6 +764,7 @@ function setHeaderTitle(s: Session | undefined): void {
 function onEnvironments(list: Environment[]): void {
   environments.clear();
   for (const e of list) environments.set(e.id, e);
+  persistEnvironments();
   renderSessions();
   if (document.getElementById("ns-modal")) showNewSession(); // refresh an open new-session modal
   if (document.getElementById("env-cards")) renderEnvCards(); // refresh an open settings view
@@ -766,7 +945,15 @@ $<HTMLFormElement>("#composer").addEventListener("submit", (e) => {
   e.preventDefault();
   const text = input.value;
   if (!activeId || (!text.trim() && pendingAttachments.length === 0)) return;
-  sock.send({ type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
+  const s = sessions.get(activeId);
+  if (sock.isOpen() && !s?.pending) {
+    sock.send({ type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
+  } else {
+    // offline, or a session that itself hasn't been created yet → queue + show optimistically
+    if (pendingAttachments.length) toast("Images need a connection — sent text only");
+    enqueue({ cid: newCid(), cmd: { type: "prompt.send", sessionId: activeId, text } });
+    appendOptimisticUser(text);
+  }
   input.value = "";
   pendingAttachments.length = 0;
   renderAttachRow();
@@ -1355,13 +1542,41 @@ function showNewSession(): void {
       model: $<HTMLSelectElement>("#ns-model").value,
       autonomy: $<HTMLSelectElement>("#ns-auto").value,
     };
-    if (env.isRepo) {
-      sock.send({ type: "session.create", source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", ...common });
+    const cmd = env.isRepo
+      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", ...common }
+      : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, ...common };
+    if (sock.isOpen()) {
+      sock.send(cmd);
     } else {
-      sock.send({ type: "session.create", source: "existing-dir", cwd: env.repoRoot, ...common });
+      createOfflineSession(cmd, env, name);
     }
     closeModal();
   });
+}
+
+/** Create a session while offline: show an optimistic "pending" session now, realize it on reconnect. */
+function createOfflineSession(cmd: Record<string, unknown> & { type: string }, env: Environment, name: string): void {
+  const tempId = `pending_${newCid()}`;
+  const now = new Date().toISOString();
+  const pending: Session = {
+    id: tempId,
+    title: name,
+    pending: true,
+    environmentId: env.id,
+    cwd: env.repoRoot,
+    source: env.isRepo ? "fresh-worktree" : "existing-dir",
+    model: cmd.model as Session["model"],
+    autonomy: cmd.autonomy as Session["autonomy"],
+    status: "idle",
+    createdAt: now,
+    lastActivityAt: now,
+    usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
+  };
+  sessions.set(tempId, pending);
+  persistSessions();
+  enqueue({ cid: newCid(), cmd, tempId });
+  selectSession(tempId);
+  toast("Session queued — will be created when you're back online");
 }
 
 /** Register a project repo as an environment. */
