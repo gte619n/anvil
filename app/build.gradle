@@ -12,6 +12,11 @@ if (localPropertiesFile.exists()) {
     localProperties.load(new FileInputStream(localPropertiesFile))
 }
 
+// Single source of truth for the user-visible app version. Bump this (and versionCode below)
+// for every deploy; it's both the APK versionName and the version shown next to the Anvil brand
+// in the bundled web UI (passed to the web build as APP_VERSION).
+def appVersionName = "2.0.1"
+
 android {
     namespace 'com.gte619n.anvil'
     compileSdk 35
@@ -20,8 +25,8 @@ android {
         applicationId "com.gte619n.anvil"
         minSdk 33
         targetSdk 35
-        versionCode 5
-        versionName "2.0.0"
+        versionCode 6
+        versionName appVersionName
 
         // The Anvil web client URL this shell loads (Tailscale HTTPS by default).
         buildConfigField "String", "ANVIL_BASE_URL",
@@ -58,9 +63,12 @@ def anvild = "${rootDir}/anvild"
 tasks.register("bundleWebAssets", Exec) {
     workingDir anvild
     def out = "${projectDir}/src/main/assets/web"
+    // APP_VERSION → the version shown next to the Anvil brand in the bundled UI.
+    environment "APP_VERSION", appVersionName
     commandLine "bash", "-lc", "bun run build:web && bun run web/bundle-native.ts '${out}'"
     inputs.dir("${anvild}/web/src")
     inputs.file("${anvild}/web/index.html")
+    inputs.property("appVersion", appVersionName) // re-bundle when the version changes
     outputs.dir(out)
 }
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
@@ -74,7 +82,7 @@ firebaseAppDistribution {
     appId = "1:1059574278871:android:f2a67ca798f942ade8de92"
     serviceCredentialsFile = "${System.getProperty('user.home')}/.config/anvil/fcm-service-account.json"
     testers = "evan.ruff@gmail.com"
-    releaseNotes = "Anvil Android shell — debug build."
+    releaseNotes = "v2.0.1 — image attachments: send waits for in-flight uploads (no more silently dropped images) + clearer feedback for non-image files."
 }
 
 dependencies {
