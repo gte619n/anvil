@@ -142,6 +142,28 @@ Requirements:
 adb logcat -s ZellijConnect:V
 ```
 
+### Deploying to Firebase App Distribution
+
+**Always bump the version first.** Edit `app/build.gradle` and increase **both**:
+
+- `versionCode` — integer, +1 every deploy (App Distribution orders releases by it).
+- `appVersionName` — the user-visible version (e.g. `2.0.1` → `2.0.2`). This is the APK
+  `versionName` **and** the version shown next to the "Anvil" title in the app, so testers can
+  confirm they're on the latest build.
+
+Then build + upload (emails the testers configured in `firebaseAppDistribution {}`):
+
+```bash
+export JAVA_HOME="$HOME/.sdkman/candidates/java/current"   # JDK 21
+./gradlew :app:assembleDebug :app:appDistributionUploadDebug
+```
+
+Notes:
+- `assembleDebug` must run in the same invocation — the upload task doesn't build the APK.
+- `bundleWebAssets` rebuilds the web client into the APK, so web changes ship automatically;
+  it passes `appVersionName` to the web build as `APP_VERSION`.
+- Update `releaseNotes` in `app/build.gradle` to describe what changed.
+
 ## Session Status Server (Optional)
 
 The `scripts/` directory contains a session status server that provides:
