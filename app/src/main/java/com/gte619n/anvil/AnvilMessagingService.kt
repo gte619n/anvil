@@ -14,6 +14,16 @@ class AnvilMessagingService : FirebaseMessagingService() {
         val n = message.notification
         val title = n?.title ?: message.data["title"] ?: "Anvil"
         val body = n?.body ?: message.data["body"] ?: ""
-        Notifications.show(this, title, body, message.data["sessionId"])
+        // Permission pushes are data-only (so this always fires, even backgrounded) and carry a
+        // requestId we can answer with Allow/Deny action buttons right on the notification.
+        Notifications.show(
+            context = this,
+            title = title,
+            body = body,
+            sessionId = message.data["sessionId"],
+            kind = message.data["kind"],
+            requestId = message.data["requestId"],
+            tool = message.data["tool"],
+        )
     }
 }

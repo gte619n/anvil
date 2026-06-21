@@ -676,6 +676,7 @@ function clearConversation(): void {
   conversation.innerHTML = "";
   streaming = null;
   thinkingEl = null; // detached by the innerHTML reset
+  permCards.clear(); // cards are detached by the reset; the re-surfaced request re-adds them
 }
 function renderEmptyState(): void {
   streaming = null;
@@ -694,7 +695,10 @@ function deselectSession(): void {
   renderSessions();
 }
 function setStatus(status: string): void {
-  if (status === "idle") hideThinking();
+  // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
+  // retire any open permission cards so a stale one can't linger.
+  if (status !== "awaiting_permission") clearPermissionCards();
+  if (status === "idle" || status === "awaiting_permission") hideThinking(); // the card is the indicator while parked
   else if (!streaming) showThinking(status); // while text streams, the text is the activity
   const s = activeId ? sessions.get(activeId) : undefined;
   if (s) {
@@ -732,11 +736,12 @@ function renderSessions(): void {
   ul.innerHTML = "";
   const items = [...sessions.values()].sort((a, b) => Number(!!a.archived) - Number(!!b.archived));
   for (const s of items) {
+    const awaiting = !s.pending && !s.archived && s.status === "awaiting_permission";
     const li = document.createElement("li");
-    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}`;
+    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}`;
     const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
     const where = envName ?? s.git?.branch ?? s.source;
-    const tag = s.pending ? "pending sync" : s.archived ? "archived" : esc(s.status);
+    const tag = s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
     const a = document.createElement("a");
     a.className = "srow";
     a.href = sessionHref(s.id);
@@ -1664,23 +1669,52 @@ function showOneOff(): void {
     closeModal();
   };
 }
+// Inline permission cards live IN the conversation (not a modal) so they survive app/session
+// switches — a modal overlay gets dismissed or visually lost, stranding the request. Keyed by
+// requestId so a replayed/re-surfaced request (cold attach) doesn't stack duplicate cards.
+const permCards = new Map<string, HTMLElement>();
+
 function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[]): void {
-  const root = $("#modal-root");
-  const m = document.createElement("div");
-  m.className = "modal";
-  m.innerHTML = `<div class="modal-box"><h3>Permission needed</h3><p><b>${esc(tool)}</b></p><pre>${esc(JSON.stringify(inputObj, null, 2)).slice(0, 800)}</pre><div class="btns"></div></div>`;
-  const btns = m.querySelector(".btns")!;
+  if (permCards.has(requestId)) return; // already shown (re-attach replay)
+  hideThinking(); // the turn is parked on this decision, not working
+  const card = document.createElement("div");
+  card.className = "bubble permission";
+  card.dataset.req = requestId;
+  const json = esc(JSON.stringify(inputObj, null, 2)).slice(0, 800);
+  card.innerHTML =
+    `<div class="perm-head">${icon("encrypted")}<span>Permission needed · <b>${esc(tool)}</b></span></div>` +
+    `<pre class="perm-input">${json}</pre>` +
+    `<div class="perm-btns"></div>`;
+  const btns = card.querySelector(".perm-btns")!;
   for (const s of suggestions) {
     const b = document.createElement("button");
+    b.className = `perm-btn ${s.decision}`;
     b.textContent = s.label;
     b.onclick = () => {
       sock.send({ type: "permission.respond", requestId, decision: s.decision });
-      root.innerHTML = "";
+      resolvePermissionUI(requestId, s.label);
     };
     btns.appendChild(b);
   }
-  root.innerHTML = "";
-  root.appendChild(m);
+  permCards.set(requestId, card);
+  conversation.appendChild(card);
+  scrollDown();
+}
+
+/** Mark a permission card answered: lock its buttons, show the choice, then fade it out. */
+function resolvePermissionUI(requestId: string, label?: string): void {
+  const card = permCards.get(requestId);
+  if (!card) return;
+  permCards.delete(requestId);
+  card.classList.add("resolved");
+  card.querySelectorAll<HTMLButtonElement>(".perm-btn").forEach((b) => (b.disabled = true));
+  const btns = card.querySelector(".perm-btns");
+  if (btns && label) btns.innerHTML = `<span class="perm-done">${icon("check")} ${esc(label)}</span>`;
+}
+
+/** A session left awaiting_permission (answered here, on another device, or superseded). */
+function clearPermissionCards(): void {
+  for (const id of [...permCards.keys()]) resolvePermissionUI(id);
 }
 
 // ── Toast ──────────────────────────────────────────────────────────────────────

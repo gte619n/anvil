@@ -62,6 +62,8 @@ export class Supervisor {
   private readonly drivers = new Map<string, AgentDriver>();
   private readonly logs = new Map<string, EventLog>();
   private readonly broker = new PermissionBroker();
+  /** Sessions whose awaiting_permission state has been announced to the whole fleet (list badge). */
+  private readonly awaitingAnnounced = new Set<string>();
   private readonly renderer: MarkdownRenderer;
   private readonly agentEnv = buildAgentEnv();
   private readonly budgetTracker: BudgetTracker;
@@ -138,6 +140,11 @@ export class Supervisor {
     // Always end with the live status so a re-attaching client's thinking indicator reflects
     // reality (the per-turn `status` events it missed while detached aren't replayed).
     events.push({ v: PROTOCOL_VERSION, type: "status", ts: now(), sessionId: id, seq: s.lastSeq, status: s.data.status });
+    // Re-surface an unanswered permission prompt: the snapshot drops permission.request (it isn't
+    // conversation history), so without this a client that cold-attaches to a blocked session would
+    // never see the prompt — the request would be "lost" and the session stuck forever (arch §6.6).
+    const pending = s.permissionRequestEvent();
+    if (pending) events.push(pending);
     return events;
   }
 
@@ -456,7 +463,9 @@ export class Supervisor {
     if (!this.broker.resolve(requestId, decision, updatedInput)) {
       throw new BadCommand(`no pending permission request: ${requestId}`);
     }
-    if (sessionId) this.sessions.get(sessionId)?.setStatus(decision === "deny" ? "thinking" : "running_tool");
+    const s = sessionId ? this.sessions.get(sessionId) : undefined;
+    s?.clearPermission(requestId); // stop re-surfacing it on reattach
+    s?.setStatus(decision === "deny" ? "thinking" : "running_tool");
   }
 
   setModel(id: string, model: Model): void {
@@ -506,18 +515,37 @@ export class Supervisor {
       (sessionId, event) => {
         this.registry.toAttached(sessionId, event);
         this.maybeNotify(sessionId, event);
+        this.maybeBroadcastAwaiting(sessionId, event);
       },
       () => this.persist(),
       (event) => log.append(event),
     );
   }
 
+  /**
+   * Keep the session-list "awaiting permission" badge correct across the whole fleet. The
+   * `status` event is session-scoped (only attached connections get it), so a device viewing a
+   * different session would never colour the entry — broadcast a `session.updated` on the in/out
+   * transition so every client repaints the list.
+   */
+  private maybeBroadcastAwaiting(sessionId: string, event: ServerEvent): void {
+    if (event.type !== "status") return;
+    const isAwaiting = event.status === "awaiting_permission";
+    const wasAwaiting = this.awaitingAnnounced.has(sessionId);
+    if (isAwaiting === wasAwaiting) return;
+    if (isAwaiting) this.awaitingAnnounced.add(sessionId);
+    else this.awaitingAnnounced.delete(sessionId);
+    const data = this.sessions.get(sessionId)?.data;
+    if (data) this.broadcastUpdated(data);
+  }
+
   /** Push a notification on the events that mean "your turn" (arch §6.7). */
   private maybeNotify(sessionId: string, event: ServerEvent): void {
     const title = this.sessions.get(sessionId)?.data.title ?? "Anvil";
     let payload: PushPayload | undefined;
-    if (event.type === "permission.request") payload = { title, body: `Needs approval: ${event.tool}`, sessionId, tag: `perm-${sessionId}` };
-    else if (event.type === "result") payload = { title, body: "Claude finished — your turn.", sessionId, tag: `done-${sessionId}` };
+    if (event.type === "permission.request")
+      payload = { title, body: `Needs approval: ${event.tool}`, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool };
+    else if (event.type === "result") payload = { title, body: "Claude finished — your turn.", sessionId, tag: `done-${sessionId}`, kind: "result" };
     if (payload) {
       void this.webpush.notify(payload); // desktop browsers
       void this.fcm.notify(payload); // Android client

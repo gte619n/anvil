@@ -1,5 +1,5 @@
 import type { ServerWebSocket } from "bun";
-import type { rest } from "@protocol";
+import type { rest, PermissionDecision } from "@protocol";
 import { checkAuth } from "../auth/guard";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
@@ -198,6 +198,25 @@ export function createServer(opts: ServerOptions): ServerHandle {
           return Response.json({ ok: true });
         } catch {
           return new Response("bad subscription", { status: 400 });
+        }
+      }
+      // Answer a parked permission prompt over REST — lets a native notification action button
+      // resolve Allow/Deny without an open WebSocket (arch §6.6).
+      if (url.pathname === "/api/permission/respond" && req.method === "POST") {
+        try {
+          const { requestId, decision, updatedInput } = (await req.json()) as {
+            requestId?: string;
+            decision?: PermissionDecision;
+            updatedInput?: unknown;
+          };
+          if (!requestId || (decision !== "allow" && decision !== "deny" && decision !== "allow_always")) {
+            return new Response("bad request", { status: 400 });
+          }
+          supervisor.resolvePermission(requestId, decision, updatedInput);
+          return Response.json({ ok: true });
+        } catch (e) {
+          // BadCommand → the request was already answered or expired; treat as gone, not a server error.
+          return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 409 });
         }
       }
       if (url.pathname === "/api/push/fcm/register" && req.method === "POST") {

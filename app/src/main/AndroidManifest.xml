@@ -35,6 +35,14 @@
             </intent-filter>
         </service>
 
+        <receiver
+            android:name=".PermissionActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.gte619n.anvil.PERMISSION_ACTION" />
+            </intent-filter>
+        </receiver>
+
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_channel_id"
             android:value="anvil" />

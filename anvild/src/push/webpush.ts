@@ -11,6 +11,12 @@ export interface PushPayload {
   body: string;
   sessionId?: string;
   tag?: string;
+  /** "permission" pushes carry an actionable request the client can resolve in-place. */
+  kind?: "permission" | "result";
+  /** Permission request id — lets a native client answer Allow/Deny from the notification. */
+  requestId?: string;
+  /** The tool awaiting approval (for the notification body / labels). */
+  tool?: string;
 }
 
 /**

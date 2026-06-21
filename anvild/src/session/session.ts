@@ -21,10 +21,20 @@ export type EventSink = (sessionId: string, event: ServerEvent) => void;
  * `emit()` that assigns `seq` → (M6: appends to the event log) → broadcasts. This is the
  * ONLY place `seq` is minted, which guarantees per-session monotonicity (arch §6.1).
  */
+/** A permission prompt currently parked in the PreToolUse hook (arch §6.6). */
+export interface PendingPermission {
+  requestId: string;
+  tool: string;
+  input: unknown;
+  suggestions: PermissionSuggestion[];
+}
+
 export class Session {
   private nextSeq: number;
   private group: Group | undefined;
   private readonly alwaysAllow = new Set<string>();
+  /** Set while blocked on a decision so a (re)attaching client can re-surface it (arch §6.4). */
+  pendingPermission: PendingPermission | undefined;
 
   constructor(
     public data: SessionData,
@@ -75,8 +85,31 @@ export class Session {
 
   /** Block on a permission decision (arch §6.6): flips to awaiting_permission + emits the request. */
   requestPermission(requestId: string, tool: string, input: unknown, suggestions: PermissionSuggestion[]): void {
+    this.pendingPermission = { requestId, tool, input, suggestions };
     this.setStatus("awaiting_permission");
     this.emit({ type: "permission.request", requestId, tool, input, suggestions });
+  }
+
+  /** A parked permission was answered (or superseded): stop re-surfacing it on reattach. */
+  clearPermission(requestId?: string): void {
+    if (!requestId || this.pendingPermission?.requestId === requestId) this.pendingPermission = undefined;
+  }
+
+  /** The unresolved permission prompt, if this session is currently blocked on one. */
+  permissionRequestEvent(): ServerEvent | undefined {
+    if (!this.pendingPermission) return undefined;
+    const p = this.pendingPermission;
+    return {
+      v: PROTOCOL_VERSION,
+      type: "permission.request",
+      ts: now(),
+      sessionId: this.data.id,
+      seq: this.lastSeq,
+      requestId: p.requestId,
+      tool: p.tool,
+      input: p.input,
+      suggestions: p.suggestions,
+    };
   }
 
   /** Attach the agent's process group (M5) so kill can reap it. */

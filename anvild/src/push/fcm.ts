@@ -94,12 +94,23 @@ export class Fcm {
     const dead: string[] = [];
     await Promise.all(
       this.tokens.map(async (token) => {
-        const message: Record<string, unknown> = {
-          token,
-          notification: { title: payload.title, body: payload.body },
-          android: { priority: "HIGH", notification: { channel_id: "anvil" } },
-        };
-        if (payload.sessionId) message.data = { sessionId: payload.sessionId };
+        // Permission pushes are sent data-only so the Android client's onMessageReceived ALWAYS
+        // fires (even backgrounded) and can build a notification with Allow/Deny action buttons.
+        // A notification-payload message would be auto-rendered by the system tray without them.
+        const isPermission = payload.kind === "permission";
+        const data: Record<string, string> = { title: payload.title, body: payload.body };
+        if (payload.sessionId) data.sessionId = payload.sessionId;
+        if (payload.kind) data.kind = payload.kind;
+        if (payload.requestId) data.requestId = payload.requestId;
+        if (payload.tool) data.tool = payload.tool;
+        const message: Record<string, unknown> = isPermission
+          ? { token, data, android: { priority: "HIGH" } }
+          : {
+              token,
+              notification: { title: payload.title, body: payload.body },
+              android: { priority: "HIGH", notification: { channel_id: "anvil" } },
+              data,
+            };
         try {
           const res = await fetch(url, {
             method: "POST",

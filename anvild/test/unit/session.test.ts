@@ -47,6 +47,29 @@ test("resume replays events after lastSeq, and snapshots from scratch", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("resume re-surfaces an unanswered permission prompt (the 'lost dialog' fix)", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir));
+
+  // Simulate the PreToolUse hook parking on a decision.
+  s.requestPermission("perm-1", "Edit", { file_path: "a.ts" }, [{ decision: "allow", label: "Allow once" }]);
+  expect(s.data.status).toBe("awaiting_permission");
+
+  // A cold attach (no lastSeq → snapshot path) must still carry the pending request, even though
+  // the snapshot itself drops permission.request — otherwise the prompt is invisible and stuck.
+  const cold = sup.resume(s.id, undefined);
+  const perm = cold.find((e) => e.type === "permission.request") as any;
+  expect(perm).toBeDefined();
+  expect(perm.requestId).toBe("perm-1");
+  expect(perm.tool).toBe("Edit");
+
+  // Once answered (cleared), it is no longer re-surfaced.
+  s.clearPermission("perm-1");
+  expect(sup.resume(s.id, undefined).some((e) => e.type === "permission.request")).toBe(false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("supervisor persists sessions and a fresh instance restores them", () => {
   const dir = tempState();
   const reg = new ConnectionRegistry();
