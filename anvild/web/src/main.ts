@@ -18,7 +18,6 @@ const b64ToBytes = (b64: string): Uint8Array => {
 };
 import type {
   AttachmentRef,
-  Budget,
   ContentBlock,
   ConversationEvent,
   DirEntry,
@@ -504,8 +503,8 @@ function onEvent(e: ServerEvent): void {
       else renderSessions();
       return;
     case "budget":
-      renderBudget(e.budget);
-      return;
+      return; // rate-limit gauge is tracked server-side; the UI display is removed for now
+
     case "environments":
       onEnvironments(e.environments);
       return;
@@ -874,13 +873,11 @@ function closeSettings(): void {
 async function renderServerCards(): Promise<void> {
   const host = $("#server-cards");
   try {
-    const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string; budget?: Budget };
-    const budgetLine = budgetText(h.budget);
+    const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string };
     const daemonHost = new URL(apiUrl("/")).host;
     host.innerHTML = `<div class="card server-card">
       <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? daemonHost)}</b> <span class="small muted">(this server)</span></div>
       <div class="small muted"><code>${esc(daemonHost)}</code> · anvild ${esc(h.version ?? "?")}</div>
-      <div class="small muted">${esc(budgetLine)}</div>
     </div>
     <p class="small muted">Multi-server (managing anvild on your other Macs from here) is on the roadmap — see the fleet design.</p>`;
   } catch {
@@ -975,20 +972,6 @@ async function toggleReadme(id: string): Promise<void> {
   } catch {
     body.innerHTML = `<p class="small muted">Couldn't load the README.</p>`;
   }
-}
-function renderBudget(b: Budget): void {
-  const el = $("#budget");
-  el.classList.toggle("warn", b.warn);
-  el.textContent = budgetText(b);
-  el.title = b.available && b.subscriptionType ? `${b.subscriptionType} plan usage` : "";
-}
-/** Compact plan-usage line from the real rate-limit windows; empty when no plan limits apply. */
-function budgetText(b?: Budget): string {
-  if (!b || !b.available) return "";
-  const parts: string[] = [];
-  if (b.week) parts.push(`Week ${Math.round(b.week.utilization)}%`);
-  if (b.session) parts.push(`Session ${Math.round(b.session.utilization)}%`);
-  return parts.join(" · ");
 }
 function selectSession(id: string, push = true): void {
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
