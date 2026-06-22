@@ -7,8 +7,16 @@ import { ASK_USER_QUESTION_DIALOG, makeUserDialogHandler, type QuestionBroker } 
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
-/** Called once per completed turn with the turn's USD-equivalent cost (for the budget tracker). */
-export type ResultRecorder = (model: Model, costUsd: number) => void;
+/** What a completed turn reports for the rate-limit gauge (arch §3). */
+export interface TurnUsage {
+  model: Model;
+  costUsd: number; // the turn's USD-equivalent cost (informational)
+  /** The SDK's `rate_limits` payload (opaque here), or null when unavailable this turn. */
+  rateLimits: unknown;
+  subscriptionType: string | null; // "max" | "pro" | … | null (API-key / 3P session)
+}
+/** Called once per completed turn so the supervisor can refresh the shared rate-limit gauge. */
+export type ResultRecorder = (usage: TurnUsage) => void;
 
 /**
  * Drives one Claude Code session via the Agent SDK in streaming-input mode (arch §2).
@@ -147,7 +155,19 @@ export class AgentDriver {
             this.session.data.usage.turns += usage.turns;
           }
           const costUsd = Number((m as any).total_cost_usd ?? 0);
-          this.onResult(this.session.data.model, costUsd);
+          // Read the plan's real rate-limit windows (the same numbers as claude.ai → Usage). This
+          // is the authoritative budget signal for an OAuth subscription. The endpoint is flagged
+          // experimental by the SDK, so tolerate it being absent or throwing.
+          let rateLimits: unknown = null;
+          let subscriptionType: string | null = null;
+          try {
+            const u = await this.q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+            if (u?.rate_limits_available) rateLimits = u.rate_limits;
+            subscriptionType = u?.subscription_type ?? null;
+          } catch {
+            /* experimental usage endpoint unavailable — keep the last-known gauge */
+          }
+          this.onResult({ model: this.session.data.model, costUsd, rateLimits, subscriptionType });
           this.session.setStatus("idle");
         }
       }

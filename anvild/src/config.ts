@@ -3,9 +3,9 @@ export interface Config {
   host: string;
   port: number;
   stateDir: string;
-  /** Budget warn threshold as a fraction of the Opus pool (arch §3). */
+  /** Warn threshold as a fraction (0–1) of any rate-limit window's utilization (arch §3). */
   warnFraction: number;
-  /** Soft-stop threshold as a fraction of the Opus pool (arch §3). */
+  /** Soft-stop threshold as a fraction (0–1) of the 7-day window's utilization (arch §3). */
   softStopFraction: number;
 }
 

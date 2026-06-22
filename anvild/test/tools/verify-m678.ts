@@ -38,7 +38,7 @@ ws.onmessage = (ev) => {
       return;
     case "result":
       console.log(`M7  permission hook fired for a benign tool under prompt-all: ${sawPermission}`);
-      console.log(`M8  budget after turn: opus=${lastBudget?.opus.usedHrs}hr sonnet=${lastBudget?.sonnet.usedHrs}hr warn=${lastBudget?.warn}`);
+      console.log(`M8  rate limits after turn: week=${lastBudget?.week?.utilization}% session=${lastBudget?.session?.utilization}% warn=${lastBudget?.warn}`);
       ws.close();
       void resume();
       return;

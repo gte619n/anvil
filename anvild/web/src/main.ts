@@ -875,8 +875,7 @@ async function renderServerCards(): Promise<void> {
   const host = $("#server-cards");
   try {
     const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string; budget?: Budget };
-    const b = h.budget;
-    const budgetLine = b ? `Opus ${b.opus.usedHrs.toFixed(1)}/${b.opus.limitHrs}h · Sonnet ${b.sonnet.usedHrs.toFixed(1)}/${b.sonnet.limitHrs}h` : "";
+    const budgetLine = budgetText(h.budget);
     const daemonHost = new URL(apiUrl("/")).host;
     host.innerHTML = `<div class="card server-card">
       <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? daemonHost)}</b> <span class="small muted">(this server)</span></div>
@@ -980,7 +979,16 @@ async function toggleReadme(id: string): Promise<void> {
 function renderBudget(b: Budget): void {
   const el = $("#budget");
   el.classList.toggle("warn", b.warn);
-  el.textContent = `Opus ${b.opus.usedHrs}/${b.opus.limitHrs}h · Sonnet ${b.sonnet.usedHrs}/${b.sonnet.limitHrs}h`;
+  el.textContent = budgetText(b);
+  el.title = b.available && b.subscriptionType ? `${b.subscriptionType} plan usage` : "";
+}
+/** Compact plan-usage line from the real rate-limit windows; empty when no plan limits apply. */
+function budgetText(b?: Budget): string {
+  if (!b || !b.available) return "";
+  const parts: string[] = [];
+  if (b.week) parts.push(`Week ${Math.round(b.week.utilization)}%`);
+  if (b.session) parts.push(`Session ${Math.round(b.session.utilization)}%`);
+  return parts.join(" · ");
 }
 function selectSession(id: string, push = true): void {
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for

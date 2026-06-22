@@ -1,110 +1,124 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Budget, Model } from "@protocol";
+import type { Budget, RateWindow } from "@protocol";
 
 /**
- * Budget tracker — arch §3, decision #9 (load-bearing).
+ * Rate-limit tracker — arch §3, decision #9 (load-bearing).
  *
- * The Max pool is denominated in *hours*, but the SDK reports per-turn USD-equivalent cost.
- * We accumulate cost per model over a rolling 7-day window and convert to an hours-estimate
- * via calibratable USD/hr rates. The exact hour figure is approximate; what matters is that
- * usage accrues, `warn` flips at the threshold, and a one-shot soft-stop fires near the cap
- * so an autonomous Opus session can't silently drain the week.
+ * The daemon runs on a Claude subscription (OAuth), so the authoritative usage signal is the
+ * plan's own rate-limit windows — the 5-hour and 7-day utilization shown in claude.ai →
+ * Settings → Usage. The Agent SDK surfaces these per session via its (experimental) usage
+ * endpoint; the driver reads them after each turn and feeds the raw payload here. We map it to
+ * the protocol `Budget`, flip `warn` when any window passes the threshold, and fire a one-shot
+ * soft-stop when the weekly window nears the cap so an autonomous session can't silently drain
+ * the week.
  *
- * Calibration knobs (env): ANVIL_OPUS_USD_PER_HR, ANVIL_SONNET_USD_PER_HR,
- * ANVIL_OPUS_LIMIT_HRS, ANVIL_SONNET_LIMIT_HRS. The cost→hours mapping is isolated here so
- * the paused Agent-SDK billing split (arch §3) can be re-pointed without touching callers.
+ * This replaces the previous cost→hours *estimate*, which invented an hours figure against a
+ * configured cap and could read far from reality (e.g. "over" while the plan was at 5%).
+ *
+ * Thresholds (env, fractions of a window 0–1): ANVIL_BUDGET_WARN, ANVIL_BUDGET_SOFTSTOP.
  */
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
-const USD_PER_HR = {
-  opus: Number(process.env.ANVIL_OPUS_USD_PER_HR ?? 18),
-  sonnet: Number(process.env.ANVIL_SONNET_USD_PER_HR ?? 6),
-};
-const LIMIT_HRS = {
-  opus: Number(process.env.ANVIL_OPUS_LIMIT_HRS ?? 20), // Max-5x defaults
-  sonnet: Number(process.env.ANVIL_SONNET_LIMIT_HRS ?? 240),
-};
+const PCT = 100;
 
-interface BudgetState {
-  windowStart: number;
-  opusUsd: number;
-  sonnetUsd: number;
-  softStopped: boolean;
-}
+/** Loosely-typed view of the SDK's `rate_limits` object — the experimental endpoint may add or
+ *  rename windows, so we read known keys defensively rather than coupling to its exact type. */
+type Win = { utilization?: number | null; resets_at?: string | null } | null | undefined;
 
 export interface BudgetConfig {
   stateDir: string;
-  warnFraction: number;
-  softStopFraction: number;
+  warnFraction: number; // 0–1 of any window
+  softStopFraction: number; // 0–1 of the 7-day window
 }
 
-export class BudgetTracker {
+interface Persisted {
+  budget: Budget;
+  softStopped: boolean; // latched so the soft-stop advisory fires once per 7-day window
+  weekResetsAt?: string; // when this changes, the window rolled over → clear the latch
+}
+
+export class RateLimitTracker {
   private readonly file: string;
-  private state: BudgetState;
+  private state: Persisted;
 
   constructor(private readonly cfg: BudgetConfig) {
     mkdirSync(cfg.stateDir, { recursive: true });
     this.file = join(cfg.stateDir, "budget.json");
     this.state = this.load();
-    this.roll();
   }
 
-  /** Record a turn's cost; returns the new snapshot and whether this crossed the soft-stop. */
-  record(model: Model, costUsd: number): { budget: Budget; crossedSoftStop: boolean } {
-    this.roll();
-    if (model === "opus") this.state.opusUsd += costUsd;
-    else this.state.sonnetUsd += costUsd;
+  /** The last-known gauge (also what a cold-attaching client / health check sees). */
+  snapshot(): Budget {
+    return this.state.budget;
+  }
 
-    const budget = this.snapshot();
-    const opusFrac = budget.opus.limitHrs > 0 ? budget.opus.usedHrs / budget.opus.limitHrs : 0;
+  /**
+   * Fold a fresh SDK `rate_limits` payload into the gauge. `raw` is null/undefined when the
+   * reading was unavailable this turn (API-key session, missing scope, or a transient failure) —
+   * we keep the last-known snapshot rather than blanking a real gauge. Returns the new snapshot
+   * and whether this crossed the weekly soft-stop (fires once per window).
+   */
+  update(raw: unknown, subscriptionType?: string | null): { budget: Budget; crossedSoftStop: boolean } {
+    const r = raw && typeof raw === "object" ? (raw as Record<string, Win>) : null;
+    if (!r) return { budget: this.state.budget, crossedSoftStop: false };
+
+    const win = (w: Win): RateWindow | undefined =>
+      w && typeof w.utilization === "number"
+        ? { utilization: round(w.utilization), ...(w.resets_at ? { resetsAt: w.resets_at } : {}) }
+        : undefined;
+    const session = win(r.five_hour);
+    const week = win(r.seven_day);
+    const weekOpus = win(r.seven_day_opus);
+    const weekSonnet = win(r.seven_day_sonnet);
+
+    const warnAt = this.cfg.warnFraction * PCT;
+    const warn = [session, week, weekOpus, weekSonnet].some((w) => (w?.utilization ?? 0) >= warnAt);
+
+    // Clear the soft-stop latch when the 7-day window rolls over (its reset timestamp changes).
+    if (week?.resetsAt && week.resetsAt !== this.state.weekResetsAt) {
+      this.state.softStopped = false;
+      this.state.weekResetsAt = week.resetsAt;
+    }
     let crossedSoftStop = false;
-    if (!this.state.softStopped && opusFrac >= this.cfg.softStopFraction) {
+    if (!this.state.softStopped && (week?.utilization ?? 0) >= this.cfg.softStopFraction * PCT) {
       this.state.softStopped = true;
       crossedSoftStop = true;
     }
-    this.save();
-    return { budget, crossedSoftStop };
-  }
 
-  snapshot(): Budget {
-    this.roll();
-    const opusHrs = this.state.opusUsd / USD_PER_HR.opus;
-    const sonnetHrs = this.state.sonnetUsd / USD_PER_HR.sonnet;
-    const warn =
-      opusHrs >= this.cfg.warnFraction * LIMIT_HRS.opus ||
-      sonnetHrs >= this.cfg.warnFraction * LIMIT_HRS.sonnet;
-    return {
-      opus: { usedHrs: round(opusHrs), limitHrs: LIMIT_HRS.opus },
-      sonnet: { usedHrs: round(sonnetHrs), limitHrs: LIMIT_HRS.sonnet },
-      windowResetsAt: new Date(this.state.windowStart + WEEK_MS).toISOString(),
+    this.state.budget = {
+      available: true,
+      ...(subscriptionType ? { subscriptionType } : {}),
+      ...(session ? { session } : {}),
+      ...(week ? { week } : {}),
+      ...(weekOpus ? { weekOpus } : {}),
+      ...(weekSonnet ? { weekSonnet } : {}),
       warn,
+      updatedAt: new Date().toISOString(),
     };
+    this.save();
+    return { budget: this.state.budget, crossedSoftStop };
   }
 
-  private load(): BudgetState {
+  private load(): Persisted {
     if (existsSync(this.file)) {
       try {
-        return JSON.parse(readFileSync(this.file, "utf8")) as BudgetState;
+        const p = JSON.parse(readFileSync(this.file, "utf8")) as Partial<Persisted>;
+        // Accept only the current shape; a legacy cost→hours file falls through to a fresh gauge.
+        if (p && typeof p === "object" && p.budget && typeof p.budget.available === "boolean") {
+          return { budget: p.budget, softStopped: Boolean(p.softStopped), weekResetsAt: p.weekResetsAt };
+        }
       } catch {
-        /* fall through to a fresh window */
+        /* fall through to a fresh gauge */
       }
     }
-    return { windowStart: Date.now(), opusUsd: 0, sonnetUsd: 0, softStopped: false };
+    return { budget: { available: false, warn: false }, softStopped: false };
   }
 
   private save(): void {
     writeFileSync(this.file, JSON.stringify(this.state, null, 2));
   }
-
-  private roll(): void {
-    if (Date.now() - this.state.windowStart >= WEEK_MS) {
-      this.state = { windowStart: Date.now(), opusUsd: 0, sonnetUsd: 0, softStopped: false };
-      this.save();
-    }
-  }
 }
 
 function round(n: number): number {
-  return Math.round(n * 100) / 100;
+  return Math.round(n * 10) / 10;
 }

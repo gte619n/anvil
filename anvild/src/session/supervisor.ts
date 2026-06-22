@@ -27,13 +27,13 @@ import type { ConnectionRegistry } from "../server/registry";
 import { Session } from "./session";
 import { SessionStore } from "./store";
 import { createWorktree, gitStatus, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
-import { AgentDriver } from "../agent/driver";
+import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
-import { BudgetTracker } from "../budget/tracker";
+import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
@@ -69,7 +69,7 @@ export class Supervisor {
   private readonly awaitingAnnounced = new Set<string>();
   private readonly renderer: MarkdownRenderer;
   private readonly agentEnv = buildAgentEnv();
-  private readonly budgetTracker: BudgetTracker;
+  private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
@@ -82,7 +82,7 @@ export class Supervisor {
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
-    this.budgetTracker = new BudgetTracker({
+    this.rateLimits = new RateLimitTracker({
       stateDir: cfg.stateDir,
       warnFraction: cfg.warnFraction ?? 0.8,
       softStopFraction: cfg.softStopFraction ?? 0.95,
@@ -91,10 +91,10 @@ export class Supervisor {
   }
 
   budget(): Budget {
-    return this.budgetTracker.snapshot();
+    return this.rateLimits.snapshot();
   }
   budgetEvent(): BudgetEvent {
-    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.budgetTracker.snapshot() };
+    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.rateLimits.snapshot() };
   }
 
   environmentsEvent(): EnvironmentsEvent {
@@ -451,8 +451,8 @@ export class Supervisor {
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
     let driver = this.drivers.get(id);
     if (!driver) {
-      driver = new AgentDriver(s, this.renderer, this.broker, this.questionBroker, this.agentEnv, (model, costUsd) =>
-        this.onAgentResult(id, model, costUsd),
+      driver = new AgentDriver(s, this.renderer, this.broker, this.questionBroker, this.agentEnv, (usage) =>
+        this.onAgentResult(id, usage),
       );
       this.drivers.set(id, driver);
     }
@@ -625,15 +625,17 @@ export class Supervisor {
     }
   }
 
-  /** Per-turn cost → budget tracker; broadcast the new budget; advise once at soft-stop. */
-  private onAgentResult(sessionId: string, model: Model, costUsd: number): void {
-    const { budget, crossedSoftStop } = this.budgetTracker.record(model, costUsd);
+  /** Per-turn: refresh the shared rate-limit gauge from the real plan windows, broadcast it, and
+   *  advise once when the weekly window nears the cap. */
+  private onAgentResult(sessionId: string, usage: TurnUsage): void {
+    const { budget, crossedSoftStop } = this.rateLimits.update(usage.rateLimits, usage.subscriptionType);
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "budget", ts: now(), budget });
     if (crossedSoftStop) {
+      const pct = Math.round(budget.week?.utilization ?? 0);
       this.sessions
         .get(sessionId)
         ?.emitError(
-          `Budget soft-stop: weekly Opus usage near the limit (~${budget.opus.usedHrs}/${budget.opus.limitHrs} hrs). Consider switching sessions to Sonnet.`,
+          `Heads up: weekly plan usage is at ~${pct}% of the limit. Consider switching sessions to Sonnet or pausing nonessential work.`,
           false,
         );
     }

@@ -117,16 +117,29 @@ export interface Usage {
   turns: number;
 }
 
-/** Shared Max-pool budget gauge (§3). `warn` flips past the configured threshold. */
-export interface Budget {
-  opus: PoolUsage;
-  sonnet: PoolUsage;
-  windowResetsAt: Iso8601;
-  warn: boolean;
+/**
+ * One rate-limit window's utilization, read from the Agent SDK's usage endpoint (§3) — the same
+ * windows shown in claude.ai → Settings → Usage. `utilization` is a percentage, 0–100.
+ */
+export interface RateWindow {
+  utilization: number; // 0–100: percent of the window consumed
+  resetsAt?: Iso8601; // when the window rolls over
 }
-export interface PoolUsage {
-  usedHrs: number;
-  limitHrs: number;
+/**
+ * Real subscription rate-limit gauge (§3). Reflects the actual plan limits the daemon's OAuth
+ * subscription is subject to — NOT a cost→hours estimate. `available` is false for an API-key /
+ * Bedrock / Vertex session, or before any turn has reported (windows are then absent). `warn`
+ * flips when any populated window passes the configured threshold.
+ */
+export interface Budget {
+  available: boolean;
+  subscriptionType?: string; // "pro" | "max" | "team" | "enterprise"
+  session?: RateWindow; // 5-hour rolling window ("current session" in the UI)
+  week?: RateWindow; // 7-day, all models
+  weekOpus?: RateWindow; // 7-day, Opus only
+  weekSonnet?: RateWindow; // 7-day, Sonnet only
+  warn: boolean;
+  updatedAt?: Iso8601; // when these numbers were last refreshed from the SDK
 }
 
 export interface Session {

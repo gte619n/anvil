@@ -122,5 +122,7 @@ test("/api/health reports liveness + the §3 auth self-check", async () => {
   expect(j.ok).toBe(true);
   expect(typeof j.subscriptionAuthOk).toBe("boolean");
   expect(j.version).toBeDefined();
-  expect(j.budget.opus.limitHrs).toBeGreaterThan(0);
+  // No turn has run, so the rate-limit gauge is present but reports "unavailable" (no plan data yet).
+  expect(typeof j.budget.available).toBe("boolean");
+  expect(typeof j.budget.warn).toBe("boolean");
 });
