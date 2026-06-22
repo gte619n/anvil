@@ -1,0 +1,99 @@
+name: Android build & distribute
+
+# Every merge/push to `main` builds the Anvil Android app and ships it to the testers on
+# Firebase App Distribution. Release notes are generated from the commits that landed in the
+# push, the versionCode/versionName are derived from the run number, and the web client is
+# re-bundled into the APK by the gradle `bundleWebAssets` task.
+#
+# Required repo secret:
+#   FIREBASE_SERVICE_ACCOUNT — the full JSON for a service account that has the
+#                              "Firebase App Distribution Admin" role on the Firebase project.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Don't run two distributions for the same branch at once; let an in-flight one finish so we
+# never upload out of order (each run still gets a unique versionCode from its run number).
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-distribute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The gradle `bundleWebAssets` task runs `bun` via a login shell (`bash -lc`), whose PATH
+      # may not include Bun's install dir. Symlink it into /usr/local/bin (always on PATH).
+      - name: Make Bun available to login shells
+        run: sudo ln -sf "$(which bun)" /usr/local/bin/bun
+
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Write Firebase service account
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "::error::FIREBASE_SERVICE_ACCOUNT secret is not set — add it in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$RUNNER_TEMP/fcm-service-account.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/fcm-service-account.json" >> "$GITHUB_ENV"
+
+      - name: Generate release notes from merged commits
+        run: |
+          set -euo pipefail
+          SHORT="$(git rev-parse --short HEAD)"
+          BEFORE="${{ github.event.before }}"
+          # Range = what landed in this push; fall back to the last 30 commits when `before` is
+          # missing/unknown (first push, force-push, or manual workflow_dispatch).
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            RANGE="$BEFORE..${{ github.sha }}"
+          else
+            RANGE="-n 30"
+          fi
+          {
+            echo "Anvil — build #${{ github.run_number }} ($SHORT)"
+            echo ""
+            echo "What's new:"
+            git log --no-merges --pretty='• %s' $RANGE | head -50
+          } > app/release-notes.txt
+          echo "----- release notes -----"
+          cat app/release-notes.txt
+
+      - name: Build APK & distribute to Firebase
+        env:
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+        run: ./gradlew :app:assembleDebug :app:appDistributionUploadDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

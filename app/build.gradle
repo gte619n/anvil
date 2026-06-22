@@ -13,9 +13,18 @@ if (localPropertiesFile.exists()) {
 }
 
 // Single source of truth for the user-visible app version. Bump this (and versionCode below)
-// for every deploy; it's both the APK versionName and the version shown next to the Anvil brand
-// in the bundled web UI (passed to the web build as APP_VERSION).
-def appVersionName = "2.0.2"
+// for meaningful releases; it's both the APK versionName and the version shown next to the Anvil
+// brand in the bundled web UI (passed to the web build as APP_VERSION).
+def baseVersionName = "2.0.2"
+
+// CI (GitHub Actions, .github/workflows/android-release.yml) sets ANVIL_BUILD_NUMBER to the
+// workflow run number on every push to `main`. When present it makes each automated build
+// uniquely identifiable: a monotonic versionCode (offset well past the last hand-bumped code)
+// and a "(build N)" suffix on the user-visible version, so testers can confirm they're on the
+// very latest build straight from the brand label. Local builds keep the plain version above.
+def ciBuildNumber = System.getenv("ANVIL_BUILD_NUMBER")
+def appVersionName = ciBuildNumber ? "${baseVersionName} (build ${ciBuildNumber})" : baseVersionName
+def computedVersionCode = ciBuildNumber ? (100 + ciBuildNumber.toInteger()) : 7
 
 android {
     namespace 'com.gte619n.anvil'
@@ -25,7 +34,7 @@ android {
         applicationId "com.gte619n.anvil"
         minSdk 33
         targetSdk 35
-        versionCode 7
+        versionCode computedVersionCode
         versionName appVersionName
 
         // The Anvil web client URL this shell loads (Tailscale HTTPS by default).
@@ -80,9 +89,20 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.con
 // "Firebase App Distribution Admin" role on that service account).
 firebaseAppDistribution {
     appId = "1:1059574278871:android:f2a67ca798f942ade8de92"
-    serviceCredentialsFile = "${System.getProperty('user.home')}/.config/anvil/fcm-service-account.json"
+    // Auth: CI writes the FIREBASE_SERVICE_ACCOUNT secret to a file and points
+    // GOOGLE_APPLICATION_CREDENTIALS at it; local builds fall back to the dev's key. Either way
+    // the service account needs the "Firebase App Distribution Admin" role.
+    serviceCredentialsFile = System.getenv("GOOGLE_APPLICATION_CREDENTIALS") ?:
+        "${System.getProperty('user.home')}/.config/anvil/fcm-service-account.json"
     testers = "evan.ruff@gmail.com"
-    releaseNotes = "v2.0.2 — Back button now closes the open dialog/menu/settings/panel and returns to the previous screen instead of exiting the app. Also: image attachments wait for in-flight uploads (no more silently dropped images) + clearer feedback for non-image files."
+    // CI generates app/release-notes.txt from the commits merged to `main` (see the workflow).
+    // When that file is present it wins; otherwise fall back to a one-line note for local builds.
+    def generatedNotes = file("${projectDir}/release-notes.txt")
+    if (generatedNotes.exists()) {
+        releaseNotesFile = generatedNotes.path
+    } else {
+        releaseNotes = "v${appVersionName} — Back button now closes the open dialog/menu/settings/panel and returns to the previous screen instead of exiting the app. Also: image attachments wait for in-flight uploads (no more silently dropped images) + clearer feedback for non-image files."
+    }
 }
 
 dependencies {
