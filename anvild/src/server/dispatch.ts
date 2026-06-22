@@ -198,6 +198,18 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "env.clone":
+        deps.supervisor.cloneEnvironment(cmd.url, cmd.name, cmd.defaultBase);
+        if (cid) send(ack(cid));
+        return;
+
+      case "daemon.update":
+        deps.supervisor
+          .daemonUpdate(cmd.checkOnly ?? false)
+          .then((result) => send({ ...result, cid }))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "env.update":
         deps.supervisor.updateEnvironment(cmd.id, { name: cmd.name, defaultBase: cmd.defaultBase });
         if (cid) send(ack(cid));

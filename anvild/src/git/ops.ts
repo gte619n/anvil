@@ -2,10 +2,53 @@
  * Git / gh operations on a session worktree (arch §8). All shell out and return combined
  * stdout+stderr so the UI can show exactly what happened. PR ops use the `gh` CLI.
  */
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 function run(cmd: string[], cwd: string): { code: number; out: string } {
   const r = Bun.spawnSync(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
   const out = `${r.stdout.toString()}${r.stderr.toString()}`.trim();
   return { code: r.exitCode, out };
+}
+
+/** Where freshly-cloned environment repos land. */
+export function clonesParent(): string {
+  return join(homedir(), "Development");
+}
+
+/**
+ * Derive a directory name from a git URL: the last path segment with any `.git`
+ * suffix / trailing slash stripped. Handles ssh-scp (`git@host:owner/repo.git`),
+ * `ssh://`, and `https://` forms.
+ */
+export function repoNameFromUrl(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  const last = trimmed.split(/[/:]/).pop() ?? "";
+  return last.replace(/\.git$/i, "");
+}
+
+/**
+ * Clone `url` into `~/Development/<repo-name>` using the host's git auth (SSH keys,
+ * credential helpers). Synchronous. Throws on a bad URL, an existing destination, or a
+ * git failure (message carries git's combined output so the UI can show it).
+ */
+export function cloneRepo(url: string): { dest: string; output: string } {
+  const trimmed = url.trim();
+  if (!trimmed) throw new Error("a git URL is required");
+  const name = repoNameFromUrl(trimmed);
+  if (!name) throw new Error(`could not derive a repo name from URL: ${url}`);
+  const parent = clonesParent();
+  const dest = join(parent, name);
+  if (existsSync(dest)) {
+    throw new Error(`destination already exists: ${dest}`);
+  }
+  mkdirSync(parent, { recursive: true });
+  const r = run(["git", "clone", trimmed, dest], parent);
+  if (r.code !== 0) {
+    throw new Error(`git clone failed: ${r.out || `exit ${r.code}`}`);
+  }
+  return { dest, output: r.out };
 }
 
 const CAP = 60_000;

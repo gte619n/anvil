@@ -321,6 +321,17 @@ export interface GitResultEvent extends Envelope {
   output: string; // combined stdout+stderr
   url?: string; // PR url for create-pr
 }
+/** Result of a `daemon.update` — carries the combined log of fetch/pull/build for display. */
+export interface DaemonUpdateResultEvent extends Envelope {
+  type: "daemon.update.result";
+  cid?: Cid;
+  ok: boolean;
+  phase: "check" | "up-to-date" | "updated" | "error";
+  output: string; // human-readable log (git pull / build output, or the error)
+  currentVersion: string; // the daemon VERSION currently running
+  behind?: number; // commits behind upstream (phase "check"/"up-to-date")
+  willRestart?: boolean; // true → the daemon is about to restart to apply the update
+}
 /** Generic ack for a correlated command that has no richer response. */
 export interface AckEvent extends Envelope {
   type: "ack";
@@ -461,6 +472,7 @@ export type ServerEvent =
   | BudgetEvent
   | EnvironmentsEvent
   | GitResultEvent
+  | DaemonUpdateResultEvent
   | AckEvent
   | CommandErrorEvent
   // conversation
@@ -621,6 +633,12 @@ export interface EnvAddCmd extends Envelope, Correlated {
   repoRoot: string; // must be a git repo
   defaultBase?: string;
 }
+export interface EnvCloneCmd extends Envelope, Correlated {
+  type: "env.clone";
+  url: string; // git URL (ssh or https); cloned into ~/Development/<repo-name> using host git auth
+  name?: string; // display name; defaults to the repo name from the URL
+  defaultBase?: string;
+}
 export interface EnvUpdateCmd extends Envelope, Correlated {
   type: "env.update";
   id: string;
@@ -630,6 +648,13 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";
   id: string;
+}
+
+// Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
+// bundle, and (when running under the launchd service) restarts itself to apply the new code.
+export interface DaemonUpdateCmd extends Envelope, Correlated {
+  type: "daemon.update";
+  checkOnly?: boolean; // fetch + report whether an update is available; don't pull/build/restart
 }
 
 // 5d. Terminal (§7)
@@ -694,8 +719,10 @@ export type ClientCommand =
   | DirsListCmd
   | EnvListCmd
   | EnvAddCmd
+  | EnvCloneCmd
   | EnvUpdateCmd
   | EnvRemoveCmd
+  | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd
@@ -736,5 +763,15 @@ export namespace rest {
     markdown?: RenderedMarkdown;
     text?: string;
     missing?: boolean;
+  }
+  /** GET /api/daemon/update (check) · POST /api/daemon/update (apply) — daemon self-update (§5).
+   *  Lets native clients (macOS menu command) and scripts trigger an update without a WebSocket. */
+  export interface DaemonUpdateResponse {
+    ok: boolean;
+    phase: "check" | "up-to-date" | "updated" | "error";
+    output: string;
+    currentVersion: string;
+    behind?: number;
+    willRestart?: boolean;
   }
 }

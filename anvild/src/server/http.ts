@@ -10,8 +10,9 @@ import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
 import { hostname, networkInterfaces } from "node:os";
+import { VERSION } from "../version";
 
-export const VERSION = "0.1.0";
+export { VERSION };
 
 // The built web client (anvild/web/dist), resolved relative to this source file.
 const WEB_DIR = join(import.meta.dir, "..", "..", "web", "dist");
@@ -178,6 +179,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
         } catch {
           return new Response("bad request", { status: 400 });
         }
+      }
+
+      // Daemon self-update (arch §5): GET checks whether an update is available; POST applies it
+      // (pull + rebuild + restart). Mirrors the `daemon.update` WS command for native clients
+      // (the macOS menu command) and scripts that have no open WebSocket.
+      if (url.pathname === "/api/daemon/update" && (req.method === "GET" || req.method === "POST")) {
+        const result = await supervisor.daemonUpdate(req.method === "GET");
+        const body: rest.DaemonUpdateResponse = {
+          ok: result.ok,
+          phase: result.phase,
+          output: result.output,
+          currentVersion: result.currentVersion,
+          ...(result.behind !== undefined ? { behind: result.behind } : {}),
+          ...(result.willRestart !== undefined ? { willRestart: result.willRestart } : {}),
+        };
+        return Response.json(body, { status: result.ok ? 200 : 500 });
       }
 
       // environment README (arch §8): rendered markdown for the settings/management view

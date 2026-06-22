@@ -81,6 +81,7 @@ unset ANTHROPIC_API_KEY
 unset ANTHROPIC_AUTH_TOKEN
 export ANVIL_HOST=127.0.0.1
 export ANVIL_PORT=$PORT
+export ANVIL_MANAGED=launchd
 exec "$bun" run "$ANVILD_DIR/src/main.ts"
 LAUNCH
   chmod 755 "$LAUNCHER"

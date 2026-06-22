@@ -273,12 +273,12 @@ function enqueue(item: OutboxItem): void {
   updateOutboxBadge();
 }
 const cidWaiters = new Map<string, (e: ServerEvent) => void>();
-function sendAwait(cmd: Record<string, unknown> & { type: string; cid: string }): Promise<ServerEvent> {
+function sendAwait(cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs = 20_000): Promise<ServerEvent> {
   return new Promise((resolve, reject) => {
     const t = window.setTimeout(() => {
       cidWaiters.delete(cmd.cid);
       reject(new Error("timeout"));
-    }, 20_000);
+    }, timeoutMs);
     cidWaiters.set(cmd.cid, (e) => {
       clearTimeout(t);
       resolve(e);
@@ -1159,8 +1159,11 @@ async function renderServerCards(): Promise<void> {
     host.innerHTML = `<div class="card server-card">
       <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? daemonHost)}</b> <span class="small muted">(this server)</span></div>
       <div class="small muted"><code>${esc(daemonHost)}</code> · anvild ${esc(h.version ?? "?")}</div>
+      <div class="git-row" style="margin-top:10px"><button id="daemon-update">${icon("refresh")} Update Anvil</button></div>
+      <pre class="git-output" id="daemon-update-output" hidden></pre>
     </div>
     <p class="small muted">Multi-server (managing anvild on your other Macs from here) is on the roadmap — see the fleet design.</p>`;
+    wireDaemonUpdate();
   } catch {
     host.innerHTML = `<p class="small muted">Couldn't reach the server.</p>`;
   }
@@ -1205,6 +1208,41 @@ async function renderServerCards(): Promise<void> {
       })
       .catch(() => {});
   }
+}
+/** Wire the "Update Anvil" button: pull the daemon's source, rebuild, and restart it. */
+function wireDaemonUpdate(): void {
+  const btn = document.getElementById("daemon-update") as HTMLButtonElement | null;
+  const out = document.getElementById("daemon-update-output");
+  if (!btn || !out) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.innerHTML = `${icon("sync")} Updating…`;
+    out.hidden = false;
+    out.textContent = "Fetching, rebuilding… this can take a minute.";
+    try {
+      const res = await sendAwait({ type: "daemon.update", cid: newCid() }, 180_000);
+      if (res.type === "command.error") {
+        out.textContent = `Update failed: ${res.message}`;
+      } else if (res.type === "daemon.update.result") {
+        out.textContent = res.output;
+        if (res.phase === "up-to-date") {
+          toast(`Anvil is up to date (v${res.currentVersion}).`);
+        } else if (res.willRestart) {
+          out.textContent += "\n\nRestarting to apply… reload the app in a few seconds.";
+          toast("Anvil updated — restarting…");
+        } else if (res.phase === "updated") {
+          toast("Anvil updated — restart the daemon to apply.");
+        } else if (res.phase === "error") {
+          toast("Update failed — see Settings.");
+        }
+      }
+    } catch (e) {
+      out.textContent = `Update failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("refresh")} Update Anvil`;
+    }
+  });
 }
 function renderEnvCards(): void {
   const host = document.getElementById("env-cards");
@@ -2020,24 +2058,55 @@ function createOfflineSession(cmd: Record<string, unknown> & { type: string }, e
   toast("Session queued — will be created when you're back online");
 }
 
-/** Register a project repo as an environment. */
+/** Register a project repo as an environment — clone from a git URL, or pick a local repo. */
 function showAddEnvironment(): void {
   const m = document.createElement("div");
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>Add environment</h3>
-    <label>Name<input id="ae-name" placeholder="e.g. OXOS Bots" /></label>
+    <label>Clone from URL<input id="ae-url" placeholder="e.g. git@github.com:owner/repo.git" /></label>
+    <p class="small muted">Cloned into <code>~/Development/&lt;repo&gt;</code> using this machine's git/SSH credentials. Leave blank to use an existing local repo instead.</p>
+    <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
     <label>Default branch (optional)<input id="ae-base" placeholder="e.g. main or dev — leave blank for HEAD" /></label>
-    <p class="small muted">Pick a project <b>git repository</b> (environments must be git repos):</p>
+    <p class="small muted">Or pick an existing local <b>git repository</b>:</p>
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
   showModal(m);
   wireBrowser();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
-  $<HTMLButtonElement>("#ae-save").onclick = () => {
-    if (!browse.path) return;
-    const name = $<HTMLInputElement>("#ae-name").value.trim() || (browse.path.split("/").pop() ?? browse.path);
+  $<HTMLButtonElement>("#ae-save").onclick = async () => {
+    const url = $<HTMLInputElement>("#ae-url").value.trim();
+    const name = $<HTMLInputElement>("#ae-name").value.trim();
     const defaultBase = $<HTMLInputElement>("#ae-base").value.trim();
-    sock.send({ type: "env.add", name, repoRoot: browse.path, ...(defaultBase ? { defaultBase } : {}) });
+    if (url) {
+      const btn = $<HTMLButtonElement>("#ae-save");
+      btn.disabled = true;
+      btn.textContent = "Cloning…";
+      try {
+        const res = await sendAwait(
+          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), cid: newCid() },
+          120_000,
+        );
+        if (res.type === "command.error") {
+          toast(`Clone failed: ${res.message}`);
+          btn.disabled = false;
+          btn.textContent = "Add";
+          return;
+        }
+        closeModal(); // the environments broadcast refreshes Settings / the new-session list
+      } catch (e) {
+        toast(`Clone failed: ${e instanceof Error ? e.message : String(e)}`);
+        btn.disabled = false;
+        btn.textContent = "Add";
+      }
+      return;
+    }
+    if (!browse.path) return;
+    sock.send({
+      type: "env.add",
+      name: name || (browse.path.split("/").pop() ?? browse.path),
+      repoRoot: browse.path,
+      ...(defaultBase ? { defaultBase } : {}),
+    });
     closeModal(); // the environments broadcast refreshes Settings / the new-session list
   };
 }

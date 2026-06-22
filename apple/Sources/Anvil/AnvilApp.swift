@@ -11,6 +11,10 @@ struct AnvilApp: App {
         }
         .defaultSize(width: 1180, height: 800)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Update Anvil…") { Updater.runUpdate() }
+                    .keyboardShortcut("u", modifiers: .command)
+            }
             CommandGroup(after: .toolbar) {
                 Button("Reload") { NotificationCenter.default.post(name: .anvilReload, object: nil) }
                     .keyboardShortcut("r", modifiers: .command)

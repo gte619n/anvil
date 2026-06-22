@@ -9,6 +9,7 @@ import {
   type AutonomyPolicy,
   type Budget,
   type BudgetEvent,
+  type DaemonUpdateResultEvent,
   type Environment,
   type EnvironmentsEvent,
   type GitCmd,
@@ -38,6 +39,8 @@ import { EnvironmentStore } from "../env/store";
 import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
+import * as selfupdate from "../daemon/selfupdate";
+import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
 import { WebPush, type PushPayload } from "../push/webpush";
 import { Fcm } from "../push/fcm";
@@ -110,6 +113,50 @@ export class Supervisor {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     this.registry.toAll(this.environmentsEvent());
+  }
+  /** Clone a git URL into ~/Development (host git auth) and register it as an environment. */
+  cloneEnvironment(url: string, name?: string, defaultBase?: string): void {
+    let dest: string;
+    try {
+      dest = git.cloneRepo(url).dest;
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    try {
+      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    this.registry.toAll(this.environmentsEvent());
+  }
+
+  /** Update the daemon itself (arch §5): pull its source, rebuild web, and restart to apply.
+   *  `checkOnly` just fetches and reports whether an update is available. */
+  async daemonUpdate(checkOnly: boolean): Promise<DaemonUpdateResultEvent> {
+    const base = { v: PROTOCOL_VERSION, type: "daemon.update.result" as const, ts: now(), currentVersion: VERSION };
+    try {
+      const chk = await selfupdate.checkForUpdate();
+      if (checkOnly) {
+        return { ...base, ok: true, phase: "check", output: chk.output, behind: chk.behind };
+      }
+      if (chk.behind === 0) {
+        return { ...base, ok: true, phase: "up-to-date", output: chk.output, behind: 0 };
+      }
+      const upd = await selfupdate.applyUpdate();
+      if (selfupdate.isManaged()) {
+        selfupdate.scheduleRestart();
+        return { ...base, ok: true, phase: "updated", output: upd.output, willRestart: true };
+      }
+      return {
+        ...base,
+        ok: true,
+        phase: "updated",
+        output: `${upd.output}\n\nNot running under the launchd service — restart the daemon manually to apply.`,
+        willRestart: false,
+      };
+    } catch (e) {
+      return { ...base, ok: false, phase: "error", output: e instanceof Error ? e.message : String(e) };
+    }
   }
   /** Read & render an environment repo's README (arch §8). */
   envReadme(id: string): { markdown?: ReturnType<MarkdownRenderer["render"]>; text?: string; missing?: boolean } {
