@@ -3,6 +3,17 @@ import type { ContentBlock, Usage } from "@protocol";
 import type { SessionEventBody } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
+/** Handled via the question card (onUserDialog), not the normal tool_use/tool.result path. */
+const ASK_USER_QUESTION = "AskUserQuestion";
+
+/** The ids of any AskUserQuestion tool_use blocks in this message — so the driver can drop the
+ *  matching tool.result (the answers echo), keeping all SDK-shape knowledge in this module. */
+export function askUserQuestionToolIds(m: SDKMessage): string[] {
+  if (m.type !== "assistant") return [];
+  const content: any[] = (m as any).message?.content ?? [];
+  return content.filter((b) => b?.type === "tool_use" && b.name === ASK_USER_QUESTION).map((b) => b.id as string);
+}
+
 /**
  * Pure translator: one `SDKMessage` → the session-scoped events to emit (arch §6.2).
  * This is the SDK-drift containment point — keep all SDK-shape knowledge here and
@@ -26,11 +37,18 @@ export function mapMessage(m: SDKMessage, renderer: MarkdownRenderer): SessionEv
         if (b?.type === "text" && typeof b.text === "string") {
           blocks.push({ kind: "markdown", rendered: renderer.render(b.text) });
         } else if (b?.type === "tool_use") {
+          // AskUserQuestion is rendered as an interactive question card (driven by the
+          // question.request event), not as a tool block — suppress its raw tool_use here so
+          // the transcript doesn't also dump the questions JSON. (arch §6.6)
+          if (b.name === ASK_USER_QUESTION) continue;
           blocks.push({ kind: "tool_use", toolUseId: b.id, name: b.name, input: b.input });
           toolUses.push({ type: "tool.use", toolUseId: b.id, name: b.name, input: b.input });
         }
       }
-      return [{ type: "assistant.message", blocks }, ...toolUses];
+      // Skip an assistant.message that held only an AskUserQuestion (now empty) so the client
+      // doesn't render a blank bubble.
+      const events: SessionEventBody[] = blocks.length ? [{ type: "assistant.message", blocks }] : [];
+      return [...events, ...toolUses];
     }
 
     case "user": {

@@ -76,6 +76,7 @@ export type SessionStatus =
   | "thinking" // model generating
   | "running_tool" // a tool_use is executing
   | "awaiting_permission" // blocked on a permission decision
+  | "awaiting_question" // blocked on an AskUserQuestion answer (§6.6)
   | "error"
   | "exited"; // process gone
 
@@ -219,6 +220,32 @@ export interface PermissionSuggestion {
   label: string; // e.g. "Allow once", "Always allow Edit in this session"
 }
 
+// 3b. Questions (AskUserQuestion, §6.6)
+//
+// Claude's AskUserQuestion tool reaches the daemon as a `request_user_dialog` control
+// request (NOT a normal tool result): the SDK parks it until the host answers. The daemon
+// surfaces it to clients as `question.request`; a client answers with `question.respond`.
+// Modeled like permissions (parked broker, re-surfaced on cold attach) but the payload is a
+// set of multiple-choice questions rather than an allow/deny.
+
+export interface QuestionOption {
+  label: string; // concise choice text shown on the button/row
+  description: string; // what the option means / its trade-off
+  preview?: string; // optional richer preview (e.g. a code snippet) for the option
+}
+export interface Question {
+  question: string; // the full question text (also the answer key the SDK expects back)
+  header: string; // short chip label (≤12 chars), e.g. "Library"
+  options: QuestionOption[]; // 2-4 mutually exclusive choices (unless multiSelect)
+  multiSelect?: boolean; // true → the user may pick more than one option
+}
+/** One question's answer: the chosen option label(s), plus any free-text ("Other") the user typed. */
+export interface QuestionAnswer {
+  question: string; // matches Question.question
+  labels: string[]; // chosen option labels (1 for single-select; ≥1 for multiSelect)
+  notes?: string; // free-text the user typed in the "Other" field, if any
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Server → Client events
 // ─────────────────────────────────────────────────────────────────────────────
@@ -314,6 +341,12 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   input: unknown;
   suggestions: PermissionSuggestion[];
 }
+/** Claude is asking the user to choose among options (AskUserQuestion, §6.6). */
+export interface QuestionRequestEvent extends Envelope, SessionScoped {
+  type: "question.request";
+  requestId: RequestId;
+  questions: Question[];
+}
 export interface StatusEvent extends Envelope, SessionScoped {
   type: "status";
   status: SessionStatus;
@@ -400,6 +433,7 @@ export type ServerEvent =
   | ToolUseEvent
   | ToolResultEvent
   | PermissionRequestEvent
+  | QuestionRequestEvent
   | StatusEvent
   | UsageEvent
   | ResultEvent
@@ -496,6 +530,13 @@ export interface PermissionRespondCmd extends Envelope, Correlated {
   requestId: RequestId;
   decision: PermissionDecision;
   updatedInput?: unknown; // optional edited tool input
+}
+/** Answer a parked AskUserQuestion (§6.6) — may come from any device. */
+export interface QuestionRespondCmd extends Envelope, Correlated {
+  type: "question.respond";
+  requestId: RequestId;
+  answers: QuestionAnswer[]; // one per question
+  cancelled?: boolean; // user dismissed without answering → the SDK applies its default
 }
 export interface InterruptCmd extends Envelope, Correlated {
   type: "interrupt";
@@ -604,6 +645,7 @@ export type ClientCommand =
   // conversation
   | PromptSendCmd
   | PermissionRespondCmd
+  | QuestionRespondCmd
   | InterruptCmd
   // files
   | FsListCmd

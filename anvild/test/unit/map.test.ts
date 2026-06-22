@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { mapMessage, extractSessionId, extractResultUsage } from "../../src/agent/map";
+import { mapMessage, extractSessionId, extractResultUsage, askUserQuestionToolIds } from "../../src/agent/map";
 import { PassthroughRenderer } from "../../src/render/markdown";
 
 const r = new PassthroughRenderer();
@@ -32,6 +32,32 @@ test("assistant tool_use → assistant.message block + a tool.use event", () => 
   expect(out.map((e) => e.type)).toEqual(["assistant.message", "tool.use"]);
   expect((out[1] as any).toolUseId).toBe("tu_1");
   expect((out[1] as any).name).toBe("Bash");
+});
+
+test("AskUserQuestion tool_use is suppressed (rendered as a question card, not a tool block)", () => {
+  const m = {
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id: "tu_q", name: "AskUserQuestion", input: { questions: [] } }] },
+  };
+  // No assistant.message (blocks would be empty) and no tool.use event for the question.
+  expect(map(m)).toEqual([]);
+  expect(askUserQuestionToolIds(m as unknown as SDKMessage)).toEqual(["tu_q"]);
+});
+
+test("AskUserQuestion alongside text keeps the text block but drops the question tool_use", () => {
+  const out = map({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "let me ask" },
+        { type: "tool_use", id: "tu_q", name: "AskUserQuestion", input: { questions: [] } },
+        { type: "tool_use", id: "tu_b", name: "Bash", input: { command: "ls" } },
+      ],
+    },
+  });
+  expect(out.map((e) => e.type)).toEqual(["assistant.message", "tool.use"]);
+  expect((out[0] as any).blocks.map((b: any) => b.kind)).toEqual(["markdown", "tool_use"]);
+  expect((out[1] as any).name).toBe("Bash"); // only the non-question tool.use is emitted
 });
 
 test("user tool_result → tool.result (string + array content)", () => {

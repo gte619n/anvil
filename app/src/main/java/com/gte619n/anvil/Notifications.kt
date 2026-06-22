@@ -25,7 +25,9 @@ object Notifications {
     /**
      * Show a notification that deep-links to [sessionId] when tapped. When [kind] is "permission"
      * and a [requestId] is present, attach Allow / Deny action buttons that answer the parked
-     * prompt directly from the shade (so it can't get lost behind an in-app dialog).
+     * prompt directly from the shade (so it can't get lost behind an in-app dialog). When [kind]
+     * is "question" (AskUserQuestion), there are no shade actions — multiple-choice options can't
+     * be buttons — so it's tap-to-open, but kept up (ongoing) until answered, like permission.
      */
     fun show(
         context: Context,
@@ -67,6 +69,11 @@ object Notifications {
             builder.addAction(0, "Allow", permissionAction(context, notifId, requestId, "allow"))
             builder.addAction(0, "Deny", permissionAction(context, notifId, requestId, "deny"))
             // Keep it up until answered — a self-dismissing prompt is easy to miss.
+            builder.setAutoCancel(false)
+            builder.setOngoing(true)
+        } else if (kind == "question") {
+            // No shade actions (options aren't yes/no) — tap to open and answer in-app — but keep
+            // it up until answered so a parked question isn't missed. Cleared when the app opens it.
             builder.setAutoCancel(false)
             builder.setOngoing(true)
         }

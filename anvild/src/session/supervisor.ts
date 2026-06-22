@@ -15,6 +15,7 @@ import {
   type GitResultEvent,
   type Model,
   type PermissionDecision,
+  type QuestionAnswer,
   type ServerEvent,
   type Session as SessionData,
   type SessionCreateCmd,
@@ -29,6 +30,7 @@ import { createWorktree, gitStatus, recreateWorktree, removeWorktree, worktreeHe
 import { AgentDriver } from "../agent/driver";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
+import { QuestionBroker } from "../agent/questions";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { BudgetTracker } from "../budget/tracker";
@@ -62,6 +64,7 @@ export class Supervisor {
   private readonly drivers = new Map<string, AgentDriver>();
   private readonly logs = new Map<string, EventLog>();
   private readonly broker = new PermissionBroker();
+  private readonly questionBroker = new QuestionBroker();
   /** Sessions whose awaiting_permission state has been announced to the whole fleet (list badge). */
   private readonly awaitingAnnounced = new Set<string>();
   private readonly renderer: MarkdownRenderer;
@@ -145,6 +148,10 @@ export class Supervisor {
     // never see the prompt — the request would be "lost" and the session stuck forever (arch §6.6).
     const pending = s.permissionRequestEvent();
     if (pending) events.push(pending);
+    // Same for a parked AskUserQuestion — question.request isn't conversation history, so a cold
+    // attach would otherwise never see it and the session would look stuck (arch §6.6).
+    const pendingQuestion = s.questionRequestEvent();
+    if (pendingQuestion) events.push(pendingQuestion);
     return events;
   }
 
@@ -444,7 +451,7 @@ export class Supervisor {
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
     let driver = this.drivers.get(id);
     if (!driver) {
-      driver = new AgentDriver(s, this.renderer, this.broker, this.agentEnv, (model, costUsd) =>
+      driver = new AgentDriver(s, this.renderer, this.broker, this.questionBroker, this.agentEnv, (model, costUsd) =>
         this.onAgentResult(id, model, costUsd),
       );
       this.drivers.set(id, driver);
@@ -466,6 +473,17 @@ export class Supervisor {
     const s = sessionId ? this.sessions.get(sessionId) : undefined;
     s?.clearPermission(requestId); // stop re-surfacing it on reattach
     s?.setStatus(decision === "deny" ? "thinking" : "running_tool");
+  }
+
+  /** Answer (or cancel) a parked AskUserQuestion (arch §6.6) — may come from any device. */
+  resolveQuestion(requestId: string, answers: QuestionAnswer[], cancelled: boolean): void {
+    const sessionId = this.questionBroker.sessionFor(requestId);
+    if (!this.questionBroker.resolve(requestId, { cancelled, answers })) {
+      throw new BadCommand(`no pending question: ${requestId}`);
+    }
+    const s = sessionId ? this.sessions.get(sessionId) : undefined;
+    s?.clearQuestion(requestId); // stop re-surfacing it on reattach
+    s?.setStatus("running_tool"); // the AskUserQuestion tool completes → the turn continues
   }
 
   setModel(id: string, model: Model): void {
@@ -526,7 +544,9 @@ export class Supervisor {
     this.clearWatchers(id);
     this.killTerminal(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
+    this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
     s.clearPermission();
+    s.clearQuestion();
 
     let recovered: string | undefined;
     if (s.data.source === "fresh-worktree" && s.data.worktree) {
@@ -573,7 +593,7 @@ export class Supervisor {
    */
   private maybeBroadcastAwaiting(sessionId: string, event: ServerEvent): void {
     if (event.type !== "status") return;
-    const isAwaiting = event.status === "awaiting_permission";
+    const isAwaiting = event.status === "awaiting_permission" || event.status === "awaiting_question";
     const wasAwaiting = this.awaitingAnnounced.has(sessionId);
     if (isAwaiting === wasAwaiting) return;
     if (isAwaiting) this.awaitingAnnounced.add(sessionId);
@@ -592,6 +612,10 @@ export class Supervisor {
     if (event.type === "permission.request") {
       const ask = summarizeRequest(event.tool, event.input);
       payload = { title, body: ask, dir, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool, ask };
+    } else if (event.type === "question.request") {
+      const first = event.questions[0]?.question ?? "Claude has a question";
+      const ask = event.questions.length > 1 ? `${first} (+${event.questions.length - 1} more)` : first;
+      payload = { title, body: ask, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
       payload = { title, body: "Finished — your turn.", dir, sessionId, tag: `done-${sessionId}`, kind: "result" };
     }
@@ -616,7 +640,7 @@ export class Supervisor {
   }
 
   private restore(): void {
-    const transient: SessionData["status"][] = ["thinking", "running_tool", "awaiting_permission"];
+    const transient: SessionData["status"][] = ["thinking", "running_tool", "awaiting_permission", "awaiting_question"];
     let recovered = 0;
     let quarantined = 0;
     for (const p of this.store.loadAll()) {

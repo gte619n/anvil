@@ -88,6 +88,13 @@ async function decide(
   tool: string,
   input: Record<string, unknown>,
 ): Promise<Decision> {
+  // AskUserQuestion isn't an action to gate — it's handled by the onUserDialog question flow
+  // (arch §6.6). Auto-allow it here so the user sees one question card, not a permission prompt
+  // for the question followed by the question itself.
+  if (tool === "AskUserQuestion") {
+    return { behavior: "allow", updatedInput: input, reason: "question dialog" };
+  }
+
   if (session.isAlwaysAllowed(tool)) {
     return { behavior: "allow", updatedInput: input, reason: "remembered allow" };
   }

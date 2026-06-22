@@ -1,6 +1,7 @@
 import {
   PROTOCOL_VERSION,
   type PermissionSuggestion,
+  type Question,
   type ServerEvent,
   type Session as SessionData,
   type SessionStatus,
@@ -28,6 +29,11 @@ export interface PendingPermission {
   input: unknown;
   suggestions: PermissionSuggestion[];
 }
+/** An AskUserQuestion prompt currently parked in the onUserDialog handler (arch §6.6). */
+export interface PendingQuestion {
+  requestId: string;
+  questions: Question[];
+}
 
 export class Session {
   private nextSeq: number;
@@ -35,6 +41,8 @@ export class Session {
   private readonly alwaysAllow = new Set<string>();
   /** Set while blocked on a decision so a (re)attaching client can re-surface it (arch §6.4). */
   pendingPermission: PendingPermission | undefined;
+  /** Set while blocked on an AskUserQuestion answer so a cold-attaching client re-surfaces it. */
+  pendingQuestion: PendingQuestion | undefined;
   /** Once disposed (killed/archived/shutdown) `emit` is a no-op — a late-draining agent turn must
    *  not write into a dead session (would target a removed dir/connection and crash the daemon). */
   private disposed = false;
@@ -135,6 +143,33 @@ export class Session {
       tool: p.tool,
       input: p.input,
       suggestions: p.suggestions,
+    };
+  }
+
+  /** Block on an AskUserQuestion answer (arch §6.6): flip to awaiting_question + emit the prompt. */
+  requestQuestion(requestId: string, questions: Question[]): void {
+    this.pendingQuestion = { requestId, questions };
+    this.setStatus("awaiting_question");
+    this.emit({ type: "question.request", requestId, questions });
+  }
+
+  /** A parked question was answered (or superseded): stop re-surfacing it on reattach. */
+  clearQuestion(requestId?: string): void {
+    if (!requestId || this.pendingQuestion?.requestId === requestId) this.pendingQuestion = undefined;
+  }
+
+  /** The unresolved AskUserQuestion prompt, if this session is currently blocked on one. */
+  questionRequestEvent(): ServerEvent | undefined {
+    if (!this.pendingQuestion) return undefined;
+    const q = this.pendingQuestion;
+    return {
+      v: PROTOCOL_VERSION,
+      type: "question.request",
+      ts: now(),
+      sessionId: this.data.id,
+      seq: this.lastSeq,
+      requestId: q.requestId,
+      questions: q.questions,
     };
   }
 

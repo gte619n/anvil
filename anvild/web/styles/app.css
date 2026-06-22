@@ -236,6 +236,29 @@ details.tool-result.error > summary { color: var(--danger); }
 .perm-done { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-weight: 600; }
 .perm-done .msym { font-size: 18px; }
 
+/* Question card (AskUserQuestion, §6.6) */
+.bubble.question { align-self: stretch; max-width: 100%; border: 1px solid var(--accent); border-radius: 12px; padding: 12px 14px; background: color-mix(in srgb, var(--accent) 7%, var(--bg)); }
+.bubble.question .q-head { display: flex; align-items: center; gap: 7px; font-weight: 600; margin-bottom: 4px; }
+.bubble.question .q-head .msym { color: var(--accent); font-size: 19px; }
+.q-block { margin: 12px 0; }
+.q-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-weight: 600; margin-bottom: 8px; }
+.q-chip { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; color: var(--accent); border: 1px solid var(--accent); border-radius: 6px; padding: 1px 6px; }
+.q-options { display: flex; flex-direction: column; gap: 6px; }
+.q-option { display: flex; align-items: flex-start; gap: 9px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); cursor: pointer; }
+.q-option:hover { background: var(--panel); }
+.q-option input { margin-top: 2px; accent-color: var(--accent); }
+.q-opt-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.q-opt-desc { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.q-other { margin-top: 8px; width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+.q-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.q-btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-weight: 600; }
+.q-btn:hover { background: var(--panel); }
+.q-btn.submit { background: var(--accent); color: #fff; border-color: var(--accent); }
+.q-btn:disabled { opacity: 0.5; cursor: default; }
+.bubble.question.resolved { opacity: 0.6; border-color: var(--border); background: var(--tool-bg); }
+.q-done { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-weight: 600; }
+.q-done .msym { font-size: 18px; }
+
 .md { min-width: 0; overflow-wrap: anywhere; }
 .md pre { background: var(--code-bg); padding: 12px; border-radius: 8px; overflow-x: auto; max-width: 100%; }
 .md pre code { overflow-wrap: normal; white-space: pre; } /* code scrolls, never breaks mid-token */

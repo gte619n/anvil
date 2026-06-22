@@ -1,8 +1,9 @@
 import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Model } from "@protocol";
 import { InputQueue, userMessage, type InlineImage } from "./input-queue";
-import { extractResultUsage, extractSessionId, mapMessage } from "./map";
+import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { makePreToolUseHook, type PermissionBroker } from "./permissions";
+import { ASK_USER_QUESTION_DIALOG, makeUserDialogHandler, type QuestionBroker } from "./questions";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
@@ -18,10 +19,14 @@ export class AgentDriver {
   private readonly input = new InputQueue();
   private q: Query | undefined;
 
+  /** tool_use ids of in-flight AskUserQuestions — their tool.result (answers echo) is dropped. */
+  private readonly askQuestionIds = new Set<string>();
+
   constructor(
     private readonly session: Session,
     private readonly renderer: MarkdownRenderer,
     private readonly broker: PermissionBroker,
+    private readonly questionBroker: QuestionBroker,
     private readonly env: Record<string, string>,
     private readonly onResult: ResultRecorder,
   ) {}
@@ -100,6 +105,11 @@ export class AgentDriver {
         hooks: {
           PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker)], timeout: 3600 }],
         },
+        // AskUserQuestion arrives as a request_user_dialog control request, not a tool result.
+        // We must BOTH provide onUserDialog AND declare the dialog kind — the SDK fails closed
+        // (degrades to "user did not answer") without the kind in supportedDialogKinds. (§6.6)
+        onUserDialog: makeUserDialogHandler(s, this.questionBroker),
+        supportedDialogKinds: [ASK_USER_QUESTION_DIALOG],
         executable: "bun",
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
       },
@@ -114,10 +124,14 @@ export class AgentDriver {
         const sid = extractSessionId(m);
         if (sid) this.session.data.claudeSessionId = sid;
 
+        for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
         const bodies = mapMessage(m, this.renderer);
         let sawToolUse = false;
         let sawToolResult = false;
         for (const body of bodies) {
+          // Drop the AskUserQuestion tool.result (the answers echo) — the question card already
+          // shows the user's choice; the raw result would just re-dump the answers as JSON.
+          if (body.type === "tool.result" && this.askQuestionIds.delete(body.toolUseId)) continue;
           if (body.type === "tool.use") sawToolUse = true;
           if (body.type === "tool.result") sawToolResult = true;
           this.session.emit(body);

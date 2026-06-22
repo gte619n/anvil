@@ -76,6 +76,7 @@ tasks.register("bundleWebAssets", Exec) {
     environment "APP_VERSION", appVersionName
     commandLine "bash", "-lc", "bun run build:web && bun run web/bundle-native.ts '${out}'"
     inputs.dir("${anvild}/web/src")
+    inputs.dir("${anvild}/web/styles") // re-bundle when the stylesheet changes (e.g. cards)
     inputs.file("${anvild}/web/index.html")
     inputs.file("${anvild}/web/sw.js") // re-bundle when the service worker changes
     inputs.property("appVersion", appVersionName) // re-bundle when the version changes

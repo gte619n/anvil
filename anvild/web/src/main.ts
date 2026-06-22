@@ -28,6 +28,8 @@ import type {
   GitResultEvent,
   GitStatus,
   PermissionSuggestion,
+  Question,
+  QuestionAnswer,
   ServerEvent,
   Session,
 } from "../../protocol";
@@ -562,6 +564,9 @@ function handleSessionEvent(e: ServerEvent): void {
     case "permission.request":
       showPermission(e.requestId, e.tool, e.input, e.suggestions);
       return;
+    case "question.request":
+      showQuestion(e.requestId, e.questions);
+      return;
     case "fs.changed":
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
       return;
@@ -734,6 +739,7 @@ function clearConversation(): void {
   streaming = null;
   thinkingEl = null; // detached by the innerHTML reset
   permCards.clear(); // cards are detached by the reset; the re-surfaced request re-adds them
+  questionCards.clear();
 }
 function renderEmptyState(): void {
   streaming = null;
@@ -753,9 +759,11 @@ function deselectSession(): void {
 }
 function setStatus(status: string): void {
   // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
-  // retire any open permission cards so a stale one can't linger.
+  // retire any open permission/question cards so a stale one can't linger.
   if (status !== "awaiting_permission") clearPermissionCards();
-  if (status === "idle" || status === "awaiting_permission") hideThinking(); // the card is the indicator while parked
+  if (status !== "awaiting_question") clearQuestionCards();
+  const awaiting = status === "awaiting_permission" || status === "awaiting_question";
+  if (status === "idle" || awaiting) hideThinking(); // the card is the indicator while parked
   else if (!streaming) showThinking(status); // while text streams, the text is the activity
   const s = activeId ? sessions.get(activeId) : undefined;
   if (s) {
@@ -793,7 +801,7 @@ function renderSessions(): void {
   ul.innerHTML = "";
   const items = [...sessions.values()].sort((a, b) => Number(!!a.archived) - Number(!!b.archived));
   for (const s of items) {
-    const awaiting = !s.pending && !s.archived && s.status === "awaiting_permission";
+    const awaiting = !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
     const li = document.createElement("li");
     li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}`;
     const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
@@ -1834,6 +1842,120 @@ function resolvePermissionUI(requestId: string, label?: string): void {
 /** A session left awaiting_permission (answered here, on another device, or superseded). */
 function clearPermissionCards(): void {
   for (const id of [...permCards.keys()]) resolvePermissionUI(id);
+}
+
+// ── Question cards (AskUserQuestion, §6.6) ───────────────────────────────────────
+// Inline like permission cards (survive session/app switches; keyed by requestId so a
+// re-surfaced request on cold attach doesn't stack duplicates). Each question renders its
+// options as radios (single-select) or checkboxes (multiSelect) plus an optional "Other" field;
+// one Submit answers all of them.
+const questionCards = new Map<string, HTMLElement>();
+
+function showQuestion(requestId: string, questions: Question[]): void {
+  if (questionCards.has(requestId)) return; // already shown (re-attach replay)
+  hideThinking(); // the turn is parked on the answer, not working
+  const card = document.createElement("div");
+  card.className = "bubble question";
+  card.dataset.req = requestId;
+
+  const head = document.createElement("div");
+  head.className = "q-head";
+  head.innerHTML = `${icon("help")}<span>Claude is asking…</span>`;
+  card.appendChild(head);
+
+  for (const [qi, q] of questions.entries()) {
+    const block = document.createElement("div");
+    block.className = "q-block";
+    block.innerHTML =
+      `<div class="q-title">${q.header ? `<span class="q-chip">${esc(q.header)}</span>` : ""}<span>${esc(q.question)}</span></div>`;
+    const opts = document.createElement("div");
+    opts.className = "q-options";
+    const inputType = q.multiSelect ? "checkbox" : "radio";
+    for (const [oi, o] of q.options.entries()) {
+      const id = `q${requestId}-${qi}-${oi}`;
+      const row = document.createElement("label");
+      row.className = "q-option";
+      row.htmlFor = id;
+      row.innerHTML =
+        `<input type="${inputType}" id="${id}" name="q${requestId}-${qi}" value="${esc(o.label)}">` +
+        `<span class="q-opt-text"><b>${esc(o.label)}</b>${o.description ? `<span class="q-opt-desc">${esc(o.description)}</span>` : ""}</span>`;
+      opts.appendChild(row);
+    }
+    // "Other" free-text affordance (the SDK always offers one).
+    const other = document.createElement("input");
+    other.type = "text";
+    other.className = "q-other";
+    other.placeholder = "Other… (type a custom answer)";
+    other.dataset.qi = String(qi);
+    block.appendChild(opts);
+    block.appendChild(other);
+    card.appendChild(block);
+  }
+
+  const btns = document.createElement("div");
+  btns.className = "q-btns";
+  const submit = document.createElement("button");
+  submit.className = "q-btn submit";
+  submit.textContent = questions.length > 1 ? "Submit answers" : "Submit";
+  submit.onclick = () => {
+    const answers = collectAnswers(card, questions);
+    if (!answers) {
+      toast("Pick or type an answer for each question.");
+      return;
+    }
+    sock.send({ type: "question.respond", requestId, answers });
+    resolveQuestionUI(requestId, summarizeAnswers(answers));
+  };
+  const skip = document.createElement("button");
+  skip.className = "q-btn skip";
+  skip.textContent = "Skip";
+  skip.onclick = () => {
+    sock.send({ type: "question.respond", requestId, answers: [], cancelled: true });
+    resolveQuestionUI(requestId, "Skipped");
+  };
+  btns.appendChild(skip);
+  btns.appendChild(submit);
+  card.appendChild(btns);
+
+  questionCards.set(requestId, card);
+  conversation.appendChild(card);
+  scrollDown();
+}
+
+/** Gather one answer per question; returns null if any question is left unanswered. */
+function collectAnswers(card: HTMLElement, questions: Question[]): QuestionAnswer[] | null {
+  const answers: QuestionAnswer[] = [];
+  const blocks = card.querySelectorAll<HTMLElement>(".q-block");
+  for (const [qi, q] of questions.entries()) {
+    const block = blocks[qi];
+    if (!block) return null;
+    const labels = [...block.querySelectorAll<HTMLInputElement>("input[type=radio]:checked, input[type=checkbox]:checked")].map((i) => i.value);
+    const notes = block.querySelector<HTMLInputElement>(".q-other")?.value.trim() || undefined;
+    if (notes) labels.push(notes); // a typed "Other" answer counts as a chosen label
+    if (labels.length === 0) return null; // unanswered
+    answers.push({ question: q.question, labels, ...(notes ? { notes } : {}) });
+  }
+  return answers;
+}
+
+function summarizeAnswers(answers: QuestionAnswer[]): string {
+  return answers.map((a) => a.labels.join(", ")).join(" · ");
+}
+
+/** Mark a question card answered: lock its inputs, show the choice, then fade it out. */
+function resolveQuestionUI(requestId: string, label?: string): void {
+  const card = questionCards.get(requestId);
+  if (!card) return;
+  questionCards.delete(requestId);
+  card.classList.add("resolved");
+  card.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = true));
+  const btns = card.querySelector(".q-btns");
+  if (btns && label) btns.innerHTML = `<span class="q-done">${icon("check")} ${esc(label)}</span>`;
+}
+
+/** A session left awaiting_question (answered here, on another device, or superseded). */
+function clearQuestionCards(): void {
+  for (const id of [...questionCards.keys()]) resolveQuestionUI(id);
 }
 
 // ── Toast ──────────────────────────────────────────────────────────────────────

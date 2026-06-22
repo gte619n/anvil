@@ -169,6 +169,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "question.respond":
+        deps.supervisor.resolveQuestion(cmd.requestId, cmd.answers ?? [], Boolean(cmd.cancelled));
+        if (cid) send(ack(cid));
+        return;
+
       case "dirs.list": {
         const listing = listDirs(cmd.path);
         send({
