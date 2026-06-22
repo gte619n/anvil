@@ -164,6 +164,26 @@ Notes:
   it passes `appVersionName` to the web build as `APP_VERSION`.
 - Update `releaseNotes` in `app/build.gradle` to describe what changed.
 
+#### Automated builds on merge to `main` (GitHub Actions)
+
+Every push/merge to `main` runs `.github/workflows/android-release.yml`, which builds the
+debug APK and distributes it to the testers (`evan.ruff@gmail.com`) on Firebase App
+Distribution — no manual `gradlew` needed. It also uploads the APK as a workflow artifact and
+can be triggered manually from the Actions tab (**Run workflow**).
+
+What the workflow handles for you:
+
+- **Version** — `ANVIL_BUILD_NUMBER` (the run number) drives a unique, monotonic `versionCode`
+  (`100 + run`) and appends `(build N)` to the visible version, so testers can confirm at a
+  glance they're on the latest. Bump `baseVersionName` in `app/build.gradle` for real releases.
+- **Release notes** — generated from the commit subjects that landed in the push and written to
+  `app/release-notes.txt`, which the Firebase plugin uses as `releaseNotesFile`.
+
+**One-time setup:** add a repo secret `FIREBASE_SERVICE_ACCOUNT` (Settings → Secrets and
+variables → Actions) containing the full JSON key for a service account with the **Firebase App
+Distribution Admin** role. The workflow writes it to a temp file and points
+`GOOGLE_APPLICATION_CREDENTIALS` at it.
+
 ## Session Status Server (Optional)
 
 The `scripts/` directory contains a session status server that provides:
