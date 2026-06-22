@@ -18,7 +18,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
 };
 import type {
   AttachmentRef,
-  Budget,
+  AutonomyPolicy,
   ContentBlock,
   ConversationEvent,
   DirEntry,
@@ -505,8 +505,8 @@ function onEvent(e: ServerEvent): void {
       else renderSessions();
       return;
     case "budget":
-      renderBudget(e.budget);
-      return;
+      return; // rate-limit gauge is tracked server-side; the UI display is removed for now
+
     case "environments":
       onEnvironments(e.environments);
       return;
@@ -1154,13 +1154,11 @@ function closeSettings(): void {
 async function renderServerCards(): Promise<void> {
   const host = $("#server-cards");
   try {
-    const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string; budget?: Budget };
-    const budgetLine = budgetText(h.budget);
+    const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string };
     const daemonHost = new URL(apiUrl("/")).host;
     host.innerHTML = `<div class="card server-card">
       <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? daemonHost)}</b> <span class="small muted">(this server)</span></div>
       <div class="small muted"><code>${esc(daemonHost)}</code> · anvild ${esc(h.version ?? "?")}</div>
-      <div class="small muted">${esc(budgetLine)}</div>
     </div>
     <p class="small muted">Multi-server (managing anvild on your other Macs from here) is on the roadmap — see the fleet design.</p>`;
   } catch {
@@ -1255,23 +1253,6 @@ async function toggleReadme(id: string): Promise<void> {
   } catch {
     body.innerHTML = `<p class="small muted">Couldn't load the README.</p>`;
   }
-}
-function renderBudget(b: Budget): void {
-  // The sidebar usage meter is hidden for now (UI refinement) — keep the handler a safe no-op
-  // when the element is absent so the budget event still flows to the Settings server card.
-  const el = document.getElementById("budget");
-  if (!el) return;
-  el.classList.toggle("warn", b.warn);
-  el.textContent = budgetText(b);
-  el.title = b.available && b.subscriptionType ? `${b.subscriptionType} plan usage` : "";
-}
-/** Compact plan-usage line from the real rate-limit windows; empty when no plan limits apply. */
-function budgetText(b?: Budget): string {
-  if (!b || !b.available) return "";
-  const parts: string[] = [];
-  if (b.week) parts.push(`Week ${Math.round(b.week.utilization)}%`);
-  if (b.session) parts.push(`Session ${Math.round(b.session.utilization)}%`);
-  return parts.join(" · ");
 }
 function selectSession(id: string, push = true): void {
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
@@ -1882,10 +1863,19 @@ function closeModalDom(): void {
   $("#modal-root").innerHTML = "";
 }
 const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
-// New sessions default to Opus + mostly-autonomous; the picker UI was removed as unnecessary
-// (UI refinement). Change these here if a chooser is ever reintroduced.
+// Model is fixed to Opus (no picker). New sessions default to "bypass" (skip all permission
+// prompts); the autonomy picker lets the user dial that back per session.
 const DEFAULT_MODEL = "opus";
-const DEFAULT_AUTONOMY = "mostly-autonomous";
+const DEFAULT_AUTONOMY: AutonomyPolicy = "bypass";
+const AUTONOMY_PICKER = `<label>Autonomy<select id="ns-auto">
+  <option value="bypass" selected>Bypass — skip all permission prompts ⚠️</option>
+  <option value="mostly-autonomous">Mostly autonomous</option>
+  <option value="allowlist">Allowlist</option>
+  <option value="prompt-all">Prompt all</option>
+</select></label>`;
+/** The chosen autonomy from the open dialog's picker, or the default if it isn't present. */
+const selectedAutonomy = (): AutonomyPolicy =>
+  ((document.getElementById("ns-auto") as HTMLSelectElement | null)?.value as AutonomyPolicy) || DEFAULT_AUTONOMY;
 
 /** A reusable directory browser (used by add-environment and one-off). */
 function browserMarkup(): string {
@@ -1932,6 +1922,7 @@ function showNewSession(): void {
       <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
       <p class="small muted" id="ns-note"></p>
       <p class="small warn-text" id="ns-warn"></p>
+      ${AUTONOMY_PICKER}
       <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-create">Create</button></div>
       <p class="small muted"><a id="ns-manage" href="#">⚙ Manage environments…</a> · <a id="ns-oneoff" href="#">one-off folder…</a></p></div>`;
   }
@@ -1990,7 +1981,7 @@ function showNewSession(): void {
       title: name,
       environmentId: env.id,
       model: DEFAULT_MODEL,
-      autonomy: DEFAULT_AUTONOMY,
+      autonomy: selectedAutonomy(),
     };
     const cmd = env.isRepo
       ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", ...common }
@@ -2090,6 +2081,7 @@ function showOneOff(): void {
   m.innerHTML = `<div class="modal-box"><h3>One-off session</h3>
     <p class="small muted">Work directly in a folder (no worktree):</p>
     ${browserMarkup()}
+    ${AUTONOMY_PICKER}
     <div class="btns"><button type="button" id="oo-back">Back</button><button type="button" id="oo-create">Open here</button></div></div>`;
   showModal(m);
   wireBrowser();
@@ -2101,7 +2093,7 @@ function showOneOff(): void {
       source: "existing-dir",
       cwd: browse.path,
       model: DEFAULT_MODEL,
-      autonomy: DEFAULT_AUTONOMY,
+      autonomy: selectedAutonomy(),
     });
     closeModal();
   };

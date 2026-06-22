@@ -100,6 +100,14 @@ async function decide(
   }
 
   const policy = session.data.autonomy;
+
+  // "bypass" is the daemon equivalent of `claude --dangerously-skip-permissions`: allow every
+  // tool unconditionally, skipping even the danger list. Short-circuit before isDangerous() so a
+  // user who opted into this mode is never parked on a prompt (arch §6.6).
+  if (policy === "bypass") {
+    return { behavior: "allow", updatedInput: input, reason: "bypass: permissions skipped" };
+  }
+
   const verdict = isDangerous(tool, input, session.data.cwd);
   const mustPrompt =
     policy === "prompt-all" ||

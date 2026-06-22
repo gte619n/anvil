@@ -21,11 +21,23 @@ swift run        # launches the window
 `swift run` runs the SPM executable directly (uses `Bundle.module` for the bundled web). This is
 the canonical local build with the Command Line Tools — **no Xcode.app required**.
 
-## Producing a distributable .app (follow-up)
+## Producing a distributable .app
 
-A signed `Anvil.app` is assembled from the `swift build` product + the SPM resource bundle via a
-CLI script (no Xcode needed) — TODO. iOS (device install, push, TestFlight) requires full
-**Xcode.app** + the Apple Developer Program.
+```sh
+cd apple
+./make-app.sh            # → apple/dist/Anvil.app  (bundles web, builds release, signs)
+./make-app.sh --skip-web # reuse the existing Sources/Anvil/web bundle (faster)
+./make-app.sh --debug    # package the debug build
+open dist/Anvil.app
+```
+
+`make-app.sh` needs only the Command Line Tools (`swift`, `iconutil`, `codesign`) — **no
+Xcode.app**. It lays out `Anvil.app/Contents/{MacOS,Resources}`, copies the bundled web client to
+`Contents/Resources/web` (served at runtime via `Bundle.main`), compiles the `.appiconset` into
+`AppIcon.icns`, writes `Info.plist` (version pulled from `project.yml`), and **ad-hoc** codesigns
+the bundle. Ad-hoc signing means no Gatekeeper/notarization — fine for local/Tailscale-internal
+distribution; recipients may need to right-click → Open the first time. Notarized distribution and
+iOS (device install, push, TestFlight) require full **Xcode.app** + the Apple Developer Program.
 
 ## Configure the daemon URL
 
@@ -38,6 +50,7 @@ defaults write com.gte619n.anvil anvil.baseURL "https://your-host.ts.net:7701/"
 ## Roadmap
 
 - [x] macOS WebView shell (window, external-link handling, ⌘R reload, brand icon)
+- [x] distributable `Anvil.app` via `make-app.sh` (no Xcode, ad-hoc signed)
 - [ ] macOS: native menu, APNs push (needs Apple Developer account)
 - [ ] iOS target (shared `WebView` as `UIViewRepresentable`, APNs, adaptive layout) — needs the
       Apple Developer Program ($99/yr) for device install + push + TestFlight
