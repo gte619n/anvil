@@ -42,6 +42,21 @@ android {
             "\"${localProperties.getProperty('ANVIL_BASE_URL', 'https://mac-mini-m4.softshell-mark.ts.net:7701/')}\""
     }
 
+    // A single, committed keystore so every build — local dev machine AND CI (GitHub Actions) —
+    // signs with the same certificate. Without this, builds fall back to the auto-managed
+    // ~/.android/debug.keystore, which differs per machine and is regenerated fresh on each
+    // ephemeral CI runner; the resulting signature mismatch forces an uninstall/reinstall when
+    // testers move between a locally-built and a CI-built APK. A debug keystore isn't secret
+    // (fixed password "android"), so checking it in is safe and makes signing reproducible.
+    signingConfigs {
+        debug {
+            storeFile file("anvil-debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled true
@@ -50,6 +65,7 @@ android {
         debug {
             minifyEnabled false
             debuggable true
+            signingConfig signingConfigs.debug
         }
     }
 
