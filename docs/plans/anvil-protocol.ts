@@ -67,7 +67,9 @@ export type Model = "opus" | "sonnet";
 export type AutonomyPolicy =
   | "mostly-autonomous" // default: auto-allow; prompt only on the danger list (§6.6)
   | "allowlist" // auto-allow reads/searches/safe cmds; prompt for writes/net
-  | "prompt-all"; // ask on every tool use
+  | "prompt-all" // ask on every tool use
+  | "bypass"; // DANGER: never prompt — allow every tool, incl. the danger list
+  //           (the daemon equivalent of `claude --dangerously-skip-permissions`)
 
 export type SessionSource = "existing-dir" | "fresh-worktree";
 

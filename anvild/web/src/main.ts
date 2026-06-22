@@ -1580,7 +1580,7 @@ function closeModalDom(): void {
 const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
 const MODEL_AUTONOMY = `<div class="row">
   <label>Model<select id="ns-model"><option value="opus">Opus</option><option value="sonnet">Sonnet</option></select></label>
-  <label>Autonomy<select id="ns-auto"><option value="mostly-autonomous">Mostly autonomous</option><option value="allowlist">Allowlist</option><option value="prompt-all">Prompt all</option></select></label>
+  <label>Autonomy<select id="ns-auto"><option value="mostly-autonomous">Mostly autonomous</option><option value="allowlist">Allowlist</option><option value="prompt-all">Prompt all</option><option value="bypass">Bypass (skip permissions ⚠️)</option></select></label>
 </div>`;
 
 /** A reusable directory browser (used by add-environment and one-off). */
