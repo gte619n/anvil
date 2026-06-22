@@ -3,9 +3,18 @@
 # anvild macOS service manager (arch §3/§5, impl plan 6).
 #   ./scripts/service.sh install     # install + load the LaunchAgent, build web, wire tailscale
 #   ./scripts/service.sh uninstall   # bootout + remove plist/launcher (keeps state)
-#   ./scripts/service.sh restart     # kickstart the service
+#   ./scripts/service.sh restart     # rebuild the web bundle + kickstart the service (full deploy)
 #   ./scripts/service.sh status      # service state + /api/health
 #   ./scripts/service.sh logs        # tail the daemon log
+#
+# DEPLOY NOTE (why `restart` rebuilds web): the daemon serves the *built* web bundle from
+# web/dist (see src/server/http.ts WEB_DIR). The daemon itself runs from TS source, so a bare
+# kickstart picks up daemon code changes — but it does NOT regenerate web/dist. For a long time
+# `restart` only kickstarted, so a `git pull` + `restart` shipped new daemon code while silently
+# serving the OLD web UI (the classic "my change merged but the dropdown/button isn't there"
+# symptom). `restart` now runs `build:web` first so a pull+restart is a true full deploy. To
+# verify the web change actually shipped, query the running daemon (not the browser, which the
+# service worker may have cached):  curl -s http://127.0.0.1:7701/main.js | grep -c <your-string>
 #
 set -euo pipefail
 
@@ -23,6 +32,14 @@ find_bun() {
   command -v bun 2>/dev/null && return 0
   [ -x "$HOME/.bun/bin/bun" ] && { echo "$HOME/.bun/bin/bun"; return 0; }
   return 1
+}
+
+# Rebuild the web client into web/dist. Both `install` and `restart` call this so the bundle the
+# daemon serves can never lag the source (see the DEPLOY NOTE at the top of this file).
+build_web() {
+  local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
+  echo "building web client…"
+  ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null )
 }
 
 wait_health() {
@@ -51,8 +68,7 @@ do_install() {
   }
   mkdir -p "$BIN_DIR" "$STATE_DIR" "$(dirname "$PLIST")"
 
-  echo "building web client…"
-  ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null )
+  build_web
 
   # launcher — sources the OAuth token, guarantees no metered key reaches the daemon (arch §3)
   cat > "$LAUNCHER" <<LAUNCH
@@ -111,7 +127,7 @@ PLISTEOF
 case "${1:-install}" in
   install)   do_install ;;
   uninstall) launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true; rm -f "$PLIST" "$LAUNCHER"; echo "removed $LABEL (state kept at $STATE_DIR)" ;;
-  restart)   launchctl kickstart -k "$DOMAIN/$LABEL"; wait_health && echo "restarted, healthy" || echo "restarted (health pending)" ;;
+  restart)   build_web; launchctl kickstart -k "$DOMAIN/$LABEL"; wait_health && echo "restarted, healthy" || echo "restarted (health pending)" ;;
   status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded"; curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null && echo || echo "no health" ;;
   logs)      tail -n 80 -f "$STATE_DIR/anvild.log" ;;
   *) echo "usage: service.sh {install|uninstall|restart|status|logs}"; exit 1 ;;
