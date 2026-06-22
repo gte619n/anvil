@@ -1,8 +1,9 @@
 // swift-tools-version:5.9
 import PackageDescription
 
-// Compile-check / quick-run target for the macOS shell. The shippable, bundled app is
-// generated via project.yml (XcodeGen) and built in Xcode — see apple/README.md.
+// SwiftPM target for the macOS shell — used both for `swift run` (dev) and as the build
+// product that make-app.sh packages into a distributable, ad-hoc-signed Anvil.app with no
+// Xcode required. project.yml remains for opening the app in Xcode.app. See apple/README.md.
 let package = Package(
     name: "Anvil",
     platforms: [.macOS(.v13)],

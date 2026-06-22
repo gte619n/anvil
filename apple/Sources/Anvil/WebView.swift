@@ -65,9 +65,19 @@ struct WebView: NSViewRepresentable {
 
 /// Serves the bundled web client (Sources/Anvil/web) for anvil-app://app/<path>.
 final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
+    /// Where the bundled web client lives. In a packaged Anvil.app the assets are copied to
+    /// Contents/Resources/web (see make-app.sh), so prefer Bundle.main; fall back to the SPM
+    /// resource bundle (Bundle.module) for `swift run` during development.
+    static let webDir: URL? = {
+        if let main = Bundle.main.resourceURL?.appendingPathComponent("web", isDirectory: true),
+           FileManager.default.fileExists(atPath: main.path) {
+            return main
+        }
+        return Bundle.module.url(forResource: "web", withExtension: nil)
+    }()
+
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        guard let url = task.request.url,
-              let webDir = Bundle.module.url(forResource: "web", withExtension: nil)
+        guard let url = task.request.url, let webDir = Self.webDir
         else { task.didFailWithError(URLError(.fileDoesNotExist)); return }
 
         var rel = url.path

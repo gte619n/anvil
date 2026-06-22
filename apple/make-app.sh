@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# Assemble a distributable, ad-hoc-signed Anvil.app from the SwiftPM build product —
+# NO Xcode.app required, only the Command Line Tools (swift, iconutil, codesign).
+#
+# Steps:
+#   1. (re)bundle the web client into Sources/Anvil/web  (unless --skip-web)
+#   2. swift build -c release
+#   3. lay out Anvil.app/Contents/{MacOS,Resources} + Info.plist
+#   4. compile the .appiconset → AppIcon.icns via iconutil
+#   5. drop the SPM resource bundle where Bundle.module looks for it
+#   6. ad-hoc codesign with the app's entitlements
+#
+# Output: apple/dist/Anvil.app
+#
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # apple/
+ROOT="$(cd "$HERE/.." && pwd)"                          # repo root
+APP_NAME="Anvil"
+BUNDLE_ID="com.gte619n.anvil"
+CONFIG="release"
+SKIP_WEB=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --skip-web) SKIP_WEB=1 ;;
+    --debug)    CONFIG="debug" ;;
+    *) echo "unknown arg: $arg (supported: --skip-web, --debug)" >&2; exit 2 ;;
+  esac
+done
+
+# Marketing/build version come from project.yml so there's a single source of truth.
+VERSION="$(sed -n 's/.*MARKETING_VERSION: *"\([^"]*\)".*/\1/p'  "$HERE/project.yml" | head -1)"
+BUILD="$(sed -n 's/.*CURRENT_PROJECT_VERSION: *"\([^"]*\)".*/\1/p' "$HERE/project.yml" | head -1)"
+VERSION="${VERSION:-0.0.0}"
+BUILD="${BUILD:-1}"
+
+# ── 1. bundle the web client ───────────────────────────────────────────────
+if [[ "$SKIP_WEB" == "0" ]]; then
+  echo "▸ bundling web client…"
+  ( cd "$ROOT/anvild" && bun run build:web )
+  ( cd "$ROOT/anvild" && bun run web/bundle-native.ts "$HERE/Sources/Anvil/web" )
+else
+  echo "▸ skipping web bundle (--skip-web); expecting Sources/Anvil/web to exist"
+  [[ -f "$HERE/Sources/Anvil/web/index.html" ]] || { echo "  ✗ Sources/Anvil/web/index.html missing — run without --skip-web" >&2; exit 1; }
+fi
+
+# ── 2. compile ─────────────────────────────────────────────────────────────
+echo "▸ swift build -c $CONFIG…"
+( cd "$HERE" && swift build -c "$CONFIG" )
+BIN_DIR="$HERE/.build/$CONFIG"
+EXE="$BIN_DIR/$APP_NAME"
+RES_BUNDLE="$BIN_DIR/${APP_NAME}_${APP_NAME}.bundle"
+[[ -x "$EXE" ]]          || { echo "  ✗ executable not found at $EXE" >&2; exit 1; }
+[[ -d "$RES_BUNDLE" ]]   || { echo "  ✗ resource bundle not found at $RES_BUNDLE" >&2; exit 1; }
+
+# ── 3. lay out the .app ────────────────────────────────────────────────────
+DIST="$HERE/dist"
+APP="$DIST/$APP_NAME.app"
+echo "▸ assembling $APP…"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+cp "$EXE" "$APP/Contents/MacOS/$APP_NAME"
+
+# Copy the bundled web client into Contents/Resources/web. BundleSchemeHandler resolves it
+# via Bundle.main.resourceURL/web at runtime (keeping everything under Contents/ so the app
+# codesigns cleanly — a resource bundle at the .app root is rejected as "unsealed contents").
+cp -R "$RES_BUNDLE/web" "$APP/Contents/Resources/web"
+
+# ── 4. icon: .appiconset → AppIcon.icns (iconutil, no Xcode) ────────────────
+ICONSET_SRC="$HERE/Resources/Assets.xcassets/AppIcon.appiconset"
+if [[ -d "$ICONSET_SRC" ]]; then
+  echo "▸ compiling AppIcon.icns…"
+  WORK="$(mktemp -d)"
+  ICONSET="$WORK/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  # iconutil wants icon_<size>.png / icon_<size>@2x.png (no "@1x" suffix).
+  for px in 16 32 128 256 512; do
+    cp "$ICONSET_SRC/icon_${px}x${px}@1x.png" "$ICONSET/icon_${px}x${px}.png"
+    cp "$ICONSET_SRC/icon_${px}x${px}@2x.png" "$ICONSET/icon_${px}x${px}@2x.png"
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+  rm -rf "$WORK"
+else
+  echo "  ! no AppIcon.appiconset — building without an app icon"
+fi
+
+# ── 5. Info.plist ──────────────────────────────────────────────────────────
+echo "▸ writing Info.plist…"
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>      <string>en</string>
+    <key>CFBundleExecutable</key>             <string>$APP_NAME</string>
+    <key>CFBundleIconFile</key>               <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>             <string>$BUNDLE_ID</string>
+    <key>CFBundleInfoDictionaryVersion</key>  <string>6.0</string>
+    <key>CFBundleName</key>                    <string>$APP_NAME</string>
+    <key>CFBundleDisplayName</key>             <string>$APP_NAME</string>
+    <key>CFBundlePackageType</key>             <string>APPL</string>
+    <key>CFBundleShortVersionString</key>      <string>$VERSION</string>
+    <key>CFBundleVersion</key>                 <string>$BUILD</string>
+    <key>LSMinimumSystemVersion</key>          <string>13.0</string>
+    <key>LSApplicationCategoryType</key>       <string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key>         <true/>
+    <key>NSPrincipalClass</key>                <string>NSApplication</string>
+</dict>
+</plist>
+PLIST
+
+echo "APPL????" > "$APP/Contents/PkgInfo"
+
+# ── 6. ad-hoc codesign ─────────────────────────────────────────────────────
+echo "▸ ad-hoc codesigning…"
+ENTITLEMENTS="$HERE/Resources/Anvil.entitlements"
+codesign --force --deep --sign - \
+  ${ENTITLEMENTS:+--entitlements "$ENTITLEMENTS"} \
+  --options runtime \
+  "$APP"
+codesign --verify --deep --strict "$APP" && echo "  ✓ signature verifies"
+
+echo
+echo "✓ built $APP  (v$VERSION build $BUILD)"
+echo "  open it with:  open \"$APP\""
