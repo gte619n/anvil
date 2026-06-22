@@ -14,8 +14,10 @@ class AnvilMessagingService : FirebaseMessagingService() {
         val n = message.notification
         val title = n?.title ?: message.data["title"] ?: "Anvil"
         val body = n?.body ?: message.data["body"] ?: ""
-        // Permission pushes are data-only (so this always fires, even backgrounded) and carry a
-        // requestId we can answer with Allow/Deny action buttons right on the notification.
+        // All pushes are data-only (so this always fires, even backgrounded), routing every reminder
+        // through the same session-keyed notification: it supersedes prior reminders for the session,
+        // deep-links to it on tap, and clears when the app opens it. Permission pushes additionally
+        // carry a requestId we answer with Allow/Deny action buttons right on the notification.
         Notifications.show(
             context = this,
             title = title,
@@ -24,6 +26,7 @@ class AnvilMessagingService : FirebaseMessagingService() {
             kind = message.data["kind"],
             requestId = message.data["requestId"],
             tool = message.data["tool"],
+            dir = message.data["dir"],
         )
     }
 }

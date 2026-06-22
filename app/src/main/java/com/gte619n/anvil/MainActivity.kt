@@ -21,6 +21,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -165,7 +166,7 @@ class MainActivity : ComponentActivity() {
             web.restoreState(savedInstanceState)
         } else {
             val sessionId = intent?.getStringExtra("sessionId") // notification-tap deep link
-            web.loadUrl(if (sessionId != null) sessionUrl(sessionId) else APP_URL)
+            if (sessionId != null) openSession(sessionId) else web.loadUrl(APP_URL)
         }
     }
 
@@ -178,7 +179,14 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        intent.getStringExtra("sessionId")?.let { web.loadUrl(sessionUrl(it)) }
+        intent.getStringExtra("sessionId")?.let { openSession(it) }
+    }
+
+    /** Open a session from a notification tap and clear that session's reminder — entering the
+     *  session is the user acting on it, so the shade entry (even an ongoing permission one) goes. */
+    private fun openSession(sessionId: String) {
+        web.loadUrl(sessionUrl(sessionId))
+        NotificationManagerCompat.from(this).cancel(sessionId.hashCode())
     }
 
     private fun sessionUrl(sessionId: String): String = "$APP_URL#s/${Uri.encode(sessionId)}"

@@ -17,6 +17,10 @@ export interface PushPayload {
   requestId?: string;
   /** The tool awaiting approval (for the notification body / labels). */
   tool?: string;
+  /** Session context for the notification: the working dir's basename (which project). */
+  dir?: string;
+  /** One-line summary of what the session is asking for (e.g. "Run: git push"). */
+  ask?: string;
 }
 
 /**

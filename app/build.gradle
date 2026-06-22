@@ -15,7 +15,7 @@ if (localPropertiesFile.exists()) {
 // Single source of truth for the user-visible app version. Bump this (and versionCode below)
 // for every deploy; it's both the APK versionName and the version shown next to the Anvil brand
 // in the bundled web UI (passed to the web build as APP_VERSION).
-def appVersionName = "2.0.2"
+def appVersionName = "2.0.3"
 
 android {
     namespace 'com.gte619n.anvil'
@@ -25,7 +25,7 @@ android {
         applicationId "com.gte619n.anvil"
         minSdk 33
         targetSdk 35
-        versionCode 7
+        versionCode 8
         versionName appVersionName
 
         // The Anvil web client URL this shell loads (Tailscale HTTPS by default).
@@ -68,6 +68,7 @@ tasks.register("bundleWebAssets", Exec) {
     commandLine "bash", "-lc", "bun run build:web && bun run web/bundle-native.ts '${out}'"
     inputs.dir("${anvild}/web/src")
     inputs.file("${anvild}/web/index.html")
+    inputs.file("${anvild}/web/sw.js") // re-bundle when the service worker changes
     inputs.property("appVersion", appVersionName) // re-bundle when the version changes
     outputs.dir(out)
 }
@@ -82,7 +83,7 @@ firebaseAppDistribution {
     appId = "1:1059574278871:android:f2a67ca798f942ade8de92"
     serviceCredentialsFile = "${System.getProperty('user.home')}/.config/anvil/fcm-service-account.json"
     testers = "evan.ruff@gmail.com"
-    releaseNotes = "v2.0.2 — Back button now closes the open dialog/menu/settings/panel and returns to the previous screen instead of exiting the app. Also: image attachments wait for in-flight uploads (no more silently dropped images) + clearer feedback for non-image files."
+    releaseNotes = "v2.0.3 — Reminders are now per-session: a new alert for a session replaces the old one (no more three stacked reminders), shows which session and what it's asking for (e.g. the command or file), and clears automatically when you tap in to that session."
 }
 
 dependencies {

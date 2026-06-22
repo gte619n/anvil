@@ -55,9 +55,13 @@ self.addEventListener("push", (event) => {
     (async () => {
       const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       if (wins.some((c) => c.focused)) return;
+      // title = which session; body = what it's asking, prefixed with the dir for context. Key the
+      // tag off the session so a newer reminder SUPERSEDES the old one (instead of permission and
+      // result stacking as separate tags) — matching the Android client.
+      const body = data.dir ? `${data.dir} — ${data.body || ""}` : data.body || "";
       await self.registration.showNotification(data.title || "Anvil", {
-        body: data.body || "",
-        tag: data.tag,
+        body,
+        tag: data.sessionId || data.tag,
         renotify: true,
         data: { sessionId: data.sessionId || null },
       });

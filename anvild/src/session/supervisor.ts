@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { mkdirSync as ensureDir, unwatchFile, watchFile } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   PROTOCOL_VERSION,
   type AttachmentRef,
@@ -584,11 +584,17 @@ export class Supervisor {
 
   /** Push a notification on the events that mean "your turn" (arch §6.7). */
   private maybeNotify(sessionId: string, event: ServerEvent): void {
-    const title = this.sessions.get(sessionId)?.data.title ?? "Anvil";
+    const data = this.sessions.get(sessionId)?.data;
+    const title = data?.title ?? "Anvil";
+    // Which project — the cwd basename — so a reminder says *which* session it's for at a glance.
+    const dir = data?.cwd ? basename(data.cwd) : undefined;
     let payload: PushPayload | undefined;
-    if (event.type === "permission.request")
-      payload = { title, body: `Needs approval: ${event.tool}`, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool };
-    else if (event.type === "result") payload = { title, body: "Claude finished — your turn.", sessionId, tag: `done-${sessionId}`, kind: "result" };
+    if (event.type === "permission.request") {
+      const ask = summarizeRequest(event.tool, event.input);
+      payload = { title, body: ask, dir, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool, ask };
+    } else if (event.type === "result") {
+      payload = { title, body: "Finished — your turn.", dir, sessionId, tag: `done-${sessionId}`, kind: "result" };
+    }
     if (payload) {
       void this.webpush.notify(payload); // desktop browsers
       void this.fcm.notify(payload); // Android client
@@ -699,4 +705,40 @@ function slugify(s: string): string {
 }
 function deriveTitle(cwd: string): string {
   return cwd.split("/").filter(Boolean).pop() ?? "session";
+}
+
+/**
+ * One-line, human summary of what a tool wants approval for, so the reminder says *what* it's
+ * asking — "Run: git push origin main", "Edit Foo.kt" — not just the bare tool name.
+ */
+function summarizeRequest(tool: string, input: unknown): string {
+  const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const str = (k: string): string | undefined => (typeof obj[k] === "string" ? (obj[k] as string) : undefined);
+  const oneLine = (s: string, n = 120): string => {
+    const t = s.replace(/\s+/g, " ").trim();
+    return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  };
+  switch (tool) {
+    case "Bash": {
+      const cmd = str("command");
+      return cmd ? `Run: ${oneLine(cmd)}` : "Run a shell command";
+    }
+    case "Write":
+    case "Edit":
+    case "MultiEdit":
+    case "NotebookEdit": {
+      const fp = str("file_path") ?? str("notebook_path") ?? str("path");
+      return fp ? `Edit ${basename(fp)}` : "Edit a file";
+    }
+    case "Read": {
+      const fp = str("file_path") ?? str("path");
+      return fp ? `Read ${basename(fp)}` : "Read a file";
+    }
+    case "WebFetch": {
+      const url = str("url");
+      return url ? `Fetch ${oneLine(url, 80)}` : "Fetch a URL";
+    }
+    default:
+      return `Approve ${tool}`;
+  }
 }

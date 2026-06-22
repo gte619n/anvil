@@ -35,8 +35,11 @@ object Notifications {
         kind: String? = null,
         requestId: String? = null,
         tool: String? = null,
+        dir: String? = null,
     ) {
         ensureChannel(context)
+        // Key the id off the session so a newer reminder for the same session SUPERSEDES the old
+        // one (replaces it in the shade) instead of stacking up three deep.
         val notifId = sessionId?.hashCode() ?: 1
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -48,6 +51,8 @@ object Notifications {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        // title = the session (which project/session this is for); body = what it's asking;
+        // subtext = the working dir, so the reminder is self-explanatory at a glance.
         val builder = NotificationCompat.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
@@ -56,6 +61,7 @@ object Notifications {
             .setAutoCancel(true)
             .setContentIntent(pi)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+        if (!dir.isNullOrBlank()) builder.setSubText(dir)
 
         if (kind == "permission" && requestId != null) {
             builder.addAction(0, "Allow", permissionAction(context, notifId, requestId, "allow"))

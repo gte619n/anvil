@@ -94,23 +94,20 @@ export class Fcm {
     const dead: string[] = [];
     await Promise.all(
       this.tokens.map(async (token) => {
-        // Permission pushes are sent data-only so the Android client's onMessageReceived ALWAYS
-        // fires (even backgrounded) and can build a notification with Allow/Deny action buttons.
-        // A notification-payload message would be auto-rendered by the system tray without them.
-        const isPermission = payload.kind === "permission";
+        // ALL pushes are sent data-only so the Android client's onMessageReceived ALWAYS handles
+        // them (even backgrounded) via Notifications.show(). That path keys the notification id off
+        // sessionId, so a new reminder for a session supersedes the old one instead of stacking,
+        // deep-links to that session on tap, and clears when the app opens it. A notification-payload
+        // message would instead be auto-rendered by the system tray with a fresh id each time —
+        // stacking, no session link, no auto-clear.
         const data: Record<string, string> = { title: payload.title, body: payload.body };
         if (payload.sessionId) data.sessionId = payload.sessionId;
         if (payload.kind) data.kind = payload.kind;
         if (payload.requestId) data.requestId = payload.requestId;
         if (payload.tool) data.tool = payload.tool;
-        const message: Record<string, unknown> = isPermission
-          ? { token, data, android: { priority: "HIGH" } }
-          : {
-              token,
-              notification: { title: payload.title, body: payload.body },
-              android: { priority: "HIGH", notification: { channel_id: "anvil" } },
-              data,
-            };
+        if (payload.dir) data.dir = payload.dir;
+        if (payload.ask) data.ask = payload.ask;
+        const message: Record<string, unknown> = { token, data, android: { priority: "HIGH" } };
         try {
           const res = await fetch(url, {
             method: "POST",
