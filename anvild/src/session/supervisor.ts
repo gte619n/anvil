@@ -12,6 +12,10 @@ import {
   type DaemonUpdateResultEvent,
   type Environment,
   type EnvironmentsEvent,
+  type EnvironmentValidation,
+  type TodoistStatusEvent,
+  type TodoistProjectsResultEvent,
+  type TodoistProjectInfo,
   type GitCmd,
   type GitResultEvent,
   type Model,
@@ -38,6 +42,9 @@ import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
+import { IntegrationStore } from "../integrations/store";
+import { WorkUnitStore } from "../integrations/workunit";
+import { TodoistClient } from "../integrations/todoist";
 import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -91,6 +98,8 @@ export class Supervisor {
   });
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
+  private readonly integrations: IntegrationStore;
+  private readonly workUnits: WorkUnitStore;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
@@ -99,6 +108,8 @@ export class Supervisor {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
+    this.integrations = new IntegrationStore(cfg.stateDir);
+    this.workUnits = new WorkUnitStore(cfg.stateDir);
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
@@ -197,9 +208,50 @@ export class Supervisor {
     }
     return { missing: true };
   }
-  updateEnvironment(id: string, fields: { name?: string; defaultBase?: string; color?: string }): void {
+  updateEnvironment(
+    id: string,
+    fields: {
+      name?: string;
+      defaultBase?: string;
+      color?: string;
+      todoistProjectId?: string | null;
+      validation?: EnvironmentValidation | null;
+    },
+  ): void {
     this.envStore.update(id, fields);
     this.registry.toAll(this.environmentsEvent());
+  }
+
+  // ── Todoist integration (task autopilot) ──────────────────────────────────
+  todoistStatusEvent(cid?: string): TodoistStatusEvent {
+    const state = this.integrations.todoist();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "todoist.status",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      connected: !!state?.accessToken,
+      ...(state?.account ? { account: state.account } : {}),
+    };
+  }
+
+  /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
+  async listTodoistProjects(cid?: string): Promise<TodoistProjectsResultEvent> {
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
+    const client = new TodoistClient(state.accessToken);
+    const [projects, tasks] = await Promise.all([client.projects(), client.tasks()]);
+    const counts = new Map<string, number>();
+    for (const t of tasks) counts.set(t.project_id, (counts.get(t.project_id) ?? 0) + 1);
+    const infos: TodoistProjectInfo[] = projects.map((p) => ({
+      id: p.id,
+      name: p.name,
+      ...(p.parent_id ? { parentId: p.parent_id } : {}),
+      ...(p.is_inbox_project ? { isInbox: true } : {}),
+      ...(p.is_favorite ? { isFavorite: true } : {}),
+      taskCount: counts.get(p.id) ?? 0,
+    }));
+    return { v: PROTOCOL_VERSION, type: "todoist.projects.result", ts: now(), ...(cid ? { cid } : {}), projects: infos };
   }
   removeEnvironment(id: string): void {
     this.envStore.remove(id);

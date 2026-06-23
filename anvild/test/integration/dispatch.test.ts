@@ -31,7 +31,7 @@ function rpc(payload: object): Promise<any> {
     ws.onopen = () => ws.send(JSON.stringify(payload));
     ws.onmessage = (ev) => {
       const m = JSON.parse(String(ev.data));
-      if (m.type === "session.list" || m.type === "budget" || m.type === "environments") return; // ignore connect snapshots
+      if (m.type === "session.list" || m.type === "budget" || m.type === "environments" || m.type === "todoist.status") return; // ignore connect snapshots
       clearTimeout(timer);
       resolve(m);
       ws.close();
@@ -107,7 +107,7 @@ test("invalid JSON → command.error", async () => {
     ws.onopen = () => ws.send("{not json");
     ws.onmessage = (ev) => {
       const m = JSON.parse(String(ev.data));
-      if (m.type === "session.list" || m.type === "budget" || m.type === "environments") return;
+      if (m.type === "session.list" || m.type === "budget" || m.type === "environments" || m.type === "todoist.status") return;
       clearTimeout(timer);
       resolve(m);
       ws.close();

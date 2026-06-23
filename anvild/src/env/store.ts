@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Environment } from "@protocol";
+import type { Environment, EnvironmentValidation } from "@protocol";
 import { newId } from "../util/ids";
 
 /**
@@ -46,12 +46,26 @@ export class EnvironmentStore {
     return env;
   }
 
-  update(id: string, fields: { name?: string; defaultBase?: string; color?: string }): void {
+  update(
+    id: string,
+    fields: {
+      name?: string;
+      defaultBase?: string;
+      color?: string;
+      todoistProjectId?: string | null;
+      validation?: EnvironmentValidation | null;
+    },
+  ): void {
     const env = this.environments.find((e) => e.id === id);
     if (!env) return;
     if (fields.name !== undefined && fields.name.trim()) env.name = fields.name.trim();
     if (fields.defaultBase !== undefined) env.defaultBase = fields.defaultBase.trim() || undefined;
     if (fields.color !== undefined) env.color = fields.color.trim() || undefined;
+    // null explicitly clears the link/gate; undefined leaves it untouched.
+    if (fields.todoistProjectId !== undefined)
+      env.todoistProjectId = fields.todoistProjectId?.trim() || undefined;
+    if (fields.validation !== undefined)
+      env.validation = fields.validation && fields.validation.commands.length ? fields.validation : undefined;
     this.save();
   }
 

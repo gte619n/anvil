@@ -102,6 +102,17 @@ export interface Environment {
   isRepo: boolean; // git repo → fresh worktree per session; otherwise work in the folder directly
   defaultBase?: string; // branch/commit to branch worktrees from (default "HEAD")
   color?: string; // base color (hex, e.g. "#335999") for env/session tinting; absent → hue hashed from name
+  todoistProjectId?: string; // linked Todoist project; its active tasks feed the nightly planner
+  validation?: EnvironmentValidation; // gate a WorkUnit must pass before reaching anvil:review
+}
+
+/**
+ * Per-environment validation gate for the Todoist autopilot. After implementing a WorkUnit in a
+ * worktree, anvil runs these commands (in repoRoot/worktree cwd) in order; all must exit 0 for the
+ * unit to advance to `anvil:review`. Otherwise the unit is iterated on or marked `anvil:blocked`.
+ */
+export interface EnvironmentValidation {
+  commands: string[]; // e.g. ["bun run typecheck", "bun test"] — run in order, all must pass
 }
 
 /** Live git state for the worktree panel (§8); pushed via `session.updated`. */
@@ -317,6 +328,28 @@ export interface EnvironmentsEvent extends Envelope {
   type: "environments";
   environments: Environment[];
 }
+/** A Todoist project, trimmed to what the link UI / planner needs. */
+export interface TodoistProjectInfo {
+  id: string;
+  name: string;
+  parentId?: string; // present for sub-projects
+  isInbox?: boolean;
+  isFavorite?: boolean;
+  taskCount?: number; // active tasks (filled by todoist.projects.list)
+}
+/** Todoist connection state — broadcast on connect and whenever it changes. */
+export interface TodoistStatusEvent extends Envelope {
+  type: "todoist.status";
+  cid?: Cid;
+  connected: boolean;
+  account?: string; // email/name of the connected account
+}
+/** Result of `todoist.projects.list` — the account's projects (live from the API). */
+export interface TodoistProjectsResultEvent extends Envelope {
+  type: "todoist.projects.result";
+  cid?: Cid;
+  projects: TodoistProjectInfo[];
+}
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
 export type GitOp = "status" | "diff" | "commit" | "push" | "create-pr" | "merge-pr";
 export interface GitResultEvent extends Envelope {
@@ -478,6 +511,8 @@ export type ServerEvent =
   | SessionDeletedEvent
   | BudgetEvent
   | EnvironmentsEvent
+  | TodoistStatusEvent
+  | TodoistProjectsResultEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent
@@ -663,10 +698,21 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
   name?: string;
   defaultBase?: string; // "" clears it (back to HEAD)
   color?: string; // base color (hex); "" clears it (back to hashed hue)
+  todoistProjectId?: string; // link to a Todoist project; "" unlinks
+  validation?: EnvironmentValidation | null; // null clears the validation gate
 }
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";
   id: string;
+}
+
+// Todoist integration (task autopilot). The token is set out-of-band (scripts/todoist.ts);
+// these commands drive the link UI and the planner.
+export interface TodoistStatusCmd extends Envelope, Correlated {
+  type: "todoist.status"; // request the current connection state
+}
+export interface TodoistProjectsListCmd extends Envelope, Correlated {
+  type: "todoist.projects.list"; // fetch the account's projects (live from the API)
 }
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
@@ -743,6 +789,8 @@ export type ClientCommand =
   | EnvCloneCmd
   | EnvUpdateCmd
   | EnvRemoveCmd
+  | TodoistStatusCmd
+  | TodoistProjectsListCmd
   | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd
