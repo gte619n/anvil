@@ -84,6 +84,47 @@ A **ConnectionManager** in the client owns N `AnvilSocket`s, keyed by `serverId`
 - **Offline servers**: a server that's asleep/unreachable shows greyed with its last-known sessions
   (from cache) and a reconnect affordance; commands queue or error cleanly.
 
+### 4.1 Discovery — finding the other servers ✅ (endpoint done)
+
+Manual URL entry (§4) is the fallback, not the daily path. The tailnet already knows every device,
+so discovery rides on Tailscale:
+
+1. **Enumerate** — the hub daemon runs `tailscale status --json` and takes every peer's MagicDNS
+   name (`Self` + each `Peer`, trailing dot stripped). `service.sh` already shells to this for the
+   server URL, so the dependency is established.
+2. **Probe** — `GET https://<peer>:<port>/api/health` on each *online* peer, in parallel, short
+   timeout. Tailscale issues valid per-node certs, so HTTPS resolves with no prompts.
+3. **Identify & dedup** — any peer that answers with a valid `HealthResponse` (has a `serverId`) is
+   an Anvil daemon. `serverId` is the dedup/identity key — one server reachable via multiple
+   addresses collapses to one entry, and the hub's own daemon is flagged `isSelf`.
+4. **Suggest** — the client lists the found servers; one tap adds to the registry (§4).
+
+**Do the probing server-side, not in the browser.** The hub daemon has the `tailscale` CLI and no
+CORS limits, so it exposes **`GET /api/fleet/discover`** → `rest.FleetDiscoverResponse`
+(`{ ok, servers: DiscoveredServer[], warning? }`) and the web client just calls its own daemon — no
+cross-node browser probing or CSP gymnastics *for discovery* (actual session WebSockets to other
+nodes still need the §5.1 `connect-src` widening). Implemented in `src/server/fleet.ts`
+(`discoverFleet` takes injectable `runTailscale`/`probe` for testing; defaults shell out + `fetch`).
+When Tailscale is missing / not logged in, `ok:false` + a guidance `warning` (fall back to URL entry).
+
+**Discovery suggests; the explicit join makes membership durable.** A peer answering on the port
+proves it's *an* Anvil daemon — but on a **shared** tailnet it might be someone else's. Today there's
+no app-level auth (§8: shared OAuth token, no fleet secret yet), so on a personal tailnet "discovered"
+and "mine" coincide. The robust model: discovery pre-fills candidates; the authenticated **join flow**
+(hub pushes the token, §9/Anvil Server.app) is what writes a server into the persisted fleet registry.
+A future per-fleet secret (checked in `server.hello`/health) is what would let discovery safely
+auto-filter on a shared tailnet.
+
+**Not used:** mDNS/Bonjour (`_anvil._tcp`) resolves only on the same LAN — Tailscale doesn't route
+mDNS over WireGuard, so it misses the cross-network case that's the whole point. Tailscale ACL tags
+(`tag:anvil`) could pre-filter peers without probing all of them, but need ACL config — an optional
+later refinement.
+
+**Assumption:** discovery probes `:<ANVIL_PORT>` on each peer, i.e. it relies on
+`tailscale serve --https=$PORT` mapping the tailnet port to the daemon's port (exactly what
+`service.sh` sets up). A node serving on a different external port wouldn't be found by probe (still
+addable by URL).
+
 ---
 
 ## 5. Client form
@@ -153,20 +194,22 @@ Each server independently keeps the §3 invariant (token present, `ANTHROPIC_API
 
 ---
 
-## 9. Packaging & install (after the design lands)
+## 9. Packaging & install
 
-Goal: stand up `anvild` on a new Mac in minutes. **Not a DMG** (that's for GUI apps). Options, in
-order of preference:
+Two audiences, two answers:
 
-1. **`bun build --compile`** → a single self-contained `anvild` binary (bundles the Bun runtime +
-   code + JS deps). Verify the Agent-SDK CLI spawn still resolves when compiled (the SDK launches a
-   child via `executable: "bun"`); keep a fallback to "install Bun + run from source" if not.
-2. **Install script** (extends `scripts/service.sh`): drop the binary, write the LaunchAgent, prompt
-   for the shared token, run `tailscale serve`, set a server name.
-3. **`.pkg`** (signed/notarized) if a double-click installer is wanted later.
+- **Non-technical / fleet (primary):** **Anvil Server.app** — a macOS menu-bar control panel that
+  installs deps, captures the OAuth token (login *or* fleet-join pairing), guarantees the §3 auth
+  invariant, runs `tailscale serve`, manages the LaunchAgent, and distributes the shared token across
+  Macs. Full design: **`anvil-server-app.md`**. (The earlier "Not a DMG" note was about the *headless
+  daemon* — still true; the DMG, if any, ships the *app* that wraps it.)
+- **Headless / Linux / CI:** keep the script path — `bun build --compile` → a single `anvild` binary
+  (verify the Agent-SDK child spawn survives compilation; fallback: embed Bun + run from source) +
+  `scripts/service.sh`/systemd. The Server.app owns the *same* on-disk artifacts as `service.sh` so
+  the two never diverge.
 
-First-run per machine: (a) the shared `CLAUDE_CODE_OAUTH_TOKEN`, (b) assert no API key, (c)
-`tailscale serve --https=7701`, (d) a server name. Bundle `web/dist` for the hub role.
+First-run per machine (both paths): (a) the shared `CLAUDE_CODE_OAUTH_TOKEN`, (b) assert no API key,
+(c) `tailscale serve --https=7701`, (d) a server name. Bundle `web/dist` for the hub role.
 
 ---
 
@@ -185,8 +228,13 @@ First-run per machine: (a) the shared `CLAUDE_CODE_OAUTH_TOKEN`, (b) assert no A
 **11.0 Prerequisite experiment (gates MS-2):** same token on a 2nd Mac, concurrent turns — confirm
 it's allowed and not crippled. *(Do this before building the fleet UI.)*
 
-1. **Server identity** — `serverId`/`serverName` in health + `server.hello`; persist id. (Daemon only; backward-compatible.)
-2. **Client ConnectionManager + registry** — multi-socket, serverId-scoped state, add/remove servers, sidebar grouping. (Hub web app: widen CSP.)
+1. **Server identity** — ✅ **done** (branch `multi-server-impl`). `serverId` (persisted to
+   `<stateDir>/server-id`, prefix `srv_`) + `serverName` (`ANVIL_SERVER_NAME` or hostname) in
+   `GET /api/health`; a `server.hello` frame emitted first on every WS open
+   (`src/server/identity.ts`, protocol v0.7). The web client caches the identity from `server.hello`
+   and groups the Settings → **Environments** tab under a per-server section header (one section
+   today; one per server once federated). Backward-compatible; `PROTOCOL_VERSION` unchanged.
+2. **Client ConnectionManager + registry** — multi-socket, serverId-scoped state, add/remove servers, sidebar grouping. (Hub web app: widen CSP.) *(next)* — **discovery endpoint `GET /api/fleet/discover` already done** (§4.1, `src/server/fleet.ts`); the client still needs to call it + own the registry/sockets.
 3. **Aggregate budget gauge** — sum across servers + warning (§7 v1 mitigation).
 4. **Packaging** — `bun build --compile` binary + install script for easy rollout (§9).
 5. *(Eventual)* native multi-server client; shared budget ledger.
