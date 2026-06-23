@@ -16,8 +16,10 @@ import { VERSION } from "../version";
 
 export { VERSION };
 
-// The built web client (anvild/web/dist), resolved relative to this source file.
-const WEB_DIR = join(import.meta.dir, "..", "..", "web", "dist");
+// The built web client (anvild/web/dist), resolved relative to this source file. When packaged via
+// `bun build --compile`, import.meta.dir points into the read-only $bunfs, so the launcher sets
+// ANVIL_WEB_DIR to the bundle's web/dist on disk (Phase 0/B — anvil-server-app.md §3.1).
+const WEB_DIR = process.env.ANVIL_WEB_DIR || join(import.meta.dir, "..", "..", "web", "dist");
 
 // CSP for the app shell. Mermaid + the markdown body run here, but all markdown HTML is
 // DOMPurify-sanitized server-side (arch §8.3); scripts are limited to our own bundle.
@@ -26,7 +28,9 @@ const CSP = [
   "img-src 'self' data:",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com", // Shiki/KaTeX/mermaid + Material Symbols (CDN)
   "script-src 'self'",
-  "connect-src 'self' ws: wss:",
+  // 'self' = the hub's own daemon; wss:/ws: for its WebSocket; https://*.ts.net + wss://*.ts.net let
+  // the hub web app federate other servers on the tailnet (fleet — anvil-multi-server.md §4.1/§5.1).
+  "connect-src 'self' ws: wss: https://*.ts.net wss://*.ts.net",
   "font-src 'self' https://fonts.gstatic.com", // Material Symbols woff2 from Google's CDN (bundled in native apps)
   "object-src 'none'",
   "base-uri 'none'",

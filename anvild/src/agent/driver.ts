@@ -1,4 +1,5 @@
 import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { claudeCliOptions } from "./cli";
 import type { Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
@@ -154,7 +155,7 @@ export class AgentDriver {
         // (degrades to "user did not answer") without the kind in supportedDialogKinds. (§6.6)
         onUserDialog: makeUserDialogHandler(s, this.questionBroker),
         supportedDialogKinds: [ASK_USER_QUESTION_DIALOG],
-        executable: "bun",
+        ...claudeCliOptions(), // executable:"bun" in dev; pathToClaudeCodeExecutable when packaged (§3.1)
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
         ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),
         ...(this.extraAllowedTools ? { allowedTools: this.extraAllowedTools } : {}),
