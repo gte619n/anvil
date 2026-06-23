@@ -58,10 +58,14 @@ export class Autopilot {
     this.log = opts.onProgress ?? (() => {});
   }
 
-  /** Build every `planned` WorkUnit for an environment, in concurrent batches. */
-  async runBuildPhase(env: BuilderEnv): Promise<WorkUnit[]> {
-    const planned = this.deps.workUnits.forEnvironment(env.id).filter((u) => u.status === "planned");
-    this.log(`${planned.length} planned units for "${env.name}".`);
+  /**
+   * Build `planned` WorkUnits for an environment, in concurrent batches. Pass `onlyWorkUnitId` to
+   * build a single unit (used for a safe first live trial / for re-running one unit).
+   */
+  async runBuildPhase(env: BuilderEnv, opts: { onlyWorkUnitId?: string } = {}): Promise<WorkUnit[]> {
+    let planned = this.deps.workUnits.forEnvironment(env.id).filter((u) => u.status === "planned");
+    if (opts.onlyWorkUnitId) planned = planned.filter((u) => u.id === opts.onlyWorkUnitId);
+    this.log(`${planned.length} planned unit(s) for "${env.name}"${opts.onlyWorkUnitId ? " (single-unit run)" : ""}.`);
     const done: WorkUnit[] = [];
     for (let i = 0; i < planned.length; i += this.batchSize) {
       const batch = planned.slice(i, i + this.batchSize);

@@ -715,8 +715,9 @@ export interface TodoistProjectsListCmd extends Envelope, Correlated {
   type: "todoist.projects.list"; // fetch the account's projects (live from the API)
 }
 export interface TodoistBuildCmd extends Envelope, Correlated {
-  type: "todoist.build"; // phase 2B: build all `planned` work units for an environment (long-running)
+  type: "todoist.build"; // phase 2B: build `planned` work units for an environment (long-running)
   environmentId: string;
+  workUnitId?: string; // build only this unit (safe single-unit trial / re-run); omit to build all planned
 }
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web

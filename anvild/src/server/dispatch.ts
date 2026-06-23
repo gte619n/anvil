@@ -257,7 +257,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         // Long-running: ack acceptance immediately, then build in the background (progress → daemon log).
         try {
           void deps.supervisor
-            .runAutopilotBuild(cmd.environmentId, (m) => console.log(`[autopilot] ${m}`))
+            .runAutopilotBuild(cmd.environmentId, (m) => console.log(`[autopilot] ${m}`), cmd.workUnitId)
             .then((s) => console.log(`[autopilot] build phase done: ${s.review} → review, ${s.blocked} blocked (of ${s.built})`))
             .catch((e) => console.error(`[autopilot] build phase failed: ${errMsg(e)}`));
           if (cid) send(ack(cid));

@@ -260,14 +260,18 @@ export class Supervisor {
    * Phase 2B entrypoint: build every `planned` WorkUnit for a linked environment (build → validate
    * → PR → tag). Runs inside the daemon so it drives real sessions. Returns a short summary.
    */
-  async runAutopilotBuild(environmentId: string, onProgress?: (m: string) => void): Promise<{ built: number; review: number; blocked: number }> {
+  async runAutopilotBuild(
+    environmentId: string,
+    onProgress?: (m: string) => void,
+    workUnitId?: string,
+  ): Promise<{ built: number; review: number; blocked: number }> {
     const state = this.integrations.todoist();
     if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
     const env = this.envStore.get(environmentId);
     if (!env) throw new BadCommand(`no such environment: ${environmentId}`);
 
     const autopilot = new Autopilot(this.makeBuildHost(), { client: new TodoistClient(state.accessToken), workUnits: this.workUnits }, { onProgress });
-    const done = await autopilot.runBuildPhase({ id: env.id, name: env.name });
+    const done = await autopilot.runBuildPhase({ id: env.id, name: env.name }, workUnitId ? { onlyWorkUnitId: workUnitId } : {});
     return {
       built: done.length,
       review: done.filter((u) => u.status === "review").length,
