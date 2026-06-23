@@ -74,6 +74,24 @@ const removingSessions = new Set<string>();
 // The sidebar order and "Finished" group live on the session itself (server-synced fields
 // `order`/`finished`), so the arrangement follows you across every client — web, desktop, Android.
 
+// ── Early-init module state (declare-up-top rule) ────────────────────────────────────────────────
+// Everything reachable from the top-level "instant restore" init chain below (renderSessions /
+// applyActiveTint / renderEmptyState → resetActivity / clearReferences) MUST be declared HERE, above
+// that block. A `let`/`const` placed next to its functions further down the file is still in its
+// temporal dead zone when init runs at module load, so touching it throws and aborts the rest of
+// module init → a totally dead app (no list, no buttons). Bites worst on the no-activeId path
+// (fresh device / reinstalled Android, empty localStorage). See memory: web-early-init-decl-order-crash.
+let drag: { el: HTMLElement; startX: number; startY: number; lastY: number; timer: number; lifted: boolean; touch: boolean } | null = null; // press-and-hold-to-reorder
+let justDragged = false; // set briefly after a drop so the row's click doesn't also navigate
+let thinkingEl: HTMLElement | null = null; // animated "thinking" indicator, pinned to the bottom while a turn runs
+let activityEl: HTMLDetailsElement | null = null; // consolidated per-turn tool/thinking activity block (§5)
+let activityCount = 0;
+let activityLive = false;
+const activityTail: string[] = [];
+const references = new Map<string, string>(); // url → display label, insertion-ordered (Links panel)
+let pendingAnswerRefs: string[] = []; // links seen in the latest assistant prose, promoted on `result`
+let panelView: "files" | "reader" | "git" | "terminal" | "links" | null = null; // open side panel, if any
+
 // Offline cache (arch §8): persist the session + environment lists so they're browsable with no
 // connection. Hydrated synchronously below, kept in sync on every change.
 function persistSessions(): void {
@@ -794,7 +812,7 @@ function renderStream(): void {
   scrollDown();
 }
 // Animated "thinking" indicator (like Claude's), pinned to the bottom while a turn runs.
-let thinkingEl: HTMLElement | null = null;
+// `thinkingEl` is declared in the early-init cluster up top (reached by renderEmptyState at load).
 const THINK_LABEL: Record<string, string> = { thinking: "Thinking", running_tool: "Working", running: "Working" };
 function showThinking(status: string): void {
   if (activityLive) return; // the live activity block already shows running state
@@ -868,10 +886,8 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
 // All the tool/thinking churn for one turn collapses into a single block that previews the
 // last few lines and expands on click — so the conversation reads as "what I said" / "what the
 // model said" without every Read/Bash/result on its own line. Reset at each new user turn.
-let activityEl: HTMLDetailsElement | null = null;
-let activityCount = 0;
-let activityLive = false;
-const activityTail: string[] = [];
+// activityEl / activityCount / activityLive / activityTail are declared in the early-init cluster up
+// top — resetActivity() touches them at load.
 const ACTIVITY_TAIL = 5;
 
 function resetActivity(): void {
@@ -950,10 +966,9 @@ function appendToolResult(content: string, isError: boolean): void {
 // thinking churn mid-turn. References are buffered from each assistant message (`pendingAnswerRefs`)
 // and only committed to the panel when the turn ends. The header Links button shows a subtle dot
 // (no count) while the panel is closed.
-const references = new Map<string, string>(); // url → display label, insertion-ordered
+// `references` / `pendingAnswerRefs` are declared in the early-init cluster up top — clearReferences()
+// reads them at load.
 const REF_LIMIT = 50;
-// Links seen in the latest assistant prose this turn; promoted into `references` on `result`.
-let pendingAnswerRefs: string[] = [];
 
 /** Pull http(s) URLs and bare host:port addresses out of a chunk of (rendered) text/HTML. */
 function extractRefs(text: string): string[] {
@@ -1253,7 +1268,7 @@ async function runMermaid(container: HTMLElement): Promise<void> {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 function renderSessions(): void {
-  if (press?.lifted) return; // don't yank a row out from under an in-progress drag
+  if (drag?.lifted) return; // don't yank a row out from under an in-progress drag
   const activeUl = $("#session-list");
   const finishedUl = $("#finished-list");
   activeUl.innerHTML = "";
@@ -1331,8 +1346,8 @@ function renderSessionItem(s: Session): HTMLLIElement {
 // non-passive touchmove (preventDefault only AFTER the hold) lets us take the gesture cleanly.
 const LONG_PRESS_MS = 250;
 const MOVE_CANCEL = 9; // px of pre-lift movement: on touch that means "scroll", so abandon the drag
-let drag: { el: HTMLElement; startX: number; startY: number; lastY: number; timer: number; lifted: boolean; touch: boolean } | null = null;
-let justDragged = false; // set briefly after a drop so the row's click doesn't also navigate
+// `drag` / `justDragged` are declared in the early-init cluster up top — renderSessions() reads
+// `drag?.lifted` and `justDragged` at load (top-level instant-restore init).
 let autoScrollRAF = 0;
 let lastTouchAt = 0; // guards against the synthetic mousedown a tap emits after touchend
 
@@ -1429,6 +1444,7 @@ function onRowTouchStart(e: TouchEvent, el: HTMLElement): void {
   lastTouchAt = Date.now();
   if (e.touches.length !== 1 || (e.target as HTMLElement).closest(".row-btn")) return;
   const t = e.touches[0];
+  if (!t) return;
   beginPress(el, t.clientX, t.clientY, true);
   document.addEventListener("touchmove", onDocTouchMove, { passive: false });
   document.addEventListener("touchend", onDocTouchEnd);
@@ -2007,7 +2023,7 @@ quoteBtn.addEventListener("mousedown", (e) => {
 // ── Side panel: files + reader (terminal lands next) ──────────────────────────────
 const panel = $("#side-panel");
 const panelContent = $("#panel-content");
-let panelView: "files" | "reader" | "git" | "terminal" | "links" | null = null;
+// `panelView` is declared in the early-init cluster up top — clearReferences() reads it at load.
 let filesPath = "";
 let readerPath = "";
 let readerWatch = "";
