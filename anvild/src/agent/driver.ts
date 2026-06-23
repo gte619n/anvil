@@ -4,7 +4,7 @@ import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker } from "./permissions";
-import { ASK_USER_QUESTION_DIALOG, makeUserDialogHandler, type QuestionBroker } from "./questions";
+import { makeCanUseTool, type QuestionBroker } from "./questions";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
@@ -149,11 +149,14 @@ export class AgentDriver {
         hooks: {
           PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker)], timeout: 3600 }],
         },
-        // AskUserQuestion arrives as a request_user_dialog control request, not a tool result.
-        // We must BOTH provide onUserDialog AND declare the dialog kind — the SDK fails closed
-        // (degrades to "user did not answer") without the kind in supportedDialogKinds. (§6.6)
-        onUserDialog: makeUserDialogHandler(s, this.questionBroker),
-        supportedDialogKinds: [ASK_USER_QUESTION_DIALOG],
+        // AskUserQuestion never returns a normal tool result: its checkPermissions always resolves
+        // to "ask", and the SDK surfaces that through canUseTool (NOT onUserDialog — verified live
+        // that the permission_ask_user_question dialog never fires here). Without a canUseTool the
+        // "ask" is denied and the model continues with "The user did not answer the questions." Our
+        // canUseTool parks the question, surfaces the card, and returns the answer via updatedInput.
+        // (The PreToolUse hook is still the authoritative gate for every other tool — a hook
+        // allow/deny short-circuits before canUseTool, so canUseTool only ever sees AskUserQuestion.)
+        canUseTool: makeCanUseTool(s, this.questionBroker),
         executable: "bun",
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
         ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),

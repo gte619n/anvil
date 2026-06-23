@@ -1,4 +1,4 @@
-import type { OnUserDialog, UserDialogResult } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type { Question, QuestionAnswer } from "@protocol";
 import { newId } from "../util/ids";
 import type { Session } from "../session/session";
@@ -6,22 +6,23 @@ import type { Session } from "../session/session";
 /**
  * AskUserQuestion plumbing (arch §6.6).
  *
- * Claude's AskUserQuestion tool does NOT come back as a normal tool result — the Agent SDK
- * delivers it as a `request_user_dialog` control request (dialogKind
- * `permission_ask_user_question`) and parks the turn until the host answers via the
- * `onUserDialog` callback. With no handler the SDK "stays silent" and the tool eventually
- * resolves to "The user did not answer the questions." — which is exactly the broken
- * behavior we're fixing. We register a handler that parks the question in a broker (so it can
- * be answered from any device, like a permission prompt) and feeds the choice back.
+ * Claude's AskUserQuestion tool does NOT come back as a normal tool result. Its `checkPermissions`
+ * always resolves to "ask", and the Agent SDK surfaces that "ask" to the host through the
+ * `canUseTool` callback — NOT through `onUserDialog`. (We originally wired `onUserDialog` +
+ * `supportedDialogKinds` for the `permission_ask_user_question` dialog kind; verified live against
+ * SDK 0.3.183 that dialog never fires for AskUserQuestion, so with no `canUseTool` the tool was
+ * denied and the CLI's own `call` produced "The user did not answer the questions." — the model
+ * then continued with defaults. That was the broken-interview bug.)
  *
- * The CLI consumes the dialog result as a PermissionResult whose `updatedInput` carries the
- * answer: `{ ...originalInput, answers: { [questionText]: label | label[] }, annotations }`
- * (reverse-engineered from the bundled CLI's answer builder). The `questions` array in
- * `updatedInput` must be the original tool input, passed straight through.
+ * The fix: answer AskUserQuestion from `canUseTool` by returning a PermissionResult whose
+ * `updatedInput` carries the answer. The CLI re-runs the tool with that input and its result
+ * builder emits "Your questions have been answered: …". The wire shape (confirmed live):
+ * `{ behavior: "allow", updatedInput: { ...originalInput, answers: { [questionText]: label | label[] },
+ * annotations? } }`. The `answers` map MUST be keyed by the exact question text (the CLI looks up
+ * `answers[question]` per original question); a multiSelect answer may be an array (the CLI joins it)
+ * or a comma-joined string. We park the question in a broker so it can be answered from any device
+ * (like a permission prompt) and feed the choice back.
  */
-
-/** The CLI dialog kind for AskUserQuestion. The SDK fails closed unless we declare it. */
-export const ASK_USER_QUESTION_DIALOG = "permission_ask_user_question";
 
 interface QuestionResolution {
   cancelled: boolean;
@@ -32,7 +33,7 @@ interface Pending {
   sessionId: string;
 }
 
-/** Holds AskUserQuestion prompts parked in `onUserDialog` until a client answers them. */
+/** Holds AskUserQuestion prompts parked in `canUseTool` until a client answers them. */
 export class QuestionBroker {
   private readonly pending = new Map<string, Pending>();
 
@@ -91,33 +92,44 @@ function normalizeQuestions(raw: unknown): Question[] {
 }
 
 /**
- * Register as `options.onUserDialog` (paired with `supportedDialogKinds`). Parks the question,
- * surfaces it to clients, and turns the answer into the PermissionResult the CLI expects.
+ * Register as `options.canUseTool`. The PreToolUse hook is the authoritative gate for every other
+ * tool (it returns allow/deny, which bypasses `canUseTool` entirely — see SDK docs), and lets
+ * AskUserQuestion fall through with a bare `continue` so its "ask" verdict reaches here. We park the
+ * question in the broker, surface it to clients, and turn the answer into the PermissionResult whose
+ * `updatedInput` the CLI re-runs the tool with.
  */
-export function makeUserDialogHandler(session: Session, broker: QuestionBroker): OnUserDialog {
-  return async (request): Promise<UserDialogResult> => {
-    if (request.dialogKind !== ASK_USER_QUESTION_DIALOG) return { behavior: "cancelled" };
-    const payload = request.payload as { questions?: unknown };
-    const questions = normalizeQuestions(payload.questions);
-    if (questions.length === 0) return { behavior: "cancelled" };
+export function makeCanUseTool(session: Session, broker: QuestionBroker): CanUseTool {
+  return async (toolName, input): Promise<PermissionResult> => {
+    // Only AskUserQuestion ever reaches canUseTool: the hook resolves all other tools to allow/deny,
+    // which short-circuits before this callback. Anything else here was already vetted by the hook,
+    // so allow it through unchanged rather than second-guessing it.
+    if (toolName !== "AskUserQuestion") return { behavior: "allow", updatedInput: input };
+
+    const questions = normalizeQuestions(input.questions);
+    // No parseable questions → let the CLI's own tool run produce its "did not answer" result so the
+    // model proceeds, rather than hard-denying (which would read as the user refusing).
+    if (questions.length === 0) return { behavior: "allow", updatedInput: input };
 
     const requestId = newId("q");
     const answer = broker.request(requestId, session.id);
     session.requestQuestion(requestId, questions);
     const res = await answer;
-    if (res.cancelled || !res.answers || res.answers.length === 0) return { behavior: "cancelled" };
+    // Skip/cancel (or a session reset): allow with no answers → the CLI emits "The user did not
+    // answer the questions." and the model continues with its own judgment (native skip semantics).
+    if (res.cancelled || !res.answers || res.answers.length === 0) return { behavior: "allow", updatedInput: input };
 
-    // Reconstruct the tool input the CLI's answer builder expects: the original questions plus an
-    // `answers` map (questionText → chosen label(s)) and optional free-text `annotations`.
+    // Hand the CLI the answer it expects: the original input plus an `answers` map (questionText →
+    // chosen label(s)) and optional free-text `annotations`. Keep `...input` so `questions` and any
+    // `metadata` round-trip — the CLI's result builder iterates the original questions to format them.
     const answers: Record<string, string | string[]> = {};
     const annotations: Record<string, { notes?: string }> = {};
     for (const a of res.answers) {
       if (a.labels.length) answers[a.question] = a.labels.length === 1 ? a.labels[0]! : a.labels;
       if (a.notes?.trim()) annotations[a.question] = { notes: a.notes.trim() };
     }
-    const updatedInput: Record<string, unknown> = { questions: payload.questions, answers };
+    const updatedInput: Record<string, unknown> = { ...input, answers };
     if (Object.keys(annotations).length) updatedInput.annotations = annotations;
 
-    return { behavior: "completed", result: { behavior: "allow", updatedInput } };
+    return { behavior: "allow", updatedInput };
   };
 }
