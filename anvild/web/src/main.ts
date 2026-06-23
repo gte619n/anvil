@@ -488,12 +488,30 @@ $("#scroll-bottom").addEventListener("click", () => {
 });
 
 // ── Connection status ────────────────────────────────────────────────────────
+// Set while a daemon self-update restart is in flight: the WS drops then reconnects, and that
+// reconnect is our signal the new build is live — reload to pick up the rebuilt web bundle.
+let pendingRestartReload = false;
+function setUpdateStatus(text: string): void {
+  const out = document.getElementById("daemon-update-output");
+  if (out) {
+    out.hidden = false;
+    out.textContent = text;
+  }
+}
 function onStatus(status: "connecting" | "connected" | "disconnected"): void {
   const dot = $("#conn-dot");
   dot.className = `conn-dot ${status}`;
   dot.title = status === "connected" ? "Connected" : status === "connecting" ? "Connecting…" : "Disconnected";
   updateOutboxBadge();
   if (status === "connected") void flushOutbox(); // push anything queued while offline
+  if (pendingRestartReload) {
+    if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
+    else if (status === "connected") {
+      pendingRestartReload = false;
+      setUpdateStatus("Back online — reloading to load the new version…");
+      setTimeout(() => location.reload(), 500); // fresh page → new web bundle
+    }
+  }
   // (re)attach happens in the session.list handler, which the daemon sends on every connect.
 }
 
@@ -1459,6 +1477,7 @@ function onEnvironments(list: Environment[]): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
+let settingsTab: "servers" | "environments" = "servers";
 function openSettings(): void {
   const root = $("#settings-root");
   root.innerHTML = `<div class="settings-view">
@@ -1466,12 +1485,15 @@ function openSettings(): void {
       <h2>${icon("tune")} Settings &amp; servers</h2>
       <button id="settings-close" class="icon-btn" title="Close">${icon("close")}</button>
     </div>
+    <div class="settings-tabs" role="tablist">
+      <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
+      <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
+    </div>
     <div class="settings-body">
-      <section class="settings-section">
-        <h3>Servers</h3>
+      <section class="settings-panel" data-tab="servers">
         <div id="server-cards"><p class="small muted">Loading…</p></div>
       </section>
-      <section class="settings-section">
+      <section class="settings-panel" data-tab="environments">
         <div class="section-head"><h3>Environments</h3><button id="set-add-env" class="primary">${icon("add")} Add repo</button></div>
         <p class="small muted">Environments are git repositories. A new session branches a fresh worktree off one.</p>
         <div id="env-cards"></div>
@@ -1480,9 +1502,18 @@ function openSettings(): void {
   </div>`;
   $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
+  root.querySelectorAll<HTMLElement>(".stab").forEach((t) =>
+    t.addEventListener("click", () => selectSettingsTab(t.dataset.tab as "servers" | "environments")),
+  );
+  selectSettingsTab(settingsTab);
   openOverlay("settings", closeSettings); // Back closes Settings (no-op if it's already a layer)
   renderServerCards();
   renderEnvCards();
+}
+function selectSettingsTab(tab: "servers" | "environments"): void {
+  settingsTab = tab;
+  document.querySelectorAll<HTMLElement>(".settings-view .stab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+  document.querySelectorAll<HTMLElement>(".settings-view .settings-panel").forEach((p) => (p.hidden = p.dataset.tab !== tab));
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
@@ -1551,33 +1582,59 @@ function wireDaemonUpdate(): void {
   const btn = document.getElementById("daemon-update") as HTMLButtonElement | null;
   const out = document.getElementById("daemon-update-output");
   if (!btn || !out) return;
+  const spin = (label: string): void => {
+    btn.innerHTML = `${icon("progress_activity")} ${label}`;
+    btn.querySelector(".msym")?.classList.add("spin");
+  };
+  const reset = (): void => {
+    btn.disabled = false;
+    btn.innerHTML = `${icon("refresh")} Update Anvil`;
+  };
   btn.addEventListener("click", async () => {
     btn.disabled = true;
-    btn.innerHTML = `${icon("sync")} Updating…`;
+    spin("Checking for updates…");
     out.hidden = false;
-    out.textContent = "Fetching, rebuilding… this can take a minute.";
+    out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
       const res = await sendAwait({ type: "daemon.update", cid: newCid() }, 180_000);
       if (res.type === "command.error") {
         out.textContent = `Update failed: ${res.message}`;
-      } else if (res.type === "daemon.update.result") {
-        out.textContent = res.output;
-        if (res.phase === "up-to-date") {
-          toast(`Anvil is up to date (v${res.currentVersion}).`);
-        } else if (res.willRestart) {
-          out.textContent += "\n\nRestarting to apply… reload the app in a few seconds.";
-          toast("Anvil updated — restarting…");
-        } else if (res.phase === "updated") {
-          toast("Anvil updated — restart the daemon to apply.");
-        } else if (res.phase === "error") {
-          toast("Update failed — see Settings.");
-        }
+        toast("Update failed — see Settings.");
+        reset();
+        return;
+      }
+      if (res.type !== "daemon.update.result") {
+        reset();
+        return;
+      }
+      out.textContent = res.output;
+      if (res.phase === "up-to-date") {
+        toast(`Anvil is already up to date (v${res.currentVersion}).`);
+        reset();
+      } else if (res.phase === "error") {
+        toast("Update failed — see Settings.");
+        reset();
+      } else if (res.willRestart) {
+        // The daemon restarts momentarily; keep the button spinning and let onStatus reload the
+        // app once the WS reconnects (that's the proof it's back). Safety net if it never returns.
+        toast("Anvil updated — restarting…");
+        pendingRestartReload = true;
+        spin("Restarting…");
+        setUpdateStatus(`${res.output}\n\nUpdate applied. Restarting the daemon — the app will reload automatically when it's back.`);
+        setTimeout(() => {
+          if (!pendingRestartReload) return;
+          pendingRestartReload = false;
+          setUpdateStatus("Still restarting — reload the app manually in a moment to pick up the update.");
+          reset();
+        }, 90_000);
+      } else {
+        // updated but this daemon isn't service-managed, so it won't self-restart
+        toast("Anvil updated — restart the daemon to apply.");
+        reset();
       }
     } catch (e) {
       out.textContent = `Update failed: ${e instanceof Error ? e.message : String(e)}`;
-    } finally {
-      btn.disabled = false;
-      btn.innerHTML = `${icon("refresh")} Update Anvil`;
+      reset();
     }
   });
 }

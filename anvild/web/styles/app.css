@@ -101,6 +101,16 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .settings-view { position: fixed; inset: 0; z-index: 50; background: var(--panel); display: flex; flex-direction: column; }
 .settings-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--bg); }
 .settings-head h2 { margin: 0; font-size: 18px; display: inline-flex; align-items: center; gap: 8px; }
+/* Settings tabs: group functions onto their own tab so the view doesn't sprawl. */
+.settings-tabs { display: flex; gap: 2px; padding: 0 20px; background: var(--bg); border-bottom: 1px solid var(--border); }
+.settings-tabs .stab { display: inline-flex; align-items: center; gap: 6px; padding: 10px 14px; border: none; border-bottom: 2px solid transparent; background: none; color: var(--muted); cursor: pointer; font-weight: 600; font-size: 13px; }
+.settings-tabs .stab .msym { font-size: 18px; }
+.settings-tabs .stab:hover { color: var(--text); }
+.settings-tabs .stab.active { color: var(--text); border-bottom-color: var(--accent); }
+.settings-panel[hidden] { display: none; }
+/* Spinner glyph (e.g. progress_activity) — used for in-progress actions like daemon update. */
+@keyframes spin { to { transform: rotate(360deg); } }
+.msym.spin { animation: spin 1s linear infinite; }
 .settings-body { flex: 1; overflow-y: auto; padding: 20px; max-width: 880px; width: 100%; margin: 0 auto; }
 .settings-section { margin-bottom: 28px; }
 .settings-section h3 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
