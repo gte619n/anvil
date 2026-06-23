@@ -5,7 +5,8 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { loadServerIdentity, serverHelloEvent } from "./identity";
-import { discoverFleet } from "./fleet";
+import { discoverFleet, inviteMac, rotateToken } from "./fleet";
+import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import type { MarkdownRenderer } from "../render/markdown";
@@ -99,6 +100,7 @@ export interface ServerOptions {
  */
 export function createServer(opts: ServerOptions): ServerHandle {
   const identity = loadServerIdentity(opts.stateDir);
+  const fleet = new FleetStore(opts.stateDir);
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
   const supervisor = new Supervisor(
@@ -171,6 +173,35 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (url.pathname === "/api/fleet/discover" && req.method === "GET") {
         const body = await discoverFleet({ port: opts.port, selfServerId: identity.serverId });
         return Response.json(body satisfies rest.FleetDiscoverResponse);
+      }
+
+      // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
+      // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
+      if (url.pathname === "/api/fleet/members" && req.method === "GET") {
+        return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
+      }
+      if (url.pathname === "/api/fleet/invite" && req.method === "POST") {
+        const { host, code } = (await req.json().catch(() => ({}))) as Partial<rest.FleetInviteRequest>;
+        if (!host || !code) return new Response("host and code required", { status: 400 });
+        const outcome = await inviteMac({ host, code, token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
+        if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
+        const member: rest.FleetMember = {
+          serverId: outcome.serverId || host,
+          serverName: outcome.serverName || host,
+          host,
+          url: `https://${host}:${opts.port}/`,
+        };
+        fleet.upsert(member);
+        return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
+      }
+      if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
+        const results = await rotateToken({ members: fleet.list(), token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
+        return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
+      }
+      const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);
+      if (memberMatch && req.method === "DELETE") {
+        fleet.remove(decodeURIComponent(memberMatch[1]!));
+        return Response.json({ ok: true });
       }
 
       // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint

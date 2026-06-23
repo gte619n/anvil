@@ -818,6 +818,33 @@ export namespace rest {
     /** Set when discovery couldn't run (e.g. Tailscale CLI missing / not logged in). */
     warning?: string;
   }
+  /** A Mac the hub has paired into the fleet (anvil-server-app.md §6). */
+  export interface FleetMember {
+    serverId: string;
+    serverName: string;
+    host: string; // tailnet MagicDNS host (where :7702 pairing + :7701 daemon live)
+    url: string; // https://host:7701/ (for the client to connect to)
+  }
+  /** GET /api/fleet/members → the hub's recorded fleet (for the clients' Fleet UI). */
+  export interface FleetMembersResponse {
+    members: FleetMember[];
+  }
+  /** POST /api/fleet/invite { host, code } → push the hub's OAuth token to a joiner's pairing
+   *  listener (first join, code-gated). The token is read from the daemon env and never returned. */
+  export interface FleetInviteRequest {
+    host: string; // joiner's tailnet name
+    code: string; // the 6-digit code the joiner is showing
+  }
+  export interface FleetInviteResponse {
+    ok: boolean;
+    member?: FleetMember;
+    error?: string;
+  }
+  /** POST /api/fleet/rotate → push the current hub token to every member (identity-gated). */
+  export interface FleetRotateResponse {
+    ok: boolean;
+    results: { host: string; ok: boolean; error?: string }[];
+  }
   /** GET /api/environments/:id/readme — the repo's README, rendered (arch §8). */
   export interface EnvReadmeResponse {
     markdown?: RenderedMarkdown;

@@ -129,3 +129,51 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
   }
   return { ok: true, servers: [...byId.values()] };
 }
+
+// ─── Hub-side token distribution (anvil-server-app.md §4) ──────────────────────────────────────
+// The hub daemon pushes ITS subscription token to a joiner's pairing listener (:7702, hosted by the
+// joiner's Anvil Server.app) so the fleet can be managed from any client — web/Android/Mac — without
+// touching the hub's Mac app. The token is read from the daemon's own env and never returned to a
+// client. First join is code-gated (/anvil-pair); rotation is identity-gated (/anvil-token).
+
+interface PairOutcome {
+  ok: boolean;
+  serverId?: string;
+  serverName?: string;
+  error?: string;
+}
+
+async function postPairing(url: string, body: Record<string, unknown>, timeoutMs = 12_000): Promise<PairOutcome> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const data = (await res.json().catch(() => ({}))) as PairOutcome;
+    return { ok: res.ok && data.ok !== false, serverId: data.serverId, serverName: data.serverName, error: data.error };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Invite a Mac: push the hub token to `host:7702/anvil-pair`, code-gated (first join). */
+export async function inviteMac(opts: { host: string; code: string; token: string; hubServerId: string; pairingPort?: number }): Promise<PairOutcome> {
+  if (!opts.token) return { ok: false, error: "this server has no OAuth token to share" };
+  const host = opts.host.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  const url = `https://${host}:${opts.pairingPort ?? 7702}/anvil-pair`;
+  return postPairing(url, { code: opts.code, token: opts.token, hubServerId: opts.hubServerId });
+}
+
+/** Rotate: push the current hub token to each member's `:7702/anvil-token`, identity-gated. */
+export async function rotateToken(opts: { members: { host: string }[]; token: string; hubServerId: string; pairingPort?: number }): Promise<{ host: string; ok: boolean; error?: string }[]> {
+  if (!opts.token) return opts.members.map((m) => ({ host: m.host, ok: false, error: "no token" }));
+  return Promise.all(
+    opts.members.map(async (m) => {
+      const url = `https://${m.host}:${opts.pairingPort ?? 7702}/anvil-token`;
+      const r = await postPairing(url, { token: opts.token, hubServerId: opts.hubServerId });
+      return { host: m.host, ok: r.ok, error: r.error };
+    }),
+  );
+}

@@ -1901,6 +1901,17 @@ function renderServerCards(): void {
       </div>
       <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover on tailnet</button></div>
       <div id="discover-results" class="small muted" style="margin-top:8px"></div>
+    </div>
+    <div class="card fleet-admin">
+      <div class="section-head"><h3>${icon("hub")} Fleet</h3><button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button></div>
+      <p class="small muted">Macs sharing this server's Claude login. Add one without touching the Mac: on the new Mac open Anvil Server → Join a fleet, then enter its name + code here.</p>
+      <div id="fleet-members" class="small muted">Loading…</div>
+      <div class="git-row" style="margin-top:8px">
+        <input id="fleet-host" placeholder="new-mac.tailnet.ts.net" style="flex:1;min-width:0" />
+        <input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="code" style="max-width:90px" />
+        <button id="fleet-invite" class="primary">${icon("add")} Add Mac</button>
+      </div>
+      <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
     </div>`;
   wireDaemonUpdate(); // the hub card's "Update Anvil"
   for (const srv of list) {
@@ -1914,6 +1925,7 @@ function renderServerCards(): void {
     if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
   });
   document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
+  wireFleetAdmin();
   renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
@@ -1994,6 +2006,51 @@ async function runDiscovery(): Promise<void> {
     );
   } catch {
     out.textContent = "Discovery failed.";
+  }
+}
+// ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
+// All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
+interface FleetMember { serverId: string; serverName: string; host: string; url: string }
+function wireFleetAdmin(): void {
+  void loadFleetMembers();
+  const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  document.getElementById("fleet-invite")?.addEventListener("click", async () => {
+    const host = ($<HTMLInputElement>("#fleet-host").value || "").trim();
+    const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
+    if (!host || !/^\d{6}$/.test(code)) { setStatus("Enter the Mac's tailnet name and its 6-digit code."); return; }
+    setStatus("Sending the login to that Mac over the tailnet…");
+    try {
+      const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; error?: string };
+      setStatus(r.ok ? `✅ ${host} joined the fleet.` : `Rejected: ${r.error ?? "unknown"}`);
+      if (r.ok) { $<HTMLInputElement>("#fleet-host").value = ""; $<HTMLInputElement>("#fleet-code").value = ""; void loadFleetMembers(); }
+    } catch { setStatus("Couldn't reach the hub daemon."); }
+  });
+  document.getElementById("fleet-rotate")?.addEventListener("click", async () => {
+    setStatus("Pushing the current login to every Mac…");
+    try {
+      const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+      const okN = r.results.filter((x) => x.ok).length;
+      setStatus(`Updated ${okN}/${r.results.length} Macs.`);
+    } catch { setStatus("Rotate failed."); }
+  });
+}
+async function loadFleetMembers(): Promise<void> {
+  const el = document.getElementById("fleet-members");
+  if (!el) return;
+  try {
+    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
+    if (!members.length) { el.innerHTML = `<p class="small muted">No other Macs yet.</p>`; return; }
+    el.innerHTML = members
+      .map((m) => `<div class="discover-row"><span>${icon("desktop_mac")} <b>${esc(m.serverName)}</b> <code>${esc(m.host)}</code></span><button class="mini fleet-forget" data-id="${esc(m.serverId)}">${icon("close")} Forget</button></div>`)
+      .join("");
+    el.querySelectorAll<HTMLElement>(".fleet-forget").forEach((b) =>
+      b.addEventListener("click", async () => {
+        await apiFetch(`/api/fleet/members/${encodeURIComponent(b.dataset.id!)}`, { method: "DELETE" }).catch(() => {});
+        void loadFleetMembers();
+      }),
+    );
+  } catch {
+    el.innerHTML = `<p class="small muted">Couldn't load the fleet.</p>`;
   }
 }
 const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
