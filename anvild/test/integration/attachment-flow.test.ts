@@ -100,3 +100,68 @@ test("an uploaded image survives the wire: shows in message.user AND reaches Cla
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a non-image file attachment lands in the chat AND its contents reach Claude as text", async () => {
+  captured.length = 0;
+  const dir = mkdtempSync(join(tmpdir(), "anvil-att-"));
+  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir });
+  const base = `http://127.0.0.1:${srv.port}`;
+
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws`);
+    const events: any[] = [];
+    const waitFor = (type: string, timeoutMs = 4000): Promise<any> =>
+      new Promise((resolve, reject) => {
+        const hit = events.find((e) => e.type === type);
+        if (hit) return resolve(hit);
+        const t = setTimeout(() => reject(new Error(`timeout waiting for ${type}`)), timeoutMs);
+        ws.addEventListener("message", (ev) => {
+          const m = JSON.parse(String((ev as MessageEvent).data));
+          if (m.type === type) {
+            clearTimeout(t);
+            resolve(m);
+          }
+        });
+      });
+    ws.addEventListener("message", (ev) => events.push(JSON.parse(String((ev as MessageEvent).data))));
+    await new Promise<void>((r) => ws.addEventListener("open", () => r()));
+    ws.send(stamp({ type: "session.create", cid: "c", source: "existing-dir", cwd: dir, model: "sonnet", autonomy: "mostly-autonomous" }));
+    const created = await waitFor("session.created");
+    const sessionId = created.session.id as string;
+
+    // Upload a text file WITH AN EMPTY mediaType — exactly what Android's content picker sends.
+    // The daemon must infer "text/*" from the ".log" extension (otherwise it's dropped).
+    const fileText = "ERROR boot failed at line 42\nstacktrace: ...";
+    const upRes = await fetch(`${base}/api/sessions/${sessionId}/attachments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "crash.log", mediaType: "", dataBase64: Buffer.from(fileText).toString("base64") }),
+    });
+    expect(upRes.ok).toBe(true);
+    const { attachment } = (await upRes.json()) as { attachment: { id: string; kind: string } };
+    expect(attachment.kind).toBe("file");
+
+    ws.send(stamp({ type: "prompt.send", cid: "p", sessionId, text: "what's in this log?", attachmentIds: [attachment.id] }));
+
+    // the broadcast user message carries it as a "file" attachment so every device renders a chip
+    const userEvt = await waitFor("message.user");
+    expect(userEvt.attachments).toHaveLength(1);
+    expect(userEvt.attachments[0].kind).toBe("file");
+
+    // and Claude receives the file's TEXT inline (not a broken image block)
+    await waitFor("result");
+    const userMsg = captured.find(
+      (m) => Array.isArray(m.message?.content) && m.message.content.some((b: any) => b.type === "text" && b.text.includes("crash.log")),
+    );
+    expect(userMsg).toBeDefined();
+    const block = userMsg.message.content.find((b: any) => b.type === "text" && b.text.includes("crash.log"));
+    expect(block.text).toContain("ERROR boot failed at line 42");
+    // no bogus image block was produced for a text file
+    expect(userMsg.message.content.some((b: any) => b.type === "image")).toBe(false);
+
+    ws.close();
+  } finally {
+    srv.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

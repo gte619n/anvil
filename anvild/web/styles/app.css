@@ -285,7 +285,14 @@ details.tool-result.error > summary { color: var(--danger); }
 .attach-chip { position: relative; width: 56px; height: 56px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .attach-chip img { width: 100%; height: 100%; object-fit: cover; }
 .attach-chip .rm { position: absolute; top: -7px; right: -7px; background: var(--danger); color: #fff; border: none; border-radius: 50%; width: 18px; height: 18px; line-height: 1; cursor: pointer; }
+/* non-image attachment chip: an icon + filename instead of a thumbnail */
+.attach-chip.file { width: auto; max-width: 180px; height: 56px; display: flex; align-items: center; gap: 6px; padding: 0 10px; background: var(--surface, rgba(127,127,127,.08)); }
+.attach-chip.file .msym { font-size: 22px; opacity: .8; }
+.attach-chip.file .att-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .att-img { max-width: 280px; max-height: 280px; border-radius: 8px; margin-top: 6px; display: block; }
+/* a non-image attachment shown in a sent user message → downloadable chip */
+.att-file { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; text-decoration: none; color: inherit; max-width: 280px; }
+.att-file .att-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #input { border: none; background: transparent; resize: none; outline: none; font: inherit; padding: 4px 6px; max-height: 200px; line-height: 1.45; overflow-y: auto; }
 #composer-controls { display: flex; align-items: center; gap: 6px; }
 #composer-controls .spacer { flex: 1; }

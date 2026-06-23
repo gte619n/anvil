@@ -671,11 +671,22 @@ function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string
   md.innerHTML = html; // daemon-sanitized (arch §8.3)
   b.appendChild(md);
   for (const att of attachments) {
-    if (att.kind === "image" && activeId) {
+    if (!activeId) continue;
+    const href = apiUrl(`/api/sessions/${activeId}/attachments/${att.id}`);
+    if (att.kind === "image") {
       const img = document.createElement("img");
       img.className = "att-img";
-      img.src = apiUrl(`/api/sessions/${activeId}/attachments/${att.id}`);
+      img.src = href;
       b.appendChild(img);
+    } else {
+      // a non-image attachment → a downloadable file chip
+      const a = document.createElement("a");
+      a.className = "att-file";
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.innerHTML = `${icon("description")}<span class="att-name">${esc(att.name)}</span>`;
+      b.appendChild(a);
     }
   }
   const t = timeEl(ts);
@@ -1433,12 +1444,13 @@ function selectSession(id: string, push = true): void {
 
 // ── Composer ───────────────────────────────────────────────────────────────────
 const input = $<HTMLTextAreaElement>("#input");
-const pendingAttachments: { id: string; name: string; dataUrl: string }[] = [];
+// `dataUrl` is set only for images (the chip thumbnail); other files show an icon + name chip.
+const pendingAttachments: { id: string; name: string; kind: "image" | "file"; dataUrl?: string }[] = [];
 const attachRow = $("#attach-row");
 
 // Uploads are async (read file → POST → push to pendingAttachments). If the user sends text
-// before an image upload lands, the attachment id wouldn't be in pendingAttachments yet and the
-// image would be silently dropped. Track in-flight uploads so send() can wait for them.
+// before an upload lands, the attachment id wouldn't be in pendingAttachments yet and the
+// file would be silently dropped. Track in-flight uploads so send() can wait for them.
 let uploadsInFlight = 0;
 const uploadWaiters: Array<() => void> = [];
 function uploadsSettled(): Promise<void> {
@@ -1450,9 +1462,9 @@ $<HTMLFormElement>("#composer").addEventListener("submit", (e) => {
   void sendComposer();
 });
 async function sendComposer(): Promise<void> {
-  // Never send ahead of an image that's still uploading — wait for it to land first.
+  // Never send ahead of a file that's still uploading — wait for it to land first.
   if (uploadsInFlight > 0) {
-    toast("Finishing image upload…");
+    toast("Finishing upload…");
     await uploadsSettled();
   }
   const text = input.value;
@@ -1462,7 +1474,7 @@ async function sendComposer(): Promise<void> {
     sock.send({ type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
   } else {
     // offline, or a session that itself hasn't been created yet → queue + show optimistically
-    if (pendingAttachments.length) toast("Images need a connection — sent text only");
+    if (pendingAttachments.length) toast("Attachments need a connection — sent text only");
     enqueue({ cid: newCid(), cmd: { type: "prompt.send", sessionId: activeId, text } });
     appendOptimisticUser(text);
   }
@@ -1494,26 +1506,27 @@ function updateSendState(): void {
 const fileInput = $<HTMLInputElement>("#file-input");
 $("#btn-attach").addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
-  attachImageFiles(Array.from(fileInput.files ?? []));
+  attachFiles(Array.from(fileInput.files ?? []));
   fileInput.value = "";
 });
 
-/** Upload the image files; tell the user about any non-image files we dropped (only images are supported). */
-function attachImageFiles(files: File[]): void {
-  let skipped = 0;
-  for (const f of files) {
-    if (f.type.startsWith("image/")) void uploadAttachment(f);
-    else skipped++;
-  }
-  if (skipped) toast(skipped === 1 ? "Only images can be attached" : `Skipped ${skipped} non-image files`);
+/** Upload every selected file (images, PDFs, code, logs, …); the daemon decides how to feed each
+ *  to the model. We don't gate on MIME type here — Android's picker frequently hands back an empty
+ *  `File.type` even for images, which is exactly what used to silently drop attachments. */
+function attachFiles(files: File[]): void {
+  for (const f of files) void uploadAttachment(f);
 }
 
 function renderAttachRow(): void {
   attachRow.innerHTML = "";
   pendingAttachments.forEach((a, i) => {
     const chip = document.createElement("div");
-    chip.className = "attach-chip";
-    chip.innerHTML = `<img src="${a.dataUrl}" alt="${esc(a.name)}" /><button type="button" class="rm" title="Remove">×</button>`;
+    chip.className = a.kind === "image" ? "attach-chip" : "attach-chip file";
+    const inner =
+      a.kind === "image" && a.dataUrl
+        ? `<img src="${a.dataUrl}" alt="${esc(a.name)}" />`
+        : `<span class="msym">description</span><span class="att-name" title="${esc(a.name)}">${esc(a.name)}</span>`;
+    chip.innerHTML = `${inner}<button type="button" class="rm" title="Remove">×</button>`;
     chip.querySelector(".rm")!.addEventListener("click", () => {
       pendingAttachments.splice(i, 1);
       renderAttachRow();
@@ -1540,14 +1553,20 @@ async function uploadAttachment(file: File): Promise<void> {
     const res = await apiFetch(`/api/sessions/${activeId}/attachments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: file.name || "pasted-image.png", mediaType: file.type || "image/png", dataBase64: base64 }),
+      // mediaType may be empty (Android picker) — the daemon infers it from the filename.
+      body: JSON.stringify({ name: file.name || "attachment", mediaType: file.type || "", dataBase64: base64 }),
     });
     if (!res.ok) {
       toast("Upload failed");
       return;
     }
-    const { attachment } = (await res.json()) as { attachment: { id: string; name: string } };
-    pendingAttachments.push({ id: attachment.id, name: attachment.name, dataUrl });
+    const { attachment } = (await res.json()) as { attachment: AttachmentRef };
+    pendingAttachments.push({
+      id: attachment.id,
+      name: attachment.name,
+      kind: attachment.kind,
+      dataUrl: attachment.kind === "image" ? dataUrl : undefined,
+    });
     renderAttachRow();
   } catch {
     toast("Upload failed");
@@ -1559,7 +1578,8 @@ async function uploadAttachment(file: File): Promise<void> {
 }
 input.addEventListener("paste", (e) => {
   for (const item of Array.from(e.clipboardData?.items ?? [])) {
-    if (item.type.startsWith("image/")) {
+    // Only file items (a pasted image or file) — `kind === "string"` is the normal text paste.
+    if (item.kind === "file") {
       const f = item.getAsFile();
       if (f) {
         e.preventDefault();
@@ -1572,7 +1592,7 @@ const composerEl = $("#composer");
 composerEl.addEventListener("dragover", (e) => e.preventDefault());
 composerEl.addEventListener("drop", (e) => {
   e.preventDefault();
-  attachImageFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []));
+  attachFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []));
 });
 
 // ── Select-to-quote (highlight any message text → quote into the composer) ─────────
