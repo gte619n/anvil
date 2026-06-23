@@ -29,7 +29,7 @@ export interface PendingPermission {
   input: unknown;
   suggestions: PermissionSuggestion[];
 }
-/** An AskUserQuestion prompt currently parked in the onUserDialog handler (arch §6.6). */
+/** An AskUserQuestion prompt currently parked in the canUseTool handler (arch §6.6). */
 export interface PendingQuestion {
   requestId: string;
   questions: Question[];
