@@ -1,24 +1,25 @@
 #!/usr/bin/env bun
 /**
- * Task-autopilot CLI — dry-run the nightly BUNDLE + PLAN against a real project. Writes nothing
- * (no Todoist labels/comments, no sessions, no git): it pulls tasks, groups them into units of
- * work, and plans each by reading the repo read-only, then prints the result.
+ * Task-autopilot CLI.
  *
- *   bun run scripts/autopilot.ts dryrun <envNameOrId> [projectId]
+ *   bun run scripts/autopilot.ts dryrun <envNameOrId> [projectId]   # read-only: bundle + plan, print
+ *   bun run scripts/autopilot.ts plan   <envNameOrId> [projectId]   # WRITES: also persists work units,
+ *                                                                   #   comments the plan, tags anvil:planned
  *
- * projectId defaults to the environment's linked Todoist project (set in the web UI). Pass one
- * explicitly to test before linking.
+ * `dryrun` touches nothing. `plan` writes to your Todoist (comments + labels) and the local work-unit
+ * store. projectId defaults to the environment's linked Todoist project; pass one to test before linking.
  */
 import { loadConfig } from "../src/config";
 import { EnvironmentStore } from "../src/env/store";
 import { IntegrationStore } from "../src/integrations/store";
+import { WorkUnitStore } from "../src/integrations/workunit";
 import { TodoistClient } from "../src/integrations/todoist";
-import { dryRunProject } from "../src/integrations/autopilot";
+import { dryRunProject, planAndTagProject } from "../src/integrations/autopilot";
 
 const cfg = loadConfig();
 const cmd = process.argv[2];
-if (cmd !== "dryrun") {
-  console.error("Usage: bun run scripts/autopilot.ts dryrun <envNameOrId> [projectId]");
+if (cmd !== "dryrun" && cmd !== "plan") {
+  console.error("Usage: bun run scripts/autopilot.ts <dryrun|plan> <envNameOrId> [projectId]");
   process.exit(1);
 }
 
@@ -50,19 +51,31 @@ if (!state?.accessToken) {
   process.exit(1);
 }
 
-console.log(`Dry-running autopilot for "${env.name}" (${env.repoRoot})\n  project ${projectId}\n`);
-const planned = await dryRunProject(new TodoistClient(state.accessToken), {
-  projectId,
-  repoRoot: env.repoRoot,
-  repoName: env.name,
-  onProgress: (m) => console.log(m),
-});
+const client = new TodoistClient(state.accessToken);
 
-console.log(`\n${"=".repeat(72)}\nPROPOSED UNITS OF WORK (${planned.length})\n${"=".repeat(72)}`);
-for (const [i, u] of planned.entries()) {
-  console.log(`\n### ${i + 1}. ${u.title}`);
-  console.log(`Rationale: ${u.rationale}`);
-  console.log(`Tasks:`);
-  for (const t of u.tasks) console.log(`  • ${t.content}`);
-  console.log(`\n--- Plan ---\n${u.plan}\n`);
+if (cmd === "dryrun") {
+  console.log(`Dry-running autopilot for "${env.name}" (${env.repoRoot})\n  project ${projectId}\n`);
+  const planned = await dryRunProject(client, {
+    projectId,
+    repoRoot: env.repoRoot,
+    repoName: env.name,
+    onProgress: (m) => console.log(m),
+  });
+  console.log(`\n${"=".repeat(72)}\nPROPOSED UNITS OF WORK (${planned.length})\n${"=".repeat(72)}`);
+  for (const [i, u] of planned.entries()) {
+    console.log(`\n### ${i + 1}. ${u.title}`);
+    console.log(`Rationale: ${u.rationale}`);
+    console.log(`Tasks:`);
+    for (const t of u.tasks) console.log(`  • ${t.content}`);
+    console.log(`\n--- Plan ---\n${u.plan}\n`);
+  }
+} else {
+  console.log(`PLAN+TAG (writes to Todoist) for "${env.name}" (${env.repoRoot})\n  project ${projectId}\n`);
+  const workUnits = new WorkUnitStore(cfg.stateDir);
+  const { created, skipped } = await planAndTagProject(
+    { client, workUnits },
+    { environmentId: env.id, projectId, repoRoot: env.repoRoot, repoName: env.name, onProgress: (m) => console.log(m) },
+  );
+  console.log(`\n${"=".repeat(72)}\nDONE — ${created.length} work units created, ${skipped} tasks skipped (already in pipeline).`);
+  for (const [i, u] of created.entries()) console.log(`  ${i + 1}. ${u.title}  [${u.taskIds.length} tasks → anvil:planned]  (${u.id})`);
 }
