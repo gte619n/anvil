@@ -80,15 +80,19 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #finished-section[hidden] { display: none; }
 #finished-head { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--border); }
 #finished-head .msym { font-size: 14px; }
-#finished-list { min-height: 6px; border-radius: 8px; transition: background 0.12s; }
+#finished-list { min-height: 6px; border-radius: 8px; }
 #finished-list.drag-over { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 #finished-list:empty::after { content: "Drop finished sessions here"; display: block; color: var(--muted); font-size: 11px; font-style: italic; text-align: center; padding: 12px 8px; margin-top: 2px; border: 1px dashed var(--border); border-radius: 8px; }
-/* Drag-to-reorder: a handle (pointer-events, so touch works) starts the drag; the moving row dims. */
-.session .drag-handle { display: flex; align-items: center; align-self: stretch; padding: 0 0 0 6px; color: var(--muted); cursor: grab; opacity: 0.3; touch-action: none; }
-.session:hover .drag-handle { opacity: 0.7; }
-.session .drag-handle:active { cursor: grabbing; }
-.session .drag-handle .msym { font-size: 18px; }
-.session.dragging { opacity: 0.6; outline: 1px dashed var(--accent); background: var(--bg); }
+/* Press-and-hold to reorder: rows aren't text-selectable, so a long-press lifts the row instead of
+   triggering Android's copy/paste selection. The lifted row floats above the rest. */
+.session { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.session.dragging { opacity: 0.9; outline: 1px dashed var(--accent); background: var(--bg); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); touch-action: none; }
+/* Row action button (open in new tab) — desktop hover convenience. */
+.session .row-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px 8px; align-self: center; display: flex; }
+.session .row-btn .msym { font-size: 16px; }
+.session .row-btn:hover { color: var(--accent); }
+.session .open-tab { display: none; }
+.session:hover .open-tab, .session.active .open-tab { display: flex; }
 .sidebar-foot { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; }
 .sidebar-foot:hover { border-color: var(--accent); }
 .sidebar-foot .msym { font-size: 19px; }
@@ -134,9 +138,6 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   border-radius: 3px; background: var(--session-stripe);
 }
 .session .srow { flex: 1; min-width: 0; display: block; padding: 8px 10px; text-decoration: none; color: inherit; }
-.session .open-tab { display: none; background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px 8px; align-self: center; }
-.session .open-tab .msym { font-size: 16px; }
-.session:hover .open-tab, .session.active .open-tab { display: flex; }
 .session .title { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .session .title .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session .title .msym { font-size: 17px; color: var(--muted); flex-shrink: 0; }
@@ -231,6 +232,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .queued-badge .msym { font-size: 13px; }
 
 #conversation { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+/* Chat text is selectable/copyable — on Android this is what surfaces the selection handles. */
+#conversation, #conversation * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
 .empty-state { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 18px; color: var(--muted); text-align: center; }
 .empty-art { width: 172px; height: 172px; opacity: 0.3; filter: grayscale(0.7); }
 .empty-state p { margin: 0; font-size: 14px; }

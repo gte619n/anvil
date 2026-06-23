@@ -48,7 +48,8 @@ const icon = (name: string): string => `<span class="msym">${name}</span>`;
 
 // Show the build version next to the brand so it's obvious which app/bundle is running.
 $("#brand-version").textContent = `v${__APP_VERSION__}`;
-const sessIcon = (s: Session): string => (s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder"));
+const sessIcon = (s: Session): string =>
+  s.isDefault ? "robot_2" : s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder");
 const conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
 let stickToBottom = true;
@@ -72,7 +73,6 @@ const removingSessions = new Set<string>();
 
 // The sidebar order and "Finished" group live on the session itself (server-synced fields
 // `order`/`finished`), so the arrangement follows you across every client — web, desktop, Android.
-let dragging: { id: string; el: HTMLElement } | null = null; // the row currently being dragged, if any
 
 // Offline cache (arch §8): persist the session + environment lists so they're browsable with no
 // connection. Hydrated synchronously below, kept in sync on every change.
@@ -1119,13 +1119,11 @@ function setStatus(status: string): void {
 
 // ── Stop the running turn (§stop) ────────────────────────────────────────────────
 const stopBtn = $<HTMLButtonElement>("#stop");
-/** True while a turn is actively running — gates Stop's visibility and keeps Send disabled. */
-let composerBusy = false;
-/** While a turn is actively running, a subtle Stop appears to the left of (a disabled) Send. */
+/** While a turn is actively running, a subtle Stop appears to the left of Send. Send itself stays
+ *  enabled-when-there's-input (it was getting stuck disabled) — you can queue a follow-up either way. */
 function updateComposerMode(status: string): void {
-  composerBusy = status === "thinking" || status === "running_tool";
-  stopBtn.hidden = !composerBusy; // only visible while actively thinking/running a tool
-  updateSendState(); // keep Send disabled for the duration of the turn
+  const busy = status === "thinking" || status === "running_tool";
+  stopBtn.hidden = !busy; // Stop shows only while actively thinking/running a tool
 }
 /** Stop button: interrupt the turn, drop the in-flight thinking/activity, and mark it cancelled —
  *  jumping back to the last prompt with a "Thinking canceled" notice (UI refinement §stop). */
@@ -1237,21 +1235,24 @@ async function runMermaid(container: HTMLElement): Promise<void> {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 function renderSessions(): void {
-  if (dragging) return; // never re-render mid-drag — it would yank the row out from under the pointer
+  if (press?.lifted) return; // don't yank a row out from under an in-progress drag
   const activeUl = $("#session-list");
   const finishedUl = $("#finished-list");
   activeUl.innerHTML = "";
   finishedUl.innerHTML = "";
   const ord = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
   const items = [...sessions.values()].sort(
-    (a, b) => Number(!!a.archived) - Number(!!b.archived) || ord(a) - ord(b),
+    (a, b) =>
+      Number(!!b.isDefault) - Number(!!a.isDefault) || // the persistent concierge chat is always pinned first
+      Number(!!a.archived) - Number(!!b.archived) ||
+      ord(a) - ord(b),
   );
   let anyFinished = false;
   for (const s of items) {
     if (s.finished) anyFinished = true;
     (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
   }
-  $("#finished-section").hidden = !anyFinished && !dragging; // hide the empty group at rest
+  $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
 }
 
 function renderSessionItem(s: Session): HTMLLIElement {
@@ -1271,14 +1272,6 @@ function renderSessionItem(s: Session): HTMLLIElement {
   const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
   const where = envName ?? s.git?.branch ?? s.source;
   const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
-  if (!removing) {
-    const handle = document.createElement("div");
-    handle.className = "drag-handle";
-    handle.title = "Drag to reorder";
-    handle.innerHTML = icon("drag_indicator");
-    handle.addEventListener("pointerdown", (e) => startDrag(e, s.id, li));
-    li.append(handle);
-  }
   const a = document.createElement("a");
   a.className = "srow";
   a.href = sessionHref(s.id);
@@ -1287,12 +1280,15 @@ function renderSessionItem(s: Session): HTMLLIElement {
   a.addEventListener("click", (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
     e.preventDefault();
+    if (justDragged) return; // a drag just ended on this row — don't also navigate
     if (!removing) selectSession(s.id); // a session being cleaned up isn't selectable
   });
   li.append(a);
   if (!removing) {
+    // The concierge is pinned and can't be reordered or moved to Finished, so it isn't draggable.
+    if (!s.isDefault) li.addEventListener("pointerdown", (e) => startSessionPress(e, li)); // press-and-hold → reorder
     const open = document.createElement("button");
-    open.className = "open-tab";
+    open.className = "row-btn open-tab";
     open.title = "Open in new tab";
     open.innerHTML = icon("open_in_new");
     open.addEventListener("click", (e) => {
@@ -1305,65 +1301,94 @@ function renderSessionItem(s: Session): HTMLLIElement {
   return li;
 }
 
-// ── Drag-to-reorder (pointer events → mouse + touch) ─────────────────────────────────────────────
-/** The row to insert the dragged element before, given the pointer's Y — or null to append. */
+// ── Long-press to reorder (touch + mouse) ───────────────────────────────────────────────────────
+// Press-and-hold a session row to pick it up, drag it (into the Finished group or a new spot), and
+// drop on release. No drag handle — Android read the handle's long-press as text selection — and
+// rows disable user-select in CSS so the lift is clean. Server-synced via session.arrange.
+const LONG_PRESS_MS = 420;
+const PRESS_MOVE_CANCEL = 10; // px of movement before the hold completes ⇒ it's a scroll/tap, not a lift
+let press: { el: HTMLElement; pointerId: number; x: number; y: number; timer: number; lifted: boolean } | null = null;
+let justDragged = false; // set briefly after a drop so the row's click doesn't also navigate
+
+function startSessionPress(e: PointerEvent, el: HTMLElement): void {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  if ((e.target as HTMLElement).closest(".row-btn")) return; // let row buttons handle their own taps
+  endPress(false); // clear any stale press
+  press = { el, pointerId: e.pointerId, x: e.clientX, y: e.clientY, timer: 0, lifted: false };
+  press.timer = window.setTimeout(liftPress, LONG_PRESS_MS);
+  window.addEventListener("pointermove", onPressMove);
+  window.addEventListener("pointerup", onPressUp);
+  window.addEventListener("pointercancel", onPressUp);
+}
+function liftPress(): void {
+  if (!press) return;
+  press.lifted = true;
+  press.el.classList.add("dragging");
+  $("#finished-section").hidden = false; // reveal the (possibly empty) drop target
+  try {
+    press.el.setPointerCapture(press.pointerId); // keep events even when the finger leaves the row
+  } catch {
+    /* capture unsupported — still works via the window listeners */
+  }
+  navigator.vibrate?.(12); // a little "picked up" haptic where supported
+}
+function onPressMove(e: PointerEvent): void {
+  if (!press || e.pointerId !== press.pointerId) return;
+  if (!press.lifted) {
+    // moved before the hold completed → it's a scroll or sloppy tap; abandon the pending lift
+    if (Math.abs(e.clientY - press.y) > PRESS_MOVE_CANCEL || Math.abs(e.clientX - press.x) > PRESS_MOVE_CANCEL) endPress(false);
+    return;
+  }
+  e.preventDefault(); // we own the gesture now
+  const finishedUl = $("#finished-list");
+  const overFinished = e.clientY >= $("#finished-section").getBoundingClientRect().top;
+  finishedUl.classList.toggle("drag-over", overFinished);
+  const list = overFinished ? finishedUl : $("#session-list");
+  const after = dragAfter(list, e.clientY);
+  if (after === null) list.appendChild(press.el);
+  else if (after !== press.el) list.insertBefore(press.el, after);
+}
+function onPressUp(e: PointerEvent): void {
+  if (!press || e.pointerId !== press.pointerId) return;
+  endPress(press.lifted); // commit iff we actually lifted
+}
+/** Tear down the press; `commit` true → persist the dropped order, false → restore from state. */
+function endPress(commit: boolean): void {
+  if (!press) return;
+  clearTimeout(press.timer);
+  press.el.classList.remove("dragging");
+  $("#finished-list").classList.remove("drag-over");
+  window.removeEventListener("pointermove", onPressMove);
+  window.removeEventListener("pointerup", onPressUp);
+  window.removeEventListener("pointercancel", onPressUp);
+  const lifted = press.lifted;
+  press = null;
+  if (lifted && commit) {
+    commitOrderFromDom();
+    justDragged = true;
+    setTimeout(() => (justDragged = false), 0); // swallow the trailing click on the dropped row
+  } else if (lifted) {
+    renderSessions(); // cancelled mid-drag → restore positions from state
+  }
+}
+/** The row to insert the dragged element before for pointer Y — or null to append. */
 function dragAfter(container: HTMLElement, y: number): HTMLElement | null {
   let best: { off: number; el: HTMLElement | null } = { off: -Infinity, el: null };
   for (const el of container.querySelectorAll<HTMLElement>(".session:not(.dragging)")) {
     const box = el.getBoundingClientRect();
-    const off = y - box.top - box.height / 2; // negative = pointer is above this row's middle
+    const off = y - box.top - box.height / 2; // negative ⇒ pointer is above this row's middle
     if (off < 0 && off > best.off) best = { off, el };
   }
   return best.el;
 }
-function startDrag(e: PointerEvent, id: string, el: HTMLElement): void {
-  if (e.pointerType === "mouse" && e.button !== 0) return;
-  e.preventDefault();
-  e.stopPropagation(); // don't let it reach the row's click/select
-  dragging = { id, el };
-  el.classList.add("dragging");
-  $("#finished-section").hidden = false; // reveal the (possibly empty) drop target while dragging
-  const handle = e.currentTarget as HTMLElement;
-  try {
-    handle.setPointerCapture(e.pointerId); // route move/up here even when the pointer leaves the handle
-  } catch {
-    /* capture unsupported — falls back to bubbling, still usable */
-  }
-  const move = (ev: PointerEvent): void => {
-    if (!dragging) return;
-    ev.preventDefault();
-    const section = $("#finished-section");
-    const finishedUl = $("#finished-list");
-    const overFinished = ev.clientY >= section.getBoundingClientRect().top;
-    finishedUl.classList.toggle("drag-over", overFinished);
-    const list = overFinished ? finishedUl : $("#session-list");
-    const after = dragAfter(list, ev.clientY);
-    if (after === null) list.appendChild(dragging.el);
-    else if (after !== dragging.el) list.insertBefore(dragging.el, after);
-  };
-  const end = (): void => {
-    handle.removeEventListener("pointermove", move);
-    handle.removeEventListener("pointerup", end);
-    handle.removeEventListener("pointercancel", end);
-    finishDrag();
-  };
-  handle.addEventListener("pointermove", move);
-  handle.addEventListener("pointerup", end);
-  handle.addEventListener("pointercancel", end);
-}
-/** Commit the DOM order back to state: the two lists' contents define order and Finished membership. */
-function finishDrag(): void {
-  if (!dragging) return;
-  dragging.el.classList.remove("dragging");
-  $("#finished-list").classList.remove("drag-over");
+/** Read both lists' DOM order → order + Finished membership, apply optimistically, sync to the daemon. */
+function commitOrderFromDom(): void {
   const ids = (sel: string): string[] =>
     [...$(sel).querySelectorAll<HTMLElement>(".session")].map((el) => el.dataset.id).filter((x): x is string => !!x);
   const active = ids("#session-list");
   const finished = ids("#finished-list");
   const order = [...active, ...finished];
   const fin = new Set(finished);
-  // Optimistically stamp the new order/finished onto the local sessions so the arrangement holds
-  // instantly; the daemon echoes session.updated back to every client (incl. Android) to confirm.
   order.forEach((id, i) => {
     const s = sessions.get(id);
     if (s) {
@@ -1373,12 +1398,12 @@ function finishDrag(): void {
   });
   persistSessions(); // keep the offline cache in step
   sock.send({ type: "session.arrange", order, finished }); // dropped if offline; server resyncs on reconnect
-  dragging = null;
-  renderSessions(); // normalize (empty-group hint, hidden state, anything that changed during the drag)
+  renderSessions();
 }
 function setHeaderTitle(s: Session | undefined): void {
   $("#header-title").innerHTML = s ? `${icon(sessIcon(s))}<span class="ht">${esc(s.title)}</span>` : `<span class="ht">Anvil</span>`;
   document.title = s ? `Anvil: ${s.title}` : "Anvil";
+  $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   void setFavicon(s);
 }
 
@@ -1699,8 +1724,7 @@ function autoGrow(): void {
   input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
 }
 function updateSendState(): void {
-  $<HTMLButtonElement>("#send").disabled =
-    composerBusy || (!input.value.trim() && pendingAttachments.length === 0);
+  $<HTMLButtonElement>("#send").disabled = !input.value.trim() && pendingAttachments.length === 0;
 }
 
 // attach button → file picker
@@ -2194,6 +2218,12 @@ function showGitResult(e: GitResultEvent): void {
   el.innerHTML = esc(head + e.output).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
 }
 
+$("#btn-new-topic").addEventListener("click", () => {
+  if (!activeId) return;
+  if (!confirm("Start a new topic? Claude forgets the earlier context but the visible history stays.")) return;
+  sock.send({ type: "session.new_topic", sessionId: activeId, cid: newCid() });
+  toast("Started a new topic — fresh context.");
+});
 $("#btn-files").addEventListener("click", () => (panelView === "files" || panelView === "reader" ? closePanel() : openPanel("files")));
 $("#btn-git").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
 $("#btn-terminal").addEventListener("click", () => (panelView === "terminal" ? closePanel() : openPanel("terminal")));
