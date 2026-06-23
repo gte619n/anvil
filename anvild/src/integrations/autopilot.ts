@@ -2,6 +2,8 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
 import type { TodoistClient, TodoistTask, TodoistSection } from "./todoist";
+import { readStatus, withStatus } from "./status";
+import type { WorkUnit, WorkUnitStore } from "./workunit";
 
 /**
  * The nightly task autopilot's planning brain (phases 2–3 of the pipeline: BUNDLE + PLAN).
@@ -133,6 +135,66 @@ Write a focused implementation plan in markdown: the approach, the specific file
 
   const plan = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
   return { ...unit, tasks: members, plan };
+}
+
+/** Tasks eligible for planning: not already in the anvil pipeline (no anvil:* label, no work unit). */
+function candidateTasks(tasks: TodoistTask[], workUnits: WorkUnitStore): TodoistTask[] {
+  return tasks.filter((t) => !readStatus(t.labels) && !workUnits.forTask(t.id));
+}
+
+function planComment(unit: PlannedUnit): string {
+  return `🤖 **anvil** bundled this into work unit “${unit.title}”.\n\n_${unit.rationale}_\n\n${unit.plan}`;
+}
+
+/**
+ * Phase 2A — PLAN + TAG (write side): pull candidate tasks for a linked project, bundle, plan each
+ * unit, then persist a WorkUnit, post the plan as a Todoist comment, and tag members `anvil:planned`.
+ * Tasks already in the pipeline are skipped. Does NOT build code — that's phase 2B.
+ */
+export async function planAndTagProject(
+  deps: { client: TodoistClient; workUnits: WorkUnitStore },
+  opts: {
+    environmentId: string;
+    projectId: string;
+    repoRoot: string;
+    repoName?: string;
+    bundleModel?: Model;
+    planModel?: Model;
+    onProgress?: (msg: string) => void;
+  },
+): Promise<{ created: WorkUnit[]; skipped: number }> {
+  const log = opts.onProgress ?? (() => {});
+  const [tasks, sections] = await Promise.all([deps.client.tasks(opts.projectId), deps.client.sections(opts.projectId)]);
+  const candidates = candidateTasks(tasks, deps.workUnits);
+  const skipped = tasks.length - candidates.length;
+  log(`${tasks.length} active tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
+  if (candidates.length === 0) return { created: [], skipped };
+
+  const units = await bundleTasks(candidates, sections, { model: opts.bundleModel, repoName: opts.repoName });
+  log(`Bundled into ${units.length} units. Planning + tagging…`);
+  const created: WorkUnit[] = [];
+  for (const [i, unit] of units.entries()) {
+    log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot });
+    const wu = deps.workUnits.create({
+      environmentId: opts.environmentId,
+      todoistProjectId: opts.projectId,
+      taskIds: planned.taskIds,
+      title: planned.title,
+      rationale: planned.rationale,
+      plan: planned.plan,
+      status: "planned",
+    });
+    // Tag every member; post the full plan once (on the first member), pointers on the rest.
+    for (const [j, t] of planned.tasks.entries()) {
+      await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
+      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
+      else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
+    }
+    created.push(wu);
+  }
+  log(`Created ${created.length} planned work units.`);
+  return { created, skipped };
 }
 
 /**
