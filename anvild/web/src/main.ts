@@ -1,4 +1,5 @@
 import MarkdownIt from "markdown-it";
+import Sortable from "sortablejs";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
@@ -81,7 +82,7 @@ const removingSessions = new Set<string>();
 // temporal dead zone when init runs at module load, so touching it throws and aborts the rest of
 // module init → a totally dead app (no list, no buttons). Bites worst on the no-activeId path
 // (fresh device / reinstalled Android, empty localStorage). See memory: web-early-init-decl-order-crash.
-let drag: { el: HTMLElement; startX: number; startY: number; lastY: number; timer: number; lifted: boolean; touch: boolean } | null = null; // press-and-hold-to-reorder
+let dragging = false; // true while a SortableJS drag is in progress (suppresses re-renders)
 let justDragged = false; // set briefly after a drop so the row's click doesn't also navigate
 let thinkingEl: HTMLElement | null = null; // animated "thinking" indicator, pinned to the bottom while a turn runs
 let activityEl: HTMLDetailsElement | null = null; // consolidated per-turn tool/thinking activity block (§5)
@@ -1268,9 +1269,11 @@ async function runMermaid(container: HTMLElement): Promise<void> {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 function renderSessions(): void {
-  if (drag?.lifted) return; // don't yank a row out from under an in-progress drag
+  if (dragging) return; // don't yank a row out from under an in-progress drag
+  const conciergeUl = $("#concierge-list");
   const activeUl = $("#session-list");
   const finishedUl = $("#finished-list");
+  conciergeUl.innerHTML = "";
   activeUl.innerHTML = "";
   finishedUl.innerHTML = "";
   const ord = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
@@ -1282,8 +1285,11 @@ function renderSessions(): void {
   );
   let anyFinished = false;
   for (const s of items) {
-    if (s.finished) anyFinished = true;
-    (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
+    if (s.isDefault) conciergeUl.appendChild(renderSessionItem(s)); // pinned at the top, outside the sortable lists
+    else {
+      if (s.finished) anyFinished = true;
+      (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
+    }
   }
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
 }
@@ -1317,12 +1323,19 @@ function renderSessionItem(s: Session): HTMLLIElement {
     if (!removing) selectSession(s.id); // a session being cleaned up isn't selectable
   });
   li.append(a);
-  if (!removing) {
-    // The concierge is pinned and can't be reordered or moved to Finished, so it isn't draggable.
-    if (!s.isDefault) {
-      li.addEventListener("touchstart", (e) => onRowTouchStart(e, li), { passive: true });
-      li.addEventListener("mousedown", (e) => onRowMouseDown(e, li));
-    }
+  if (s.isDefault) {
+    // The concierge is pinned; its row carries the "+" that opens the new-session flow.
+    const add = document.createElement("button");
+    add.className = "row-btn new-session";
+    add.title = "New session";
+    add.innerHTML = icon("add");
+    add.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showNewSession();
+    });
+    li.append(add);
+  } else if (!removing) {
     const open = document.createElement("button");
     open.className = "row-btn open-tab";
     open.title = "Open in new tab";
@@ -1337,172 +1350,48 @@ function renderSessionItem(s: Session): HTMLLIElement {
   return li;
 }
 
-// ── Press-and-hold to reorder (touch + mouse) ───────────────────────────────────────────────────
-// Press-and-hold a row to lift it, then drag — into the Finished group or a new position — and drop
-// on release. No drag handle (Android read a handle's long-press as text selection; rows are
-// user-select:none). Implemented with raw touch/mouse events, NOT pointer events: in an Android
-// WebView a pointer gesture inside a scroll container gets claimed for scrolling — pointermove turns
-// uncancelable and pointercancel fires — so the lift never engaged. Touch events + a hold delay + a
-// non-passive touchmove (preventDefault only AFTER the hold) lets us take the gesture cleanly.
-const LONG_PRESS_MS = 250;
-const MOVE_CANCEL = 9; // px of pre-lift movement: on touch that means "scroll", so abandon the drag
-// `drag` / `justDragged` are declared in the early-init cluster up top — renderSessions() reads
-// `drag?.lifted` and `justDragged` at load (top-level instant-restore init).
-let autoScrollRAF = 0;
-let lastTouchAt = 0; // guards against the synthetic mousedown a tap emits after touchend
-
-function beginPress(el: HTMLElement, x: number, y: number, touch: boolean): void {
-  clearDrag();
-  drag = { el, startX: x, startY: y, lastY: y, timer: 0, lifted: false, touch };
-  drag.timer = window.setTimeout(liftPress, LONG_PRESS_MS);
-}
-function liftPress(): void {
-  if (!drag) return;
-  drag.lifted = true;
-  drag.el.classList.add("dragging");
-  $("#finished-section").hidden = false; // reveal the (possibly empty) drop target
-  navigator.vibrate?.(12); // "picked up" haptic where supported
-  startAutoScroll();
-}
-/** Handle a move; returns true while actively dragging (so the touch handler preventDefaults scroll). */
-function pressMove(x: number, y: number): boolean {
-  if (!drag) return false;
-  if (!drag.lifted) {
-    const moved = Math.abs(y - drag.startY) > MOVE_CANCEL || Math.abs(x - drag.startX) > MOVE_CANCEL;
-    if (moved) {
-      if (drag.touch) clearDrag(); // a pre-hold move on touch = the user is scrolling; let them
-      else {
-        clearTimeout(drag.timer);
-        liftPress(); // mouse: a drag begins immediately on move
-      }
-    }
-    return drag?.lifted ?? false;
-  }
-  drag.lastY = y;
-  reorderTo(y);
-  return true;
-}
-function reorderTo(y: number): void {
-  if (!drag) return;
-  const finishedUl = $("#finished-list");
-  const overFinished = y >= $("#finished-section").getBoundingClientRect().top;
-  finishedUl.classList.toggle("drag-over", overFinished);
-  const list = overFinished ? finishedUl : $("#session-list");
-  const after = dragAfter(list, y);
-  if (after === null) list.appendChild(drag.el);
-  else if (after !== drag.el) list.insertBefore(drag.el, after);
-}
-/** End the gesture; `commit` true → persist the dropped order, false → restore from state. */
-function endPress(commit: boolean): void {
-  const lifted = drag?.lifted ?? false;
-  clearDrag();
-  if (lifted && commit) {
-    commitOrderFromDom();
-    justDragged = true;
-    setTimeout(() => (justDragged = false), 350); // swallow the click the drop synthesizes
-  } else if (lifted) {
-    renderSessions(); // cancelled mid-drag → restore positions from state
-  }
-}
-function clearDrag(): void {
-  if (!drag) return;
-  clearTimeout(drag.timer);
-  drag.el.classList.remove("dragging");
-  $("#finished-list").classList.remove("drag-over");
-  stopAutoScroll();
-  drag = null;
-}
-// While lifted, keep scrolling the list when the finger/cursor sits near an edge (even if held still).
-function startAutoScroll(): void {
-  const scroller = $("#session-scroll");
-  const EDGE = 48;
-  const step = (): void => {
-    if (!drag?.lifted) {
-      autoScrollRAF = 0;
-      return;
-    }
-    const r = scroller.getBoundingClientRect();
-    const y = drag.lastY;
-    if (y < r.top + EDGE && scroller.scrollTop > 0) {
-      scroller.scrollTop -= Math.ceil((r.top + EDGE - y) / 5);
-      reorderTo(y);
-    } else if (y > r.bottom - EDGE) {
-      scroller.scrollTop += Math.ceil((y - (r.bottom - EDGE)) / 5);
-      reorderTo(y);
-    }
-    autoScrollRAF = requestAnimationFrame(step);
+// ── Drag-to-reorder (SortableJS) ────────────────────────────────────────────────────────────────
+// The active-session list and the Finished group are two linked sortables sharing one group, so a
+// row can be dragged from either into the other (and back out of Finished). forceFallback uses
+// SortableJS's own cloned-element drag rather than native HTML5 DnD — which never fires on touch —
+// so it behaves identically on desktop and in the Android WebView. delayOnTouchOnly + a touch
+// threshold give the familiar press-and-hold-then-drag feel on touch while keeping an immediate grab
+// with the mouse. The pinned concierge row lives in its own list (not a sortable), so it can't be
+// reordered or dropped into Finished. `dragging`/`justDragged` are declared in the early-init cluster.
+let sortablesReady = false;
+function initSortables(): void {
+  if (sortablesReady) return;
+  sortablesReady = true;
+  const opts: Sortable.Options = {
+    group: "sessions",
+    draggable: ".session",
+    filter: ".row-btn", // taps on the open-tab / + buttons must not begin a drag
+    preventOnFilter: false, // …and must still fire their own click
+    animation: 150,
+    delay: 250, // press-and-hold before a touch drag engages
+    delayOnTouchOnly: true, // mouse drags start immediately
+    touchStartThreshold: 9, // a small finger move within the delay = scroll, so abandon the drag
+    forceFallback: true, // cloned-element fallback everywhere: touch-safe and consistent
+    fallbackClass: "session-fallback",
+    fallbackOnBody: true,
+    ghostClass: "session-ghost",
+    chosenClass: "session-chosen",
+    scroll: true, // auto-scroll a list when dragging near its edges
+    scrollSensitivity: 48,
+    onStart: () => {
+      dragging = true;
+      $("#finished-section").hidden = false; // reveal the (possibly empty) drop target
+      navigator.vibrate?.(12); // "picked up" haptic where supported
+    },
+    onEnd: () => {
+      dragging = false;
+      justDragged = true;
+      setTimeout(() => (justDragged = false), 350); // swallow the click the drop synthesizes
+      commitOrderFromDom(); // read the settled DOM order, sync to the daemon, and re-render
+    },
   };
-  autoScrollRAF = requestAnimationFrame(step);
-}
-function stopAutoScroll(): void {
-  if (autoScrollRAF) cancelAnimationFrame(autoScrollRAF);
-  autoScrollRAF = 0;
-}
-// Touch: start passively (a plain scroll stays fast); the document touchmove is non-passive so we can
-// cancel scrolling once the row is lifted.
-function onRowTouchStart(e: TouchEvent, el: HTMLElement): void {
-  lastTouchAt = Date.now();
-  if (e.touches.length !== 1 || (e.target as HTMLElement).closest(".row-btn")) return;
-  const t = e.touches[0];
-  if (!t) return;
-  beginPress(el, t.clientX, t.clientY, true);
-  document.addEventListener("touchmove", onDocTouchMove, { passive: false });
-  document.addEventListener("touchend", onDocTouchEnd);
-  document.addEventListener("touchcancel", onDocTouchCancel);
-}
-function onDocTouchMove(e: TouchEvent): void {
-  if (!drag) {
-    detachTouch();
-    return;
-  }
-  const t = e.touches[0];
-  if (!t) return;
-  if (pressMove(t.clientX, t.clientY)) e.preventDefault(); // own the gesture → block page scroll
-}
-function onDocTouchEnd(): void {
-  detachTouch();
-  endPress(true);
-}
-function onDocTouchCancel(): void {
-  detachTouch();
-  endPress(false);
-}
-function detachTouch(): void {
-  document.removeEventListener("touchmove", onDocTouchMove);
-  document.removeEventListener("touchend", onDocTouchEnd);
-  document.removeEventListener("touchcancel", onDocTouchCancel);
-}
-function onRowMouseDown(e: MouseEvent, el: HTMLElement): void {
-  if (e.button !== 0 || Date.now() - lastTouchAt < 700) return; // ignore the post-tap synthetic mousedown
-  if ((e.target as HTMLElement).closest(".row-btn")) return;
-  beginPress(el, e.clientX, e.clientY, false);
-  document.addEventListener("mousemove", onDocMouseMove);
-  document.addEventListener("mouseup", onDocMouseUp);
-}
-function onDocMouseMove(e: MouseEvent): void {
-  if (!drag) {
-    detachMouse();
-    return;
-  }
-  pressMove(e.clientX, e.clientY);
-}
-function onDocMouseUp(): void {
-  detachMouse();
-  endPress(true);
-}
-function detachMouse(): void {
-  document.removeEventListener("mousemove", onDocMouseMove);
-  document.removeEventListener("mouseup", onDocMouseUp);
-}
-/** The row to insert the dragged element before for pointer Y — or null to append. */
-function dragAfter(container: HTMLElement, y: number): HTMLElement | null {
-  let best: { off: number; el: HTMLElement | null } = { off: -Infinity, el: null };
-  for (const el of container.querySelectorAll<HTMLElement>(".session:not(.dragging)")) {
-    const box = el.getBoundingClientRect();
-    const off = y - box.top - box.height / 2; // negative ⇒ pointer is above this row's middle
-    if (off < 0 && off > best.off) best = { off, el };
-  }
-  return best.el;
+  Sortable.create($("#session-list"), opts);
+  Sortable.create($("#finished-list"), opts);
 }
 /** Read both lists' DOM order → order + Finished membership, apply optimistically, sync to the daemon. */
 function commitOrderFromDom(): void {
@@ -2413,7 +2302,7 @@ document.addEventListener("pointerdown", (e) => {
 let onDirs: ((e: DirsListResultEvent) => void) | null = null;
 const browse = { path: "", parent: undefined as string | undefined };
 
-$("#new-session").addEventListener("click", showNewSession);
+initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
 
 /** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so

@@ -790,16 +790,22 @@ export class Supervisor {
   private ensureDefaultSession(): void {
     const existing = this.sessions.get(DEFAULT_SESSION_ID);
     if (existing) {
+      let healed = false;
       if (!existing.data.isDefault) {
         existing.data.isDefault = true; // heal a pre-0.6 persisted copy
-        this.persist();
+        healed = true;
       }
+      if (existing.data.title === "Anvil") {
+        existing.data.title = "Claude"; // rename the concierge from its old default title
+        healed = true;
+      }
+      if (healed) this.persist();
       return;
     }
     mkdirSync(this.store.sessionDir(DEFAULT_SESSION_ID), { recursive: true });
     const data: SessionData = {
       id: DEFAULT_SESSION_ID,
-      title: "Anvil",
+      title: "Claude",
       icon: "forum", // fixed curated icon — skip assignIcon for the default
       isDefault: true,
       cwd: process.env.HOME ?? this.store.worktreeRoot(),
