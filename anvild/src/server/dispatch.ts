@@ -227,13 +227,30 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "env.update":
-        deps.supervisor.updateEnvironment(cmd.id, { name: cmd.name, defaultBase: cmd.defaultBase, color: cmd.color });
+        deps.supervisor.updateEnvironment(cmd.id, {
+          name: cmd.name,
+          defaultBase: cmd.defaultBase,
+          color: cmd.color,
+          todoistProjectId: cmd.todoistProjectId,
+          validation: cmd.validation,
+        });
         if (cid) send(ack(cid));
         return;
 
       case "env.remove":
         deps.supervisor.removeEnvironment(cmd.id);
         if (cid) send(ack(cid));
+        return;
+
+      case "todoist.status":
+        send(deps.supervisor.todoistStatusEvent(cid));
+        return;
+
+      case "todoist.projects.list":
+        deps.supervisor
+          .listTodoistProjects(cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "fs.list": {
