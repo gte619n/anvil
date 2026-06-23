@@ -6,10 +6,14 @@
  * which does the same steps by hand).
  *
  * All steps shell out asynchronously (Bun.spawn) so a slow build never blocks the event loop /
- * other sessions. Restart reuses the SIGTERM graceful-shutdown path in main.ts; launchd's
- * KeepAlive respawns a fresh instance that re-reads the updated source.
+ * other sessions. Restart is done with `launchctl kickstart -k` (the same path service.sh uses):
+ * launchd's KeepAlive does NOT respawn after a clean SIGTERM exit (verified empirically), so a bare
+ * self-SIGTERM would shut the daemon down for good — kickstart -k deterministically kills + respawns.
  */
 import { join } from "node:path";
+
+/** launchd service label (must match LABEL in scripts/service.sh). */
+const SERVICE_LABEL = "com.anvil.anvild";
 
 /** The anvild package dir (where package.json + build:web live): .../anvild */
 const anvildDir = join(import.meta.dir, "..", "..");
@@ -71,8 +75,23 @@ export async function applyUpdate(): Promise<{ output: string }> {
   return { output: log.join("\n\n") };
 }
 
-/** Restart by exiting cleanly after a short delay (so the result event flushes first); launchd's
- *  KeepAlive respawns a fresh instance that re-reads the updated source + serves the new bundle. */
+/** Restart via `launchctl kickstart -k` after a short delay (so the result event flushes first).
+ *  KeepAlive does NOT respawn a clean SIGTERM exit, so the daemon must ask launchd to relaunch it:
+ *  kickstart -k SIGKILLs the current instance (after its SIGTERM graceful flush) and starts a fresh
+ *  one that re-reads the updated source + serves the new bundle. The launchctl child is detached so
+ *  it isn't torn down with us — by the time the kill lands, launchd has already queued the relaunch. */
 export function scheduleRestart(): void {
-  setTimeout(() => process.kill(process.pid, "SIGTERM"), 1000).unref?.();
+  const uid = process.getuid?.() ?? 0;
+  setTimeout(() => {
+    try {
+      Bun.spawn(["launchctl", "kickstart", "-k", `gui/${uid}/${SERVICE_LABEL}`], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+    } catch {
+      // Fallback: at least stop cleanly. (Should never happen — launchctl always exists on macOS.)
+      process.kill(process.pid, "SIGTERM");
+    }
+  }, 1000).unref?.();
 }
