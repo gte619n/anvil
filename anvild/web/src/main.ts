@@ -168,6 +168,20 @@ window.addEventListener("popstate", () => {
   }
 });
 let streaming: HTMLElement | null = null;
+// State touched by the early "instant restore" init (renderEmptyState → resetActivity /
+// clearReferences). It MUST be declared up here with the rest of the module state: the bundler
+// keeps module-scope declarations in source order, so when this lived next to its functions further
+// down it was still undefined when init ran, and `activityTail.length = 0` / `references.clear()`
+// threw — killing the whole module load (blank, dead app whenever no session was restored, which is
+// exactly the state of a fresh device / freshly reinstalled app). See renderEmptyState().
+let activityEl: HTMLDetailsElement | null = null;
+let activityCount = 0;
+let activityLive = false;
+const activityTail: string[] = [];
+const ACTIVITY_TAIL = 5;
+const references = new Map<string, string>(); // url → display label, insertion-ordered
+const REF_LIMIT = 50;
+let pendingAnswerRefs: string[] = []; // links in the latest assistant prose; promoted on `result`
 // Set when the user hits Stop: the daemon keeps draining the interrupted turn for a moment, so we
 // suppress that trailing churn (see the guard in handleSessionEvent). Cleared on the next turn.
 let turnCanceled = false;
@@ -868,11 +882,8 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
 // All the tool/thinking churn for one turn collapses into a single block that previews the
 // last few lines and expands on click — so the conversation reads as "what I said" / "what the
 // model said" without every Read/Bash/result on its own line. Reset at each new user turn.
-let activityEl: HTMLDetailsElement | null = null;
-let activityCount = 0;
-let activityLive = false;
-const activityTail: string[] = [];
-const ACTIVITY_TAIL = 5;
+// (activityEl/activityCount/activityLive/activityTail/ACTIVITY_TAIL are declared with the module
+// state near the top so they're initialized before early-init renderEmptyState() touches them.)
 
 function resetActivity(): void {
   activityEl = null;
@@ -950,10 +961,8 @@ function appendToolResult(content: string, isError: boolean): void {
 // thinking churn mid-turn. References are buffered from each assistant message (`pendingAnswerRefs`)
 // and only committed to the panel when the turn ends. The header Links button shows a subtle dot
 // (no count) while the panel is closed.
-const references = new Map<string, string>(); // url → display label, insertion-ordered
-const REF_LIMIT = 50;
-// Links seen in the latest assistant prose this turn; promoted into `references` on `result`.
-let pendingAnswerRefs: string[] = [];
+// (references/REF_LIMIT/pendingAnswerRefs are declared with the module state near the top so
+// they're initialized before early-init renderEmptyState() → clearReferences() touches them.)
 
 /** Pull http(s) URLs and bare host:port addresses out of a chunk of (rendered) text/HTML. */
 function extractRefs(text: string): string[] {
