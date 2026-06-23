@@ -64,6 +64,18 @@ export function makePreToolUseHook(session: Session, broker: PermissionBroker): 
     const i = input as PreToolUseHookInput;
     const tool = i.tool_name;
     const toolInput = (i.tool_input ?? {}) as Record<string, unknown>;
+
+    // AskUserQuestion must fall through with NO permission decision. The CLI only emits the
+    // `permission_ask_user_question` dialog (which drives our onUserDialog question card) when the
+    // tool's permission resolves to "ask" with no hook/rule decision: in the CLI's `ask` branch the
+    // PreToolUse hooks run first and `if (hookResult) { resolve(hookResult); return }` PREEMPTS the
+    // dialog. So returning *any* concrete decision here — even "allow" — suppresses the question
+    // card: onUserDialog never fires, AskUserQuestion runs with empty answers, and its result
+    // becomes "The user did not answer the questions." (the model then continues unanswered). Emit a
+    // bare continue so the native dialog flow runs; the question card is the only UI users see.
+    // (arch §6.6 — see src/agent/questions.ts)
+    if (tool === "AskUserQuestion") return { continue: true };
+
     const out = await decide(session, broker, tool, toolInput);
     return {
       hookSpecificOutput: {
@@ -88,13 +100,9 @@ async function decide(
   tool: string,
   input: Record<string, unknown>,
 ): Promise<Decision> {
-  // AskUserQuestion isn't an action to gate — it's handled by the onUserDialog question flow
-  // (arch §6.6). Auto-allow it here so the user sees one question card, not a permission prompt
-  // for the question followed by the question itself.
-  if (tool === "AskUserQuestion") {
-    return { behavior: "allow", updatedInput: input, reason: "question dialog" };
-  }
-
+  // NOTE: AskUserQuestion is handled before this point in makePreToolUseHook — it must fall through
+  // with no decision so the native question dialog (onUserDialog) fires. Do not re-add it here: a
+  // decision returned from the hook preempts that dialog (arch §6.6).
   if (session.isAlwaysAllowed(tool)) {
     return { behavior: "allow", updatedInput: input, reason: "remembered allow" };
   }

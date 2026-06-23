@@ -98,6 +98,7 @@ export interface Environment {
   repoRoot: string; // absolute path
   isRepo: boolean; // git repo → fresh worktree per session; otherwise work in the folder directly
   defaultBase?: string; // branch/commit to branch worktrees from (default "HEAD")
+  color?: string; // base color (hex, e.g. "#335999") for env/session tinting; absent → hue hashed from name
 }
 
 /** Live git state for the worktree panel (§8); pushed via `session.updated`. */
@@ -639,18 +640,21 @@ export interface EnvAddCmd extends Envelope, Correlated {
   name: string;
   repoRoot: string; // must be a git repo
   defaultBase?: string;
+  color?: string; // base color (hex) for tinting
 }
 export interface EnvCloneCmd extends Envelope, Correlated {
   type: "env.clone";
   url: string; // git URL (ssh or https); cloned into ~/Development/<repo-name> using host git auth
   name?: string; // display name; defaults to the repo name from the URL
   defaultBase?: string;
+  color?: string; // base color (hex) for tinting
 }
 export interface EnvUpdateCmd extends Envelope, Correlated {
   type: "env.update";
   id: string;
   name?: string;
   defaultBase?: string; // "" clears it (back to HEAD)
+  color?: string; // base color (hex); "" clears it (back to hashed hue)
 }
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";

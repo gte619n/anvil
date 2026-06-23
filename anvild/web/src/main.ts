@@ -34,6 +34,7 @@ import type {
   ServerEvent,
   Session,
 } from "../../protocol";
+import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
@@ -199,9 +200,17 @@ function saveConvoCache(): void {
   }, 600);
 }
 
+// Resolve the theme before the first render so JS-computed session tints use the right band.
+(function initTheme() {
+  const stored = localStorage.getItem("anvil.theme");
+  const theme = stored ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  document.documentElement.dataset.theme = theme;
+})();
+
 // instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
 // fully offline; the daemon refreshes everything once the WS connects).
 renderSessions();
+applyActiveTint();
 if (activeId) {
   if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
   const cached = localStorage.getItem(`anvil.convo.${activeId}`);
@@ -220,17 +229,22 @@ function currentTheme(): "light" | "dark" {
 function applyThemeIcon(): void {
   $("#theme-toggle").innerHTML = icon(currentTheme() === "dark" ? "light_mode" : "dark_mode");
 }
-(function initTheme() {
-  const stored = localStorage.getItem("anvil.theme");
-  const theme = stored ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  document.documentElement.dataset.theme = theme;
-})();
-applyThemeIcon();
+applyThemeIcon(); // data-theme is resolved earlier, before the first render
 $("#theme-toggle").addEventListener("click", () => {
   const next = currentTheme() === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   localStorage.setItem("anvil.theme", next);
   applyThemeIcon();
+  renderSessions(); // re-clamp session tints for the new theme
+  applyActiveTint();
+});
+// Follow the OS theme live when the user hasn't pinned a preference.
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  if (localStorage.getItem("anvil.theme")) return; // a manual choice wins
+  document.documentElement.dataset.theme = e.matches ? "dark" : "light";
+  applyThemeIcon();
+  renderSessions();
+  applyActiveTint();
 });
 
 // ── Sidebar collapse ─────────────────────────────────────────────────────────────
@@ -687,11 +701,22 @@ function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string
   md.innerHTML = html; // daemon-sanitized (arch §8.3)
   b.appendChild(md);
   for (const att of attachments) {
-    if (att.kind === "image" && activeId) {
+    if (!activeId) continue;
+    const href = apiUrl(`/api/sessions/${activeId}/attachments/${att.id}`);
+    if (att.kind === "image") {
       const img = document.createElement("img");
       img.className = "att-img";
-      img.src = apiUrl(`/api/sessions/${activeId}/attachments/${att.id}`);
+      img.src = href;
       b.appendChild(img);
+    } else {
+      // a non-image attachment → a downloadable file chip
+      const a = document.createElement("a");
+      a.className = "att-file";
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.innerHTML = `${icon("description")}<span class="att-name">${esc(att.name)}</span>`;
+      b.appendChild(a);
     }
   }
   const t = timeEl(ts);
@@ -1062,6 +1087,19 @@ function deselectSession(): void {
   setHeaderTitle(undefined);
   renderEmptyState();
   renderSessions();
+  applyActiveTint();
+}
+// Tint the conversation area to the active session's derived background (cleared when none).
+function applyActiveTint(): void {
+  const s = activeId ? sessions.get(activeId) : undefined;
+  const main = document.getElementById("main");
+  if (!main) return;
+  if (s?.environmentId) {
+    const env = environments.get(s.environmentId);
+    main.style.setProperty("--session-active-bg", sessionBg(env, envOrdinal(s, sessions.values()), currentTheme()));
+  } else {
+    main.style.removeProperty("--session-active-bg");
+  }
 }
 function setStatus(status: string): void {
   // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
@@ -1222,6 +1260,14 @@ function renderSessionItem(s: Session): HTMLLIElement {
   const li = document.createElement("li");
   li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}`;
   li.dataset.id = s.id;
+  if (s.environmentId && !removing) {
+    const env = environments.get(s.environmentId);
+    const ord = envOrdinal(s, sessions.values());
+    const theme = currentTheme();
+    li.classList.add("tinted");
+    li.style.setProperty("--session-bg", sessionBg(env, ord, theme));
+    li.style.setProperty("--session-stripe", stripeColor(env, ord, theme));
+  }
   const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
   const where = envName ?? s.git?.branch ?? s.source;
   const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
@@ -1382,6 +1428,7 @@ function onEnvironments(list: Environment[]): void {
   for (const e of list) environments.set(e.id, e);
   persistEnvironments();
   renderSessions();
+  applyActiveTint();
   if (document.getElementById("ns-modal")) showNewSession(); // refresh an open new-session modal
   if (document.getElementById("env-cards")) renderEnvCards(); // refresh an open settings view
 }
@@ -1522,7 +1569,7 @@ function renderEnvCards(): void {
       (e) => `<div class="card env-card" data-env="${esc(e.id)}">
       <div class="env-head">
         <div class="env-meta">
-          <b>${esc(e.name)}</b>
+          <b><span class="env-dot" style="background:${stripeColor(e, 0, currentTheme())}"></span>${esc(e.name)}</b>
           <div class="small muted"><code>${esc(e.repoRoot)}</code></div>
           <div class="small muted">${icon("account_tree")} off <code>${esc(e.defaultBase ?? "HEAD")}</code></div>
         </div>
@@ -1578,6 +1625,7 @@ function selectSession(id: string, push = true): void {
   renderSessions();
   const s = sessions.get(id);
   setHeaderTitle(s);
+  applyActiveTint();
   snapshotLoaded.delete(id);
   // Opening a session is acting on it — clear its push reminder on this device immediately (the
   // daemon also clears it everywhere when we attach below). (UI refinement §1)
@@ -1596,12 +1644,13 @@ function selectSession(id: string, push = true): void {
 
 // ── Composer ───────────────────────────────────────────────────────────────────
 const input = $<HTMLTextAreaElement>("#input");
-const pendingAttachments: { id: string; name: string; dataUrl: string }[] = [];
+// `dataUrl` is set only for images (the chip thumbnail); other files show an icon + name chip.
+const pendingAttachments: { id: string; name: string; kind: "image" | "file"; dataUrl?: string }[] = [];
 const attachRow = $("#attach-row");
 
 // Uploads are async (read file → POST → push to pendingAttachments). If the user sends text
-// before an image upload lands, the attachment id wouldn't be in pendingAttachments yet and the
-// image would be silently dropped. Track in-flight uploads so send() can wait for them.
+// before an upload lands, the attachment id wouldn't be in pendingAttachments yet and the
+// file would be silently dropped. Track in-flight uploads so send() can wait for them.
 let uploadsInFlight = 0;
 const uploadWaiters: Array<() => void> = [];
 function uploadsSettled(): Promise<void> {
@@ -1613,9 +1662,9 @@ $<HTMLFormElement>("#composer").addEventListener("submit", (e) => {
   void sendComposer();
 });
 async function sendComposer(): Promise<void> {
-  // Never send ahead of an image that's still uploading — wait for it to land first.
+  // Never send ahead of a file that's still uploading — wait for it to land first.
   if (uploadsInFlight > 0) {
-    toast("Finishing image upload…");
+    toast("Finishing upload…");
     await uploadsSettled();
   }
   const text = input.value;
@@ -1625,7 +1674,7 @@ async function sendComposer(): Promise<void> {
     sock.send({ type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
   } else {
     // offline, or a session that itself hasn't been created yet → queue + show optimistically
-    if (pendingAttachments.length) toast("Images need a connection — sent text only");
+    if (pendingAttachments.length) toast("Attachments need a connection — sent text only");
     enqueue({ cid: newCid(), cmd: { type: "prompt.send", sessionId: activeId, text } });
     appendOptimisticUser(text);
   }
@@ -1658,26 +1707,27 @@ function updateSendState(): void {
 const fileInput = $<HTMLInputElement>("#file-input");
 $("#btn-attach").addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
-  attachImageFiles(Array.from(fileInput.files ?? []));
+  attachFiles(Array.from(fileInput.files ?? []));
   fileInput.value = "";
 });
 
-/** Upload the image files; tell the user about any non-image files we dropped (only images are supported). */
-function attachImageFiles(files: File[]): void {
-  let skipped = 0;
-  for (const f of files) {
-    if (f.type.startsWith("image/")) void uploadAttachment(f);
-    else skipped++;
-  }
-  if (skipped) toast(skipped === 1 ? "Only images can be attached" : `Skipped ${skipped} non-image files`);
+/** Upload every selected file (images, PDFs, code, logs, …); the daemon decides how to feed each
+ *  to the model. We don't gate on MIME type here — Android's picker frequently hands back an empty
+ *  `File.type` even for images, which is exactly what used to silently drop attachments. */
+function attachFiles(files: File[]): void {
+  for (const f of files) void uploadAttachment(f);
 }
 
 function renderAttachRow(): void {
   attachRow.innerHTML = "";
   pendingAttachments.forEach((a, i) => {
     const chip = document.createElement("div");
-    chip.className = "attach-chip";
-    chip.innerHTML = `<img src="${a.dataUrl}" alt="${esc(a.name)}" /><button type="button" class="rm" title="Remove">×</button>`;
+    chip.className = a.kind === "image" ? "attach-chip" : "attach-chip file";
+    const inner =
+      a.kind === "image" && a.dataUrl
+        ? `<img src="${a.dataUrl}" alt="${esc(a.name)}" />`
+        : `<span class="msym">description</span><span class="att-name" title="${esc(a.name)}">${esc(a.name)}</span>`;
+    chip.innerHTML = `${inner}<button type="button" class="rm" title="Remove">×</button>`;
     chip.querySelector(".rm")!.addEventListener("click", () => {
       pendingAttachments.splice(i, 1);
       renderAttachRow();
@@ -1704,14 +1754,20 @@ async function uploadAttachment(file: File): Promise<void> {
     const res = await apiFetch(`/api/sessions/${activeId}/attachments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: file.name || "pasted-image.png", mediaType: file.type || "image/png", dataBase64: base64 }),
+      // mediaType may be empty (Android picker) — the daemon infers it from the filename.
+      body: JSON.stringify({ name: file.name || "attachment", mediaType: file.type || "", dataBase64: base64 }),
     });
     if (!res.ok) {
       toast("Upload failed");
       return;
     }
-    const { attachment } = (await res.json()) as { attachment: { id: string; name: string } };
-    pendingAttachments.push({ id: attachment.id, name: attachment.name, dataUrl });
+    const { attachment } = (await res.json()) as { attachment: AttachmentRef };
+    pendingAttachments.push({
+      id: attachment.id,
+      name: attachment.name,
+      kind: attachment.kind,
+      dataUrl: attachment.kind === "image" ? dataUrl : undefined,
+    });
     renderAttachRow();
   } catch {
     toast("Upload failed");
@@ -1723,7 +1779,8 @@ async function uploadAttachment(file: File): Promise<void> {
 }
 input.addEventListener("paste", (e) => {
   for (const item of Array.from(e.clipboardData?.items ?? [])) {
-    if (item.type.startsWith("image/")) {
+    // Only file items (a pasted image or file) — `kind === "string"` is the normal text paste.
+    if (item.kind === "file") {
       const f = item.getAsFile();
       if (f) {
         e.preventDefault();
@@ -1736,7 +1793,7 @@ const composerEl = $("#composer");
 composerEl.addEventListener("dragover", (e) => e.preventDefault());
 composerEl.addEventListener("drop", (e) => {
   e.preventDefault();
-  attachImageFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []));
+  attachFiles(Array.from((e as DragEvent).dataTransfer?.files ?? []));
 });
 
 // ── Select-to-quote (highlight any message text → quote into the composer) ─────────
@@ -2338,6 +2395,33 @@ function createOfflineSession(cmd: Record<string, unknown> & { type: string }, e
   toast("Session queued — will be created when you're back online");
 }
 
+// ── Color swatch picker (environment color) ──────────────────────────────────
+/** A row of the 16 palette swatches plus an "auto" (hashed) option; `selected` pre-selects one. */
+function swatchPickerMarkup(selected?: string): string {
+  const norm = (selected ?? "").toLowerCase();
+  const auto = `<button type="button" class="swatch swatch-auto${norm ? "" : " selected"}" data-hex="" title="Auto — hue from the name">${icon("hide_source")}</button>`;
+  const dots = PALETTE.map(
+    (p) =>
+      `<button type="button" class="swatch${p.hex.toLowerCase() === norm ? " selected" : ""}" data-hex="${p.hex}" title="${p.name}" style="background:${p.hex}"></button>`,
+  ).join("");
+  return `<label>Color<div class="swatch-row" id="swatch-row">${auto}${dots}</div></label>`;
+}
+function wireSwatchPicker(): void {
+  const row = document.getElementById("swatch-row");
+  if (!row) return;
+  row.querySelectorAll<HTMLElement>(".swatch").forEach((b) =>
+    b.addEventListener("click", () => {
+      row.querySelectorAll(".swatch").forEach((x) => x.classList.remove("selected"));
+      b.classList.add("selected");
+    }),
+  );
+}
+/** The picked hex, or "" for auto. */
+function selectedSwatch(): string {
+  const sel = document.querySelector<HTMLElement>("#swatch-row .swatch.selected");
+  return sel?.dataset.hex ?? "";
+}
+
 /** Register a project repo as an environment — clone from a git URL, or pick a local repo. */
 function showAddEnvironment(): void {
   const m = document.createElement("div");
@@ -2347,23 +2431,26 @@ function showAddEnvironment(): void {
     <p class="small muted">Cloned into <code>~/Development/&lt;repo&gt;</code> using this machine's git/SSH credentials. Leave blank to use an existing local repo instead.</p>
     <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
     <label>Default branch (optional)<input id="ae-base" placeholder="e.g. main or dev — leave blank for HEAD" /></label>
+    ${swatchPickerMarkup()}
     <p class="small muted">Or pick an existing local <b>git repository</b>:</p>
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
   showModal(m);
   wireBrowser();
+  wireSwatchPicker();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
   $<HTMLButtonElement>("#ae-save").onclick = async () => {
     const url = $<HTMLInputElement>("#ae-url").value.trim();
     const name = $<HTMLInputElement>("#ae-name").value.trim();
     const defaultBase = $<HTMLInputElement>("#ae-base").value.trim();
+    const color = selectedSwatch();
     if (url) {
       const btn = $<HTMLButtonElement>("#ae-save");
       btn.disabled = true;
       btn.textContent = "Cloning…";
       try {
         const res = await sendAwait(
-          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), cid: newCid() },
+          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), cid: newCid() },
           120_000,
         );
         if (res.type === "command.error") {
@@ -2386,6 +2473,7 @@ function showAddEnvironment(): void {
       name: name || (browse.path.split("/").pop() ?? browse.path),
       repoRoot: browse.path,
       ...(defaultBase ? { defaultBase } : {}),
+      ...(color ? { color } : {}),
     });
     closeModal(); // the environments broadcast refreshes Settings / the new-session list
   };
@@ -2400,12 +2488,14 @@ function showEditEnvironment(id: string): void {
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
+    ${swatchPickerMarkup(env.color)}
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
+  wireSwatchPicker();
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
-    sock.send({ type: "env.update", id, name: $<HTMLInputElement>("#ee-name").value, defaultBase: $<HTMLInputElement>("#ee-base").value });
+    sock.send({ type: "env.update", id, name: $<HTMLInputElement>("#ee-name").value, defaultBase: $<HTMLInputElement>("#ee-base").value, color: selectedSwatch() });
     closeModal();
   };
   $<HTMLButtonElement>("#ee-remove").onclick = async () => {

@@ -26,7 +26,7 @@ export class EnvironmentStore {
   }
 
   /** @throws if `repoRoot` doesn't exist or isn't a git repo (environments are git repos). */
-  add(name: string, repoRoot: string, defaultBase?: string): Environment {
+  add(name: string, repoRoot: string, defaultBase?: string, color?: string): Environment {
     if (!existsSync(repoRoot)) {
       throw new Error(`no such directory: ${repoRoot}`);
     }
@@ -39,17 +39,19 @@ export class EnvironmentStore {
       repoRoot,
       isRepo: existsSync(join(repoRoot, ".git")),
       defaultBase,
+      ...(color?.trim() ? { color: color.trim() } : {}),
     };
     this.environments.push(env);
     this.save();
     return env;
   }
 
-  update(id: string, fields: { name?: string; defaultBase?: string }): void {
+  update(id: string, fields: { name?: string; defaultBase?: string; color?: string }): void {
     const env = this.environments.find((e) => e.id === id);
     if (!env) return;
     if (fields.name !== undefined && fields.name.trim()) env.name = fields.name.trim();
     if (fields.defaultBase !== undefined) env.defaultBase = fields.defaultBase.trim() || undefined;
+    if (fields.color !== undefined) env.color = fields.color.trim() || undefined;
     this.save();
   }
 

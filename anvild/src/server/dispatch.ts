@@ -201,12 +201,12 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "env.add":
-        deps.supervisor.addEnvironment(cmd.name, cmd.repoRoot, cmd.defaultBase);
+        deps.supervisor.addEnvironment(cmd.name, cmd.repoRoot, cmd.defaultBase, cmd.color);
         if (cid) send(ack(cid));
         return;
 
       case "env.clone":
-        deps.supervisor.cloneEnvironment(cmd.url, cmd.name, cmd.defaultBase);
+        deps.supervisor.cloneEnvironment(cmd.url, cmd.name, cmd.defaultBase, cmd.color);
         if (cid) send(ack(cid));
         return;
 
@@ -218,7 +218,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "env.update":
-        deps.supervisor.updateEnvironment(cmd.id, { name: cmd.name, defaultBase: cmd.defaultBase });
+        deps.supervisor.updateEnvironment(cmd.id, { name: cmd.name, defaultBase: cmd.defaultBase, color: cmd.color });
         if (cid) send(ack(cid));
         return;
 

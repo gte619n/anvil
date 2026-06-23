@@ -8,7 +8,54 @@ const EXT: Record<string, string> = {
   "image/jpeg": "jpg",
   "image/gif": "gif",
   "image/webp": "webp",
+  "application/pdf": "pdf",
+  "text/plain": "txt",
+  "text/markdown": "md",
+  "text/csv": "csv",
+  "application/json": "json",
 };
+
+/** Best-effort media type from a filename when the client couldn't supply one (common on mobile,
+ *  where the Android content picker often hands back a File with an empty `type`). */
+const MEDIA_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  heic: "image/heic",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  log: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  xml: "text/xml",
+  yaml: "text/yaml",
+  yml: "text/yaml",
+  ts: "text/x-typescript",
+  tsx: "text/x-typescript",
+  js: "text/javascript",
+  py: "text/x-python",
+  sh: "text/x-shellscript",
+  rs: "text/x-rust",
+  go: "text/x-go",
+  java: "text/x-java",
+  kt: "text/x-kotlin",
+  swift: "text/x-swift",
+  c: "text/x-c",
+  h: "text/x-c",
+  cpp: "text/x-c++",
+  html: "text/html",
+  css: "text/css",
+};
+
+/** Resolve a usable media type, inferring from the filename when the upload omitted one. */
+export function inferMediaType(mediaType: string | undefined, name: string): string {
+  if (mediaType && mediaType !== "application/octet-stream") return mediaType;
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  return MEDIA_BY_EXT[ext] ?? mediaType ?? "application/octet-stream";
+}
 
 /**
  * Per-session attachment store (arch §6.5). Pasted/dropped images are written under
@@ -26,12 +73,16 @@ export class AttachmentStore {
 
   add(sessionId: string, name: string, mediaType: string, dataBase64: string): AttachmentRef {
     const id = newId("att");
-    const ext = EXT[mediaType] ?? "bin";
+    const resolved = inferMediaType(mediaType, name);
+    // Prefer the original filename's extension so the stored blob stays recognizable for any
+    // type; fall back to the media-type map, then "bin".
+    const nameExt = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+    const ext = nameExt || EXT[resolved] || "bin";
     const dir = this.dir(sessionId);
     const binPath = join(dir, `${id}.${ext}`);
     writeFileSync(binPath, Buffer.from(dataBase64, "base64"));
-    writeFileSync(join(dir, `${id}.json`), JSON.stringify({ mediaType, name, ext }));
-    return { id, kind: mediaType.startsWith("image/") ? "image" : "file", name, path: binPath };
+    writeFileSync(join(dir, `${id}.json`), JSON.stringify({ mediaType: resolved, name, ext }));
+    return { id, kind: resolved.startsWith("image/") ? "image" : "file", name, path: binPath };
   }
 
   private resolve(sessionId: string, id: string): { binPath: string; mediaType: string; name: string } | undefined {
@@ -53,10 +104,11 @@ export class AttachmentStore {
     return r && existsSync(r.binPath) ? { mediaType: r.mediaType, path: r.binPath } : undefined;
   }
 
-  /** For feeding the agent — base64 + media type for an image content block. */
-  loadBase64(sessionId: string, id: string): { mediaType: string; data: string } | undefined {
+  /** For feeding the agent — name + media type + base64 bytes. The driver turns this into the
+   *  right content block (image / PDF document / inline text). */
+  loadForAgent(sessionId: string, id: string): { mediaType: string; name: string; data: string } | undefined {
     const r = this.resolve(sessionId, id);
     if (!r || !existsSync(r.binPath)) return undefined;
-    return { mediaType: r.mediaType, data: readFileSync(r.binPath).toString("base64") };
+    return { mediaType: r.mediaType, name: r.name, data: readFileSync(r.binPath).toString("base64") };
   }
 }
