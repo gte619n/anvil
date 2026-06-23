@@ -714,6 +714,10 @@ export interface TodoistStatusCmd extends Envelope, Correlated {
 export interface TodoistProjectsListCmd extends Envelope, Correlated {
   type: "todoist.projects.list"; // fetch the account's projects (live from the API)
 }
+export interface TodoistBuildCmd extends Envelope, Correlated {
+  type: "todoist.build"; // phase 2B: build all `planned` work units for an environment (long-running)
+  environmentId: string;
+}
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
 // bundle, and (when running under the launchd service) restarts itself to apply the new code.
@@ -791,6 +795,7 @@ export type ClientCommand =
   | EnvRemoveCmd
   | TodoistStatusCmd
   | TodoistProjectsListCmd
+  | TodoistBuildCmd
   | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd

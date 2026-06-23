@@ -72,8 +72,30 @@ Link is stored on `Environment.todoistProjectId`.
 | Dispatch routing + connect-time `todoist.status` | `src/server/dispatch.ts`, `src/server/http.ts` | ✅ done |
 | Supervisor wiring (IntegrationStore, WorkUnitStore, status/projects methods) | `src/session/supervisor.ts` | ✅ done |
 | Web UI: Todoist tab (project browser) + per-env link & validation | `web/src/main.ts`, `web/styles/app.css` | ✅ done |
-| **Autopilot — BUILD → VALIDATE → PR → tag** | `src/integrations/autopilot.ts` (+ supervisor) | ⬜ todo |
-| **Scheduler** (nightly trigger) | `src/integrations/scheduler.ts` | ⬜ todo |
+| **2A — plan & tag (write side)** `planAndTagProject` + `plan` CLI | `src/integrations/autopilot.ts`, `scripts/autopilot.ts` | ✅ done (live-verified) |
+| **2B — validation gate** (auto-detect + runner, unit-tested) | `src/integrations/validation.ts` | ✅ built |
+| **2B — orchestrator** BUILD→VALIDATE→PR→tag (fake-host unit-tested) | `src/integrations/builder.ts` (+ supervisor host) | ✅ built · ⏳ needs live-daemon test |
+| 2B trigger: `todoist.build` cmd + ws trigger script | `protocol.ts`, `dispatch.ts`, `test/tools/trigger-autopilot-build.ts` | ✅ built |
+| **2C — Scheduler** (nightly trigger) | `src/integrations/scheduler.ts` | ⬜ todo |
+
+### Phase 2B — how it runs
+
+`todoist.build <environmentId>` (or, later, the scheduler) → for each `planned` WorkUnit, in
+concurrent batches of 3:
+
+1. **build**: fresh-worktree session off `defaultBase`, autonomy **bypass**, seeded with the plan;
+   tasks → `anvil:building`.
+2. **await**: poll the session to settled. If it parks on an **AskUserQuestion** (`awaiting_question`)
+   it can't proceed unattended → `anvil:blocked` (you answer in the morning). No committed changes →
+   blocked.
+3. **validate**: run the env's gate (explicit, else auto-detected per `validation.ts`) in the worktree.
+   Fail → feed the failure back and retry (≤ `maxFixAttempts`, default 2), then block.
+4. **PR**: commit + push + `gh pr create`; tasks → `anvil:review`; PR link commented.
+
+The session/git/validation seams live behind `BuildHost` (impl in the Supervisor) so the state
+machine in `builder.ts` is pure and covered by `test/unit/builder.test.ts` (happy path, fix-retry,
+block-after-N, question-block, no-changes, PR-fail). **Not yet exercised end-to-end on the live
+daemon** — that spawns real worktree sessions + PRs.
 
 ### Dry-run (verified working)
 

@@ -45,6 +45,8 @@ import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore } from "../integrations/workunit";
 import { TodoistClient } from "../integrations/todoist";
+import { Autopilot, type BuildHost, type SettledStatus } from "../integrations/builder";
+import { resolveGate, runValidation, type ValidationResult } from "../integrations/validation";
 import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -252,6 +254,89 @@ export class Supervisor {
       taskCount: counts.get(p.id) ?? 0,
     }));
     return { v: PROTOCOL_VERSION, type: "todoist.projects.result", ts: now(), ...(cid ? { cid } : {}), projects: infos };
+  }
+
+  /**
+   * Phase 2B entrypoint: build every `planned` WorkUnit for a linked environment (build → validate
+   * → PR → tag). Runs inside the daemon so it drives real sessions. Returns a short summary.
+   */
+  async runAutopilotBuild(environmentId: string, onProgress?: (m: string) => void): Promise<{ built: number; review: number; blocked: number }> {
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
+    const env = this.envStore.get(environmentId);
+    if (!env) throw new BadCommand(`no such environment: ${environmentId}`);
+
+    const autopilot = new Autopilot(this.makeBuildHost(), { client: new TodoistClient(state.accessToken), workUnits: this.workUnits }, { onProgress });
+    const done = await autopilot.runBuildPhase({ id: env.id, name: env.name });
+    return {
+      built: done.length,
+      review: done.filter((u) => u.status === "review").length,
+      blocked: done.filter((u) => u.status === "blocked").length,
+    };
+  }
+
+  /** The Supervisor's implementation of the builder's session/git/validation seams (phase 2B). */
+  private makeBuildHost(): BuildHost {
+    const WORKING = new Set(["thinking", "running_tool"]);
+    return {
+      startBuildSession: ({ environmentId, title, brief }) => {
+        const env = this.envStore.get(environmentId);
+        if (!env) throw new BadCommand(`no such environment: ${environmentId}`);
+        const session = this.create({
+          v: PROTOCOL_VERSION,
+          type: "session.create",
+          ts: now(),
+          source: "fresh-worktree",
+          repoRoot: env.repoRoot,
+          base: env.defaultBase,
+          title,
+          environmentId: env.id,
+          model: "opus",
+          autonomy: "bypass", // unattended: auto-allow tools; AskUserQuestion still parks → we treat as blocked
+        });
+        this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
+        this.prompt(session.id, brief);
+        return { sessionId: session.id };
+      },
+      promptSession: (sessionId, text) => this.prompt(sessionId, text),
+      awaitSettled: async (sessionId): Promise<SettledStatus> => {
+        const pollMs = 2000;
+        const deadline = Date.now() + 30 * 60_000; // 30-minute ceiling per turn
+        for (;;) {
+          const s = this.sessions.get(sessionId);
+          if (!s) return "exited";
+          const status = s.data.status;
+          if (!WORKING.has(status)) return status as SettledStatus;
+          if (Date.now() > deadline) return "timeout";
+          await new Promise((r) => setTimeout(r, pollMs));
+        }
+      },
+      hasChanges: (sessionId) => {
+        const s = this.sessions.get(sessionId);
+        const wt = s?.data.worktree;
+        if (!s || !wt) return false;
+        return git.commitsAhead(s.data.cwd, wt.base) > 0;
+      },
+      validate: async (sessionId): Promise<ValidationResult> => {
+        const s = this.require(sessionId);
+        const env = s.data.environmentId ? this.envStore.get(s.data.environmentId) : undefined;
+        const gate = resolveGate(s.data.cwd, env?.validation);
+        return runValidation(s.data.cwd, gate.commands, { autodetected: gate.autodetected, env: this.agentEnv });
+      },
+      openPr: (sessionId, title, body) => {
+        const s = this.require(sessionId);
+        const wt = s.data.worktree;
+        if (!wt) return { ok: false, output: "session has no worktree" };
+        git.commit(s.data.cwd, `anvil: ${title}`); // best-effort — agent may have already committed
+        const pushed = git.push(s.data.cwd, wt.branch);
+        if (!pushed.ok) return { ok: false, output: pushed.output };
+        return git.createPr(s.data.cwd, title, body);
+      },
+      stopSession: async (sessionId) => {
+        await this.drivers.get(sessionId)?.stop();
+        this.drivers.delete(sessionId);
+      },
+    };
   }
   removeEnvironment(id: string): void {
     this.envStore.remove(id);

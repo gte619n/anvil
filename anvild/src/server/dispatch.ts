@@ -253,6 +253,19 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      case "todoist.build":
+        // Long-running: ack acceptance immediately, then build in the background (progress → daemon log).
+        try {
+          void deps.supervisor
+            .runAutopilotBuild(cmd.environmentId, (m) => console.log(`[autopilot] ${m}`))
+            .then((s) => console.log(`[autopilot] build phase done: ${s.review} → review, ${s.blocked} blocked (of ${s.built})`))
+            .catch((e) => console.error(`[autopilot] build phase failed: ${errMsg(e)}`));
+          if (cid) send(ack(cid));
+        } catch (e) {
+          send(cmdError(errMsg(e), cid));
+        }
+        return;
+
       case "fs.list": {
         const r = deps.supervisor.fsList(cmd.sessionId, cmd.path);
         send({ v: PROTOCOL_VERSION, type: "fs.list.result", ts: now(), cid, sessionId: cmd.sessionId, path: r.path, entries: r.entries });

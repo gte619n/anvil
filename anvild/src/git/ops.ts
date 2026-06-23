@@ -99,6 +99,13 @@ export function commit(cwd: string, message: string): { ok: boolean; output: str
   return { ok: r.code === 0, output: r.out || (r.code === 0 ? "committed" : "nothing to commit") };
 }
 
+/** Number of commits on the worktree's HEAD that aren't in `base` (i.e. work the agent produced). */
+export function commitsAhead(cwd: string, base: string): number {
+  const r = run(["git", "rev-list", "--count", `${base}..HEAD`], cwd);
+  const n = Number(r.out.trim());
+  return r.code === 0 && Number.isFinite(n) ? n : 0;
+}
+
 export function push(cwd: string, branch: string): { ok: boolean; output: string } {
   const r = run(["git", "push", "-u", "origin", branch], cwd);
   return { ok: r.code === 0, output: r.out || "pushed" };
