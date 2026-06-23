@@ -65,24 +65,17 @@ jobs:
           printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$RUNNER_TEMP/fcm-service-account.json"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/fcm-service-account.json" >> "$GITHUB_ENV"
 
+      # Grouped, de-noised notes parsed from the Conventional-Commit history that landed in this
+      # push (see scripts/gen-release-notes.ts). The gradle firebaseAppDistribution block uploads
+      # app/release-notes.txt when present.
       - name: Generate release notes from merged commits
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          SHORT="$(git rev-parse --short HEAD)"
-          BEFORE="${{ github.event.before }}"
-          # Range = what landed in this push; fall back to the last 30 commits when `before` is
-          # missing/unknown (first push, force-push, or manual workflow_dispatch).
-          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            RANGE="$BEFORE..${{ github.sha }}"
-          else
-            RANGE="-n 30"
-          fi
-          {
-            echo "Anvil — build #${{ github.run_number }} ($SHORT)"
-            echo ""
-            echo "What's new:"
-            git log --no-merges --pretty='• %s' $RANGE | head -50
-          } > app/release-notes.txt
+          bun scripts/gen-release-notes.ts > app/release-notes.txt
           echo "----- release notes -----"
           cat app/release-notes.txt
 

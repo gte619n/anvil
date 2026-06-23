@@ -10,6 +10,7 @@
   --code-bg: #f6f8fa;
   --warn: #d97706;
   --danger: #dc2626;
+  --merged: #8250df; /* GitHub "merged" purple — the session-list merged badge */
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   color: var(--text);
 }
@@ -23,6 +24,7 @@
   --user-bg: #2a3350;
   --tool-bg: #2a2c30;
   --code-bg: #24292e;
+  --merged: #a371f7; /* lighter purple for contrast on the dark sidebar */
   color-scheme: dark;
 }
 /* Shiki dual-theme: flip code colors to the dark palette under dark mode. */
@@ -72,7 +74,21 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #new-session { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; }
 #new-session .msym { font-size: 18px; }
 #theme-toggle { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; }
-#session-list { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+#session-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+#session-list, #finished-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+#finished-section { margin-top: 6px; }
+#finished-section[hidden] { display: none; }
+#finished-head { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--border); }
+#finished-head .msym { font-size: 14px; }
+#finished-list { min-height: 6px; border-radius: 8px; transition: background 0.12s; }
+#finished-list.drag-over { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+#finished-list:empty::after { content: "Drop finished sessions here"; display: block; color: var(--muted); font-size: 11px; font-style: italic; text-align: center; padding: 12px 8px; margin-top: 2px; border: 1px dashed var(--border); border-radius: 8px; }
+/* Drag-to-reorder: a handle (pointer-events, so touch works) starts the drag; the moving row dims. */
+.session .drag-handle { display: flex; align-items: center; align-self: stretch; padding: 0 0 0 6px; color: var(--muted); cursor: grab; opacity: 0.3; touch-action: none; }
+.session:hover .drag-handle { opacity: 0.7; }
+.session .drag-handle:active { cursor: grabbing; }
+.session .drag-handle .msym { font-size: 18px; }
+.session.dragging { opacity: 0.6; outline: 1px dashed var(--accent); background: var(--bg); }
 .sidebar-foot { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; }
 .sidebar-foot:hover { border-color: var(--accent); }
 .sidebar-foot .msym { font-size: 19px; }
@@ -108,15 +124,21 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .session .title { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .session .title .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session .title .msym { font-size: 17px; color: var(--muted); flex-shrink: 0; }
+/* Merged badge: marks sessions whose PR has landed, so done work is obvious at a glance. */
+.session .merged-badge { display: inline-flex; align-items: center; flex-shrink: 0; color: var(--merged); }
+.session .merged-badge .msym { font-size: 15px; color: var(--merged); }
 .session.active .title .msym { color: var(--accent); }
 .session .meta { font-size: 11px; color: var(--muted); padding-left: 23px; }
 
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-#header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-#header-title { font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
-#header-title .msym { font-size: 18px; color: var(--accent); }
-#header-left { display: flex; align-items: center; gap: 10px; }
-#header-actions { display: flex; align-items: center; gap: 8px; }
+#header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+#header-title { font-weight: 600; display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+#header-title .msym { font-size: 18px; color: var(--accent); flex-shrink: 0; }
+/* keep a long session title on one line with an ellipsis instead of wrapping the header bar */
+#header-title .ht { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+#header-left { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+#header-left > #btn-sidebar, #header-left > .conn-dot { flex-shrink: 0; }
+#header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
 .hbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
@@ -295,11 +317,15 @@ details.tool-result.error > summary { color: var(--danger); }
 #send:not(:disabled):hover { transform: scale(1.06); }
 #send:not(:disabled):active { transform: scale(0.95); }
 #send:disabled { background: var(--border); color: var(--muted); cursor: default; box-shadow: none; }
-/* Stop button: replaces Send while a turn runs (§stop) — a clear "interrupt" affordance. */
-#stop { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--danger); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0,0,0,0.25); transition: transform 0.1s; }
-#stop:hover { transform: scale(1.06); }
+/* Stop button: replaces Send only while a turn is actively running (§stop). Modeled on Claude's
+ * understated stop control — a neutral theme-colored circle (not alarm-red), no heavy shadow. */
+#stop { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--text); color: var(--bg); cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.7; transition: opacity 0.15s, transform 0.1s; }
+#stop:hover { opacity: 1; }
 #stop:active { transform: scale(0.95); }
-#stop .msym { font-size: 22px; }
+#stop .msym { font-size: 18px; }
+/* Author display rules above beat the UA [hidden] rule, so the buttons ignored their `hidden`
+ * attribute and always showed — restore it so Send/Stop actually toggle. */
+#send[hidden], #stop[hidden] { display: none; }
 
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 1000; }
 .modal-box { background: var(--bg); padding: 20px; border-radius: 12px; min-width: 360px; max-width: 560px; }
@@ -346,9 +372,11 @@ details.tool-result.error > summary { color: var(--danger); }
 .bubble.user .msg-time { text-align: right; }
 
 /* One-click copy button on code blocks (commands, snippets, output) */
-.md pre, details.tool-result pre { position: relative; }
+/* The button hangs off this non-scrolling wrapper (not the scrollable <pre>) so it stays pinned
+ * top-right while the code scrolls horizontally. */
+.code-wrap { position: relative; }
 .copy-btn { position: absolute; top: 6px; right: 6px; display: inline-flex; align-items: center; justify-content: center; padding: 3px 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--muted); cursor: pointer; opacity: 0.5; transition: opacity 0.12s, color 0.12s; }
-.md pre:hover .copy-btn, details.tool-result pre:hover .copy-btn { opacity: 1; }
+.code-wrap:hover .copy-btn { opacity: 1; }
 .copy-btn .msym { font-size: 15px; }
 .copy-btn.copied { color: var(--accent); border-color: var(--accent); opacity: 1; }
 
@@ -405,7 +433,7 @@ details.tool-result.error > summary { color: var(--danger); }
 
 #sidebar.collapsed { display: none; }
 
-@media (max-width: 720px) {
+@media (max-width: 700px) {
   /* on narrow screens the sidebar overlays the conversation instead of squishing it */
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
 }

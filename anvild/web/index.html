@@ -25,7 +25,13 @@
           <button id="theme-toggle" title="Toggle dark mode"><span class="msym">brightness_6</span></button>
         </div>
         <button id="new-session"><span class="msym">add</span> New session</button>
-        <ul id="session-list"></ul>
+        <div id="session-scroll">
+          <ul id="session-list"></ul>
+          <div id="finished-section" hidden>
+            <div id="finished-head"><span class="msym">check_circle</span> Finished</div>
+            <ul id="finished-list"></ul>
+          </div>
+        </div>
         <button id="open-settings" class="sidebar-foot"><span class="msym">tune</span> Settings &amp; servers</button>
       </aside>
       <main id="main">
@@ -55,11 +61,11 @@
                 <div id="composer-controls">
                   <button type="button" id="btn-attach" title="Attach image"><span class="msym">image</span></button>
                   <span class="spacer"></span>
-                  <button type="submit" id="send" title="Send" disabled>
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" /></svg>
-                  </button>
                   <button type="button" id="stop" title="Stop" hidden>
                     <span class="msym">stop</span>
+                  </button>
+                  <button type="submit" id="send" title="Send" disabled>
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" /></svg>
                   </button>
                 </div>
               </div>

@@ -129,6 +129,21 @@ export function prStatus(cwd: string): { state?: "open" | "merged" | "closed"; u
   }
 }
 
+/** Async PR state via `gh` (network), non-blocking — for the on-attach badge refresh so it never
+ *  stalls the single-threaded daemon. Same shape/semantics as prStatus(). */
+export async function prStatusAsync(cwd: string): Promise<{ state?: "open" | "merged" | "closed"; url?: string }> {
+  try {
+    const proc = Bun.spawn(["gh", "pr", "view", "--json", "state,url"], { cwd, stdout: "pipe", stderr: "ignore" });
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return {};
+    const j = JSON.parse(out) as { state?: string; url?: string };
+    const s = (j.state ?? "").toLowerCase();
+    return { state: s === "open" || s === "merged" || s === "closed" ? s : undefined, url: j.url };
+  } catch {
+    return {};
+  }
+}
+
 /** Best-effort delete of the remote branch (for abandon/cleanup). */
 export function deleteRemoteBranch(cwd: string, branch: string): void {
   run(["git", "push", "origin", "--delete", branch], cwd);

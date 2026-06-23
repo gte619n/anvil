@@ -151,6 +151,8 @@ export interface Session {
   icon?: string; // Material Symbols name chosen by Sonnet from the session title (arch §5)
   environmentId?: string; // the Environment this session was created from, if any
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted
+  finished?: boolean; // user-parked in the sidebar's "Finished" group (done, e.g. pending deploy)
+  order?: number; // explicit sidebar sort position (lower = higher); unset sorts newest-on-top
   cwd: string;
   source: SessionSource;
   worktree?: Worktree; // present when source === "fresh-worktree"
@@ -542,6 +544,11 @@ export interface SessionUnarchiveCmd extends Envelope, Correlated {
   type: "session.unarchive";
   sessionId: SessionId;
 }
+export interface SessionArrangeCmd extends Envelope, Correlated {
+  type: "session.arrange"; // set the sidebar order + "Finished" membership in one shot (drag-to-reorder)
+  order: SessionId[]; // full desired display order, active group followed by the finished group
+  finished: SessionId[]; // which sessions belong to the Finished group
+}
 export interface SessionResetCmd extends Envelope, Correlated {
   type: "session.reset"; // un-stick: drop stale driver, recover worktree, clear parked perms → idle
   sessionId: SessionId;
@@ -702,6 +709,7 @@ export type ClientCommand =
   | SessionKillCmd
   | SessionArchiveCmd
   | SessionUnarchiveCmd
+  | SessionArrangeCmd
   | SessionResetCmd
   | SessionSetModelCmd
   | SessionSetAutonomyCmd

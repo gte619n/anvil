@@ -69,6 +69,10 @@ const environments = new Map<string, Environment>();
 // (session.deleted). Transient — not persisted. (UI refinement §8)
 const removingSessions = new Set<string>();
 
+// The sidebar order and "Finished" group live on the session itself (server-synced fields
+// `order`/`finished`), so the arrangement follows you across every client — web, desktop, Android.
+let dragging: { id: string; el: HTMLElement } | null = null; // the row currently being dragged, if any
+
 // Offline cache (arch §8): persist the session + environment lists so they're browsable with no
 // connection. Hydrated synchronously below, kept in sync on every change.
 function persistSessions(): void {
@@ -230,7 +234,9 @@ $("#theme-toggle").addEventListener("click", () => {
 });
 
 // ── Sidebar collapse ─────────────────────────────────────────────────────────────
-const isNarrow = (): boolean => matchMedia("(max-width: 720px)").matches;
+// 700px keeps the phone-only layout off the iPad Mini (744px) and the unfolded Galaxy Z Fold
+// (~755px) while still catching every real phone. Must stay in sync with the @media query in app.css.
+const isNarrow = (): boolean => matchMedia("(max-width: 700px)").matches;
 let sidebarCollapsed =
   localStorage.getItem("anvil.sidebar") === "collapsed" ||
   (localStorage.getItem("anvil.sidebar") === null && isNarrow());
@@ -255,6 +261,16 @@ function toggleSidebar(): void {
 // when the open sidebar overlays the header (e.g. unfolding a foldable).
 $("#btn-sidebar").addEventListener("click", toggleSidebar);
 $("#sidebar-collapse").addEventListener("click", toggleSidebar);
+
+// On a phone there isn't room for both panes, so when focus moves to the chat (a tap or the
+// composer gaining focus) we collapse the overlaid session list — never a half-covered chat.
+function collapseSidebarForChat(): void {
+  if (!isNarrow() || sidebarCollapsed) return;
+  if (overlayOpen("sidebar")) dismissOverlay("sidebar"); // also unwinds the Back-stack entry
+  else { sidebarCollapsed = true; applySidebar(); } // open without an overlay entry (e.g. after a resize)
+}
+$("#convo-col").addEventListener("pointerdown", collapseSidebarForChat);
+$("#convo-col").addEventListener("focusin", collapseSidebarForChat);
 
 const sock = new AnvilSocket(wsUrl(), onEvent, onStatus);
 // sock.connect() is called after the outbox state below is declared (onStatus reads it).
@@ -1065,11 +1081,13 @@ function setStatus(status: string): void {
 
 // ── Stop the running turn (§stop) ────────────────────────────────────────────────
 const stopBtn = $<HTMLButtonElement>("#stop");
-/** While a turn is actively running, the Send button becomes a Stop button (like Claude Code). */
+/** True while a turn is actively running — gates Stop's visibility and keeps Send disabled. */
+let composerBusy = false;
+/** While a turn is actively running, a subtle Stop appears to the left of (a disabled) Send. */
 function updateComposerMode(status: string): void {
-  const busy = status === "thinking" || status === "running_tool";
-  stopBtn.hidden = !busy;
-  $<HTMLButtonElement>("#send").hidden = busy;
+  composerBusy = status === "thinking" || status === "running_tool";
+  stopBtn.hidden = !composerBusy; // only visible while actively thinking/running a tool
+  updateSendState(); // keep Send disabled for the duration of the turn
 }
 /** Stop button: interrupt the turn, drop the in-flight thinking/activity, and mark it cancelled —
  *  jumping back to the last prompt with a "Thinking canceled" notice (UI refinement §stop). */
@@ -1126,7 +1144,7 @@ async function copyText(text: string): Promise<boolean> {
 /** Add a one-click copy button to every code block under `root` (commands, snippets, output). */
 function addCopyButtons(root: HTMLElement): void {
   for (const pre of root.querySelectorAll<HTMLElement>("pre")) {
-    if (pre.querySelector(".copy-btn") || pre.classList.contains("mermaid")) continue;
+    if (pre.parentElement?.classList.contains("code-wrap") || pre.classList.contains("mermaid")) continue;
     const code = pre.textContent ?? "";
     if (!code.trim()) continue;
     const btn = document.createElement("button");
@@ -1146,7 +1164,13 @@ function addCopyButtons(root: HTMLElement): void {
         }, 1400);
       });
     });
-    pre.appendChild(btn);
+    // Pin the button to a non-scrolling wrapper, not the <pre> itself: an absolutely-positioned
+    // child of the horizontally-scrolling <pre> would drift left as the code scrolls.
+    const wrap = document.createElement("div");
+    wrap.className = "code-wrap";
+    pre.before(wrap);
+    wrap.appendChild(pre);
+    wrap.appendChild(btn);
   }
 }
 
@@ -1175,44 +1199,183 @@ async function runMermaid(container: HTMLElement): Promise<void> {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 function renderSessions(): void {
-  const ul = $("#session-list");
-  ul.innerHTML = "";
-  const items = [...sessions.values()].sort((a, b) => Number(!!a.archived) - Number(!!b.archived));
+  if (dragging) return; // never re-render mid-drag — it would yank the row out from under the pointer
+  const activeUl = $("#session-list");
+  const finishedUl = $("#finished-list");
+  activeUl.innerHTML = "";
+  finishedUl.innerHTML = "";
+  const ord = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
+  const items = [...sessions.values()].sort(
+    (a, b) => Number(!!a.archived) - Number(!!b.archived) || ord(a) - ord(b),
+  );
+  let anyFinished = false;
   for (const s of items) {
-    const removing = removingSessions.has(s.id);
-    const awaiting = !removing && !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
-    const li = document.createElement("li");
-    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}`;
-    const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
-    const where = envName ?? s.git?.branch ?? s.source;
-    const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
-    const a = document.createElement("a");
-    a.className = "srow";
-    a.href = sessionHref(s.id);
-    a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span></div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
-    a.addEventListener("click", (e) => {
-      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
-      e.preventDefault();
-      if (!removing) selectSession(s.id); // a session being cleaned up isn't selectable
-    });
-    li.append(a);
-    if (!removing) {
-      const open = document.createElement("button");
-      open.className = "open-tab";
-      open.title = "Open in new tab";
-      open.innerHTML = icon("open_in_new");
-      open.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        window.open(sessionHref(s.id), "_blank");
-      });
-      li.append(open);
-    }
-    ul.appendChild(li);
+    if (s.finished) anyFinished = true;
+    (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
   }
+  $("#finished-section").hidden = !anyFinished && !dragging; // hide the empty group at rest
+}
+
+function renderSessionItem(s: Session): HTMLLIElement {
+  const removing = removingSessions.has(s.id);
+  const awaiting = !removing && !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
+  const li = document.createElement("li");
+  li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}`;
+  li.dataset.id = s.id;
+  const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
+  const where = envName ?? s.git?.branch ?? s.source;
+  const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
+  if (!removing) {
+    const handle = document.createElement("div");
+    handle.className = "drag-handle";
+    handle.title = "Drag to reorder";
+    handle.innerHTML = icon("drag_indicator");
+    handle.addEventListener("pointerdown", (e) => startDrag(e, s.id, li));
+    li.append(handle);
+  }
+  const a = document.createElement("a");
+  a.className = "srow";
+  a.href = sessionHref(s.id);
+  const merged = s.git?.prState === "merged" ? `<span class="merged-badge" title="PR merged">${icon("merge")}</span>` : "";
+  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}</div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
+  a.addEventListener("click", (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
+    e.preventDefault();
+    if (!removing) selectSession(s.id); // a session being cleaned up isn't selectable
+  });
+  li.append(a);
+  if (!removing) {
+    const open = document.createElement("button");
+    open.className = "open-tab";
+    open.title = "Open in new tab";
+    open.innerHTML = icon("open_in_new");
+    open.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      window.open(sessionHref(s.id), "_blank");
+    });
+    li.append(open);
+  }
+  return li;
+}
+
+// ── Drag-to-reorder (pointer events → mouse + touch) ─────────────────────────────────────────────
+/** The row to insert the dragged element before, given the pointer's Y — or null to append. */
+function dragAfter(container: HTMLElement, y: number): HTMLElement | null {
+  let best: { off: number; el: HTMLElement | null } = { off: -Infinity, el: null };
+  for (const el of container.querySelectorAll<HTMLElement>(".session:not(.dragging)")) {
+    const box = el.getBoundingClientRect();
+    const off = y - box.top - box.height / 2; // negative = pointer is above this row's middle
+    if (off < 0 && off > best.off) best = { off, el };
+  }
+  return best.el;
+}
+function startDrag(e: PointerEvent, id: string, el: HTMLElement): void {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation(); // don't let it reach the row's click/select
+  dragging = { id, el };
+  el.classList.add("dragging");
+  $("#finished-section").hidden = false; // reveal the (possibly empty) drop target while dragging
+  const handle = e.currentTarget as HTMLElement;
+  try {
+    handle.setPointerCapture(e.pointerId); // route move/up here even when the pointer leaves the handle
+  } catch {
+    /* capture unsupported — falls back to bubbling, still usable */
+  }
+  const move = (ev: PointerEvent): void => {
+    if (!dragging) return;
+    ev.preventDefault();
+    const section = $("#finished-section");
+    const finishedUl = $("#finished-list");
+    const overFinished = ev.clientY >= section.getBoundingClientRect().top;
+    finishedUl.classList.toggle("drag-over", overFinished);
+    const list = overFinished ? finishedUl : $("#session-list");
+    const after = dragAfter(list, ev.clientY);
+    if (after === null) list.appendChild(dragging.el);
+    else if (after !== dragging.el) list.insertBefore(dragging.el, after);
+  };
+  const end = (): void => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", end);
+    handle.removeEventListener("pointercancel", end);
+    finishDrag();
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", end);
+  handle.addEventListener("pointercancel", end);
+}
+/** Commit the DOM order back to state: the two lists' contents define order and Finished membership. */
+function finishDrag(): void {
+  if (!dragging) return;
+  dragging.el.classList.remove("dragging");
+  $("#finished-list").classList.remove("drag-over");
+  const ids = (sel: string): string[] =>
+    [...$(sel).querySelectorAll<HTMLElement>(".session")].map((el) => el.dataset.id).filter((x): x is string => !!x);
+  const active = ids("#session-list");
+  const finished = ids("#finished-list");
+  const order = [...active, ...finished];
+  const fin = new Set(finished);
+  // Optimistically stamp the new order/finished onto the local sessions so the arrangement holds
+  // instantly; the daemon echoes session.updated back to every client (incl. Android) to confirm.
+  order.forEach((id, i) => {
+    const s = sessions.get(id);
+    if (s) {
+      s.order = i;
+      s.finished = fin.has(id);
+    }
+  });
+  persistSessions(); // keep the offline cache in step
+  sock.send({ type: "session.arrange", order, finished }); // dropped if offline; server resyncs on reconnect
+  dragging = null;
+  renderSessions(); // normalize (empty-group hint, hidden state, anything that changed during the drag)
 }
 function setHeaderTitle(s: Session | undefined): void {
-  $("#header-title").innerHTML = s ? `${icon(sessIcon(s))} ${esc(s.title)}` : "Anvil";
+  $("#header-title").innerHTML = s ? `${icon(sessIcon(s))}<span class="ht">${esc(s.title)}</span>` : `<span class="ht">Anvil</span>`;
+  document.title = s ? `Anvil: ${s.title}` : "Anvil";
+  void setFavicon(s);
+}
+
+// ── Favicon: mirror the active session's Material Symbol; fall back to the brand mark ────────────
+const DEFAULT_FAVICON = "/anvil.svg";
+let faviconToken = 0; // guards against a slow render landing after a faster session switch
+/** Paint a Material Symbols glyph (drawn via the font's ligatures) onto a canvas → PNG data URI. */
+async function glyphFaviconUrl(name: string): Promise<string> {
+  const size = 64;
+  const font = `${Math.round(size * 0.82)}px "Material Symbols Rounded"`;
+  await document.fonts.load(font, name); // ensure the icon font is ready before we paint
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("no 2d canvas context");
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#3b6ef5";
+  ctx.font = font;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(name, size / 2, size / 2 + size * 0.04); // tiny nudge so the glyph sits optically centered
+  return canvas.toDataURL("image/png");
+}
+async function setFavicon(s: Session | undefined): Promise<void> {
+  const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+  if (!link) return;
+  const token = ++faviconToken;
+  if (!s) {
+    link.type = "image/svg+xml";
+    link.href = DEFAULT_FAVICON;
+    return;
+  }
+  try {
+    const url = await glyphFaviconUrl(sessIcon(s));
+    if (token === faviconToken) {
+      link.type = "image/png";
+      link.href = url;
+    }
+  } catch {
+    if (token === faviconToken) {
+      link.type = "image/svg+xml";
+      link.href = DEFAULT_FAVICON; // canvas/font unavailable → keep the brand mark
+    }
+  }
 }
 function onEnvironments(list: Environment[]): void {
   environments.clear();
@@ -1487,7 +1650,8 @@ function autoGrow(): void {
   input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
 }
 function updateSendState(): void {
-  $<HTMLButtonElement>("#send").disabled = !input.value.trim() && pendingAttachments.length === 0;
+  $<HTMLButtonElement>("#send").disabled =
+    composerBusy || (!input.value.trim() && pendingAttachments.length === 0);
 }
 
 // attach button → file picker

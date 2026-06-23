@@ -385,6 +385,12 @@ export class Supervisor {
         const r = git.mergePr(cwd, cmd.method ?? "squash");
         ok = r.ok;
         output = r.output;
+        if (r.ok) {
+          this.refreshGit(s); // branch may be gone after --delete-branch; refresh dirty/ahead too
+          if (s.data.git) s.data.git.prState = "merged"; // mark done → the session list shows a merged badge
+          this.persist();
+          this.broadcastUpdated(s.data);
+        }
         break;
       }
     }
@@ -393,10 +399,29 @@ export class Supervisor {
   private refreshGit(s: Session): void {
     const g = gitStatus(s.data.cwd);
     if (g) {
+      // gitStatus() is local-only; carry the PR state we learned from gh across refreshes so a
+      // known "merged"/"open" (and the session-list badge) doesn't flicker away on the next commit.
+      g.prState = s.data.git?.prState;
+      g.prUrl = s.data.git?.prUrl;
       s.data.git = g;
       this.persist();
       this.broadcastUpdated(s.data);
     }
+  }
+  /** Best-effort, non-blocking PR-state refresh (network via gh), called on attach so a PR merged
+   *  outside the app surfaces its badge without opening the git panel. Skips sessions already known
+   *  merged (terminal) or without a branch, so the common case costs nothing. */
+  async refreshPrState(id: string): Promise<void> {
+    const s = this.sessions.get(id);
+    if (!s?.data.git || s.data.git.prState === "merged") return;
+    if (!s.data.worktree?.branch && !s.data.git.branch) return;
+    const pr = await git.prStatusAsync(s.data.cwd);
+    const cur = this.sessions.get(id); // may have changed/closed during the await
+    if (!cur?.data.git || (cur.data.git.prState === pr.state && cur.data.git.prUrl === pr.url)) return;
+    cur.data.git.prState = pr.state;
+    cur.data.git.prUrl = pr.url;
+    this.persist();
+    this.broadcastUpdated(cur.data);
   }
 
   /** Archive: stop the agent + terminal/watchers, keep the worktree/branch/history. */
@@ -418,6 +443,21 @@ export class Supervisor {
     s.data.lastActivityAt = now();
     this.persist();
     this.broadcastUpdated(s.data);
+  }
+  /** Apply a sidebar arrangement: explicit order + Finished-group membership. Reordering isn't
+   *  activity, so lastActivityAt is left untouched. Sessions not named keep their current order. */
+  arrange(order: string[], finished: string[]): void {
+    const rank = new Map(order.map((id, i) => [id, i] as const));
+    const fin = new Set(finished);
+    for (const s of this.sessions.values()) {
+      const o = rank.get(s.data.id) ?? s.data.order;
+      const f = fin.has(s.data.id);
+      if (s.data.order === o && !!s.data.finished === f) continue; // unchanged → no echo
+      s.data.order = o;
+      s.data.finished = f;
+      this.broadcastUpdated(s.data);
+    }
+    this.persist();
   }
 
   // Terminal channel (arch §7): a persistent PTY per session via Bun.Terminal.
@@ -714,8 +754,9 @@ export class Supervisor {
       const more = event.questions.length > 1 ? ` (+${event.questions.length - 1} more)` : "";
       payload = { title, body: `${first}${more}${opts ? `\n${opts}` : ""}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
-      // Quote what Claude actually said so the reminder carries real context, not just "Finished".
-      const snippet = oneLine(this.sessions.get(sessionId)?.lastAssistantText ?? "", 160);
+      // A short, plain-text summary of what Claude said — no Markdown, no novel — so the reminder
+      // carries real context at a glance instead of raw "## heading **bold**" glyphs.
+      const snippet = summarize(this.sessions.get(sessionId)?.lastAssistantText ?? "");
       payload = { title, body: snippet || "Finished — your turn.", dir, sessionId, tag: `done-${sessionId}`, kind: "result" };
     }
     if (payload) {
@@ -841,6 +882,29 @@ function deriveTitle(cwd: string): string {
 function oneLine(s: string, n = 120): string {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
+
+/** Notifications are plain text — Android (and most OSes) show raw Markdown glyphs rather than
+ *  rendering them — so reduce the prose to a short, glanceable summary of what was done. */
+const NOTIFY_MAX_WORDS = 24;
+function stripMarkdown(s: string): string {
+  return s
+    .replace(/```[\s\S]*?```/g, " ") // fenced code blocks
+    .replace(/`([^`]+)`/g, "$1") // inline code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ") // images
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // links → label only
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "") // headings
+    .replace(/^\s{0,3}>\s?/gm, "") // blockquotes
+    .replace(/^\s{0,3}(?:[-*+]|\d+[.)])\s+/gm, "") // list markers
+    .replace(/(\*\*|__)(.*?)\1/g, "$2") // bold
+    .replace(/(\*|_)(.*?)\1/g, "$2") // italic
+    .replace(/~~(.*?)~~/g, "$2"); // strikethrough
+}
+function summarize(s: string, maxWords = NOTIFY_MAX_WORDS): string {
+  const words = stripMarkdown(s).replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  if (words.length === 0) return "";
+  const clipped = words.slice(0, maxWords).join(" ");
+  return words.length > maxWords ? `${clipped}…` : clipped;
 }
 function summarizeRequest(tool: string, input: unknown): string {
   const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;

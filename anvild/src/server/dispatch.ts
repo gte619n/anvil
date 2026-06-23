@@ -89,6 +89,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         // replay events with seq > lastSeq, or a conversation.snapshot (arch §6.4)
         for (const event of deps.supervisor.resume(cmd.sessionId, cmd.lastSeq)) send(event);
+        void deps.supervisor.refreshPrState(cmd.sessionId); // best-effort: surface an external merge's badge
         return;
       }
 
@@ -117,6 +118,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "session.unarchive":
         deps.supervisor.unarchive(cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
+      case "session.arrange":
+        deps.supervisor.arrange(cmd.order, cmd.finished);
         if (cid) send(ack(cid));
         return;
 

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The raw foreground art nearly fills the 108dp canvas, so the launcher mask crops it and it looks
+     off-center. Inset it into the adaptive-icon safe zone (~66dp) so it sits centered on every mask
+     shape. `android:inset` fractions require API 26, which the v26 adaptive icon already guarantees. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@mipmap/ic_launcher_foreground"
+    android:inset="13%" />
