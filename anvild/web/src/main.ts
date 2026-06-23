@@ -2821,8 +2821,11 @@ function showQuestion(requestId: string, questions: Question[]): void {
       toast("Pick or type an answer for each question.");
       return;
     }
-    sock.send({ type: "question.respond", requestId, answers });
+    // Resolve the card and surface "Working" up front so the tap feels instant — the turn
+    // resumes on the daemon's next event. The send happens after (and is queued if we're offline).
     resolveQuestionUI(requestId, summarizeAnswers(answers));
+    showThinking("running_tool");
+    respondToQuestion({ type: "question.respond", requestId, answers });
   };
 
   for (const [qi, q] of questions.entries()) {
@@ -2878,8 +2881,9 @@ function showQuestion(requestId: string, questions: Question[]): void {
   skip.className = "q-btn skip";
   skip.textContent = "Skip";
   skip.onclick = () => {
-    sock.send({ type: "question.respond", requestId, answers: [], cancelled: true });
     resolveQuestionUI(requestId, "Skipped");
+    showThinking("running_tool");
+    respondToQuestion({ type: "question.respond", requestId, answers: [], cancelled: true });
   };
   btns.appendChild(skip);
   if (!oneTap) {
@@ -2894,6 +2898,11 @@ function showQuestion(requestId: string, questions: Question[]): void {
   questionCards.set(requestId, card);
   conversation.appendChild(card);
   scrollDown();
+}
+
+/** Fire a question answer; queue it for reconnect instead of dropping it if we're momentarily offline. */
+function respondToQuestion(cmd: { type: "question.respond"; requestId: string; answers: QuestionAnswer[]; cancelled?: boolean }): void {
+  if (!sock.send(cmd)) enqueue({ cid: newCid(), cmd });
 }
 
 /** Gather one answer per question from the clicked options + any "Other" text; null if any is empty. */
