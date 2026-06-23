@@ -1,0 +1,4 @@
+.build/
+Anvil Server.app/
+*.xcodeproj
+.DS_Store
