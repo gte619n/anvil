@@ -501,9 +501,9 @@ export class Supervisor {
     const attachments = attachmentIds
       .map((aid) => this.attachStore.ref(id, aid))
       .filter((r): r is AttachmentRef => r !== undefined);
-    const images = attachmentIds
-      .map((aid) => this.attachStore.loadBase64(id, aid))
-      .filter((x): x is { mediaType: string; data: string } => x !== undefined);
+    const inline = attachmentIds
+      .map((aid) => this.attachStore.loadForAgent(id, aid))
+      .filter((x): x is { mediaType: string; name: string; data: string } => x !== undefined);
 
     // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4)
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
@@ -514,7 +514,7 @@ export class Supervisor {
       );
       this.drivers.set(id, driver);
     }
-    driver.prompt(text, images);
+    driver.prompt(text, inline);
   }
 
   interrupt(id: string): void {

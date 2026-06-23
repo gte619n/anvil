@@ -312,8 +312,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
         if (req.method === "POST" && !attId) {
           try {
             const body = (await req.json()) as { name?: string; mediaType?: string; dataBase64?: string };
-            if (!body.mediaType || !body.dataBase64) return new Response("name, mediaType, dataBase64 required", { status: 400 });
-            const attachment = supervisor.addAttachment(sessionId, body.name ?? "attachment", body.mediaType, body.dataBase64);
+            // mediaType may be empty (Android's content picker often omits it); the store infers
+            // it from the filename. Only dataBase64 is strictly required.
+            if (!body.dataBase64) return new Response("dataBase64 required", { status: 400 });
+            const attachment = supervisor.addAttachment(sessionId, body.name ?? "attachment", body.mediaType ?? "", body.dataBase64);
             return Response.json({ attachment } satisfies rest.UploadAttachmentResponse);
           } catch (e) {
             return new Response(e instanceof Error ? e.message : "upload failed", { status: 400 });
