@@ -28,6 +28,10 @@ export function createWorktree(
   const cwd = join(worktreeRoot, sessionId);
   const r = git(["worktree", "add", "-b", branch, cwd, base], repoRoot);
   if (r.code !== 0) {
+    // An empty repo (unborn HEAD) can't branch a worktree — git only says "invalid reference: HEAD".
+    if (git(["rev-parse", "--verify", "HEAD"], repoRoot).code !== 0) {
+      throw new Error(`repository has no commits yet — make an initial commit in ${repoRoot} before starting a session`);
+    }
     throw new Error(r.stderr.trim() || r.stdout.trim() || "git worktree add failed");
   }
   return { worktree: { repoRoot, branch, base }, cwd };

@@ -2,9 +2,9 @@
  * Git / gh operations on a session worktree (arch §8). All shell out and return combined
  * stdout+stderr so the UI can show exactly what happened. PR ops use the `gh` CLI.
  */
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 function run(cmd: string[], cwd: string): { code: number; out: string } {
   const r = Bun.spawnSync(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
@@ -48,7 +48,41 @@ export function cloneRepo(url: string): { dest: string; output: string } {
   if (r.code !== 0) {
     throw new Error(`git clone failed: ${r.out || `exit ${r.code}`}`);
   }
-  return { dest, output: r.out };
+  // A freshly-created (empty) repo clones with an unborn HEAD — there's no commit to branch a
+  // session worktree from, so seed one. Otherwise `session.create` fails with git's cryptic
+  // "invalid reference: HEAD".
+  const init = ensureInitialCommit(dest);
+  return { dest, output: init.initialized ? `${r.out}\n${init.output}` : r.out };
+}
+
+/**
+ * If `dest` is an empty repo (unborn HEAD), seed it with an initial commit so HEAD resolves and
+ * sessions can branch a worktree off it. Writes a minimal README, commits with the host's git
+ * identity, and best-effort pushes so the remote default branch is initialized too. No-op (and
+ * never throws) if the repo already has commits or the commit can't be made — callers that need a
+ * commit surface a clear error later instead.
+ */
+export function ensureInitialCommit(dest: string): { initialized: boolean; output: string } {
+  if (run(["git", "rev-parse", "--verify", "HEAD"], dest).code === 0) {
+    return { initialized: false, output: "" };
+  }
+  const ref = run(["git", "symbolic-ref", "--short", "HEAD"], dest);
+  const branch = ref.code === 0 && ref.out.trim() ? ref.out.trim() : "main";
+  const readme = join(dest, "README.md");
+  if (!existsSync(readme)) writeFileSync(readme, `# ${basename(dest)}\n`);
+  run(["git", "add", "-A"], dest);
+  const commit = run(["git", "commit", "-m", "Initial commit"], dest);
+  if (commit.code !== 0) {
+    return { initialized: false, output: `could not auto-create an initial commit: ${commit.out}` };
+  }
+  const pushed = run(["git", "push", "-u", "origin", branch], dest);
+  return {
+    initialized: true,
+    output:
+      pushed.code === 0
+        ? `seeded an initial commit on ${branch} and pushed to origin`
+        : `seeded a local initial commit on ${branch} (push failed: ${pushed.out})`,
+  };
 }
 
 const CAP = 60_000;
