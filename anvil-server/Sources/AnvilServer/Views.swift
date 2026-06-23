@@ -1,78 +1,149 @@
 import SwiftUI
 
+/// Anvil "forge" accent used across the UI.
+extension Color {
+  static let anvil = Color(red: 0.90, green: 0.47, blue: 0.13)
+}
+
+/// A header row: a tinted icon chip + title/subtitle. Used at the top of each window/popover.
+private struct Header: View {
+  let symbol: String
+  let title: String
+  var subtitle: String?
+  var body: some View {
+    HStack(spacing: 12) {
+      Image(systemName: symbol)
+        .font(.title2).foregroundStyle(.white)
+        .frame(width: 38, height: 38)
+        .background(LinearGradient(colors: [Color.anvil, Color.anvil.opacity(0.75)], startPoint: .top, endPoint: .bottom))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+      VStack(alignment: .leading, spacing: 1) {
+        Text(title).font(.headline)
+        if let subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary) }
+      }
+      Spacer()
+    }
+  }
+}
+
+/// A light rounded "card" container for grouping a section's content.
+private struct Card<Content: View>: View {
+  @ViewBuilder var content: Content
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) { content }
+      .padding(12)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(.quaternary.opacity(0.5))
+      .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+  }
+}
+
 // MARK: - Menu (popover content)
 
 struct MenuView: View {
   @ObservedObject var state: AppState
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      HStack(spacing: 8) {
-        Circle().fill(dotColor).frame(width: 9, height: 9)
-        Text(state.serverName).font(.headline)
+    VStack(alignment: .leading, spacing: 12) {
+      HStack(spacing: 9) {
+        Image(systemName: "hammer.fill").foregroundStyle(Color.anvil)
+        Text(state.serverName).font(.headline).lineLimit(1)
         Spacer()
-        Text(state.health?.version.map { "anvild \($0)" } ?? "").font(.caption).foregroundStyle(.secondary)
-      }
-      Divider()
-
-      switch state.phase {
-      case .needsSetup:
-        Text("Not set up yet.").font(.callout)
-        Button("Set up this Mac…") { state.openWizard?() }.buttonStyle(.borderedProminent)
-      case .stopped:
-        Text(state.busy ?? "Daemon stopped.").font(.callout)
-        Button("Start Anvil") { state.install(); state.ensureServe() }
-      case .starting:
-        ProgressView().controlSize(.small)
-        Text(state.busy ?? "Starting…").font(.callout)
-      case .authError:
-        Label("Subscription auth invalid", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-        Text("The OAuth token is missing/expired (or an API key is overriding it).").font(.caption)
-        Button("Re-login…") { state.openWizard?() }
-      case .running:
-        Label("Running", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-        if let url = state.daemonURL {
-          HStack {
-            Text(url).font(.caption).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
-            Button { copy(url) } label: { Image(systemName: "doc.on.doc") }.buttonStyle(.plain)
-          }
+        if let v = state.health?.version {
+          Text("anvild \(v)").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
+            .background(.quaternary).clipShape(Capsule())
         }
-        budgetLine
       }
 
-      if let msg = state.lastMessage { Text(msg).font(.caption).foregroundStyle(.red).lineLimit(3) }
-      Divider()
+      statusCard
 
-      Group {
-        Button("Open client in browser") { state.openClient() }.disabled(state.daemonURL == nil)
-        Button("Add a Mac to the fleet…") { state.openAddMac?() }.disabled(state.phase != .running)
-        Button("Restart") { state.restart() }.disabled(!state.hasToken || !state.hasCheckout)
-        Button("Settings…") { state.openWizard?() }
-      }.buttonStyle(.plain)
+      if let msg = state.lastMessage {
+        Label(msg, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.red).lineLimit(3)
+      }
 
+      VStack(alignment: .leading, spacing: 2) {
+        menuButton("Open client in browser", "safari", state.openClient, enabled: state.daemonURL != nil)
+        menuButton("Add a Mac to the fleet…", "person.2.badge.plus", { state.openAddMac?() }, enabled: state.phase == .running)
+        menuButton("Restart daemon", "arrow.clockwise", state.restart, enabled: state.hasToken && state.hasCheckout)
+        menuButton("Settings…", "gearshape", { state.openWizard?() })
+      }
       Divider()
-      Button("Quit Anvil Server") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain)
+      menuButton("Quit Anvil Server", "power", { NSApplication.shared.terminate(nil) }, tint: .secondary)
     }
     .padding(14)
-    .frame(width: 320)
+    .frame(width: 340)
   }
 
+  @ViewBuilder private var statusCard: some View {
+    Card {
+      HStack(spacing: 8) {
+        Image(systemName: statusSymbol).foregroundStyle(dotColor)
+        Text(statusText).font(.subheadline.weight(.medium))
+        Spacer()
+      }
+      switch state.phase {
+      case .needsSetup:
+        Button { state.openWizard?() } label: { Label("Set up this Mac…", systemImage: "wand.and.stars") }
+          .buttonStyle(.borderedProminent).tint(.anvil)
+      case .stopped:
+        Button { state.install(); state.ensureServe() } label: { Label("Start Anvil", systemImage: "play.fill") }
+          .buttonStyle(.borderedProminent).tint(.anvil)
+      case .starting:
+        HStack(spacing: 6) { ProgressView().controlSize(.small); Text(state.busy ?? "Starting…").font(.caption) }
+      case .authError:
+        Button { state.openWizard?() } label: { Label("Re-login…", systemImage: "key.fill") }.tint(.orange)
+      case .running:
+        if let url = state.daemonURL {
+          HStack(spacing: 6) {
+            Image(systemName: "link").font(.caption).foregroundStyle(.secondary)
+            Text(url).font(.caption).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+            Button { copy(url) } label: { Image(systemName: "doc.on.doc") }.buttonStyle(.plain).help("Copy URL")
+          }
+        }
+        if let b = state.health?.budget {
+          Label(b.warn == true ? "Approaching the weekly limit" : "Budget OK",
+                systemImage: b.warn == true ? "exclamationmark.triangle.fill" : "gauge.with.dots.needle.67percent")
+            .font(.caption).foregroundStyle(b.warn == true ? .orange : .secondary)
+        }
+      }
+    }
+  }
+
+  private func menuButton(_ title: String, _ symbol: String, _ action: @escaping () -> Void, enabled: Bool = true, tint: Color = .primary) -> some View {
+    Button(action: action) {
+      Label(title, systemImage: symbol).frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .buttonStyle(.plain).foregroundStyle(enabled ? tint : Color.secondary).disabled(!enabled)
+    .padding(.vertical, 3)
+  }
+
+  private var statusText: String {
+    switch state.phase {
+    case .needsSetup: return "Not set up yet"
+    case .stopped: return state.busy ?? "Daemon stopped"
+    case .starting: return "Starting…"
+    case .authError: return "Subscription auth invalid"
+    case .running: return "Running"
+    }
+  }
+  private var statusSymbol: String {
+    switch state.phase {
+    case .running: return "checkmark.circle.fill"
+    case .starting: return "clock.fill"
+    case .authError: return "exclamationmark.triangle.fill"
+    case .needsSetup: return "wand.and.stars"
+    case .stopped: return "stop.circle.fill"
+    }
+  }
   private var dotColor: Color {
     switch state.phase {
     case .running: return .green
     case .starting: return .yellow
     case .authError: return .orange
-    case .needsSetup, .stopped: return .secondary
+    case .needsSetup: return .anvil
+    case .stopped: return .secondary
     }
   }
-
-  @ViewBuilder private var budgetLine: some View {
-    if let b = state.health?.budget {
-      Text(b.warn == true ? "⚠️ Approaching the weekly limit" : "Budget OK")
-        .font(.caption).foregroundStyle(b.warn == true ? .orange : .secondary)
-    }
-  }
-
   private func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
 }
 
@@ -87,60 +158,99 @@ struct WizardView: View {
   @State private var token = ""
   @State private var pairingCode = ""
   @State private var status = ""
+  @State private var checkoutTick = 0
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      Text("Set up Anvil Server").font(.title2).bold()
-      if let w = Auth.apiKeyWarning() { Label(w, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
+    VStack(alignment: .leading, spacing: 16) {
+      Header(symbol: "hammer.fill", title: "Set up Anvil Server", subtitle: "Drive Claude across your Macs")
+
+      if let w = Auth.apiKeyWarning() {
+        Label(w, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+      }
       if !state.hasCheckout {
-        Label("Can't find the anvild checkout. Set ANVILD_DIR or install the bundled app.", systemImage: "folder.badge.questionmark")
-          .font(.caption).foregroundStyle(.red)
+        let _ = checkoutTick
+        Card {
+          Label("Can't find the anvild daemon on this Mac.", systemImage: "folder.badge.questionmark")
+            .font(.callout).foregroundStyle(.red)
+          Button { chooseCheckout() } label: { Label("Choose anvild folder…", systemImage: "folder") }
+        }
       }
 
       switch role {
       case .choose:
-        Text("Is this your first Anvil Mac, or are you adding it to an existing fleet?")
-        HStack {
-          Button("Establish a new fleet") { role = .establish }.buttonStyle(.borderedProminent)
-          Button("Join an existing fleet") { startJoin() }
+        Text("Is this your first Anvil Mac, or are you adding it to an existing fleet?").font(.callout)
+        HStack(spacing: 10) {
+          roleButton("Establish a new fleet", "flag.checkered", prominent: true) { role = .establish }
+          roleButton("Join an existing fleet", "person.2.badge.plus") { startJoin() }
         }
       case .establish:
-        Text("1. Log in with your Claude subscription (opens Terminal):")
-        Button("Run `claude setup-token`") { _ = Auth.openSetupTokenInTerminal() }
-        Text("2. Paste the token it prints:")
-        SecureField("CLAUDE_CODE_OAUTH_TOKEN", text: $token)
-        Button("Save & start") { saveAndStart() }.buttonStyle(.borderedProminent).disabled(token.isEmpty)
+        Card {
+          Label("Log in with your Claude subscription", systemImage: "1.circle.fill").font(.callout.weight(.medium))
+          Text("Opens Terminal to run `claude setup-token` (no API key — your subscription).").font(.caption).foregroundStyle(.secondary)
+          Button { _ = Auth.openSetupTokenInTerminal() } label: { Label("Run setup-token", systemImage: "terminal") }
+        }
+        Card {
+          Label("Paste the token it prints", systemImage: "2.circle.fill").font(.callout.weight(.medium))
+          SecureField("CLAUDE_CODE_OAUTH_TOKEN", text: $token).textFieldStyle(.roundedBorder)
+          Button { saveAndStart() } label: { Label("Save & start", systemImage: "play.fill") }
+            .buttonStyle(.borderedProminent).tint(.anvil).disabled(token.isEmpty)
+        }
       case .join:
-        Text("On your main Mac: Anvil → Add a Mac to the fleet → enter this code:")
-        Text(pairingCode).font(.system(size: 34, weight: .bold, design: .monospaced)).frame(maxWidth: .infinity)
-        Text("This Mac: \(Tailscale.magicDNSName() ?? "—")").font(.caption).foregroundStyle(.secondary)
-        Text("Waiting for the hub to send the token…").font(.caption)
+        Card {
+          Label("On your main Mac", systemImage: "arrow.down.left.circle.fill").font(.callout.weight(.medium))
+          Text("Open Anvil → Add a Mac to the fleet → enter this code:").font(.caption).foregroundStyle(.secondary)
+          Text(pairingCode)
+            .font(.system(size: 38, weight: .bold, design: .monospaced)).kerning(4)
+            .frame(maxWidth: .infinity).padding(.vertical, 6)
+            .background(Color.anvil.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 10))
+          Label("This Mac: \(Tailscale.magicDNSName() ?? "—")", systemImage: "desktopcomputer").font(.caption).foregroundStyle(.secondary)
+          HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Waiting for the hub…").font(.caption).foregroundStyle(.secondary) }
+        }
       }
 
-      if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
+      if !status.isEmpty { Label(status, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary) }
       Spacer()
       HStack { Spacer(); Button("Close") { stopJoin(); close() } }
     }
-    .padding(20)
-    .frame(width: 460, height: 320)
+    .padding(22)
+    .frame(width: 480, height: 380)
+  }
+
+  private func roleButton(_ title: String, _ symbol: String, prominent: Bool = false, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      VStack(spacing: 8) {
+        Image(systemName: symbol).font(.title)
+        Text(title).font(.callout).multilineTextAlignment(.center)
+      }.frame(maxWidth: .infinity).padding(.vertical, 14)
+    }
+    .buttonStyle(.bordered).tint(prominent ? .anvil : .secondary)
+  }
+
+  private func chooseCheckout() {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = true
+    panel.canChooseFiles = false
+    panel.prompt = "Use this anvild folder"
+    panel.message = "Choose the anvild checkout (the folder containing scripts/service.sh)."
+    if panel.runModal() == .OK, let url = panel.url {
+      if Paths.valid(url.path) {
+        Paths.setAnvildDir(url.path); checkoutTick += 1; status = "Using anvild at \(url.path)"
+      } else {
+        status = "That folder isn't an anvild checkout (no scripts/service.sh)."
+      }
+    }
   }
 
   private func saveAndStart() {
     do {
       try Auth.writeToken(token)
-      state.install()
-      state.ensureServe()
-      // Re-login also refreshes the shared token across the fleet (§4.4); no-op if no members.
-      state.rotateFleet(token: token) { msg in status = msg }
+      state.install(); state.ensureServe()
+      state.rotateFleet(token: token) { msg in status = msg } // re-login also refreshes the fleet (§4.4)
       status = "Token saved. Starting the daemon…"
     } catch { status = (error as NSError).localizedDescription }
   }
 
-  private func startJoin() {
-    role = .join
-    pairingCode = state.armJoin() // opens the persistent listener + a join window; the hub pushes the token
-  }
-
+  private func startJoin() { role = .join; pairingCode = state.armJoin() }
   private func stopJoin() { state.cancelJoin() }
 }
 
@@ -155,21 +265,27 @@ struct AddMacView: View {
   @State private var sending = false
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      Text("Add a Mac to the fleet").font(.title2).bold()
-      Text("On the new Mac, open Anvil → Join an existing fleet. Enter its tailnet name and the 6-digit code it shows.")
-        .font(.callout).foregroundStyle(.secondary)
-      TextField("joiner.tailnet.ts.net", text: $host)
-      TextField("6-digit code", text: $code)
-      Button(sending ? "Sending…" : "Send invite") { send() }
-        .buttonStyle(.borderedProminent)
-        .disabled(sending || host.isEmpty || code.count != 6)
-      if !status.isEmpty { Text(status).font(.caption) }
+    VStack(alignment: .leading, spacing: 16) {
+      Header(symbol: "person.2.badge.plus", title: "Add a Mac to the fleet", subtitle: "Share this fleet's login over your tailnet")
+      Card {
+        Text("On the new Mac, open Anvil → Join an existing fleet. Enter its tailnet name and the 6-digit code it shows.")
+          .font(.callout).foregroundStyle(.secondary)
+        Label("Tailnet name", systemImage: "network").font(.caption).foregroundStyle(.secondary)
+        TextField("joiner.tailnet.ts.net", text: $host).textFieldStyle(.roundedBorder)
+        Label("Pairing code", systemImage: "number").font(.caption).foregroundStyle(.secondary)
+        TextField("6-digit code", text: $code).textFieldStyle(.roundedBorder)
+      }
+      Button { send() } label: {
+        Label(sending ? "Sending…" : "Send invite", systemImage: "paperplane.fill").frame(maxWidth: .infinity)
+      }
+      .buttonStyle(.borderedProminent).tint(.anvil).disabled(sending || host.isEmpty || code.count != 6)
+
+      if !status.isEmpty { Label(status, systemImage: "info.circle").font(.caption) }
       Spacer()
       HStack { Spacer(); Button("Close") { close() } }
     }
-    .padding(20)
-    .frame(width: 460, height: 280)
+    .padding(22)
+    .frame(width: 480, height: 360)
   }
 
   private func send() {
@@ -180,12 +296,8 @@ struct AddMacView: View {
       sending = false
       switch result {
       case .success(let reply):
-        if reply.ok {
-          state.recordMember(host: h, reply: reply) // remember it for future token rotations (§6)
-          status = "✅ \(h) joined the fleet."
-        } else {
-          status = "Rejected: \(reply.error ?? "unknown")"
-        }
+        if reply.ok { state.recordMember(host: h, reply: reply); status = "✅ \(h) joined the fleet." }
+        else { status = "Rejected: \(reply.error ?? "unknown")" }
       case .failure(let e): status = "Failed: \(e.localizedDescription)"
       }
     }
