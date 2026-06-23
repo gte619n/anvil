@@ -135,6 +135,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      case "session.new_topic":
+        deps.supervisor
+          .newTopic(cmd.sessionId)
+          .then(() => {
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "git": {
         const result = deps.supervisor.gitOp(cmd);
         send({ ...result, cid });

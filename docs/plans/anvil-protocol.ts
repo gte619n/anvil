@@ -1,7 +1,10 @@
 /**
  * Anvil wire protocol — shared contract between `anvild` (daemon) and all clients.
  *
- * Status: 0.5-draft (2026-06-20). Companion to `anvil-native-architecture.md` (§6, §8).
+ * Status: 0.6-draft (2026-06-23). Companion to `anvil-native-architecture.md` (§6, §8).
+ *   0.6: default "concierge" chat — Session.isDefault (single persistent, pinned,
+ *        non-killable general assistant) + session.new_topic (fresh Claude context,
+ *        keep scrollback). Both additive; PROTOCOL_VERSION unchanged.
  *   0.5: git lifecycle — `git` command (status/diff/commit/push/create-pr/merge-pr) +
  *        git.result event; session.archive/unarchive + Session.archived.
  *   0.4: added Environment registry — environments event + env.list/env.add/env.remove,
@@ -148,6 +151,7 @@ export interface Budget {
 export interface Session {
   id: SessionId;
   title: string;
+  isDefault?: boolean; // the single persistent "concierge" chat: pinned first, never killable/archivable (§0.6)
   pending?: boolean; // client-only: created offline, not yet realized on the daemon (never set by the server)
   icon?: string; // Material Symbols name chosen by Sonnet from the session title (arch §5)
   environmentId?: string; // the Environment this session was created from, if any
@@ -554,6 +558,10 @@ export interface SessionResetCmd extends Envelope, Correlated {
   type: "session.reset"; // un-stick: drop stale driver, recover worktree, clear parked perms → idle
   sessionId: SessionId;
 }
+export interface SessionNewTopicCmd extends Envelope, Correlated {
+  type: "session.new_topic"; // start a fresh Claude context (drop --resume) but keep the visible scrollback (§0.6)
+  sessionId: SessionId;
+}
 /** Git / gh operations on the session's worktree (arch §8). */
 export interface GitCmd extends Envelope, Correlated {
   type: "git";
@@ -715,6 +723,7 @@ export type ClientCommand =
   | SessionUnarchiveCmd
   | SessionArrangeCmd
   | SessionResetCmd
+  | SessionNewTopicCmd
   | SessionSetModelCmd
   | SessionSetAutonomyCmd
   | GitCmd

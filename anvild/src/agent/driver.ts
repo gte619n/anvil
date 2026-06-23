@@ -1,4 +1,4 @@
-import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
 import type { Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
@@ -42,6 +42,10 @@ export class AgentDriver {
     private readonly questionBroker: QuestionBroker,
     private readonly env: Record<string, string>,
     private readonly onResult: ResultRecorder,
+    /** In-process MCP servers exposed to this session — set ONLY for the default concierge chat (§0.6). */
+    private readonly mcpServers?: Record<string, McpSdkServerConfigWithInstance>,
+    /** Extra `allowedTools` (the concierge's `mcp__anvil__*` ids) auto-allowed by the SDK layer. */
+    private readonly extraAllowedTools?: string[],
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -93,6 +97,23 @@ export class AgentDriver {
   private systemPrompt(): { type: "preset"; preset: "claude_code"; append?: string } {
     const s = this.session.data;
     let append = AgentDriver.TOOLING_GUIDANCE;
+    if (s.isDefault) {
+      append +=
+        "\n\nYOU ARE THE ANVIL CONCIERGE. You are a single, persistent, general-purpose assistant for the " +
+        "user's whole Anvil fleet on this machine — NOT scoped to one project. Answer general questions and act " +
+        "as mission control across every environment and session.\n\n" +
+        "CROSS-SESSION VISIBILITY: Use `mcp__anvil__list_sessions`, `mcp__anvil__get_session`, and " +
+        "`mcp__anvil__list_environments` to see the live state of ALL ongoing work — titles, status, model, and " +
+        "git branch/dirty/ahead-behind/PR — and to answer 'what's in flight?' style questions. Prefer these tools " +
+        "over guessing; the data is live.\n\n" +
+        "HANDOFF: When the user wants real work done in a project, use `mcp__anvil__create_session` to spin up a " +
+        "fresh-worktree session in the right environment (call `mcp__anvil__list_environments` first to choose), " +
+        "passing a clear, self-contained `brief` as the first instruction. That session starts working immediately " +
+        "and independently — confirm which session you started and what you asked it to do, then let it run. Do NOT " +
+        "do heavy project edits yourself from here; hand off instead.\n\n" +
+        "Your working directory is the user's home directory; treat it as scratch space, not a project repo.";
+      return { type: "preset", preset: "claude_code", append };
+    }
     if (s.source === "fresh-worktree") {
       const where = s.worktree ? ` (branch "${s.worktree.branch}", based on "${s.worktree.base}")` : "";
       append +=
@@ -135,6 +156,8 @@ export class AgentDriver {
         supportedDialogKinds: [ASK_USER_QUESTION_DIALOG],
         executable: "bun",
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
+        ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),
+        ...(this.extraAllowedTools ? { allowedTools: this.extraAllowedTools } : {}),
       },
     });
     void this.consume();

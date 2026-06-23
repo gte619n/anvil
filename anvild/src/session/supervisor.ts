@@ -21,6 +21,7 @@ import {
   type Session as SessionData,
   type SessionCreateCmd,
   type SessionListEvent,
+  type SessionSource,
 } from "@protocol";
 import { now } from "../util/envelope";
 import { newId } from "../util/ids";
@@ -29,6 +30,7 @@ import { Session } from "./session";
 import { SessionStore } from "./store";
 import { createWorktree, gitStatus, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
+import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
@@ -47,6 +49,10 @@ import { Fcm } from "../push/fcm";
 
 /** A client command that can't be honored (bad args, no such session). → command.error. */
 export class BadCommand extends Error {}
+
+/** Stable sentinel id for the single persistent "concierge" default chat (§0.6). `newId` is random
+ *  so this can never collide with an ordinary session. */
+export const DEFAULT_SESSION_ID = "sess_default";
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -75,6 +81,14 @@ export class Supervisor {
   private readonly notified = new Set<string>();
   private readonly renderer: MarkdownRenderer;
   private readonly agentEnv = buildAgentEnv();
+  /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
+   *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
+  private readonly defaultToolsServer = buildDefaultToolsServer({
+    listSessions: () => this.list(),
+    getSession: (id) => this.sessions.get(id)?.data,
+    listEnvironments: () => this.envStore.list(),
+    handoff: (a) => this.handoffCreate(a),
+  });
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly attachStore: AttachmentStore;
@@ -214,7 +228,10 @@ export class Supervisor {
   }
 
   list(): SessionData[] {
-    return [...this.sessions.values()].map((s) => s.data);
+    // The concierge default chat is always pinned first; everything else keeps insertion order.
+    return [...this.sessions.values()]
+      .map((s) => s.data)
+      .sort((a, b) => Number(!!b.isDefault) - Number(!!a.isDefault));
   }
   get(id: string): Session | undefined {
     return this.sessions.get(id);
@@ -267,6 +284,60 @@ export class Supervisor {
     this.persist();
     void this.assignIcon(session); // async: Sonnet picks an icon from the title (arch §5)
     return session; // dispatch announces session.created (creator gets the cid; others via registry)
+  }
+
+  /**
+   * Create a session AND auto-start it on a seeded brief — the concierge's handoff path (§0.6).
+   * Unlike a client-driven `create()` (announced by dispatch), a tool-driven create has no dispatch
+   * frame, so this broadcasts `session.created` itself. `prompt()` emits the brief as `message.user`,
+   * so it appears in the new session's history and starts the first turn.
+   */
+  private handoffCreate(a: {
+    environmentId?: string;
+    source: SessionSource;
+    cwd?: string;
+    base?: string;
+    title: string;
+    model?: Model;
+    autonomy?: AutonomyPolicy;
+    brief: string;
+  }): { id: string; title: string; cwd: string } {
+    let cmd: SessionCreateCmd;
+    if (a.source === "fresh-worktree") {
+      const env = a.environmentId ? this.envStore.get(a.environmentId) : undefined;
+      if (!env) {
+        throw new BadCommand("environmentId is required and must be a known environment for a fresh-worktree handoff");
+      }
+      cmd = {
+        v: PROTOCOL_VERSION,
+        type: "session.create",
+        ts: now(),
+        source: "fresh-worktree",
+        repoRoot: env.repoRoot,
+        base: a.base ?? env.defaultBase,
+        title: a.title,
+        environmentId: env.id,
+        model: a.model,
+        autonomy: a.autonomy,
+      };
+    } else {
+      if (!a.cwd) throw new BadCommand("cwd is required for an existing-dir handoff");
+      cmd = {
+        v: PROTOCOL_VERSION,
+        type: "session.create",
+        ts: now(),
+        source: "existing-dir",
+        cwd: a.cwd,
+        title: a.title,
+        environmentId: a.environmentId,
+        model: a.model,
+        autonomy: a.autonomy,
+      };
+    }
+    const session = this.create(cmd);
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
+    this.prompt(session.id, a.brief); // lazily starts the driver and runs the first turn
+    return { id: session.id, title: session.data.title, cwd: session.data.cwd };
   }
 
   /** Fire-and-forget: ask Sonnet for a fitting icon, then push it via session.updated. */
@@ -426,6 +497,7 @@ export class Supervisor {
 
   /** Archive: stop the agent + terminal/watchers, keep the worktree/branch/history. */
   async archive(id: string): Promise<void> {
+    if (id === DEFAULT_SESSION_ID) throw new BadCommand("the default chat cannot be archived");
     const s = this.require(id);
     await this.drivers.get(id)?.stop();
     this.drivers.delete(id);
@@ -549,8 +621,16 @@ export class Supervisor {
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
     let driver = this.drivers.get(id);
     if (!driver) {
-      driver = new AgentDriver(s, this.renderer, this.broker, this.questionBroker, this.agentEnv, (usage) =>
-        this.onAgentResult(id, usage),
+      const isDefault = s.data.isDefault === true;
+      driver = new AgentDriver(
+        s,
+        this.renderer,
+        this.broker,
+        this.questionBroker,
+        this.agentEnv,
+        (usage) => this.onAgentResult(id, usage),
+        isDefault ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer } : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : undefined,
       );
       this.drivers.set(id, driver);
     }
@@ -628,6 +708,7 @@ export class Supervisor {
    * Now nothing the teardown does can bring the session back; failures are logged, not fatal.
    */
   async kill(id: string): Promise<void> {
+    if (id === DEFAULT_SESSION_ID) throw new BadCommand("the default chat cannot be deleted");
     const s = this.require(id);
     s.dispose(); // stop accepting events first, so a late-draining turn can't write to a removed dir
     this.clearNotifications(id); // dismiss any lingering "your turn" reminder for the gone session
@@ -698,6 +779,74 @@ export class Supervisor {
     this.persist();
     this.broadcastUpdated(s.data);
     s.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(`🔄 _Session reset${recovered ? ` — ${recovered}` : ""}. Re-send your message to continue._`) }] });
+  }
+
+  /**
+   * Guarantee the single persistent "concierge" default chat exists (§0.6). Called at the end of
+   * `restore()` so a previously persisted default (and its `events.ndjson` history) is reused; only
+   * created fresh when truly absent. It's an existing-dir session rooted at the user's home, so the
+   * worktree recovery/cleanup paths no-op for it.
+   */
+  private ensureDefaultSession(): void {
+    const existing = this.sessions.get(DEFAULT_SESSION_ID);
+    if (existing) {
+      if (!existing.data.isDefault) {
+        existing.data.isDefault = true; // heal a pre-0.6 persisted copy
+        this.persist();
+      }
+      return;
+    }
+    mkdirSync(this.store.sessionDir(DEFAULT_SESSION_ID), { recursive: true });
+    const data: SessionData = {
+      id: DEFAULT_SESSION_ID,
+      title: "Anvil",
+      icon: "forum", // fixed curated icon — skip assignIcon for the default
+      isDefault: true,
+      cwd: process.env.HOME ?? this.store.worktreeRoot(),
+      source: "existing-dir",
+      model: "opus",
+      autonomy: "mostly-autonomous",
+      status: "idle",
+      createdAt: now(),
+      lastActivityAt: now(),
+      usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
+    };
+    const session = this.wrap(data, 0);
+    this.sessions.set(DEFAULT_SESSION_ID, session);
+    this.persist();
+    this.registry.toAll(this.sessionListEvent()); // clients refresh; pin happens via list() ordering
+  }
+
+  /**
+   * Reset the topic (§0.6): start a fresh Claude SDK context (drop `--resume`) WITHOUT touching the
+   * visible scrollback. Drops the live driver, clears any parked prompt, and writes a persisted
+   * divider into the event log so the boundary survives reload and syncs to all clients. Generic for
+   * any session; the UI exposes it on the concierge chat.
+   */
+  async newTopic(id: string): Promise<void> {
+    const s = this.require(id);
+    await this.drivers.get(id)?.stop(); // drop the live query so the next prompt starts fresh
+    this.drivers.delete(id);
+    this.broker.resolveSession(id, "deny"); // unblock any parked permission
+    this.questionBroker.resolveSession(id); // cancel any parked AskUserQuestion
+    s.clearPermission();
+    s.clearQuestion();
+    s.data.claudeSessionId = undefined; // the key line: forget the prior topic (no resume next turn)
+    s.data.status = "idle";
+    s.data.lastActivityAt = now();
+    s.emit({
+      type: "assistant.message",
+      blocks: [
+        {
+          kind: "markdown",
+          rendered: this.renderer.render(
+            "───────────\n**New topic** — the earlier conversation is above for reference; Claude no longer has it in context.",
+          ),
+        },
+      ],
+    });
+    this.persist();
+    this.broadcastUpdated(s.data);
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -814,6 +963,7 @@ export class Supervisor {
       }
     }
     this.persist(); // reconcile disk == memory after status resets / recovery (fixes drift)
+    this.ensureDefaultSession(); // the concierge chat always exists (reused if persisted, else created)
 
     const known = new Set(this.sessions.keys());
     const orphanDirs = this.store.listSessionDirs().filter((d) => !known.has(d));
