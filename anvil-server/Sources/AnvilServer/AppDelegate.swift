@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private func window(_ existing: inout NSWindow?, title: String, view: some View) -> NSWindow {
     if let w = existing { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return w }
     let w = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 480, height: 340),
+      contentRect: NSRect(x: 0, y: 0, width: 480, height: 460),
       styleMask: [.titled, .closable], backing: .buffered, defer: false
     )
     w.title = title

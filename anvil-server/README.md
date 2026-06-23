@@ -35,6 +35,9 @@ notarized DMG needs a Developer ID (design §8) — not wired yet.
 
 ## What it does
 
+- **Dependencies:** the wizard detects **Bun** and installs it on a tap (official `bun.sh` script →
+  `~/.bun/bin`, which the daemon launcher already uses); **Tailscale** is detected with a download
+  link if missing. An "anvild folder" picker handles a non-bundled checkout.
 - **Menu bar:** health dot (green/yellow/orange/grey), server name + tailnet URL, budget warning,
   Start/Restart, Open client, Add a Mac, Settings, Quit.
 - **First-run wizard:** *Establish a fleet* (`claude setup-token` → paste token → write

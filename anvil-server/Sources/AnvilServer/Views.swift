@@ -159,10 +159,15 @@ struct WizardView: View {
   @State private var pairingCode = ""
   @State private var status = ""
   @State private var checkoutTick = 0
+  @State private var bunOK = Deps.bunInstalled()
+  @State private var tsOK = Deps.tailscaleInstalled
+  @State private var installingBun = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
       Header(symbol: "hammer.fill", title: "Set up Anvil Server", subtitle: "Drive Claude across your Macs")
+
+      dependencyCard
 
       if let w = Auth.apiKeyWarning() {
         Label(w, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
@@ -213,7 +218,7 @@ struct WizardView: View {
       HStack { Spacer(); Button("Close") { stopJoin(); close() } }
     }
     .padding(22)
-    .frame(width: 480, height: 380)
+    .frame(width: 480, height: 460)
   }
 
   private func roleButton(_ title: String, _ symbol: String, prominent: Bool = false, action: @escaping () -> Void) -> some View {
@@ -224,6 +229,41 @@ struct WizardView: View {
       }.frame(maxWidth: .infinity).padding(.vertical, 14)
     }
     .buttonStyle(.bordered).tint(prominent ? .anvil : .secondary)
+  }
+
+  @ViewBuilder private var dependencyCard: some View {
+    Card {
+      Label("Dependencies", systemImage: "shippingbox").font(.callout.weight(.medium))
+      HStack {
+        Label(bunOK ? "Bun installed" : "Bun not installed",
+              systemImage: bunOK ? "checkmark.circle.fill" : "xmark.circle.fill")
+          .font(.caption).foregroundStyle(bunOK ? .green : .red)
+        Spacer()
+        if !bunOK {
+          Button { installBun() } label: {
+            if installingBun { HStack(spacing: 5) { ProgressView().controlSize(.small); Text("Installing…") } }
+            else { Label("Install Bun", systemImage: "arrow.down.circle") }
+          }.controlSize(.small).disabled(installingBun)
+        }
+      }
+      HStack {
+        Label(tsOK ? "Tailscale installed" : "Tailscale not installed",
+              systemImage: tsOK ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+          .font(.caption).foregroundStyle(tsOK ? .green : .orange)
+        Spacer()
+        if !tsOK { Link("Get Tailscale", destination: Deps.tailscaleDownloadURL).font(.caption) }
+      }
+    }
+  }
+
+  private func installBun() {
+    installingBun = true
+    status = "Installing Bun from bun.sh…"
+    Deps.installBun { ok, msg in
+      installingBun = false
+      bunOK = ok
+      status = msg
+    }
   }
 
   private func chooseCheckout() {
