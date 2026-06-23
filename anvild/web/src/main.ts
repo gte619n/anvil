@@ -34,6 +34,7 @@ import type {
   ServerEvent,
   Session,
 } from "../../protocol";
+import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
@@ -195,9 +196,17 @@ function saveConvoCache(): void {
   }, 600);
 }
 
+// Resolve the theme before the first render so JS-computed session tints use the right band.
+(function initTheme() {
+  const stored = localStorage.getItem("anvil.theme");
+  const theme = stored ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  document.documentElement.dataset.theme = theme;
+})();
+
 // instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
 // fully offline; the daemon refreshes everything once the WS connects).
 renderSessions();
+applyActiveTint();
 if (activeId) {
   if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
   const cached = localStorage.getItem(`anvil.convo.${activeId}`);
@@ -216,17 +225,22 @@ function currentTheme(): "light" | "dark" {
 function applyThemeIcon(): void {
   $("#theme-toggle").innerHTML = icon(currentTheme() === "dark" ? "light_mode" : "dark_mode");
 }
-(function initTheme() {
-  const stored = localStorage.getItem("anvil.theme");
-  const theme = stored ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  document.documentElement.dataset.theme = theme;
-})();
-applyThemeIcon();
+applyThemeIcon(); // data-theme is resolved earlier, before the first render
 $("#theme-toggle").addEventListener("click", () => {
   const next = currentTheme() === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   localStorage.setItem("anvil.theme", next);
   applyThemeIcon();
+  renderSessions(); // re-clamp session tints for the new theme
+  applyActiveTint();
+});
+// Follow the OS theme live when the user hasn't pinned a preference.
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  if (localStorage.getItem("anvil.theme")) return; // a manual choice wins
+  document.documentElement.dataset.theme = e.matches ? "dark" : "light";
+  applyThemeIcon();
+  renderSessions();
+  applyActiveTint();
 });
 
 // ── Sidebar collapse ─────────────────────────────────────────────────────────────
@@ -1046,6 +1060,19 @@ function deselectSession(): void {
   setHeaderTitle(undefined);
   renderEmptyState();
   renderSessions();
+  applyActiveTint();
+}
+// Tint the conversation area to the active session's derived background (cleared when none).
+function applyActiveTint(): void {
+  const s = activeId ? sessions.get(activeId) : undefined;
+  const main = document.getElementById("main");
+  if (!main) return;
+  if (s?.environmentId) {
+    const env = environments.get(s.environmentId);
+    main.style.setProperty("--session-active-bg", sessionBg(env, envOrdinal(s, sessions.values()), currentTheme()));
+  } else {
+    main.style.removeProperty("--session-active-bg");
+  }
 }
 function setStatus(status: string): void {
   // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
@@ -1183,6 +1210,14 @@ function renderSessions(): void {
     const awaiting = !removing && !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
     const li = document.createElement("li");
     li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}`;
+    if (s.environmentId && !removing) {
+      const env = environments.get(s.environmentId);
+      const ord = envOrdinal(s, sessions.values());
+      const theme = currentTheme();
+      li.classList.add("tinted");
+      li.style.setProperty("--session-bg", sessionBg(env, ord, theme));
+      li.style.setProperty("--session-stripe", stripeColor(env, ord, theme));
+    }
     const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
     const where = envName ?? s.git?.branch ?? s.source;
     const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
@@ -1219,6 +1254,7 @@ function onEnvironments(list: Environment[]): void {
   for (const e of list) environments.set(e.id, e);
   persistEnvironments();
   renderSessions();
+  applyActiveTint();
   if (document.getElementById("ns-modal")) showNewSession(); // refresh an open new-session modal
   if (document.getElementById("env-cards")) renderEnvCards(); // refresh an open settings view
 }
@@ -1359,7 +1395,7 @@ function renderEnvCards(): void {
       (e) => `<div class="card env-card" data-env="${esc(e.id)}">
       <div class="env-head">
         <div class="env-meta">
-          <b>${esc(e.name)}</b>
+          <b><span class="env-dot" style="background:${stripeColor(e, 0, currentTheme())}"></span>${esc(e.name)}</b>
           <div class="small muted"><code>${esc(e.repoRoot)}</code></div>
           <div class="small muted">${icon("account_tree")} off <code>${esc(e.defaultBase ?? "HEAD")}</code></div>
         </div>
@@ -1415,6 +1451,7 @@ function selectSession(id: string, push = true): void {
   renderSessions();
   const s = sessions.get(id);
   setHeaderTitle(s);
+  applyActiveTint();
   snapshotLoaded.delete(id);
   // Opening a session is acting on it — clear its push reminder on this device immediately (the
   // daemon also clears it everywhere when we attach below). (UI refinement §1)
@@ -2174,6 +2211,33 @@ function createOfflineSession(cmd: Record<string, unknown> & { type: string }, e
   toast("Session queued — will be created when you're back online");
 }
 
+// ── Color swatch picker (environment color) ──────────────────────────────────
+/** A row of the 16 palette swatches plus an "auto" (hashed) option; `selected` pre-selects one. */
+function swatchPickerMarkup(selected?: string): string {
+  const norm = (selected ?? "").toLowerCase();
+  const auto = `<button type="button" class="swatch swatch-auto${norm ? "" : " selected"}" data-hex="" title="Auto — hue from the name">${icon("hide_source")}</button>`;
+  const dots = PALETTE.map(
+    (p) =>
+      `<button type="button" class="swatch${p.hex.toLowerCase() === norm ? " selected" : ""}" data-hex="${p.hex}" title="${p.name}" style="background:${p.hex}"></button>`,
+  ).join("");
+  return `<label>Color<div class="swatch-row" id="swatch-row">${auto}${dots}</div></label>`;
+}
+function wireSwatchPicker(): void {
+  const row = document.getElementById("swatch-row");
+  if (!row) return;
+  row.querySelectorAll<HTMLElement>(".swatch").forEach((b) =>
+    b.addEventListener("click", () => {
+      row.querySelectorAll(".swatch").forEach((x) => x.classList.remove("selected"));
+      b.classList.add("selected");
+    }),
+  );
+}
+/** The picked hex, or "" for auto. */
+function selectedSwatch(): string {
+  const sel = document.querySelector<HTMLElement>("#swatch-row .swatch.selected");
+  return sel?.dataset.hex ?? "";
+}
+
 /** Register a project repo as an environment — clone from a git URL, or pick a local repo. */
 function showAddEnvironment(): void {
   const m = document.createElement("div");
@@ -2183,23 +2247,26 @@ function showAddEnvironment(): void {
     <p class="small muted">Cloned into <code>~/Development/&lt;repo&gt;</code> using this machine's git/SSH credentials. Leave blank to use an existing local repo instead.</p>
     <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
     <label>Default branch (optional)<input id="ae-base" placeholder="e.g. main or dev — leave blank for HEAD" /></label>
+    ${swatchPickerMarkup()}
     <p class="small muted">Or pick an existing local <b>git repository</b>:</p>
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
   showModal(m);
   wireBrowser();
+  wireSwatchPicker();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
   $<HTMLButtonElement>("#ae-save").onclick = async () => {
     const url = $<HTMLInputElement>("#ae-url").value.trim();
     const name = $<HTMLInputElement>("#ae-name").value.trim();
     const defaultBase = $<HTMLInputElement>("#ae-base").value.trim();
+    const color = selectedSwatch();
     if (url) {
       const btn = $<HTMLButtonElement>("#ae-save");
       btn.disabled = true;
       btn.textContent = "Cloning…";
       try {
         const res = await sendAwait(
-          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), cid: newCid() },
+          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), cid: newCid() },
           120_000,
         );
         if (res.type === "command.error") {
@@ -2222,6 +2289,7 @@ function showAddEnvironment(): void {
       name: name || (browse.path.split("/").pop() ?? browse.path),
       repoRoot: browse.path,
       ...(defaultBase ? { defaultBase } : {}),
+      ...(color ? { color } : {}),
     });
     closeModal(); // the environments broadcast refreshes Settings / the new-session list
   };
@@ -2236,12 +2304,14 @@ function showEditEnvironment(id: string): void {
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
+    ${swatchPickerMarkup(env.color)}
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
+  wireSwatchPicker();
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
-    sock.send({ type: "env.update", id, name: $<HTMLInputElement>("#ee-name").value, defaultBase: $<HTMLInputElement>("#ee-base").value });
+    sock.send({ type: "env.update", id, name: $<HTMLInputElement>("#ee-name").value, defaultBase: $<HTMLInputElement>("#ee-base").value, color: selectedSwatch() });
     closeModal();
   };
   $<HTMLButtonElement>("#ee-remove").onclick = async () => {

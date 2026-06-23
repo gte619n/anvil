@@ -109,16 +109,16 @@ export class Supervisor {
   getEnvironment(id: string): Environment | undefined {
     return this.envStore.get(id);
   }
-  addEnvironment(name: string, repoRoot: string, defaultBase?: string): void {
+  addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string): void {
     try {
-      this.envStore.add(name, repoRoot, defaultBase);
+      this.envStore.add(name, repoRoot, defaultBase, color);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     this.registry.toAll(this.environmentsEvent());
   }
   /** Clone a git URL into ~/Development (host git auth) and register it as an environment. */
-  cloneEnvironment(url: string, name?: string, defaultBase?: string): void {
+  cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string): void {
     let dest: string;
     try {
       dest = git.cloneRepo(url).dest;
@@ -126,7 +126,7 @@ export class Supervisor {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     try {
-      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase);
+      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
@@ -183,7 +183,7 @@ export class Supervisor {
     }
     return { missing: true };
   }
-  updateEnvironment(id: string, fields: { name?: string; defaultBase?: string }): void {
+  updateEnvironment(id: string, fields: { name?: string; defaultBase?: string; color?: string }): void {
     this.envStore.update(id, fields);
     this.registry.toAll(this.environmentsEvent());
   }
