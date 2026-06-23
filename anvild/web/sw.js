@@ -53,6 +53,12 @@ self.addEventListener("push", (event) => {
   }
   event.waitUntil(
     (async () => {
+      // A "clear" push is a silent dismissal (you viewed/answered the session on another device):
+      // close the matching notification instead of showing one.
+      if (data.kind === "clear") {
+        await closeSessionNotifications(data.sessionId || data.tag);
+        return;
+      }
       const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       if (wins.some((c) => c.focused)) return;
       // title = which session; body = what it's asking, prefixed with the dir for context. Key the
@@ -67,6 +73,22 @@ self.addEventListener("push", (event) => {
       });
     })(),
   );
+});
+
+/** Close any open notification for a session (by tag or matching data.sessionId). */
+async function closeSessionNotifications(sessionId) {
+  if (!sessionId) return;
+  const notes = await self.registration.getNotifications();
+  for (const n of notes) {
+    if (n.tag === sessionId || (n.data && n.data.sessionId === sessionId)) n.close();
+  }
+}
+
+// The app tells us when it opens a session so we can clear its reminder immediately (faster than,
+// and a backstop to, the daemon's "clear" push) — opening the session is acting on it.
+self.addEventListener("message", (event) => {
+  const m = event.data;
+  if (m && m.type === "close-notifications") event.waitUntil(closeSessionNotifications(m.sessionId));
 });
 
 self.addEventListener("notificationclick", (event) => {

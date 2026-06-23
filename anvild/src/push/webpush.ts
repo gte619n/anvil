@@ -14,9 +14,10 @@ export interface PushPayload {
   /**
    * "permission" pushes carry an actionable request the client can resolve in-place (Allow/Deny);
    * "question" pushes mean Claude is asking a multiple-choice question — tap to open and answer
-   * (no shade actions, since options can't be buttons); "result" means the turn finished.
+   * (no shade actions, since options can't be buttons); "result" means the turn finished;
+   * "clear" is a silent dismissal — close the session's existing notification, don't show one.
    */
-  kind?: "permission" | "question" | "result";
+  kind?: "permission" | "question" | "result" | "clear";
   /** Permission request id — lets a native client answer Allow/Deny from the notification. */
   requestId?: string;
   /** The tool awaiting approval (for the notification body / labels). */

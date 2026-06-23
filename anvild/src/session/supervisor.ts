@@ -70,6 +70,9 @@ export class Supervisor {
   private readonly questionBroker = new QuestionBroker();
   /** Sessions whose awaiting_permission state has been announced to the whole fleet (list badge). */
   private readonly awaitingAnnounced = new Set<string>();
+  /** Sessions with an outstanding "your turn" push out on devices — so we can send a matching
+   *  "clear" push to dismiss it everywhere once the session is viewed/answered (UI refinement §1). */
+  private readonly notified = new Set<string>();
   private readonly renderer: MarkdownRenderer;
   private readonly agentEnv = buildAgentEnv();
   private readonly rateLimits: RateLimitTracker;
@@ -519,6 +522,7 @@ export class Supervisor {
     }
     const s = sessionId ? this.sessions.get(sessionId) : undefined;
     s?.clearPermission(requestId); // stop re-surfacing it on reattach
+    if (sessionId) this.clearNotifications(sessionId); // answered → dismiss the reminder everywhere
     s?.setStatus(decision === "deny" ? "thinking" : "running_tool");
   }
 
@@ -530,7 +534,24 @@ export class Supervisor {
     }
     const s = sessionId ? this.sessions.get(sessionId) : undefined;
     s?.clearQuestion(requestId); // stop re-surfacing it on reattach
+    if (sessionId) this.clearNotifications(sessionId); // answered → dismiss the reminder everywhere
     s?.setStatus("running_tool"); // the AskUserQuestion tool completes → the turn continues
+  }
+
+  /** A client opened/attached to a session — that's the user acting on it, so dismiss any parked
+   *  "your turn" reminder on every device (the notified one and the rest). (UI refinement §1) */
+  viewed(id: string): void {
+    if (this.sessions.has(id)) this.clearNotifications(id);
+  }
+
+  /** Send a "clear" push (web + native) that dismisses the session's outstanding reminder on every
+   *  device. No-op unless we actually pushed something for this session. */
+  private clearNotifications(sessionId: string): void {
+    if (!this.notified.delete(sessionId)) return;
+    const data = this.sessions.get(sessionId)?.data;
+    const payload: PushPayload = { title: data?.title ?? "Anvil", body: "", sessionId, tag: sessionId, kind: "clear" };
+    void this.webpush.notify(payload);
+    void this.fcm.notify(payload);
   }
 
   setModel(id: string, model: Model): void {
@@ -549,23 +570,42 @@ export class Supervisor {
     this.broadcastUpdated(s.data);
   }
 
+  /**
+   * Remove a session (UI refinement §8). The fleet's view is updated FIRST — drop it from the
+   * registry, persist, and broadcast `session.deleted` immediately — then the slow, best-effort
+   * teardown (interrupt the agent, delete the remote/local branch, remove the worktree + state)
+   * runs in the background. Doing the network/git work up front (it shells out synchronously and a
+   * `git push --delete` can hang) was what made cleanup "act like it's removing but never update"
+   * — and a throw mid-teardown would leave the session resurrectable on the next `session.list`.
+   * Now nothing the teardown does can bring the session back; failures are logged, not fatal.
+   */
   async kill(id: string): Promise<void> {
     const s = this.require(id);
     s.dispose(); // stop accepting events first, so a late-draining turn can't write to a removed dir
-    await this.drivers.get(id)?.stop(); // interrupt the agent SDK query + close its input
-    this.drivers.delete(id);
-    this.clearWatchers(id);
-    this.killTerminal(id);
-    await s.stop(); // reap any attached process group (PTY in Phase 3)
-    if (s.data.source === "fresh-worktree" && s.data.worktree) {
-      git.deleteRemoteBranch(s.data.cwd, s.data.worktree.branch); // best-effort, before the worktree goes
-      removeWorktree(s.data.worktree.repoRoot, s.data.cwd, s.data.worktree.branch);
-    }
-    rmSync(this.store.sessionDir(id), { recursive: true, force: true });
+    this.clearNotifications(id); // dismiss any lingering "your turn" reminder for the gone session
     this.sessions.delete(id);
     this.logs.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
+    void this.teardownSession(id, s);
+  }
+
+  /** Best-effort background reap of a killed session's agent, terminal, worktree, branch + state. */
+  private async teardownSession(id: string, s: Session): Promise<void> {
+    try {
+      await this.drivers.get(id)?.stop(); // interrupt the agent SDK query + close its input
+      this.drivers.delete(id);
+      this.clearWatchers(id);
+      this.killTerminal(id);
+      await s.stop(); // reap any attached process group (PTY in Phase 3)
+      if (s.data.source === "fresh-worktree" && s.data.worktree) {
+        git.deleteRemoteBranch(s.data.cwd, s.data.worktree.branch); // best-effort, before the worktree goes
+        removeWorktree(s.data.worktree.repoRoot, s.data.cwd, s.data.worktree.branch);
+      }
+      rmSync(this.store.sessionDir(id), { recursive: true, force: true });
+    } catch (e) {
+      console.error(`[kill ${id}] background cleanup failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /**
@@ -658,15 +698,20 @@ export class Supervisor {
     let payload: PushPayload | undefined;
     if (event.type === "permission.request") {
       const ask = summarizeRequest(event.tool, event.input);
-      payload = { title, body: ask, dir, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool, ask };
+      payload = { title, body: `Needs your approval — ${ask}`, dir, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool, ask };
     } else if (event.type === "question.request") {
-      const first = event.questions[0]?.question ?? "Claude has a question";
-      const ask = event.questions.length > 1 ? `${first} (+${event.questions.length - 1} more)` : first;
-      payload = { title, body: ask, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
+      const q0 = event.questions[0];
+      const first = q0?.question ?? "Claude has a question";
+      const opts = (q0?.options ?? []).slice(0, 3).map((o) => o.label).filter(Boolean).join(" · ");
+      const more = event.questions.length > 1 ? ` (+${event.questions.length - 1} more)` : "";
+      payload = { title, body: `${first}${more}${opts ? `\n${opts}` : ""}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
-      payload = { title, body: "Finished — your turn.", dir, sessionId, tag: `done-${sessionId}`, kind: "result" };
+      // Quote what Claude actually said so the reminder carries real context, not just "Finished".
+      const snippet = oneLine(this.sessions.get(sessionId)?.lastAssistantText ?? "", 160);
+      payload = { title, body: snippet || "Finished — your turn.", dir, sessionId, tag: `done-${sessionId}`, kind: "result" };
     }
     if (payload) {
+      this.notified.add(sessionId); // remember so a later view/answer can dismiss it everywhere
       void this.webpush.notify(payload); // desktop browsers
       void this.fcm.notify(payload); // Android client
     }
@@ -784,13 +829,14 @@ function deriveTitle(cwd: string): string {
  * One-line, human summary of what a tool wants approval for, so the reminder says *what* it's
  * asking — "Run: git push origin main", "Edit Foo.kt" — not just the bare tool name.
  */
+/** Collapse whitespace and clip to `n` chars with an ellipsis — for one-line notification bodies. */
+function oneLine(s: string, n = 120): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
 function summarizeRequest(tool: string, input: unknown): string {
   const obj = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
   const str = (k: string): string | undefined => (typeof obj[k] === "string" ? (obj[k] as string) : undefined);
-  const oneLine = (s: string, n = 120): string => {
-    const t = s.replace(/\s+/g, " ").trim();
-    return t.length > n ? `${t.slice(0, n - 1)}…` : t;
-  };
   switch (tool) {
     case "Bash": {
       const cmd = str("command");

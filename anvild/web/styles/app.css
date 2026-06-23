@@ -166,6 +166,10 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .git-output a { color: var(--accent); }
 .session.archived { opacity: 0.55; }
 .session.pending .title .msym { color: var(--warn); }
+/* A session being cleaned up: disabled + greyed until the daemon confirms deletion (§8). */
+.session.removing { opacity: 0.5; pointer-events: none; }
+.session.removing .meta { font-style: italic; }
+.session.removing .title .msym { animation: think-pulse 1.6s infinite ease-in-out; }
 
 /* "Waiting on permission" — a hard-to-miss pulsing amber rail + chip so it stands out in the list */
 .session.awaiting { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 9%, transparent); animation: perm-pulse 1.8s ease-in-out infinite; }
@@ -198,6 +202,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .thinking .dots i:nth-child(2) { animation-delay: 0.18s; }
 .thinking .dots i:nth-child(3) { animation-delay: 0.36s; }
 .thinking .think-label { animation: think-pulse 1.6s infinite ease-in-out; }
+/* "Thinking canceled" marker dropped in when the user hits Stop (§stop). */
+.turn-canceled { display: flex; align-items: center; gap: 6px; align-self: flex-start; color: var(--muted); font-size: 13px; font-style: italic; padding: 2px 0; }
+.turn-canceled .msym { font-size: 16px; }
 @keyframes think { 0%, 80%, 100% { opacity: 0.3; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
 @keyframes think-pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
 .bubble { max-width: min(760px, 100%); min-width: 0; align-self: flex-start; overflow-wrap: anywhere; }
@@ -245,6 +252,10 @@ details.tool-result.error > summary { color: var(--danger); }
 .q-option { display: flex; align-items: flex-start; gap: 9px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); cursor: pointer; }
 .q-option:hover { background: var(--panel); }
 .q-option input { margin-top: 2px; accent-color: var(--accent); }
+/* Clickable option (single-tap to answer, like Claude Code natively): a full-width button. */
+.q-option.clickable { width: 100%; text-align: left; color: inherit; font: inherit; transition: background 0.12s, border-color 0.12s; }
+.q-option.clickable:hover { border-color: var(--accent); }
+.q-option.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .q-opt-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .q-opt-desc { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
 .q-other { margin-top: 8px; width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
@@ -284,6 +295,11 @@ details.tool-result.error > summary { color: var(--danger); }
 #send:not(:disabled):hover { transform: scale(1.06); }
 #send:not(:disabled):active { transform: scale(0.95); }
 #send:disabled { background: var(--border); color: var(--muted); cursor: default; box-shadow: none; }
+/* Stop button: replaces Send while a turn runs (§stop) — a clear "interrupt" affordance. */
+#stop { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--danger); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0,0,0,0.25); transition: transform 0.1s; }
+#stop:hover { transform: scale(1.06); }
+#stop:active { transform: scale(0.95); }
+#stop .msym { font-size: 22px; }
 
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 1000; }
 .modal-box { background: var(--bg); padding: 20px; border-radius: 12px; min-width: 360px; max-width: 560px; }
@@ -369,9 +385,9 @@ details.tool-result.error > summary { color: var(--danger); }
 .ref-copy { border: none; border-left: 1px solid var(--border); background: none; color: var(--muted); cursor: pointer; padding: 8px 9px; display: inline-flex; flex-shrink: 0; }
 .ref-copy:hover { color: var(--accent); background: var(--panel); }
 .ref-copy .msym { font-size: 15px; }
-/* Count badge on the header Links button (links arrived while the panel is closed) */
+/* Subtle dot on the header Links button when answers have surfaced links (no counter — §2) */
 #btn-links.has-links { position: relative; }
-#btn-links.has-links::after { content: attr(data-count); position: absolute; top: -6px; right: -6px; background: var(--accent); color: #fff; font-size: 9px; font-weight: 700; line-height: 14px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; text-align: center; }
+#btn-links.has-links::after { content: ""; position: absolute; top: -2px; right: -2px; width: 8px; height: 8px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 0 2px var(--panel); }
 
 /* File-offer card — a deliverable file presented as an attachment "from the model" */
 .bubble.file-offer { align-self: flex-start; max-width: min(420px, 100%); }

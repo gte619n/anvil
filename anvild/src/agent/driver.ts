@@ -161,6 +161,16 @@ export class AgentDriver {
         if (sid) this.session.data.claudeSessionId = sid;
 
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
+        // Stash the assistant's prose so a "your turn" push can quote it (real context, not a
+        // generic "Finished"). Cheap: read text blocks straight off the SDK message.
+        if (m.type === "assistant") {
+          const text = ((m as any).message?.content ?? [])
+            .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+            .map((b: any) => b.text as string)
+            .join(" ")
+            .trim();
+          if (text) this.session.lastAssistantText = text;
+        }
         const bodies = mapMessage(m, this.renderer);
         let sawToolUse = false;
         let sawToolResult = false;

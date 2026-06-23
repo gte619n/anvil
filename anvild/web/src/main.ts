@@ -65,6 +65,9 @@ conversation.addEventListener("scroll", () => {
 // ── State ────────────────────────────────────────────────────────────────────
 const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
+// Sessions being cleaned up: shown disabled in the sidebar until the daemon confirms deletion
+// (session.deleted). Transient — not persisted. (UI refinement §8)
+const removingSessions = new Set<string>();
 
 // Offline cache (arch §8): persist the session + environment lists so they're browsable with no
 // connection. Hydrated synchronously below, kept in sync on every change.
@@ -136,7 +139,11 @@ function setSessionHash(id: string | null, push: boolean): void {
   if (push) history.pushState(state, "", url);
   else history.replaceState(state, "", url);
 }
-let activeId: string | null = sessionFromHash() || new URLSearchParams(location.search).get("session") || localStorage.getItem("anvil.active");
+// A session in the URL (#s/… or ?session=) means we were opened via a deep link or a notification
+// tap — as opposed to just restoring the last-active session from storage. On a phone we then jump
+// straight into that conversation with the sidebar hidden (see the collapse below). (UI refinement §4)
+const deepLinkedSession = sessionFromHash() || new URLSearchParams(location.search).get("session");
+let activeId: string | null = deepLinkedSession || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
 window.addEventListener("popstate", () => {
   if (suppressPop > 0) {
@@ -156,6 +163,9 @@ window.addEventListener("popstate", () => {
   }
 });
 let streaming: HTMLElement | null = null;
+// Set when the user hits Stop: the daemon keeps draining the interrupted turn for a moment, so we
+// suppress that trailing churn (see the guard in handleSessionEvent). Cleared on the next turn.
+let turnCanceled = false;
 const snapshotLoaded = new Set<string>(); // sessions with a full snapshot loaded this page-load
 
 const seqStore = {
@@ -224,6 +234,9 @@ const isNarrow = (): boolean => matchMedia("(max-width: 720px)").matches;
 let sidebarCollapsed =
   localStorage.getItem("anvil.sidebar") === "collapsed" ||
   (localStorage.getItem("anvil.sidebar") === null && isNarrow());
+// Opened via a deep link / notification on a phone: jump straight into the conversation with the
+// session menu hidden, even if the sidebar was last left open. (UI refinement §4)
+if (deepLinkedSession && activeId && isNarrow()) sidebarCollapsed = true;
 function applySidebar(): void {
   $("#sidebar").classList.toggle("collapsed", sidebarCollapsed);
 }
@@ -468,6 +481,9 @@ function onEvent(e: ServerEvent): void {
       // server is now the source of truth — drop optimistic/pending locals it doesn't know about
       for (const id of [...sessions.keys()]) if (!sessions.get(id)?.pending) sessions.delete(id);
       e.sessions.forEach((s) => sessions.set(s.id, s));
+      // A removing session the server still lists is mid-teardown — keep it (shown disabled); one
+      // it no longer lists is gone, so forget the removing flag.
+      for (const id of [...removingSessions]) if (!sessions.has(id)) removingSessions.delete(id);
       persistSessions();
       renderSessions();
       if (activeId && sessions.has(activeId)) {
@@ -499,6 +515,7 @@ function onEvent(e: ServerEvent): void {
       return;
     case "session.deleted":
       sessions.delete(e.sessionId);
+      removingSessions.delete(e.sessionId); // cleanup finished — the row goes for good now
       localStorage.removeItem(`anvil.convo.${e.sessionId}`);
       persistSessions();
       if (activeId === e.sessionId) deselectSession();
@@ -534,10 +551,28 @@ function onEvent(e: ServerEvent): void {
 }
 
 function handleSessionEvent(e: ServerEvent): void {
+  // A turn the user cancelled (Stop): drop the in-flight churn the daemon is still draining
+  // (deltas, tool results, a partial assistant message, "working" statuses) so the conversation
+  // stays at the cancel point. The guard lifts when the turn truly ends or a new one begins.
+  if (turnCanceled) {
+    if (e.type === "result" || (e.type === "status" && e.status === "idle") || e.type === "message.user") {
+      turnCanceled = false; // fall through and handle normally
+    } else if (
+      e.type === "assistant.delta" ||
+      e.type === "assistant.message" ||
+      e.type === "tool.result" ||
+      e.type === "file.offer" ||
+      e.type === "status"
+    ) {
+      return;
+    }
+  }
   switch (e.type) {
     case "conversation.snapshot":
       clearConversation();
+      replayingSnapshot = true;
       e.events.forEach(renderConversationEvent);
+      replayingSnapshot = false;
       snapshotLoaded.add(e.sessionId);
       saveConvoCache();
       return;
@@ -563,6 +598,7 @@ function handleSessionEvent(e: ServerEvent): void {
       setStatus("idle");
       streaming = null;
       finalizeActivity(); // stop the activity spinner now the turn is done
+      commitAnswerRefs(); // promote the final answer's links into the Links panel
       saveConvoCache();
       if (panelView === "git" && e.sessionId === activeId) requestGitStatus(); // refresh the SCM buttons
       return;
@@ -627,6 +663,8 @@ function timeEl(ts?: string): HTMLElement | null {
 
 function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string): void {
   resetActivity(); // a new user turn closes off the previous turn's activity block
+  turnCanceled = false; // a fresh user turn starts clean
+  pendingAnswerRefs = []; // don't carry a prior turn's un-committed links across
   const b = bubble("user");
   const md = document.createElement("div");
   md.className = "md";
@@ -642,7 +680,7 @@ function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string
   }
   const t = timeEl(ts);
   if (t) b.appendChild(t);
-  collectReferences(html); // surface any links/addresses the user pasted
+  // Note: we deliberately do NOT collect links from the user's own prompt — only from Claude's answers.
   scrollDown();
   saveConvoCache();
 }
@@ -650,6 +688,8 @@ function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string
  *  when the outbox flushes and the session re-snapshots. */
 function appendOptimisticUser(text: string): void {
   resetActivity();
+  turnCanceled = false;
+  pendingAnswerRefs = [];
   const b = bubble("user");
   b.classList.add("queued");
   const md = document.createElement("div");
@@ -732,7 +772,7 @@ function commitAssistant(blocks: ContentBlock[], ts?: string): void {
     const t = timeEl(ts);
     if (t) b.appendChild(t);
     addCopyButtons(md);
-    collectReferences(md.innerHTML);
+    noteAnswerRefs(md.innerHTML); // buffered; only the final answer's links reach the panel (on result)
     void runMermaid(md);
   } else if (streaming) {
     // A tool-only turn: drop the empty streaming draft bubble so it isn't left blank.
@@ -846,11 +886,15 @@ function appendToolResult(content: string, isError: boolean): void {
 }
 
 // ── Links panel (§links) ────────────────────────────────────────────────────────
-// As links and addresses (running servers, URLs) stream by, collect them so they're reachable
-// from the side panel's "Links" tab without scrolling the conversation back. A count badge on
-// the header Links button surfaces new references while the panel is closed.
+// Surface only the links/addresses that appear in Claude's ANSWERS — the URLs and server
+// addresses it hands you — not the noise from your pasted prompts or the transitional tool/
+// thinking churn mid-turn. References are buffered from each assistant message (`pendingAnswerRefs`)
+// and only committed to the panel when the turn ends. The header Links button shows a subtle dot
+// (no count) while the panel is closed.
 const references = new Map<string, string>(); // url → display label, insertion-ordered
 const REF_LIMIT = 50;
+// Links seen in the latest assistant prose this turn; promoted into `references` on `result`.
+let pendingAnswerRefs: string[] = [];
 
 /** Pull http(s) URLs and bare host:port addresses out of a chunk of (rendered) text/HTML. */
 function extractRefs(text: string): string[] {
@@ -863,13 +907,29 @@ function extractRefs(text: string): string[] {
   }
   return out;
 }
-function collectReferences(text: string): void {
+/** True while a full-history snapshot is replaying: assistant links are added straight away (all of
+ *  Claude's past answers are relevant), rather than buffered for a turn-end `result` that won't come. */
+let replayingSnapshot = false;
+/** Note the links in one assistant message. Live: buffer them as "this turn's answer" so an earlier
+ *  message's links are superseded by the final answer's (only it reaches the panel, on `result`).
+ *  Replay: add immediately, since each is a finished historical answer. */
+function noteAnswerRefs(text: string): void {
+  if (replayingSnapshot) addRefs(extractRefs(text));
+  else pendingAnswerRefs = extractRefs(text);
+}
+/** Turn ended: promote the final answer's buffered links into the panel. */
+function commitAnswerRefs(): void {
+  const urls = pendingAnswerRefs;
+  pendingAnswerRefs = [];
+  addRefs(urls);
+}
+/** Add `urls` to the reference set (deduped, capped) and refresh the panel/badge if anything's new. */
+function addRefs(urls: string[]): void {
   let added = false;
-  for (const url of extractRefs(text)) {
+  for (const url of urls) {
     if (references.has(url)) continue;
     references.set(url, url.replace(/^https?:\/\//, ""));
     added = true;
-    // keep only the most recent REF_LIMIT
     if (references.size > REF_LIMIT) references.delete(references.keys().next().value as string);
   }
   if (added) {
@@ -879,16 +939,16 @@ function collectReferences(text: string): void {
 }
 function clearReferences(): void {
   references.clear();
+  pendingAnswerRefs = [];
   updateLinksBadge();
   if (panelView === "links") renderLinks();
 }
-/** Reflect the reference count on the header Links button (visible while the panel is closed). */
+/** Reflect on the header Links button whether there are any links (a subtle dot, no count). */
 function updateLinksBadge(): void {
   const btn = document.getElementById("btn-links");
   if (!btn) return;
   const n = references.size;
   btn.classList.toggle("has-links", n > 0);
-  btn.dataset.count = n > 99 ? "99+" : String(n);
   btn.title = n > 0 ? `Links (${n})` : "Links";
 }
 function renderLinks(): void {
@@ -962,10 +1022,12 @@ function clearConversation(): void {
   conversation.innerHTML = "";
   streaming = null;
   thinkingEl = null; // detached by the innerHTML reset
+  turnCanceled = false;
   resetActivity(); // detached by the reset
   clearReferences();
   permCards.clear(); // cards are detached by the reset; the re-surfaced request re-adds them
   questionCards.clear();
+  updateComposerMode("idle"); // a freshly cleared pane shows Send, not a stale Stop
 }
 function renderEmptyState(): void {
   streaming = null;
@@ -993,12 +1055,48 @@ function setStatus(status: string): void {
   const awaiting = status === "awaiting_permission" || status === "awaiting_question";
   if (status === "idle" || awaiting) hideThinking(); // the card is the indicator while parked
   else if (!streaming) showThinking(status); // while text streams, the text is the activity
+  updateComposerMode(status); // swap Send ↔ Stop while a turn runs
   const s = activeId ? sessions.get(activeId) : undefined;
   if (s) {
     s.status = status as Session["status"];
     renderSessions();
   }
 }
+
+// ── Stop the running turn (§stop) ────────────────────────────────────────────────
+const stopBtn = $<HTMLButtonElement>("#stop");
+/** While a turn is actively running, the Send button becomes a Stop button (like Claude Code). */
+function updateComposerMode(status: string): void {
+  const busy = status === "thinking" || status === "running_tool";
+  stopBtn.hidden = !busy;
+  $<HTMLButtonElement>("#send").hidden = busy;
+}
+/** Stop button: interrupt the turn, drop the in-flight thinking/activity, and mark it cancelled —
+ *  jumping back to the last prompt with a "Thinking canceled" notice (UI refinement §stop). */
+function cancelThinking(): void {
+  if (!activeId) return;
+  sock.send({ type: "interrupt", sessionId: activeId });
+  turnCanceled = true; // suppress the trailing churn the daemon is still draining
+  if (streamRaf) {
+    cancelAnimationFrame(streamRaf);
+    streamRaf = 0;
+  }
+  streaming?.remove(); // drop the partial streaming answer
+  streaming = null;
+  streamText = "";
+  if (activityEl && activityLive) activityEl.remove(); // remove the in-flight activity block
+  resetActivity();
+  hideThinking();
+  pendingAnswerRefs = [];
+  const note = document.createElement("div");
+  note.className = "turn-canceled";
+  note.innerHTML = `${icon("cancel")} Thinking canceled`;
+  conversation.appendChild(note);
+  setStatus("idle"); // also hides the spinner and restores the Send button
+  scrollDown(true);
+  saveConvoCache();
+}
+stopBtn.addEventListener("click", cancelThinking);
 
 // ── Copy-to-clipboard ─────────────────────────────────────────────────────────────
 /** Copy `text` to the clipboard (with a legacy fallback for non-secure contexts). */
@@ -1081,31 +1179,35 @@ function renderSessions(): void {
   ul.innerHTML = "";
   const items = [...sessions.values()].sort((a, b) => Number(!!a.archived) - Number(!!b.archived));
   for (const s of items) {
-    const awaiting = !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
+    const removing = removingSessions.has(s.id);
+    const awaiting = !removing && !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
     const li = document.createElement("li");
-    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}`;
+    li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}`;
     const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
     const where = envName ?? s.git?.branch ?? s.source;
-    const tag = s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
+    const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
     const a = document.createElement("a");
     a.className = "srow";
     a.href = sessionHref(s.id);
-    a.innerHTML = `<div class="title">${icon(sessIcon(s))}<span class="t">${esc(s.title)}</span></div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
+    a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span></div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
     a.addEventListener("click", (e) => {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
       e.preventDefault();
-      selectSession(s.id);
+      if (!removing) selectSession(s.id); // a session being cleaned up isn't selectable
     });
-    const open = document.createElement("button");
-    open.className = "open-tab";
-    open.title = "Open in new tab";
-    open.innerHTML = icon("open_in_new");
-    open.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      window.open(sessionHref(s.id), "_blank");
-    });
-    li.append(a, open);
+    li.append(a);
+    if (!removing) {
+      const open = document.createElement("button");
+      open.className = "open-tab";
+      open.title = "Open in new tab";
+      open.innerHTML = icon("open_in_new");
+      open.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        window.open(sessionHref(s.id), "_blank");
+      });
+      li.append(open);
+    }
     ul.appendChild(li);
   }
 }
@@ -1314,6 +1416,9 @@ function selectSession(id: string, push = true): void {
   const s = sessions.get(id);
   setHeaderTitle(s);
   snapshotLoaded.delete(id);
+  // Opening a session is acting on it — clear its push reminder on this device immediately (the
+  // daemon also clears it everywhere when we attach below). (UI refinement §1)
+  navigator.serviceWorker?.controller?.postMessage({ type: "close-notifications", sessionId: id });
   sock.send({ type: "session.attach", sessionId: id }); // full snapshot (always show history)
   if (isNarrow() && !sidebarCollapsed) {
     sidebarCollapsed = true;
@@ -1807,19 +1912,24 @@ async function abandonSession(): Promise<void> {
   });
   if (ok) killSession(id);
 }
-/** Kill a session and tidy the UI immediately (the session.deleted broadcast also arrives). */
+/** Kill a session: disable it immediately and drop its conversation, while the daemon tears the
+ *  worktree/branch down in the background. The row stays (greyed, "cleaning up…") until the
+ *  daemon's session.deleted broadcast removes it for good — so cleanup never looks like it hung,
+ *  and a failed/slow teardown can't leave a half-removed session behind. (UI refinement §8) */
 function killSession(id: string): void {
+  removingSessions.add(id);
   sock.send({ type: "session.kill", sessionId: id });
-  // Optimistically drop it locally so the list/pane update instantly — the server's kill does
-  // network work (delete remote branch, remove worktree) before it broadcasts session.deleted,
-  // and waiting on that round-trip is what made cleanup look like it hung. The later broadcast
-  // is idempotent; a failed kill is reconciled by the next session.list.
-  sessions.delete(id);
   localStorage.removeItem(`anvil.convo.${id}`);
-  persistSessions();
   if (panelView) closePanel();
-  if (activeId === id) deselectSession(); // also re-renders the list + empty state
-  else renderSessions();
+  if (activeId === id) {
+    // Drop the conversation now, but keep the (disabled) sidebar entry until it's actually gone.
+    activeId = null;
+    localStorage.removeItem("anvil.active");
+    setSessionHash(null, false);
+    setHeaderTitle(undefined);
+    renderEmptyState();
+  }
+  renderSessions();
 }
 /** Cleanup found outstanding work — offer to handle it first, or remove anyway. */
 function showOutstandingDialog(outstanding: string[]): void {
@@ -2217,9 +2327,11 @@ function clearPermissionCards(): void {
 
 // ── Question cards (AskUserQuestion, §6.6) ───────────────────────────────────────
 // Inline like permission cards (survive session/app switches; keyed by requestId so a
-// re-surfaced request on cold attach doesn't stack duplicates). Each question renders its
-// options as radios (single-select) or checkboxes (multiSelect) plus an optional "Other" field;
-// one Submit answers all of them.
+// re-surfaced request on cold attach doesn't stack duplicates). Options are CLICKABLE buttons,
+// like Claude Code natively: for a lone single-select question, one tap on an option submits it
+// outright (no separate Submit step). Multi-select questions toggle their buttons and a Submit
+// answers them; multiple questions select per-block, then Submit answers all. Each block keeps an
+// "Other" free-text field (the SDK always offers one).
 const questionCards = new Map<string, HTMLElement>();
 
 function showQuestion(requestId: string, questions: Question[]): void {
@@ -2234,42 +2346,12 @@ function showQuestion(requestId: string, questions: Question[]): void {
   head.innerHTML = `${icon("help")}<span>Claude is asking…</span>`;
   card.appendChild(head);
 
-  for (const [qi, q] of questions.entries()) {
-    const block = document.createElement("div");
-    block.className = "q-block";
-    block.innerHTML =
-      `<div class="q-title">${q.header ? `<span class="q-chip">${esc(q.header)}</span>` : ""}<span>${esc(q.question)}</span></div>`;
-    const opts = document.createElement("div");
-    opts.className = "q-options";
-    const inputType = q.multiSelect ? "checkbox" : "radio";
-    for (const [oi, o] of q.options.entries()) {
-      const id = `q${requestId}-${qi}-${oi}`;
-      const row = document.createElement("label");
-      row.className = "q-option";
-      row.htmlFor = id;
-      row.innerHTML =
-        `<input type="${inputType}" id="${id}" name="q${requestId}-${qi}" value="${esc(o.label)}">` +
-        `<span class="q-opt-text"><b>${esc(o.label)}</b>${o.description ? `<span class="q-opt-desc">${esc(o.description)}</span>` : ""}</span>`;
-      opts.appendChild(row);
-    }
-    // "Other" free-text affordance (the SDK always offers one).
-    const other = document.createElement("input");
-    other.type = "text";
-    other.className = "q-other";
-    other.placeholder = "Other… (type a custom answer)";
-    other.dataset.qi = String(qi);
-    block.appendChild(opts);
-    block.appendChild(other);
-    card.appendChild(block);
-  }
+  // One tap answers when there's a single single-select question (the common "interview me" case).
+  const oneTap = questions.length === 1 && !questions[0]!.multiSelect;
+  const chosen: string[][] = questions.map(() => []); // button selections, per question
 
-  const btns = document.createElement("div");
-  btns.className = "q-btns";
-  const submit = document.createElement("button");
-  submit.className = "q-btn submit";
-  submit.textContent = questions.length > 1 ? "Submit answers" : "Submit";
-  submit.onclick = () => {
-    const answers = collectAnswers(card, questions);
+  const send = (): void => {
+    const answers = gatherAnswers(card, questions, chosen);
     if (!answers) {
       toast("Pick or type an answer for each question.");
       return;
@@ -2277,6 +2359,56 @@ function showQuestion(requestId: string, questions: Question[]): void {
     sock.send({ type: "question.respond", requestId, answers });
     resolveQuestionUI(requestId, summarizeAnswers(answers));
   };
+
+  for (const [qi, q] of questions.entries()) {
+    const block = document.createElement("div");
+    block.className = "q-block";
+    block.innerHTML =
+      `<div class="q-title">${q.header ? `<span class="q-chip">${esc(q.header)}</span>` : ""}<span>${esc(q.question)}</span></div>`;
+    const opts = document.createElement("div");
+    opts.className = "q-options";
+    for (const o of q.options) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "q-option clickable";
+      btn.innerHTML = `<span class="q-opt-text"><b>${esc(o.label)}</b>${o.description ? `<span class="q-opt-desc">${esc(o.description)}</span>` : ""}</span>`;
+      btn.onclick = () => {
+        if (oneTap) {
+          chosen[qi] = [o.label];
+          send(); // one tap → answer immediately
+        } else if (q.multiSelect) {
+          const set = new Set(chosen[qi]);
+          set.has(o.label) ? set.delete(o.label) : set.add(o.label);
+          chosen[qi] = [...set];
+          btn.classList.toggle("selected");
+        } else {
+          chosen[qi] = [o.label];
+          opts.querySelectorAll(".q-option").forEach((el) => el.classList.remove("selected"));
+          btn.classList.add("selected");
+        }
+      };
+      opts.appendChild(btn);
+    }
+    // "Other" free-text affordance — Enter submits it when this is the one-tap case.
+    const other = document.createElement("input");
+    other.type = "text";
+    other.className = "q-other";
+    other.placeholder = "Other… (type a custom answer)";
+    if (oneTap) {
+      other.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          if (other.value.trim()) send();
+        }
+      });
+    }
+    block.appendChild(opts);
+    block.appendChild(other);
+    card.appendChild(block);
+  }
+
+  const btns = document.createElement("div");
+  btns.className = "q-btns";
   const skip = document.createElement("button");
   skip.className = "q-btn skip";
   skip.textContent = "Skip";
@@ -2285,7 +2417,13 @@ function showQuestion(requestId: string, questions: Question[]): void {
     resolveQuestionUI(requestId, "Skipped");
   };
   btns.appendChild(skip);
-  btns.appendChild(submit);
+  if (!oneTap) {
+    const submit = document.createElement("button");
+    submit.className = "q-btn submit";
+    submit.textContent = questions.length > 1 ? "Submit answers" : "Submit";
+    submit.onclick = send;
+    btns.appendChild(submit);
+  }
   card.appendChild(btns);
 
   questionCards.set(requestId, card);
@@ -2293,15 +2431,13 @@ function showQuestion(requestId: string, questions: Question[]): void {
   scrollDown();
 }
 
-/** Gather one answer per question; returns null if any question is left unanswered. */
-function collectAnswers(card: HTMLElement, questions: Question[]): QuestionAnswer[] | null {
+/** Gather one answer per question from the clicked options + any "Other" text; null if any is empty. */
+function gatherAnswers(card: HTMLElement, questions: Question[], chosen: string[][]): QuestionAnswer[] | null {
   const answers: QuestionAnswer[] = [];
   const blocks = card.querySelectorAll<HTMLElement>(".q-block");
   for (const [qi, q] of questions.entries()) {
-    const block = blocks[qi];
-    if (!block) return null;
-    const labels = [...block.querySelectorAll<HTMLInputElement>("input[type=radio]:checked, input[type=checkbox]:checked")].map((i) => i.value);
-    const notes = block.querySelector<HTMLInputElement>(".q-other")?.value.trim() || undefined;
+    const labels = [...(chosen[qi] ?? [])];
+    const notes = blocks[qi]?.querySelector<HTMLInputElement>(".q-other")?.value.trim() || undefined;
     if (notes) labels.push(notes); // a typed "Other" answer counts as a chosen label
     if (labels.length === 0) return null; // unanswered
     answers.push({ question: q.question, labels, ...(notes ? { notes } : {}) });

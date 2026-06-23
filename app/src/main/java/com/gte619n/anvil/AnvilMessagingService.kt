@@ -1,5 +1,6 @@
 package com.gte619n.anvil
 
+import androidx.core.app.NotificationManagerCompat
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import org.json.JSONObject
@@ -14,6 +15,12 @@ class AnvilMessagingService : FirebaseMessagingService() {
         val n = message.notification
         val title = n?.title ?: message.data["title"] ?: "Anvil"
         val body = n?.body ?: message.data["body"] ?: ""
+        // A "clear" push means the session was viewed/answered elsewhere — dismiss its reminder
+        // here instead of showing one (the id is keyed off the session, matching Notifications.show).
+        if (message.data["kind"] == "clear") {
+            message.data["sessionId"]?.let { NotificationManagerCompat.from(this).cancel(it.hashCode()) }
+            return
+        }
         // All pushes are data-only (so this always fires, even backgrounded), routing every reminder
         // through the same session-keyed notification: it supersedes prior reminders for the session,
         // deep-links to it on tap, and clears when the app opens it. Permission pushes additionally

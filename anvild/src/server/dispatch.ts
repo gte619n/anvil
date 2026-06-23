@@ -85,6 +85,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           return;
         }
         conn.attached.add(cmd.sessionId);
+        deps.supervisor.viewed(cmd.sessionId); // viewing a session dismisses its "your turn" reminder everywhere
         if (cid) send(ack(cid));
         // replay events with seq > lastSeq, or a conversation.snapshot (arch §6.4)
         for (const event of deps.supervisor.resume(cmd.sessionId, cmd.lastSeq)) send(event);

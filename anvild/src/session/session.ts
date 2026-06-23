@@ -43,6 +43,9 @@ export class Session {
   pendingPermission: PendingPermission | undefined;
   /** Set while blocked on an AskUserQuestion answer so a cold-attaching client re-surfaces it. */
   pendingQuestion: PendingQuestion | undefined;
+  /** The most recent assistant prose (plain text, trimmed) — used to give the "your turn"
+   *  notification real context ("…here's the summary") instead of a generic "Finished". Transient. */
+  lastAssistantText: string | undefined;
   /** Once disposed (killed/archived/shutdown) `emit` is a no-op — a late-draining agent turn must
    *  not write into a dead session (would target a removed dir/connection and crash the daemon). */
   private disposed = false;
