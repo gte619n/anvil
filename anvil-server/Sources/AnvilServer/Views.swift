@@ -86,7 +86,6 @@ struct WizardView: View {
   @State private var role: Role = .choose
   @State private var token = ""
   @State private var pairingCode = ""
-  @State private var listener: Pairing.Listener?
   @State private var status = ""
 
   var body: some View {
@@ -129,43 +128,26 @@ struct WizardView: View {
   private func saveAndStart() {
     do {
       try Auth.writeToken(token)
-      status = "Token saved. Starting the daemon…"
       state.install()
       state.ensureServe()
-      close()
+      // Re-login also refreshes the shared token across the fleet (§4.4); no-op if no members.
+      state.rotateFleet(token: token) { msg in status = msg }
+      status = "Token saved. Starting the daemon…"
     } catch { status = (error as NSError).localizedDescription }
   }
 
   private func startJoin() {
     role = .join
-    pairingCode = Pairing.generateCode()
-    let code = pairingCode
-    let l = Pairing.Listener(expectedCode: code) { token in
-      // Runs on the pairing queue: persist the token, then proceed to install on the main thread.
-      do { try Auth.writeToken(token) } catch { return Pairing.PairReply(ok: false, serverId: nil, serverName: nil, error: "could not save token") }
-      DispatchQueue.main.async {
-        state.install(); state.ensureServe()
-        status = "Paired! Token received — starting the daemon…"
-        stopJoin()
-      }
-      return Pairing.PairReply(ok: true, serverId: state.health?.serverId, serverName: Tailscale.magicDNSName(), error: nil)
-    }
-    do {
-      let local = try l.start()
-      Tailscale.serve(externalPort: Paths.pairingPort, localPort: local)
-      listener = l
-    } catch { status = "Couldn't open the pairing listener: \(error.localizedDescription)" }
+    pairingCode = state.armJoin() // opens the persistent listener + a join window; the hub pushes the token
   }
 
-  private func stopJoin() {
-    listener?.stop(); listener = nil
-    Tailscale.unserve(externalPort: Paths.pairingPort)
-  }
+  private func stopJoin() { state.cancelJoin() }
 }
 
 // MARK: - Hub: add a Mac to the fleet
 
 struct AddMacView: View {
+  @ObservedObject var state: AppState
   let close: () -> Void
   @State private var host = ""
   @State private var code = ""
@@ -192,11 +174,18 @@ struct AddMacView: View {
 
   private func send() {
     guard let token = try? Auth.readToken() ?? nil else { status = "No local token to share — set this Mac up first."; return }
+    let h = host.trimmingCharacters(in: .whitespaces)
     sending = true; status = "Pushing the token over the tailnet…"
-    Pairing.pushToken(toHost: host.trimmingCharacters(in: .whitespaces), code: code, token: token, fleetName: nil, hubServerId: nil) { result in
+    Pairing.pushPair(toHost: h, code: code, token: token, fleetName: nil, hubServerId: state.myServerId) { result in
       sending = false
       switch result {
-      case .success(let reply): status = reply.ok ? "✅ \(host) joined the fleet." : "Rejected: \(reply.error ?? "unknown")"
+      case .success(let reply):
+        if reply.ok {
+          state.recordMember(host: h, reply: reply) // remember it for future token rotations (§6)
+          status = "✅ \(h) joined the fleet."
+        } else {
+          status = "Rejected: \(reply.error ?? "unknown")"
+        }
       case .failure(let e): status = "Failed: \(e.localizedDescription)"
       }
     }

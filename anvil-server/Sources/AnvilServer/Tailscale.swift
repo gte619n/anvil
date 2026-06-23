@@ -43,4 +43,26 @@ enum Tailscale {
   static func daemonURL() -> String? {
     magicDNSName().map { "https://\($0):\(Paths.port)/" }
   }
+
+  /// This node's tailnet login (owner), e.g. "evan@example.com" — used to gate pairing to same-user.
+  static func selfLogin() -> String? {
+    let r = Shell.run("tailscale", ["status", "--json"])
+    guard r.ok, let data = r.stdout.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let selfNode = obj["Self"] as? [String: Any],
+          let uid = selfNode["UserID"] as? Int,
+          let users = obj["User"] as? [String: Any],
+          let user = users[String(uid)] as? [String: Any],
+          let login = user["LoginName"] as? String
+    else { return nil }
+    return login
+  }
+
+  /// Defense-in-depth for pairing (anvil-server-app.md §4.3): does `login` (from the
+  /// `Tailscale-User-Login` header that `tailscale serve` injects on the proxied request) match the
+  /// tailnet user that owns THIS Mac? Returns false when either side is unknown.
+  static func isSameUser(_ login: String?) -> Bool {
+    guard let login, !login.isEmpty, let mine = selfLogin() else { return false }
+    return login.caseInsensitiveCompare(mine) == .orderedSame
+  }
 }

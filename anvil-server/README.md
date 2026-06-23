@@ -41,14 +41,16 @@ notarized DMG needs a Developer ID (design §8) — not wired yet.
   `~/.config/anvil/env` 0600 → `service.sh install` → `tailscale serve`) or *Join a fleet* (show a
   6-digit code + this Mac's MagicDNS name; receive the token from the hub).
 - **Add a Mac (hub):** enter the joiner's tailnet name + its code → push the OAuth token over the
-  tailnet to its pairing listener (`:7702`, code-gated, WireGuard-encrypted — design §4.3).
+  tailnet to its `:7702` listener (code-gated, WireGuard-encrypted — design §4.3). Joined members are
+  saved (`FleetRegistry`) so the hub can later **rotate** the token to them.
+- **Token rotation (§4.4):** on the hub, re-login → the new token is pushed to every recorded member
+  via `/anvil-token`, **identity-gated** by the `Tailscale-User-Login` serve header + the recorded
+  hub id (no code needed). Members keep a persistent `:7702` listener for this (design §7).
 
 ## Known gaps / next
 
-- **Runtime-untested** (see Status). The pairing HTTP listener, `claude setup-token` capture, and
-  `launchctl` flows need a live run.
+- **Runtime-untested** (see Status). The pairing HTTP listener, rotation, `claude setup-token`
+  capture, and `launchctl`/`tailscale serve` flows need a live run on a GUI Mac.
 - **`claude setup-token`** is launched in Terminal and the token is pasted back (it needs a browser +
   TTY); a fully in-app capture is a later refinement.
-- **Token rotation** across the fleet (Phase 7B) and **Tailscale `whois` hardening** of pairing
-  (design §4.3) are not implemented yet.
-- **Notarization / Sparkle updates** (design §8) — not wired.
+- **Notarization / Sparkle updates** (design §8), in-menu budget detail, and a logs viewer — not wired.

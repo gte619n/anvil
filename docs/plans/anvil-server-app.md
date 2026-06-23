@@ -156,20 +156,25 @@ secrets by hand.
 - **The code** gives mutual, human-confirmed intent (right fleet ↔ right Mac), is short-lived, and is
   single-attempt — it stops a wrong/hostile node on a *shared* tailnet from being handed the token, or
   the joiner from accepting a stranger's token.
-- **Hardening (later):** the joiner calls the **Tailscale LocalAPI `whois`** on the incoming
-  connection (already referenced in impl-6) to confirm the caller is a node owned by the *same tailnet
-  user*, and/or pin to `hubServerId`. This makes the code a convenience rather than the sole gate.
+- **Identity hardening (implemented):** `tailscale serve` terminates TLS at tailscaled and proxies to
+  the listener over localhost, so the socket peer is `127.0.0.1` — but it injects a
+  **`Tailscale-User-Login`** header identifying the caller's tailnet user. The listener compares that
+  to this node's own owner (`tailscale status --json` → Self.UserID → User[…].LoginName); a request
+  from a *different* tailnet user is rejected even with a correct code. (This supersedes the earlier
+  "whois the socket IP" idea, which the serve-proxy makes meaningless.)
 - The token is a bearer secret living on N disks — exactly the posture multi-server §8 already accepts;
   pairing doesn't widen it beyond the documented blast radius.
 
-### 4.4 Rotation & expiry
+### 4.4 Rotation & expiry (implemented)
 
 `setup-token` issues a ~1-year OAuth token (impl-1). When it expires (or `subscriptionAuthOk` flips
 false / turns start failing with auth errors), **the whole fleet breaks at once** (shared credential).
-Flow: the hub app surfaces the failure → "Re-login" re-runs `setup-token` → **"Update the fleet"**
-re-pushes the new token to every known member (§4.2 push, no code needed for an existing member if
-`whois`-pinned; otherwise re-pair). Members can also re-pull on next hub contact. Keep v1 simple:
-hub re-pushes to its membership list.
+Implemented flow: on the hub, **Re-login** re-runs `setup-token`; saving the new token automatically
+**rotates it to every recorded member** (`FleetRegistry`, §6) by pushing to each member's
+**`POST /anvil-token`**. That route is **identity-gated, not code-gated**: it requires the same tailnet
+user (the serve header, §4.3) *and* a `hubServerId` matching the hub recorded at first join — so the
+hub can refresh the token unattended, but a stranger can't. To make this work, each member runs a
+**persistent** fleet-control listener (not just during the join window) — see the §7 posture note.
 
 ---
 
@@ -210,8 +215,14 @@ but keep the layers separate: Server.app = machine admin, client = session acces
 ## 7. Security posture (delta from multi-server §8)
 
 - Boundary unchanged: tailnet only; daemon binds `127.0.0.1` + `tailscale serve`.
-- **New surface:** the pairing listener on `:7702`, open only during a join window, code- (and later
-  `whois`-) gated. Closed otherwise. No standing inbound surface beyond `tailscale serve`.
+- **New surface — the fleet-control listener on `:7702`.** Originally scoped to "open only during a
+  join window," but **token rotation (§4.4) requires it to be persistent on members** so the hub can
+  push a refreshed token unattended. So: a joined Mac keeps `:7702` served for the app's lifetime.
+  Mitigations — every request is gated by the `Tailscale-User-Login` serve header (same tailnet user,
+  §4.3); `/anvil-pair` additionally needs a live 6-digit code (only during a join); `/anvil-token`
+  additionally needs a `hubServerId` matching the hub recorded at join. A Mac that has never joined
+  doesn't open the listener at all. Net: a small, identity-gated standing surface, reachable only by
+  your own tailnet nodes — an accepted trade for unattended rotation.
 - **Same token on N disks** — pairing automates distribution but doesn't change the blast radius §8
   already documents. `chmod 600` enforced by the app. Per-machine tokens remain the eventual better
   answer if/when the platform allows it.
@@ -236,14 +247,16 @@ but keep the layers separate: Server.app = machine admin, client = session acces
 0. **Compile spike (gates SA-4):** ✅ **done** (§3.1). Verdict: ship **Bun + source + node_modules**
    (full `--compile` doesn't boot due to runtime data-file deps; the SDK-spawn issue is solvable on
    its own). Daemon made packaging-ready: `ANVIL_CLI_PATH` (`src/agent/cli.ts`) + `ANVIL_WEB_DIR`.
-1. **Single-server wizard:** menu-bar app that does what `service.sh install` does — deps → login →
-   guard → serve → LaunchAgent → health. (No fleet yet.) Replaces hand-setup for one Mac.
-2. **Pairing receiver + join:** the app's `:7702` listener, code UX, write-token-then-start (§4.2).
-   *Establish*/*Join* roles.
-3. **Hub-side "Add a Mac" + fleet registry:** discover candidates (§4.1), push token, persist
-   membership (§6).
-4. **Rotation:** re-login + re-push to the fleet (§4.4); `whois` hardening (§4.3).
-5. **Polish/distribution:** notarization, Sparkle, budget surfacing, logs viewer.
+1–4. ✅ **built** (branch `multi-server-impl`, `anvil-server/` — SwiftPM, compiles with CLT, runtime
+   not yet exercised on a GUI Mac):
+   - **Wizard** (Establish/Join), menu-bar shell (NSStatusItem + SwiftUI popover, health-tinted icon),
+     daemon control via `service.sh`, `/api/health` polling, `tailscale serve`.
+   - **Pairing + join** — persistent `:7702` fleet-control listener (Network framework), 6-digit code,
+     write-token-then-install.
+   - **Hub "Add a Mac" + `FleetRegistry`** (§6) — push token, persist membership.
+   - **Rotation + identity hardening** (§4.4/§4.3) — re-login re-pushes to members via `/anvil-token`,
+     gated by the `Tailscale-User-Login` serve header + recorded `hubServerId`.
+5. **Polish/distribution:** notarization, Sparkle, budget surfacing in-menu, logs viewer — *not done*.
 
 ---
 
@@ -252,10 +265,13 @@ but keep the layers separate: Server.app = machine admin, client = session acces
 - ~~**[gating] Compiled-binary Agent-SDK spawn** (§3.1)~~ — **resolved** (2026-06-23): SDK spawn is
   solvable (`ANVIL_CLI_PATH` → native CLI), but full `--compile` doesn't boot (runtime data-file
   deps), so packaging is Bun + source + node_modules. See §3.1.
-- **Pairing direction & UX** — chosen: joiner shows code, hub approves (mirrors ADB). Confirm this
-  reads naturally for "regular people" vs. the inverse.
-- **Pairing transport** — `tailscale serve --https=7702` for the window vs. binding the tailscale
-  interface directly vs. an app-level listener with the LocalAPI cert. Pick during Phase 2.
+- **Pairing direction & UX** — built as: joiner shows code, hub approves (mirrors ADB). Confirm it
+  reads naturally for "regular people" once run on real hardware.
+- **Pairing transport** — built as `tailscale serve --https=7702` → a local Network-framework listener
+  (identity from the injected `Tailscale-User-Login` header). Now **persistent** on members for
+  rotation (§7), not just during the join window.
+- **Runtime verification** — the whole app is compile-verified only; the pairing handshake,
+  `setup-token` capture, and `launchctl`/`tailscale serve` flows need a live run on a GUI Mac.
 - **Token lifetime / refresh** — confirm the real `setup-token` lifetime and whether a refresh exists;
   shapes §4.4 (re-login cadence).
 - **Membership authority** — app-side registry vs. client localStorage vs. a tiny shared store. v1:

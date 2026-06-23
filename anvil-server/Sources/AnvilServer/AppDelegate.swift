@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     state.openAddMac = { [weak self] in self?.showAddMac() }
 
     state.startPolling()
+    state.startFleetControlIfMember() // a joined Mac listens for token rotations (§4.4)
     refreshIconLoop()
 
     // First run with nothing configured → open the wizard immediately.
@@ -78,6 +79,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   private func showAddMac() {
     popover.performClose(nil)
-    _ = window(&addMacWindow, title: "Add a Mac", view: AddMacView(close: { [weak self] in self?.addMacWindow?.close() }))
+    _ = window(&addMacWindow, title: "Add a Mac", view: AddMacView(state: state, close: { [weak self] in self?.addMacWindow?.close() }))
   }
 }
