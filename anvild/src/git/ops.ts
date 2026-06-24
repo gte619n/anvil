@@ -110,10 +110,96 @@ export function createPr(cwd: string, title: string, body: string): { ok: boolea
   return { ok: r.code === 0, output: r.out, url };
 }
 
-export function mergePr(cwd: string, method: "merge" | "squash" | "rebase"): { ok: boolean; output: string } {
+/**
+ * Merge the PR for the current branch. NB: no `--delete-branch` — letting gh delete the merged
+ * branch forces the local checkout off it (onto the default branch, or a detached HEAD when the
+ * default is already checked out in another worktree), which orphans a session worktree on the
+ * "wrong branch" forever. Instead, when `branch` is given (a worktree session), we roll the worktree
+ * onto a fresh `<branch>_followup` branch based on the freshly-merged default and delete the merged
+ * branch locally ourselves — so work can continue cleanly and the health check stays happy.
+ * Returns `newBranch` when a rollover happened so the caller can update the session's recorded branch.
+ */
+export function mergePr(
+  cwd: string,
+  method: "merge" | "squash" | "rebase",
+  branch?: string,
+): { ok: boolean; output: string; newBranch?: string } {
   const flag = method === "squash" ? "--squash" : method === "rebase" ? "--rebase" : "--merge";
-  const r = run(["gh", "pr", "merge", flag, "--delete-branch"], cwd);
-  return { ok: r.code === 0, output: r.out || "merged" };
+  const r = run(["gh", "pr", "merge", flag], cwd);
+  if (r.code !== 0 || !branch) return { ok: r.code === 0, output: r.out || "merged" };
+
+  // Pull the merged state down so the follow-up branch starts from the new default-branch tip
+  // (after a squash/rebase merge the local merged-branch tip has diverged from it).
+  run(["git", "fetch", "origin"], cwd);
+  const def = defaultBranch(cwd);
+  const start = def ? `origin/${def}` : "HEAD";
+  const followup = freeFollowupBranch(cwd, branch);
+  const co = run(["git", "checkout", "-b", followup, start], cwd);
+  if (co.code !== 0) {
+    // Couldn't roll over (e.g. uncommitted changes block the checkout) — leave the worktree on the
+    // merged branch, which is still fine to keep working on. Surface it rather than failing silently.
+    return { ok: true, output: `${r.out}\n(merged; stayed on ${branch}: ${co.out})` };
+  }
+  run(["git", "branch", "-D", branch], cwd); // local-only; the merge is safely on the remote default
+  return { ok: true, output: `${r.out}\nrolled onto ${followup} (off ${start}); deleted local ${branch}`, newBranch: followup };
+}
+
+/** The remote's default branch (e.g. "main") via origin/HEAD; undefined if it isn't set locally. */
+function defaultBranch(cwd: string): string | undefined {
+  const r = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd);
+  const name = r.code === 0 ? r.out.trim() : "";
+  return name.startsWith("origin/") ? name.slice("origin/".length) : undefined;
+}
+
+/** A `<branch>_followup` name not already taken locally (…_followup, _followup_2, _followup_3, …). */
+function freeFollowupBranch(cwd: string, branch: string): string {
+  const base = `${branch}_followup`;
+  const exists = (name: string) =>
+    run(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${name}`], cwd).code === 0;
+  if (!exists(base)) return base;
+  for (let i = 2; i < 1000; i++) {
+    if (!exists(`${base}_${i}`)) return `${base}_${i}`;
+  }
+  return `${base}_${Date.now()}`; // unreachable in practice; never collide
+}
+
+/** Local branch names matching `<x>_followup` / `<x>_followup_<n>`. */
+function listFollowupBranches(cwd: string): string[] {
+  const r = run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd);
+  if (r.code !== 0) return [];
+  return r.out.split("\n").map((l) => l.trim()).filter((b) => /_followup(_\d+)?$/.test(b));
+}
+
+/** Branches currently checked out in any worktree of this repo (must not be deleted). */
+function checkedOutBranches(cwd: string): Set<string> {
+  const r = run(["git", "worktree", "list", "--porcelain"], cwd);
+  const out = new Set<string>();
+  for (const line of r.out.split("\n")) {
+    const m = line.match(/^branch refs\/heads\/(.+)$/);
+    if (m) out.add(m[1]);
+  }
+  return out;
+}
+
+/**
+ * Delete local follow-up branches that were never used. A follow-up branch is "unused" when it is
+ * not checked out in any worktree and has no commits beyond the default branch — i.e. the user
+ * merged and then never continued the work. Follow-up branches are local-only (we never push them),
+ * so an untouched one is pure garbage. Best-effort and safe: branches with real work, or that a live
+ * session is sitting on, are left alone. Returns the names actually deleted.
+ */
+export function pruneUnusedFollowupBranches(repoRoot: string): { deleted: string[]; output: string } {
+  const def = defaultBranch(repoRoot);
+  if (!def) return { deleted: [], output: "skipped: no origin/HEAD default branch" };
+  const checkedOut = checkedOutBranches(repoRoot);
+  const deleted: string[] = [];
+  for (const b of listFollowupBranches(repoRoot)) {
+    if (checkedOut.has(b)) continue; // a live session is on it
+    const ahead = run(["git", "rev-list", "--count", `${b}`, `^origin/${def}`], repoRoot);
+    if (ahead.code !== 0 || ahead.out.trim() !== "0") continue; // has unique commits → real work
+    if (run(["git", "branch", "-D", b], repoRoot).code === 0) deleted.push(b);
+  }
+  return { deleted, output: deleted.length ? `pruned ${deleted.join(", ")}` : "no unused follow-up branches" };
 }
 
 /** PR state for the current branch via `gh` (network); undefined if there's no PR. */
