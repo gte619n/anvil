@@ -4,7 +4,12 @@ Provision any Mac for Apple **Developer ID** code signing + notarization, with
 the cert and notary key stored in **Google Secret Manager** (not on disk, not in
 git). Used by the Slates (Tauri) and Anvil (`make-app.sh`) builds.
 
+**New here? Start with [`SETUP.md`](./SETUP.md)** — the full one-time walkthrough
+for generating the cert + API key, the exact secret names, and what goes where.
+This README is the quick reference.
+
 ## Files
+- `SETUP.md` — complete one-time setup guide (cert generation → secrets → build).
 - `config.sh` — project + secret names + helpers. No secrets; safe to commit.
 - `push-secrets.sh` — run **once** to upload your cert + API key to Secret Manager.
 - `provision.sh` — run on **each machine** to install signing locally.
