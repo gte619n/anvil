@@ -164,6 +164,7 @@ struct WizardView: View {
   @State private var tsUp = Deps.tailscaleInstalled && Tailscale.loggedIn() // installed AND signed in/running
   @State private var installingBun = false
   @State private var provisioning = false
+  @State private var daemonUpdate = Provision.needed() // bundled daemon differs from what's installed
 
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
@@ -190,6 +191,18 @@ struct WizardView: View {
               .font(.callout).foregroundStyle(.red)
             Button { chooseCheckout() } label: { Label("Choose anvild folder…", systemImage: "folder") }
           }
+        }
+      } else if daemonUpdate {
+        // A checkout exists but the app bundles a NEWER daemon (e.g. a fixed service.sh) — offer to
+        // update it in place. Re-provision preserves node_modules, so this is fast, and it restarts a
+        // running daemon to pick up the new code.
+        Card {
+          Label("A daemon update is available.", systemImage: "arrow.triangle.2.circlepath").font(.callout)
+          Text("This Mac is running an older copy of the Anvil daemon than this app ships. Updating refreshes it (keeps the installed dependencies) and restarts it.").font(.caption).foregroundStyle(.secondary)
+          Button { provisionDaemon() } label: {
+            if provisioning { HStack(spacing: 5) { ProgressView().controlSize(.small); Text("Updating…") } }
+            else { Label("Update Anvil daemon", systemImage: "arrow.down.circle.fill") }
+          }.buttonStyle(.borderedProminent).tint(.anvil).disabled(provisioning || !bunOK)
         }
       }
 
@@ -254,7 +267,8 @@ struct WizardView: View {
   private func recheckDeps() {
     DispatchQueue.global(qos: .userInitiated).async {
       let bun = Deps.bunInstalled(), ts = Deps.tailscaleInstalled, up = ts && Tailscale.loggedIn()
-      DispatchQueue.main.async { bunOK = bun; tsOK = ts; tsUp = up }
+      let upd = Provision.needed()
+      DispatchQueue.main.async { bunOK = bun; tsOK = ts; tsUp = up; daemonUpdate = upd }
     }
   }
 
@@ -321,6 +335,11 @@ struct WizardView: View {
       provisioning = false
       status = msg
       checkoutTick += 1 // hasCheckout now resolves to the provisioned install root
+      if ok {
+        daemonUpdate = false
+        // If this Mac is already configured, restart so the freshly-installed daemon code takes effect.
+        if state.hasToken { state.restart() }
+      }
     })
   }
 

@@ -215,7 +215,11 @@ PLISTEOF
   if wait_health; then
     echo "healthy: $(curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health")"
   else
+    # Exit non-zero so the caller (the app's "Start Anvil") knows the daemon didn't come up and
+    # surfaces the reason — otherwise install "succeeds", the app shows no error, and the UI silently
+    # falls back to "Daemon stopped" with the real cause hidden in the log.
     report_unhealthy
+    exit 1
   fi
 
   # Print the URL clients should use for THIS host's transport: serve → HTTPS on the MagicDNS name
@@ -240,7 +244,7 @@ case "${1:-install}" in
     # direct-bind mode would create a tailnet :PORT listener that collides with the daemon's own bind.
     grep -q 'ANVIL_HOST=127.0.0.1' "$LAUNCHER" 2>/dev/null && setup_serve >/dev/null 2>&1 || true
     launchctl kickstart -k "$DOMAIN/$LABEL"
-    if wait_health; then echo "restarted, healthy"; else report_unhealthy; fi
+    if wait_health; then echo "restarted, healthy"; else report_unhealthy; exit 1; fi
     ;;
   status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded"; { curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health" 2>/dev/null; } && echo || echo "no health" ;;
   logs)      tail -n 80 -f "$STATE_DIR/anvild.log" ;;
