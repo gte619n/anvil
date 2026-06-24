@@ -39,10 +39,13 @@ export class Session {
   private nextSeq: number;
   private group: Group | undefined;
   private readonly alwaysAllow = new Set<string>();
-  /** Set while blocked on a decision so a (re)attaching client can re-surface it (arch §6.4). */
-  pendingPermission: PendingPermission | undefined;
-  /** Set while blocked on an AskUserQuestion answer so a cold-attaching client re-surfaces it. */
-  pendingQuestion: PendingQuestion | undefined;
+  /** Prompts currently parked in the PreToolUse hook, keyed by requestId. A single session can hold
+   *  SEVERAL at once — sub-agents (the `Agent`/Task tool) fan out and each parks its own tool prompt.
+   *  A (re)attaching client re-surfaces all of them (arch §6.4/§6.6). */
+  readonly pendingPermissions = new Map<string, PendingPermission>();
+  /** AskUserQuestion prompts parked in canUseTool, keyed by requestId. Like permissions, sub-agents
+   *  can fan out several at once, so a (re)attaching client re-surfaces all of them (arch §6.6). */
+  readonly pendingQuestions = new Map<string, PendingQuestion>();
   /** The most recent assistant prose (plain text, trimmed) — used to give the "your turn"
    *  notification real context ("…here's the summary") instead of a generic "Finished". Transient. */
   lastAssistantText: string | undefined;
@@ -109,9 +112,32 @@ export class Session {
   }
 
   setStatus(status: SessionStatus): void {
+    // The awaiting states are STICKY while ANY prompt (permission or question) is still parked:
+    // during sub-agent fan-out an already-answered sub-agent keeps working and the driver reports
+    // running_tool/thinking, but the session must keep advertising that it needs the user (fleet
+    // badge + the parked sibling cards) until every prompt is resolved. The awaiting statuses
+    // themselves, plus terminal/error/idle, always pass through. (arch §6.6)
+    const parked = this.pendingPermissions.size > 0 || this.pendingQuestions.size > 0;
+    if (
+      parked &&
+      status !== "awaiting_permission" &&
+      status !== "awaiting_question" &&
+      status !== "error" &&
+      status !== "idle"
+    ) {
+      return;
+    }
     this.data.status = status;
     this.data.lastActivityAt = now();
     this.emit({ type: "status", status });
+  }
+
+  /** After a parked prompt resolves, the status to settle on: keep advertising any prompt STILL
+   *  waiting (a sibling from sub-agent fan-out), else fall back to the caller's working status. */
+  settleStatus(fallback: SessionStatus): SessionStatus {
+    if (this.pendingPermissions.size > 0) return "awaiting_permission";
+    if (this.pendingQuestions.size > 0) return "awaiting_question";
+    return fallback;
   }
 
   /** Surface an agent/turn error to attached clients (arch §6.2). */
@@ -120,60 +146,104 @@ export class Session {
     this.emit({ type: "error", message, fatal });
   }
 
-  /** Block on a permission decision (arch §6.6): flips to awaiting_permission + emits the request. */
+  /** Whether any permission prompt is still parked (drives the "needs approval" fleet badge). */
+  hasPendingPermission(): boolean {
+    return this.pendingPermissions.size > 0;
+  }
+
+  /** Block on a permission decision (arch §6.6): flips to awaiting_permission + emits the request.
+   *  Several may be parked at once (sub-agent fan-out) — each is tracked + re-surfaced by requestId. */
   requestPermission(requestId: string, tool: string, input: unknown, suggestions: PermissionSuggestion[]): void {
-    this.pendingPermission = { requestId, tool, input, suggestions };
+    this.pendingPermissions.set(requestId, { requestId, tool, input, suggestions });
     this.setStatus("awaiting_permission");
     this.emit({ type: "permission.request", requestId, tool, input, suggestions });
   }
 
-  /** A parked permission was answered (or superseded): stop re-surfacing it on reattach. */
+  /** A parked permission was answered or superseded: stop re-surfacing it on reattach. With no
+   *  requestId, drop ALL parked prompts (used by reset/teardown to unblock a wedged session). */
   clearPermission(requestId?: string): void {
-    if (!requestId || this.pendingPermission?.requestId === requestId) this.pendingPermission = undefined;
+    if (!requestId) this.pendingPermissions.clear();
+    else this.pendingPermissions.delete(requestId);
   }
 
-  /** The unresolved permission prompt, if this session is currently blocked on one. */
-  permissionRequestEvent(): ServerEvent | undefined {
-    if (!this.pendingPermission) return undefined;
-    const p = this.pendingPermission;
-    return {
-      v: PROTOCOL_VERSION,
-      type: "permission.request",
-      ts: now(),
-      sessionId: this.data.id,
-      seq: this.lastSeq,
-      requestId: p.requestId,
-      tool: p.tool,
-      input: p.input,
-      suggestions: p.suggestions,
-    };
+  /** Drop one parked permission AND tell every device to retire exactly that card (decoupled from
+   *  the session's transient status, since a sibling prompt may still be parked). (arch §6.6) */
+  permissionResolved(requestId: string): void {
+    this.pendingPermissions.delete(requestId);
+    this.emit({ type: "permission.resolved", requestId });
   }
 
-  /** Block on an AskUserQuestion answer (arch §6.6): flip to awaiting_question + emit the prompt. */
+  /** Supersede ALL parked permissions (reset/newTopic): announce each so clients retire its card,
+   *  then drop them. The broker is unblocked separately (resolveSession). (arch §6.6) */
+  resolveAllPermissions(): void {
+    for (const requestId of [...this.pendingPermissions.keys()]) this.permissionResolved(requestId);
+  }
+
+  /** Every unresolved permission prompt, re-emitted so a cold-attaching client re-surfaces them all
+   *  (the snapshot drops permission.request from history). */
+  permissionRequestEvents(): ServerEvent[] {
+    return [...this.pendingPermissions.values()].map(
+      (p) =>
+        ({
+          v: PROTOCOL_VERSION,
+          type: "permission.request",
+          ts: now(),
+          sessionId: this.data.id,
+          seq: this.lastSeq,
+          requestId: p.requestId,
+          tool: p.tool,
+          input: p.input,
+          suggestions: p.suggestions,
+        }) as ServerEvent,
+    );
+  }
+
+  /** Whether any AskUserQuestion prompt is still parked. */
+  hasPendingQuestion(): boolean {
+    return this.pendingQuestions.size > 0;
+  }
+
+  /** Block on an AskUserQuestion answer (arch §6.6): flip to awaiting_question + emit the prompt.
+   *  Several may be parked at once (sub-agent fan-out) — each tracked + re-surfaced by requestId. */
   requestQuestion(requestId: string, questions: Question[]): void {
-    this.pendingQuestion = { requestId, questions };
+    this.pendingQuestions.set(requestId, { requestId, questions });
     this.setStatus("awaiting_question");
     this.emit({ type: "question.request", requestId, questions });
   }
 
-  /** A parked question was answered (or superseded): stop re-surfacing it on reattach. */
+  /** A parked question was answered or superseded: stop re-surfacing it. No requestId → drop ALL. */
   clearQuestion(requestId?: string): void {
-    if (!requestId || this.pendingQuestion?.requestId === requestId) this.pendingQuestion = undefined;
+    if (!requestId) this.pendingQuestions.clear();
+    else this.pendingQuestions.delete(requestId);
   }
 
-  /** The unresolved AskUserQuestion prompt, if this session is currently blocked on one. */
-  questionRequestEvent(): ServerEvent | undefined {
-    if (!this.pendingQuestion) return undefined;
-    const q = this.pendingQuestion;
-    return {
-      v: PROTOCOL_VERSION,
-      type: "question.request",
-      ts: now(),
-      sessionId: this.data.id,
-      seq: this.lastSeq,
-      requestId: q.requestId,
-      questions: q.questions,
-    };
+  /** Drop one parked question AND tell every device to retire exactly that card (decoupled from the
+   *  session's transient status, since a sibling prompt may still be parked). (arch §6.6) */
+  questionResolved(requestId: string): void {
+    this.pendingQuestions.delete(requestId);
+    this.emit({ type: "question.resolved", requestId });
+  }
+
+  /** Supersede ALL parked questions (reset/newTopic): announce each so clients retire its card. */
+  resolveAllQuestions(): void {
+    for (const requestId of [...this.pendingQuestions.keys()]) this.questionResolved(requestId);
+  }
+
+  /** Every unresolved AskUserQuestion prompt, re-emitted so a cold-attaching client re-surfaces all
+   *  (the snapshot drops question.request from history). */
+  questionRequestEvents(): ServerEvent[] {
+    return [...this.pendingQuestions.values()].map(
+      (q) =>
+        ({
+          v: PROTOCOL_VERSION,
+          type: "question.request",
+          ts: now(),
+          sessionId: this.data.id,
+          seq: this.lastSeq,
+          requestId: q.requestId,
+          questions: q.questions,
+        }) as ServerEvent,
+    );
   }
 
   /** Attach the agent's process group (M5) so kill can reap it. */

@@ -873,8 +873,18 @@ function handleSessionEvent(e: ServerEvent): void {
     case "permission.request":
       showPermission(e.requestId, e.tool, e.input, e.suggestions);
       return;
+    case "permission.resolved":
+      // Retire EXACTLY this card (answered here, on another device, or superseded). Per-request so a
+      // sibling prompt still parked during sub-agent fan-out is never collaterally cleared.
+      resolvePermissionUI(e.requestId);
+      return;
     case "question.request":
       showQuestion(e.requestId, e.questions);
+      return;
+    case "question.resolved":
+      // Retire EXACTLY this card (answered here, on another device, or superseded) — per-request so
+      // a sibling question still parked during sub-agent fan-out is never collaterally cleared.
+      resolveQuestionUI(e.requestId);
       return;
     case "fs.changed":
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
@@ -1337,10 +1347,14 @@ function applyActiveTint(): void {
   }
 }
 function setStatus(status: string): void {
-  // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
-  // retire any open permission/question cards so a stale one can't linger.
-  if (status !== "awaiting_permission") clearPermissionCards();
-  if (status !== "awaiting_question") clearQuestionCards();
+  // Permission AND question cards are retired individually by their `*.resolved` events (a session
+  // can hold several at once during sub-agent fan-out, so a status flip to running_tool/thinking
+  // must NOT clear a still-parked sibling). Only a terminal status sweeps any straggler that somehow
+  // lost its resolve event.
+  if (status === "idle" || status === "error") {
+    clearPermissionCards();
+    clearQuestionCards();
+  }
   const awaiting = status === "awaiting_permission" || status === "awaiting_question";
   if (status === "idle" || awaiting) hideThinking(); // the card is the indicator while parked
   else if (!streaming) showThinking(status); // while text streams, the text is the activity

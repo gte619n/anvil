@@ -267,15 +267,15 @@ export class Supervisor {
     // Always end with the live status so a re-attaching client's thinking indicator reflects
     // reality (the per-turn `status` events it missed while detached aren't replayed).
     events.push({ v: PROTOCOL_VERSION, type: "status", ts: now(), sessionId: id, seq: s.lastSeq, status: s.data.status });
-    // Re-surface an unanswered permission prompt: the snapshot drops permission.request (it isn't
+    // Re-surface every unanswered permission prompt: the snapshot drops permission.request (it isn't
     // conversation history), so without this a client that cold-attaches to a blocked session would
-    // never see the prompt — the request would be "lost" and the session stuck forever (arch §6.6).
-    const pending = s.permissionRequestEvent();
-    if (pending) events.push(pending);
-    // Same for a parked AskUserQuestion — question.request isn't conversation history, so a cold
-    // attach would otherwise never see it and the session would look stuck (arch §6.6).
-    const pendingQuestion = s.questionRequestEvent();
-    if (pendingQuestion) events.push(pendingQuestion);
+    // never see the prompt — the request would be "lost" and the session stuck forever. A session can
+    // hold several at once (sub-agent fan-out), so re-surface all of them (arch §6.6).
+    for (const pending of s.permissionRequestEvents()) events.push(pending);
+    // Same for parked AskUserQuestions — question.request isn't conversation history, so a cold
+    // attach would otherwise never see them and the session would look stuck. Re-surface all of them
+    // (a session can hold several at once, like permissions). (arch §6.6).
+    for (const pendingQuestion of s.questionRequestEvents()) events.push(pendingQuestion);
     return events;
   }
 
@@ -723,9 +723,15 @@ export class Supervisor {
       throw new BadCommand(`no pending permission request: ${requestId}`);
     }
     const s = sessionId ? this.sessions.get(sessionId) : undefined;
-    s?.clearPermission(requestId); // stop re-surfacing it on reattach
-    if (sessionId) this.clearNotifications(sessionId); // answered → dismiss the reminder everywhere
-    s?.setStatus(decision === "deny" ? "thinking" : "running_tool");
+    s?.permissionResolved(requestId); // clear + tell every device to retire exactly this card
+    if (s) {
+      // settleStatus keeps the session "awaiting" if a sibling prompt (permission OR question) is
+      // still parked from sub-agent fan-out — only fall back to the working status once all clear.
+      s.setStatus(s.settleStatus(decision === "deny" ? "thinking" : "running_tool"));
+      // Dismiss the session's reminder only when NOTHING needs the user anymore — clearing it while a
+      // sibling is still parked would orphan that prompt (its push vanishes). (arch §6.6)
+      if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion()) this.clearNotifications(sessionId);
+    }
   }
 
   /** Answer (or cancel) a parked AskUserQuestion (arch §6.6) — may come from any device. */
@@ -735,9 +741,12 @@ export class Supervisor {
       throw new BadCommand(`no pending question: ${requestId}`);
     }
     const s = sessionId ? this.sessions.get(sessionId) : undefined;
-    s?.clearQuestion(requestId); // stop re-surfacing it on reattach
-    if (sessionId) this.clearNotifications(sessionId); // answered → dismiss the reminder everywhere
-    s?.setStatus("running_tool"); // the AskUserQuestion tool completes → the turn continues
+    s?.questionResolved(requestId); // clear + tell every device to retire exactly this card
+    if (s) {
+      // Keep awaiting if a sibling prompt is still parked (fan-out); else the turn continues.
+      s.setStatus(s.settleStatus("running_tool"));
+      if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion()) this.clearNotifications(sessionId);
+    }
   }
 
   /** A client opened/attached to a session — that's the user acting on it, so dismiss any parked
@@ -835,8 +844,8 @@ export class Supervisor {
     this.killTerminal(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
-    s.clearPermission();
-    s.clearQuestion();
+    s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
+    s.resolveAllQuestions();
 
     let recovered: string | undefined;
     if (s.data.source === "fresh-worktree" && s.data.worktree) {
@@ -909,8 +918,8 @@ export class Supervisor {
     this.drivers.delete(id);
     this.broker.resolveSession(id, "deny"); // unblock any parked permission
     this.questionBroker.resolveSession(id); // cancel any parked AskUserQuestion
-    s.clearPermission();
-    s.clearQuestion();
+    s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
+    s.resolveAllQuestions();
     s.data.claudeSessionId = undefined; // the key line: forget the prior topic (no resume next turn)
     s.data.status = "idle";
     s.data.lastActivityAt = now();
@@ -1184,6 +1193,12 @@ function summarizeRequest(tool: string, input: unknown): string {
     case "WebFetch": {
       const url = str("url");
       return url ? `Fetch ${oneLine(url, 80)}` : "Fetch a URL";
+    }
+    case "Agent":
+    case "Task": {
+      // The sub-agent launcher (the SDK names it "Agent"; "Task" in older CLIs). Surface what it'll do.
+      const what = str("description") ?? str("subagent_type");
+      return what ? `Launch sub-agent: ${oneLine(what, 60)}` : "Launch a sub-agent";
     }
     default:
       return `Approve ${tool}`;
