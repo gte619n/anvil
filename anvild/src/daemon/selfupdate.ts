@@ -80,8 +80,19 @@ export async function applyUpdate(): Promise<{ output: string }> {
 
   // build:web stages into dist.next and atomically swaps, so a build failure here leaves the live
   // bundle the daemon is serving untouched (see web/build.ts).
-  const build = await run(["bun", "run", "build:web"], anvildDir);
+  let build = await run(["bun", "run", "build:web"], anvildDir);
   log.push(`$ bun run build:web\n${build.out}`);
+  // Self-heal: the conditional install above can be fooled — if an earlier deploy left node_modules
+  // missing a dependency, a later update whose diff doesn't touch package.json skips install and the
+  // build fails to resolve that import ("Could not resolve …"). If we didn't already install this
+  // run, do it now and retry the build once before giving up.
+  if (build.code !== 0 && !depsChanged) {
+    const install = await run(["bun", "install"], anvildDir);
+    log.push(`(build failed — running bun install and retrying)\n$ bun install\n${install.out}`);
+    if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
+    build = await run(["bun", "run", "build:web"], anvildDir);
+    log.push(`$ bun run build:web\n${build.out}`);
+  }
   if (build.code !== 0) throw new Error(`web build failed:\n${build.out}`);
 
   return { output: log.join("\n\n") };

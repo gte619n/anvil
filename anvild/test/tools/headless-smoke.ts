@@ -138,7 +138,7 @@ const check = await new Promise<{ result?: { result?: { value?: string } } }>((r
       id: probeId,
       method: "Runtime.evaluate",
       // shell rendered AND init ran past the connection layer (new-session button + a populated brand version)
-      params: { expression: `JSON.stringify({ newSession: !!document.querySelector('#new-session'), brand: document.querySelector('#brand-version')?.textContent || '', url: location.href, bodyLen: document.body?.innerHTML.length || 0 })`, returnByValue: true },
+      params: { expression: `JSON.stringify({ newSession: !!document.querySelector('#open-settings'), brand: document.querySelector('#brand-version')?.textContent || '', url: location.href, bodyLen: document.body?.innerHTML.length || 0 })`, returnByValue: true },
     }),
   );
 });

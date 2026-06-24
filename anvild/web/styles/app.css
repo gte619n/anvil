@@ -71,22 +71,30 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .conn-dot.connected { background: #21ba45; }
 .conn-dot.connecting { background: #f2c037; animation: think-pulse 1.4s infinite ease-in-out; }
 .conn-dot.disconnected { background: var(--danger); }
-#new-session { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; }
-#new-session .msym { font-size: 18px; }
 #theme-toggle { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; }
-#session-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+/* Concierge row: pinned at the top, never scrolls or reorders. */
+#concierge-list { list-style: none; margin: 0; padding: 0; flex-shrink: 0; }
+#session-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; min-height: 60px; }
 #session-list, #finished-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-#finished-section { margin-top: 6px; }
+/* Finished group is pinned to the bottom of the sidebar (above Settings); it scrolls on its own
+   if many sessions pile up so it never crowds out the active list or the Settings button. */
+#finished-section { margin-top: 6px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; }
 #finished-section[hidden] { display: none; }
-#finished-head { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--border); }
+#finished-head { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--border); flex-shrink: 0; }
 #finished-head .msym { font-size: 14px; }
-#finished-list { min-height: 6px; border-radius: 8px; }
+#finished-list { min-height: 6px; border-radius: 8px; max-height: 34vh; overflow-y: auto; }
 #finished-list.drag-over { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 #finished-list:empty::after { content: "Drop finished sessions here"; display: block; color: var(--muted); font-size: 11px; font-style: italic; text-align: center; padding: 12px 8px; margin-top: 2px; border: 1px dashed var(--border); border-radius: 8px; }
-/* Press-and-hold to reorder: rows aren't text-selectable, so a long-press lifts the row instead of
-   triggering Android's copy/paste selection. The lifted row floats above the rest. */
+/* + button that opens the new-session flow, sitting on the pinned concierge row. */
+.session .new-session { color: var(--accent); }
+/* Drag-to-reorder (SortableJS): rows aren't text-selectable so an Android long-press lifts the row
+   instead of triggering copy/paste selection. */
 .session { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
-.session.dragging { opacity: 0.9; outline: 1px dashed var(--accent); background: var(--bg); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); touch-action: none; }
+/* The floating clone that follows the finger/cursor (forceFallback mode). */
+.session-fallback { opacity: 0.95; outline: 1px dashed var(--accent); background: var(--bg); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3); }
+/* The placeholder left behind in the list, marking the drop position. */
+.session-ghost { opacity: 0.4; }
+.session-chosen { cursor: grabbing; }
 /* Row action button (open in new tab) — desktop hover convenience. */
 .session .row-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px 8px; align-self: center; display: flex; }
 .session .row-btn .msym { font-size: 16px; }
@@ -228,6 +236,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .git-panel hr { border: none; border-top: 1px solid var(--border); margin: 4px 0; width: 100%; }
 .git-output { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 11px; background: var(--panel); padding: 8px; border-radius: 8px; max-height: 260px; overflow: auto; margin: 0; }
 .git-output a { color: var(--accent); }
+.todoist-projects { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+.todoist-projects th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.todoist-projects td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .session.archived { opacity: 0.55; }
 .session.pending .title .msym { color: var(--warn); }
 /* A session being cleaned up: disabled + greyed until the daemon confirms deletion (§8). */

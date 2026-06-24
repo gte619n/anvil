@@ -3,7 +3,7 @@ import type { ContentBlock, Usage } from "@protocol";
 import type { SessionEventBody } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
-/** Handled via the question card (onUserDialog), not the normal tool_use/tool.result path. */
+/** Handled via the question card (canUseTool), not the normal tool_use/tool.result path. */
 const ASK_USER_QUESTION = "AskUserQuestion";
 
 /** The ids of any AskUserQuestion tool_use blocks in this message — so the driver can drop the

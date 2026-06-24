@@ -16,15 +16,15 @@ function fakeSession(autonomy = "mostly-autonomous"): Session {
 const ctx = { signal: new AbortController().signal } as any;
 
 // Regression guard for the "interview mode" bug: a PreToolUse hook that returns ANY concrete
-// permission decision (even "allow") for AskUserQuestion preempts the CLI's
-// permission_ask_user_question dialog — onUserDialog never fires, the tool runs with empty answers,
-// and the model continues with "The user did not answer the questions." The hook MUST fall through
-// with no decision so the native question dialog (the card) is shown.
-test("AskUserQuestion falls through with no permission decision (lets the dialog fire)", async () => {
+// permission decision (even "allow") for AskUserQuestion short-circuits the permission flow before
+// canUseTool — so the tool runs with empty answers and the model continues with "The user did not
+// answer the questions." The hook MUST fall through with no decision so the tool's "ask" verdict
+// reaches canUseTool, where the question card is surfaced and the answer fed back via updatedInput.
+test("AskUserQuestion falls through with no permission decision (so 'ask' reaches canUseTool)", async () => {
   const hook = makePreToolUseHook(fakeSession(), new PermissionBroker());
   const out = (await hook({ tool_name: "AskUserQuestion", tool_input: { questions: [] } } as any, "tool_1", ctx)) as any;
   expect(out).toEqual({ continue: true });
-  // Crucially, it must NOT carry a permission decision (that is what suppresses the dialog).
+  // Crucially, it must NOT carry a permission decision (that is what short-circuits canUseTool).
   expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
 });
 

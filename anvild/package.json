@@ -20,6 +20,7 @@
     "@types/jsdom": "^28.0.3",
     "@types/katex": "^0.16.8",
     "@types/markdown-it": "^14.1.2",
+    "@types/sortablejs": "^1.15.9",
     "typescript": "^5"
   },
   "dependencies": {
@@ -35,6 +36,7 @@
     "material-symbols": "^0.45.2",
     "mermaid": "^11.15.0",
     "shiki": "^4.2.0",
+    "sortablejs": "^1.15.7",
     "web-push": "^3.6.7"
   }
 }

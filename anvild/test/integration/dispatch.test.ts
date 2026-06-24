@@ -18,7 +18,7 @@ afterAll(() => {
 });
 
 // Frames the server sends automatically on connect (arch §6.2, fleet §6) — not RPC replies.
-const CONNECT_FRAMES = new Set(["server.hello", "session.list", "budget", "environments"]);
+const CONNECT_FRAMES = new Set(["server.hello", "session.list", "budget", "environments", "todoist.status"]);
 
 /**
  * Open a WS, send `payload`, resolve with the first reply that ISN'T one of the on-connect

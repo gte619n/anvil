@@ -1,4 +1,5 @@
 import MarkdownIt from "markdown-it";
+import Sortable from "sortablejs";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
@@ -34,6 +35,7 @@ import type {
   QuestionAnswer,
   ServerEvent,
   Session,
+  TodoistProjectInfo,
 } from "../../protocol";
 import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 
@@ -82,7 +84,7 @@ const removingSessions = new Set<string>();
 // temporal dead zone when init runs at module load, so touching it throws and aborts the rest of
 // module init → a totally dead app (no list, no buttons). Bites worst on the no-activeId path
 // (fresh device / reinstalled Android, empty localStorage). See memory: web-early-init-decl-order-crash.
-let drag: { el: HTMLElement; startX: number; startY: number; lastY: number; timer: number; lifted: boolean; touch: boolean } | null = null; // press-and-hold-to-reorder
+let dragging = false; // true while a SortableJS drag is in progress (suppresses re-renders)
 let justDragged = false; // set briefly after a drop so the row's click doesn't also navigate
 let thinkingEl: HTMLElement | null = null; // animated "thinking" indicator, pinned to the bottom while a turn runs
 let activityEl: HTMLDetailsElement | null = null; // consolidated per-turn tool/thinking activity block (§5)
@@ -781,6 +783,11 @@ function onEvent(url: string, e: ServerEvent): void {
     case "environments":
       onEnvironments(url, e.environments);
       return;
+    case "todoist.status":
+      onTodoistStatus(e.connected, e.account);
+      return;
+    case "todoist.projects.result":
+      return; // resolved via cidWaiter (loadTodoistProjects)
     case "dirs.list.result":
       onDirs?.(e);
       return;
@@ -1456,28 +1463,32 @@ async function runMermaid(container: HTMLElement): Promise<void> {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 function renderSessions(): void {
-  if (drag?.lifted) return; // don't yank a row out from under an in-progress drag
+  if (dragging) return; // don't yank a row out from under an in-progress drag
+  const conciergeUl = $("#concierge-list");
   const activeUl = $("#session-list");
   const finishedUl = $("#finished-list");
+  conciergeUl.innerHTML = "";
   activeUl.innerHTML = "";
   finishedUl.innerHTML = "";
   const ord = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
   const sortFn = (a: Session, b: Session): number =>
-    Number(!!b.isDefault) - Number(!!a.isDefault) || // the persistent concierge chat is always pinned first
+    Number(!!b.isDefault) - Number(!!a.isDefault) ||
     Number(!!a.archived) - Number(!!b.archived) ||
     ord(a) - ord(b);
   const all = [...sessions.values()];
-  const anyFinished = all.some((s) => s.finished);
+  // The concierge (isDefault) is pinned at the top, OUTSIDE the sortable/grouped lists (#26).
+  for (const s of all.filter((s) => s.isDefault)) conciergeUl.appendChild(renderSessionItem(s));
+  const rest = all.filter((s) => !s.isDefault);
+  const anyFinished = rest.some((s) => s.finished);
 
-  // With one server, render a flat list (identical to before). With many, the active list is
-  // grouped under per-server section headers (hub first) each showing a live status dot; the
-  // Finished list stays flat across servers. Separators aren't `.session` rows, so drag-reorder
-  // (which selects `.session`) ignores them. (fleet — anvil-multi-server.md §4)
+  // One server → flat list. Many → group the active list under per-server section headers (hub
+  // first) with a live status dot; the Finished list stays flat. Separators aren't `.session` rows,
+  // so SortableJS (which is filtered to `.session`) ignores them. (fleet — anvil-multi-server.md §4)
   if (orderedServers().length <= 1) {
-    for (const s of all.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
+    for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
   } else {
     for (const srv of orderedServers()) {
-      const group = all.filter((s) => !s.finished && (sessionServer.get(s.id) ?? HUB_URL) === srv.url).sort(sortFn);
+      const group = rest.filter((s) => !s.finished && (sessionServer.get(s.id) ?? HUB_URL) === srv.url).sort(sortFn);
       activeUl.appendChild(serverSepRow(srv));
       if (group.length) {
         for (const s of group) activeUl.appendChild(renderSessionItem(s));
@@ -1488,7 +1499,7 @@ function renderSessions(): void {
         activeUl.appendChild(empty);
       }
     }
-    for (const s of all.filter((x) => x.finished).sort(sortFn)) finishedUl.appendChild(renderSessionItem(s));
+    for (const s of rest.filter((x) => x.finished).sort(sortFn)) finishedUl.appendChild(renderSessionItem(s));
   }
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
 }
@@ -1529,12 +1540,19 @@ function renderSessionItem(s: Session): HTMLLIElement {
     if (!removing) selectSession(s.id); // a session being cleaned up isn't selectable
   });
   li.append(a);
-  if (!removing) {
-    // The concierge is pinned and can't be reordered or moved to Finished, so it isn't draggable.
-    if (!s.isDefault) {
-      li.addEventListener("touchstart", (e) => onRowTouchStart(e, li), { passive: true });
-      li.addEventListener("mousedown", (e) => onRowMouseDown(e, li));
-    }
+  if (s.isDefault) {
+    // The concierge is pinned; its row carries the "+" that opens the new-session flow.
+    const add = document.createElement("button");
+    add.className = "row-btn new-session";
+    add.title = "New session";
+    add.innerHTML = icon("add");
+    add.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showNewSession();
+    });
+    li.append(add);
+  } else if (!removing) {
     const open = document.createElement("button");
     open.className = "row-btn open-tab";
     open.title = "Open in new tab";
@@ -1549,172 +1567,48 @@ function renderSessionItem(s: Session): HTMLLIElement {
   return li;
 }
 
-// ── Press-and-hold to reorder (touch + mouse) ───────────────────────────────────────────────────
-// Press-and-hold a row to lift it, then drag — into the Finished group or a new position — and drop
-// on release. No drag handle (Android read a handle's long-press as text selection; rows are
-// user-select:none). Implemented with raw touch/mouse events, NOT pointer events: in an Android
-// WebView a pointer gesture inside a scroll container gets claimed for scrolling — pointermove turns
-// uncancelable and pointercancel fires — so the lift never engaged. Touch events + a hold delay + a
-// non-passive touchmove (preventDefault only AFTER the hold) lets us take the gesture cleanly.
-const LONG_PRESS_MS = 250;
-const MOVE_CANCEL = 9; // px of pre-lift movement: on touch that means "scroll", so abandon the drag
-// `drag` / `justDragged` are declared in the early-init cluster up top — renderSessions() reads
-// `drag?.lifted` and `justDragged` at load (top-level instant-restore init).
-let autoScrollRAF = 0;
-let lastTouchAt = 0; // guards against the synthetic mousedown a tap emits after touchend
-
-function beginPress(el: HTMLElement, x: number, y: number, touch: boolean): void {
-  clearDrag();
-  drag = { el, startX: x, startY: y, lastY: y, timer: 0, lifted: false, touch };
-  drag.timer = window.setTimeout(liftPress, LONG_PRESS_MS);
-}
-function liftPress(): void {
-  if (!drag) return;
-  drag.lifted = true;
-  drag.el.classList.add("dragging");
-  $("#finished-section").hidden = false; // reveal the (possibly empty) drop target
-  navigator.vibrate?.(12); // "picked up" haptic where supported
-  startAutoScroll();
-}
-/** Handle a move; returns true while actively dragging (so the touch handler preventDefaults scroll). */
-function pressMove(x: number, y: number): boolean {
-  if (!drag) return false;
-  if (!drag.lifted) {
-    const moved = Math.abs(y - drag.startY) > MOVE_CANCEL || Math.abs(x - drag.startX) > MOVE_CANCEL;
-    if (moved) {
-      if (drag.touch) clearDrag(); // a pre-hold move on touch = the user is scrolling; let them
-      else {
-        clearTimeout(drag.timer);
-        liftPress(); // mouse: a drag begins immediately on move
-      }
-    }
-    return drag?.lifted ?? false;
-  }
-  drag.lastY = y;
-  reorderTo(y);
-  return true;
-}
-function reorderTo(y: number): void {
-  if (!drag) return;
-  const finishedUl = $("#finished-list");
-  const overFinished = y >= $("#finished-section").getBoundingClientRect().top;
-  finishedUl.classList.toggle("drag-over", overFinished);
-  const list = overFinished ? finishedUl : $("#session-list");
-  const after = dragAfter(list, y);
-  if (after === null) list.appendChild(drag.el);
-  else if (after !== drag.el) list.insertBefore(drag.el, after);
-}
-/** End the gesture; `commit` true → persist the dropped order, false → restore from state. */
-function endPress(commit: boolean): void {
-  const lifted = drag?.lifted ?? false;
-  clearDrag();
-  if (lifted && commit) {
-    commitOrderFromDom();
-    justDragged = true;
-    setTimeout(() => (justDragged = false), 350); // swallow the click the drop synthesizes
-  } else if (lifted) {
-    renderSessions(); // cancelled mid-drag → restore positions from state
-  }
-}
-function clearDrag(): void {
-  if (!drag) return;
-  clearTimeout(drag.timer);
-  drag.el.classList.remove("dragging");
-  $("#finished-list").classList.remove("drag-over");
-  stopAutoScroll();
-  drag = null;
-}
-// While lifted, keep scrolling the list when the finger/cursor sits near an edge (even if held still).
-function startAutoScroll(): void {
-  const scroller = $("#session-scroll");
-  const EDGE = 48;
-  const step = (): void => {
-    if (!drag?.lifted) {
-      autoScrollRAF = 0;
-      return;
-    }
-    const r = scroller.getBoundingClientRect();
-    const y = drag.lastY;
-    if (y < r.top + EDGE && scroller.scrollTop > 0) {
-      scroller.scrollTop -= Math.ceil((r.top + EDGE - y) / 5);
-      reorderTo(y);
-    } else if (y > r.bottom - EDGE) {
-      scroller.scrollTop += Math.ceil((y - (r.bottom - EDGE)) / 5);
-      reorderTo(y);
-    }
-    autoScrollRAF = requestAnimationFrame(step);
+// ── Drag-to-reorder (SortableJS) ────────────────────────────────────────────────────────────────
+// The active-session list and the Finished group are two linked sortables sharing one group, so a
+// row can be dragged from either into the other (and back out of Finished). forceFallback uses
+// SortableJS's own cloned-element drag rather than native HTML5 DnD — which never fires on touch —
+// so it behaves identically on desktop and in the Android WebView. delayOnTouchOnly + a touch
+// threshold give the familiar press-and-hold-then-drag feel on touch while keeping an immediate grab
+// with the mouse. The pinned concierge row lives in its own list (not a sortable), so it can't be
+// reordered or dropped into Finished. `dragging`/`justDragged` are declared in the early-init cluster.
+let sortablesReady = false;
+function initSortables(): void {
+  if (sortablesReady) return;
+  sortablesReady = true;
+  const opts: Sortable.Options = {
+    group: "sessions",
+    draggable: ".session",
+    filter: ".row-btn", // taps on the open-tab / + buttons must not begin a drag
+    preventOnFilter: false, // …and must still fire their own click
+    animation: 150,
+    delay: 250, // press-and-hold before a touch drag engages
+    delayOnTouchOnly: true, // mouse drags start immediately
+    touchStartThreshold: 9, // a small finger move within the delay = scroll, so abandon the drag
+    forceFallback: true, // cloned-element fallback everywhere: touch-safe and consistent
+    fallbackClass: "session-fallback",
+    fallbackOnBody: true,
+    ghostClass: "session-ghost",
+    chosenClass: "session-chosen",
+    scroll: true, // auto-scroll a list when dragging near its edges
+    scrollSensitivity: 48,
+    onStart: () => {
+      dragging = true;
+      $("#finished-section").hidden = false; // reveal the (possibly empty) drop target
+      navigator.vibrate?.(12); // "picked up" haptic where supported
+    },
+    onEnd: () => {
+      dragging = false;
+      justDragged = true;
+      setTimeout(() => (justDragged = false), 350); // swallow the click the drop synthesizes
+      commitOrderFromDom(); // read the settled DOM order, sync to the daemon, and re-render
+    },
   };
-  autoScrollRAF = requestAnimationFrame(step);
-}
-function stopAutoScroll(): void {
-  if (autoScrollRAF) cancelAnimationFrame(autoScrollRAF);
-  autoScrollRAF = 0;
-}
-// Touch: start passively (a plain scroll stays fast); the document touchmove is non-passive so we can
-// cancel scrolling once the row is lifted.
-function onRowTouchStart(e: TouchEvent, el: HTMLElement): void {
-  lastTouchAt = Date.now();
-  if (e.touches.length !== 1 || (e.target as HTMLElement).closest(".row-btn")) return;
-  const t = e.touches[0];
-  if (!t) return;
-  beginPress(el, t.clientX, t.clientY, true);
-  document.addEventListener("touchmove", onDocTouchMove, { passive: false });
-  document.addEventListener("touchend", onDocTouchEnd);
-  document.addEventListener("touchcancel", onDocTouchCancel);
-}
-function onDocTouchMove(e: TouchEvent): void {
-  if (!drag) {
-    detachTouch();
-    return;
-  }
-  const t = e.touches[0];
-  if (!t) return;
-  if (pressMove(t.clientX, t.clientY)) e.preventDefault(); // own the gesture → block page scroll
-}
-function onDocTouchEnd(): void {
-  detachTouch();
-  endPress(true);
-}
-function onDocTouchCancel(): void {
-  detachTouch();
-  endPress(false);
-}
-function detachTouch(): void {
-  document.removeEventListener("touchmove", onDocTouchMove);
-  document.removeEventListener("touchend", onDocTouchEnd);
-  document.removeEventListener("touchcancel", onDocTouchCancel);
-}
-function onRowMouseDown(e: MouseEvent, el: HTMLElement): void {
-  if (e.button !== 0 || Date.now() - lastTouchAt < 700) return; // ignore the post-tap synthetic mousedown
-  if ((e.target as HTMLElement).closest(".row-btn")) return;
-  beginPress(el, e.clientX, e.clientY, false);
-  document.addEventListener("mousemove", onDocMouseMove);
-  document.addEventListener("mouseup", onDocMouseUp);
-}
-function onDocMouseMove(e: MouseEvent): void {
-  if (!drag) {
-    detachMouse();
-    return;
-  }
-  pressMove(e.clientX, e.clientY);
-}
-function onDocMouseUp(): void {
-  detachMouse();
-  endPress(true);
-}
-function detachMouse(): void {
-  document.removeEventListener("mousemove", onDocMouseMove);
-  document.removeEventListener("mouseup", onDocMouseUp);
-}
-/** The row to insert the dragged element before for pointer Y — or null to append. */
-function dragAfter(container: HTMLElement, y: number): HTMLElement | null {
-  let best: { off: number; el: HTMLElement | null } = { off: -Infinity, el: null };
-  for (const el of container.querySelectorAll<HTMLElement>(".session:not(.dragging)")) {
-    const box = el.getBoundingClientRect();
-    const off = y - box.top - box.height / 2; // negative ⇒ pointer is above this row's middle
-    if (off < 0 && off > best.off) best = { off, el };
-  }
-  return best.el;
+  Sortable.create($("#session-list"), opts);
+  Sortable.create($("#finished-list"), opts);
 }
 /** Read both lists' DOM order → order + Finished membership, apply optimistically, sync to the daemon. */
 function commitOrderFromDom(): void {
@@ -1804,7 +1698,8 @@ function onEnvironments(url: string, list: Environment[]): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-let settingsTab: "servers" | "environments" = "environments";
+type SettingsTab = "servers" | "environments" | "todoist";
+let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
   root.innerHTML = `<div class="settings-view">
@@ -1815,6 +1710,7 @@ function openSettings(): void {
     <div class="settings-tabs" role="tablist">
       <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
+      <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
     </div>
     <div class="settings-body">
       <section class="settings-panel" data-tab="environments">
@@ -1825,22 +1721,115 @@ function openSettings(): void {
       <section class="settings-panel" data-tab="servers">
         <div id="server-cards"><p class="small muted">Loading…</p></div>
       </section>
+      <section class="settings-panel" data-tab="todoist">
+        <div class="section-head"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
+        <p class="small muted">Link a Todoist project to an environment, then the nightly autopilot plans &amp; builds its tasks. Set the token with <code>bun run scripts/todoist.ts set</code>.</p>
+        <div id="todoist-panel"><p class="small muted">Loading…</p></div>
+      </section>
     </div>
   </div>`;
   $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
+  $("#todoist-refresh").addEventListener("click", () => loadTodoistProjects(true));
   root.querySelectorAll<HTMLElement>(".stab").forEach((t) =>
-    t.addEventListener("click", () => selectSettingsTab(t.dataset.tab as "servers" | "environments")),
+    t.addEventListener("click", () => selectSettingsTab(t.dataset.tab as SettingsTab)),
   );
   selectSettingsTab(settingsTab);
   openOverlay("settings", closeSettings); // Back closes Settings (no-op if it's already a layer)
   renderServerCards();
   renderEnvCards();
 }
-function selectSettingsTab(tab: "servers" | "environments"): void {
+function selectSettingsTab(tab: SettingsTab): void {
   settingsTab = tab;
   document.querySelectorAll<HTMLElement>(".settings-view .stab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   document.querySelectorAll<HTMLElement>(".settings-view .settings-panel").forEach((p) => (p.hidden = p.dataset.tab !== tab));
+  if (tab === "todoist") renderTodoistPanel();
+}
+
+// ── Todoist integration ──────────────────────────────────────────────────────────
+let todoistConnected = false;
+let todoistAccount: string | undefined;
+const todoistProjects = new Map<string, TodoistProjectInfo>();
+let todoistProjectsLoaded = false;
+
+const todoistProjectName = (id?: string): string | undefined => (id ? todoistProjects.get(id)?.name : undefined);
+
+/** <option> list for the env link select; keeps the current link selectable even if not yet cached. */
+function todoistProjectOptions(selectedId?: string): string {
+  const opts = [`<option value="">— none —</option>`];
+  const seen = new Set<string>();
+  for (const p of [...todoistProjects.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+    seen.add(p.id);
+    const label = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
+    opts.push(`<option value="${esc(p.id)}"${p.id === selectedId ? " selected" : ""}>${label}</option>`);
+  }
+  if (selectedId && !seen.has(selectedId)) {
+    opts.push(`<option value="${esc(selectedId)}" selected>${esc(todoistProjectName(selectedId) ?? selectedId)}</option>`);
+  }
+  return opts.join("");
+}
+
+function onTodoistStatus(connected: boolean, account?: string): void {
+  todoistConnected = connected;
+  todoistAccount = account;
+  if (document.getElementById("todoist-panel")) renderTodoistPanel();
+}
+
+/** Fetch the account's projects (live) and cache them; `force` re-fetches even if already loaded. */
+async function loadTodoistProjects(force = false): Promise<void> {
+  if (!todoistConnected) return;
+  if (todoistProjectsLoaded && !force) return;
+  const host = document.getElementById("todoist-panel");
+  if (host && force) host.innerHTML = `<p class="small muted">Loading projects…</p>`;
+  try {
+    const res = await sendAwait(hub(), { type: "todoist.projects.list", cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type !== "todoist.projects.result") return;
+    todoistProjects.clear();
+    for (const p of res.projects) todoistProjects.set(p.id, p);
+    todoistProjectsLoaded = true;
+    renderTodoistPanel();
+    if (document.getElementById("env-cards")) renderEnvCards(); // refresh link labels
+  } catch (err) {
+    toast(`Couldn't load Todoist projects: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+function renderTodoistPanel(): void {
+  const host = document.getElementById("todoist-panel");
+  if (!host) return;
+  if (!todoistConnected) {
+    host.innerHTML = `<div class="card"><b>Not connected.</b>
+      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), then run on the daemon host:</p>
+      <pre class="git-output">bun run scripts/todoist.ts set</pre></div>`;
+    return;
+  }
+  if (!todoistProjectsLoaded) {
+    host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""}.</div>
+      <p class="small muted" style="margin-top:10px">Loading projects…</p>`;
+    void loadTodoistProjects();
+    return;
+  }
+  // Which env (if any) each project is linked to.
+  const linkedBy = new Map<string, string>();
+  for (const e of environments.values()) if (e.todoistProjectId) linkedBy.set(e.todoistProjectId, e.name);
+  const rows = [...todoistProjects.values()]
+    .sort((a, b) => (b.taskCount ?? 0) - (a.taskCount ?? 0))
+    .map((p) => {
+      const link = linkedBy.get(p.id);
+      return `<tr>
+        <td>${esc(p.name)}${p.parentId ? ` <span class="small muted">(sub)</span>` : ""}</td>
+        <td class="small muted">${p.taskCount ?? 0}</td>
+        <td>${link ? `<span class="small">${icon("link")} ${esc(link)}</span>` : `<span class="small muted">—</span>`}</td>
+      </tr>`;
+    })
+    .join("");
+  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects</div>
+    <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
@@ -2154,6 +2143,7 @@ function renderEnvCards(): void {
           <b><span class="env-dot" style="background:${stripeColor(e, 0, currentTheme())}"></span>${esc(e.name)}</b>
           <div class="small muted"><code>${esc(e.repoRoot)}</code></div>
           <div class="small muted">${icon("account_tree")} off <code>${esc(e.defaultBase ?? "HEAD")}</code></div>
+          ${e.todoistProjectId ? `<div class="small muted">${icon("checklist")} ${esc(todoistProjectName(e.todoistProjectId) ?? "Todoist project")}</div>` : ""}
         </div>
         <div class="env-actions">
           <button class="mini env-readme" data-env="${esc(e.id)}">${icon("description")} README</button>
@@ -2818,7 +2808,7 @@ let onDirs: ((e: DirsListResultEvent) => void) | null = null;
 const browse = { path: "", parent: undefined as string | undefined, serverUrl: HUB_URL };
 const browseServer = (): Server => servers.get(browse.serverUrl) ?? hub();
 
-$("#new-session").addEventListener("click", showNewSession);
+initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
 
 /** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so
@@ -3118,17 +3108,39 @@ function showEditEnvironment(id: string): void {
   if (!env) return;
   const m = document.createElement("div");
   m.className = "modal";
+  const projectOptions = todoistProjectOptions(env.todoistProjectId);
+  const validationText = env.validation?.commands?.join("\n") ?? "";
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
     ${swatchPickerMarkup(env.color)}
+    <label>Todoist project
+      <select id="ee-todoist">${projectOptions}</select>
+    </label>
+    ${todoistConnected ? "" : `<p class="small muted">Connect Todoist (Settings → Todoist) to link a project.</p>`}
+    <label>Validation gate <span class="small muted">(one command per line — all must pass before a unit is auto-PR'd)</span>
+      <textarea id="ee-validation" rows="3" placeholder="bun run typecheck&#10;bun test">${esc(validationText)}</textarea>
+    </label>
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
   wireSwatchPicker();
+  if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
-    serverOfEnv(id).sock.send({ type: "env.update", id, name: $<HTMLInputElement>("#ee-name").value, defaultBase: $<HTMLInputElement>("#ee-base").value, color: selectedSwatch() });
+    const commands = $<HTMLTextAreaElement>("#ee-validation").value
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    serverOfEnv(id).sock.send({
+      type: "env.update",
+      id,
+      name: $<HTMLInputElement>("#ee-name").value,
+      defaultBase: $<HTMLInputElement>("#ee-base").value,
+      color: selectedSwatch(),
+      todoistProjectId: $<HTMLSelectElement>("#ee-todoist").value, // "" unlinks
+      validation: commands.length ? { commands } : null,
+    });
     closeModal();
   };
   $<HTMLButtonElement>("#ee-remove").onclick = async () => {
@@ -3251,8 +3263,11 @@ function showQuestion(requestId: string, questions: Question[]): void {
       toast("Pick or type an answer for each question.");
       return;
     }
-    sendTo(activeId, { type: "question.respond", requestId, answers });
+    // Resolve the card and surface "Working" up front so the tap feels instant — the turn
+    // resumes on the daemon's next event. The send happens after (and is queued if we're offline).
     resolveQuestionUI(requestId, summarizeAnswers(answers));
+    showThinking("running_tool");
+    respondToQuestion({ type: "question.respond", requestId, answers });
   };
 
   for (const [qi, q] of questions.entries()) {
@@ -3308,8 +3323,9 @@ function showQuestion(requestId: string, questions: Question[]): void {
   skip.className = "q-btn skip";
   skip.textContent = "Skip";
   skip.onclick = () => {
-    sendTo(activeId, { type: "question.respond", requestId, answers: [], cancelled: true });
     resolveQuestionUI(requestId, "Skipped");
+    showThinking("running_tool");
+    respondToQuestion({ type: "question.respond", requestId, answers: [], cancelled: true });
   };
   btns.appendChild(skip);
   if (!oneTap) {
@@ -3324,6 +3340,11 @@ function showQuestion(requestId: string, questions: Question[]): void {
   questionCards.set(requestId, card);
   conversation.appendChild(card);
   scrollDown();
+}
+
+/** Fire a question answer; queue it for reconnect instead of dropping it if we're momentarily offline. */
+function respondToQuestion(cmd: { type: "question.respond"; requestId: string; answers: QuestionAnswer[]; cancelled?: boolean }): void {
+  if (!sendTo(activeId, cmd)) enqueue({ cid: newCid(), cmd }); // route to the active session's server
 }
 
 /** Gather one answer per question from the clicked options + any "Other" text; null if any is empty. */

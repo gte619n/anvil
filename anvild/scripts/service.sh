@@ -35,9 +35,15 @@ find_bun() {
 }
 
 # Rebuild the web client into web/dist. Both `install` and `restart` call this so the bundle the
-# daemon serves can never lag the source (see the DEPLOY NOTE at the top of this file).
+# daemon serves can never lag the source (see the DEPLOY NOTE at the top of this file). We run
+# `bun install` first: a `git pull` can add a new dependency (e.g. sortablejs in #26), and
+# `build:web` resolves imports straight out of node_modules — so without an install the build
+# fails with "Could not resolve …" and the atomic dist swap silently keeps serving the old UI.
+# An in-sync lockfile makes the install a fast no-op, so it's cheap to always run.
 build_web() {
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
+  echo "installing dependencies…"
+  ( cd "$ANVILD_DIR" && "$bun" install ) || { echo "error: bun install failed"; exit 1; }
   echo "building web client…"
   ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null )
 }
