@@ -2805,9 +2805,15 @@ function showGitResult(e: GitResultEvent): void {
   el.innerHTML = esc(head + e.output).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
 }
 
-$("#btn-new-topic").addEventListener("click", () => {
+$("#btn-new-topic").addEventListener("click", async () => {
   if (!activeId) return;
-  if (!confirm("Start a new topic? Claude forgets the earlier context but the visible history stays.")) return;
+  const ok = await confirmDialog({
+    icon: "restart_alt",
+    title: "Start a new topic?",
+    body: "Claude forgets the earlier context but the visible history stays.",
+    confirmLabel: "Start new topic",
+  });
+  if (!ok) return;
   sendTo(activeId, { type: "session.new_topic", sessionId: activeId, cid: newCid() });
   toast("Started a new topic — fresh context.");
 });
