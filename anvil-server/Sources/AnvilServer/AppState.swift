@@ -29,8 +29,7 @@ final class AppState: ObservableObject {
     do { try Auth.writeToken(token) } catch {
       return Pairing.PairReply(ok: false, serverId: nil, serverName: nil, error: "could not save token — \(error.localizedDescription)")
     }
-    Daemon.service(.install) { _ in }
-    DispatchQueue.global().async { Tailscale.serve(externalPort: Paths.port, localPort: Paths.port) }
+    Daemon.service(.install) { _ in } // the daemon binds the tailnet IP itself (service.sh) — no serve
     return Pairing.PairReply(ok: true, serverId: nil, serverName: Tailscale.magicDNSName(), error: nil)
   }
 
@@ -81,12 +80,9 @@ final class AppState: ObservableObject {
     }
   }
 
-  /// Ensure `tailscale serve` exposes the daemon, then report the URL.
-  func ensureServe() {
-    DispatchQueue.global().async {
-      Tailscale.serve(externalPort: Paths.port, localPort: Paths.port)
-    }
-  }
+  /// No-op now: the daemon binds its tailnet IP directly (service.sh), so there's no `tailscale serve`
+  /// to set up. Kept so callers don't need to change.
+  func ensureServe() {}
 
   // MARK: - Fleet (join + rotation)
 

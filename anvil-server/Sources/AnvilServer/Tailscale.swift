@@ -39,9 +39,32 @@ enum Tailscale {
     Shell.run("tailscale", ["serve", "--https=\(externalPort)", "off"])
   }
 
-  /// The https URL the daemon is reachable at on the tailnet, if resolvable.
+  /// This host's Tailscale IPv4 (100.64.0.0/10) from the network interfaces — no `tailscale` CLI
+  /// needed. The daemon binds this directly, so it's reachable over the tailnet via plain HTTP.
+  static func tailnetIP() -> String? {
+    var ptr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ptr) == 0, let first = ptr else { return nil }
+    defer { freeifaddrs(ptr) }
+    var cur: UnsafeMutablePointer<ifaddrs>? = first
+    while let c = cur {
+      let ifa = c.pointee
+      if let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) {
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+          let ip = String(cString: host)
+          let o = ip.split(separator: ".").compactMap { Int($0) }
+          if o.count == 4, o[0] == 100, o[1] >= 64, o[1] <= 127 { return ip }
+        }
+      }
+      cur = ifa.ifa_next
+    }
+    return nil
+  }
+
+  /// The plain-HTTP URL the daemon is reachable at on the tailnet (MagicDNS name if the CLI resolves
+  /// it, else the tailnet IP). No `tailscale serve` / HTTPS.
   static func daemonURL() -> String? {
-    magicDNSName().map { "https://\($0):\(Paths.port)/" }
+    (magicDNSName() ?? tailnetIP()).map { "http://\($0):\(Paths.port)/" }
   }
 
   /// This node's tailnet login (owner), e.g. "evan@example.com" — used to gate pairing to same-user.

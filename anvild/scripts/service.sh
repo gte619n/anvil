@@ -48,9 +48,16 @@ build_web() {
   ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null )
 }
 
+# This host's Tailscale IPv4 (100.64.0.0/10), if any — the daemon binds it directly (no `tailscale
+# serve`). Found from interfaces, so it works even when the `tailscale` CLI doesn't.
+tailnet_ip() {
+  ifconfig 2>/dev/null | awk '/inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./{print $2; exit}'
+}
+
 wait_health() {
+  local ip; ip="$(tailnet_ip)"; ip="${ip:-127.0.0.1}"
   for _ in $(seq 1 60); do
-    curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && return 0
+    curl -fsS "http://$ip:$PORT/api/health" >/dev/null 2>&1 && return 0
     sleep 0.2
   done
   return 1
@@ -85,7 +92,8 @@ set -a
 set +a
 unset ANTHROPIC_API_KEY
 unset ANTHROPIC_AUTH_TOKEN
-export ANVIL_HOST=127.0.0.1
+# Bind the tailnet IP directly (reachable over the tailnet via plain HTTP, no \`tailscale serve\`);
+# the daemon falls back to localhost if this host isn't on a tailnet. ANVIL_HOST can override.
 export ANVIL_PORT=$PORT
 export ANVIL_MANAGED=launchd
 exec "$bun" run "$ANVILD_DIR/src/main.ts"
@@ -115,18 +123,19 @@ PLISTEOF
   launchctl bootstrap "$DOMAIN" "$PLIST"
   launchctl kickstart -k "$DOMAIN/$LABEL"
 
+  local bind_ip; bind_ip="$(tailnet_ip)"; bind_ip="${bind_ip:-127.0.0.1}"
   if wait_health; then
-    echo "healthy: $(curl -fsS "http://127.0.0.1:$PORT/api/health")"
+    echo "healthy: $(curl -fsS "http://$bind_ip:$PORT/api/health")"
   else
     echo "warning: not healthy yet — check $STATE_DIR/anvild.error.log"
   fi
 
-  # tailscale serve (idempotent)
+  # Reachable directly on the tailnet over plain HTTP — no `tailscale serve` (it can fail per-machine,
+  # e.g. the App Store Tailscale). WireGuard encrypts the hop; the daemon is bound to the tailnet IP.
   if command -v tailscale >/dev/null 2>&1; then
-    tailscale serve --bg --https="$PORT" "http://127.0.0.1:$PORT" >/dev/null 2>&1 || true
     local dns
     dns="$(tailscale status --json 2>/dev/null | "$bun" -e 'const s=JSON.parse(await Bun.stdin.text());process.stdout.write((s.Self?.DNSName||"").replace(/\.$/,""))' 2>/dev/null || true)"
-    [ -n "$dns" ] && echo "URL: https://$dns:$PORT/"
+    [ -n "$dns" ] && echo "URL: http://$dns:$PORT/"
   fi
   echo "installed $LABEL  (logs: $STATE_DIR/anvild.log)"
 }

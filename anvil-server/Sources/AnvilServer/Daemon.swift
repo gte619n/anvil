@@ -30,7 +30,11 @@ enum Daemon {
     }
   }
 
-  static func healthURL() -> URL { URL(string: "http://127.0.0.1:\(Paths.port)/api/health")! }
+  // The daemon binds the tailnet IP directly (no serve), so health-check that — not localhost.
+  static func healthURL() -> URL {
+    let ip = Tailscale.tailnetIP() ?? "127.0.0.1"
+    return URL(string: "http://\(ip):\(Paths.port)/api/health")!
+  }
 
   /// Poll `/api/health`. `nil` health = unreachable (daemon down / starting).
   static func fetchHealth(completion: @escaping (Health?) -> Void) {

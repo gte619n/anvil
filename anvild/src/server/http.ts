@@ -31,7 +31,10 @@ const CSP = [
   "script-src 'self'",
   // 'self' = the hub's own daemon; wss:/ws: for its WebSocket; https://*.ts.net + wss://*.ts.net let
   // the hub web app federate other servers on the tailnet (fleet — anvil-multi-server.md §4.1/§5.1).
-  "connect-src 'self' ws: wss: https://*.ts.net wss://*.ts.net",
+  // 'self' = the hub's own daemon; the *.ts.net entries let the hub web app federate other servers on
+  // the tailnet. Both http/ws (daemons bound directly to the tailnet IP) and https/wss (behind
+  // `tailscale serve`) are allowed (fleet — anvil-multi-server.md §4.1/§5.1).
+  "connect-src 'self' ws: wss: http://*.ts.net ws://*.ts.net https://*.ts.net wss://*.ts.net",
   "font-src 'self' https://fonts.gstatic.com", // Material Symbols woff2 from Google's CDN (bundled in native apps)
   "object-src 'none'",
   "base-uri 'none'",
@@ -194,7 +197,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
           serverId: outcome.serverId || host,
           serverName: outcome.serverName || host,
           host,
-          url: `https://${host}:${opts.port}/`,
+          url: `http://${host}:${opts.port}/`, // joiner daemons bind the tailnet IP directly (plain HTTP, no serve)
         };
         fleet.upsert(member);
         return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
