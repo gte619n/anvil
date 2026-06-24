@@ -114,14 +114,31 @@ PLIST
 
 echo "APPL????" > "$APP/Contents/PkgInfo"
 
-# ── 6. ad-hoc codesign ─────────────────────────────────────────────────────
-echo "▸ ad-hoc codesigning…"
+# ── 6. codesign ────────────────────────────────────────────────────────────
+# SIGN_ID="-" → ad-hoc (default, for local debug). Set SIGN_ID to a real
+# "Developer ID Application: …" identity (e.g. via scripts/mac-signing/provision.sh,
+# which exports it) to produce a distributable, notarizable build.
+SIGN_ID="${SIGN_ID:--}"
 ENTITLEMENTS="$HERE/Resources/Anvil.entitlements"
-codesign --force --deep --sign - \
+TIMESTAMP_FLAG=(); [ "$SIGN_ID" != "-" ] && TIMESTAMP_FLAG=(--timestamp)
+echo "▸ codesigning ($([ "$SIGN_ID" = "-" ] && echo ad-hoc || echo "$SIGN_ID"))…"
+codesign --force --sign "$SIGN_ID" \
   ${ENTITLEMENTS:+--entitlements "$ENTITLEMENTS"} \
-  --options runtime \
+  --options runtime "${TIMESTAMP_FLAG[@]}" \
   "$APP"
 codesign --verify --deep --strict "$APP" && echo "  ✓ signature verifies"
+
+# ── 7. notarize + staple (only for real Developer ID builds) ───────────────
+if [ "$SIGN_ID" != "-" ] && [ -n "${APPLE_API_KEY_PATH:-}" ]; then
+  echo "▸ notarizing…"
+  ditto -c -k --keepParent "$APP" "$APP.zip"
+  xcrun notarytool submit "$APP.zip" \
+    --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+    --wait
+  xcrun stapler staple "$APP"
+  rm -f "$APP.zip"
+  echo "  ✓ notarized & stapled"
+fi
 
 echo
 echo "✓ built $APP  (v$VERSION build $BUILD)"
