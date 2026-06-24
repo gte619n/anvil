@@ -156,7 +156,14 @@ function saveExtraServers(urls: string[]): void {
     /* quota */
   }
 }
-const serverWsUrl = (base: string): string => base.replace(/^http/i, "ws") + "/ws";
+const serverWsUrl = (base: string): string => {
+  const ws = base.replace(/^http/i, "ws") + "/ws";
+  // An https page CANNOT open a ws:// socket (mixed content → synchronous SecurityError). A fleet
+  // member stored with a plain http:// base would derive ws:// and crash; force wss:// to match the
+  // page's security context. If that peer doesn't actually serve wss it just fails to connect — which
+  // the socket now handles gracefully — instead of taking the whole app down.
+  return typeof location !== "undefined" && location.protocol === "https:" ? ws.replace(/^ws:\/\//i, "wss://") : ws;
+};
 /** Resolve a daemon-relative path against a specific server (session-scoped REST routing). */
 const serverApiUrl = (base: string, path: string): string =>
   /^https?:\/\//i.test(path) ? path : base.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`);
@@ -1862,7 +1869,18 @@ async function addServerByUrl(raw: string): Promise<void> {
   // scheme, try https then http and keep whichever answers. (For a ts.net *name* the browser's HSTS
   // upgrades http→https regardless, so such a host must be served; reach an unserved host by IP.)
   const hasScheme = /^https?:\/\//i.test(input);
-  const candidates = (hasScheme ? [input] : [`https://${input}`, `http://${input}`]).map((u) => u.replace(/\/+$/, ""));
+  // An https page can only ever talk to an https/wss peer (a plain-http member would derive a blocked
+  // ws:// socket). So when this page is secure, never probe or store an http:// candidate: upgrade an
+  // explicit http:// URL and skip the http fallback. A plain-http peer must be reached from a plain-
+  // http page (or given a serve-capable https name).
+  const secure = typeof location !== "undefined" && location.protocol === "https:";
+  const candidates = (
+    hasScheme
+      ? [secure ? input.replace(/^http:\/\//i, "https://") : input]
+      : secure
+        ? [`https://${input}`]
+        : [`https://${input}`, `http://${input}`]
+  ).map((u) => u.replace(/\/+$/, ""));
   let found: string | undefined;
   for (const url of candidates) {
     if (url === HUB_URL || servers.has(url)) {

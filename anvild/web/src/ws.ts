@@ -28,7 +28,21 @@ export class AnvilSocket {
     if (this.closed) return; // removed from the fleet — never reconnect
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     this.onStatus("connecting");
-    const ws = new WebSocket(this.url);
+    // `new WebSocket()` can throw SYNCHRONOUSLY — e.g. a ws:// URL on an https page (mixed content)
+    // raises SecurityError. This runs from top-level module init (one socket per fleet server), so an
+    // uncaught throw here aborts the rest of main.ts and leaves the whole app dead (see memory:
+    // web-early-init-decl-order-crash). Treat a construction failure exactly like a dropped
+    // connection: mark disconnected and retry on the backoff — never let one bad server kill the app.
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(this.url);
+    } catch {
+      this.onStatus("disconnected");
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = window.setTimeout(() => this.connect(), this.backoff);
+      this.backoff = Math.min(this.backoff * 2, 15000);
+      return;
+    }
     this.ws = ws;
     ws.onopen = () => {
       this.backoff = 500;

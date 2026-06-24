@@ -30,5 +30,8 @@ export function apiFetch(path: string, init?: RequestInit): Promise<Response> {
 
 /** ws:// or wss:// URL for the daemon's /ws endpoint. */
 export function wsUrl(): string {
-  return daemonBase().replace(/^http/i, "ws") + "/ws";
+  const ws = daemonBase().replace(/^http/i, "ws") + "/ws";
+  // An https page can't open ws:// (mixed content → synchronous SecurityError). Match the page's
+  // security context so a stored/injected http:// base can't produce a blocked socket.
+  return typeof location !== "undefined" && location.protocol === "https:" ? ws.replace(/^ws:\/\//i, "wss://") : ws;
 }
