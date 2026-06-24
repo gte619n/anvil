@@ -20,6 +20,8 @@ import {
   type AutopilotPlansEvent,
   type AutopilotPlanResultEvent,
   type AutopilotStartedEvent,
+  type AutopilotSchedule,
+  type AutopilotScheduleEvent,
   type GitCmd,
   type GitResultEvent,
   type Model,
@@ -51,6 +53,7 @@ import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient } from "../integrations/todoist";
 import { withStatus } from "../integrations/status";
 import { planAndTagProject, refinePlanQuery } from "../integrations/autopilot";
+import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -106,6 +109,9 @@ export class Supervisor {
   private readonly envStore: EnvironmentStore;
   private readonly integrations: IntegrationStore;
   private readonly workUnits: WorkUnitStore;
+  private readonly autopilotSchedule: AutopilotScheduleStore;
+  private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
+  private scheduleTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
@@ -116,6 +122,7 @@ export class Supervisor {
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
     this.workUnits = new WorkUnitStore(cfg.stateDir);
+    this.autopilotSchedule = new AutopilotScheduleStore(cfg.stateDir);
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
@@ -125,6 +132,29 @@ export class Supervisor {
       softStopFraction: cfg.softStopFraction ?? 0.95,
     });
     this.restore();
+    this.startAutopilotScheduler();
+  }
+
+  /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether a run
+   *  is due and fire it. `unref` so it never holds the process (or a test) open; a startup tick gives
+   *  the catch-up-on-restart behaviour. */
+  private startAutopilotScheduler(): void {
+    this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), 5 * 60_000);
+    this.scheduleTimer.unref?.();
+    void this.maybeRunScheduled();
+  }
+  private async maybeRunScheduled(): Promise<void> {
+    const sched = this.autopilotSchedule.get();
+    if (this.autopilotRunning || !isRunDue(sched, new Date(), sched.lastRunAt)) return;
+    // Stamp the run NOW so a slow run isn't re-triggered on the next 5-min tick, and so a hard error
+    // (Todoist down, no linked envs) doesn't hammer — it waits for the next scheduled window.
+    this.autopilotSchedule.markRun(now());
+    this.broadcastSchedule();
+    try {
+      await this.runAutopilot({ notify: true, autoStart: sched.autoStart, maxAutoStart: sched.maxAutoStart });
+    } catch {
+      /* swallowed: re-tries at the next due window */
+    }
   }
 
   budget(): Budget {
@@ -368,9 +398,17 @@ export class Supervisor {
     return `${head}${body}\n\nImplement it end to end in this worktree, then summarize what you changed.`;
   }
 
-  /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + nightly
-   *  path). Broadcasts the refreshed plans; pushes "N new plans" when an autonomous run produces work. */
-  async runAutopilot(opts: { environmentId?: string; notify?: boolean; onProgress?: (line: string) => void }): Promise<{ created: number; skipped: number; output: string }> {
+  /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
+   *  scheduled run). Broadcasts refreshed plans; when `autoStart`, launches up to `maxAutoStart` of
+   *  the new units (skipped while the budget is warning); pushes a summary when `notify`. */
+  async runAutopilot(opts: {
+    environmentId?: string;
+    notify?: boolean;
+    autoStart?: boolean;
+    maxAutoStart?: number;
+    onProgress?: (line: string) => void;
+  }): Promise<{ created: number; skipped: number; started: number; output: string }> {
+    if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
     const state = this.integrations.todoist();
     if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
     const client = new TodoistClient(state.accessToken);
@@ -384,32 +422,78 @@ export class Supervisor {
       log.push(line);
       opts.onProgress?.(line);
     };
-    let created = 0;
+    this.autopilotRunning = true;
+    const createdUnits: WorkUnit[] = [];
     let skipped = 0;
-    for (const env of envs) {
-      emit(`▸ ${env.name}`);
-      const res = await planAndTagProject(deps, {
-        environmentId: env.id,
-        projectId: env.todoistProjectId!,
-        repoRoot: env.repoRoot,
-        repoName: env.name,
-        onProgress: emit,
-      });
-      created += res.created.length;
-      skipped += res.skipped;
+    let started = 0;
+    try {
+      for (const env of envs) {
+        emit(`▸ ${env.name}`);
+        const res = await planAndTagProject(deps, {
+          environmentId: env.id,
+          projectId: env.todoistProjectId!,
+          repoRoot: env.repoRoot,
+          repoName: env.name,
+          onProgress: emit,
+        });
+        createdUnits.push(...res.created);
+        skipped += res.skipped;
+      }
+      // Auto-start the new units, capped, and only when the subscription budget is healthy — an
+      // unattended run must never spawn a swarm of sessions or exhaust the weekly window.
+      if (opts.autoStart && createdUnits.length) {
+        if (this.budget().warn) {
+          emit("⏸ Auto-start skipped — subscription budget is in its warn zone; plans left for review.");
+        } else {
+          const cap = opts.maxAutoStart ?? 3;
+          for (const u of createdUnits.slice(0, cap)) {
+            try {
+              this.startPlan(u.id);
+              started++;
+              emit(`🚀 Started “${u.title}”.`);
+            } catch (e) {
+              emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+          if (createdUnits.length > cap) emit(`${createdUnits.length - cap} more plan(s) left for manual review (cap ${cap}).`);
+        }
+      }
+    } finally {
+      this.autopilotRunning = false;
     }
+    const created = createdUnits.length;
     this.broadcastAutopilotPlans();
     if (opts.notify && created > 0) {
-      const payload: PushPayload = {
-        title: "Anvil autopilot",
-        body: `${created} new plan${created === 1 ? "" : "s"} ready to review`,
-        tag: "autopilot",
-        kind: "result",
-      };
+      const body = started
+        ? `${created} new plan${created === 1 ? "" : "s"} · ${started} started`
+        : `${created} new plan${created === 1 ? "" : "s"} ready to review`;
+      const payload: PushPayload = { title: "Anvil autopilot", body, tag: "autopilot", kind: "result" };
       void this.webpush.notify(payload);
       void this.fcm.notify(payload);
     }
-    return { created, skipped, output: log.join("\n") };
+    return { created, skipped, started, output: log.join("\n") };
+  }
+
+  // ── Autopilot schedule (in-daemon timer) ──────────────────────────────────────────
+  autopilotScheduleEvent(cid?: string): AutopilotScheduleEvent {
+    const schedule = this.autopilotSchedule.get();
+    const next = nextScheduledFire(schedule, new Date());
+    return {
+      v: PROTOCOL_VERSION,
+      type: "autopilot.schedule",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      schedule,
+      ...(next ? { nextRunAt: next.toISOString() } : {}),
+    };
+  }
+  private broadcastSchedule(): void {
+    this.registry.toAll(this.autopilotScheduleEvent());
+  }
+  setAutopilotSchedule(patch: Partial<Omit<AutopilotSchedule, "lastRunAt">>, cid?: string): AutopilotScheduleEvent {
+    this.autopilotSchedule.set(patch);
+    this.broadcastSchedule(); // every device (no cid)
+    return this.autopilotScheduleEvent(cid); // the requester (cid)
   }
 
   /** Best-effort: set every member task's anvil status label (used on dismiss/build transitions). */

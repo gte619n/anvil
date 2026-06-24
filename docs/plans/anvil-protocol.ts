@@ -432,6 +432,24 @@ export interface AutopilotRunResultEvent extends Envelope {
   skipped: number; // tasks already in the pipeline
   output: string; // human-readable log (or the error message when ok=false)
 }
+/** The daemon's autopilot schedule (in-daemon timer; anvil-autopilot-ui.md → Scheduling). Times are
+ *  server-local. A run plans the linked projects and, when `autoStart`, launches up to `maxAutoStart`
+ *  of the new units (skipped if the subscription budget is warning). */
+export interface AutopilotSchedule {
+  enabled: boolean;
+  timeOfDay: string; // "HH:MM", 24h, server-local
+  days?: number[]; // 0=Sun..6=Sat; empty/absent = every day
+  autoStart: boolean; // after planning, also start worktree sessions for the new units
+  maxAutoStart?: number; // cap how many sessions a single run may auto-start (default 3)
+  lastRunAt?: Iso8601; // server-set: when the scheduler last fired (read-only to clients)
+}
+/** The current schedule — answer to `autopilot.schedule.get`/`.set` (cid) and broadcast on change. */
+export interface AutopilotScheduleEvent extends Envelope {
+  type: "autopilot.schedule";
+  cid?: Cid;
+  schedule: AutopilotSchedule;
+  nextRunAt?: Iso8601; // computed next fire, for display
+}
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
 export type GitOp = "status" | "diff" | "commit" | "push" | "create-pr" | "merge-pr";
 export interface GitResultEvent extends Envelope {
@@ -601,6 +619,7 @@ export type ServerEvent =
   | AutopilotStartedEvent
   | AutopilotRunProgressEvent
   | AutopilotRunResultEvent
+  | AutopilotScheduleEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent
@@ -827,6 +846,17 @@ export interface AutopilotRunCmd extends Envelope, Correlated {
   type: "autopilot.run"; // re-plan linked Todoist projects on this server → autopilot.run.result
   environmentId?: string; // limit to one environment; omitted = every linked environment
 }
+export interface AutopilotScheduleGetCmd extends Envelope, Correlated {
+  type: "autopilot.schedule.get"; // current schedule → autopilot.schedule
+}
+export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
+  type: "autopilot.schedule.set"; // update fields (omitted fields unchanged) → autopilot.schedule
+  enabled?: boolean;
+  timeOfDay?: string;
+  days?: number[];
+  autoStart?: boolean;
+  maxAutoStart?: number;
+}
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
 // bundle, and (when running under the launchd service) restarts itself to apply the new code.
@@ -909,6 +939,8 @@ export type ClientCommand =
   | AutopilotDismissCmd
   | AutopilotStartCmd
   | AutopilotRunCmd
+  | AutopilotScheduleGetCmd
+  | AutopilotScheduleSetCmd
   | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd

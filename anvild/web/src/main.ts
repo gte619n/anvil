@@ -20,6 +20,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
 import type {
   AttachmentRef,
   AutopilotPlanInfo,
+  AutopilotSchedule,
   AutonomyPolicy,
   Budget,
   ContentBlock,
@@ -691,6 +692,7 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
   if (status === "connected") {
     void flushOutbox(); // push anything queued while offline (routed per server)
     srv?.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
+    srv?.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
   }
   if (pendingRestartReload && url === HUB_URL) {
     if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
@@ -817,6 +819,9 @@ function onEvent(url: string, e: ServerEvent): void {
       return; // resolved via cidWaiter (runAutopilot)
     case "autopilot.run.progress":
       onAutopilotProgress(e.line);
+      return;
+    case "autopilot.schedule":
+      onAutopilotSchedule(url, e.schedule, e.nextRunAt);
       return;
     case "dirs.list.result":
       onDirs?.(e);
@@ -1869,6 +1874,9 @@ function closeSettings(): void {
 const autopilotLog: string[] = []; // streamed progress lines for the current/last run
 let openPlanId: string | null = null; // the plan open in the reader, if any (else the grid is shown)
 const SIZE_LABEL: Record<string, string> = { xs: "XS", s: "S", m: "M", l: "L", xl: "XL" };
+const DAY_LABEL = ["S", "M", "T", "W", "T", "F", "S"]; // Sun..Sat, for the schedule day toggles
+// Each server's autopilot schedule (the UI control targets the hub; the daemon supports per-server).
+const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string }>();
 
 /** Every server's pending plans, hub first, in the sidebar/grouping order. */
 function allPlans(): AutopilotPlanInfo[] {
@@ -1928,11 +1936,13 @@ function openAutopilot(): void {
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
     </div>
+    <div class="ap-schedule-bar" id="autopilot-schedule"></div>
     <pre class="git-output ap-log" id="autopilot-log" hidden></pre>
     <div class="settings-body"><div id="autopilot-grid"></div></div>
   </div>`;
   $("#autopilot-close").addEventListener("click", () => dismissOverlay("autopilot"));
   $("#autopilot-run").addEventListener("click", () => void runAutopilot());
+  renderScheduleBar();
   if (autopilotLog.length) {
     const log = $("#autopilot-log");
     log.hidden = false;
@@ -1940,7 +1950,11 @@ function openAutopilot(): void {
   }
   openOverlay("autopilot", closeAutopilot); // Back closes it (no-op if it's already a layer)
   renderAutopilotGrid();
-  for (const s of orderedServers()) if (s.sock.isOpen()) s.sock.send({ type: "autopilot.plans.list" }); // fresh pull
+  for (const s of orderedServers())
+    if (s.sock.isOpen()) {
+      s.sock.send({ type: "autopilot.plans.list" }); // fresh pull
+      s.sock.send({ type: "autopilot.schedule.get" });
+    }
 }
 /** Tear down the autopilot view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeAutopilot(): void {
@@ -2170,6 +2184,86 @@ async function runAutopilot(): Promise<void> {
   } finally {
     btn.disabled = false;
     btn.innerHTML = `${icon("play_arrow")} Run autopilot`;
+  }
+}
+
+// ── Scheduled run (in-daemon timer; the control targets the hub) ────────────────────
+function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string): void {
+  serverSchedule.set(url, { schedule, nextRunAt });
+  if (url === HUB_URL && document.getElementById("autopilot-schedule")) renderScheduleBar();
+}
+const fmtTime = (hhmm: string): string => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
+  if (!m) return hhmm;
+  const h = Number(m[1]);
+  const suffix = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${m[2]} ${suffix}`;
+};
+const fmtNextRun = (iso?: string): string => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+};
+function renderScheduleBar(): void {
+  const host = document.getElementById("autopilot-schedule");
+  if (!host) return;
+  const entry = serverSchedule.get(HUB_URL);
+  const s = entry?.schedule;
+  let summary: string;
+  if (!s || !s.enabled) {
+    summary = `<span class="muted">${icon("schedule")} Scheduled run off</span>`;
+  } else {
+    const auto = s.autoStart ? `auto-start ${s.maxAutoStart ?? 3}` : "plan only";
+    const next = entry?.nextRunAt ? ` · next ${esc(fmtNextRun(entry.nextRunAt))}` : "";
+    summary = `<span>${icon("schedule")} Daily ${esc(fmtTime(s.timeOfDay))} · ${esc(auto)}${next}</span>`;
+  }
+  host.innerHTML = `${summary}<button class="mini" id="ap-sched-edit">${icon("tune")} Schedule</button>`;
+  $("#ap-sched-edit").addEventListener("click", openScheduleModal);
+}
+
+function openScheduleModal(): void {
+  const cur = serverSchedule.get(HUB_URL)?.schedule;
+  const s: AutopilotSchedule = cur ?? { enabled: false, timeOfDay: "02:00", autoStart: true, maxAutoStart: 3 };
+  const days = s.days && s.days.length ? new Set(s.days) : new Set([0, 1, 2, 3, 4, 5, 6]);
+  const dayBtns = DAY_LABEL.map(
+    (d, i) => `<button type="button" class="ap-day${days.has(i) ? " on" : ""}" data-day="${i}">${d}</button>`,
+  ).join("");
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box" id="ap-sched-modal"><h3>${icon("schedule")} Scheduled autopilot run</h3>
+    <p class="small muted">An in-daemon timer re-plans linked Todoist projects on the hub and (when auto-start is on) launches the new work. Times are the server's local time.</p>
+    <label class="ap-check"><input type="checkbox" id="ap-enabled"${s.enabled ? " checked" : ""}/> Enable scheduled run</label>
+    <label>Time of day<input type="time" id="ap-time" value="${esc(s.timeOfDay)}" /></label>
+    <div class="ap-field"><span>Days</span><div class="ap-days" id="ap-days">${dayBtns}</div></div>
+    <label class="ap-check"><input type="checkbox" id="ap-autostart"${s.autoStart ? " checked" : ""}/> Auto-start sessions for new plans</label>
+    <label>Auto-start at most<input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /> <span class="small muted">sessions per run (the rest wait for manual launch). Skipped while the budget is in its warn zone.</span></label>
+    <div class="btns"><button type="button" id="ap-sched-cancel">Cancel</button><button type="button" id="ap-sched-save" class="primary">Save</button></div></div>`;
+  showModal(m);
+  m.querySelectorAll<HTMLElement>(".ap-day").forEach((b) =>
+    b.addEventListener("click", () => b.classList.toggle("on")),
+  );
+  $("#ap-sched-cancel").addEventListener("click", closeModal);
+  $("#ap-sched-save").addEventListener("click", () => void saveSchedule());
+}
+async function saveSchedule(): Promise<void> {
+  const enabled = $<HTMLInputElement>("#ap-enabled").checked;
+  const timeOfDay = $<HTMLInputElement>("#ap-time").value || "02:00";
+  const autoStart = $<HTMLInputElement>("#ap-autostart").checked;
+  const maxAutoStart = Math.max(0, Number($<HTMLInputElement>("#ap-cap").value) || 0);
+  const on = [...document.querySelectorAll<HTMLElement>("#ap-days .ap-day.on")].map((b) => Number(b.dataset.day));
+  // all 7 selected → send [] (every day); none selected → keep it simple and treat as every day too
+  const days = on.length === 0 || on.length === 7 ? [] : on.sort((a, b) => a - b);
+  try {
+    const res = await sendAwait(hub(), { type: "autopilot.schedule.set", enabled, timeOfDay, days, autoStart, maxAutoStart, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    closeModal();
+    toast(enabled ? "Schedule saved" : "Scheduled run off");
+  } catch (err) {
+    toast(`Couldn't save schedule: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

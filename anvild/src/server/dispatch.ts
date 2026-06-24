@@ -281,11 +281,24 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         deps.supervisor
           .runAutopilot({
             environmentId: cmd.environmentId,
-            notify: false, // interactive run — the open screen updates live; push is for nightly runs
+            notify: false, // interactive run — the open screen updates live; push is for scheduled runs
             onProgress: (line) => deps.registry.toAll({ v: PROTOCOL_VERSION, type: "autopilot.run.progress", ts: now(), line }),
           })
           .then((r) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: true, created: r.created, skipped: r.skipped, output: r.output }))
           .catch((e) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: false, created: 0, skipped: 0, output: errMsg(e) }));
+        return;
+
+      case "autopilot.schedule.get":
+        send(deps.supervisor.autopilotScheduleEvent(cid));
+        return;
+
+      case "autopilot.schedule.set":
+        send(
+          deps.supervisor.setAutopilotSchedule(
+            { enabled: cmd.enabled, timeOfDay: cmd.timeOfDay, days: cmd.days, autoStart: cmd.autoStart, maxAutoStart: cmd.maxAutoStart },
+            cid,
+          ),
+        );
         return;
 
       case "fs.list": {

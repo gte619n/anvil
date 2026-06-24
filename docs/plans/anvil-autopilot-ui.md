@@ -142,9 +142,40 @@ log) and returns `autopilot.run.result` to the requester.
 - **`styles/app.css`** — `.autopilot-view`, `.plan-grid`, `.plan-card`, effort/status chips, the reader
   + refine-chat layout. Responsive: multi-column on desktop/web, single column on a phone.
 
+## Scheduling (in-daemon, decided 2026-06-24)
+
+The autonomous run is driven by an **in-daemon timer** — not OS cron/launchd — so it gets the live
+broadcast + push for free and behaves identically on every fleet member. Each daemon schedules its
+own linked environments (same per-server model as `runAutopilot`).
+
+**Decisions:**
+- **Mechanism** — in-daemon timer: a 5-minute, `unref`'d interval (so it never holds a process /
+  test open) checks whether a run is due and fires `runAutopilot({ notify: true, autoStart })`.
+- **Run scope** — plan **and auto-start** the new units (fully unattended), with two guardrails:
+  - **Auto-start cap** (`maxAutoStart`, default 3): a single run starts at most N sessions; any extra
+    planned units stay in the Autopilot grid for manual Go. Stops one busy night from spawning a dozen
+    concurrent `bypass`-autonomy sessions.
+  - **Rate-limit guard**: if the subscription budget is in warn/soft-stop, the run still plans +
+    notifies but **skips auto-start** (so it can't exhaust the weekly Opus window unattended).
+- **Config** — set from the app (a control in the Autopilot view): enable, time-of-day (server-local
+  `HH:MM`), days (default daily), auto-start on/off, and the cap. Persisted daemon-side.
+- **Missed runs** — catch up on next startup: the loop computes the most recent scheduled fire at or
+  before `now` and compares it to `lastRunAt`; if the daemon was down at the fire time it runs once
+  shortly after coming back, then resumes. No separate "was I down?" bookkeeping.
+
+**Due logic** lives in the SDK-free `src/integrations/schedule.ts` (store + pure
+`isRunDue`/`nextScheduledFire`/`lastScheduledFire`), unit-tested deterministically by passing `now`.
+
+**Protocol:** `AutopilotSchedule` type, `autopilot.schedule` event (carries the schedule +
+computed `nextRunAt`), `autopilot.schedule.get` / `autopilot.schedule.set` commands.
+
+**`runAutopilot`** gains `autoStart?` + `maxAutoStart?`: after `planAndTagProject`, when `autoStart`
+and the budget isn't warning, it `startPlan`s up to the cap of the freshly-created units (each in a
+try/catch so one failure doesn't abort the run).
+
 ## Open follow-ups (not in this pass)
 
-- A real in-daemon nightly **scheduler** still doesn't exist; the autonomous run (and its push) is
-  triggered by the existing CLI / the new Run button. Wiring a cron into the daemon is separate.
+- Schedule config is currently surfaced for the **hub** in the UI; the daemon fully supports a
+  distinct schedule per fleet member (each runs its own), but the control doesn't yet enumerate them.
 - Refine is request/response (a spinner per turn), not token-streamed; good enough for "comment &
   refine" and far simpler than standing up a second streaming channel.
