@@ -507,16 +507,18 @@ export class Supervisor {
         break;
       }
       case "merge-pr": {
-        const r = git.mergePr(cwd, cmd.method ?? "squash");
+        const r = git.mergePr(cwd, cmd.method ?? "squash", s.data.worktree?.branch);
         ok = r.ok;
         output = r.output;
         if (r.ok) {
-          const mergedBranch = s.data.git?.branch ?? branch; // the branch we just merged (before any refresh)
-          this.refreshGit(s); // branch may be gone after --delete-branch; refresh dirty/ahead too
+          // The worktree rolled onto a fresh follow-up branch — track it so the restart health
+          // check (which compares against worktree.branch) stays happy and work can continue here.
+          if (r.newBranch && s.data.worktree) s.data.worktree.branch = r.newBranch;
+          this.refreshGit(s); // refresh dirty/ahead and pick up the new current branch (the follow-up)
           if (s.data.git) {
-            // Show the merged badge (scoped to the merged branch so later work clears it) unless the
-            // tree already has uncommitted work — then it's no longer cleanly merged. See prBadgeFor.
-            const badge = prBadgeFor("merged", s.data.git.prUrl, mergedBranch, s.data.git.dirtyFileCount);
+            // Show the merged badge scoped to the current branch (the follow-up after a rollover) so
+            // it clears once new work starts — a dirty tree, or another branch switch. See prBadgeFor.
+            const badge = prBadgeFor("merged", s.data.git.prUrl, s.data.git.branch, s.data.git.dirtyFileCount);
             s.data.git.prState = badge.prState;
             s.data.git.prUrl = badge.prUrl;
             s.data.git.prBranch = badge.prBranch;
@@ -1047,6 +1049,7 @@ export class Supervisor {
     }
     this.persist(); // reconcile disk == memory after status resets / recovery (fixes drift)
     this.ensureDefaultSession(); // the concierge chat always exists (reused if persisted, else created)
+    this.pruneFollowupBranches(); // reap merge-rollover branches the user never continued (best-effort)
 
     const known = new Set(this.sessions.keys());
     const orphanDirs = this.store.listSessionDirs().filter((d) => !known.has(d));
@@ -1077,6 +1080,26 @@ export class Supervisor {
       return { message: `🔧 _Worktree was ${health} after a restart and has been restored from branch \`${branch}\`._`, recovered: true };
     }
     return { message: `⚠️ _This session's worktree was ${health} and could not be auto-restored (${r.error}). Use **Reset** to retry._`, recovered: false };
+  }
+
+  /**
+   * Reap `<branch>_followup` branches left by merges the user never continued (see git.mergePr).
+   * One pass per repo that still has a worktree session; only deletes branches with no work and no
+   * live session on them. Best-effort — never throws, never blocks startup on a bad repo.
+   */
+  private pruneFollowupBranches(): void {
+    const repoRoots = new Set<string>();
+    for (const s of this.sessions.values()) {
+      if (s.data.source === "fresh-worktree" && s.data.worktree) repoRoots.add(s.data.worktree.repoRoot);
+    }
+    for (const repoRoot of repoRoots) {
+      try {
+        const r = git.pruneUnusedFollowupBranches(repoRoot);
+        if (r.deleted.length) console.log(`[restore] ${repoRoot}: ${r.output}`);
+      } catch (e) {
+        console.error(`[restore] follow-up prune failed for ${repoRoot}: ${e instanceof Error ? e.message : e}`);
+      }
+    }
   }
 
   private persist(): void {
