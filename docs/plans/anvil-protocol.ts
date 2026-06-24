@@ -446,11 +446,24 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   input: unknown;
   suggestions: PermissionSuggestion[];
 }
+/** A parked permission prompt was answered or superseded (reset/kill). Clients retire EXACTLY
+ *  that card by requestId — a session can have several prompts parked at once (sub-agent fan-out),
+ *  so card lifecycle is per-request, not driven by the session's transient status. (§6.6) */
+export interface PermissionResolvedEvent extends Envelope, SessionScoped {
+  type: "permission.resolved";
+  requestId: RequestId;
+}
 /** Claude is asking the user to choose among options (AskUserQuestion, §6.6). */
 export interface QuestionRequestEvent extends Envelope, SessionScoped {
   type: "question.request";
   requestId: RequestId;
   questions: Question[];
+}
+/** A parked AskUserQuestion was answered or superseded — clients retire EXACTLY that card by
+ *  requestId (sub-agents can fan out several at once, like permissions). (§6.6) */
+export interface QuestionResolvedEvent extends Envelope, SessionScoped {
+  type: "question.resolved";
+  requestId: RequestId;
 }
 export interface StatusEvent extends Envelope, SessionScoped {
   type: "status";
@@ -547,7 +560,9 @@ export type ServerEvent =
   | ToolUseEvent
   | ToolResultEvent
   | PermissionRequestEvent
+  | PermissionResolvedEvent
   | QuestionRequestEvent
+  | QuestionResolvedEvent
   | StatusEvent
   | UsageEvent
   | ResultEvent

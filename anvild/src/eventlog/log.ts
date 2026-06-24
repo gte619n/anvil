@@ -90,7 +90,7 @@ export class EventLog {
           events.push({ kind: "file_offer", ts: a.ts, file: a.file });
           break;
         default:
-          break; // status / usage / tool.use / permission.request / error are not part of the snapshot
+          break; // status / usage / tool.use / permission.request|resolved / error are not part of the snapshot
       }
     }
     return { v: PROTOCOL_VERSION, type: "conversation.snapshot", ts: now(), sessionId, seq: lastSeq, events, lastSeq };
