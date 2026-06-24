@@ -130,6 +130,9 @@ export interface GitStatus {
   /** PR state for the branch (populated by an explicit `git status` op via gh; network). */
   prState?: "open" | "merged" | "closed";
   prUrl?: string;
+  /** The branch `prState`/`prUrl` describe. The PR badge is scoped to this branch: once the
+   *  worktree moves to a different branch (e.g. more work after a merge), the stale badge clears. */
+  prBranch?: string;
 }
 
 export interface Usage {

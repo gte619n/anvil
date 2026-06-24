@@ -37,7 +37,9 @@ android {
         versionCode computedVersionCode
         versionName appVersionName
 
-        // The Anvil web client URL this shell loads (Tailscale HTTPS by default).
+        // The Anvil daemon URL this shell loads. HTTPS on the MagicDNS name — the daemon is fronted
+        // by `tailscale serve` (service.sh setup_serve), and ts.net forces HTTPS in the Chromium
+        // WebView anyway. Override via local.properties for an App-Store-Tailscale host (plain http by IP).
         buildConfigField "String", "ANVIL_BASE_URL",
             "\"${localProperties.getProperty('ANVIL_BASE_URL', 'https://mac-mini-m4.softshell-mark.ts.net:7701/')}\""
     }

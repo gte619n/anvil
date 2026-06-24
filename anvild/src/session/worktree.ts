@@ -86,6 +86,38 @@ export function recreateWorktree(repoRoot: string, cwd: string, branch: string, 
   return { ok: true };
 }
 
+type PrBadge = Pick<GitStatus, "prState" | "prUrl" | "prBranch">;
+
+/**
+ * The PR-badge fields a worktree should display, given a freshly-known PR state and the current
+ * tree. The "merged" badge means "this branch is done and merged" — so it's suppressed while the
+ * tree has uncommitted work (`dirtyFileCount > 0`), regardless of branch: new local changes mean the
+ * branch is no longer cleanly merged and the "done" icon would be misleading. Open/closed states are
+ * unaffected by dirtiness. Returns empty when there's no badge to show.
+ */
+export function prBadgeFor(
+  prState: GitStatus["prState"],
+  prUrl: string | undefined,
+  branch: string,
+  dirtyFileCount: number,
+): PrBadge {
+  if (!prState) return {};
+  if (prState === "merged" && dirtyFileCount > 0) return {};
+  return { prState, prUrl, prBranch: branch };
+}
+
+/**
+ * Decide which PR badge fields survive a local git refresh. `gitStatus()` is local-only and can't
+ * learn PR state, so we carry forward what we last learned from `gh` — but only while the worktree
+ * is still on the branch that PR belongs to (a branch switch, e.g. new work after a merge, clears
+ * it) and, for a merged PR, only while the tree stays clean (see `prBadgeFor`). Returns the fields
+ * to copy onto the fresh status (empty when the badge no longer applies).
+ */
+export function carryPrBadge(prev: GitStatus | undefined, next: GitStatus): PrBadge {
+  if (!prev?.prBranch || prev.prBranch !== next.branch) return {};
+  return prBadgeFor(prev.prState, prev.prUrl, next.branch, next.dirtyFileCount);
+}
+
 /** Best-effort git state for the worktree panel (arch §8); undefined if `cwd` isn't a repo. */
 export function gitStatus(cwd: string): GitStatus | undefined {
   const branch = git(["branch", "--show-current"], cwd);

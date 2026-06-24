@@ -5,7 +5,7 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { loadServerIdentity, serverHelloEvent } from "./identity";
-import { discoverFleet, inviteMac, rotateToken, tailnetPeers } from "./fleet";
+import { discoverFleet, inviteMac, resolveMemberUrl, rotateToken, tailnetPeers } from "./fleet";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
@@ -197,7 +197,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
           serverId: outcome.serverId || host,
           serverName: outcome.serverName || host,
           host,
-          url: `http://${host}:${opts.port}/`, // joiner daemons bind the tailnet IP directly (plain HTTP, no serve)
+          // Probe the joiner's transport: https if it serves, else plain http (tailnet-IP bind).
+          url: await resolveMemberUrl(host, opts.port),
         };
         fleet.upsert(member);
         return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);

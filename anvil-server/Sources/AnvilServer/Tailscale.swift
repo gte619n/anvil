@@ -39,6 +39,14 @@ enum Tailscale {
     Shell.run("tailscale", ["serve", "--https=\(externalPort)", "off"])
   }
 
+  /// True if `tailscale serve` is currently fronting `externalPort` (HTTPS on the MagicDNS name).
+  /// When true the daemon is reached over https on the name; when false it binds the tailnet IP
+  /// directly over plain http. Mirrors service.sh's `setup_serve` decision.
+  static func serveActive(externalPort: Int) -> Bool {
+    let r = Shell.run("tailscale", ["serve", "status"])
+    return r.ok && r.stdout.contains(":\(externalPort)")
+  }
+
   /// This host's Tailscale IPv4 (100.64.0.0/10) from the network interfaces — no `tailscale` CLI
   /// needed. The daemon binds this directly, so it's reachable over the tailnet via plain HTTP.
   static func tailnetIP() -> String? {
@@ -61,10 +69,15 @@ enum Tailscale {
     return nil
   }
 
-  /// The plain-HTTP URL the daemon is reachable at on the tailnet (MagicDNS name if the CLI resolves
-  /// it, else the tailnet IP). No `tailscale serve` / HTTPS.
+  /// The URL the daemon is reachable at on the tailnet, matching this host's transport: if
+  /// `tailscale serve` is fronting the port, https on the MagicDNS name (browser-friendly — ts.net
+  /// forces HTTPS anyway); otherwise plain http on the tailnet IP (the name can't be used over http
+  /// in a browser, so prefer the IP for the direct-bind case).
   static func daemonURL() -> String? {
-    (magicDNSName() ?? tailnetIP()).map { "http://\($0):\(Paths.port)/" }
+    if serveActive(externalPort: Paths.port), let name = magicDNSName() {
+      return "https://\(name):\(Paths.port)/"
+    }
+    return (tailnetIP() ?? magicDNSName()).map { "http://\($0):\(Paths.port)/" }
   }
 
   /// This node's tailnet login (owner), e.g. "evan@example.com" — used to gate pairing to same-user.

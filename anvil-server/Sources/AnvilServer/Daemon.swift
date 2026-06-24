@@ -30,10 +30,11 @@ enum Daemon {
     }
   }
 
-  // The daemon binds the tailnet IP directly (no serve), so health-check that — not localhost.
+  // Health-check the LOCAL daemon over the right interface for this host's transport: in serve mode
+  // it binds loopback (serve fronts the tailnet port), in direct mode it binds the tailnet IP.
   static func healthURL() -> URL {
-    let ip = Tailscale.tailnetIP() ?? "127.0.0.1"
-    return URL(string: "http://\(ip):\(Paths.port)/api/health")!
+    let host = Tailscale.serveActive(externalPort: Paths.port) ? "127.0.0.1" : (Tailscale.tailnetIP() ?? "127.0.0.1")
+    return URL(string: "http://\(host):\(Paths.port)/api/health")!
   }
 
   /// Poll `/api/health`. `nil` health = unreachable (daemon down / starting).

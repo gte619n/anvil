@@ -2,7 +2,8 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createWorktree, removeWorktree, gitStatus } from "../../src/session/worktree";
+import { carryPrBadge, createWorktree, prBadgeFor, removeWorktree, gitStatus } from "../../src/session/worktree";
+import type { GitStatus } from "@protocol";
 import { ensureInitialCommit } from "../../src/git/ops";
 
 function git(args: string[], cwd: string) {
@@ -83,4 +84,48 @@ test("gitStatus returns undefined outside a repo", () => {
   const notRepo = mkdtempSync(join(tmpdir(), "anvil-norepo-"));
   expect(gitStatus(notRepo)).toBeUndefined();
   rmSync(notRepo, { recursive: true, force: true });
+});
+
+const mergedBadge = { prState: "merged" as const, prUrl: "https://example/pr/1", prBranch: "feature-work" };
+const stat = (over: Partial<GitStatus> = {}): GitStatus => ({
+  branch: "feature-work",
+  ahead: 0,
+  behind: 0,
+  dirtyFileCount: 0,
+  diffstat: [],
+  ...mergedBadge,
+  ...over,
+});
+
+test("carryPrBadge keeps the PR badge on its own branch and clears it after a branch switch", () => {
+  const merged = stat();
+
+  // Same branch, clean tree → the merged badge (and its URL) is carried forward.
+  expect(carryPrBadge(merged, stat())).toEqual(mergedBadge);
+
+  // New branch (more work started after the merge) → the stale badge clears entirely.
+  expect(carryPrBadge(merged, stat({ branch: "more-work" }))).toEqual({});
+
+  // No prior badge, or a prior status that never had a PR → nothing to carry.
+  expect(carryPrBadge(undefined, stat())).toEqual({});
+  expect(carryPrBadge(stat({ prState: undefined, prUrl: undefined, prBranch: undefined }), stat())).toEqual({});
+});
+
+test("a merged badge clears once there is uncommitted work, even on the same branch", () => {
+  const merged = stat();
+
+  // Same branch but the tree is now dirty → the "done" merged badge is suppressed.
+  expect(carryPrBadge(merged, stat({ dirtyFileCount: 3 }))).toEqual({});
+  expect(prBadgeFor("merged", "https://example/pr/1", "feature-work", 1)).toEqual({});
+
+  // An open/closed PR is unaffected by dirtiness (uncommitted work alongside an open PR is normal).
+  expect(prBadgeFor("open", "https://example/pr/1", "feature-work", 5)).toEqual({
+    prState: "open",
+    prUrl: "https://example/pr/1",
+    prBranch: "feature-work",
+  });
+  // A merged PR on a clean tree still shows.
+  expect(prBadgeFor("merged", "https://example/pr/1", "feature-work", 0)).toEqual(mergedBadge);
+  // No PR → nothing to show.
+  expect(prBadgeFor(undefined, undefined, "feature-work", 0)).toEqual({});
 });

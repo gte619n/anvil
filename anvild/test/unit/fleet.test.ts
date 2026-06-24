@@ -39,14 +39,15 @@ test("parseTailscalePeers: Self + peers, trailing dot stripped, online flags car
   expect(peers.find((p) => p.dnsName === "asleep.tail-scale.ts.net")?.online).toBe(false);
 });
 
-test("discoverFleet: probes only online peers, flags self, dedups by serverId", async () => {
+test("discoverFleet: probes https then http per peer, flags self, dedups by serverId", async () => {
   const probed: string[] = [];
-  // mac-mini = this hub (selfServerId), laptop = a real peer, phone isn't an Anvil daemon.
+  // mac-mini = this hub (serve-capable → https). laptop = an App-Store-Tailscale peer that only
+  // answers over plain http (https probe fails → http fallback). phone isn't an Anvil daemon.
   const probe = async (baseUrl: string): Promise<ProbeResult | null> => {
     probed.push(baseUrl);
-    if (baseUrl.includes("mac-mini")) return { serverId: "srv_self", serverName: "Mac mini", version: "1.0.0" };
-    if (baseUrl.includes("laptop")) return { serverId: "srv_laptop", serverName: "Laptop", version: "1.0.0" };
-    return null; // phone → not Anvil
+    if (baseUrl === "https://mac-mini.tail-scale.ts.net:7701") return { serverId: "srv_self", serverName: "Mac mini", version: "1.0.0" };
+    if (baseUrl === "http://laptop.tail-scale.ts.net:7701") return { serverId: "srv_laptop", serverName: "Laptop", version: "1.0.0" };
+    return null; // https://laptop (forces fallback), phone (both schemes) → not Anvil
   };
   const res = await discoverFleet({
     port: 7701,
@@ -56,15 +57,31 @@ test("discoverFleet: probes only online peers, flags self, dedups by serverId", 
   });
 
   expect(res.ok).toBe(true);
-  // offline "asleep" peer is never probed
+  // offline "asleep" peer is never probed, on either scheme
   expect(probed).not.toContain("https://asleep.tail-scale.ts.net:7701");
-  expect(probed).toHaveLength(3); // self + laptop + phone (all online)
+  expect(probed).not.toContain("http://asleep.tail-scale.ts.net:7701");
+  // self answered on https (http never tried); laptop fell back to http; phone tried both
+  expect(probed).toContain("https://mac-mini.tail-scale.ts.net:7701");
+  expect(probed).not.toContain("http://mac-mini.tail-scale.ts.net:7701");
+  expect(probed).toContain("https://laptop.tail-scale.ts.net:7701");
+  expect(probed).toContain("http://laptop.tail-scale.ts.net:7701");
 
   const byId = new Map(res.servers.map((s) => [s.serverId, s]));
   expect(byId.get("srv_self")!.isSelf).toBe(true);
-  expect(byId.get("srv_self")!.url).toBe("https://mac-mini.tail-scale.ts.net:7701");
+  expect(byId.get("srv_self")!.url).toBe("https://mac-mini.tail-scale.ts.net:7701"); // serve host → https
   expect(byId.get("srv_laptop")!.isSelf).toBe(false);
-  expect(res.servers).toHaveLength(2); // phone (null probe) excluded
+  expect(byId.get("srv_laptop")!.url).toBe("http://laptop.tail-scale.ts.net:7701"); // App Store host → http
+  expect(res.servers).toHaveLength(2); // phone (null on both) excluded
+});
+
+test("resolveMemberUrl: prefers https, falls back to http, defaults to http", async () => {
+  const { resolveMemberUrl } = await import("../../src/server/fleet");
+  // serve-capable joiner answers https
+  expect(await resolveMemberUrl("served.ts.net", 7701, async (u) => (u.startsWith("https") ? { serverId: "s", serverName: "", version: "" } : null))).toBe("https://served.ts.net:7701/");
+  // App Store joiner answers only http
+  expect(await resolveMemberUrl("plain.ts.net", 7701, async (u) => (u.startsWith("http://") ? { serverId: "s", serverName: "", version: "" } : null))).toBe("http://plain.ts.net:7701/");
+  // not yet up → default http so the registry still has a usable entry
+  expect(await resolveMemberUrl("down.ts.net", 7701, async () => null)).toBe("http://down.ts.net:7701/");
 });
 
 test("discoverFleet: same server reachable twice is deduped by serverId", async () => {
