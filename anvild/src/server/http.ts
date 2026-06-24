@@ -4,18 +4,23 @@ import { checkAuth } from "../auth/guard";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
+import { loadServerIdentity, serverHelloEvent } from "./identity";
+import { discoverFleet, inviteMac, rotateToken } from "./fleet";
+import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
-import { hostname, networkInterfaces } from "node:os";
+import { networkInterfaces } from "node:os";
 import { VERSION } from "../version";
 
 export { VERSION };
 
-// The built web client (anvild/web/dist), resolved relative to this source file.
-const WEB_DIR = join(import.meta.dir, "..", "..", "web", "dist");
+// The built web client (anvild/web/dist), resolved relative to this source file. When packaged via
+// `bun build --compile`, import.meta.dir points into the read-only $bunfs, so the launcher sets
+// ANVIL_WEB_DIR to the bundle's web/dist on disk (Phase 0/B — anvil-server-app.md §3.1).
+const WEB_DIR = process.env.ANVIL_WEB_DIR || join(import.meta.dir, "..", "..", "web", "dist");
 
 // CSP for the app shell. Mermaid + the markdown body run here, but all markdown HTML is
 // DOMPurify-sanitized server-side (arch §8.3); scripts are limited to our own bundle.
@@ -24,7 +29,9 @@ const CSP = [
   "img-src 'self' data:",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com", // Shiki/KaTeX/mermaid + Material Symbols (CDN)
   "script-src 'self'",
-  "connect-src 'self' ws: wss:",
+  // 'self' = the hub's own daemon; wss:/ws: for its WebSocket; https://*.ts.net + wss://*.ts.net let
+  // the hub web app federate other servers on the tailnet (fleet — anvil-multi-server.md §4.1/§5.1).
+  "connect-src 'self' ws: wss: https://*.ts.net wss://*.ts.net",
   "font-src 'self' https://fonts.gstatic.com", // Material Symbols woff2 from Google's CDN (bundled in native apps)
   "object-src 'none'",
   "base-uri 'none'",
@@ -92,6 +99,8 @@ export interface ServerOptions {
  * (`port: 0`) against a temp `stateDir` and stop it.
  */
 export function createServer(opts: ServerOptions): ServerHandle {
+  const identity = loadServerIdentity(opts.stateDir);
+  const fleet = new FleetStore(opts.stateDir);
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
   const supervisor = new Supervisor(
@@ -117,6 +126,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const WS = {
     open(ws: ServerWebSocket<ConnState>) {
       registry.add(ws);
+      ws.send(JSON.stringify(serverHelloEvent(identity))); // who am I — first frame (fleet §3/§6)
       ws.send(JSON.stringify(supervisor.sessionListEvent()));
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
@@ -152,10 +162,47 @@ export function createServer(opts: ServerOptions): ServerHandle {
           ok: true,
           subscriptionAuthOk: auth.subscriptionAuthOk,
           version: VERSION,
-          serverName: process.env.ANVIL_SERVER_NAME || hostname(),
+          serverId: identity.serverId,
+          serverName: identity.serverName,
           budget: supervisor.budget(),
         };
         return Response.json(body);
+      }
+
+      // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
+      // /api/health, return the Anvil daemons found (deduped by serverId) as add-suggestions.
+      if (url.pathname === "/api/fleet/discover" && req.method === "GET") {
+        const body = await discoverFleet({ port: opts.port, selfServerId: identity.serverId });
+        return Response.json(body satisfies rest.FleetDiscoverResponse);
+      }
+
+      // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
+      // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
+      if (url.pathname === "/api/fleet/members" && req.method === "GET") {
+        return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
+      }
+      if (url.pathname === "/api/fleet/invite" && req.method === "POST") {
+        const { host, code } = (await req.json().catch(() => ({}))) as Partial<rest.FleetInviteRequest>;
+        if (!host || !code) return new Response("host and code required", { status: 400 });
+        const outcome = await inviteMac({ host, code, token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
+        if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
+        const member: rest.FleetMember = {
+          serverId: outcome.serverId || host,
+          serverName: outcome.serverName || host,
+          host,
+          url: `https://${host}:${opts.port}/`,
+        };
+        fleet.upsert(member);
+        return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
+      }
+      if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
+        const results = await rotateToken({ members: fleet.list(), token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
+        return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
+      }
+      const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);
+      if (memberMatch && req.method === "DELETE") {
+        fleet.remove(decodeURIComponent(memberMatch[1]!));
+        return Response.json({ ok: true });
       }
 
       // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint

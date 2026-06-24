@@ -17,9 +17,12 @@ afterAll(() => {
   rmSync(stateDir, { recursive: true, force: true });
 });
 
+// Frames the server sends automatically on connect (arch §6.2, fleet §6) — not RPC replies.
+const CONNECT_FRAMES = new Set(["server.hello", "session.list", "budget", "environments", "todoist.status"]);
+
 /**
- * Open a WS, send `payload`, resolve with the first reply that ISN'T the on-connect
- * `session.list` snapshot (sent automatically on open — arch §6.2), then close.
+ * Open a WS, send `payload`, resolve with the first reply that ISN'T one of the on-connect
+ * snapshot frames (sent automatically on open), then close.
  */
 function rpc(payload: object): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -31,7 +34,7 @@ function rpc(payload: object): Promise<any> {
     ws.onopen = () => ws.send(JSON.stringify(payload));
     ws.onmessage = (ev) => {
       const m = JSON.parse(String(ev.data));
-      if (m.type === "session.list" || m.type === "budget" || m.type === "environments" || m.type === "todoist.status") return; // ignore connect snapshots
+      if (CONNECT_FRAMES.has(m.type)) return; // ignore connect snapshots
       clearTimeout(timer);
       resolve(m);
       ws.close();
@@ -68,18 +71,25 @@ test("session.create (existing-dir) → session.created with cid", async () => {
   expect(r.session.autonomy).toBe("mostly-autonomous");
 });
 
-test("connecting client receives a session.list on open", async () => {
-  const list = await new Promise<any>((resolve, reject) => {
+test("on open: server.hello is the first frame, followed by session.list", async () => {
+  const frames = await new Promise<any[]>((resolve, reject) => {
     const ws = new WebSocket(`ws://localhost:${srv.port}/ws`);
+    const got: any[] = [];
     const timer = setTimeout(() => reject(new Error("timeout")), 2000);
     ws.onmessage = (ev) => {
-      clearTimeout(timer);
-      resolve(JSON.parse(String(ev.data)));
-      ws.close();
+      got.push(JSON.parse(String(ev.data)));
+      if (got.length >= 2) {
+        clearTimeout(timer);
+        resolve(got);
+        ws.close();
+      }
     };
   });
-  expect(list.type).toBe("session.list");
-  expect(Array.isArray(list.sessions)).toBe(true);
+  expect(frames[0].type).toBe("server.hello"); // identifies the server before anything else (fleet §6)
+  expect(frames[0].serverId).toMatch(/^srv_/);
+  expect(typeof frames[0].serverName).toBe("string");
+  expect(frames[1].type).toBe("session.list");
+  expect(Array.isArray(frames[1].sessions)).toBe(true);
 });
 
 test("env.add rejects a nonexistent path", async () => {
@@ -107,7 +117,7 @@ test("invalid JSON → command.error", async () => {
     ws.onopen = () => ws.send("{not json");
     ws.onmessage = (ev) => {
       const m = JSON.parse(String(ev.data));
-      if (m.type === "session.list" || m.type === "budget" || m.type === "environments" || m.type === "todoist.status") return;
+      if (CONNECT_FRAMES.has(m.type)) return;
       clearTimeout(timer);
       resolve(m);
       ws.close();
@@ -122,7 +132,17 @@ test("/api/health reports liveness + the §3 auth self-check", async () => {
   expect(j.ok).toBe(true);
   expect(typeof j.subscriptionAuthOk).toBe("boolean");
   expect(j.version).toBeDefined();
+  expect(j.serverId).toMatch(/^srv_/); // stable fleet identity (§3)
+  expect(typeof j.serverName).toBe("string");
   // No turn has run, so the rate-limit gauge is present but reports "unavailable" (no plan data yet).
   expect(typeof j.budget.available).toBe("boolean");
   expect(typeof j.budget.warn).toBe("boolean");
+});
+
+test("/api/fleet/discover returns a well-formed result (with or without Tailscale)", async () => {
+  const res = await fetch(`http://localhost:${srv.port}/api/fleet/discover`);
+  expect(res.ok).toBe(true);
+  const j = (await res.json()) as any;
+  expect(typeof j.ok).toBe("boolean"); // ok:true if tailscale present, ok:false+warning otherwise
+  expect(Array.isArray(j.servers)).toBe(true);
 });

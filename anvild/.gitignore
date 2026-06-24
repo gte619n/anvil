@@ -5,3 +5,6 @@ web/dist/
 web/dist.next/
 web/dist.old/
 
+
+# headless-smoke Chrome profile
+test/tools/.chrome-smoke/

@@ -3,7 +3,7 @@ import Sortable from "sortablejs";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
-import { apiFetch, apiUrl, wsUrl } from "./api";
+import { apiFetch, daemonBase } from "./api";
 
 const strToB64 = (s: string): string => {
   const bytes = new TextEncoder().encode(s);
@@ -20,6 +20,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
 import type {
   AttachmentRef,
   AutonomyPolicy,
+  Budget,
   ContentBlock,
   ConversationEvent,
   DirEntry,
@@ -93,6 +94,134 @@ const activityTail: string[] = [];
 const references = new Map<string, string>(); // url → display label, insertion-ordered (Links panel)
 let pendingAnswerRefs: string[] = []; // links seen in the latest assistant prose, promoted on `result`
 let panelView: "files" | "reader" | "git" | "terminal" | "links" | null = null; // open side panel, if any
+
+// ── Multi-server connection layer (fleet — anvil-multi-server.md §4) ──────────────────────
+// Declared HERE (early-init state) because the instant-restore render below calls orderedServers()
+// → reads `servers`/`HUB_URL`; a lower declaration would be in its TDZ at module load → dead app
+// (see memory: web-early-init-decl-order-crash). One AnvilSocket per server, keyed by base URL.
+// The hub (the daemon that served this page, or the native-injected ANVIL_DAEMON_URL) is always
+// server #0; extra servers come from the localStorage registry. With a single server this behaves
+// exactly as before. Sessions/environments are tagged with the server they arrived from
+// (sessionServer/envServer) so commands and session-scoped REST route back to the right daemon.
+// Session ids are globally unique, so inbound event matching by `activeId` needs no server
+// disambiguation — only outbound routing does. Sockets connect at the bottom (after `outbox`).
+interface Server {
+  url: string; // base, no trailing slash — the stable registry key
+  id: string; // serverId once known (server.hello / health); "" until then
+  name: string; // display name; the host until hello/health says otherwise
+  sock: AnvilSocket;
+  status: "connecting" | "connected" | "disconnected";
+  version?: string; // anvild version (from server.hello)
+  budget?: Budget; // last budget snapshot (aggregate gauge, §7)
+}
+const cssId = (s: string): string => s.replace(/[^a-z0-9]/gi, "_"); // safe element-id suffix from a URL
+const HUB_URL = daemonBase();
+const hostOf = (url: string): string => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+const servers = new Map<string, Server>(); // keyed by url
+const sessionServer = new Map<string, string>(); // sessionId → server url (outbound routing)
+const envServer = new Map<string, string>(); // environmentId → server url (grouping/routing)
+(function hydrateRouting() {
+  try {
+    for (const [k, v] of JSON.parse(localStorage.getItem("anvil.sessionServer") ?? "[]") as [string, string][]) sessionServer.set(k, v);
+    for (const [k, v] of JSON.parse(localStorage.getItem("anvil.envServer") ?? "[]") as [string, string][]) envServer.set(k, v);
+  } catch {
+    /* corrupt — repopulated on connect */
+  }
+})();
+const persistRouting = (): void => {
+  try {
+    localStorage.setItem("anvil.sessionServer", JSON.stringify([...sessionServer]));
+    localStorage.setItem("anvil.envServer", JSON.stringify([...envServer]));
+  } catch {
+    /* quota */
+  }
+};
+function loadExtraServers(): string[] {
+  try {
+    return (JSON.parse(localStorage.getItem("anvil.servers") ?? "[]") as string[]).map((u) => u.replace(/\/+$/, "")).filter((u) => u && u !== HUB_URL);
+  } catch {
+    return [];
+  }
+}
+function saveExtraServers(urls: string[]): void {
+  try {
+    localStorage.setItem("anvil.servers", JSON.stringify([...new Set(urls.map((u) => u.replace(/\/+$/, "")).filter((u) => u && u !== HUB_URL))]));
+  } catch {
+    /* quota */
+  }
+}
+const serverWsUrl = (base: string): string => base.replace(/^http/i, "ws") + "/ws";
+/** Resolve a daemon-relative path against a specific server (session-scoped REST routing). */
+const serverApiUrl = (base: string, path: string): string =>
+  /^https?:\/\//i.test(path) ? path : base.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`);
+const serverFetch = (base: string, path: string, init?: RequestInit): Promise<Response> => fetch(serverApiUrl(base, path), init);
+function ensureServer(url: string): Server {
+  const clean = url.replace(/\/+$/, "");
+  const existing = servers.get(clean);
+  if (existing) return existing;
+  const sock = new AnvilSocket(
+    serverWsUrl(clean),
+    (e) => onEvent(clean, e),
+    (st) => onStatus(clean, st),
+  );
+  const s: Server = { url: clean, id: "", name: hostOf(clean), sock, status: "disconnected" };
+  servers.set(clean, s);
+  sock.connect();
+  return s;
+}
+/** Forget a server: close its socket and drop its sessions/environments from the merged view. */
+function removeServer(url: string): void {
+  if (url === HUB_URL) return; // the hub is implicit and can't be removed
+  const s = servers.get(url);
+  if (!s) return;
+  s.sock.close();
+  servers.delete(url);
+  for (const [sid, u] of [...sessionServer]) if (u === url) { sessionServer.delete(sid); sessions.delete(sid); }
+  for (const [eid, u] of [...envServer]) if (u === url) { envServer.delete(eid); environments.delete(eid); }
+  saveExtraServers([...servers.keys()].filter((u) => u !== HUB_URL));
+  persistSessions();
+  persistEnvironments();
+  persistRouting();
+  renderSessions();
+}
+const hub = (): Server => servers.get(HUB_URL)!;
+function serverOf(sessionId: string | null | undefined): Server | undefined {
+  if (!sessionId) return undefined;
+  const u = sessionServer.get(sessionId);
+  return u ? servers.get(u) : undefined;
+}
+function activeServer(): Server {
+  return serverOf(activeId) ?? hub();
+}
+/** The server an environment lives on (its repos are local to that daemon). */
+function serverOfEnv(envId: string | null | undefined): Server {
+  const u = envId ? envServer.get(envId) : undefined;
+  return (u ? servers.get(u) : undefined) ?? hub();
+}
+/** Route a session-scoped command to the daemon that owns the session (falls back to the hub). */
+function sendTo(sessionId: string | null | undefined, cmd: Record<string, unknown> & { type: string }): boolean {
+  return (serverOf(sessionId) ?? hub()).sock.send(cmd);
+}
+const anyOpen = (): boolean => {
+  for (const s of servers.values()) if (s.sock.isOpen()) return true;
+  return false;
+};
+/** Hub first, then extra servers in registry order — the sidebar/grouping order. */
+function orderedServers(): Server[] {
+  const h = servers.get(HUB_URL);
+  const out: Server[] = h ? [h] : []; // empty only during early-init before the hub socket is created
+  for (const u of loadExtraServers()) {
+    const s = servers.get(u);
+    if (s) out.push(s);
+  }
+  return out;
+}
 
 // Offline cache (arch §8): persist the session + environment lists so they're browsable with no
 // connection. Hydrated synchronously below, kept in sync on every change.
@@ -306,14 +435,15 @@ function collapseSidebarForChat(): void {
 $("#convo-col").addEventListener("pointerdown", collapseSidebarForChat);
 $("#convo-col").addEventListener("focusin", collapseSidebarForChat);
 
-const sock = new AnvilSocket(wsUrl(), onEvent, onStatus);
-// sock.connect() is called after the outbox state below is declared (onStatus reads it).
+// (multi-server connection layer is declared up top with the other early-init state; the sockets
+// connect at the bottom, once the outbox state onStatus reads is initialized.)
 
 // ── Outbox: writes made offline are queued and flushed, in order, on reconnect (arch §8) ──────
 interface OutboxItem {
   cid: string;
   cmd: Record<string, unknown> & { type: string };
   tempId?: string; // for session.create: the optimistic local session id to reconcile
+  serverUrl?: string; // target server for commands with no sessionId yet (session.create)
 }
 const newCid = (): string => (crypto.randomUUID ? crypto.randomUUID() : `c_${Date.now()}_${Math.floor(Math.random() * 1e9)}`);
 let outbox: OutboxItem[] = (() => {
@@ -336,7 +466,7 @@ function enqueue(item: OutboxItem): void {
   updateOutboxBadge();
 }
 const cidWaiters = new Map<string, (e: ServerEvent) => void>();
-function sendAwait(cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs = 20_000): Promise<ServerEvent> {
+function sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs = 20_000): Promise<ServerEvent> {
   return new Promise((resolve, reject) => {
     const t = window.setTimeout(() => {
       cidWaiters.delete(cmd.cid);
@@ -346,7 +476,7 @@ function sendAwait(cmd: Record<string, unknown> & { type: string; cid: string },
       clearTimeout(t);
       resolve(e);
     });
-    if (!sock.send(cmd)) {
+    if (!server.sock.send(cmd)) {
       clearTimeout(t);
       cidWaiters.delete(cmd.cid);
       reject(new Error("offline"));
@@ -356,38 +486,52 @@ function sendAwait(cmd: Record<string, unknown> & { type: string; cid: string },
 const tempMap = new Map<string, string>(); // optimistic id → real id
 let flushing = false;
 async function flushOutbox(): Promise<void> {
-  if (flushing || !sock.isOpen()) return;
+  if (flushing || !anyOpen()) return;
   flushing = true;
   let touchedActive = false;
+  const remaining: OutboxItem[] = []; // items whose server is offline / that error stay queued
+  const failedTemps = new Set<string>();
   try {
-    while (outbox.length && sock.isOpen()) {
-      const item = outbox[0]!;
+    for (const item of outbox) {
+      // a create that was just rejected → drop its dependent queued prompts
+      if ((item.tempId && failedTemps.has(item.tempId)) || (typeof item.cmd.sessionId === "string" && failedTemps.has(item.cmd.sessionId))) continue;
       const sid = item.cmd.sessionId as string | undefined;
       if (sid && tempMap.has(sid)) item.cmd.sessionId = tempMap.get(sid); // rewrite temp → real
-      if (sid === activeId || item.cmd.sessionId === activeId) touchedActive = true;
+      // route: explicit target (session.create) → the session's server → the hub
+      const srv = (item.serverUrl ? servers.get(item.serverUrl) : undefined) ?? serverOf(item.cmd.sessionId as string | undefined) ?? hub();
+      if (!srv.sock.isOpen()) {
+        remaining.push(item); // its server is offline — leave queued, try on its next connect
+        continue;
+      }
+      if (item.cmd.sessionId === activeId) touchedActive = true;
       try {
-        const res = await sendAwait({ ...item.cmd, cid: item.cid });
+        const res = await sendAwait(srv, { ...item.cmd, cid: item.cid });
         if (res.type === "command.error") {
           toast(`Queued ${item.cmd.type} failed: ${res.message}`);
-          if (item.tempId) failTemp(item.tempId);
+          if (item.tempId) {
+            failedTemps.add(item.tempId);
+            failTemp(item.tempId);
+          }
         } else if (item.tempId && res.type === "session.created") {
           tempMap.set(item.tempId, res.session.id);
+          sessionServer.set(res.session.id, srv.url);
+          persistRouting();
           reconcileTemp(item.tempId, res.session.id);
           if (activeId === res.session.id) touchedActive = true;
         }
       } catch {
-        break; // disconnected/timeout mid-flush — retry on next connect
+        remaining.push(item); // disconnected/timeout — retry on next connect
       }
-      outbox.shift();
-      saveOutbox();
     }
   } finally {
+    outbox = remaining;
+    saveOutbox();
     flushing = false;
     updateOutboxBadge();
     // re-pull authoritative history for the active session so optimistic bubbles are replaced
-    if (touchedActive && activeId && sock.isOpen()) {
+    if (touchedActive && activeId && serverOf(activeId)?.sock.isOpen()) {
       snapshotLoaded.delete(activeId);
-      sock.send({ type: "session.attach", sessionId: activeId });
+      sendTo(activeId, { type: "session.attach", sessionId: activeId });
     }
   }
 }
@@ -420,15 +564,18 @@ function updateOutboxBadge(): void {
   const el = document.getElementById("offline-banner");
   if (!el) return;
   const queued = outbox.length;
-  const online = sock.isOpen();
+  const online = anyOpen();
   el.hidden = online && queued === 0;
   el.innerHTML = online
     ? `${icon("sync")} Syncing ${queued} queued change${queued === 1 ? "" : "s"}…`
     : `${icon("cloud_off")} Offline${queued ? ` · ${queued} change${queued === 1 ? "" : "s"} queued` : ""} <button id="offline-retry" class="mini">${icon("refresh")} Retry</button>`;
   const retry = document.getElementById("offline-retry");
-  if (retry) retry.onclick = () => sock.connectNow();
+  if (retry) retry.onclick = () => { for (const s of servers.values()) s.sock.connectNow(); };
 }
-sock.connect(); // start connecting now that the outbox state onStatus reads is initialized
+// Start connecting now that the outbox state onStatus reads is initialized: the hub always, plus
+// every server in the registry (fleet — they merge into one view).
+ensureServer(HUB_URL);
+for (const u of loadExtraServers()) ensureServer(u);
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
@@ -518,13 +665,16 @@ function setUpdateStatus(text: string): void {
     out.textContent = text;
   }
 }
-function onStatus(status: "connecting" | "connected" | "disconnected"): void {
-  const dot = $("#conn-dot");
-  dot.className = `conn-dot ${status}`;
-  dot.title = status === "connected" ? "Connected" : status === "connecting" ? "Connecting…" : "Disconnected";
+function onStatus(url: string, status: "connecting" | "connected" | "disconnected"): void {
+  const srv = servers.get(url);
+  if (srv) srv.status = status;
+  // The header dot reflects the ACTIVE session's server; per-server dots live in the sidebar groups.
+  refreshConnDot();
   updateOutboxBadge();
-  if (status === "connected") void flushOutbox(); // push anything queued while offline
-  if (pendingRestartReload) {
+  renderSessions(); // per-server status dots in the group headers
+  if (document.querySelector(".settings-view")) renderServerCards(); // live status in Settings
+  if (status === "connected") void flushOutbox(); // push anything queued while offline (routed per server)
+  if (pendingRestartReload && url === HUB_URL) {
     if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
     else if (status === "connected") {
       pendingRestartReload = false;
@@ -534,9 +684,18 @@ function onStatus(status: "connecting" | "connected" | "disconnected"): void {
   }
   // (re)attach happens in the session.list handler, which the daemon sends on every connect.
 }
+/** The header connection dot tracks the server that owns the currently-open session. */
+function refreshConnDot(): void {
+  const dot = document.getElementById("conn-dot");
+  if (!dot) return;
+  const status = activeServer()?.status ?? "disconnected";
+  dot.className = `conn-dot ${status}`;
+  dot.title = status === "connected" ? "Connected" : status === "connecting" ? "Connecting…" : "Disconnected";
+}
 
 // ── Event routing ──────────────────────────────────────────────────────────────
-function onEvent(e: ServerEvent): void {
+// `url` is the server the frame arrived from — used to tag sessions/environments for routing.
+function onEvent(url: string, e: ServerEvent): void {
   if ("seq" in e && "sessionId" in e && typeof e.seq === "number") seqStore.set(e.sessionId, e.seq);
   const cid = (e as { cid?: string }).cid;
   if (cid && cidWaiters.has(cid)) {
@@ -545,55 +704,84 @@ function onEvent(e: ServerEvent): void {
   }
 
   switch (e.type) {
-    case "session.list":
-      // server is now the source of truth — drop optimistic/pending locals it doesn't know about
-      for (const id of [...sessions.keys()]) if (!sessions.get(id)?.pending) sessions.delete(id);
-      e.sessions.forEach((s) => sessions.set(s.id, s));
-      // A removing session the server still lists is mid-teardown — keep it (shown disabled); one
-      // it no longer lists is gone, so forget the removing flag.
+    case "session.list": {
+      // This server is the source of truth for ITS OWN sessions only — drop the ones it used to
+      // own and no longer lists (not other servers' sessions, not optimistic pending locals).
+      for (const id of [...sessions.keys()]) {
+        if (sessionServer.get(id) === url && !sessions.get(id)?.pending) {
+          sessions.delete(id);
+          sessionServer.delete(id);
+        }
+      }
+      e.sessions.forEach((s) => {
+        sessions.set(s.id, s);
+        sessionServer.set(s.id, url);
+      });
       for (const id of [...removingSessions]) if (!sessions.has(id)) removingSessions.delete(id);
       persistSessions();
+      persistRouting();
       renderSessions();
-      if (activeId && sessions.has(activeId)) {
+      // (re)attach the active session only if it lives on THIS server.
+      if (activeId && sessions.has(activeId) && sessionServer.get(activeId) === url) {
         setHeaderTitle(sessions.get(activeId));
-        // first attach this page-load → full snapshot (DOM was reloaded); a later reconnect
-        // (DOM intact) → resume only new events from the watermark.
         if (snapshotLoaded.has(activeId)) {
-          sock.send({ type: "session.attach", sessionId: activeId, lastSeq: seqStore.get(activeId) });
+          sendTo(activeId, { type: "session.attach", sessionId: activeId, lastSeq: seqStore.get(activeId) });
         } else {
-          sock.send({ type: "session.attach", sessionId: activeId });
+          sendTo(activeId, { type: "session.attach", sessionId: activeId });
         }
-      } else if (activeId) {
-        activeId = null; // the remembered session is gone
+      } else if (activeId && !sessions.has(activeId) && sessionServer.get(activeId) === url) {
+        activeId = null; // the remembered session was on this server and is gone
         localStorage.removeItem("anvil.active");
         clearConversation();
       }
       return;
+    }
     case "session.created":
       sessions.set(e.session.id, e.session);
+      sessionServer.set(e.session.id, url);
       persistSessions();
+      persistRouting();
       renderSessions();
       if (!activeId) selectSession(e.session.id);
       return;
     case "session.updated":
       sessions.set(e.session.id, e.session);
+      sessionServer.set(e.session.id, url);
       persistSessions();
       renderSessions();
       if (e.session.id === activeId) updateGitPanelMeta();
       return;
     case "session.deleted":
       sessions.delete(e.sessionId);
+      sessionServer.delete(e.sessionId);
       removingSessions.delete(e.sessionId); // cleanup finished — the row goes for good now
       localStorage.removeItem(`anvil.convo.${e.sessionId}`);
       persistSessions();
+      persistRouting();
       if (activeId === e.sessionId) deselectSession();
       else renderSessions();
       return;
-    case "budget":
-      return; // rate-limit gauge is tracked server-side; the UI display is removed for now
-
+    case "server.hello": {
+      // identify the server on this socket as soon as it opens (fleet §3/§6).
+      const srv = servers.get(url);
+      if (srv) {
+        srv.id = e.serverId;
+        srv.name = e.serverName || srv.name;
+        srv.version = e.version;
+      }
+      renderSessions(); // group headers now know this server's name
+      if (document.getElementById("env-cards")) renderEnvCards();
+      if (document.querySelector(".settings-view")) renderServerCards();
+      return;
+    }
+    case "budget": {
+      const srv = servers.get(url);
+      if (srv) srv.budget = e.budget;
+      renderAggregateBudget(); // sum across servers (§7)
+      return;
+    }
     case "environments":
-      onEnvironments(e.environments);
+      onEnvironments(url, e.environments);
       return;
     case "todoist.status":
       onTodoistStatus(e.connected, e.account);
@@ -745,7 +933,7 @@ function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string
   b.appendChild(md);
   for (const att of attachments) {
     if (!activeId) continue;
-    const href = apiUrl(`/api/sessions/${activeId}/attachments/${att.id}`);
+    const href = serverApiUrl(activeServer().url, `/api/sessions/${activeId}/attachments/${att.id}`);
     if (att.kind === "image") {
       const img = document.createElement("img");
       img.className = "att-img";
@@ -1087,7 +1275,7 @@ function fileOfferIcon(mime: string): string {
 function appendFileOffer(file: FileOffer): void {
   const b = bubble("assistant");
   b.className = "bubble assistant file-offer";
-  const href = apiUrl(file.downloadUrl);
+  const href = serverApiUrl(activeServer().url, file.downloadUrl);
   const taildrop = file.taildropped ? `<span class="fo-taildrop">${icon("send_to_mobile")} Sent to your device</span>` : "";
   b.innerHTML =
     `<div class="fo-card">` +
@@ -1169,7 +1357,7 @@ function updateComposerMode(status: string): void {
  *  jumping back to the last prompt with a "Thinking canceled" notice (UI refinement §stop). */
 function cancelThinking(): void {
   if (!activeId) return;
-  sock.send({ type: "interrupt", sessionId: activeId });
+  sendTo(activeId, { type: "interrupt", sessionId: activeId });
   turnCanceled = true; // suppress the trailing churn the daemon is still draining
   if (streamRaf) {
     cancelAnimationFrame(streamRaf);
@@ -1283,21 +1471,44 @@ function renderSessions(): void {
   activeUl.innerHTML = "";
   finishedUl.innerHTML = "";
   const ord = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
-  const items = [...sessions.values()].sort(
-    (a, b) =>
-      Number(!!b.isDefault) - Number(!!a.isDefault) || // the persistent concierge chat is always pinned first
-      Number(!!a.archived) - Number(!!b.archived) ||
-      ord(a) - ord(b),
-  );
-  let anyFinished = false;
-  for (const s of items) {
-    if (s.isDefault) conciergeUl.appendChild(renderSessionItem(s)); // pinned at the top, outside the sortable lists
-    else {
-      if (s.finished) anyFinished = true;
-      (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
+  const sortFn = (a: Session, b: Session): number =>
+    Number(!!b.isDefault) - Number(!!a.isDefault) ||
+    Number(!!a.archived) - Number(!!b.archived) ||
+    ord(a) - ord(b);
+  const all = [...sessions.values()];
+  // The concierge (isDefault) is pinned at the top, OUTSIDE the sortable/grouped lists (#26).
+  for (const s of all.filter((s) => s.isDefault)) conciergeUl.appendChild(renderSessionItem(s));
+  const rest = all.filter((s) => !s.isDefault);
+  const anyFinished = rest.some((s) => s.finished);
+
+  // One server → flat list. Many → group the active list under per-server section headers (hub
+  // first) with a live status dot; the Finished list stays flat. Separators aren't `.session` rows,
+  // so SortableJS (which is filtered to `.session`) ignores them. (fleet — anvil-multi-server.md §4)
+  if (orderedServers().length <= 1) {
+    for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
+  } else {
+    for (const srv of orderedServers()) {
+      const group = rest.filter((s) => !s.finished && (sessionServer.get(s.id) ?? HUB_URL) === srv.url).sort(sortFn);
+      activeUl.appendChild(serverSepRow(srv));
+      if (group.length) {
+        for (const s of group) activeUl.appendChild(renderSessionItem(s));
+      } else {
+        const empty = document.createElement("li");
+        empty.className = "server-empty";
+        empty.textContent = srv.status === "connected" ? "No sessions" : srv.status === "connecting" ? "Connecting…" : "Offline";
+        activeUl.appendChild(empty);
+      }
     }
+    for (const s of rest.filter((x) => x.finished).sort(sortFn)) finishedUl.appendChild(renderSessionItem(s));
   }
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
+}
+/** A non-draggable section header for a server's group in the sidebar (multi-server only). */
+function serverSepRow(srv: Server): HTMLLIElement {
+  const li = document.createElement("li");
+  li.className = "server-sep";
+  li.innerHTML = `<span class="conn-dot ${srv.status}"></span><span class="server-sep-name">${esc(srv.name)}</span>`;
+  return li;
 }
 
 function renderSessionItem(s: Session): HTMLLIElement {
@@ -1415,7 +1626,12 @@ function commitOrderFromDom(): void {
     }
   });
   persistSessions(); // keep the offline cache in step
-  sock.send({ type: "session.arrange", order, finished }); // dropped if offline; server resyncs on reconnect
+  // order/finished live on each session's own daemon, so send every server only its own subset
+  // (cross-server interleaving is visual; within a server the relative order is preserved).
+  for (const srv of servers.values()) {
+    const subset = order.filter((id) => sessionServer.get(id) === srv.url);
+    if (subset.length) srv.sock.send({ type: "session.arrange", order: subset, finished: subset.filter((id) => fin.has(id)) });
+  }
   renderSessions();
 }
 function setHeaderTitle(s: Session | undefined): void {
@@ -1466,10 +1682,15 @@ async function setFavicon(s: Session | undefined): Promise<void> {
     }
   }
 }
-function onEnvironments(list: Environment[]): void {
-  environments.clear();
-  for (const e of list) environments.set(e.id, e);
+function onEnvironments(url: string, list: Environment[]): void {
+  // Replace only THIS server's environments (others stay), and tag each with its server.
+  for (const [eid, u] of [...envServer]) if (u === url) { envServer.delete(eid); environments.delete(eid); }
+  for (const e of list) {
+    environments.set(e.id, e);
+    envServer.set(e.id, url);
+  }
   persistEnvironments();
+  persistRouting();
   renderSessions();
   applyActiveTint();
   if (document.getElementById("ns-modal")) showNewSession(); // refresh an open new-session modal
@@ -1478,7 +1699,7 @@ function onEnvironments(list: Environment[]): void {
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
 type SettingsTab = "servers" | "environments" | "todoist";
-let settingsTab: SettingsTab = "servers";
+let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
   root.innerHTML = `<div class="settings-view">
@@ -1487,18 +1708,18 @@ function openSettings(): void {
       <button id="settings-close" class="icon-btn" title="Close">${icon("close")}</button>
     </div>
     <div class="settings-tabs" role="tablist">
-      <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
+      <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
     </div>
     <div class="settings-body">
-      <section class="settings-panel" data-tab="servers">
-        <div id="server-cards"><p class="small muted">Loading…</p></div>
-      </section>
       <section class="settings-panel" data-tab="environments">
         <div class="section-head"><h3>Environments</h3><button id="set-add-env" class="primary">${icon("add")} Add repo</button></div>
-        <p class="small muted">Environments are git repositories. A new session branches a fresh worktree off one.</p>
+        <p class="small muted">Environments are git repositories, each living on a specific server. A new session branches a fresh worktree off one.</p>
         <div id="env-cards"></div>
+      </section>
+      <section class="settings-panel" data-tab="servers">
+        <div id="server-cards"><p class="small muted">Loading…</p></div>
       </section>
       <section class="settings-panel" data-tab="todoist">
         <div class="section-head"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
@@ -1561,7 +1782,7 @@ async function loadTodoistProjects(force = false): Promise<void> {
   const host = document.getElementById("todoist-panel");
   if (host && force) host.innerHTML = `<p class="small muted">Loading projects…</p>`;
   try {
-    const res = await sendAwait({ type: "todoist.projects.list", cid: newCid() }, 20_000);
+    const res = await sendAwait(hub(), { type: "todoist.projects.list", cid: newCid() }, 20_000);
     if (res.type === "command.error") {
       toast(res.message);
       return;
@@ -1614,22 +1835,87 @@ function renderTodoistPanel(): void {
 function closeSettings(): void {
   $("#settings-root").innerHTML = "";
 }
-async function renderServerCards(): Promise<void> {
-  const host = $("#server-cards");
-  try {
-    const h = (await (await apiFetch("/api/health")).json()) as { serverName?: string; version?: string };
-    const daemonHost = new URL(apiUrl("/")).host;
-    host.innerHTML = `<div class="card server-card">
-      <div class="card-main"><span class="conn-dot connected"></span><b>${esc(h.serverName ?? daemonHost)}</b> <span class="small muted">(this server)</span></div>
-      <div class="small muted"><code>${esc(daemonHost)}</code> · anvild ${esc(h.version ?? "?")}</div>
-      <div class="git-row" style="margin-top:10px"><button id="daemon-update">${icon("refresh")} Update Anvil</button></div>
-      <pre class="git-output" id="daemon-update-output" hidden></pre>
-    </div>
-    <p class="small muted">Multi-server (managing anvild on your other Macs from here) is on the roadmap — see the fleet design.</p>`;
-    wireDaemonUpdate();
-  } catch {
-    host.innerHTML = `<p class="small muted">Couldn't reach the server.</p>`;
+/** One card per server in the fleet (hub first): live status, version, budget, and remove. */
+function serverCardHtml(srv: Server): string {
+  const isHub = srv.url === HUB_URL;
+  const ver = srv.version ? ` · anvild ${esc(srv.version)}` : "";
+  const state = srv.status === "connected" ? "" : ` · <span class="warn-text">${esc(srv.status)}</span>`;
+  const update = isHub
+    ? `<div class="git-row" style="margin-top:10px"><button id="daemon-update">${icon("refresh")} Update Anvil</button></div><pre class="git-output" id="daemon-update-output" hidden></pre>`
+    : "";
+  const tail = isHub
+    ? '<span class="small muted">(this server)</span>'
+    : `<button class="mini danger" id="srv-remove-${cssId(srv.url)}">${icon("close")} Remove</button>`;
+  return `<div class="card server-card">
+    <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
+    <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
+    <div id="srv-budget-${cssId(srv.url)}" class="small muted srv-budget"></div>
+    ${update}
+  </div>`;
+}
+/** Verify a URL is a reachable Anvil daemon, then add it to the registry and connect. */
+async function addServerByUrl(raw: string): Promise<void> {
+  let url = raw.trim();
+  if (!url) return;
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  url = url.replace(/\/+$/, "");
+  if (url === HUB_URL || servers.has(url)) {
+    toast("Already in your fleet");
+    return;
   }
+  try {
+    const h = (await (await serverFetch(url, "/api/health")).json()) as { serverId?: string };
+    if (!h.serverId) throw new Error("not anvil");
+  } catch {
+    toast("Couldn't reach an Anvil server at that URL");
+    return;
+  }
+  saveExtraServers([...loadExtraServers(), url]);
+  ensureServer(url);
+  renderServerCards();
+}
+function renderServerCards(): void {
+  const host = document.getElementById("server-cards");
+  if (!host) return;
+  const list = orderedServers();
+  host.innerHTML =
+    `<div id="fleet-budget"></div>` +
+    list.map(serverCardHtml).join("") +
+    `<div class="card add-server">
+      <div class="card-main">${icon("dns")} <b>Add a server</b></div>
+      <p class="small muted">Another Mac on your tailnet running anvild. Paste its URL, or discover them automatically.</p>
+      <div class="git-row" style="margin-top:8px">
+        <input id="add-server-url" placeholder="https://laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
+        <button id="add-server-btn" class="primary">${icon("add")} Add</button>
+      </div>
+      <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover on tailnet</button></div>
+      <div id="discover-results" class="small muted" style="margin-top:8px"></div>
+    </div>
+    <div class="card fleet-admin">
+      <div class="section-head"><h3>${icon("hub")} Fleet</h3><button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button></div>
+      <p class="small muted">Macs sharing this server's Claude login. Add one without touching the Mac: on the new Mac open Anvil Server → Join a fleet, then enter its name + code here.</p>
+      <div id="fleet-members" class="small muted">Loading…</div>
+      <div class="git-row" style="margin-top:8px">
+        <input id="fleet-host" placeholder="new-mac.tailnet.ts.net" style="flex:1;min-width:0" />
+        <input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="code" style="max-width:90px" />
+        <button id="fleet-invite" class="primary">${icon("add")} Add Mac</button>
+      </div>
+      <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
+    </div>`;
+  wireDaemonUpdate(); // the hub card's "Update Anvil"
+  for (const srv of list) {
+    if (srv.url === HUB_URL) continue;
+    document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => removeServer(srv.url));
+  }
+  const addBtn = document.getElementById("add-server-btn");
+  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
+  addBtn?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
+  addInput?.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
+  });
+  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
+  wireFleetAdmin();
+  renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
       const el = document.getElementById("adb-output");
@@ -1672,6 +1958,120 @@ async function renderServerCards(): Promise<void> {
       .catch(() => {});
   }
 }
+/** Discover Anvil servers on the tailnet via the hub's /api/fleet/discover and offer one-tap adds. */
+async function runDiscovery(): Promise<void> {
+  const out = document.getElementById("discover-results");
+  if (!out) return;
+  out.textContent = "Scanning your tailnet…";
+  try {
+    const res = (await (await apiFetch("/api/fleet/discover")).json()) as {
+      ok: boolean;
+      servers?: { serverId: string; serverName: string; url: string; isSelf: boolean }[];
+      warning?: string;
+    };
+    if (!res.ok) {
+      out.textContent = res.warning ?? "Discovery is unavailable.";
+      return;
+    }
+    const found = (res.servers ?? [])
+      .map((s) => ({ ...s, url: s.url.replace(/\/+$/, "") }))
+      .filter((s) => !s.isSelf && s.url !== HUB_URL && !servers.has(s.url));
+    if (!found.length) {
+      out.textContent = "No new Anvil servers found on your tailnet.";
+      return;
+    }
+    out.innerHTML = found
+      .map(
+        (s) => `<div class="discover-row"><span><b>${esc(s.serverName)}</b> <code>${esc(hostOf(s.url))}</code></span><button class="mini" data-url="${esc(s.url)}">${icon("add")} Add</button></div>`,
+      )
+      .join("");
+    out.querySelectorAll<HTMLElement>("button[data-url]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const u = b.dataset.url!;
+        saveExtraServers([...loadExtraServers(), u]);
+        ensureServer(u);
+        renderServerCards();
+      }),
+    );
+  } catch {
+    out.textContent = "Discovery failed.";
+  }
+}
+// ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
+// All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
+interface FleetMember { serverId: string; serverName: string; host: string; url: string }
+function wireFleetAdmin(): void {
+  void loadFleetMembers();
+  const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  document.getElementById("fleet-invite")?.addEventListener("click", async () => {
+    const host = ($<HTMLInputElement>("#fleet-host").value || "").trim();
+    const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
+    if (!host || !/^\d{6}$/.test(code)) { setStatus("Enter the Mac's tailnet name and its 6-digit code."); return; }
+    setStatus("Sending the login to that Mac over the tailnet…");
+    try {
+      const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; error?: string };
+      setStatus(r.ok ? `✅ ${host} joined the fleet.` : `Rejected: ${r.error ?? "unknown"}`);
+      if (r.ok) { $<HTMLInputElement>("#fleet-host").value = ""; $<HTMLInputElement>("#fleet-code").value = ""; void loadFleetMembers(); }
+    } catch { setStatus("Couldn't reach the hub daemon."); }
+  });
+  document.getElementById("fleet-rotate")?.addEventListener("click", async () => {
+    setStatus("Pushing the current login to every Mac…");
+    try {
+      const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+      const okN = r.results.filter((x) => x.ok).length;
+      setStatus(`Updated ${okN}/${r.results.length} Macs.`);
+    } catch { setStatus("Rotate failed."); }
+  });
+}
+async function loadFleetMembers(): Promise<void> {
+  const el = document.getElementById("fleet-members");
+  if (!el) return;
+  try {
+    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
+    if (!members.length) { el.innerHTML = `<p class="small muted">No other Macs yet.</p>`; return; }
+    el.innerHTML = members
+      .map((m) => `<div class="discover-row"><span>${icon("desktop_mac")} <b>${esc(m.serverName)}</b> <code>${esc(m.host)}</code></span><button class="mini fleet-forget" data-id="${esc(m.serverId)}">${icon("close")} Forget</button></div>`)
+      .join("");
+    el.querySelectorAll<HTMLElement>(".fleet-forget").forEach((b) =>
+      b.addEventListener("click", async () => {
+        await apiFetch(`/api/fleet/members/${encodeURIComponent(b.dataset.id!)}`, { method: "DELETE" }).catch(() => {});
+        void loadFleetMembers();
+      }),
+    );
+  } catch {
+    el.innerHTML = `<p class="small muted">Couldn't load the fleet.</p>`;
+  }
+}
+const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
+/** Per-server budget lines + one aggregate "account usage" gauge (fleet §7). No-op if Settings is closed. */
+function renderAggregateBudget(): void {
+  for (const srv of servers.values()) {
+    const el = document.getElementById(`srv-budget-${cssId(srv.url)}`);
+    if (!el) continue;
+    const b = srv.budget;
+    el.innerHTML = b?.available
+      ? `Opus ${fmtPct(b.weekOpus)} · week ${fmtPct(b.week)}${b.warn ? ` ${icon("warning")}` : ""}`
+      : `budget: n/a`;
+  }
+  const agg = document.getElementById("fleet-budget");
+  if (!agg) return;
+  // All servers draw from ONE account, so each reports the same account-wide usage via the SDK.
+  // The honest aggregate is therefore the highest utilization any server reports — the real ceiling
+  // (§7) — not a sum. Shown only when there's more than one server.
+  const budgets = [...servers.values()].map((s) => s.budget).filter((b): b is Budget => !!b?.available);
+  if (orderedServers().length <= 1 || budgets.length === 0) {
+    agg.innerHTML = "";
+    return;
+  }
+  const maxU = (pick: (b: Budget) => number): number => Math.round(Math.max(0, ...budgets.map(pick)));
+  const opus = maxU((b) => b.weekOpus?.utilization ?? 0);
+  const week = maxU((b) => b.week?.utilization ?? 0);
+  const warn = budgets.some((b) => b.warn) || opus >= 80;
+  agg.innerHTML = `<div class="card${warn ? " warn-card" : ""}">
+    <div class="card-main">${icon("monitoring")} <b>Account usage</b></div>
+    <div class="small muted">Shared Max pool across the fleet — Opus <b>${opus}%</b> · week <b>${week}%</b> (highest any server reports).${warn ? " ⚠️ approaching the weekly limit." : ""}</div>
+  </div>`;
+}
 /** Wire the "Update Anvil" button: pull the daemon's source, rebuild, and restart it. */
 function wireDaemonUpdate(): void {
   const btn = document.getElementById("daemon-update") as HTMLButtonElement | null;
@@ -1691,7 +2091,7 @@ function wireDaemonUpdate(): void {
     out.hidden = false;
     out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
-      const res = await sendAwait({ type: "daemon.update", cid: newCid() }, 180_000);
+      const res = await sendAwait(hub(), { type: "daemon.update", cid: newCid() }, 180_000);
       if (res.type === "command.error") {
         out.textContent = `Update failed: ${res.message}`;
         toast("Update failed — see Settings.");
@@ -1736,14 +2136,8 @@ function wireDaemonUpdate(): void {
 function renderEnvCards(): void {
   const host = document.getElementById("env-cards");
   if (!host) return;
-  const envs = [...environments.values()];
-  if (envs.length === 0) {
-    host.innerHTML = `<p class="small muted">No environments yet. Add a git repo to get started.</p>`;
-    return;
-  }
-  host.innerHTML = envs
-    .map(
-      (e) => `<div class="card env-card" data-env="${esc(e.id)}">
+  const all = [...environments.values()];
+  const envCard = (e: Environment): string => `<div class="card env-card" data-env="${esc(e.id)}">
       <div class="env-head">
         <div class="env-meta">
           <b><span class="env-dot" style="background:${stripeColor(e, 0, currentTheme())}"></span>${esc(e.name)}</b>
@@ -1757,8 +2151,16 @@ function renderEnvCards(): void {
         </div>
       </div>
       <div class="env-readme-body" id="readme-${esc(e.id)}" hidden></div>
-    </div>`,
-    )
+    </div>`;
+  // One section per server (each repo is local to its daemon). Single-server → one section.
+  const srvHead = (srv: Server): string =>
+    `<div class="env-server-head"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> <span class="small muted"><code>${esc(hostOf(srv.url))}</code></span></div>`;
+  host.innerHTML = orderedServers()
+    .map((srv) => {
+      const group = all.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url);
+      const body = group.length ? group.map(envCard).join("") : `<p class="small muted">No environments on this server yet.</p>`;
+      return srvHead(srv) + body;
+    })
     .join("");
   host.querySelectorAll<HTMLElement>(".env-edit").forEach((b) => b.addEventListener("click", () => showEditEnvironment(b.dataset.env!)));
   host.querySelectorAll<HTMLElement>(".env-readme").forEach((b) => b.addEventListener("click", () => toggleReadme(b.dataset.env!)));
@@ -1771,7 +2173,7 @@ async function toggleReadme(id: string): Promise<void> {
   if (body.hidden || readmeLoaded.has(id)) return;
   body.innerHTML = `<p class="small muted">Loading README…</p>`;
   try {
-    const r = (await (await apiFetch(`/api/environments/${encodeURIComponent(id)}/readme`)).json()) as { markdown?: { html: string }; text?: string; missing?: boolean };
+    const r = (await (await serverFetch(serverOfEnv(id).url, `/api/environments/${encodeURIComponent(id)}/readme`)).json()) as { markdown?: { html: string }; text?: string; missing?: boolean };
     if (r.missing) body.innerHTML = `<p class="small muted">No README found in this repo.</p>`;
     else if (r.markdown) {
       body.innerHTML = `<div class="md reader-md">${r.markdown.html}</div>`;
@@ -1808,7 +2210,7 @@ function selectSession(id: string, push = true): void {
   // Opening a session is acting on it — clear its push reminder on this device immediately (the
   // daemon also clears it everywhere when we attach below). (UI refinement §1)
   navigator.serviceWorker?.controller?.postMessage({ type: "close-notifications", sessionId: id });
-  sock.send({ type: "session.attach", sessionId: id }); // full snapshot (always show history)
+  sendTo(id, { type: "session.attach", sessionId: id }); // full snapshot (always show history)
   if (isNarrow() && !sidebarCollapsed) {
     sidebarCollapsed = true;
     applySidebar(); // on a phone, get out of the way once you've picked a session
@@ -1848,8 +2250,8 @@ async function sendComposer(): Promise<void> {
   const text = input.value;
   if (!activeId || (!text.trim() && pendingAttachments.length === 0)) return;
   const s = sessions.get(activeId);
-  if (sock.isOpen() && !s?.pending) {
-    sock.send({ type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
+  if (serverOf(activeId)?.sock.isOpen() && !s?.pending) {
+    sendTo(activeId, { type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
   } else {
     // offline, or a session that itself hasn't been created yet → queue + show optimistically
     if (pendingAttachments.length) toast("Attachments need a connection — sent text only");
@@ -1928,7 +2330,7 @@ async function uploadAttachment(file: File): Promise<void> {
       r.readAsDataURL(file);
     });
     const base64 = dataUrl.split(",")[1] ?? "";
-    const res = await apiFetch(`/api/sessions/${activeId}/attachments`, {
+    const res = await serverFetch(activeServer().url, `/api/sessions/${activeId}/attachments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // mediaType may be empty (Android picker) — the daemon infers it from the filename.
@@ -2047,7 +2449,7 @@ function openPanel(view: "files" | "reader" | "git" | "terminal" | "links"): voi
 }
 /** Tear down the panel (DOM/state only). Reached via Back (popstate) or closePanel(). */
 function closePanelDom(): void {
-  if (readerWatch && activeId) sock.send({ type: "fs.unwatch", sessionId: activeId, path: readerWatch });
+  if (readerWatch && activeId) sendTo(activeId, { type: "fs.unwatch", sessionId: activeId, path: readerWatch });
   readerWatch = "";
   disposeTerminal();
   panelView = null;
@@ -2070,13 +2472,13 @@ function mountTerminal(): void {
   xterm.open($("#term-host"));
   fit.fit();
   xterm.onData((d) => {
-    if (activeId) sock.send({ type: "terminal.input", sessionId: activeId, data: strToB64(d) });
+    if (activeId) sendTo(activeId, { type: "terminal.input", sessionId: activeId, data: strToB64(d) });
   });
-  if (activeId) sock.send({ type: "terminal.open", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
+  if (activeId) sendTo(activeId, { type: "terminal.open", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
   termObs = new ResizeObserver(() => {
     if (fit && xterm && activeId) {
       fit.fit();
-      sock.send({ type: "terminal.resize", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
+      sendTo(activeId, { type: "terminal.resize", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
     }
   });
   termObs.observe(panelContent);
@@ -2091,7 +2493,7 @@ function disposeTerminal(): void {
 function requestFiles(path: string): void {
   if (!activeId) return;
   filesPath = path;
-  sock.send({ type: "fs.list", sessionId: activeId, path });
+  sendTo(activeId, { type: "fs.list", sessionId: activeId, path });
 }
 function renderFiles(entries: DirEntry[]): void {
   panelView = "files";
@@ -2123,9 +2525,9 @@ function openFile(path: string): void {
   readerPath = path;
   panelView = "reader";
   setPanelTabs();
-  if (readerWatch && readerWatch !== path) sock.send({ type: "fs.unwatch", sessionId: activeId, path: readerWatch });
-  sock.send({ type: "fs.read", sessionId: activeId, path });
-  sock.send({ type: "fs.watch", sessionId: activeId, path });
+  if (readerWatch && readerWatch !== path) sendTo(activeId, { type: "fs.unwatch", sessionId: activeId, path: readerWatch });
+  sendTo(activeId, { type: "fs.read", sessionId: activeId, path });
+  sendTo(activeId, { type: "fs.watch", sessionId: activeId, path });
   readerWatch = path;
   panelContent.innerHTML = `<p class="muted small">Loading ${esc(path)}…</p>`;
 }
@@ -2140,7 +2542,7 @@ function renderReader(content: FileContent): void {
   } else if (content.text !== undefined) {
     panelContent.innerHTML = head + `<pre class="reader-text">${esc(content.text)}</pre>` + (content.truncated ? '<p class="muted small">(truncated)</p>' : "");
   } else if (content.binaryUrl) {
-    const burl = apiUrl(content.binaryUrl); // daemon-relative → absolute (bundled native shells)
+    const burl = serverApiUrl(activeServer().url, content.binaryUrl); // daemon-relative → absolute, routed to the session's server
     panelContent.innerHTML =
       head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank">Open ${esc(content.path)}</a>`);
   }
@@ -2150,7 +2552,7 @@ function renderReader(content: FileContent): void {
 // ── Git panel ──────────────────────────────────────────────────────────────────
 function askClaude(instruction: string): void {
   if (!activeId) return;
-  sock.send({ type: "prompt.send", sessionId: activeId, text: instruction });
+  sendTo(activeId, { type: "prompt.send", sessionId: activeId, text: instruction });
   toast("Asked Claude →");
   closePanel(); // jump to the conversation to watch it work
 }
@@ -2188,7 +2590,7 @@ function applyGitButtons(): void {
   }
 }
 function requestGitStatus(): void {
-  if (activeId) sock.send({ type: "git", sessionId: activeId, op: "status" });
+  if (activeId) sendTo(activeId, { type: "git", sessionId: activeId, op: "status" });
 }
 function renderGit(): void {
   panelView = "git";
@@ -2219,7 +2621,7 @@ function renderGit(): void {
   $("#git-view-diff").onclick = () => {
     if (!activeId) return;
     setGitOutput("loading diff…");
-    sock.send({ type: "git", sessionId: activeId, op: "diff" });
+    sendTo(activeId, { type: "git", sessionId: activeId, op: "diff" });
   };
   for (const m of STAGE_META) {
     const btn = document.getElementById(`ga-${m.key}`) as HTMLButtonElement | null;
@@ -2239,7 +2641,7 @@ function runStage(key: Stage, label: string): void {
     if (b) b.disabled = true; // immediate response; re-evaluated on the next status
   }
   setGitOutput(`Working… asked Claude to ${label.toLowerCase()}.`);
-  sock.send({ type: "prompt.send", sessionId: activeId, text: STAGE_PROMPT[key] });
+  sendTo(activeId, { type: "prompt.send", sessionId: activeId, text: STAGE_PROMPT[key] });
   toast(`${label} →`);
 }
 function gitStatusLine(s: Session | undefined): string {
@@ -2276,7 +2678,7 @@ async function resetSession(): Promise<void> {
     confirmLabel: "Reset",
   });
   if (ok) {
-    sock.send({ type: "session.reset", sessionId: id });
+    sendTo(id, { type: "session.reset", sessionId: id });
     setGitOutput("resetting…");
   }
 }
@@ -2316,7 +2718,7 @@ async function abandonSession(): Promise<void> {
  *  and a failed/slow teardown can't leave a half-removed session behind. (UI refinement §8) */
 function killSession(id: string): void {
   removingSessions.add(id);
-  sock.send({ type: "session.kill", sessionId: id });
+  sendTo(id, { type: "session.kill", sessionId: id });
   localStorage.removeItem(`anvil.convo.${id}`);
   if (panelView) closePanel();
   if (activeId === id) {
@@ -2374,7 +2776,7 @@ function showGitResult(e: GitResultEvent): void {
 $("#btn-new-topic").addEventListener("click", () => {
   if (!activeId) return;
   if (!confirm("Start a new topic? Claude forgets the earlier context but the visible history stays.")) return;
-  sock.send({ type: "session.new_topic", sessionId: activeId, cid: newCid() });
+  sendTo(activeId, { type: "session.new_topic", sessionId: activeId, cid: newCid() });
   toast("Started a new topic — fresh context.");
 });
 $("#btn-files").addEventListener("click", () => (panelView === "files" || panelView === "reader" ? closePanel() : openPanel("files")));
@@ -2402,7 +2804,9 @@ document.addEventListener("pointerdown", (e) => {
 
 // ── Modals ─────────────────────────────────────────────────────────────────────
 let onDirs: ((e: DirsListResultEvent) => void) | null = null;
-const browse = { path: "", parent: undefined as string | undefined };
+// `serverUrl` is the daemon whose filesystem we're browsing (add-env / one-off pick a server).
+const browse = { path: "", parent: undefined as string | undefined, serverUrl: HUB_URL };
+const browseServer = (): Server => servers.get(browse.serverUrl) ?? hub();
 
 initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
@@ -2435,6 +2839,25 @@ const AUTONOMY_PICKER = `<label>Autonomy<select id="ns-auto">
 const selectedAutonomy = (): AutonomyPolicy =>
   ((document.getElementById("ns-auto") as HTMLSelectElement | null)?.value as AutonomyPolicy) || DEFAULT_AUTONOMY;
 
+/** A server picker for the browse-based modals (add-env, one-off). Hidden when there's one server. */
+function serverPickerMarkup(): string {
+  const list = orderedServers();
+  if (list.length <= 1) return "";
+  const opts = list.map((s) => `<option value="${esc(s.url)}">${esc(s.name)}</option>`).join("");
+  return `<label>Server<div class="env-row"><select id="ns-server">${opts}</select></div></label>`;
+}
+/** Initialise browse.serverUrl (→ hub) and, if the picker is shown, re-list on change. Call before wireBrowser(). */
+function wireServerPicker(): void {
+  browse.serverUrl = HUB_URL;
+  const sel = document.getElementById("ns-server") as HTMLSelectElement | null;
+  if (!sel) return;
+  sel.value = HUB_URL;
+  sel.addEventListener("change", () => {
+    browse.serverUrl = sel.value;
+    browse.path = "";
+    browseServer().sock.send({ type: "dirs.list" }); // re-list from the newly-chosen server's root
+  });
+}
 /** A reusable directory browser (used by add-environment and one-off). */
 function browserMarkup(): string {
   return `<div class="browser">
@@ -2453,14 +2876,14 @@ function wireBrowser(): void {
     for (const d of e.entries) {
       const li = document.createElement("li");
       li.innerHTML = `<span>📁 ${esc(d.name)}</span>${d.isRepo ? '<span class="repo">git</span>' : ""}`;
-      li.onclick = () => sock.send({ type: "dirs.list", path: d.path });
+      li.onclick = () => browseServer().sock.send({ type: "dirs.list", path: d.path });
       ul.appendChild(li);
     }
   };
   $<HTMLButtonElement>("#ns-up").onclick = () => {
-    if (browse.parent) sock.send({ type: "dirs.list", path: browse.parent });
+    if (browse.parent) browseServer().sock.send({ type: "dirs.list", path: browse.parent });
   };
-  sock.send({ type: "dirs.list" });
+  browseServer().sock.send({ type: "dirs.list" });
 }
 
 /** Primary flow: pick an environment + name → fresh worktree. */
@@ -2474,7 +2897,18 @@ function showNewSession(): void {
       <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-manage" class="primary">Settings &amp; servers</button></div>
       <p class="small muted"><a id="ns-oneoff" href="#">or work in a one-off folder…</a></p></div>`;
   } else {
-    const opts = envs.map((e) => `<option value="${esc(e.id)}">${esc(e.name)}</option>`).join("");
+    // Group the environments by the server they live on (the chosen env determines the server the
+    // session is created on). With a single server, render a flat list — no optgroup noise.
+    const multi = orderedServers().length > 1;
+    const opt = (e: Environment): string => `<option value="${esc(e.id)}">${esc(e.name)}</option>`;
+    const opts = multi
+      ? orderedServers()
+          .map((srv) => {
+            const group = envs.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url);
+            return group.length ? `<optgroup label="${esc(srv.name)}">${group.map(opt).join("")}</optgroup>` : "";
+          })
+          .join("")
+      : envs.map(opt).join("");
     m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
       <label>Environment<div class="env-row"><select id="ns-env">${opts}</select></div></label>
       <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
@@ -2544,17 +2978,18 @@ function showNewSession(): void {
     const cmd = env.isRepo
       ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", ...common }
       : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, ...common };
-    if (sock.isOpen()) {
-      sock.send(cmd);
+    const srv = serverOfEnv(env.id); // the session is created on the env's server
+    if (srv.sock.isOpen()) {
+      srv.sock.send(cmd);
     } else {
-      createOfflineSession(cmd, env, name);
+      createOfflineSession(cmd, env, name, srv.url);
     }
     closeModal();
   });
 }
 
 /** Create a session while offline: show an optimistic "pending" session now, realize it on reconnect. */
-function createOfflineSession(cmd: Record<string, unknown> & { type: string }, env: Environment, name: string): void {
+function createOfflineSession(cmd: Record<string, unknown> & { type: string }, env: Environment, name: string, serverUrl: string): void {
   const tempId = `pending_${newCid()}`;
   const now = new Date().toISOString();
   const pending: Session = {
@@ -2572,8 +3007,10 @@ function createOfflineSession(cmd: Record<string, unknown> & { type: string }, e
     usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
   };
   sessions.set(tempId, pending);
+  sessionServer.set(tempId, serverUrl); // route the queued create + its prompts to this server
   persistSessions();
-  enqueue({ cid: newCid(), cmd, tempId });
+  persistRouting();
+  enqueue({ cid: newCid(), cmd, tempId, serverUrl });
   selectSession(tempId);
   toast("Session queued — will be created when you're back online");
 }
@@ -2610,6 +3047,7 @@ function showAddEnvironment(): void {
   const m = document.createElement("div");
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>Add environment</h3>
+    ${serverPickerMarkup()}
     <label>Clone from URL<input id="ae-url" placeholder="e.g. git@github.com:owner/repo.git" /></label>
     <p class="small muted">Cloned into <code>~/Development/&lt;repo&gt;</code> using this machine's git/SSH credentials. Leave blank to use an existing local repo instead.</p>
     <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
@@ -2619,6 +3057,7 @@ function showAddEnvironment(): void {
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
   showModal(m);
+  wireServerPicker();
   wireBrowser();
   wireSwatchPicker();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
@@ -2633,6 +3072,7 @@ function showAddEnvironment(): void {
       btn.textContent = "Cloning…";
       try {
         const res = await sendAwait(
+          browseServer(),
           { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), cid: newCid() },
           120_000,
         );
@@ -2651,7 +3091,7 @@ function showAddEnvironment(): void {
       return;
     }
     if (!browse.path) return;
-    sock.send({
+    browseServer().sock.send({
       type: "env.add",
       name: name || (browse.path.split("/").pop() ?? browse.path),
       repoRoot: browse.path,
@@ -2692,7 +3132,7 @@ function showEditEnvironment(id: string): void {
       .split("\n")
       .map((s) => s.trim())
       .filter(Boolean);
-    sock.send({
+    serverOfEnv(id).sock.send({
       type: "env.update",
       id,
       name: $<HTMLInputElement>("#ee-name").value,
@@ -2712,7 +3152,7 @@ function showEditEnvironment(id: string): void {
       danger: true,
     });
     if (ok) {
-      sock.send({ type: "env.remove", id });
+      serverOfEnv(id).sock.send({ type: "env.remove", id });
       closeModal();
     }
   };
@@ -2724,15 +3164,17 @@ function showOneOff(): void {
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>One-off session</h3>
     <p class="small muted">Work directly in a folder (no worktree):</p>
+    ${serverPickerMarkup()}
     ${browserMarkup()}
     ${AUTONOMY_PICKER}
     <div class="btns"><button type="button" id="oo-back">Back</button><button type="button" id="oo-create">Open here</button></div></div>`;
   showModal(m);
+  wireServerPicker();
   wireBrowser();
   $<HTMLButtonElement>("#oo-back").onclick = () => showNewSession();
   $<HTMLButtonElement>("#oo-create").onclick = () => {
     if (!browse.path) return;
-    sock.send({
+    browseServer().sock.send({
       type: "session.create",
       source: "existing-dir",
       cwd: browse.path,
@@ -2764,7 +3206,7 @@ function showPermission(requestId: string, tool: string, inputObj: unknown, sugg
     b.className = `perm-btn ${s.decision}`;
     b.textContent = s.label;
     b.onclick = () => {
-      sock.send({ type: "permission.respond", requestId, decision: s.decision });
+      sendTo(activeId, { type: "permission.respond", requestId, decision: s.decision });
       resolvePermissionUI(requestId, s.label);
     };
     btns.appendChild(b);
@@ -2902,7 +3344,7 @@ function showQuestion(requestId: string, questions: Question[]): void {
 
 /** Fire a question answer; queue it for reconnect instead of dropping it if we're momentarily offline. */
 function respondToQuestion(cmd: { type: "question.respond"; requestId: string; answers: QuestionAnswer[]; cancelled?: boolean }): void {
-  if (!sock.send(cmd)) enqueue({ cid: newCid(), cmd });
+  if (!sendTo(activeId, cmd)) enqueue({ cid: newCid(), cmd }); // route to the active session's server
 }
 
 /** Gather one answer per question from the clicked options + any "Other" text; null if any is empty. */

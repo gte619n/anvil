@@ -8,6 +8,7 @@ export class AnvilSocket {
   private ws: WebSocket | undefined;
   private backoff = 500;
   private reconnectTimer = 0;
+  private closed = false; // set by close() — stops auto-reconnect (server removed from the fleet)
 
   constructor(
     private readonly url: string,
@@ -24,6 +25,7 @@ export class AnvilSocket {
   }
 
   connect(): void {
+    if (this.closed) return; // removed from the fleet — never reconnect
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     this.onStatus("connecting");
     const ws = new WebSocket(this.url);
@@ -64,6 +66,17 @@ export class AnvilSocket {
 
   isOpen(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  /** Permanently close this socket and stop reconnecting (the server was removed from the fleet). */
+  close(): void {
+    this.closed = true;
+    clearTimeout(this.reconnectTimer);
+    try {
+      this.ws?.close();
+    } catch {
+      /* already closing */
+    }
   }
 
   /** Send a client command; the envelope (v, ts) is stamped here. Returns false if not connected. */

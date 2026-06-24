@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { claudeCliOptions } from "./cli";
 
 /**
  * Curated Material Symbols (Rounded) names. Constraining Sonnet's choice to this set
@@ -38,7 +39,7 @@ export async function pickIcon(title: string, env: Record<string, string>): Prom
         allowedTools: [],
         permissionMode: "bypassPermissions",
         maxTurns: 1,
-        executable: "bun",
+        ...claudeCliOptions(),
         abortController: ac,
         env,
       },

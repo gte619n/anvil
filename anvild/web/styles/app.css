@@ -125,6 +125,20 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .section-head { display: flex; align-items: center; justify-content: space-between; }
 .card { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px 16px; margin-bottom: 10px; }
 .card-main { display: flex; align-items: center; gap: 8px; }
+/* per-server group header + empty placeholder in the sidebar session list (fleet grouping) */
+.server-sep { display: flex; align-items: center; gap: 7px; padding: 10px 12px 4px; font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; list-style: none; cursor: default; }
+.server-sep:not(:first-child) { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 12px; }
+.server-sep-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-empty { padding: 4px 12px 8px; font-size: 12px; color: var(--muted); list-style: none; }
+/* Settings → Servers: add-a-server card, discovered rows, per-server budget, account gauge */
+.add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
+.discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
+.discover-row code { word-break: break-all; }
+.srv-budget { margin-top: 6px; }
+.warn-card { border-color: var(--danger); }
+/* per-server section header on the Environments tab (fleet grouping) */
+.env-server-head { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.env-server-head + .env-server-head, .env-card + .env-server-head { margin-top: 18px; }
 .env-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .env-meta { min-width: 0; }
 .env-meta code { word-break: break-all; }

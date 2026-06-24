@@ -1,4 +1,5 @@
 import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { claudeCliOptions } from "./cli";
 import type { Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
@@ -157,7 +158,7 @@ export class AgentDriver {
         // (The PreToolUse hook is still the authoritative gate for every other tool — a hook
         // allow/deny short-circuits before canUseTool, so canUseTool only ever sees AskUserQuestion.)
         canUseTool: makeCanUseTool(s, this.questionBroker),
-        executable: "bun",
+        ...claudeCliOptions(), // executable:"bun" in dev; pathToClaudeCodeExecutable when packaged (§3.1)
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
         ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),
         ...(this.extraAllowedTools ? { allowedTools: this.extraAllowedTools } : {}),
