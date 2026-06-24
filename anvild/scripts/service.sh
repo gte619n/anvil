@@ -40,12 +40,33 @@ find_bun() {
 # `build:web` resolves imports straight out of node_modules — so without an install the build
 # fails with "Could not resolve …" and the atomic dist swap silently keeps serving the old UI.
 # An in-sync lockfile makes the install a fast no-op, so it's cheap to always run.
+#
+# CRITICAL: the rebuild is best-effort and must NEVER block the daemon from starting. The app ships a
+# prebuilt web/dist (Provision copies it into the install root) and build.ts swaps atomically — a
+# failed build leaves the existing dist untouched. So if install/build fails but a usable bundle is
+# already present, warn and carry on with it; only hard-fail when there's no dist to serve at all.
+# (Before this, `set -e` let a failed `build:web` abort `do_install` *before* the LaunchAgent was
+# bootstrapped — a transient build error left the daemon dead and fleet clients stuck "connecting".)
 build_web() {
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
+  # Put bun's own dir on PATH. The `build:web` script re-invokes bun BY NAME (`bun run web/build.ts`),
+  # and `bun install` may run package hooks that do the same. Some bun builds don't propagate their
+  # install dir to spawned scripts, so a bun that's resolvable by full path but missing from PATH
+  # (e.g. ~/.bun/bin absent from the shell/daemon PATH) makes those nested calls die with
+  # "bun: command not found" (exit 127) — observed on a fleet M1, which silently kept the daemon down.
+  export PATH="$(dirname "$bun"):$PATH"
   echo "installing dependencies…"
-  ( cd "$ANVILD_DIR" && "$bun" install ) || { echo "error: bun install failed"; exit 1; }
+  ( cd "$ANVILD_DIR" && "$bun" install ) || echo "warning: bun install failed — building against the existing node_modules"
   echo "building web client…"
-  ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null )
+  if ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null ); then
+    return 0
+  fi
+  if [ -f "$ANVILD_DIR/web/dist/main.js" ]; then
+    echo "warning: web build failed — serving the existing web/dist bundle (may be stale; see the build error above)"
+    return 0
+  fi
+  echo "error: web build failed and there's no prebuilt web/dist to fall back on"
+  exit 1
 }
 
 # This host's Tailscale IPv4 (100.64.0.0/10), if any. Found from interfaces, so it works even when
@@ -103,6 +124,15 @@ wait_health() {
   return 1
 }
 
+# When the daemon won't come up, print the ACTUAL reason (the tail of its error log) instead of
+# just pointing at a log file — the app surfaces this output verbatim in its status line, and a
+# non-technical user is never going to open a log by hand. Keep it short so it fits the menu.
+report_unhealthy() {
+  echo "warning: the daemon isn't answering on :$PORT yet. Most recent errors:"
+  tail -n 12 "$STATE_DIR/anvild.error.log" 2>/dev/null | sed 's/^/    /' || true
+  echo "  full log: $STATE_DIR/anvild.error.log"
+}
+
 free_port() {
   pkill -f "anvild/src/main.ts" 2>/dev/null || true
   local pids
@@ -122,6 +152,15 @@ do_install() {
   mkdir -p "$BIN_DIR" "$STATE_DIR" "$(dirname "$PLIST")"
 
   build_web
+
+  # The daemon imports its dependencies at runtime (the Claude agent SDK, etc.) — without an
+  # installed node_modules it just crash-loops, which would otherwise surface only as a vague
+  # "not healthy" timeout. Catch the missing-deps case up front with an actionable message.
+  if [ ! -d "$ANVILD_DIR/node_modules" ]; then
+    echo "error: dependencies are not installed — $ANVILD_DIR/node_modules is missing, so the daemon can't run."
+    echo "  Fix: open a terminal and run:  cd \"$ANVILD_DIR\" && bun install"
+    exit 1
+  fi
 
   # Decide the transport BEFORE writing the launcher: if serve is available we bind loopback so
   # `tailscale serve` can own the tailnet :PORT over HTTPS; otherwise the daemon binds the tailnet
@@ -176,7 +215,11 @@ PLISTEOF
   if wait_health; then
     echo "healthy: $(curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health")"
   else
-    echo "warning: not healthy yet — check $STATE_DIR/anvild.error.log"
+    # Exit non-zero so the caller (the app's "Start Anvil") knows the daemon didn't come up and
+    # surfaces the reason — otherwise install "succeeds", the app shows no error, and the UI silently
+    # falls back to "Daemon stopped" with the real cause hidden in the log.
+    report_unhealthy
+    exit 1
   fi
 
   # Print the URL clients should use for THIS host's transport: serve → HTTPS on the MagicDNS name
@@ -201,7 +244,7 @@ case "${1:-install}" in
     # direct-bind mode would create a tailnet :PORT listener that collides with the daemon's own bind.
     grep -q 'ANVIL_HOST=127.0.0.1' "$LAUNCHER" 2>/dev/null && setup_serve >/dev/null 2>&1 || true
     launchctl kickstart -k "$DOMAIN/$LABEL"
-    wait_health && echo "restarted, healthy" || echo "restarted (health pending)"
+    if wait_health; then echo "restarted, healthy"; else report_unhealthy; exit 1; fi
     ;;
   status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded"; { curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health" 2>/dev/null; } && echo || echo "no health" ;;
   logs)      tail -n 80 -f "$STATE_DIR/anvild.log" ;;

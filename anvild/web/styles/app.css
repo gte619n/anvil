@@ -139,6 +139,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
 .discover-row code { word-break: break-all; }
 .srv-budget { margin-top: 6px; }
+.server-card.removing { opacity: 0.5; pointer-events: none; transition: opacity 0.15s ease; }
 .warn-card { border-color: var(--danger); }
 /* per-server section header on the Environments tab (fleet grouping) */
 .env-server-head { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
@@ -254,6 +255,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .todoist-projects { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
 .todoist-projects th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .todoist-projects td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.todoist-connect { display: flex; gap: 8px; margin-top: 10px; }
+.todoist-connect input { flex: 1; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background-color: var(--bg); color: var(--text); }
 .session.archived { opacity: 0.55; }
 .session.pending .title .msym { color: var(--warn); }
 /* A session being cleaned up: disabled + greyed until the daemon confirms deletion (§8). */

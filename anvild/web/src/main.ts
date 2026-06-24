@@ -196,6 +196,7 @@ function removeServer(url: string): void {
   persistEnvironments();
   persistRouting();
   renderSessions();
+  if (document.getElementById("server-cards")) renderServerCards(); // drop the card from an open Settings view
 }
 const hub = (): Server => servers.get(HUB_URL)!;
 function serverOf(sessionId: string | null | undefined): Server | undefined {
@@ -784,7 +785,8 @@ $("#scroll-bottom").addEventListener("click", () => {
 // reconnect is our signal the new build is live — reload to pick up the rebuilt web bundle.
 let pendingRestartReload = false;
 function setUpdateStatus(text: string): void {
-  const out = document.getElementById("daemon-update-output");
+  // The hub's card owns the page-reload-on-restart flow; its output element is keyed by the hub URL.
+  const out = document.getElementById(`daemon-update-output-${cssId(HUB_URL)}`);
   if (out) {
     out.hidden = false;
     out.textContent = text;
@@ -901,6 +903,11 @@ function onEvent(url: string, e: ServerEvent): void {
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
+      // A member just (re)joined the fleet — if the hub holds a Todoist token, have the hub replicate
+      // it to this member so its linked environments can run autopilot. Self-heals every reconnect.
+      if (url !== HUB_URL && todoistConnected && e.serverId) {
+        hub().sock.send({ type: "todoist.propagate", targets: [e.serverId], cid: newCid() });
+      }
       return;
     }
     case "budget": {
@@ -913,7 +920,10 @@ function onEvent(url: string, e: ServerEvent): void {
       onEnvironments(url, e.environments);
       return;
     case "todoist.status":
-      onTodoistStatus(e.connected, e.account);
+      // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
+      // Fleet members each push their own status on connect — ignore them so a tokenless member
+      // can't clobber the hub's "connected" with its "not connected".
+      if (url === HUB_URL) onTodoistStatus(e.connected, e.account);
       return;
     case "todoist.projects.result":
       return; // resolved via cidWaiter (loadTodoistProjects)
@@ -999,8 +1009,18 @@ function handleSessionEvent(e: ServerEvent): void {
     case "permission.request":
       showPermission(e.requestId, e.tool, e.input, e.suggestions);
       return;
+    case "permission.resolved":
+      // Retire EXACTLY this card (answered here, on another device, or superseded). Per-request so a
+      // sibling prompt still parked during sub-agent fan-out is never collaterally cleared.
+      resolvePermissionUI(e.requestId);
+      return;
     case "question.request":
       showQuestion(e.requestId, e.questions);
+      return;
+    case "question.resolved":
+      // Retire EXACTLY this card (answered here, on another device, or superseded) — per-request so
+      // a sibling question still parked during sub-agent fan-out is never collaterally cleared.
+      resolveQuestionUI(e.requestId);
       return;
     case "fs.changed":
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
@@ -1509,10 +1529,14 @@ function applyActiveTint(): void {
   }
 }
 function setStatus(status: string): void {
-  // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
-  // retire any open permission/question cards so a stale one can't linger.
-  if (status !== "awaiting_permission") clearPermissionCards();
-  if (status !== "awaiting_question") clearQuestionCards();
+  // Permission AND question cards are retired individually by their `*.resolved` events (a session
+  // can hold several at once during sub-agent fan-out, so a status flip to running_tool/thinking
+  // must NOT clear a still-parked sibling). Only a terminal status sweeps any straggler that somehow
+  // lost its resolve event.
+  if (status === "idle" || status === "error") {
+    clearPermissionCards();
+    clearQuestionCards();
+  }
   const awaiting = status === "awaiting_permission" || status === "awaiting_question";
   if (status === "idle") finalizeActivity(); // turn ended (even if `result` never arrived) — stop the spinner
   if (status === "idle" || awaiting) hideThinking(); // the card is the indicator while parked
@@ -1880,7 +1904,7 @@ function openSettings(): void {
   const root = $("#settings-root");
   root.innerHTML = `<div class="settings-view">
     <div class="settings-head">
-      <h2>${icon("tune")} Settings &amp; servers</h2>
+      <h2>${icon("tune")} Settings &amp; Servers</h2>
       <button id="settings-close" class="icon-btn" title="Close">${icon("close")}</button>
     </div>
     <div class="settings-tabs" role="tablist">
@@ -1931,13 +1955,31 @@ let todoistProjectsLoaded = false;
 const todoistProjectName = (id?: string): string | undefined => (id ? todoistProjects.get(id)?.name : undefined);
 
 /** <option> list for the env link select; keeps the current link selectable even if not yet cached. */
-function todoistProjectOptions(selectedId?: string): string {
+/** Where each Todoist project is already linked (env on ANY fleet server), excluding `exceptEnvId`.
+ *  A project maps to exactly ONE environment — otherwise two daemons would plan the same tasks. */
+function todoistProjectLinks(exceptEnvId?: string): Map<string, { envName: string; serverName: string }> {
+  const links = new Map<string, { envName: string; serverName: string }>();
+  for (const e of environments.values()) {
+    if (!e.todoistProjectId || e.id === exceptEnvId) continue;
+    const srvUrl = envServer.get(e.id);
+    const srv = srvUrl ? servers.get(srvUrl) : undefined;
+    links.set(e.todoistProjectId, { envName: e.name, serverName: srv?.name ?? hostOf(srvUrl ?? "") });
+  }
+  return links;
+}
+
+function todoistProjectOptions(selectedId?: string, exceptEnvId?: string): string {
+  const links = todoistProjectLinks(exceptEnvId);
   const opts = [`<option value="">— none —</option>`];
   const seen = new Set<string>();
   for (const p of [...todoistProjects.values()].sort((a, b) => a.name.localeCompare(b.name))) {
     seen.add(p.id);
-    const label = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
-    opts.push(`<option value="${esc(p.id)}"${p.id === selectedId ? " selected" : ""}>${label}</option>`);
+    const linked = links.get(p.id);
+    const isSelected = p.id === selectedId;
+    const disabled = !!linked && !isSelected; // already owned by another env → can't double-link
+    const base = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
+    const label = disabled ? `${base} — linked to ${esc(linked!.envName)} @ ${esc(linked!.serverName)}` : base;
+    opts.push(`<option value="${esc(p.id)}"${isSelected ? " selected" : ""}${disabled ? " disabled" : ""}>${label}</option>`);
   }
   if (selectedId && !seen.has(selectedId)) {
     opts.push(`<option value="${esc(selectedId)}" selected>${esc(todoistProjectName(selectedId) ?? selectedId)}</option>`);
@@ -1974,13 +2016,58 @@ async function loadTodoistProjects(force = false): Promise<void> {
   }
 }
 
+async function connectTodoistToken(token: string, btn?: HTMLButtonElement): Promise<void> {
+  const t = token.trim();
+  if (!t) {
+    toast("Paste your Todoist API token first.");
+    return;
+  }
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Connecting…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "todoist.connect", token: t, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return; // onTodoistStatus only fires on success → stay on the entry form
+    }
+    todoistProjectsLoaded = false; // a (possibly new) account → refetch projects
+    // The connected `todoist.status` arrives via onTodoistStatus and re-renders the panel.
+    // Replicate the token to every fleet member (hub-side, server→server) so autopilot can run
+    // wherever a linked environment lives. Fire-and-forget; members also self-heal on reconnect.
+    if (orderedServers().some((s) => s.url !== HUB_URL)) {
+      hub().sock.send({ type: "todoist.propagate", cid: newCid() });
+      toast("Sharing the Todoist token across your fleet…");
+    }
+  } catch (err) {
+    toast(`Couldn't connect Todoist: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
 function renderTodoistPanel(): void {
   const host = document.getElementById("todoist-panel");
   if (!host) return;
   if (!todoistConnected) {
     host.innerHTML = `<div class="card"><b>Not connected.</b>
-      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), then run on the daemon host:</p>
-      <pre class="git-output">bun run scripts/todoist.ts set</pre></div>`;
+      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), paste it below, then connect.</p>
+      <div class="todoist-connect">
+        <input id="todoist-token" type="password" autocomplete="off" spellcheck="false" placeholder="Todoist API token" />
+        <button id="todoist-connect" class="primary">Connect</button>
+      </div>
+      <p class="small muted" style="margin-top:8px">Stored on the hub daemon (mode 0600) and replicated across your fleet, so autopilot can run wherever a linked environment lives.</p></div>`;
+    const input = $<HTMLInputElement>("#todoist-token");
+    const btn = $<HTMLButtonElement>("#todoist-connect");
+    btn.addEventListener("click", () => void connectTodoistToken(input.value, btn));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") void connectTodoistToken(input.value, btn);
+    });
     return;
   }
   if (!todoistProjectsLoaded) {
@@ -2003,30 +2090,36 @@ function renderTodoistPanel(): void {
       </tr>`;
     })
     .join("");
-  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects</div>
+  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects
+      <button id="todoist-disconnect" class="mini" style="float:right">Disconnect</button></div>
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
     <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
+  $("#todoist-disconnect").addEventListener("click", () => {
+    hub().sock.send({ type: "todoist.disconnect", cid: newCid() });
+    todoistProjectsLoaded = false;
+    todoistProjects.clear();
+  });
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
   $("#settings-root").innerHTML = "";
 }
-/** One card per server in the fleet (hub first): live status, version, budget, and remove. */
+/** One card per server in the fleet (hub first): live status, version, budget, update & remove. */
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
+  const id = cssId(srv.url);
   const ver = srv.version ? ` · anvild ${esc(srv.version)}` : "";
   const state = srv.status === "connected" ? "" : ` · <span class="warn-text">${esc(srv.status)}</span>`;
-  const update = isHub
-    ? `<div class="git-row" style="margin-top:10px"><button id="daemon-update">${icon("refresh")} Update Anvil</button></div><pre class="git-output" id="daemon-update-output" hidden></pre>`
-    : "";
+  // Every Mac runs its own daemon, so "Update Anvil" is per-server (the hub no longer has a monopoly).
   const tail = isHub
     ? '<span class="small muted">(this server)</span>'
-    : `<button class="mini danger" id="srv-remove-${cssId(srv.url)}">${icon("close")} Remove</button>`;
-  return `<div class="card server-card">
+    : `<button class="mini danger" id="srv-remove-${id}">${icon("close")} Remove</button>`;
+  return `<div class="card server-card" id="srv-card-${id}">
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
-    <div id="srv-budget-${cssId(srv.url)}" class="small muted srv-budget"></div>
-    ${update}
+    <div id="srv-budget-${id}" class="small muted srv-budget"></div>
+    <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
+    <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
 }
 /** Verify a URL is a reachable Anvil daemon, then add it to the registry and connect. */
@@ -2075,45 +2168,25 @@ function renderServerCards(): void {
   const host = document.getElementById("server-cards");
   if (!host) return;
   const list = orderedServers();
+  // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
+  // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
     `<div id="fleet-budget"></div>` +
-    list.map(serverCardHtml).join("") +
-    `<div class="card fleet-admin">
-      <div class="section-head"><h3>${icon("hub")} Fleet</h3><button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button></div>
-      <p class="small muted">The Macs sharing this server's Claude login.</p>
-      <div id="fleet-members" class="small muted">Loading…</div>
-      <hr style="border:none;border-top:1px solid var(--border);margin:12px 0 8px" />
-      <div class="card-main">${icon("add")} <b>Add a Mac</b></div>
-      <p class="small muted">On the new Mac open Anvil Server → <b>Join a fleet</b> for a 6-digit code. Then just pick it here and enter the code — no IP to track down.</p>
-      <div class="git-row" style="margin-top:8px">
-        <select id="fleet-host" style="flex:1;min-width:0"><option value="">Scanning your tailnet…</option></select>
-        <input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="code" style="max-width:90px" />
-        <button id="fleet-invite" class="primary">${icon("add")} Add</button>
-      </div>
-      <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
-      <details style="margin-top:10px">
-        <summary class="small muted" style="cursor:pointer">Connect a Mac that's already running, or add by URL…</summary>
-        <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
-        <div id="discover-results" class="small muted" style="margin-top:8px"></div>
-        <div class="git-row" style="margin-top:8px">
-          <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
-          <button id="add-server-btn">${icon("add")} Add by URL</button>
-        </div>
-      </details>
-    </div>`;
-  wireDaemonUpdate(); // the hub card's "Update Anvil"
+    `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
+    `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
+    `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
+    `</div></div>` +
+    `<p class="small muted">Every Mac here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    list.map(serverCardHtml).join("");
   for (const srv of list) {
-    if (srv.url === HUB_URL) continue;
-    document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => removeServer(srv.url));
+    wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
+    if (srv.url !== HUB_URL) {
+      document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => void confirmRemoveServer(srv));
+    }
   }
-  const addBtn = document.getElementById("add-server-btn");
-  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
-  addBtn?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
-  addInput?.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
-  });
-  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
-  wireFleetAdmin();
+  document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
+  document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
+  void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
@@ -2199,10 +2272,45 @@ async function runDiscovery(): Promise<void> {
 // ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
 // All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
 interface FleetMember { serverId: string; serverName: string; host: string; url: string }
-function wireFleetAdmin(): void {
-  void loadFleetMembers();
+// host → serverId for every Mac the hub knows as a fleet member. Lets a server card's "Remove" also
+// eject that Mac from the fleet (the old separate "Forget" action), so there's one button, not two.
+const fleetMemberIdByHost = new Map<string, string>();
+
+/** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
+async function rotateFleetToken(): Promise<void> {
+  toast("Pushing the current login to every Mac…");
+  try {
+    const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    const okN = r.results.filter((x) => x.ok).length;
+    toast(`Updated ${okN}/${r.results.length} Macs.`);
+  } catch { toast("Couldn't push the login — is the hub reachable?"); }
+}
+
+/** The "+ Add a Mac" dialog: invite by join code (primary), or adopt a server that's already running. */
+function showAddMac(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a Mac</h3>
+    <p class="small muted">On the new Mac open <b>Anvil Server → Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
+    <label>Mac<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
+    <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" /></label>
+    <div id="fleet-status" class="small muted"></div>
+    <details style="margin-top:12px">
+      <summary class="small muted" style="cursor:pointer">Already running? Connect it directly, or add by URL…</summary>
+      <p class="small muted" style="margin-top:8px">Use this for a Mac whose daemon is already up (no join code) — discover it on your tailnet, or type its address.</p>
+      <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
+      <div id="discover-results" class="small muted" style="margin-top:8px"></div>
+      <div class="git-row" style="margin-top:8px">
+        <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
+        <button id="add-server-btn">${icon("add")} Add by URL</button>
+      </div>
+    </details>
+    <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
+  </div>`;
+  showModal(m);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
     const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
     const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
@@ -2215,8 +2323,7 @@ function wireFleetAdmin(): void {
         // Onboarded → also connect this client to it so its sessions show up (one step, not two).
         if (r.member?.url) { saveExtraServers([...loadExtraServers(), r.member.url]); ensureServer(r.member.url); }
         $<HTMLInputElement>("#fleet-code").value = "";
-        setStatus(`✅ ${host} joined the fleet — connecting…`);
-        void loadFleetMembers();
+        setStatus(`✅ ${host} joined the fleet.`);
         void loadFleetPeers();
         renderServerCards();
       } else {
@@ -2224,14 +2331,57 @@ function wireFleetAdmin(): void {
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
-  document.getElementById("fleet-rotate")?.addEventListener("click", async () => {
-    setStatus("Pushing the current login to every Mac…");
-    try {
-      const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
-      const okN = r.results.filter((x) => x.ok).length;
-      setStatus(`Updated ${okN}/${r.results.length} Macs.`);
-    } catch { setStatus("Rotate failed."); }
+  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
+  document.getElementById("add-server-btn")?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
+  addInput?.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
   });
+  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
+}
+
+/** Click handler for a server card's "Remove": dim the card, eject it from the fleet (if it's a member),
+ *  then drop it locally and re-render. "Remove" now does what "Forget" used to — one action, not two. */
+async function confirmRemoveServer(srv: Server): Promise<void> {
+  if (srv.url === HUB_URL) return;
+  const card = document.getElementById(`srv-card-${cssId(srv.url)}`);
+  const btn = document.getElementById(`srv-remove-${cssId(srv.url)}`) as HTMLButtonElement | null;
+  card?.classList.add("removing"); // dim + ignore further clicks until this resolves
+  if (btn) { btn.disabled = true; btn.innerHTML = `${icon("progress_activity")} Removing…`; btn.querySelector(".msym")?.classList.add("spin"); }
+  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login.
+  const memberId = fleetMemberIdByHost.get(hostOf(srv.url));
+  if (memberId) {
+    try {
+      await apiFetch(`/api/fleet/members/${encodeURIComponent(memberId)}`, { method: "DELETE" });
+      fleetMemberIdByHost.delete(hostOf(srv.url));
+    } catch {
+      card?.classList.remove("removing");
+      if (btn) { btn.disabled = false; btn.innerHTML = `${icon("close")} Remove`; }
+      toast("Couldn't remove that Mac from the fleet — is the hub reachable?");
+      return;
+    }
+  }
+  removeServer(srv.url); // local teardown — re-renders the (now shorter) card list
+}
+/** Fetch the hub's fleet members: cache host→serverId for Remove, and adopt any member this device
+ *  isn't connected to yet so the one card list is the whole fleet, not just this device's history. */
+async function loadFleetMembers(): Promise<void> {
+  try {
+    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
+    fleetMemberIdByHost.clear();
+    let adopted = false;
+    for (const m of members) {
+      fleetMemberIdByHost.set(m.host, m.serverId);
+      const url = m.url.replace(/\/+$/, "");
+      if (url && url !== HUB_URL && !servers.has(url)) {
+        saveExtraServers([...loadExtraServers(), url]);
+        ensureServer(url);
+        adopted = true;
+      }
+    }
+    if (adopted && document.getElementById("server-cards")) renderServerCards();
+  } catch {
+    /* hub unreachable — cards still render from the locally-known servers */
+  }
 }
 /** Fill the "Add a Mac" dropdown from the hub's tailnet peers — so you pick a name, not an IP. */
 async function loadFleetPeers(): Promise<void> {
@@ -2250,25 +2400,6 @@ async function loadFleetPeers(): Promise<void> {
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
-  }
-}
-async function loadFleetMembers(): Promise<void> {
-  const el = document.getElementById("fleet-members");
-  if (!el) return;
-  try {
-    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
-    if (!members.length) { el.innerHTML = `<p class="small muted">No other Macs yet.</p>`; return; }
-    el.innerHTML = members
-      .map((m) => `<div class="discover-row"><span>${icon("desktop_mac")} <b>${esc(m.serverName)}</b> <code>${esc(m.host)}</code></span><button class="mini fleet-forget" data-id="${esc(m.serverId)}">${icon("close")} Forget</button></div>`)
-      .join("");
-    el.querySelectorAll<HTMLElement>(".fleet-forget").forEach((b) =>
-      b.addEventListener("click", async () => {
-        await apiFetch(`/api/fleet/members/${encodeURIComponent(b.dataset.id!)}`, { method: "DELETE" }).catch(() => {});
-        void loadFleetMembers();
-      }),
-    );
-  } catch {
-    el.innerHTML = `<p class="small muted">Couldn't load the fleet.</p>`;
   }
 }
 const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
@@ -2301,10 +2432,14 @@ function renderAggregateBudget(): void {
     <div class="small muted">Shared Max pool across the fleet — Opus <b>${opus}%</b> · week <b>${week}%</b> (highest any server reports).${warn ? " ⚠️ approaching the weekly limit." : ""}</div>
   </div>`;
 }
-/** Wire the "Update Anvil" button: pull the daemon's source, rebuild, and restart it. */
-function wireDaemonUpdate(): void {
-  const btn = document.getElementById("daemon-update") as HTMLButtonElement | null;
-  const out = document.getElementById("daemon-update-output");
+/** Wire one server card's "Update Anvil" button: pull that daemon's source, rebuild, and restart it.
+ *  Each Mac self-updates independently — the hub no longer has a monopoly on updates. Only a hub
+ *  restart reloads this page (it's serving the bundle); a remote restart just reconnects in the list. */
+function wireDaemonUpdate(srv: Server): void {
+  const id = cssId(srv.url);
+  const isHub = srv.url === HUB_URL;
+  const btn = document.getElementById(`daemon-update-${id}`) as HTMLButtonElement | null;
+  const out = document.getElementById(`daemon-update-output-${id}`);
   if (!btn || !out) return;
   const spin = (label: string): void => {
     btn.innerHTML = `${icon("progress_activity")} ${label}`;
@@ -2320,7 +2455,7 @@ function wireDaemonUpdate(): void {
     out.hidden = false;
     out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
-      const res = await sendAwait(hub(), { type: "daemon.update", cid: newCid() }, 180_000);
+      const res = await sendAwait(srv, { type: "daemon.update", cid: newCid() }, 180_000);
       if (res.type === "command.error") {
         out.textContent = `Update failed: ${res.message}`;
         toast("Update failed — see Settings.");
@@ -2333,14 +2468,14 @@ function wireDaemonUpdate(): void {
       }
       out.textContent = res.output;
       if (res.phase === "up-to-date") {
-        toast(`Anvil is already up to date (v${res.currentVersion}).`);
+        toast(`${esc(srv.name)} is already up to date (v${res.currentVersion}).`);
         reset();
       } else if (res.phase === "error") {
         toast("Update failed — see Settings.");
         reset();
-      } else if (res.willRestart) {
-        // The daemon restarts momentarily; keep the button spinning and let onStatus reload the
-        // app once the WS reconnects (that's the proof it's back). Safety net if it never returns.
+      } else if (res.willRestart && isHub) {
+        // The hub serves THIS page, so when it restarts we reload to pick up the new bundle. Keep the
+        // button spinning and let onStatus reload once the WS reconnects. Safety net if it never returns.
         toast("Anvil updated — restarting…");
         pendingRestartReload = true;
         spin("Restarting…");
@@ -2351,9 +2486,14 @@ function wireDaemonUpdate(): void {
           setUpdateStatus("Still restarting — reload the app manually in a moment to pick up the update.");
           reset();
         }, 90_000);
+      } else if (res.willRestart) {
+        // A remote Mac restarts on its own; nothing to reload here — it just reconnects in the list.
+        toast(`${esc(srv.name)} updated — restarting it…`);
+        out.textContent = `${res.output}\n\nUpdate applied. ${srv.name} is restarting — it'll reconnect in the list shortly.`;
+        reset();
       } else {
-        // updated but this daemon isn't service-managed, so it won't self-restart
-        toast("Anvil updated — restart the daemon to apply.");
+        // updated but that daemon isn't service-managed, so it won't self-restart
+        toast(`${esc(srv.name)} updated — restart it to apply.`);
         reset();
       }
     } catch (e) {
@@ -3414,7 +3554,7 @@ function showEditEnvironment(id: string): void {
   if (!env) return;
   const m = document.createElement("div");
   m.className = "modal";
-  const projectOptions = todoistProjectOptions(env.todoistProjectId);
+  const projectOptions = todoistProjectOptions(env.todoistProjectId, env.id);
   const validationText = env.validation?.commands?.join("\n") ?? "";
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
@@ -3434,6 +3574,16 @@ function showEditEnvironment(id: string): void {
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
+    const chosenProject = $<HTMLSelectElement>("#ee-todoist").value;
+    // Guard against a race: another client may have linked this project while the modal was open
+    // (the dropdown already disables known clashes). One project ↔ one environment.
+    if (chosenProject) {
+      const clash = todoistProjectLinks(id).get(chosenProject);
+      if (clash) {
+        toast(`“${todoistProjectName(chosenProject) ?? "That project"}” is already linked to ${clash.envName} @ ${clash.serverName}. Unlink it there first.`);
+        return;
+      }
+    }
     const commands = $<HTMLTextAreaElement>("#ee-validation").value
       .split("\n")
       .map((s) => s.trim())

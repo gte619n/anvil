@@ -5,7 +5,7 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { loadServerIdentity, serverHelloEvent } from "./identity";
-import { discoverFleet, inviteMac, resolveMemberUrl, rotateToken, tailnetPeers } from "./fleet";
+import { discoverFleet, inviteMac, propagateTodoist, resolveMemberUrl, rotateToken, tailnetPeers } from "./fleet";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
@@ -126,6 +126,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
     "Access-Control-Max-Age": "86400",
   };
 
+  // Replicate this hub's Todoist token to member daemons so autopilot can run where each repo lives
+  // (anvil-multi-server.md). `targets` = member serverIds; omit for all. No-op on a leaf member (its
+  // fleet is empty) or before a token is set. Fire-and-forget + idempotent — members heal on reconnect.
+  function pushTodoist(targets?: string[]): void {
+    const token = supervisor.todoistTokenForFleet();
+    if (!token) return;
+    const members = fleet.list().filter((m) => !targets || targets.includes(m.serverId));
+    if (members.length === 0) return;
+    void propagateTodoist({ members, token }).then((results) => {
+      for (const r of results) {
+        if (r.ok) console.log(`[todoist] replicated token → ${r.url}${r.account ? ` (${r.account})` : ""}`);
+        else console.warn(`[todoist] replication to ${r.url} failed: ${r.error ?? "unknown"}`);
+      }
+    });
+  }
+
   const WS = {
     open(ws: ServerWebSocket<ConnState>) {
       registry.add(ws);
@@ -140,7 +156,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     message(ws: ServerWebSocket<ConnState>, message: string | Buffer) {
       const raw = typeof message === "string" ? message : message.toString("utf8");
-      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry });
+      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist });
     },
   };
 
@@ -201,7 +217,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
           url: await resolveMemberUrl(host, opts.port),
         };
         fleet.upsert(member);
+        pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
         return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
+      }
+
+      // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
+      // here so this daemon can run autopilot for its own linked environments. Validated against the
+      // Todoist API before it's stored (mode 0600); tailnet-gated like the rest of the daemon API.
+      if (url.pathname === "/api/integrations/todoist" && req.method === "POST") {
+        const { token } = (await req.json().catch(() => ({}))) as { token?: string };
+        if (!token) return Response.json({ ok: false, error: "token required" }, { status: 400 });
+        try {
+          const ev = await supervisor.connectTodoist(token);
+          return Response.json({ ok: true, account: ev.account });
+        } catch (e) {
+          return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+        }
       }
       if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
         const results = await rotateToken({ members: fleet.list(), token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });

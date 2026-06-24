@@ -10,6 +10,9 @@ export interface DispatchDeps {
   push: PushRegistry;
   supervisor: Supervisor;
   registry: ConnectionRegistry;
+  /** Hub-only: replicate the stored Todoist token to fleet members (defined in http.ts, where the
+   *  FleetStore lives). Omitted/no-op on leaf members. */
+  propagateTodoist?: (targets?: string[]) => void;
 }
 
 type Send = (event: ServerEvent) => void;
@@ -244,6 +247,22 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "todoist.status":
         send(deps.supervisor.todoistStatusEvent(cid));
+        return;
+
+      case "todoist.connect":
+        deps.supervisor
+          .connectTodoist(cmd.token, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "todoist.disconnect":
+        send(deps.supervisor.disconnectTodoist(cid));
+        return;
+
+      case "todoist.propagate":
+        deps.propagateTodoist?.(cmd.targets);
+        if (cid) send(ack(cid));
         return;
 
       case "todoist.projects.list":

@@ -17,8 +17,13 @@ enum Tailscale {
     return dns.hasSuffix(".") ? String(dns.dropLast()) : dns
   }
 
-  /// True when Tailscale reports a logged-in, running backend.
+  /// True when this Mac is on the tailnet. The AUTHORITATIVE signal is a tailnet IP (100.64/10) on a
+  /// live interface — read straight from the kernel, so it's correct even when the `tailscale` CLI
+  /// can't be driven by a third-party app (the Mac App Store Tailscale build sandboxes its CLI socket,
+  /// so `tailscale status` fails from here even while Tailscale is fully connected). We only fall back
+  /// to the CLI when there's no tailnet IP yet, to distinguish "starting up" from "not installed".
   static func loggedIn() -> Bool {
+    if tailnetIP() != nil { return true }
     let r = Shell.run("tailscale", ["status", "--json"])
     guard r.ok, let data = r.stdout.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]

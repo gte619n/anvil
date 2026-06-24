@@ -59,7 +59,11 @@ PLIST
 # prebuilt. Opt in with BUNDLE_ANVILD=../anvild; in dev the app finds a checkout via the picker.
 if [ -n "${BUNDLE_ANVILD:-}" ] && [ -d "$BUNDLE_ANVILD" ]; then
   echo "bundling anvild source from $BUNDLE_ANVILD (excluding node_modules)…"
-  rsync -a --exclude node_modules --exclude .git "$BUNDLE_ANVILD/" "$APP/Contents/Resources/anvild/"
+  # -L (copy-links) MATERIALIZES symlinks into real files. anvild/protocol.ts is a symlink to
+  # ../docs/plans/anvil-protocol.ts — OUTSIDE the bundled tree — so a plain copy ships a DANGLING
+  # link, and both `build:web` and the daemon's `@protocol` import then fail in the install root.
+  # Dereferencing makes the bundle self-contained. (protocol.ts is the only out-of-tree symlink.)
+  rsync -aL --exclude node_modules --exclude .git "$BUNDLE_ANVILD/" "$APP/Contents/Resources/anvild/"
 fi
 
 echo "ad-hoc signing…"
