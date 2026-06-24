@@ -1,5 +1,27 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, discoverFleet, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, discoverFleet, tailnetPeers, type ProbeResult } from "../../src/server/fleet";
+
+test("tailnetPeers: lists other Macs by short name (Self + offline excluded from the picker)", async () => {
+  const status = JSON.stringify({
+    Self: { DNSName: "mac-mini-m4.tnet.ts.net." },
+    Peer: {
+      a: { DNSName: "mac-mini-m1.tnet.ts.net.", Online: true },
+      b: { DNSName: "laptop.tnet.ts.net.", Online: false },
+    },
+  });
+  const r = await tailnetPeers(async () => status);
+  expect(r.ok).toBe(true);
+  expect(r.peers).toContainEqual({ name: "mac-mini-m1", host: "mac-mini-m1.tnet.ts.net", online: true });
+  expect(r.peers.find((p) => p.name === "laptop")?.online).toBe(false); // listed but marked offline
+  expect(r.peers.some((p) => p.name === "mac-mini-m4")).toBe(false); // Self excluded
+});
+
+test("tailnetPeers: Tailscale unavailable → ok:false + warning", async () => {
+  const r = await tailnetPeers(async () => null);
+  expect(r.ok).toBe(false);
+  expect(r.peers).toEqual([]);
+  expect(r.warning).toMatch(/Tailscale/);
+});
 
 const STATUS = JSON.stringify({
   Self: { DNSName: "mac-mini.tail-scale.ts.net." },

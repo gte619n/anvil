@@ -877,6 +877,17 @@ export namespace rest {
   export interface FleetMembersResponse {
     members: FleetMember[];
   }
+  /** GET /api/fleet/peers → the other Macs on this tailnet, so a client picks one by name (no IPs). */
+  export interface FleetPeer {
+    name: string; // short label, e.g. "mac-mini-m1"
+    host: string; // full MagicDNS name
+    online: boolean;
+  }
+  export interface FleetPeersResponse {
+    ok: boolean;
+    peers: FleetPeer[];
+    warning?: string;
+  }
   /** POST /api/fleet/invite { host, code } → push the hub's OAuth token to a joiner's pairing
    *  listener (first join, code-gated). The token is read from the daemon env and never returned. */
   export interface FleetInviteRequest {

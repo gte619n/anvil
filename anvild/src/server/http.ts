@@ -5,7 +5,7 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { loadServerIdentity, serverHelloEvent } from "./identity";
-import { discoverFleet, inviteMac, rotateToken } from "./fleet";
+import { discoverFleet, inviteMac, rotateToken, tailnetPeers } from "./fleet";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
@@ -180,6 +180,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
       if (url.pathname === "/api/fleet/members" && req.method === "GET") {
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
+      }
+      // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
+      if (url.pathname === "/api/fleet/peers" && req.method === "GET") {
+        return Response.json((await tailnetPeers()) satisfies rest.FleetPeersResponse);
       }
       if (url.pathname === "/api/fleet/invite" && req.method === "POST") {
         const { host, code } = (await req.json().catch(() => ({}))) as Partial<rest.FleetInviteRequest>;

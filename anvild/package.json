@@ -1,6 +1,6 @@
 {
   "name": "anvild",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Anvil daemon — supervises Claude Code sessions and serves the Anvil protocol over Tailscale.",

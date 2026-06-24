@@ -26,6 +26,29 @@ export interface ProbeResult {
 export type RunTailscale = () => Promise<string | null>; // null → CLI unavailable / not logged in
 export type Probe = (baseUrl: string) => Promise<ProbeResult | null>; // null → not an Anvil server
 
+/** A tailnet Mac the user can pick when adding to the fleet (no IPs to track down). */
+export interface TailnetPeer {
+  name: string; // short label (first DNS label), e.g. "mac-mini-m1"
+  host: string; // full MagicDNS name for :7701/:7702
+  online: boolean;
+}
+
+/** List the other Macs on this tailnet (Self excluded) so a client can pick one by name. */
+export async function tailnetPeers(runTailscale: RunTailscale = defaultRunTailscale): Promise<{ ok: boolean; peers: TailnetPeer[]; warning?: string }> {
+  const json = await runTailscale();
+  if (!json) return { ok: false, peers: [], warning: "Tailscale isn't available (CLI missing or not logged in)." };
+  let parsed: TailscalePeer[];
+  try {
+    parsed = parseTailscalePeers(json);
+  } catch {
+    return { ok: false, peers: [], warning: "Couldn't parse `tailscale status --json`." };
+  }
+  const peers = parsed
+    .filter((p) => !p.isSelf && p.dnsName)
+    .map((p) => ({ name: p.dnsName.split(".")[0]!, host: p.dnsName, online: p.online }));
+  return { ok: true, peers };
+}
+
 /** Parse `tailscale status --json` into the peers we might probe (Self + every Peer). */
 export function parseTailscalePeers(statusJson: string): TailscalePeer[] {
   const s = JSON.parse(statusJson) as {

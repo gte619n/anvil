@@ -1881,26 +1881,28 @@ function renderServerCards(): void {
   host.innerHTML =
     `<div id="fleet-budget"></div>` +
     list.map(serverCardHtml).join("") +
-    `<div class="card add-server">
-      <div class="card-main">${icon("dns")} <b>Add a server</b></div>
-      <p class="small muted">Another Mac on your tailnet running anvild. Paste its URL, or discover them automatically.</p>
-      <div class="git-row" style="margin-top:8px">
-        <input id="add-server-url" placeholder="https://laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
-        <button id="add-server-btn" class="primary">${icon("add")} Add</button>
-      </div>
-      <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover on tailnet</button></div>
-      <div id="discover-results" class="small muted" style="margin-top:8px"></div>
-    </div>
-    <div class="card fleet-admin">
+    `<div class="card fleet-admin">
       <div class="section-head"><h3>${icon("hub")} Fleet</h3><button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button></div>
-      <p class="small muted">Macs sharing this server's Claude login. Add one without touching the Mac: on the new Mac open Anvil Server → Join a fleet, then enter its name + code here.</p>
+      <p class="small muted">The Macs sharing this server's Claude login.</p>
       <div id="fleet-members" class="small muted">Loading…</div>
+      <hr style="border:none;border-top:1px solid var(--border);margin:12px 0 8px" />
+      <div class="card-main">${icon("add")} <b>Add a Mac</b></div>
+      <p class="small muted">On the new Mac open Anvil Server → <b>Join a fleet</b> for a 6-digit code. Then just pick it here and enter the code — no IP to track down.</p>
       <div class="git-row" style="margin-top:8px">
-        <input id="fleet-host" placeholder="new-mac.tailnet.ts.net" style="flex:1;min-width:0" />
+        <select id="fleet-host" style="flex:1;min-width:0"><option value="">Scanning your tailnet…</option></select>
         <input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="code" style="max-width:90px" />
-        <button id="fleet-invite" class="primary">${icon("add")} Add Mac</button>
+        <button id="fleet-invite" class="primary">${icon("add")} Add</button>
       </div>
       <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
+      <details style="margin-top:10px">
+        <summary class="small muted" style="cursor:pointer">Connect a Mac that's already running, or add by URL…</summary>
+        <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
+        <div id="discover-results" class="small muted" style="margin-top:8px"></div>
+        <div class="git-row" style="margin-top:8px">
+          <input id="add-server-url" placeholder="https://laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
+          <button id="add-server-btn">${icon("add")} Add by URL</button>
+        </div>
+      </details>
     </div>`;
   wireDaemonUpdate(); // the hub card's "Update Anvil"
   for (const srv of list) {
@@ -2002,16 +2004,27 @@ async function runDiscovery(): Promise<void> {
 interface FleetMember { serverId: string; serverName: string; host: string; url: string }
 function wireFleetAdmin(): void {
   void loadFleetMembers();
+  void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
-    const host = ($<HTMLInputElement>("#fleet-host").value || "").trim();
+    const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
     const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
-    if (!host || !/^\d{6}$/.test(code)) { setStatus("Enter the Mac's tailnet name and its 6-digit code."); return; }
-    setStatus("Sending the login to that Mac over the tailnet…");
+    if (!host) { setStatus("Pick the Mac you're adding."); return; }
+    if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that Mac is showing."); return; }
+    setStatus(`Sending the login to ${host} over the tailnet…`);
     try {
-      const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; error?: string };
-      setStatus(r.ok ? `✅ ${host} joined the fleet.` : `Rejected: ${r.error ?? "unknown"}`);
-      if (r.ok) { $<HTMLInputElement>("#fleet-host").value = ""; $<HTMLInputElement>("#fleet-code").value = ""; void loadFleetMembers(); }
+      const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; member?: { url: string }; error?: string };
+      if (r.ok) {
+        // Onboarded → also connect this client to it so its sessions show up (one step, not two).
+        if (r.member?.url) { saveExtraServers([...loadExtraServers(), r.member.url]); ensureServer(r.member.url); }
+        $<HTMLInputElement>("#fleet-code").value = "";
+        setStatus(`✅ ${host} joined the fleet — connecting…`);
+        void loadFleetMembers();
+        void loadFleetPeers();
+        renderServerCards();
+      } else {
+        setStatus(`Rejected: ${r.error ?? "unknown"}. Make sure that Mac's “Join a fleet” screen is still open.`);
+      }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
   document.getElementById("fleet-rotate")?.addEventListener("click", async () => {
@@ -2022,6 +2035,25 @@ function wireFleetAdmin(): void {
       setStatus(`Updated ${okN}/${r.results.length} Macs.`);
     } catch { setStatus("Rotate failed."); }
   });
+}
+/** Fill the "Add a Mac" dropdown from the hub's tailnet peers — so you pick a name, not an IP. */
+async function loadFleetPeers(): Promise<void> {
+  const sel = document.getElementById("fleet-host") as HTMLSelectElement | null;
+  if (!sel) return;
+  try {
+    const r = (await (await apiFetch("/api/fleet/peers")).json()) as { ok: boolean; peers: { name: string; host: string; online: boolean }[]; warning?: string };
+    const knownHosts = new Set([...servers.values()].map((s) => hostOf(s.url)));
+    const candidates = (r.peers ?? []).filter((p) => p.online && !knownHosts.has(p.host));
+    if (!r.ok) {
+      sel.innerHTML = `<option value="">${esc(r.warning ?? "Tailscale unavailable")}</option>`;
+    } else if (!candidates.length) {
+      sel.innerHTML = `<option value="">No other Macs found on your tailnet</option>`;
+    } else {
+      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}">${esc(p.name)}</option>`).join("");
+    }
+  } catch {
+    sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
+  }
 }
 async function loadFleetMembers(): Promise<void> {
   const el = document.getElementById("fleet-members");
