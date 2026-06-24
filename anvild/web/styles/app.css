@@ -163,6 +163,19 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .swatch-auto .msym { font-size: 16px; }
 .settings-body .primary { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }
 .settings-body .primary .msym { font-size: 18px; }
+/* Secondary buttons across Settings (fleet "Update token", per-card "Update Anvil"): one consistent
+   look that pairs cleanly with the primary "Add a Mac" — same height/radius, bordered not filled. */
+.settings-body .mini { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; font-size: 13px; }
+.settings-body .mini:hover:not(:disabled) { border-color: var(--accent); }
+.settings-body .mini:disabled { opacity: 0.6; cursor: default; }
+.settings-body .mini .msym { font-size: 17px; }
+/* Remove "×" pinned to a card's top-right corner (server cards). A confirm dialog sits behind it. */
+.card-x { position: absolute; top: 8px; right: 8px; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 50%; background: none; color: var(--muted); cursor: pointer; }
+.card-x:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 14%, transparent); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+.card-x.danger { color: var(--danger); }
+.card-x .msym { font-size: 18px; }
+.server-card { position: relative; }
+.server-card .card-main { padding-right: 28px; }
 .session { display: flex; align-items: center; border-radius: 8px; cursor: pointer; border: 1px solid transparent; position: relative; }
 .session:hover { background: var(--bg); }
 .session.active { background: var(--bg); border-color: var(--accent); }
@@ -380,11 +393,13 @@ details.tool-result.error > summary { color: var(--danger); }
 #composer { padding: 10px 16px 16px; flex-shrink: 0; }
 #input-box { border: 1px solid var(--border); border-radius: 18px; background: var(--bg); padding: 8px 10px 6px; display: flex; flex-direction: column; gap: 4px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05); }
 #input-box:focus-within { border-color: var(--accent); }
-#attach-row { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px 4px 2px; }
+/* Top padding leaves room for the remove badge that overhangs each chip's top-right corner. */
+#attach-row { display: flex; gap: 8px; flex-wrap: wrap; padding: 9px 9px 2px; }
 #attach-row:empty { display: none; }
-.attach-chip { position: relative; width: 56px; height: 56px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-.attach-chip img { width: 100%; height: 100%; object-fit: cover; }
-.attach-chip .rm { position: absolute; top: -7px; right: -7px; background: var(--danger); color: #fff; border: none; border-radius: 50%; width: 18px; height: 18px; line-height: 1; cursor: pointer; }
+/* overflow stays visible so the remove badge isn't clipped; the image carries its own rounding. */
+.attach-chip { position: relative; width: 56px; height: 56px; border: 1px solid var(--border); border-radius: 8px; overflow: visible; }
+.attach-chip img { width: 100%; height: 100%; object-fit: cover; border-radius: 7px; }
+.attach-chip .rm { position: absolute; top: -7px; right: -7px; z-index: 1; background: var(--danger); color: #fff; border: none; border-radius: 50%; width: 18px; height: 18px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 /* non-image attachment chip: an icon + filename instead of a thumbnail */
 .attach-chip.file { width: auto; max-width: 180px; height: 56px; display: flex; align-items: center; gap: 6px; padding: 0 10px; background: var(--surface, rgba(127,127,127,.08)); }
 .attach-chip.file .msym { font-size: 22px; opacity: .8; }
@@ -574,8 +589,10 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-server-empty { margin: 0 0 8px; }
 
 .plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-bottom: 8px; }
-.plan-card { text-align: left; display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px 15px; cursor: pointer; font: inherit; color: var(--text); transition: border-color 0.12s, transform 0.12s; }
-.plan-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+/* Each card is tinted by its environment (--plan-stripe set inline): a coloured left rail ties the
+   plan to its repo, matching the sidebar/session colour scheme. */
+.plan-card { position: relative; text-align: left; display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-left: 3px solid var(--plan-stripe, var(--accent)); border-radius: 12px; background: var(--bg); padding: 14px 15px; cursor: pointer; font: inherit; color: var(--text); transition: border-color 0.12s, transform 0.12s; }
+.plan-card:hover { border-color: var(--accent); border-left-color: var(--plan-stripe, var(--accent)); transform: translateY(-1px); }
 .plan-title { font-weight: 700; font-size: 14px; line-height: 1.3; }
 .plan-summary { font-size: 12.5px; color: var(--muted); line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .plan-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
@@ -612,14 +629,42 @@ input:focus, select:focus, textarea:not(#input):focus {
 .plan-refine-form textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); color: var(--text); padding: 8px 10px; font: inherit; font-size: 13px; }
 .plan-refine-form .primary { padding: 8px 11px; }
 
-/* Scheduled-run bar + schedule modal */
-.ap-schedule-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-size: 13px; }
-.ap-schedule-bar span { display: inline-flex; align-items: center; gap: 6px; }
-.ap-schedule-bar .msym { font-size: 17px; }
+/* Autopilot header: title + inline schedule summary on the left, actions on the right. */
+.ap-head { align-items: flex-start; }
+.ap-head-titles { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ap-sched-summary { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+.ap-sched-summary > span { display: inline-flex; align-items: center; gap: 6px; }
+.ap-sched-summary .msym { font-size: 16px; }
+.ap-sched-edit-btn { padding: 3px 9px !important; font-size: 11.5px !important; }
+
+/* Run status banner (above the raw log): running indicator, live progress line, per-server tallies. */
+.ap-run-status { margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; padding: 10px 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-size: 13px; display: flex; flex-direction: column; gap: 5px; }
+.ap-status-head { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+.ap-status-head .msym { font-size: 17px; }
+.ap-status-line { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+.ap-status-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.ap-status-row .ok { color: #21ba45; display: inline-flex; }
+.ap-status-row .msym { font-size: 15px; }
+.ap-status-row.warn { color: var(--danger); }
+
+/* Settings → Todoist schedule card */
 .schedule-card .card-main { gap: 8px; }
 .schedule-card .card-main span { display: inline-flex; align-items: center; gap: 6px; }
 .schedule-card .card-main .msym { font-size: 17px; }
-.ap-check { display: flex; align-items: center; gap: 8px; flex-direction: row !important; }
+
+/* Schedule modal: toggle "buttons" (instead of stray checkboxes) + a cohesive field stack. */
+.ap-sched-modal label { display: block; }
+.ap-toggle { display: flex; align-items: center; gap: 10px; width: 100%; margin: 10px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-weight: 600; font-size: 13px; text-align: left; transition: border-color 0.12s, background 0.12s; }
+.ap-toggle:hover { border-color: var(--accent); }
+.ap-toggle .ap-toggle-box { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: transparent; flex-shrink: 0; }
+.ap-toggle .ap-toggle-box .msym { font-size: 16px; }
+.ap-toggle.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg)); }
+.ap-toggle.on .ap-toggle-box { background: var(--accent); border-color: var(--accent); color: #fff; }
+.ap-sched-body { padding: 4px 0 4px 12px; margin-left: 2px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 4px; transition: opacity 0.12s; }
+.ap-sched-body.dim { opacity: 0.45; pointer-events: none; }
+.ap-field-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.ap-field-row > span:first-child { font-size: 12px; color: var(--muted); min-width: 96px; }
+.ap-field-row input { width: auto; }
 .ap-field { margin: 8px 0; }
 .ap-field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
 .ap-days { display: inline-flex; gap: 6px; }

@@ -2185,31 +2185,73 @@ function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
 }
 function onAutopilotProgress(line: string): void {
   autopilotLog.push(line);
+  runState.lastLine = line;
   const log = document.getElementById("autopilot-log");
   if (log) {
     log.hidden = false;
     log.textContent = autopilotLog.join("\n");
     log.scrollTop = log.scrollHeight;
   }
+  renderRunStatus();
+}
+
+// Live status of the current/last "Run autopilot", surfaced as a banner above the log so the run is
+// legible without reading the raw stream (how many tasks evaluated, what's new, per-server outcome).
+interface RunState {
+  running: boolean;
+  serversTotal: number;
+  lastLine: string;
+  results: { name: string; ok: boolean; created: number; skipped: number; error?: string }[];
+}
+const runState: RunState = { running: false, serversTotal: 0, lastLine: "", results: [] };
+
+function renderRunStatus(): void {
+  const host = document.getElementById("autopilot-status");
+  if (!host) return;
+  if (!runState.running && runState.results.length === 0) {
+    host.hidden = true;
+    host.innerHTML = "";
+    return;
+  }
+  host.hidden = false;
+  const createdTotal = runState.results.reduce((n, r) => n + r.created, 0);
+  const head = runState.running
+    ? `<span class="ap-status-head"><span class="msym spin">progress_activity</span> Evaluating ${runState.serversTotal} project source${runState.serversTotal === 1 ? "" : "s"}…</span>`
+    : `<span class="ap-status-head">${icon("check_circle")} ${createdTotal ? `${createdTotal} new plan${createdTotal === 1 ? "" : "s"}` : "No new plans"}</span>`;
+  const live = runState.running && runState.lastLine
+    ? `<div class="ap-status-line">${esc(runState.lastLine)}</div>`
+    : "";
+  const rows = runState.results
+    .map((r) =>
+      r.ok
+        ? `<div class="ap-status-row"><span class="ok">${icon("check")}</span> <b>${esc(r.name)}</b> — ${r.created} new · ${r.skipped} already in pipeline</div>`
+        : `<div class="ap-status-row warn"><span>${icon("warning")}</span> <b>${esc(r.name)}</b> — ${esc(r.error ?? "failed")}</div>`,
+    )
+    .join("");
+  host.innerHTML = `${head}${live}${rows}`;
 }
 
 function openAutopilot(): void {
   const root = $("#autopilot-root");
   root.innerHTML = `<div class="autopilot-view">
-    <div class="settings-head">
-      <h2>${icon("bolt")} Autopilot</h2>
+    <div class="settings-head ap-head">
+      <div class="ap-head-titles">
+        <h2>${icon("bolt")} Autopilot</h2>
+        <span class="ap-sched-summary" id="autopilot-schedule"></span>
+      </div>
       <span class="ap-head-actions">
         <button id="autopilot-run" class="primary">${icon("play_arrow")} Run autopilot</button>
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
     </div>
-    <div class="ap-schedule-bar" id="autopilot-schedule"></div>
+    <div class="ap-run-status" id="autopilot-status" hidden></div>
     <pre class="git-output ap-log" id="autopilot-log" hidden></pre>
     <div class="settings-body"><div id="autopilot-grid"></div></div>
   </div>`;
   $("#autopilot-close").addEventListener("click", () => dismissOverlay("autopilot"));
   $("#autopilot-run").addEventListener("click", () => void runAutopilot());
   renderScheduleBar();
+  renderRunStatus();
   if (autopilotLog.length) {
     const log = $("#autopilot-log");
     log.hidden = false;
@@ -2230,21 +2272,31 @@ function closeAutopilot(): void {
 }
 
 function planCardHtml(p: AutopilotPlanInfo): string {
-  const env = p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined);
+  const localEnv = p.environmentId ? environments.get(p.environmentId) : undefined;
+  const env = p.environmentName ?? localEnv?.name;
+  // Tint each card with its environment's colour (same hue the sidebar/session rows use), so a plan is
+  // visually tied to the repo it belongs to. Falls back to the accent when the env isn't local.
+  const stripe = localEnv ? stripeColor(localEnv, 0, currentTheme()) : "var(--accent)";
   const summary = p.summary ?? p.rationale ?? "";
   const eff = p.effort
     ? `<span class="ap-chip eff-${p.effort.size}">${SIZE_LABEL[p.effort.size] ?? p.effort.size}${p.effort.filesTouched != null ? ` · ${p.effort.filesTouched} file${p.effort.filesTouched === 1 ? "" : "s"}` : ""}</span>`
     : "";
-  return `<button class="plan-card" data-id="${esc(p.id)}">
+  return `<button class="plan-card" data-id="${esc(p.id)}" style="--plan-stripe:${stripe}">
     <span class="plan-title">${esc(p.title)}</span>
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
     <span class="plan-meta">
-      ${env ? `<span class="ap-chip">${icon("folder")}${esc(env)}</span>` : ""}
+      ${env ? `<span class="ap-chip"><span class="env-dot" style="background:${stripe}"></span>${esc(env)}</span>` : ""}
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
       <span class="ap-chip status-${esc(p.status)}">${esc(p.status)}</span>
     </span>
   </button>`;
+}
+/** Plans for one server, ordered by environment (name) then title — so a repo's plans sit together. */
+function plansByEnvironment(list: AutopilotPlanInfo[]): AutopilotPlanInfo[] {
+  const envName = (p: AutopilotPlanInfo): string =>
+    (p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "~").toLowerCase();
+  return [...list].sort((a, b) => envName(a).localeCompare(envName(b)) || a.title.localeCompare(b.title));
 }
 /** The flowing card grid, grouped by server when the fleet has more than one. */
 function renderAutopilotGrid(): void {
@@ -2266,7 +2318,7 @@ function renderAutopilotGrid(): void {
       if (multi) html += `<p class="small muted ap-server-empty">No plans</p>`;
       continue;
     }
-    html += `<div class="plan-grid">${list.map(planCardHtml).join("")}</div>`;
+    html += `<div class="plan-grid">${plansByEnvironment(list).map(planCardHtml).join("")}</div>`;
   }
   host.innerHTML = html;
   host.querySelectorAll<HTMLElement>(".plan-card").forEach((c) =>
@@ -2338,7 +2390,9 @@ async function refinePlan(id: string): Promise<void> {
   const send = $<HTMLButtonElement>("#plan-refine-send");
   send.disabled = true;
   try {
-    const res = await sendAwait(srv, { type: "autopilot.refine", workUnitId: id, feedback, cid: newCid() }, 180_000);
+    // Refine runs a fresh read-only Opus pass over the repo — that can take minutes, so allow the same
+    // generous budget as a full autopilot run rather than the old 3-min cap (which timed out mid-think).
+    const res = await sendAwait(srv, { type: "autopilot.refine", workUnitId: id, feedback, cid: newCid() }, 600_000);
     if (res.type === "command.error") {
       pending.className = "rf-msg rf-claude rf-err";
       pending.textContent = res.message;
@@ -2430,6 +2484,11 @@ async function runAutopilot(): Promise<void> {
     return;
   }
   autopilotLog.length = 0;
+  runState.running = true;
+  runState.serversTotal = targets.length;
+  runState.lastLine = "";
+  runState.results = [];
+  renderRunStatus();
   onAutopilotProgress("Running autopilot…");
   const btn = $<HTMLButtonElement>("#autopilot-run");
   btn.disabled = true;
@@ -2441,14 +2500,19 @@ async function runAutopilot(): Promise<void> {
         const res = await sendAwait(srv, { type: "autopilot.run", cid: newCid() }, 600_000);
         if (res.type === "autopilot.run.result") {
           created += res.created;
+          runState.results.push({ name: srv.name, ok: res.ok, created: res.created, skipped: res.skipped, error: res.ok ? undefined : res.output });
           onAutopilotProgress(res.ok ? `✓ ${srv.name}: ${res.created} new · ${res.skipped} already in pipeline` : `⚠ ${srv.name}: ${res.output}`);
         }
       } catch (err) {
-        onAutopilotProgress(`⚠ ${srv.name}: ${err instanceof Error ? err.message : String(err)}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: msg });
+        onAutopilotProgress(`⚠ ${srv.name}: ${msg}`);
       }
     }
     toast(created ? `${created} new plan${created === 1 ? "" : "s"}` : "No new plans");
   } finally {
+    runState.running = false;
+    renderRunStatus();
     btn.disabled = false;
     btn.innerHTML = `${icon("play_arrow")} Run autopilot`;
   }
@@ -2488,7 +2552,7 @@ function scheduleSummaryHtml(): string {
 function renderScheduleBar(): void {
   const host = document.getElementById("autopilot-schedule");
   if (!host) return;
-  host.innerHTML = `${scheduleSummaryHtml()}<button class="mini" id="ap-sched-edit">${icon("tune")} Schedule</button>`;
+  host.innerHTML = `${scheduleSummaryHtml()}<button class="mini ap-sched-edit-btn" id="ap-sched-edit">${icon("tune")} Schedule</button>`;
   $("#ap-sched-edit").addEventListener("click", openScheduleModal);
 }
 /** A Settings → Todoist card mirroring the schedule, so it can be configured without opening Autopilot. */
@@ -2508,25 +2572,42 @@ function openScheduleModal(): void {
   ).join("");
   const m = document.createElement("div");
   m.className = "modal";
-  m.innerHTML = `<div class="modal-box" id="ap-sched-modal"><h3>${icon("schedule")} Scheduled autopilot run</h3>
+  const toggle = (id: string, on: boolean, label: string): string =>
+    `<button type="button" class="ap-toggle${on ? " on" : ""}" id="${id}" aria-pressed="${on}"><span class="ap-toggle-box">${icon("check")}</span><span>${label}</span></button>`;
+  m.innerHTML = `<div class="modal-box ap-sched-modal" id="ap-sched-modal"><h3>${icon("schedule")} Scheduled autopilot run</h3>
     <p class="small muted">An in-daemon timer re-plans linked Todoist projects on the hub and (when auto-start is on) launches the new work. Times are the server's local time.</p>
-    <label class="ap-check"><input type="checkbox" id="ap-enabled"${s.enabled ? " checked" : ""}/> Enable scheduled run</label>
-    <label>Time of day<input type="time" id="ap-time" value="${esc(s.timeOfDay)}" /></label>
-    <div class="ap-field"><span>Days</span><div class="ap-days" id="ap-days">${dayBtns}</div></div>
-    <label class="ap-check"><input type="checkbox" id="ap-autostart"${s.autoStart ? " checked" : ""}/> Auto-start sessions for new plans</label>
-    <label>Auto-start at most<input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /> <span class="small muted">sessions per run (the rest wait for manual launch). Skipped while the budget is in its warn zone.</span></label>
+    ${toggle("ap-enabled", s.enabled, "Enable scheduled run")}
+    <div class="ap-sched-body" id="ap-sched-body">
+      <label class="ap-field-row"><span>Time of day</span><input type="time" id="ap-time" value="${esc(s.timeOfDay)}" /></label>
+      <div class="ap-field"><span>Days</span><div class="ap-days" id="ap-days">${dayBtns}</div></div>
+      ${toggle("ap-autostart", s.autoStart, "Auto-start sessions for new plans")}
+      <label class="ap-field-row"><span>Auto-start at most</span><input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /><span class="small muted">per run (the rest wait for manual launch; skipped while the budget is in its warn zone)</span></label>
+    </div>
     <div class="btns"><button type="button" id="ap-sched-cancel">Cancel</button><button type="button" id="ap-sched-save" class="primary">Save</button></div></div>`;
   showModal(m);
+  const syncEnabled = (): void => {
+    $("#ap-sched-body").classList.toggle("dim", $("#ap-enabled").getAttribute("aria-pressed") !== "true");
+  };
+  m.querySelectorAll<HTMLElement>(".ap-toggle").forEach((b) =>
+    b.addEventListener("click", () => {
+      const on = b.getAttribute("aria-pressed") !== "true";
+      b.setAttribute("aria-pressed", String(on));
+      b.classList.toggle("on", on);
+      if (b.id === "ap-enabled") syncEnabled();
+    }),
+  );
   m.querySelectorAll<HTMLElement>(".ap-day").forEach((b) =>
     b.addEventListener("click", () => b.classList.toggle("on")),
   );
+  syncEnabled();
   $("#ap-sched-cancel").addEventListener("click", closeModal);
   $("#ap-sched-save").addEventListener("click", () => void saveSchedule());
 }
 async function saveSchedule(): Promise<void> {
-  const enabled = $<HTMLInputElement>("#ap-enabled").checked;
+  const isOn = (id: string): boolean => document.getElementById(id)?.getAttribute("aria-pressed") === "true";
+  const enabled = isOn("ap-enabled");
   const timeOfDay = $<HTMLInputElement>("#ap-time").value || "02:00";
-  const autoStart = $<HTMLInputElement>("#ap-autostart").checked;
+  const autoStart = isOn("ap-autostart");
   const maxAutoStart = Math.max(0, Number($<HTMLInputElement>("#ap-cap").value) || 0);
   const on = [...document.querySelectorAll<HTMLElement>("#ap-days .ap-day.on")].map((b) => Number(b.dataset.day));
   // all 7 selected → send [] (every day); none selected → keep it simple and treat as every day too
@@ -2551,58 +2632,17 @@ function serverCardHtml(srv: Server): string {
   const ver = srv.version ? ` · anvild ${esc(srv.version)}` : "";
   const state = srv.status === "connected" ? "" : ` · <span class="warn-text">${esc(srv.status)}</span>`;
   // Every Mac runs its own daemon, so "Update Anvil" is per-server (the hub no longer has a monopoly).
-  const tail = isHub
-    ? '<span class="small muted">(this server)</span>'
-    : `<button class="mini danger" id="srv-remove-${id}">${icon("close")} Remove</button>`;
+  // Remove is an X in the card's top-right corner (a confirm dialog sits behind it); the hub can't be removed.
+  const tail = isHub ? '<span class="small muted">(this server)</span>' : "";
+  const removeX = isHub ? "" : `<button class="card-x danger" id="srv-remove-${id}" title="Remove this Mac">${icon("close")}</button>`;
   return `<div class="card server-card" id="srv-card-${id}">
+    ${removeX}
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
     <div id="srv-budget-${id}" class="small muted srv-budget"></div>
     <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
     <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
-}
-/** Verify a URL is a reachable Anvil daemon, then add it to the registry and connect. */
-async function addServerByUrl(raw: string): Promise<void> {
-  const input = raw.trim();
-  if (!input) return;
-  // A peer's transport depends on its host: serve-capable Macs answer https on the MagicDNS name;
-  // App-Store-Tailscale Macs bind the tailnet IP directly over plain http. If the user gave no
-  // scheme, try https then http and keep whichever answers. (For a ts.net *name* the browser's HSTS
-  // upgrades http→https regardless, so such a host must be served; reach an unserved host by IP.)
-  const hasScheme = /^https?:\/\//i.test(input);
-  // An https page can only ever talk to an https/wss peer (a plain-http member would derive a blocked
-  // ws:// socket). So when this page is secure, never probe or store an http:// candidate: upgrade an
-  // explicit http:// URL and skip the http fallback. A plain-http peer must be reached from a plain-
-  // http page (or given a serve-capable https name).
-  const secure = typeof location !== "undefined" && location.protocol === "https:";
-  const candidates = (
-    hasScheme
-      ? [secure ? input.replace(/^http:\/\//i, "https://") : input]
-      : secure
-        ? [`https://${input}`]
-        : [`https://${input}`, `http://${input}`]
-  ).map((u) => u.replace(/\/+$/, ""));
-  let found: string | undefined;
-  for (const url of candidates) {
-    if (url === HUB_URL || servers.has(url)) {
-      toast("Already in your fleet");
-      return;
-    }
-    try {
-      const h = (await (await serverFetch(url, "/api/health")).json()) as { serverId?: string };
-      if (h.serverId) { found = url; break; }
-    } catch {
-      /* try the next scheme */
-    }
-  }
-  if (!found) {
-    toast("Couldn't reach an Anvil server at that URL");
-    return;
-  }
-  saveExtraServers([...loadExtraServers(), found]);
-  ensureServer(found);
-  renderServerCards();
 }
 function renderServerCards(): void {
   const host = document.getElementById("server-cards");
@@ -2670,45 +2710,6 @@ function renderServerCards(): void {
       .catch(() => {});
   }
 }
-/** Discover Anvil servers on the tailnet via the hub's /api/fleet/discover and offer one-tap adds. */
-async function runDiscovery(): Promise<void> {
-  const out = document.getElementById("discover-results");
-  if (!out) return;
-  out.textContent = "Scanning your tailnet…";
-  try {
-    const res = (await (await apiFetch("/api/fleet/discover")).json()) as {
-      ok: boolean;
-      servers?: { serverId: string; serverName: string; url: string; isSelf: boolean }[];
-      warning?: string;
-    };
-    if (!res.ok) {
-      out.textContent = res.warning ?? "Discovery is unavailable.";
-      return;
-    }
-    const found = (res.servers ?? [])
-      .map((s) => ({ ...s, url: s.url.replace(/\/+$/, "") }))
-      .filter((s) => !s.isSelf && s.url !== HUB_URL && !servers.has(s.url));
-    if (!found.length) {
-      out.textContent = "No new Anvil servers found on your tailnet.";
-      return;
-    }
-    out.innerHTML = found
-      .map(
-        (s) => `<div class="discover-row"><span><b>${esc(s.serverName)}</b> <code>${esc(hostOf(s.url))}</code></span><button class="mini" data-url="${esc(s.url)}">${icon("add")} Add</button></div>`,
-      )
-      .join("");
-    out.querySelectorAll<HTMLElement>("button[data-url]").forEach((b) =>
-      b.addEventListener("click", () => {
-        const u = b.dataset.url!;
-        saveExtraServers([...loadExtraServers(), u]);
-        ensureServer(u);
-        renderServerCards();
-      }),
-    );
-  } catch {
-    out.textContent = "Discovery failed.";
-  }
-}
 // ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
 // All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
 interface FleetMember { serverId: string; serverName: string; host: string; url: string }
@@ -2735,16 +2736,6 @@ function showAddMac(): void {
     <label>Mac<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
     <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" /></label>
     <div id="fleet-status" class="small muted"></div>
-    <details style="margin-top:12px">
-      <summary class="small muted" style="cursor:pointer">Already running? Connect it directly, or add by URL…</summary>
-      <p class="small muted" style="margin-top:8px">Use this for a Mac whose daemon is already up (no join code) — discover it on your tailnet, or type its address.</p>
-      <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
-      <div id="discover-results" class="small muted" style="margin-top:8px"></div>
-      <div class="git-row" style="margin-top:8px">
-        <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
-        <button id="add-server-btn">${icon("add")} Add by URL</button>
-      </div>
-    </details>
     <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
   </div>`;
   showModal(m);
@@ -2771,18 +2762,20 @@ function showAddMac(): void {
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
-  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
-  document.getElementById("add-server-btn")?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
-  addInput?.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
-  });
-  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
 }
 
 /** Click handler for a server card's "Remove": dim the card, eject it from the fleet (if it's a member),
  *  then drop it locally and re-render. "Remove" now does what "Forget" used to — one action, not two. */
 async function confirmRemoveServer(srv: Server): Promise<void> {
   if (srv.url === HUB_URL) return;
+  const ok = await confirmDialog({
+    icon: "close",
+    title: `Remove “${srv.name}”?`,
+    body: "Stops using this Mac from this device and ejects it from the fleet, so it no longer shares this server's Claude login. You can add it back later with a join code.",
+    confirmLabel: "Remove",
+    danger: true,
+  });
+  if (!ok) return;
   const card = document.getElementById(`srv-card-${cssId(srv.url)}`);
   const btn = document.getElementById(`srv-remove-${cssId(srv.url)}`) as HTMLButtonElement | null;
   card?.classList.add("removing"); // dim + ignore further clicks until this resolves
@@ -3848,6 +3841,13 @@ function showNewSession(): void {
   };
   envSel?.addEventListener("change", validate);
   nameInp?.addEventListener("input", validate);
+  // Enter in the name field creates the session (unless the form's still invalid — e.g. blank/dup name).
+  nameInp?.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter" && createBtn && !createBtn.disabled) {
+      e.preventDefault();
+      createBtn.click();
+    }
+  });
   nameInp?.focus();
   validate();
 
@@ -3996,7 +3996,6 @@ function showEditEnvironment(id: string): void {
   const m = document.createElement("div");
   m.className = "modal";
   const projectOptions = todoistProjectOptions(env.todoistProjectId, env.id);
-  const validationText = env.validation?.commands?.join("\n") ?? "";
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
@@ -4005,9 +4004,6 @@ function showEditEnvironment(id: string): void {
       <select id="ee-todoist">${projectOptions}</select>
     </label>
     ${todoistConnected ? "" : `<p class="small muted">Connect Todoist (Settings → Todoist) to link a project.</p>`}
-    <label>Validation gate <span class="small muted">(one command per line — all must pass before a unit is auto-PR'd)</span>
-      <textarea id="ee-validation" rows="3" placeholder="bun run typecheck&#10;bun test">${esc(validationText)}</textarea>
-    </label>
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
@@ -4025,10 +4021,6 @@ function showEditEnvironment(id: string): void {
         return;
       }
     }
-    const commands = $<HTMLTextAreaElement>("#ee-validation").value
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
     serverOfEnv(id).sock.send({
       type: "env.update",
       id,
@@ -4036,7 +4028,8 @@ function showEditEnvironment(id: string): void {
       defaultBase: $<HTMLInputElement>("#ee-base").value,
       color: selectedSwatch(),
       todoistProjectId: $<HTMLSelectElement>("#ee-todoist").value, // "" unlinks
-      validation: commands.length ? { commands } : null,
+      // validation gate omitted: autopilot doesn't auto-build/PR yet. Omitting the field preserves
+      // any stored value (env.update only writes validation when it's present).
     });
     closeModal();
   };

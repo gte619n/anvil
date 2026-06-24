@@ -31,10 +31,17 @@ async function run(cmd: string[], cwd: string): Promise<{ code: number; out: str
   return { code, out: `${stdout}${stderr}`.trim() };
 }
 
-/** Resolve the daemon's own git repo root from the anvild source dir. */
+/** Resolve the daemon's own git repo root from the anvild source dir. Throws a human-actionable
+ *  message (surfaced verbatim in the client's "Update failed:" line) when this Mac's Anvil wasn't
+ *  installed from a git clone — self-update only works on a git checkout it can `git pull`. */
 async function repoRoot(): Promise<string> {
   const r = await run(["git", "rev-parse", "--show-toplevel"], anvildDir);
-  if (r.code !== 0) throw new Error(`not a git checkout: ${r.out || `exit ${r.code}`}`);
+  if (r.code !== 0) {
+    throw new Error(
+      `This Mac's Anvil isn't a git checkout (${anvildDir}), so it can't self-update. ` +
+        `Re-install it from a git clone (run scripts/service.sh from a cloned repo on this Mac), then Update Anvil will work here.`,
+    );
+  }
   return r.out.trim();
 }
 
