@@ -525,11 +525,24 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   input: unknown;
   suggestions: PermissionSuggestion[];
 }
+/** A parked permission prompt was answered or superseded (reset/kill). Clients retire EXACTLY
+ *  that card by requestId — a session can have several prompts parked at once (sub-agent fan-out),
+ *  so card lifecycle is per-request, not driven by the session's transient status. (§6.6) */
+export interface PermissionResolvedEvent extends Envelope, SessionScoped {
+  type: "permission.resolved";
+  requestId: RequestId;
+}
 /** Claude is asking the user to choose among options (AskUserQuestion, §6.6). */
 export interface QuestionRequestEvent extends Envelope, SessionScoped {
   type: "question.request";
   requestId: RequestId;
   questions: Question[];
+}
+/** A parked AskUserQuestion was answered or superseded — clients retire EXACTLY that card by
+ *  requestId (sub-agents can fan out several at once, like permissions). (§6.6) */
+export interface QuestionResolvedEvent extends Envelope, SessionScoped {
+  type: "question.resolved";
+  requestId: RequestId;
 }
 export interface StatusEvent extends Envelope, SessionScoped {
   type: "status";
@@ -632,7 +645,9 @@ export type ServerEvent =
   | ToolUseEvent
   | ToolResultEvent
   | PermissionRequestEvent
+  | PermissionResolvedEvent
   | QuestionRequestEvent
+  | QuestionResolvedEvent
   | StatusEvent
   | UsageEvent
   | ResultEvent
@@ -813,10 +828,23 @@ export interface EnvRemoveCmd extends Envelope, Correlated {
   id: string;
 }
 
-// Todoist integration (task autopilot). The token is set out-of-band (scripts/todoist.ts);
-// these commands drive the link UI and the planner.
+// Todoist integration (task autopilot). The token can be set in-app (todoist.connect) or
+// out-of-band (scripts/todoist.ts); these commands drive the link UI and the planner.
 export interface TodoistStatusCmd extends Envelope, Correlated {
   type: "todoist.status"; // request the current connection state
+}
+export interface TodoistConnectCmd extends Envelope, Correlated {
+  type: "todoist.connect"; // set/replace the personal API token; validated against the API before it's stored
+  token: string;
+}
+export interface TodoistDisconnectCmd extends Envelope, Correlated {
+  type: "todoist.disconnect"; // clear the stored token
+}
+export interface TodoistPropagateCmd extends Envelope, Correlated {
+  // Hub-only: replicate the hub's stored token to fleet members (so autopilot can run where the
+  // repo lives). `targets` = member serverIds; omit to push to every member. A no-op off the hub.
+  type: "todoist.propagate";
+  targets?: string[];
 }
 export interface TodoistProjectsListCmd extends Envelope, Correlated {
   type: "todoist.projects.list"; // fetch the account's projects (live from the API)
@@ -933,6 +961,9 @@ export type ClientCommand =
   | EnvUpdateCmd
   | EnvRemoveCmd
   | TodoistStatusCmd
+  | TodoistConnectCmd
+  | TodoistDisconnectCmd
+  | TodoistPropagateCmd
   | TodoistProjectsListCmd
   | AutopilotPlansListCmd
   | AutopilotRefineCmd

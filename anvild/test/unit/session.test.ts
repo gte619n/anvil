@@ -70,6 +70,71 @@ test("resume re-surfaces an unanswered permission prompt (the 'lost dialog' fix)
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("concurrent permission prompts (sub-agent fan-out) each re-surface and clear independently", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir));
+
+  // Two sub-agents each park a tool prompt on the SAME session at once.
+  s.requestPermission("perm-1", "Bash", { command: "echo a" }, [{ decision: "allow", label: "Allow once" }]);
+  s.requestPermission("perm-2", "Bash", { command: "echo b" }, [{ decision: "allow", label: "Allow once" }]);
+
+  // Both must re-surface on a cold attach — a single-slot model silently drops perm-1.
+  const cold = sup.resume(s.id, undefined);
+  const reqs = (cold.filter((e) => e.type === "permission.request") as any[]).map((r) => r.requestId).sort();
+  expect(reqs).toEqual(["perm-1", "perm-2"]);
+
+  // Resolving one must NOT retire the other (the orphan-then-timeout-deny bug).
+  s.clearPermission("perm-1");
+  const after = (sup.resume(s.id, undefined).filter((e) => e.type === "permission.request") as any[]).map((r) => r.requestId);
+  expect(after).toEqual(["perm-2"]);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a session stays awaiting_permission while any prompt is still parked (no mid-fan-out badge clear)", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir));
+
+  s.requestPermission("perm-1", "Bash", { command: "echo a" }, [{ decision: "allow", label: "Allow once" }]);
+  s.requestPermission("perm-2", "Bash", { command: "echo b" }, [{ decision: "allow", label: "Allow once" }]);
+
+  // perm-1 was allowed → its sub-agent continues and the driver reports activity. The session must
+  // stay "awaiting_permission" because perm-2 is still parked, or the fleet badge clears wrongly.
+  s.setStatus("running_tool");
+  expect(s.data.status).toBe("awaiting_permission");
+
+  // Once every prompt is answered, transient statuses flow normally again.
+  s.clearPermission("perm-1");
+  s.clearPermission("perm-2");
+  s.setStatus("running_tool");
+  expect(s.data.status).toBe("running_tool");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("concurrent AskUserQuestion prompts (sub-agent fan-out) each re-surface and clear independently", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir));
+
+  const q = (txt: string) => [{ question: txt, header: "H", options: [{ label: "a", description: "" }] }];
+  s.requestQuestion("q-1", q("one?"));
+  s.requestQuestion("q-2", q("two?"));
+
+  const cold = sup.resume(s.id, undefined);
+  const reqs = (cold.filter((e) => e.type === "question.request") as any[]).map((r) => r.requestId).sort();
+  expect(reqs).toEqual(["q-1", "q-2"]);
+
+  // A continuing sibling sub-agent must not clear the still-parked question's awaiting state.
+  s.setStatus("running_tool");
+  expect(s.data.status).toBe("awaiting_question");
+
+  s.clearQuestion("q-1");
+  const after = (sup.resume(s.id, undefined).filter((e) => e.type === "question.request") as any[]).map((r) => r.requestId);
+  expect(after).toEqual(["q-2"]);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("supervisor persists sessions and a fresh instance restores them", () => {
   const dir = tempState();
   const reg = new ConnectionRegistry();

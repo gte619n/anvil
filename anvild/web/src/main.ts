@@ -205,6 +205,7 @@ function removeServer(url: string): void {
   persistEnvironments();
   persistRouting();
   renderSessions();
+  if (document.getElementById("server-cards")) renderServerCards(); // drop the card from an open Settings view
 }
 const hub = (): Server => servers.get(HUB_URL)!;
 function serverOf(sessionId: string | null | undefined): Server | undefined {
@@ -301,6 +302,13 @@ function dismissOverlay(name: OverlayName): void {
   suppressPop++;
   history.go(-n); // drop our history entries; the one popstate this fires is suppressed below
 }
+/** Dismiss just the topmost soft layer (used by the Escape key) — same teardown as a single Back. */
+function dismissTopOverlay(): boolean {
+  const top = overlays[overlays.length - 1];
+  if (!top) return false;
+  dismissOverlay(top.name);
+  return true;
+}
 
 const sessionHref = (id: string): string => `${location.pathname}#s/${encodeURIComponent(id)}`;
 function setSessionHash(id: string | null, push: boolean): void {
@@ -332,6 +340,45 @@ window.addEventListener("popstate", () => {
     deselectSession();
   }
 });
+// External hash navigations only fire `hashchange`, never `popstate`: the Android shell deep-links a
+// notification tap via web.loadUrl("…#s/<id>") (a warm app is already loaded, so it's a same-document
+// fragment change, not a reload), and manual URL edits / a restored PWA do the same. Our own in-app
+// navigation uses push/replaceState, which fire neither — so this listener only ever sees genuinely
+// external changes. Without it, a notification tapped while the app is already open didn't switch
+// sessions ("not deep linking every time"). (UI refinement §deep-link)
+window.addEventListener("hashchange", () => {
+  const id = sessionFromHash();
+  if (!id) {
+    if (activeId) deselectSession();
+    return;
+  }
+  if (id === activeId) return;
+  if (sessions.has(id)) {
+    selectSession(id, false);
+  } else {
+    // Target not synced to this client yet (e.g. a session on a server still connecting). Remember it
+    // so the next session.list attaches it, and canonicalize the URL without a new history entry.
+    activeId = id;
+    localStorage.setItem("anvil.active", id);
+    setSessionHash(id, false);
+  }
+});
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────────────────
+// Escape dismisses the topmost soft layer (dialog → settings → side panel → expanded sidebar) — the
+// same teardown as a single Back; with nothing layered, it drops focus out of the composer (closing
+// the on-screen keyboard on mobile). Enter-to-send / Shift+Enter-newline live on the composer itself,
+// and dialogs focus their default button so Enter confirms and Escape cancels (see confirmDialog).
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || e.defaultPrevented) return;
+  // The embedded terminal owns Escape (it sends ESC to the shell) — don't steal it to close the panel.
+  if ((document.activeElement as HTMLElement | null)?.closest(".xterm")) return;
+  if (dismissTopOverlay()) {
+    e.preventDefault();
+  } else if (document.activeElement === input) {
+    input.blur();
+  }
+});
 let streaming: HTMLElement | null = null;
 // Set when the user hits Stop: the daemon keeps draining the interrupted turn for a moment, so we
 // suppress that trailing churn (see the guard in handleSessionEvent). Cleared on the next turn.
@@ -356,6 +403,15 @@ function saveConvoCache(): void {
       // re-paint as a frozen "stuck" status on return.
       const clone = conversation.cloneNode(true) as HTMLElement;
       clone.querySelectorAll(".thinking, .empty-state").forEach((e) => e.remove());
+      // Freeze any still-"live" activity block: the cache is a snapshot, not a running turn, so it
+      // must restore as "Worked" — never an animated "Working" that can't stop (no WS yet on reload).
+      clone.querySelectorAll(".activity.live").forEach((a) => {
+        a.classList.remove("live");
+        const ind = a.querySelector(".activity-ind");
+        if (ind) ind.innerHTML = `<span class="msym">check</span>`;
+        const title = a.querySelector(".activity-title");
+        if (title) title.textContent = "Worked";
+      });
       const html = clone.innerHTML;
       if (html.length < 1_500_000) localStorage.setItem(`anvil.convo.${id}`, html);
       else localStorage.removeItem(`anvil.convo.${id}`);
@@ -440,6 +496,69 @@ function toggleSidebar(): void {
 // when the open sidebar overlays the header (e.g. unfolding a foldable).
 $("#btn-sidebar").addEventListener("click", toggleSidebar);
 $("#sidebar-collapse").addEventListener("click", toggleSidebar);
+
+// ── Resizable panes (left sidebar + right side panel) ────────────────────────────
+// Each pane's width is a CSS variable on :root, persisted per device. A thin handle straddling the
+// pane's border drives it via pointer events (touch-safe, capture so the drag survives leaving the
+// strip). Disabled on narrow screens, where the sidebar overlays and the panel is near full-bleed.
+const clampN = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
+function initResizers(): void {
+  const root = document.documentElement;
+  const stored = (k: string): number => Number(localStorage.getItem(k)) || 0;
+  const sw = stored("anvil.sidebarW");
+  if (sw) root.style.setProperty("--sidebar-w", `${sw}px`);
+  const pw = stored("anvil.panelW");
+  if (pw) root.style.setProperty("--panel-w", `${pw}px`);
+
+  const wire = (
+    handle: HTMLElement | null,
+    cfg: { cssVar: string; key: string; min: number; maxFn: () => number; width: (clientX: number) => number },
+  ): void => {
+    if (!handle) return;
+    handle.addEventListener("pointerdown", (e: PointerEvent) => {
+      if (isNarrow()) return; // resizing is desktop-only
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add("dragging");
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+      let latest = 0;
+      const move = (ev: PointerEvent): void => {
+        latest = clampN(cfg.width(ev.clientX), cfg.min, cfg.maxFn());
+        root.style.setProperty(cfg.cssVar, `${latest}px`);
+      };
+      const up = (): void => {
+        handle.releasePointerCapture(e.pointerId);
+        handle.classList.remove("dragging");
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", up);
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        if (latest) localStorage.setItem(cfg.key, String(Math.round(latest)));
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", up);
+    });
+  };
+
+  const sidebar = document.getElementById("sidebar");
+  wire(document.getElementById("sidebar-resizer"), {
+    cssVar: "--sidebar-w",
+    key: "anvil.sidebarW",
+    min: 200,
+    maxFn: () => Math.min(620, window.innerWidth - 360), // always leave the conversation room
+    width: (x) => x - (sidebar?.getBoundingClientRect().left ?? 0), // pointer X minus the sidebar's left edge
+  });
+  const sidePanel = document.getElementById("side-panel");
+  wire(document.getElementById("panel-resizer"), {
+    cssVar: "--panel-w",
+    key: "anvil.panelW",
+    min: 320,
+    maxFn: () => Math.min(window.innerWidth * 0.92, 1000),
+    width: (x) => (sidePanel?.getBoundingClientRect().right ?? window.innerWidth) - x, // panel is pinned right, grows leftward
+  });
+}
+initResizers();
 
 // On a phone there isn't room for both panes, so when focus moves to the chat (a tap or the
 // composer gaining focus) we collapse the overlaid session list — never a half-covered chat.
@@ -675,7 +794,8 @@ $("#scroll-bottom").addEventListener("click", () => {
 // reconnect is our signal the new build is live — reload to pick up the rebuilt web bundle.
 let pendingRestartReload = false;
 function setUpdateStatus(text: string): void {
-  const out = document.getElementById("daemon-update-output");
+  // The hub's card owns the page-reload-on-restart flow; its output element is keyed by the hub URL.
+  const out = document.getElementById(`daemon-update-output-${cssId(HUB_URL)}`);
   if (out) {
     out.hidden = false;
     out.textContent = text;
@@ -769,13 +889,17 @@ function onEvent(url: string, e: ServerEvent): void {
       sessionServer.set(e.session.id, url);
       persistSessions();
       renderSessions();
-      if (e.session.id === activeId) updateGitPanelMeta();
+      if (e.session.id === activeId) {
+        updateGitPanelMeta();
+        updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
+      }
       return;
     case "session.deleted":
       sessions.delete(e.sessionId);
       sessionServer.delete(e.sessionId);
       removingSessions.delete(e.sessionId); // cleanup finished — the row goes for good now
       localStorage.removeItem(`anvil.convo.${e.sessionId}`);
+      localStorage.removeItem(`anvil.draft.${e.sessionId}`); // its unsent draft has nowhere to go now
       persistSessions();
       persistRouting();
       if (activeId === e.sessionId) deselectSession();
@@ -792,6 +916,11 @@ function onEvent(url: string, e: ServerEvent): void {
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
+      // A member just (re)joined the fleet — if the hub holds a Todoist token, have the hub replicate
+      // it to this member so its linked environments can run autopilot. Self-heals every reconnect.
+      if (url !== HUB_URL && todoistConnected && e.serverId) {
+        hub().sock.send({ type: "todoist.propagate", targets: [e.serverId], cid: newCid() });
+      }
       return;
     }
     case "budget": {
@@ -804,7 +933,10 @@ function onEvent(url: string, e: ServerEvent): void {
       onEnvironments(url, e.environments);
       return;
     case "todoist.status":
-      onTodoistStatus(e.connected, e.account);
+      // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
+      // Fleet members each push their own status on connect — ignore them so a tokenless member
+      // can't clobber the hub's "connected" with its "not connected".
+      if (url === HUB_URL) onTodoistStatus(e.connected, e.account);
       return;
     case "todoist.projects.result":
       return; // resolved via cidWaiter (loadTodoistProjects)
@@ -869,6 +1001,10 @@ function handleSessionEvent(e: ServerEvent): void {
       replayingSnapshot = true;
       e.events.forEach(renderConversationEvent);
       replayingSnapshot = false;
+      // A replayed history has no `result` event, so the last turn's activity block was rebuilt
+      // "live" — finalize it so it shows "Worked" instead of an eternally spinning "Working". If the
+      // session is actually mid-turn, the live status/message events that follow re-light it.
+      finalizeActivity();
       snapshotLoaded.add(e.sessionId);
       saveConvoCache();
       return;
@@ -901,8 +1037,18 @@ function handleSessionEvent(e: ServerEvent): void {
     case "permission.request":
       showPermission(e.requestId, e.tool, e.input, e.suggestions);
       return;
+    case "permission.resolved":
+      // Retire EXACTLY this card (answered here, on another device, or superseded). Per-request so a
+      // sibling prompt still parked during sub-agent fan-out is never collaterally cleared.
+      resolvePermissionUI(e.requestId);
+      return;
     case "question.request":
       showQuestion(e.requestId, e.questions);
+      return;
+    case "question.resolved":
+      // Retire EXACTLY this card (answered here, on another device, or superseded) — per-request so
+      // a sibling question still parked during sub-agent fan-out is never collaterally cleared.
+      resolveQuestionUI(e.requestId);
       return;
     case "fs.changed":
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
@@ -1079,6 +1225,7 @@ function commitAssistant(blocks: ContentBlock[], ts?: string): void {
     const t = timeEl(ts);
     if (t) b.appendChild(t);
     addCopyButtons(md);
+    linkifyFilePaths(md); // make plain-text mentions of .md files clickable → open in the reader
     noteAnswerRefs(md.innerHTML); // buffered; only the final answer's links reach the panel (on result)
     void runMermaid(md);
   } else if (streaming) {
@@ -1112,6 +1259,48 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
   return `<div class="tool">${icon("build")} <b>${esc(b.name)}</b> <code>${esc(JSON.stringify(b.input)).slice(0, 160)}</code></div>`;
 }
 
+// Markdown files Claude names in prose (e.g. "see docs/plans/design.md") are usually design docs you
+// want to open — turn those mentions into the same `.file-link` the tool rows use, so one tap opens
+// them in the reader. Limited to .md/.markdown to avoid over-linkifying ordinary words; skips text
+// already inside a link or a fenced code block (but inline `path.md` in backticks is fair game).
+const MD_PATH_RE = /(?:\.{0,2}\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:md|markdown)(?![\w/-])/gi;
+function linkifyFilePaths(root: HTMLElement): void {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(n: Node): number {
+      const v = n.nodeValue;
+      MD_PATH_RE.lastIndex = 0;
+      if (!v || !MD_PATH_RE.test(v)) return NodeFilter.FILTER_REJECT;
+      for (let p = n.parentElement; p && p !== root; p = p.parentElement) {
+        if (p.tagName === "A" || p.tagName === "PRE") return NodeFilter.FILTER_REJECT; // already a link / code block
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const targets: Text[] = [];
+  while (walker.nextNode()) targets.push(walker.currentNode as Text);
+  for (const node of targets) {
+    const text = node.nodeValue ?? "";
+    MD_PATH_RE.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = MD_PATH_RE.exec(text)) !== null) {
+      const raw = m[0];
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const a = document.createElement("a");
+      a.href = "#";
+      a.className = "file-link md-file-link";
+      a.dataset.path = raw.replace(/^\.\//, ""); // fs.read is worktree-relative
+      a.title = `Open ${raw}`;
+      a.textContent = raw;
+      frag.appendChild(a);
+      last = m.index + raw.length;
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+}
+
 // ── Consolidated activity block (§5) ─────────────────────────────────────────────
 // All the tool/thinking churn for one turn collapses into a single block that previews the
 // last few lines and expands on click — so the conversation reads as "what I said" / "what the
@@ -1121,6 +1310,7 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
 const ACTIVITY_TAIL = 5;
 
 function resetActivity(): void {
+  finalizeActivity(); // a prior turn that never saw a clean end (no `result`) left a block spinning — stop it
   activityEl = null;
   activityCount = 0;
   activityLive = false;
@@ -1344,6 +1534,7 @@ function renderEmptyState(): void {
 }
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
+  saveDraft(activeId, input.value); // keep the unsent draft with the session we're leaving
   activeId = null;
   localStorage.removeItem("anvil.active");
   setSessionHash(null, false);
@@ -1351,6 +1542,7 @@ function deselectSession(): void {
   renderEmptyState();
   renderSessions();
   applyActiveTint();
+  restoreDraft(null); // empty the composer (no session selected)
 }
 // Tint the conversation area to the active session's derived background (cleared when none).
 function applyActiveTint(): void {
@@ -1365,11 +1557,16 @@ function applyActiveTint(): void {
   }
 }
 function setStatus(status: string): void {
-  // Any non-awaiting status means a parked prompt was answered (here or elsewhere) or superseded —
-  // retire any open permission/question cards so a stale one can't linger.
-  if (status !== "awaiting_permission") clearPermissionCards();
-  if (status !== "awaiting_question") clearQuestionCards();
+  // Permission AND question cards are retired individually by their `*.resolved` events (a session
+  // can hold several at once during sub-agent fan-out, so a status flip to running_tool/thinking
+  // must NOT clear a still-parked sibling). Only a terminal status sweeps any straggler that somehow
+  // lost its resolve event.
+  if (status === "idle" || status === "error") {
+    clearPermissionCards();
+    clearQuestionCards();
+  }
   const awaiting = status === "awaiting_permission" || status === "awaiting_question";
+  if (status === "idle") finalizeActivity(); // turn ended (even if `result` never arrived) — stop the spinner
   if (status === "idle" || awaiting) hideThinking(); // the card is the indicator while parked
   else if (!streaming) showThinking(status); // while text streams, the text is the activity
   updateComposerMode(status); // swap Send ↔ Stop while a turn runs
@@ -1516,34 +1713,11 @@ function renderSessions(): void {
   const rest = all.filter((s) => !s.isDefault);
   const anyFinished = rest.some((s) => s.finished);
 
-  // One server → flat list. Many → group the active list under per-server section headers (hub
-  // first) with a live status dot; the Finished list stays flat. Separators aren't `.session` rows,
-  // so SortableJS (which is filtered to `.session`) ignores them. (fleet — anvil-multi-server.md §4)
-  if (orderedServers().length <= 1) {
-    for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
-  } else {
-    for (const srv of orderedServers()) {
-      const group = rest.filter((s) => !s.finished && (sessionServer.get(s.id) ?? HUB_URL) === srv.url).sort(sortFn);
-      activeUl.appendChild(serverSepRow(srv));
-      if (group.length) {
-        for (const s of group) activeUl.appendChild(renderSessionItem(s));
-      } else {
-        const empty = document.createElement("li");
-        empty.className = "server-empty";
-        empty.textContent = srv.status === "connected" ? "No sessions" : srv.status === "connecting" ? "Connecting…" : "Offline";
-        activeUl.appendChild(empty);
-      }
-    }
-    for (const s of rest.filter((x) => x.finished).sort(sortFn)) finishedUl.appendChild(renderSessionItem(s));
-  }
+  // One flat list across every server — no per-machine grouping. Sessions interleave by their
+  // server-synced order; which machine a session lives on is shown subtly in its row meta when
+  // there's more than one server. (fleet — anvil-multi-server.md §4)
+  for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
-}
-/** A non-draggable section header for a server's group in the sidebar (multi-server only). */
-function serverSepRow(srv: Server): HTMLLIElement {
-  const li = document.createElement("li");
-  li.className = "server-sep";
-  li.innerHTML = `<span class="conn-dot ${srv.status}"></span><span class="server-sep-name">${esc(srv.name)}</span>`;
-  return li;
 }
 
 function renderSessionItem(s: Session): HTMLLIElement {
@@ -1563,11 +1737,14 @@ function renderSessionItem(s: Session): HTMLLIElement {
   const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
   const where = envName ?? s.git?.branch ?? s.source;
   const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
+  // With a fleet, the list is flat (no per-machine sections), so name the owning server inline.
+  const srv = serverOf(s.id);
+  const machine = orderedServers().length > 1 && srv ? ` · ${icon("dns")}${esc(srv.name)}` : "";
   const a = document.createElement("a");
   a.className = "srow";
   a.href = sessionHref(s.id);
   const merged = s.git?.prState === "merged" ? `<span class="merged-badge" title="PR merged">${icon("merge")}</span>` : "";
-  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}</div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
+  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}</div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}${machine}</div>`;
   a.addEventListener("click", (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
     e.preventDefault();
@@ -1673,8 +1850,24 @@ function setHeaderTitle(s: Session | undefined): void {
   $("#header-title").innerHTML = s ? `${icon(sessIcon(s))}<span class="ht">${esc(s.title)}</span>` : `<span class="ht">Anvil</span>`;
   document.title = s ? `Anvil: ${s.title}` : "Anvil";
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
+  updateHeaderBranch(s);
   void setFavicon(s);
 }
+/** Show the active session's git branch as a chip in the header; tap it to open the Git panel. */
+function updateHeaderBranch(s: Session | undefined): void {
+  const el = document.getElementById("header-branch");
+  if (!el) return;
+  const branch = s && !s.isDefault ? s.git?.branch : undefined;
+  if (branch) {
+    el.innerHTML = `${icon("account_tree")}<span class="hb-name">${esc(branch)}</span>`;
+    el.title = `On branch ${branch} — open Git`;
+    el.hidden = false;
+  } else {
+    el.innerHTML = "";
+    el.hidden = true;
+  }
+}
+$("#header-branch").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
 
 // ── Favicon: mirror the active session's Material Symbol; fall back to the brand mark ────────────
 const DEFAULT_FAVICON = "/anvil.svg";
@@ -1739,7 +1932,7 @@ function openSettings(): void {
   const root = $("#settings-root");
   root.innerHTML = `<div class="settings-view">
     <div class="settings-head">
-      <h2>${icon("tune")} Settings &amp; servers</h2>
+      <h2>${icon("tune")} Settings &amp; Servers</h2>
       <button id="settings-close" class="icon-btn" title="Close">${icon("close")}</button>
     </div>
     <div class="settings-tabs" role="tablist">
@@ -1790,13 +1983,31 @@ let todoistProjectsLoaded = false;
 const todoistProjectName = (id?: string): string | undefined => (id ? todoistProjects.get(id)?.name : undefined);
 
 /** <option> list for the env link select; keeps the current link selectable even if not yet cached. */
-function todoistProjectOptions(selectedId?: string): string {
+/** Where each Todoist project is already linked (env on ANY fleet server), excluding `exceptEnvId`.
+ *  A project maps to exactly ONE environment — otherwise two daemons would plan the same tasks. */
+function todoistProjectLinks(exceptEnvId?: string): Map<string, { envName: string; serverName: string }> {
+  const links = new Map<string, { envName: string; serverName: string }>();
+  for (const e of environments.values()) {
+    if (!e.todoistProjectId || e.id === exceptEnvId) continue;
+    const srvUrl = envServer.get(e.id);
+    const srv = srvUrl ? servers.get(srvUrl) : undefined;
+    links.set(e.todoistProjectId, { envName: e.name, serverName: srv?.name ?? hostOf(srvUrl ?? "") });
+  }
+  return links;
+}
+
+function todoistProjectOptions(selectedId?: string, exceptEnvId?: string): string {
+  const links = todoistProjectLinks(exceptEnvId);
   const opts = [`<option value="">— none —</option>`];
   const seen = new Set<string>();
   for (const p of [...todoistProjects.values()].sort((a, b) => a.name.localeCompare(b.name))) {
     seen.add(p.id);
-    const label = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
-    opts.push(`<option value="${esc(p.id)}"${p.id === selectedId ? " selected" : ""}>${label}</option>`);
+    const linked = links.get(p.id);
+    const isSelected = p.id === selectedId;
+    const disabled = !!linked && !isSelected; // already owned by another env → can't double-link
+    const base = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
+    const label = disabled ? `${base} — linked to ${esc(linked!.envName)} @ ${esc(linked!.serverName)}` : base;
+    opts.push(`<option value="${esc(p.id)}"${isSelected ? " selected" : ""}${disabled ? " disabled" : ""}>${label}</option>`);
   }
   if (selectedId && !seen.has(selectedId)) {
     opts.push(`<option value="${esc(selectedId)}" selected>${esc(todoistProjectName(selectedId) ?? selectedId)}</option>`);
@@ -1833,13 +2044,58 @@ async function loadTodoistProjects(force = false): Promise<void> {
   }
 }
 
+async function connectTodoistToken(token: string, btn?: HTMLButtonElement): Promise<void> {
+  const t = token.trim();
+  if (!t) {
+    toast("Paste your Todoist API token first.");
+    return;
+  }
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Connecting…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "todoist.connect", token: t, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return; // onTodoistStatus only fires on success → stay on the entry form
+    }
+    todoistProjectsLoaded = false; // a (possibly new) account → refetch projects
+    // The connected `todoist.status` arrives via onTodoistStatus and re-renders the panel.
+    // Replicate the token to every fleet member (hub-side, server→server) so autopilot can run
+    // wherever a linked environment lives. Fire-and-forget; members also self-heal on reconnect.
+    if (orderedServers().some((s) => s.url !== HUB_URL)) {
+      hub().sock.send({ type: "todoist.propagate", cid: newCid() });
+      toast("Sharing the Todoist token across your fleet…");
+    }
+  } catch (err) {
+    toast(`Couldn't connect Todoist: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
 function renderTodoistPanel(): void {
   const host = document.getElementById("todoist-panel");
   if (!host) return;
   if (!todoistConnected) {
     host.innerHTML = `<div class="card"><b>Not connected.</b>
-      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), then run on the daemon host:</p>
-      <pre class="git-output">bun run scripts/todoist.ts set</pre></div>`;
+      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), paste it below, then connect.</p>
+      <div class="todoist-connect">
+        <input id="todoist-token" type="password" autocomplete="off" spellcheck="false" placeholder="Todoist API token" />
+        <button id="todoist-connect" class="primary">Connect</button>
+      </div>
+      <p class="small muted" style="margin-top:8px">Stored on the hub daemon (mode 0600) and replicated across your fleet, so autopilot can run wherever a linked environment lives.</p></div>`;
+    const input = $<HTMLInputElement>("#todoist-token");
+    const btn = $<HTMLButtonElement>("#todoist-connect");
+    btn.addEventListener("click", () => void connectTodoistToken(input.value, btn));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") void connectTodoistToken(input.value, btn);
+    });
     return;
   }
   if (!todoistProjectsLoaded) {
@@ -1862,9 +2118,15 @@ function renderTodoistPanel(): void {
       </tr>`;
     })
     .join("");
-  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects</div>
+  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects
+      <button id="todoist-disconnect" class="mini" style="float:right">Disconnect</button></div>
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
     <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
+  $("#todoist-disconnect").addEventListener("click", () => {
+    hub().sock.send({ type: "todoist.disconnect", cid: newCid() });
+    todoistProjectsLoaded = false;
+    todoistProjects.clear();
+  });
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
@@ -2267,22 +2529,22 @@ async function saveSchedule(): Promise<void> {
   }
 }
 
-/** One card per server in the fleet (hub first): live status, version, budget, and remove. */
+/** One card per server in the fleet (hub first): live status, version, budget, update & remove. */
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
+  const id = cssId(srv.url);
   const ver = srv.version ? ` · anvild ${esc(srv.version)}` : "";
   const state = srv.status === "connected" ? "" : ` · <span class="warn-text">${esc(srv.status)}</span>`;
-  const update = isHub
-    ? `<div class="git-row" style="margin-top:10px"><button id="daemon-update">${icon("refresh")} Update Anvil</button></div><pre class="git-output" id="daemon-update-output" hidden></pre>`
-    : "";
+  // Every Mac runs its own daemon, so "Update Anvil" is per-server (the hub no longer has a monopoly).
   const tail = isHub
     ? '<span class="small muted">(this server)</span>'
-    : `<button class="mini danger" id="srv-remove-${cssId(srv.url)}">${icon("close")} Remove</button>`;
-  return `<div class="card server-card">
+    : `<button class="mini danger" id="srv-remove-${id}">${icon("close")} Remove</button>`;
+  return `<div class="card server-card" id="srv-card-${id}">
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
-    <div id="srv-budget-${cssId(srv.url)}" class="small muted srv-budget"></div>
-    ${update}
+    <div id="srv-budget-${id}" class="small muted srv-budget"></div>
+    <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
+    <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
 }
 /** Verify a URL is a reachable Anvil daemon, then add it to the registry and connect. */
@@ -2331,45 +2593,25 @@ function renderServerCards(): void {
   const host = document.getElementById("server-cards");
   if (!host) return;
   const list = orderedServers();
+  // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
+  // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
     `<div id="fleet-budget"></div>` +
-    list.map(serverCardHtml).join("") +
-    `<div class="card fleet-admin">
-      <div class="section-head"><h3>${icon("hub")} Fleet</h3><button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button></div>
-      <p class="small muted">The Macs sharing this server's Claude login.</p>
-      <div id="fleet-members" class="small muted">Loading…</div>
-      <hr style="border:none;border-top:1px solid var(--border);margin:12px 0 8px" />
-      <div class="card-main">${icon("add")} <b>Add a Mac</b></div>
-      <p class="small muted">On the new Mac open Anvil Server → <b>Join a fleet</b> for a 6-digit code. Then just pick it here and enter the code — no IP to track down.</p>
-      <div class="git-row" style="margin-top:8px">
-        <select id="fleet-host" style="flex:1;min-width:0"><option value="">Scanning your tailnet…</option></select>
-        <input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="code" style="max-width:90px" />
-        <button id="fleet-invite" class="primary">${icon("add")} Add</button>
-      </div>
-      <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
-      <details style="margin-top:10px">
-        <summary class="small muted" style="cursor:pointer">Connect a Mac that's already running, or add by URL…</summary>
-        <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
-        <div id="discover-results" class="small muted" style="margin-top:8px"></div>
-        <div class="git-row" style="margin-top:8px">
-          <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
-          <button id="add-server-btn">${icon("add")} Add by URL</button>
-        </div>
-      </details>
-    </div>`;
-  wireDaemonUpdate(); // the hub card's "Update Anvil"
+    `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
+    `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
+    `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
+    `</div></div>` +
+    `<p class="small muted">Every Mac here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    list.map(serverCardHtml).join("");
   for (const srv of list) {
-    if (srv.url === HUB_URL) continue;
-    document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => removeServer(srv.url));
+    wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
+    if (srv.url !== HUB_URL) {
+      document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => void confirmRemoveServer(srv));
+    }
   }
-  const addBtn = document.getElementById("add-server-btn");
-  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
-  addBtn?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
-  addInput?.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
-  });
-  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
-  wireFleetAdmin();
+  document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
+  document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
+  void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
@@ -2384,7 +2626,7 @@ function renderServerCards(): void {
       <hr />
       <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
       <div class="git-row" style="margin-top:8px">
-        <input id="adb-pair-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
+        <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
         <button id="adb-pair">${icon("link")} Pair this Mac</button>
       </div>
       <pre class="git-output" id="adb-output"></pre></div>`,
@@ -2455,10 +2697,45 @@ async function runDiscovery(): Promise<void> {
 // ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
 // All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
 interface FleetMember { serverId: string; serverName: string; host: string; url: string }
-function wireFleetAdmin(): void {
-  void loadFleetMembers();
+// host → serverId for every Mac the hub knows as a fleet member. Lets a server card's "Remove" also
+// eject that Mac from the fleet (the old separate "Forget" action), so there's one button, not two.
+const fleetMemberIdByHost = new Map<string, string>();
+
+/** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
+async function rotateFleetToken(): Promise<void> {
+  toast("Pushing the current login to every Mac…");
+  try {
+    const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    const okN = r.results.filter((x) => x.ok).length;
+    toast(`Updated ${okN}/${r.results.length} Macs.`);
+  } catch { toast("Couldn't push the login — is the hub reachable?"); }
+}
+
+/** The "+ Add a Mac" dialog: invite by join code (primary), or adopt a server that's already running. */
+function showAddMac(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a Mac</h3>
+    <p class="small muted">On the new Mac open <b>Anvil Server → Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
+    <label>Mac<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
+    <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" /></label>
+    <div id="fleet-status" class="small muted"></div>
+    <details style="margin-top:12px">
+      <summary class="small muted" style="cursor:pointer">Already running? Connect it directly, or add by URL…</summary>
+      <p class="small muted" style="margin-top:8px">Use this for a Mac whose daemon is already up (no join code) — discover it on your tailnet, or type its address.</p>
+      <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
+      <div id="discover-results" class="small muted" style="margin-top:8px"></div>
+      <div class="git-row" style="margin-top:8px">
+        <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
+        <button id="add-server-btn">${icon("add")} Add by URL</button>
+      </div>
+    </details>
+    <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
+  </div>`;
+  showModal(m);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
     const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
     const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
@@ -2471,8 +2748,7 @@ function wireFleetAdmin(): void {
         // Onboarded → also connect this client to it so its sessions show up (one step, not two).
         if (r.member?.url) { saveExtraServers([...loadExtraServers(), r.member.url]); ensureServer(r.member.url); }
         $<HTMLInputElement>("#fleet-code").value = "";
-        setStatus(`✅ ${host} joined the fleet — connecting…`);
-        void loadFleetMembers();
+        setStatus(`✅ ${host} joined the fleet.`);
         void loadFleetPeers();
         renderServerCards();
       } else {
@@ -2480,14 +2756,57 @@ function wireFleetAdmin(): void {
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
-  document.getElementById("fleet-rotate")?.addEventListener("click", async () => {
-    setStatus("Pushing the current login to every Mac…");
-    try {
-      const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
-      const okN = r.results.filter((x) => x.ok).length;
-      setStatus(`Updated ${okN}/${r.results.length} Macs.`);
-    } catch { setStatus("Rotate failed."); }
+  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
+  document.getElementById("add-server-btn")?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
+  addInput?.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
   });
+  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
+}
+
+/** Click handler for a server card's "Remove": dim the card, eject it from the fleet (if it's a member),
+ *  then drop it locally and re-render. "Remove" now does what "Forget" used to — one action, not two. */
+async function confirmRemoveServer(srv: Server): Promise<void> {
+  if (srv.url === HUB_URL) return;
+  const card = document.getElementById(`srv-card-${cssId(srv.url)}`);
+  const btn = document.getElementById(`srv-remove-${cssId(srv.url)}`) as HTMLButtonElement | null;
+  card?.classList.add("removing"); // dim + ignore further clicks until this resolves
+  if (btn) { btn.disabled = true; btn.innerHTML = `${icon("progress_activity")} Removing…`; btn.querySelector(".msym")?.classList.add("spin"); }
+  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login.
+  const memberId = fleetMemberIdByHost.get(hostOf(srv.url));
+  if (memberId) {
+    try {
+      await apiFetch(`/api/fleet/members/${encodeURIComponent(memberId)}`, { method: "DELETE" });
+      fleetMemberIdByHost.delete(hostOf(srv.url));
+    } catch {
+      card?.classList.remove("removing");
+      if (btn) { btn.disabled = false; btn.innerHTML = `${icon("close")} Remove`; }
+      toast("Couldn't remove that Mac from the fleet — is the hub reachable?");
+      return;
+    }
+  }
+  removeServer(srv.url); // local teardown — re-renders the (now shorter) card list
+}
+/** Fetch the hub's fleet members: cache host→serverId for Remove, and adopt any member this device
+ *  isn't connected to yet so the one card list is the whole fleet, not just this device's history. */
+async function loadFleetMembers(): Promise<void> {
+  try {
+    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
+    fleetMemberIdByHost.clear();
+    let adopted = false;
+    for (const m of members) {
+      fleetMemberIdByHost.set(m.host, m.serverId);
+      const url = m.url.replace(/\/+$/, "");
+      if (url && url !== HUB_URL && !servers.has(url)) {
+        saveExtraServers([...loadExtraServers(), url]);
+        ensureServer(url);
+        adopted = true;
+      }
+    }
+    if (adopted && document.getElementById("server-cards")) renderServerCards();
+  } catch {
+    /* hub unreachable — cards still render from the locally-known servers */
+  }
 }
 /** Fill the "Add a Mac" dropdown from the hub's tailnet peers — so you pick a name, not an IP. */
 async function loadFleetPeers(): Promise<void> {
@@ -2506,25 +2825,6 @@ async function loadFleetPeers(): Promise<void> {
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
-  }
-}
-async function loadFleetMembers(): Promise<void> {
-  const el = document.getElementById("fleet-members");
-  if (!el) return;
-  try {
-    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
-    if (!members.length) { el.innerHTML = `<p class="small muted">No other Macs yet.</p>`; return; }
-    el.innerHTML = members
-      .map((m) => `<div class="discover-row"><span>${icon("desktop_mac")} <b>${esc(m.serverName)}</b> <code>${esc(m.host)}</code></span><button class="mini fleet-forget" data-id="${esc(m.serverId)}">${icon("close")} Forget</button></div>`)
-      .join("");
-    el.querySelectorAll<HTMLElement>(".fleet-forget").forEach((b) =>
-      b.addEventListener("click", async () => {
-        await apiFetch(`/api/fleet/members/${encodeURIComponent(b.dataset.id!)}`, { method: "DELETE" }).catch(() => {});
-        void loadFleetMembers();
-      }),
-    );
-  } catch {
-    el.innerHTML = `<p class="small muted">Couldn't load the fleet.</p>`;
   }
 }
 const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
@@ -2557,10 +2857,14 @@ function renderAggregateBudget(): void {
     <div class="small muted">Shared Max pool across the fleet — Opus <b>${opus}%</b> · week <b>${week}%</b> (highest any server reports).${warn ? " ⚠️ approaching the weekly limit." : ""}</div>
   </div>`;
 }
-/** Wire the "Update Anvil" button: pull the daemon's source, rebuild, and restart it. */
-function wireDaemonUpdate(): void {
-  const btn = document.getElementById("daemon-update") as HTMLButtonElement | null;
-  const out = document.getElementById("daemon-update-output");
+/** Wire one server card's "Update Anvil" button: pull that daemon's source, rebuild, and restart it.
+ *  Each Mac self-updates independently — the hub no longer has a monopoly on updates. Only a hub
+ *  restart reloads this page (it's serving the bundle); a remote restart just reconnects in the list. */
+function wireDaemonUpdate(srv: Server): void {
+  const id = cssId(srv.url);
+  const isHub = srv.url === HUB_URL;
+  const btn = document.getElementById(`daemon-update-${id}`) as HTMLButtonElement | null;
+  const out = document.getElementById(`daemon-update-output-${id}`);
   if (!btn || !out) return;
   const spin = (label: string): void => {
     btn.innerHTML = `${icon("progress_activity")} ${label}`;
@@ -2576,7 +2880,7 @@ function wireDaemonUpdate(): void {
     out.hidden = false;
     out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
-      const res = await sendAwait(hub(), { type: "daemon.update", cid: newCid() }, 180_000);
+      const res = await sendAwait(srv, { type: "daemon.update", cid: newCid() }, 180_000);
       if (res.type === "command.error") {
         out.textContent = `Update failed: ${res.message}`;
         toast("Update failed — see Settings.");
@@ -2589,14 +2893,14 @@ function wireDaemonUpdate(): void {
       }
       out.textContent = res.output;
       if (res.phase === "up-to-date") {
-        toast(`Anvil is already up to date (v${res.currentVersion}).`);
+        toast(`${esc(srv.name)} is already up to date (v${res.currentVersion}).`);
         reset();
       } else if (res.phase === "error") {
         toast("Update failed — see Settings.");
         reset();
-      } else if (res.willRestart) {
-        // The daemon restarts momentarily; keep the button spinning and let onStatus reload the
-        // app once the WS reconnects (that's the proof it's back). Safety net if it never returns.
+      } else if (res.willRestart && isHub) {
+        // The hub serves THIS page, so when it restarts we reload to pick up the new bundle. Keep the
+        // button spinning and let onStatus reload once the WS reconnects. Safety net if it never returns.
         toast("Anvil updated — restarting…");
         pendingRestartReload = true;
         spin("Restarting…");
@@ -2607,9 +2911,14 @@ function wireDaemonUpdate(): void {
           setUpdateStatus("Still restarting — reload the app manually in a moment to pick up the update.");
           reset();
         }, 90_000);
+      } else if (res.willRestart) {
+        // A remote Mac restarts on its own; nothing to reload here — it just reconnects in the list.
+        toast(`${esc(srv.name)} updated — restarting it…`);
+        out.textContent = `${res.output}\n\nUpdate applied. ${srv.name} is restarting — it'll reconnect in the list shortly.`;
+        reset();
       } else {
-        // updated but this daemon isn't service-managed, so it won't self-restart
-        toast("Anvil updated — restart the daemon to apply.");
+        // updated but that daemon isn't service-managed, so it won't self-restart
+        toast(`${esc(srv.name)} updated — restart it to apply.`);
         reset();
       }
     } catch (e) {
@@ -2670,6 +2979,7 @@ async function toggleReadme(id: string): Promise<void> {
   }
 }
 function selectSession(id: string, push = true): void {
+  if (id !== activeId) saveDraft(activeId, input.value); // stash the outgoing session's unsent draft before we switch
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
   // the session (replace, don't push) so Back stays balanced.
   let reuseSidebarEntry = false;
@@ -2679,6 +2989,7 @@ function selectSession(id: string, push = true): void {
   }
   activeId = id;
   localStorage.setItem("anvil.active", id);
+  restoreDraft(id); // bring in the incoming session's own draft (usually blank)
   setSessionHash(id, push && !reuseSidebarEntry); // reflect in the URL (history entry unless restoring via Back/Forward)
   stickToBottom = true; // a freshly opened session starts pinned to the latest
   clearConversation();
@@ -2713,6 +3024,37 @@ const input = $<HTMLTextAreaElement>("#input");
 const pendingAttachments: { id: string; name: string; kind: "image" | "file"; dataUrl?: string }[] = [];
 const attachRow = $("#attach-row");
 
+// ── Per-session composer drafts ──────────────────────────────────────────────────
+// Unsent text belongs to the session it was typed in, not the box. Switching sessions stashes the
+// current draft under the outgoing session and restores the incoming one's (usually blank), so a
+// half-written message for one session never bleeds into another. Persisted per session so a draft
+// also survives a reload / app restart.
+const draftKey = (id: string): string => `anvil.draft.${id}`;
+function saveDraft(id: string | null, text: string): void {
+  if (!id) return;
+  try {
+    if (text.trim()) localStorage.setItem(draftKey(id), text);
+    else localStorage.removeItem(draftKey(id));
+  } catch {
+    /* quota */
+  }
+}
+function loadDraft(id: string | null): string {
+  if (!id) return "";
+  try {
+    return localStorage.getItem(draftKey(id)) ?? "";
+  } catch {
+    return "";
+  }
+}
+/** Put `id`'s saved draft into the composer (or clear it), and resize/enable Send to match. */
+function restoreDraft(id: string | null): void {
+  input.value = loadDraft(id);
+  autoGrow();
+  updateSendState();
+}
+restoreDraft(activeId); // on load, bring back the active session's own unsent draft (if any)
+
 // Uploads are async (read file → POST → push to pendingAttachments). If the user sends text
 // before an upload lands, the attachment id wouldn't be in pendingAttachments yet and the
 // file would be silently dropped. Track in-flight uploads so send() can wait for them.
@@ -2743,6 +3085,7 @@ async function sendComposer(): Promise<void> {
     enqueue({ cid: newCid(), cmd: { type: "prompt.send", sessionId: activeId, text } });
     appendOptimisticUser(text);
   }
+  saveDraft(activeId, ""); // the draft was just sent — drop the stored copy
   input.value = "";
   pendingAttachments.length = 0;
   renderAttachRow();
@@ -3020,7 +3363,11 @@ function renderReader(content: FileContent): void {
   if (content.path !== readerPath) return;
   panelView = "reader";
   setPanelTabs();
-  const head = `<div class="reader-head"><b>${esc(content.path)}</b><a href="#" id="reader-back">← files</a></div>`;
+  const head =
+    `<div class="reader-head"><b>${esc(content.path)}</b>` +
+    `<span class="reader-head-actions">` +
+    `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>` +
+    `<a href="#" id="reader-back">← files</a></span></div>`;
   if (content.markdown) {
     panelContent.innerHTML = head + `<div class="md reader-md">${content.markdown.html}</div>`;
     void runMermaid(panelContent.querySelector(".reader-md") as HTMLElement);
@@ -3033,6 +3380,36 @@ function renderReader(content: FileContent): void {
   }
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
+  const popout = document.getElementById("reader-popout");
+  if (popout) popout.onclick = () => popOutReader(content.path);
+}
+/** Open the currently-rendered reader content in a standalone window (Mac + Web). Reuses the page's
+ *  stylesheets + theme and the already-rendered DOM (Mermaid/KaTeX/code highlighting intact), minus
+ *  the in-app chrome, so the file reads as its own clean document you can park beside the chat. */
+function popOutReader(path: string): void {
+  const clone = panelContent.cloneNode(true) as HTMLElement;
+  clone.querySelector(".reader-head")?.remove(); // in-app header + back link don't belong in the window
+  clone.querySelectorAll(".copy-btn").forEach((b) => b.remove()); // their click handlers don't survive the copy
+  const styles = [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')]
+    .map((l) => `<link rel="stylesheet" href="${esc(l.href)}" />`)
+    .join("");
+  const theme = document.documentElement.dataset.theme ?? "light";
+  const title = path.split("/").pop() || path;
+  const win = window.open("", "_blank", "noopener,width=860,height=920");
+  if (!win) {
+    toast("Allow pop-ups to open the reader in its own window");
+    return;
+  }
+  win.document.write(
+    `<!doctype html><html lang="en" data-theme="${esc(theme)}"><head><meta charset="utf-8" />` +
+      `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
+      `<title>${esc(title)}</title>${styles}` +
+      `<style>body{margin:0;background:var(--bg);color:var(--text)}` +
+      `.popout-wrap{max-width:880px;margin:0 auto;padding:28px clamp(16px,4vw,40px)}` +
+      `.popout-head{font:600 12px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-bottom:16px;word-break:break-all}</style>` +
+      `</head><body><div class="popout-wrap"><div class="popout-head">${esc(path)}</div>${clone.innerHTML}</div></body></html>`,
+  );
+  win.document.close();
 }
 // ── Git panel ──────────────────────────────────────────────────────────────────
 function askClaude(instruction: string): void {
@@ -3128,6 +3505,7 @@ function runStage(key: Stage, label: string): void {
   setGitOutput(`Working… asked Claude to ${label.toLowerCase()}.`);
   sendTo(activeId, { type: "prompt.send", sessionId: activeId, text: STAGE_PROMPT[key] });
   toast(`${label} →`);
+  closePanel(); // get out of the way and jump to the conversation to watch it work
 }
 function gitStatusLine(s: Session | undefined): string {
   const g = s?.git;
@@ -3205,6 +3583,7 @@ function killSession(id: string): void {
   removingSessions.add(id);
   sendTo(id, { type: "session.kill", sessionId: id });
   localStorage.removeItem(`anvil.convo.${id}`);
+  localStorage.removeItem(`anvil.draft.${id}`); // abandoning the session — its draft goes with it
   if (panelView) closePanel();
   if (activeId === id) {
     // Drop the conversation now, but keep the (disabled) sidebar entry until it's actually gone.
@@ -3213,6 +3592,7 @@ function killSession(id: string): void {
     setSessionHash(null, false);
     setHeaderTitle(undefined);
     renderEmptyState();
+    restoreDraft(null); // clear the composer of the killed session's text
   }
   renderSessions();
 }
@@ -3289,7 +3669,7 @@ document.addEventListener("pointerdown", (e) => {
   if (!panelView) return; // panel already closed
   if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot")) return; // a dialog/settings/autopilot is on top — leave the panel be
   const t = e.target as HTMLElement;
-  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root") || t.closest("#autopilot-root")) return;
+  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root") || t.closest("#autopilot-root") || t.closest(".resizer")) return;
   closePanel();
 });
 
@@ -3600,7 +3980,7 @@ function showEditEnvironment(id: string): void {
   if (!env) return;
   const m = document.createElement("div");
   m.className = "modal";
-  const projectOptions = todoistProjectOptions(env.todoistProjectId);
+  const projectOptions = todoistProjectOptions(env.todoistProjectId, env.id);
   const validationText = env.validation?.commands?.join("\n") ?? "";
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
@@ -3620,6 +4000,16 @@ function showEditEnvironment(id: string): void {
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
+    const chosenProject = $<HTMLSelectElement>("#ee-todoist").value;
+    // Guard against a race: another client may have linked this project while the modal was open
+    // (the dropdown already disables known clashes). One project ↔ one environment.
+    if (chosenProject) {
+      const clash = todoistProjectLinks(id).get(chosenProject);
+      if (clash) {
+        toast(`“${todoistProjectName(chosenProject) ?? "That project"}” is already linked to ${clash.envName} @ ${clash.serverName}. Unlink it there first.`);
+        return;
+      }
+    }
     const commands = $<HTMLTextAreaElement>("#ee-validation").value
       .split("\n")
       .map((s) => s.trim())
@@ -3857,15 +4247,21 @@ function summarizeAnswers(answers: QuestionAnswer[]): string {
   return answers.map((a) => a.labels.join(", ")).join(" · ");
 }
 
-/** Mark a question card answered: lock its inputs, show the choice, then fade it out. */
+/** Mark a question card answered. With a known answer, collapse the whole prompt to a single compact
+ *  "Claude asked → <answer>" line right away (no lingering, faded options list) so it feels instant
+ *  and reads like a sent reply; otherwise (answered elsewhere/superseded) just lock + fade it. */
 function resolveQuestionUI(requestId: string, label?: string): void {
   const card = questionCards.get(requestId);
   if (!card) return;
   questionCards.delete(requestId);
   card.classList.add("resolved");
-  card.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = true));
-  const btns = card.querySelector(".q-btns");
-  if (btns && label) btns.innerHTML = `<span class="q-done">${icon("check")} ${esc(label)}</span>`;
+  if (label) {
+    card.innerHTML =
+      `<div class="q-head">${icon("help")}<span>Claude asked…</span></div>` +
+      `<div class="q-answered"><span class="q-done">${icon("check")} ${esc(label)}</span></div>`;
+  } else {
+    card.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = true));
+  }
 }
 
 /** A session left awaiting_question (answered here, on another device, or superseded). */
@@ -3894,14 +4290,33 @@ function confirmDialog(opts: { title: string; body?: string; confirmLabel?: stri
       <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
     </div>`;
     showModal(m);
+    let settled = false;
     const done = (v: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v); // resolve BEFORE teardown so the explicit choice wins over the cancel-on-close below
       closeModal();
-      resolve(v);
     };
+    // Dismissing the dialog any other way (Escape, device Back, backdrop tap) counts as Cancel — and,
+    // crucially, must resolve the promise so the awaiting caller doesn't hang. Augment this modal
+    // layer's teardown to resolve(false); whichever resolve runs first wins (Promise is one-shot).
+    const top = overlays[overlays.length - 1];
+    if (top && top.name === "modal") {
+      const origClose = top.close;
+      top.close = () => {
+        origClose();
+        if (!settled) {
+          settled = true;
+          resolve(false);
+        }
+      };
+    }
     $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
     $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
     m.addEventListener("click", (e) => {
       if (e.target === m) done(false); // click backdrop to cancel
     });
+    // Focus a default button so Enter confirms; a destructive dialog defaults to the safe Cancel.
+    (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
   });
 }

@@ -161,8 +161,10 @@ struct WizardView: View {
   @State private var checkoutTick = 0
   @State private var bunOK = Deps.bunInstalled()
   @State private var tsOK = Deps.tailscaleInstalled
+  @State private var tsUp = Deps.tailscaleInstalled && Tailscale.loggedIn() // installed AND signed in/running
   @State private var installingBun = false
   @State private var provisioning = false
+  @State private var daemonUpdate = Provision.needed() // bundled daemon differs from what's installed
 
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
@@ -190,6 +192,18 @@ struct WizardView: View {
             Button { chooseCheckout() } label: { Label("Choose anvild folder…", systemImage: "folder") }
           }
         }
+      } else if daemonUpdate {
+        // A checkout exists but the app bundles a NEWER daemon (e.g. a fixed service.sh) — offer to
+        // update it in place. Re-provision preserves node_modules, so this is fast, and it restarts a
+        // running daemon to pick up the new code.
+        Card {
+          Label("A daemon update is available.", systemImage: "arrow.triangle.2.circlepath").font(.callout)
+          Text("This Mac is running an older copy of the Anvil daemon than this app ships. Updating refreshes it (keeps the installed dependencies) and restarts it.").font(.caption).foregroundStyle(.secondary)
+          Button { provisionDaemon() } label: {
+            if provisioning { HStack(spacing: 5) { ProgressView().controlSize(.small); Text("Updating…") } }
+            else { Label("Update Anvil daemon", systemImage: "arrow.down.circle.fill") }
+          }.buttonStyle(.borderedProminent).tint(.anvil).disabled(provisioning || !bunOK)
+        }
       }
 
       switch role {
@@ -209,7 +223,12 @@ struct WizardView: View {
         Card {
           Label("Log in with your Claude subscription", systemImage: "1.circle.fill").font(.callout.weight(.medium))
           Text("Opens Terminal to run `claude setup-token` (no API key — your subscription).").font(.caption).foregroundStyle(.secondary)
-          Button { _ = Auth.openSetupTokenInTerminal() } label: { Label("Run setup-token", systemImage: "terminal") }
+          Button {
+            // Don't silently do nothing if Claude Code isn't installed — tell the user how to fix it.
+            if !Auth.openSetupTokenInTerminal() {
+              status = "Claude Code isn't installed on this Mac. Install it from claude.com/claude-code, then try again."
+            }
+          } label: { Label("Run setup-token", systemImage: "terminal") }
         }
         Card {
           Label("Paste the token it prints", systemImage: "2.circle.fill").font(.callout.weight(.medium))
@@ -225,7 +244,10 @@ struct WizardView: View {
             .font(.system(size: 38, weight: .bold, design: .monospaced)).kerning(4)
             .frame(maxWidth: .infinity).padding(.vertical, 6)
             .background(Color.anvil.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 10))
-          Label("This Mac: \(Tailscale.magicDNSName() ?? "—")", systemImage: "desktopcomputer").font(.caption).foregroundStyle(.secondary)
+          // Prefer the MagicDNS name, but fall back to the tailnet IP (read straight from the network
+          // interfaces — works even when the `tailscale` CLI doesn't resolve in the app's sandbox, which
+          // is exactly when magicDNSName() returns nil). Either value is something the hub can pair to.
+          Label("This Mac: \(Tailscale.magicDNSName() ?? Tailscale.tailnetIP() ?? "—")", systemImage: "desktopcomputer").font(.caption).foregroundStyle(.secondary)
           HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Waiting for the hub…").font(.caption).foregroundStyle(.secondary) }
         }
       }
@@ -236,6 +258,18 @@ struct WizardView: View {
     }
     .padding(22)
     .frame(width: 480, height: 460)
+    .onAppear { recheckDeps() } // reflect reality each time the window opens (e.g. after signing in to Tailscale)
+  }
+
+  /// Re-read dependency state off the main thread (each shells out) and publish on the main actor, so
+  /// the wizard always shows the current truth — a user who installs Bun or signs in to Tailscale in
+  /// another window sees it update on return, with no app restart.
+  private func recheckDeps() {
+    DispatchQueue.global(qos: .userInitiated).async {
+      let bun = Deps.bunInstalled(), ts = Deps.tailscaleInstalled, up = ts && Tailscale.loggedIn()
+      let upd = Provision.needed()
+      DispatchQueue.main.async { bunOK = bun; tsOK = ts; tsUp = up; daemonUpdate = upd }
+    }
   }
 
   private func roleButton(_ title: String, _ symbol: String, prominent: Bool = false, action: @escaping () -> Void) -> some View {
@@ -264,11 +298,23 @@ struct WizardView: View {
         }
       }
       HStack {
-        Label(tsOK ? "Tailscale installed" : "Tailscale not installed",
-              systemImage: tsOK ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-          .font(.caption).foregroundStyle(tsOK ? .green : .orange)
+        // Three states, because "installed" isn't enough to reach other Macs — a very common
+        // regular-person snag is Tailscale installed but not signed in, which leaves the daemon
+        // bound to a tailnet address that doesn't exist yet.
+        Label(!tsOK ? "Tailscale not installed" : (tsUp ? "Tailscale connected" : "Tailscale not signed in"),
+              systemImage: tsUp ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+          .font(.caption).foregroundStyle(tsUp ? .green : .orange)
         Spacer()
-        if !tsOK { Link("Get Tailscale", destination: Deps.tailscaleDownloadURL).font(.caption) }
+        if !tsOK {
+          Link("Get Tailscale", destination: Deps.tailscaleDownloadURL).font(.caption)
+        } else if !tsUp {
+          Button("Open Tailscale") { _ = Shell.run("open", ["-a", "Tailscale"]); recheckDeps() }
+            .controlSize(.small)
+        }
+      }
+      if tsOK && !tsUp {
+        Text("Open Tailscale and sign in — Anvil reaches your other Macs over your private tailnet.")
+          .font(.caption2).foregroundStyle(.secondary)
       }
     }
   }
@@ -289,6 +335,11 @@ struct WizardView: View {
       provisioning = false
       status = msg
       checkoutTick += 1 // hasCheckout now resolves to the provisioned install root
+      if ok {
+        daemonUpdate = false
+        // If this Mac is already configured, restart so the freshly-installed daemon code takes effect.
+        if state.hasToken { state.restart() }
+      }
     })
   }
 
@@ -401,7 +452,14 @@ struct FleetView: View {
       case .success(let reply):
         if reply.ok {
           state.recordMember(host: h, reply: reply); members = FleetRegistry.all()
-          status = "✅ \(h) joined the fleet."; host = ""; code = ""
+          status = "✅ \(h) joined — checking it's online…"; host = ""; code = ""
+          // Confirm the new Mac's daemon actually came up, so a silent dead-daemon doesn't masquerade
+          // as a successful join (the client would just spin on "connecting" with no explanation).
+          Pairing.probeHealth(host: h) { online in
+            status = online
+              ? "✅ \(h) joined and is online."
+              : "✅ \(h) joined, but its daemon isn't responding yet. Give it a moment; if it stays down, open Anvil on \(h) to see the error."
+          }
         } else { status = "Rejected: \(reply.error ?? "unknown")" }
       case .failure(let e): status = "Failed: \(e.localizedDescription)"
       }
