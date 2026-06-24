@@ -196,6 +196,7 @@ function removeServer(url: string): void {
   persistEnvironments();
   persistRouting();
   renderSessions();
+  if (document.getElementById("server-cards")) renderServerCards(); // drop the card from an open Settings view
 }
 const hub = (): Server => servers.get(HUB_URL)!;
 function serverOf(sessionId: string | null | undefined): Server | undefined {
@@ -666,7 +667,8 @@ $("#scroll-bottom").addEventListener("click", () => {
 // reconnect is our signal the new build is live — reload to pick up the rebuilt web bundle.
 let pendingRestartReload = false;
 function setUpdateStatus(text: string): void {
-  const out = document.getElementById("daemon-update-output");
+  // The hub's card owns the page-reload-on-restart flow; its output element is keyed by the hub URL.
+  const out = document.getElementById(`daemon-update-output-${cssId(HUB_URL)}`);
   if (out) {
     out.hidden = false;
     out.textContent = text;
@@ -1733,7 +1735,7 @@ function openSettings(): void {
   const root = $("#settings-root");
   root.innerHTML = `<div class="settings-view">
     <div class="settings-head">
-      <h2>${icon("tune")} Settings &amp; servers</h2>
+      <h2>${icon("tune")} Settings &amp; Servers</h2>
       <button id="settings-close" class="icon-btn" title="Close">${icon("close")}</button>
     </div>
     <div class="settings-tabs" role="tablist">
@@ -1933,22 +1935,22 @@ function renderTodoistPanel(): void {
 function closeSettings(): void {
   $("#settings-root").innerHTML = "";
 }
-/** One card per server in the fleet (hub first): live status, version, budget, and remove. */
+/** One card per server in the fleet (hub first): live status, version, budget, update & remove. */
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
+  const id = cssId(srv.url);
   const ver = srv.version ? ` · anvild ${esc(srv.version)}` : "";
   const state = srv.status === "connected" ? "" : ` · <span class="warn-text">${esc(srv.status)}</span>`;
-  const update = isHub
-    ? `<div class="git-row" style="margin-top:10px"><button id="daemon-update">${icon("refresh")} Update Anvil</button></div><pre class="git-output" id="daemon-update-output" hidden></pre>`
-    : "";
+  // Every Mac runs its own daemon, so "Update Anvil" is per-server (the hub no longer has a monopoly).
   const tail = isHub
     ? '<span class="small muted">(this server)</span>'
-    : `<button class="mini danger" id="srv-remove-${cssId(srv.url)}">${icon("close")} Remove</button>`;
-  return `<div class="card server-card">
+    : `<button class="mini danger" id="srv-remove-${id}">${icon("close")} Remove</button>`;
+  return `<div class="card server-card" id="srv-card-${id}">
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
-    <div id="srv-budget-${cssId(srv.url)}" class="small muted srv-budget"></div>
-    ${update}
+    <div id="srv-budget-${id}" class="small muted srv-budget"></div>
+    <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
+    <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
 }
 /** Verify a URL is a reachable Anvil daemon, then add it to the registry and connect. */
@@ -1997,45 +1999,25 @@ function renderServerCards(): void {
   const host = document.getElementById("server-cards");
   if (!host) return;
   const list = orderedServers();
+  // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
+  // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
     `<div id="fleet-budget"></div>` +
-    list.map(serverCardHtml).join("") +
-    `<div class="card fleet-admin">
-      <div class="section-head"><h3>${icon("hub")} Fleet</h3><button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button></div>
-      <p class="small muted">The Macs sharing this server's Claude login.</p>
-      <div id="fleet-members" class="small muted">Loading…</div>
-      <hr style="border:none;border-top:1px solid var(--border);margin:12px 0 8px" />
-      <div class="card-main">${icon("add")} <b>Add a Mac</b></div>
-      <p class="small muted">On the new Mac open Anvil Server → <b>Join a fleet</b> for a 6-digit code. Then just pick it here and enter the code — no IP to track down.</p>
-      <div class="git-row" style="margin-top:8px">
-        <select id="fleet-host" style="flex:1;min-width:0"><option value="">Scanning your tailnet…</option></select>
-        <input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="code" style="max-width:90px" />
-        <button id="fleet-invite" class="primary">${icon("add")} Add</button>
-      </div>
-      <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
-      <details style="margin-top:10px">
-        <summary class="small muted" style="cursor:pointer">Connect a Mac that's already running, or add by URL…</summary>
-        <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
-        <div id="discover-results" class="small muted" style="margin-top:8px"></div>
-        <div class="git-row" style="margin-top:8px">
-          <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
-          <button id="add-server-btn">${icon("add")} Add by URL</button>
-        </div>
-      </details>
-    </div>`;
-  wireDaemonUpdate(); // the hub card's "Update Anvil"
+    `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
+    `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
+    `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
+    `</div></div>` +
+    `<p class="small muted">Every Mac here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    list.map(serverCardHtml).join("");
   for (const srv of list) {
-    if (srv.url === HUB_URL) continue;
-    document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => removeServer(srv.url));
+    wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
+    if (srv.url !== HUB_URL) {
+      document.getElementById(`srv-remove-${cssId(srv.url)}`)?.addEventListener("click", () => void confirmRemoveServer(srv));
+    }
   }
-  const addBtn = document.getElementById("add-server-btn");
-  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
-  addBtn?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
-  addInput?.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
-  });
-  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
-  wireFleetAdmin();
+  document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
+  document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
+  void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
@@ -2121,10 +2103,45 @@ async function runDiscovery(): Promise<void> {
 // ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
 // All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
 interface FleetMember { serverId: string; serverName: string; host: string; url: string }
-function wireFleetAdmin(): void {
-  void loadFleetMembers();
+// host → serverId for every Mac the hub knows as a fleet member. Lets a server card's "Remove" also
+// eject that Mac from the fleet (the old separate "Forget" action), so there's one button, not two.
+const fleetMemberIdByHost = new Map<string, string>();
+
+/** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
+async function rotateFleetToken(): Promise<void> {
+  toast("Pushing the current login to every Mac…");
+  try {
+    const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    const okN = r.results.filter((x) => x.ok).length;
+    toast(`Updated ${okN}/${r.results.length} Macs.`);
+  } catch { toast("Couldn't push the login — is the hub reachable?"); }
+}
+
+/** The "+ Add a Mac" dialog: invite by join code (primary), or adopt a server that's already running. */
+function showAddMac(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a Mac</h3>
+    <p class="small muted">On the new Mac open <b>Anvil Server → Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
+    <label>Mac<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
+    <label>Join code<input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" /></label>
+    <div id="fleet-status" class="small muted"></div>
+    <details style="margin-top:12px">
+      <summary class="small muted" style="cursor:pointer">Already running? Connect it directly, or add by URL…</summary>
+      <p class="small muted" style="margin-top:8px">Use this for a Mac whose daemon is already up (no join code) — discover it on your tailnet, or type its address.</p>
+      <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
+      <div id="discover-results" class="small muted" style="margin-top:8px"></div>
+      <div class="git-row" style="margin-top:8px">
+        <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
+        <button id="add-server-btn">${icon("add")} Add by URL</button>
+      </div>
+    </details>
+    <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
+  </div>`;
+  showModal(m);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
     const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
     const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
@@ -2137,8 +2154,7 @@ function wireFleetAdmin(): void {
         // Onboarded → also connect this client to it so its sessions show up (one step, not two).
         if (r.member?.url) { saveExtraServers([...loadExtraServers(), r.member.url]); ensureServer(r.member.url); }
         $<HTMLInputElement>("#fleet-code").value = "";
-        setStatus(`✅ ${host} joined the fleet — connecting…`);
-        void loadFleetMembers();
+        setStatus(`✅ ${host} joined the fleet.`);
         void loadFleetPeers();
         renderServerCards();
       } else {
@@ -2146,14 +2162,57 @@ function wireFleetAdmin(): void {
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
-  document.getElementById("fleet-rotate")?.addEventListener("click", async () => {
-    setStatus("Pushing the current login to every Mac…");
-    try {
-      const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
-      const okN = r.results.filter((x) => x.ok).length;
-      setStatus(`Updated ${okN}/${r.results.length} Macs.`);
-    } catch { setStatus("Rotate failed."); }
+  const addInput = document.getElementById("add-server-url") as HTMLInputElement | null;
+  document.getElementById("add-server-btn")?.addEventListener("click", () => void addServerByUrl(addInput?.value ?? ""));
+  addInput?.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter") void addServerByUrl(addInput.value);
   });
+  document.getElementById("discover-btn")?.addEventListener("click", () => void runDiscovery());
+}
+
+/** Click handler for a server card's "Remove": dim the card, eject it from the fleet (if it's a member),
+ *  then drop it locally and re-render. "Remove" now does what "Forget" used to — one action, not two. */
+async function confirmRemoveServer(srv: Server): Promise<void> {
+  if (srv.url === HUB_URL) return;
+  const card = document.getElementById(`srv-card-${cssId(srv.url)}`);
+  const btn = document.getElementById(`srv-remove-${cssId(srv.url)}`) as HTMLButtonElement | null;
+  card?.classList.add("removing"); // dim + ignore further clicks until this resolves
+  if (btn) { btn.disabled = true; btn.innerHTML = `${icon("progress_activity")} Removing…`; btn.querySelector(".msym")?.classList.add("spin"); }
+  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login.
+  const memberId = fleetMemberIdByHost.get(hostOf(srv.url));
+  if (memberId) {
+    try {
+      await apiFetch(`/api/fleet/members/${encodeURIComponent(memberId)}`, { method: "DELETE" });
+      fleetMemberIdByHost.delete(hostOf(srv.url));
+    } catch {
+      card?.classList.remove("removing");
+      if (btn) { btn.disabled = false; btn.innerHTML = `${icon("close")} Remove`; }
+      toast("Couldn't remove that Mac from the fleet — is the hub reachable?");
+      return;
+    }
+  }
+  removeServer(srv.url); // local teardown — re-renders the (now shorter) card list
+}
+/** Fetch the hub's fleet members: cache host→serverId for Remove, and adopt any member this device
+ *  isn't connected to yet so the one card list is the whole fleet, not just this device's history. */
+async function loadFleetMembers(): Promise<void> {
+  try {
+    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
+    fleetMemberIdByHost.clear();
+    let adopted = false;
+    for (const m of members) {
+      fleetMemberIdByHost.set(m.host, m.serverId);
+      const url = m.url.replace(/\/+$/, "");
+      if (url && url !== HUB_URL && !servers.has(url)) {
+        saveExtraServers([...loadExtraServers(), url]);
+        ensureServer(url);
+        adopted = true;
+      }
+    }
+    if (adopted && document.getElementById("server-cards")) renderServerCards();
+  } catch {
+    /* hub unreachable — cards still render from the locally-known servers */
+  }
 }
 /** Fill the "Add a Mac" dropdown from the hub's tailnet peers — so you pick a name, not an IP. */
 async function loadFleetPeers(): Promise<void> {
@@ -2172,25 +2231,6 @@ async function loadFleetPeers(): Promise<void> {
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
-  }
-}
-async function loadFleetMembers(): Promise<void> {
-  const el = document.getElementById("fleet-members");
-  if (!el) return;
-  try {
-    const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
-    if (!members.length) { el.innerHTML = `<p class="small muted">No other Macs yet.</p>`; return; }
-    el.innerHTML = members
-      .map((m) => `<div class="discover-row"><span>${icon("desktop_mac")} <b>${esc(m.serverName)}</b> <code>${esc(m.host)}</code></span><button class="mini fleet-forget" data-id="${esc(m.serverId)}">${icon("close")} Forget</button></div>`)
-      .join("");
-    el.querySelectorAll<HTMLElement>(".fleet-forget").forEach((b) =>
-      b.addEventListener("click", async () => {
-        await apiFetch(`/api/fleet/members/${encodeURIComponent(b.dataset.id!)}`, { method: "DELETE" }).catch(() => {});
-        void loadFleetMembers();
-      }),
-    );
-  } catch {
-    el.innerHTML = `<p class="small muted">Couldn't load the fleet.</p>`;
   }
 }
 const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
@@ -2223,10 +2263,14 @@ function renderAggregateBudget(): void {
     <div class="small muted">Shared Max pool across the fleet — Opus <b>${opus}%</b> · week <b>${week}%</b> (highest any server reports).${warn ? " ⚠️ approaching the weekly limit." : ""}</div>
   </div>`;
 }
-/** Wire the "Update Anvil" button: pull the daemon's source, rebuild, and restart it. */
-function wireDaemonUpdate(): void {
-  const btn = document.getElementById("daemon-update") as HTMLButtonElement | null;
-  const out = document.getElementById("daemon-update-output");
+/** Wire one server card's "Update Anvil" button: pull that daemon's source, rebuild, and restart it.
+ *  Each Mac self-updates independently — the hub no longer has a monopoly on updates. Only a hub
+ *  restart reloads this page (it's serving the bundle); a remote restart just reconnects in the list. */
+function wireDaemonUpdate(srv: Server): void {
+  const id = cssId(srv.url);
+  const isHub = srv.url === HUB_URL;
+  const btn = document.getElementById(`daemon-update-${id}`) as HTMLButtonElement | null;
+  const out = document.getElementById(`daemon-update-output-${id}`);
   if (!btn || !out) return;
   const spin = (label: string): void => {
     btn.innerHTML = `${icon("progress_activity")} ${label}`;
@@ -2242,7 +2286,7 @@ function wireDaemonUpdate(): void {
     out.hidden = false;
     out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
-      const res = await sendAwait(hub(), { type: "daemon.update", cid: newCid() }, 180_000);
+      const res = await sendAwait(srv, { type: "daemon.update", cid: newCid() }, 180_000);
       if (res.type === "command.error") {
         out.textContent = `Update failed: ${res.message}`;
         toast("Update failed — see Settings.");
@@ -2255,14 +2299,14 @@ function wireDaemonUpdate(): void {
       }
       out.textContent = res.output;
       if (res.phase === "up-to-date") {
-        toast(`Anvil is already up to date (v${res.currentVersion}).`);
+        toast(`${esc(srv.name)} is already up to date (v${res.currentVersion}).`);
         reset();
       } else if (res.phase === "error") {
         toast("Update failed — see Settings.");
         reset();
-      } else if (res.willRestart) {
-        // The daemon restarts momentarily; keep the button spinning and let onStatus reload the
-        // app once the WS reconnects (that's the proof it's back). Safety net if it never returns.
+      } else if (res.willRestart && isHub) {
+        // The hub serves THIS page, so when it restarts we reload to pick up the new bundle. Keep the
+        // button spinning and let onStatus reload once the WS reconnects. Safety net if it never returns.
         toast("Anvil updated — restarting…");
         pendingRestartReload = true;
         spin("Restarting…");
@@ -2273,9 +2317,14 @@ function wireDaemonUpdate(): void {
           setUpdateStatus("Still restarting — reload the app manually in a moment to pick up the update.");
           reset();
         }, 90_000);
+      } else if (res.willRestart) {
+        // A remote Mac restarts on its own; nothing to reload here — it just reconnects in the list.
+        toast(`${esc(srv.name)} updated — restarting it…`);
+        out.textContent = `${res.output}\n\nUpdate applied. ${srv.name} is restarting — it'll reconnect in the list shortly.`;
+        reset();
       } else {
-        // updated but this daemon isn't service-managed, so it won't self-restart
-        toast("Anvil updated — restart the daemon to apply.");
+        // updated but that daemon isn't service-managed, so it won't self-restart
+        toast(`${esc(srv.name)} updated — restart it to apply.`);
         reset();
       }
     } catch (e) {
