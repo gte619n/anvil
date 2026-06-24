@@ -6,8 +6,8 @@ import Network
 ///   POST /anvil-pair   — first join: gated by a one-time 6-digit code (+ same-tailnet-user).
 ///   POST /anvil-token  — rotation: gated by identity (same tailnet user AND the hub serverId recorded
 ///                        at join) — no code, so the hub can push a refreshed token unattended.
-/// Identity comes from the `Tailscale-User-Login` header `tailscale serve` injects on the proxied
-/// request (TLS terminates at tailscaled → the socket peer is localhost, so we trust the header).
+/// The joiner binds :7702 DIRECTLY on the tailnet (plain HTTP, no `tailscale serve`) so pairing works
+/// with any Tailscale install. Identity is checked with `tailscale whois` on the caller's real IP.
 enum Pairing {
   static func generateCode() -> String { String(format: "%06d", Int.random(in: 0...999_999)) }
 
@@ -44,25 +44,46 @@ enum Pairing {
       self.onRotate = onRotate
     }
 
-    /// Start the listener and expose :7702 on the tailnet. Idempotent-ish (no-op if already started).
+    /// Bind :7702 DIRECTLY (no `tailscale serve`) so pairing works with any Tailscale install,
+    /// including the sandboxed App Store build that can't run `serve`. WireGuard encrypts the hop and
+    /// `whois` gates the caller (§4.3). Returns false if the port couldn't be bound.
     @discardableResult
     func start() -> Bool {
       guard listener == nil else { return true }
-      guard let l = try? NWListener(using: .tcp, on: .any) else { return false }
+      guard let port = NWEndpoint.Port(rawValue: UInt16(Paths.pairingPort)) else { return false }
+      let params = NWParameters.tcp
+      params.allowLocalEndpointReuse = true
+      guard let l = try? NWListener(using: params, on: port) else { return false }
       listener = l
       l.newConnectionHandler = { [weak self] c in self?.handle(c) }
       let sem = DispatchSemaphore(value: 0)
-      l.stateUpdateHandler = { if case .ready = $0 { sem.signal() } }
+      var ready = false
+      l.stateUpdateHandler = { state in
+        switch state {
+        case .ready: ready = true; sem.signal()
+        case .failed, .cancelled: sem.signal()
+        default: break
+        }
+      }
       l.start(queue: queue)
       _ = sem.wait(timeout: .now() + 3)
-      localPort = l.port.map { Int($0.rawValue) } ?? 0
-      if localPort > 0 { Tailscale.serve(externalPort: Paths.pairingPort, localPort: localPort) }
-      return localPort > 0
+      localPort = ready ? Paths.pairingPort : 0
+      if !ready { listener?.cancel(); listener = nil }
+      return ready
     }
 
-    func stop() {
-      listener?.cancel(); listener = nil
-      Tailscale.unserve(externalPort: Paths.pairingPort)
+    func stop() { listener?.cancel(); listener = nil }
+
+    /// The connecting peer's tailnet IP (so we can `whois` it). The connection's remote endpoint is
+    /// the caller, since this connection came from the listener.
+    private func remoteIP(_ c: NWConnection) -> String? {
+      guard case let .hostPort(host, _) = c.currentPath?.remoteEndpoint ?? c.endpoint else { return nil }
+      switch host {
+      case .ipv4(let a): return "\(a)"
+      case .ipv6(let a): return String("\(a)".split(separator: "%").first ?? "")
+      case .name(let n, _): return n
+      @unknown default: return nil
+      }
     }
 
     /// Open a join window with a fresh code (returned for display). Auto-disarms on success.
@@ -92,19 +113,20 @@ enum Pairing {
 
     private func respond(_ c: NWConnection, _ req: HTTP.Request) {
       var reply = PairReply(ok: false, serverId: nil, serverName: nil, error: "bad request")
-      let peerLogin = req.headers["tailscale-user-login"]
-      let sameUser = Tailscale.isSameUser(peerLogin)
+      let trust = remoteIP(c).map { Tailscale.peerTrust(ip: $0) } ?? .unknown
+      let sameUser = trust == .sameUser
+      let notOtherUser = trust != .otherUser // sameUser, or unknown (whois unavailable) → allow with the code
       if req.method == "POST", let pr = try? JSONDecoder().decode(PairRequest.self, from: req.body) {
         switch req.path {
         case "/anvil-pair":
-          // First join: the 6-digit code is the gate; if the header IS present it must match (a
-          // wrong-user request is rejected even with a guessed code). Absent header → code-only.
-          if let code = armedCode, pr.code == code, peerLogin == nil || sameUser {
+          // First join: the 6-digit code is the gate; a caller whois says is a DIFFERENT tailnet user
+          // is rejected even with the right code. whois-unknown falls back to code-only.
+          if let code = armedCode, pr.code == code, notOtherUser {
             FleetControl.recordedHubId = pr.hubServerId
             reply = onPair(pr.token, pr.hubServerId)
             if reply.ok { armedCode = nil } // already on `queue` (respond) — set directly, don't re-enter sync
           } else {
-            reply.error = armedCode == nil ? "not accepting pairings" : (sameUser || peerLogin == nil ? "wrong code" : "different tailnet user")
+            reply.error = armedCode == nil ? "not accepting pairings" : (notOtherUser ? "wrong code" : "different tailnet user")
           }
         case "/anvil-token":
           // Rotation: identity-only. Require same tailnet user AND the hub we were joined by.
@@ -134,7 +156,7 @@ enum Pairing {
   }
 
   private static func post(host: String, path: String, body: PairRequest, completion: @escaping (Result<PairReply, Error>) -> Void) {
-    guard let url = URL(string: "https://\(host):\(Paths.pairingPort)\(path)") else {
+    guard let url = URL(string: "http://\(host):\(Paths.pairingPort)\(path)") else { // plain HTTP over the tailnet (no serve)
       completion(.failure(NSError(domain: "AnvilPair", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad host"])))
       return
     }

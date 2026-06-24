@@ -97,11 +97,11 @@ final class AppState: ObservableObject {
     DispatchQueue.global().async { f.start() }
   }
 
-  /// Open a join window; returns the 6-digit code to display. The hub pushes the token to us.
-  func armJoin() -> String {
-    let f = fleet
-    DispatchQueue.global().async { f.start() }
-    return f.arm()
+  /// Open a join window: bind the pairing listener and return the code + whether it actually bound.
+  /// (Binding a local port is instant — no `tailscale serve` to wait on anymore.)
+  func armJoin() -> (code: String, listening: Bool) {
+    let listening = fleet.start()
+    return (fleet.arm(), listening)
   }
 
   /// Close a join window; stop listening if this Mac isn't (yet) a fleet member.

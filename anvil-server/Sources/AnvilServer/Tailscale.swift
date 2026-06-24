@@ -58,11 +58,24 @@ enum Tailscale {
     return login
   }
 
-  /// Defense-in-depth for pairing (anvil-server-app.md §4.3): does `login` (from the
-  /// `Tailscale-User-Login` header that `tailscale serve` injects on the proxied request) match the
-  /// tailnet user that owns THIS Mac? Returns false when either side is unknown.
-  static func isSameUser(_ login: String?) -> Bool {
-    guard let login, !login.isEmpty, let mine = selfLogin() else { return false }
-    return login.caseInsensitiveCompare(mine) == .orderedSame
+  /// The tailnet login that owns the node at `ip` (`tailscale whois`), or nil if unknown.
+  static func whoisLogin(ip: String) -> String? {
+    let r = Shell.run("tailscale", ["whois", "--json", ip])
+    guard r.ok, let data = r.stdout.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let prof = obj["UserProfile"] as? [String: Any],
+          let login = prof["LoginName"] as? String
+    else { return nil }
+    return login
+  }
+
+  /// Defense-in-depth for pairing (anvil-server-app.md §4.3). Now that the joiner listens directly on
+  /// the tailnet (no `serve` proxy), it sees the caller's real IP — so we `whois` it and compare to
+  /// this Mac's owner. `.unknown` when whois can't resolve (caller decides whether to fall back to the code).
+  enum PeerTrust { case sameUser, otherUser, unknown }
+  static func peerTrust(ip: String) -> PeerTrust {
+    guard let mine = selfLogin() else { return .unknown }
+    guard let theirs = whoisLogin(ip: ip) else { return .unknown }
+    return theirs.caseInsensitiveCompare(mine) == .orderedSame ? .sameUser : .otherUser
   }
 }
