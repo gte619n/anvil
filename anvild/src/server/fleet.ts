@@ -213,6 +213,37 @@ export async function inviteMac(opts: { host: string; code: string; token: strin
   return postPairing(url, { code: opts.code, token: opts.token, hubServerId: opts.hubServerId });
 }
 
+/**
+ * Replicate the hub's Todoist token to member DAEMONS (anvil-multi-server.md — autopilot runs where
+ * the repo lives, so each member that hosts a linked environment needs the token). Unlike the OAuth
+ * token (pushed to the Server.app pairing listener on :7702), this lands in the member daemon's own
+ * IntegrationStore via its REST API on :7701. Tailnet-gated like the rest of the daemon API; the hop
+ * is WireGuard-encrypted. Best-effort + idempotent — unreachable members heal on their next connect.
+ */
+export async function propagateTodoist(opts: {
+  members: { url: string; serverName?: string }[];
+  token: string;
+}): Promise<{ url: string; ok: boolean; account?: string; error?: string }[]> {
+  if (!opts.token) return opts.members.map((m) => ({ url: m.url, ok: false, error: "no token" }));
+  return Promise.all(
+    opts.members.map(async (m) => {
+      const url = `${m.url.replace(/\/?$/, "/")}api/integrations/todoist`;
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token: opts.token }),
+          signal: AbortSignal.timeout(12_000),
+        });
+        const data = (await res.json().catch(() => ({}))) as { ok?: boolean; account?: string; error?: string };
+        return { url: m.url, ok: res.ok && data.ok !== false, account: data.account, error: data.error };
+      } catch (e) {
+        return { url: m.url, ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    }),
+  );
+}
+
 /** Rotate: push the current hub token to each member's `:7702/anvil-token`, identity-gated. */
 export async function rotateToken(opts: { members: { host: string }[]; token: string; hubServerId: string; pairingPort?: number }): Promise<{ host: string; ok: boolean; error?: string }[]> {
   if (!opts.token) return opts.members.map((m) => ({ host: m.host, ok: false, error: "no token" }));

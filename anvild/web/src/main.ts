@@ -779,6 +779,11 @@ function onEvent(url: string, e: ServerEvent): void {
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
+      // A member just (re)joined the fleet — if the hub holds a Todoist token, have the hub replicate
+      // it to this member so its linked environments can run autopilot. Self-heals every reconnect.
+      if (url !== HUB_URL && todoistConnected && e.serverId) {
+        hub().sock.send({ type: "todoist.propagate", targets: [e.serverId], cid: newCid() });
+      }
       return;
     }
     case "budget": {
@@ -791,7 +796,10 @@ function onEvent(url: string, e: ServerEvent): void {
       onEnvironments(url, e.environments);
       return;
     case "todoist.status":
-      onTodoistStatus(e.connected, e.account);
+      // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
+      // Fleet members each push their own status on connect — ignore them so a tokenless member
+      // can't clobber the hub's "connected" with its "not connected".
+      if (url === HUB_URL) onTodoistStatus(e.connected, e.account);
       return;
     case "todoist.projects.result":
       return; // resolved via cidWaiter (loadTodoistProjects)
@@ -1776,13 +1784,31 @@ let todoistProjectsLoaded = false;
 const todoistProjectName = (id?: string): string | undefined => (id ? todoistProjects.get(id)?.name : undefined);
 
 /** <option> list for the env link select; keeps the current link selectable even if not yet cached. */
-function todoistProjectOptions(selectedId?: string): string {
+/** Where each Todoist project is already linked (env on ANY fleet server), excluding `exceptEnvId`.
+ *  A project maps to exactly ONE environment — otherwise two daemons would plan the same tasks. */
+function todoistProjectLinks(exceptEnvId?: string): Map<string, { envName: string; serverName: string }> {
+  const links = new Map<string, { envName: string; serverName: string }>();
+  for (const e of environments.values()) {
+    if (!e.todoistProjectId || e.id === exceptEnvId) continue;
+    const srvUrl = envServer.get(e.id);
+    const srv = srvUrl ? servers.get(srvUrl) : undefined;
+    links.set(e.todoistProjectId, { envName: e.name, serverName: srv?.name ?? hostOf(srvUrl ?? "") });
+  }
+  return links;
+}
+
+function todoistProjectOptions(selectedId?: string, exceptEnvId?: string): string {
+  const links = todoistProjectLinks(exceptEnvId);
   const opts = [`<option value="">— none —</option>`];
   const seen = new Set<string>();
   for (const p of [...todoistProjects.values()].sort((a, b) => a.name.localeCompare(b.name))) {
     seen.add(p.id);
-    const label = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
-    opts.push(`<option value="${esc(p.id)}"${p.id === selectedId ? " selected" : ""}>${label}</option>`);
+    const linked = links.get(p.id);
+    const isSelected = p.id === selectedId;
+    const disabled = !!linked && !isSelected; // already owned by another env → can't double-link
+    const base = `${esc(p.name)}${p.parentId ? " (sub)" : ""}${p.taskCount != null ? ` · ${p.taskCount}` : ""}`;
+    const label = disabled ? `${base} — linked to ${esc(linked!.envName)} @ ${esc(linked!.serverName)}` : base;
+    opts.push(`<option value="${esc(p.id)}"${isSelected ? " selected" : ""}${disabled ? " disabled" : ""}>${label}</option>`);
   }
   if (selectedId && !seen.has(selectedId)) {
     opts.push(`<option value="${esc(selectedId)}" selected>${esc(todoistProjectName(selectedId) ?? selectedId)}</option>`);
@@ -1819,13 +1845,58 @@ async function loadTodoistProjects(force = false): Promise<void> {
   }
 }
 
+async function connectTodoistToken(token: string, btn?: HTMLButtonElement): Promise<void> {
+  const t = token.trim();
+  if (!t) {
+    toast("Paste your Todoist API token first.");
+    return;
+  }
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Connecting…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "todoist.connect", token: t, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return; // onTodoistStatus only fires on success → stay on the entry form
+    }
+    todoistProjectsLoaded = false; // a (possibly new) account → refetch projects
+    // The connected `todoist.status` arrives via onTodoistStatus and re-renders the panel.
+    // Replicate the token to every fleet member (hub-side, server→server) so autopilot can run
+    // wherever a linked environment lives. Fire-and-forget; members also self-heal on reconnect.
+    if (orderedServers().some((s) => s.url !== HUB_URL)) {
+      hub().sock.send({ type: "todoist.propagate", cid: newCid() });
+      toast("Sharing the Todoist token across your fleet…");
+    }
+  } catch (err) {
+    toast(`Couldn't connect Todoist: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
 function renderTodoistPanel(): void {
   const host = document.getElementById("todoist-panel");
   if (!host) return;
   if (!todoistConnected) {
     host.innerHTML = `<div class="card"><b>Not connected.</b>
-      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), then run on the daemon host:</p>
-      <pre class="git-output">bun run scripts/todoist.ts set</pre></div>`;
+      <p class="small muted">Generate a personal API token in Todoist (Settings → Integrations → Developer), paste it below, then connect.</p>
+      <div class="todoist-connect">
+        <input id="todoist-token" type="password" autocomplete="off" spellcheck="false" placeholder="Todoist API token" />
+        <button id="todoist-connect" class="primary">Connect</button>
+      </div>
+      <p class="small muted" style="margin-top:8px">Stored on the hub daemon (mode 0600) and replicated across your fleet, so autopilot can run wherever a linked environment lives.</p></div>`;
+    const input = $<HTMLInputElement>("#todoist-token");
+    const btn = $<HTMLButtonElement>("#todoist-connect");
+    btn.addEventListener("click", () => void connectTodoistToken(input.value, btn));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") void connectTodoistToken(input.value, btn);
+    });
     return;
   }
   if (!todoistProjectsLoaded) {
@@ -1848,9 +1919,15 @@ function renderTodoistPanel(): void {
       </tr>`;
     })
     .join("");
-  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects</div>
+  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects
+      <button id="todoist-disconnect" class="mini" style="float:right">Disconnect</button></div>
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
     <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
+  $("#todoist-disconnect").addEventListener("click", () => {
+    hub().sock.send({ type: "todoist.disconnect", cid: newCid() });
+    todoistProjectsLoaded = false;
+    todoistProjects.clear();
+  });
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
@@ -3188,7 +3265,7 @@ function showEditEnvironment(id: string): void {
   if (!env) return;
   const m = document.createElement("div");
   m.className = "modal";
-  const projectOptions = todoistProjectOptions(env.todoistProjectId);
+  const projectOptions = todoistProjectOptions(env.todoistProjectId, env.id);
   const validationText = env.validation?.commands?.join("\n") ?? "";
   m.innerHTML = `<div class="modal-box"><h3>Edit environment</h3>
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
@@ -3208,6 +3285,16 @@ function showEditEnvironment(id: string): void {
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
+    const chosenProject = $<HTMLSelectElement>("#ee-todoist").value;
+    // Guard against a race: another client may have linked this project while the modal was open
+    // (the dropdown already disables known clashes). One project ↔ one environment.
+    if (chosenProject) {
+      const clash = todoistProjectLinks(id).get(chosenProject);
+      if (clash) {
+        toast(`“${todoistProjectName(chosenProject) ?? "That project"}” is already linked to ${clash.envName} @ ${clash.serverName}. Unlink it there first.`);
+        return;
+      }
+    }
     const commands = $<HTMLTextAreaElement>("#ee-validation").value
       .split("\n")
       .map((s) => s.trim())
