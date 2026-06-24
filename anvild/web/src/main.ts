@@ -1855,23 +1855,33 @@ function serverCardHtml(srv: Server): string {
 }
 /** Verify a URL is a reachable Anvil daemon, then add it to the registry and connect. */
 async function addServerByUrl(raw: string): Promise<void> {
-  let url = raw.trim();
-  if (!url) return;
-  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
-  url = url.replace(/\/+$/, "");
-  if (url === HUB_URL || servers.has(url)) {
-    toast("Already in your fleet");
-    return;
+  const input = raw.trim();
+  if (!input) return;
+  // A peer's transport depends on its host: serve-capable Macs answer https on the MagicDNS name;
+  // App-Store-Tailscale Macs bind the tailnet IP directly over plain http. If the user gave no
+  // scheme, try https then http and keep whichever answers. (For a ts.net *name* the browser's HSTS
+  // upgrades http→https regardless, so such a host must be served; reach an unserved host by IP.)
+  const hasScheme = /^https?:\/\//i.test(input);
+  const candidates = (hasScheme ? [input] : [`https://${input}`, `http://${input}`]).map((u) => u.replace(/\/+$/, ""));
+  let found: string | undefined;
+  for (const url of candidates) {
+    if (url === HUB_URL || servers.has(url)) {
+      toast("Already in your fleet");
+      return;
+    }
+    try {
+      const h = (await (await serverFetch(url, "/api/health")).json()) as { serverId?: string };
+      if (h.serverId) { found = url; break; }
+    } catch {
+      /* try the next scheme */
+    }
   }
-  try {
-    const h = (await (await serverFetch(url, "/api/health")).json()) as { serverId?: string };
-    if (!h.serverId) throw new Error("not anvil");
-  } catch {
+  if (!found) {
     toast("Couldn't reach an Anvil server at that URL");
     return;
   }
-  saveExtraServers([...loadExtraServers(), url]);
-  ensureServer(url);
+  saveExtraServers([...loadExtraServers(), found]);
+  ensureServer(found);
   renderServerCards();
 }
 function renderServerCards(): void {
@@ -1899,7 +1909,7 @@ function renderServerCards(): void {
         <div class="git-row" style="margin-top:8px"><button id="discover-btn">${icon("travel_explore")} Discover running servers</button></div>
         <div id="discover-results" class="small muted" style="margin-top:8px"></div>
         <div class="git-row" style="margin-top:8px">
-          <input id="add-server-url" placeholder="https://laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
+          <input id="add-server-url" placeholder="laptop.tailnet.ts.net:7701" style="flex:1;min-width:0" />
           <button id="add-server-btn">${icon("add")} Add by URL</button>
         </div>
       </details>
