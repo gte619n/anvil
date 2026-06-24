@@ -316,7 +316,14 @@ struct WizardView: View {
     } catch { status = (error as NSError).localizedDescription }
   }
 
-  private func startJoin() { role = .join; pairingCode = state.armJoin() }
+  private func startJoin() {
+    role = .join
+    let r = state.armJoin()
+    pairingCode = r.code
+    status = r.listening
+      ? "Ready — waiting for the hub. Keep this window open."
+      : "⚠️ Couldn't open the pairing port \(Paths.pairingPort). Is it already in use? Pairing won't work until this succeeds."
+  }
   private func stopJoin() { state.cancelJoin() }
 }
 

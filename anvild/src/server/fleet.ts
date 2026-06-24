@@ -158,6 +158,11 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
 // joiner's Anvil Server.app) so the fleet can be managed from any client — web/Android/Mac — without
 // touching the hub's Mac app. The token is read from the daemon's own env and never returned to a
 // client. First join is code-gated (/anvil-pair); rotation is identity-gated (/anvil-token).
+//
+// Transport is PLAIN HTTP over the tailnet (not `tailscale serve` HTTPS): the joiner binds :7702
+// directly on its tailnet interface, so this works with any Tailscale install (incl. the sandboxed
+// App Store build that can't run `serve`). WireGuard encrypts the hop; the joiner verifies the
+// caller via `tailscale whois` on the connecting IP + the 6-digit code (anvil-server-app.md §4.3).
 
 interface PairOutcome {
   ok: boolean;
@@ -185,7 +190,7 @@ async function postPairing(url: string, body: Record<string, unknown>, timeoutMs
 export async function inviteMac(opts: { host: string; code: string; token: string; hubServerId: string; pairingPort?: number }): Promise<PairOutcome> {
   if (!opts.token) return { ok: false, error: "this server has no OAuth token to share" };
   const host = opts.host.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-  const url = `https://${host}:${opts.pairingPort ?? 7702}/anvil-pair`;
+  const url = `http://${host}:${opts.pairingPort ?? 7702}/anvil-pair`;
   return postPairing(url, { code: opts.code, token: opts.token, hubServerId: opts.hubServerId });
 }
 
@@ -194,7 +199,7 @@ export async function rotateToken(opts: { members: { host: string }[]; token: st
   if (!opts.token) return opts.members.map((m) => ({ host: m.host, ok: false, error: "no token" }));
   return Promise.all(
     opts.members.map(async (m) => {
-      const url = `https://${m.host}:${opts.pairingPort ?? 7702}/anvil-token`;
+      const url = `http://${m.host}:${opts.pairingPort ?? 7702}/anvil-token`;
       const r = await postPairing(url, { token: opts.token, hubServerId: opts.hubServerId });
       return { host: m.host, ok: r.ok, error: r.error };
     }),
