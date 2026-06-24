@@ -292,6 +292,13 @@ function dismissOverlay(name: OverlayName): void {
   suppressPop++;
   history.go(-n); // drop our history entries; the one popstate this fires is suppressed below
 }
+/** Dismiss just the topmost soft layer (used by the Escape key) — same teardown as a single Back. */
+function dismissTopOverlay(): boolean {
+  const top = overlays[overlays.length - 1];
+  if (!top) return false;
+  dismissOverlay(top.name);
+  return true;
+}
 
 const sessionHref = (id: string): string => `${location.pathname}#s/${encodeURIComponent(id)}`;
 function setSessionHash(id: string | null, push: boolean): void {
@@ -323,6 +330,45 @@ window.addEventListener("popstate", () => {
     deselectSession();
   }
 });
+// External hash navigations only fire `hashchange`, never `popstate`: the Android shell deep-links a
+// notification tap via web.loadUrl("…#s/<id>") (a warm app is already loaded, so it's a same-document
+// fragment change, not a reload), and manual URL edits / a restored PWA do the same. Our own in-app
+// navigation uses push/replaceState, which fire neither — so this listener only ever sees genuinely
+// external changes. Without it, a notification tapped while the app is already open didn't switch
+// sessions ("not deep linking every time"). (UI refinement §deep-link)
+window.addEventListener("hashchange", () => {
+  const id = sessionFromHash();
+  if (!id) {
+    if (activeId) deselectSession();
+    return;
+  }
+  if (id === activeId) return;
+  if (sessions.has(id)) {
+    selectSession(id, false);
+  } else {
+    // Target not synced to this client yet (e.g. a session on a server still connecting). Remember it
+    // so the next session.list attaches it, and canonicalize the URL without a new history entry.
+    activeId = id;
+    localStorage.setItem("anvil.active", id);
+    setSessionHash(id, false);
+  }
+});
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────────────────
+// Escape dismisses the topmost soft layer (dialog → settings → side panel → expanded sidebar) — the
+// same teardown as a single Back; with nothing layered, it drops focus out of the composer (closing
+// the on-screen keyboard on mobile). Enter-to-send / Shift+Enter-newline live on the composer itself,
+// and dialogs focus their default button so Enter confirms and Escape cancels (see confirmDialog).
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || e.defaultPrevented) return;
+  // The embedded terminal owns Escape (it sends ESC to the shell) — don't steal it to close the panel.
+  if ((document.activeElement as HTMLElement | null)?.closest(".xterm")) return;
+  if (dismissTopOverlay()) {
+    e.preventDefault();
+  } else if (document.activeElement === input) {
+    input.blur();
+  }
+});
 let streaming: HTMLElement | null = null;
 // Set when the user hits Stop: the daemon keeps draining the interrupted turn for a moment, so we
 // suppress that trailing churn (see the guard in handleSessionEvent). Cleared on the next turn.
@@ -347,6 +393,15 @@ function saveConvoCache(): void {
       // re-paint as a frozen "stuck" status on return.
       const clone = conversation.cloneNode(true) as HTMLElement;
       clone.querySelectorAll(".thinking, .empty-state").forEach((e) => e.remove());
+      // Freeze any still-"live" activity block: the cache is a snapshot, not a running turn, so it
+      // must restore as "Worked" — never an animated "Working" that can't stop (no WS yet on reload).
+      clone.querySelectorAll(".activity.live").forEach((a) => {
+        a.classList.remove("live");
+        const ind = a.querySelector(".activity-ind");
+        if (ind) ind.innerHTML = `<span class="msym">check</span>`;
+        const title = a.querySelector(".activity-title");
+        if (title) title.textContent = "Worked";
+      });
       const html = clone.innerHTML;
       if (html.length < 1_500_000) localStorage.setItem(`anvil.convo.${id}`, html);
       else localStorage.removeItem(`anvil.convo.${id}`);
@@ -431,6 +486,69 @@ function toggleSidebar(): void {
 // when the open sidebar overlays the header (e.g. unfolding a foldable).
 $("#btn-sidebar").addEventListener("click", toggleSidebar);
 $("#sidebar-collapse").addEventListener("click", toggleSidebar);
+
+// ── Resizable panes (left sidebar + right side panel) ────────────────────────────
+// Each pane's width is a CSS variable on :root, persisted per device. A thin handle straddling the
+// pane's border drives it via pointer events (touch-safe, capture so the drag survives leaving the
+// strip). Disabled on narrow screens, where the sidebar overlays and the panel is near full-bleed.
+const clampN = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
+function initResizers(): void {
+  const root = document.documentElement;
+  const stored = (k: string): number => Number(localStorage.getItem(k)) || 0;
+  const sw = stored("anvil.sidebarW");
+  if (sw) root.style.setProperty("--sidebar-w", `${sw}px`);
+  const pw = stored("anvil.panelW");
+  if (pw) root.style.setProperty("--panel-w", `${pw}px`);
+
+  const wire = (
+    handle: HTMLElement | null,
+    cfg: { cssVar: string; key: string; min: number; maxFn: () => number; width: (clientX: number) => number },
+  ): void => {
+    if (!handle) return;
+    handle.addEventListener("pointerdown", (e: PointerEvent) => {
+      if (isNarrow()) return; // resizing is desktop-only
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add("dragging");
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+      let latest = 0;
+      const move = (ev: PointerEvent): void => {
+        latest = clampN(cfg.width(ev.clientX), cfg.min, cfg.maxFn());
+        root.style.setProperty(cfg.cssVar, `${latest}px`);
+      };
+      const up = (): void => {
+        handle.releasePointerCapture(e.pointerId);
+        handle.classList.remove("dragging");
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", up);
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        if (latest) localStorage.setItem(cfg.key, String(Math.round(latest)));
+      };
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", up);
+    });
+  };
+
+  const sidebar = document.getElementById("sidebar");
+  wire(document.getElementById("sidebar-resizer"), {
+    cssVar: "--sidebar-w",
+    key: "anvil.sidebarW",
+    min: 200,
+    maxFn: () => Math.min(620, window.innerWidth - 360), // always leave the conversation room
+    width: (x) => x - (sidebar?.getBoundingClientRect().left ?? 0), // pointer X minus the sidebar's left edge
+  });
+  const sidePanel = document.getElementById("side-panel");
+  wire(document.getElementById("panel-resizer"), {
+    cssVar: "--panel-w",
+    key: "anvil.panelW",
+    min: 320,
+    maxFn: () => Math.min(window.innerWidth * 0.92, 1000),
+    width: (x) => (sidePanel?.getBoundingClientRect().right ?? window.innerWidth) - x, // panel is pinned right, grows leftward
+  });
+}
+initResizers();
 
 // On a phone there isn't room for both panes, so when focus moves to the chat (a tap or the
 // composer gaining focus) we collapse the overlaid session list — never a half-covered chat.
@@ -756,13 +874,17 @@ function onEvent(url: string, e: ServerEvent): void {
       sessionServer.set(e.session.id, url);
       persistSessions();
       renderSessions();
-      if (e.session.id === activeId) updateGitPanelMeta();
+      if (e.session.id === activeId) {
+        updateGitPanelMeta();
+        updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
+      }
       return;
     case "session.deleted":
       sessions.delete(e.sessionId);
       sessionServer.delete(e.sessionId);
       removingSessions.delete(e.sessionId); // cleanup finished — the row goes for good now
       localStorage.removeItem(`anvil.convo.${e.sessionId}`);
+      localStorage.removeItem(`anvil.draft.${e.sessionId}`); // its unsent draft has nowhere to go now
       persistSessions();
       persistRouting();
       if (activeId === e.sessionId) deselectSession();
@@ -841,6 +963,10 @@ function handleSessionEvent(e: ServerEvent): void {
       replayingSnapshot = true;
       e.events.forEach(renderConversationEvent);
       replayingSnapshot = false;
+      // A replayed history has no `result` event, so the last turn's activity block was rebuilt
+      // "live" — finalize it so it shows "Worked" instead of an eternally spinning "Working". If the
+      // session is actually mid-turn, the live status/message events that follow re-light it.
+      finalizeActivity();
       snapshotLoaded.add(e.sessionId);
       saveConvoCache();
       return;
@@ -1051,6 +1177,7 @@ function commitAssistant(blocks: ContentBlock[], ts?: string): void {
     const t = timeEl(ts);
     if (t) b.appendChild(t);
     addCopyButtons(md);
+    linkifyFilePaths(md); // make plain-text mentions of .md files clickable → open in the reader
     noteAnswerRefs(md.innerHTML); // buffered; only the final answer's links reach the panel (on result)
     void runMermaid(md);
   } else if (streaming) {
@@ -1084,6 +1211,48 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
   return `<div class="tool">${icon("build")} <b>${esc(b.name)}</b> <code>${esc(JSON.stringify(b.input)).slice(0, 160)}</code></div>`;
 }
 
+// Markdown files Claude names in prose (e.g. "see docs/plans/design.md") are usually design docs you
+// want to open — turn those mentions into the same `.file-link` the tool rows use, so one tap opens
+// them in the reader. Limited to .md/.markdown to avoid over-linkifying ordinary words; skips text
+// already inside a link or a fenced code block (but inline `path.md` in backticks is fair game).
+const MD_PATH_RE = /(?:\.{0,2}\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:md|markdown)(?![\w/-])/gi;
+function linkifyFilePaths(root: HTMLElement): void {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(n: Node): number {
+      const v = n.nodeValue;
+      MD_PATH_RE.lastIndex = 0;
+      if (!v || !MD_PATH_RE.test(v)) return NodeFilter.FILTER_REJECT;
+      for (let p = n.parentElement; p && p !== root; p = p.parentElement) {
+        if (p.tagName === "A" || p.tagName === "PRE") return NodeFilter.FILTER_REJECT; // already a link / code block
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const targets: Text[] = [];
+  while (walker.nextNode()) targets.push(walker.currentNode as Text);
+  for (const node of targets) {
+    const text = node.nodeValue ?? "";
+    MD_PATH_RE.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m: RegExpExecArray | null;
+    while ((m = MD_PATH_RE.exec(text)) !== null) {
+      const raw = m[0];
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const a = document.createElement("a");
+      a.href = "#";
+      a.className = "file-link md-file-link";
+      a.dataset.path = raw.replace(/^\.\//, ""); // fs.read is worktree-relative
+      a.title = `Open ${raw}`;
+      a.textContent = raw;
+      frag.appendChild(a);
+      last = m.index + raw.length;
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+}
+
 // ── Consolidated activity block (§5) ─────────────────────────────────────────────
 // All the tool/thinking churn for one turn collapses into a single block that previews the
 // last few lines and expands on click — so the conversation reads as "what I said" / "what the
@@ -1093,6 +1262,7 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
 const ACTIVITY_TAIL = 5;
 
 function resetActivity(): void {
+  finalizeActivity(); // a prior turn that never saw a clean end (no `result`) left a block spinning — stop it
   activityEl = null;
   activityCount = 0;
   activityLive = false;
@@ -1316,6 +1486,7 @@ function renderEmptyState(): void {
 }
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
+  saveDraft(activeId, input.value); // keep the unsent draft with the session we're leaving
   activeId = null;
   localStorage.removeItem("anvil.active");
   setSessionHash(null, false);
@@ -1323,6 +1494,7 @@ function deselectSession(): void {
   renderEmptyState();
   renderSessions();
   applyActiveTint();
+  restoreDraft(null); // empty the composer (no session selected)
 }
 // Tint the conversation area to the active session's derived background (cleared when none).
 function applyActiveTint(): void {
@@ -1342,6 +1514,7 @@ function setStatus(status: string): void {
   if (status !== "awaiting_permission") clearPermissionCards();
   if (status !== "awaiting_question") clearQuestionCards();
   const awaiting = status === "awaiting_permission" || status === "awaiting_question";
+  if (status === "idle") finalizeActivity(); // turn ended (even if `result` never arrived) — stop the spinner
   if (status === "idle" || awaiting) hideThinking(); // the card is the indicator while parked
   else if (!streaming) showThinking(status); // while text streams, the text is the activity
   updateComposerMode(status); // swap Send ↔ Stop while a turn runs
@@ -1488,34 +1661,11 @@ function renderSessions(): void {
   const rest = all.filter((s) => !s.isDefault);
   const anyFinished = rest.some((s) => s.finished);
 
-  // One server → flat list. Many → group the active list under per-server section headers (hub
-  // first) with a live status dot; the Finished list stays flat. Separators aren't `.session` rows,
-  // so SortableJS (which is filtered to `.session`) ignores them. (fleet — anvil-multi-server.md §4)
-  if (orderedServers().length <= 1) {
-    for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
-  } else {
-    for (const srv of orderedServers()) {
-      const group = rest.filter((s) => !s.finished && (sessionServer.get(s.id) ?? HUB_URL) === srv.url).sort(sortFn);
-      activeUl.appendChild(serverSepRow(srv));
-      if (group.length) {
-        for (const s of group) activeUl.appendChild(renderSessionItem(s));
-      } else {
-        const empty = document.createElement("li");
-        empty.className = "server-empty";
-        empty.textContent = srv.status === "connected" ? "No sessions" : srv.status === "connecting" ? "Connecting…" : "Offline";
-        activeUl.appendChild(empty);
-      }
-    }
-    for (const s of rest.filter((x) => x.finished).sort(sortFn)) finishedUl.appendChild(renderSessionItem(s));
-  }
+  // One flat list across every server — no per-machine grouping. Sessions interleave by their
+  // server-synced order; which machine a session lives on is shown subtly in its row meta when
+  // there's more than one server. (fleet — anvil-multi-server.md §4)
+  for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
-}
-/** A non-draggable section header for a server's group in the sidebar (multi-server only). */
-function serverSepRow(srv: Server): HTMLLIElement {
-  const li = document.createElement("li");
-  li.className = "server-sep";
-  li.innerHTML = `<span class="conn-dot ${srv.status}"></span><span class="server-sep-name">${esc(srv.name)}</span>`;
-  return li;
 }
 
 function renderSessionItem(s: Session): HTMLLIElement {
@@ -1535,11 +1685,14 @@ function renderSessionItem(s: Session): HTMLLIElement {
   const envName = s.environmentId ? environments.get(s.environmentId)?.name : undefined;
   const where = envName ?? s.git?.branch ?? s.source;
   const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
+  // With a fleet, the list is flat (no per-machine sections), so name the owning server inline.
+  const srv = serverOf(s.id);
+  const machine = orderedServers().length > 1 && srv ? ` · ${icon("dns")}${esc(srv.name)}` : "";
   const a = document.createElement("a");
   a.className = "srow";
   a.href = sessionHref(s.id);
   const merged = s.git?.prState === "merged" ? `<span class="merged-badge" title="PR merged">${icon("merge")}</span>` : "";
-  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}</div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}</div>`;
+  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}</div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}${machine}</div>`;
   a.addEventListener("click", (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
     e.preventDefault();
@@ -1645,8 +1798,24 @@ function setHeaderTitle(s: Session | undefined): void {
   $("#header-title").innerHTML = s ? `${icon(sessIcon(s))}<span class="ht">${esc(s.title)}</span>` : `<span class="ht">Anvil</span>`;
   document.title = s ? `Anvil: ${s.title}` : "Anvil";
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
+  updateHeaderBranch(s);
   void setFavicon(s);
 }
+/** Show the active session's git branch as a chip in the header; tap it to open the Git panel. */
+function updateHeaderBranch(s: Session | undefined): void {
+  const el = document.getElementById("header-branch");
+  if (!el) return;
+  const branch = s && !s.isDefault ? s.git?.branch : undefined;
+  if (branch) {
+    el.innerHTML = `${icon("account_tree")}<span class="hb-name">${esc(branch)}</span>`;
+    el.title = `On branch ${branch} — open Git`;
+    el.hidden = false;
+  } else {
+    el.innerHTML = "";
+    el.hidden = true;
+  }
+}
+$("#header-branch").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
 
 // ── Favicon: mirror the active session's Material Symbol; fall back to the brand mark ────────────
 const DEFAULT_FAVICON = "/anvil.svg";
@@ -1918,7 +2087,7 @@ function renderServerCards(): void {
       <p class="small muted">On the new Mac open Anvil Server → <b>Join a fleet</b> for a 6-digit code. Then just pick it here and enter the code — no IP to track down.</p>
       <div class="git-row" style="margin-top:8px">
         <select id="fleet-host" style="flex:1;min-width:0"><option value="">Scanning your tailnet…</option></select>
-        <input id="fleet-code" inputmode="numeric" maxlength="6" placeholder="code" style="max-width:90px" />
+        <input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="code" style="max-width:90px" />
         <button id="fleet-invite" class="primary">${icon("add")} Add</button>
       </div>
       <div id="fleet-status" class="small muted" style="margin-top:6px"></div>
@@ -1959,7 +2128,7 @@ function renderServerCards(): void {
       <hr />
       <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
       <div class="git-row" style="margin-top:8px">
-        <input id="adb-pair-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
+        <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
         <button id="adb-pair">${icon("link")} Pair this Mac</button>
       </div>
       <pre class="git-output" id="adb-output"></pre></div>`,
@@ -2245,6 +2414,7 @@ async function toggleReadme(id: string): Promise<void> {
   }
 }
 function selectSession(id: string, push = true): void {
+  if (id !== activeId) saveDraft(activeId, input.value); // stash the outgoing session's unsent draft before we switch
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
   // the session (replace, don't push) so Back stays balanced.
   let reuseSidebarEntry = false;
@@ -2254,6 +2424,7 @@ function selectSession(id: string, push = true): void {
   }
   activeId = id;
   localStorage.setItem("anvil.active", id);
+  restoreDraft(id); // bring in the incoming session's own draft (usually blank)
   setSessionHash(id, push && !reuseSidebarEntry); // reflect in the URL (history entry unless restoring via Back/Forward)
   stickToBottom = true; // a freshly opened session starts pinned to the latest
   clearConversation();
@@ -2288,6 +2459,37 @@ const input = $<HTMLTextAreaElement>("#input");
 const pendingAttachments: { id: string; name: string; kind: "image" | "file"; dataUrl?: string }[] = [];
 const attachRow = $("#attach-row");
 
+// ── Per-session composer drafts ──────────────────────────────────────────────────
+// Unsent text belongs to the session it was typed in, not the box. Switching sessions stashes the
+// current draft under the outgoing session and restores the incoming one's (usually blank), so a
+// half-written message for one session never bleeds into another. Persisted per session so a draft
+// also survives a reload / app restart.
+const draftKey = (id: string): string => `anvil.draft.${id}`;
+function saveDraft(id: string | null, text: string): void {
+  if (!id) return;
+  try {
+    if (text.trim()) localStorage.setItem(draftKey(id), text);
+    else localStorage.removeItem(draftKey(id));
+  } catch {
+    /* quota */
+  }
+}
+function loadDraft(id: string | null): string {
+  if (!id) return "";
+  try {
+    return localStorage.getItem(draftKey(id)) ?? "";
+  } catch {
+    return "";
+  }
+}
+/** Put `id`'s saved draft into the composer (or clear it), and resize/enable Send to match. */
+function restoreDraft(id: string | null): void {
+  input.value = loadDraft(id);
+  autoGrow();
+  updateSendState();
+}
+restoreDraft(activeId); // on load, bring back the active session's own unsent draft (if any)
+
 // Uploads are async (read file → POST → push to pendingAttachments). If the user sends text
 // before an upload lands, the attachment id wouldn't be in pendingAttachments yet and the
 // file would be silently dropped. Track in-flight uploads so send() can wait for them.
@@ -2318,6 +2520,7 @@ async function sendComposer(): Promise<void> {
     enqueue({ cid: newCid(), cmd: { type: "prompt.send", sessionId: activeId, text } });
     appendOptimisticUser(text);
   }
+  saveDraft(activeId, ""); // the draft was just sent — drop the stored copy
   input.value = "";
   pendingAttachments.length = 0;
   renderAttachRow();
@@ -2595,7 +2798,11 @@ function renderReader(content: FileContent): void {
   if (content.path !== readerPath) return;
   panelView = "reader";
   setPanelTabs();
-  const head = `<div class="reader-head"><b>${esc(content.path)}</b><a href="#" id="reader-back">← files</a></div>`;
+  const head =
+    `<div class="reader-head"><b>${esc(content.path)}</b>` +
+    `<span class="reader-head-actions">` +
+    `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>` +
+    `<a href="#" id="reader-back">← files</a></span></div>`;
   if (content.markdown) {
     panelContent.innerHTML = head + `<div class="md reader-md">${content.markdown.html}</div>`;
     void runMermaid(panelContent.querySelector(".reader-md") as HTMLElement);
@@ -2608,6 +2815,36 @@ function renderReader(content: FileContent): void {
   }
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
+  const popout = document.getElementById("reader-popout");
+  if (popout) popout.onclick = () => popOutReader(content.path);
+}
+/** Open the currently-rendered reader content in a standalone window (Mac + Web). Reuses the page's
+ *  stylesheets + theme and the already-rendered DOM (Mermaid/KaTeX/code highlighting intact), minus
+ *  the in-app chrome, so the file reads as its own clean document you can park beside the chat. */
+function popOutReader(path: string): void {
+  const clone = panelContent.cloneNode(true) as HTMLElement;
+  clone.querySelector(".reader-head")?.remove(); // in-app header + back link don't belong in the window
+  clone.querySelectorAll(".copy-btn").forEach((b) => b.remove()); // their click handlers don't survive the copy
+  const styles = [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')]
+    .map((l) => `<link rel="stylesheet" href="${esc(l.href)}" />`)
+    .join("");
+  const theme = document.documentElement.dataset.theme ?? "light";
+  const title = path.split("/").pop() || path;
+  const win = window.open("", "_blank", "noopener,width=860,height=920");
+  if (!win) {
+    toast("Allow pop-ups to open the reader in its own window");
+    return;
+  }
+  win.document.write(
+    `<!doctype html><html lang="en" data-theme="${esc(theme)}"><head><meta charset="utf-8" />` +
+      `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
+      `<title>${esc(title)}</title>${styles}` +
+      `<style>body{margin:0;background:var(--bg);color:var(--text)}` +
+      `.popout-wrap{max-width:880px;margin:0 auto;padding:28px clamp(16px,4vw,40px)}` +
+      `.popout-head{font:600 12px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-bottom:16px;word-break:break-all}</style>` +
+      `</head><body><div class="popout-wrap"><div class="popout-head">${esc(path)}</div>${clone.innerHTML}</div></body></html>`,
+  );
+  win.document.close();
 }
 // ── Git panel ──────────────────────────────────────────────────────────────────
 function askClaude(instruction: string): void {
@@ -2703,6 +2940,7 @@ function runStage(key: Stage, label: string): void {
   setGitOutput(`Working… asked Claude to ${label.toLowerCase()}.`);
   sendTo(activeId, { type: "prompt.send", sessionId: activeId, text: STAGE_PROMPT[key] });
   toast(`${label} →`);
+  closePanel(); // get out of the way and jump to the conversation to watch it work
 }
 function gitStatusLine(s: Session | undefined): string {
   const g = s?.git;
@@ -2780,6 +3018,7 @@ function killSession(id: string): void {
   removingSessions.add(id);
   sendTo(id, { type: "session.kill", sessionId: id });
   localStorage.removeItem(`anvil.convo.${id}`);
+  localStorage.removeItem(`anvil.draft.${id}`); // abandoning the session — its draft goes with it
   if (panelView) closePanel();
   if (activeId === id) {
     // Drop the conversation now, but keep the (disabled) sidebar entry until it's actually gone.
@@ -2788,6 +3027,7 @@ function killSession(id: string): void {
     setSessionHash(null, false);
     setHeaderTitle(undefined);
     renderEmptyState();
+    restoreDraft(null); // clear the composer of the killed session's text
   }
   renderSessions();
 }
@@ -2864,7 +3104,7 @@ document.addEventListener("pointerdown", (e) => {
   if (!panelView) return; // panel already closed
   if (overlayOpen("modal") || overlayOpen("settings")) return; // a dialog/settings is on top — leave the panel be
   const t = e.target as HTMLElement;
-  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root")) return;
+  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root") || t.closest(".resizer")) return;
   closePanel();
 });
 
@@ -3431,15 +3671,21 @@ function summarizeAnswers(answers: QuestionAnswer[]): string {
   return answers.map((a) => a.labels.join(", ")).join(" · ");
 }
 
-/** Mark a question card answered: lock its inputs, show the choice, then fade it out. */
+/** Mark a question card answered. With a known answer, collapse the whole prompt to a single compact
+ *  "Claude asked → <answer>" line right away (no lingering, faded options list) so it feels instant
+ *  and reads like a sent reply; otherwise (answered elsewhere/superseded) just lock + fade it. */
 function resolveQuestionUI(requestId: string, label?: string): void {
   const card = questionCards.get(requestId);
   if (!card) return;
   questionCards.delete(requestId);
   card.classList.add("resolved");
-  card.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = true));
-  const btns = card.querySelector(".q-btns");
-  if (btns && label) btns.innerHTML = `<span class="q-done">${icon("check")} ${esc(label)}</span>`;
+  if (label) {
+    card.innerHTML =
+      `<div class="q-head">${icon("help")}<span>Claude asked…</span></div>` +
+      `<div class="q-answered"><span class="q-done">${icon("check")} ${esc(label)}</span></div>`;
+  } else {
+    card.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((el) => (el.disabled = true));
+  }
 }
 
 /** A session left awaiting_question (answered here, on another device, or superseded). */
@@ -3468,14 +3714,33 @@ function confirmDialog(opts: { title: string; body?: string; confirmLabel?: stri
       <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
     </div>`;
     showModal(m);
+    let settled = false;
     const done = (v: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v); // resolve BEFORE teardown so the explicit choice wins over the cancel-on-close below
       closeModal();
-      resolve(v);
     };
+    // Dismissing the dialog any other way (Escape, device Back, backdrop tap) counts as Cancel — and,
+    // crucially, must resolve the promise so the awaiting caller doesn't hang. Augment this modal
+    // layer's teardown to resolve(false); whichever resolve runs first wins (Promise is one-shot).
+    const top = overlays[overlays.length - 1];
+    if (top && top.name === "modal") {
+      const origClose = top.close;
+      top.close = () => {
+        origClose();
+        if (!settled) {
+          settled = true;
+          resolve(false);
+        }
+      };
+    }
     $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
     $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
     m.addEventListener("click", (e) => {
       if (e.target === m) done(false); // click backdrop to cancel
     });
+    // Focus a default button so Enter confirms; a destructive dialog defaults to the safe Cancel.
+    (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
   });
 }
