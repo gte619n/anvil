@@ -33,6 +33,7 @@
           <ul id="finished-list"></ul>
         </div>
         <button id="open-settings" class="sidebar-foot"><span class="msym">tune</span> Settings &amp; Servers</button>
+        <div id="sidebar-resizer" class="resizer" title="Drag to resize"></div>
       </aside>
       <main id="main">
         <header id="header">
@@ -40,6 +41,7 @@
             <button class="hbtn" id="btn-sidebar" title="Toggle sidebar"><span class="msym">menu</span></button>
             <span id="conn-dot" class="conn-dot" title="Connecting…"></span>
             <span id="header-title">Anvil</span>
+            <button id="header-branch" class="header-branch" title="Git" hidden></button>
           </span>
           <span id="header-actions">
             <button class="hbtn" id="btn-new-topic" title="New topic — start a fresh context, keep the history" hidden><span class="msym">restart_alt</span></button>
@@ -74,6 +76,7 @@
             </form>
           </div>
           <aside id="side-panel">
+            <div id="panel-resizer" class="resizer" title="Drag to resize"></div>
             <div id="panel-tabs">
               <button class="ptab" data-view="files"><span class="msym">folder</span> Files</button>
               <button class="ptab" data-view="reader"><span class="msym">description</span> Reader</button>

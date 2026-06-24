@@ -46,6 +46,10 @@ struct WebView: NSViewRepresentable {
         let daemonHost: String?
         init(daemonHost: String?) { self.daemonHost = daemonHost }
 
+        // Pop-out windows (e.g. the markdown reader "open in its own window"): keep a strong reference
+        // to each window, keyed by its web view, so it isn't deallocated while open.
+        private var popoutWindows: [WKWebView: NSWindow] = [:]
+
         // Keep our bundled UI in the app; open external/daemon links in the default browser.
         func webView(
             _ webView: WKWebView,
@@ -59,6 +63,52 @@ struct WebView: NSViewRepresentable {
                 return
             }
             decisionHandler(.allow)
+        }
+
+        // window.open(…): the web client uses this to pop the reader into its own window. Returning a
+        // real web view (rather than nil) is also what makes window.open() non-null, so the page can
+        // document.write its content into it. A target=_blank to an external URL just opens the browser.
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if let u = navigationAction.request.url, !u.absoluteString.isEmpty, u.scheme != WebView.scheme {
+                NSWorkspace.shared.open(u)
+                return nil
+            }
+            let w = windowFeatures.width?.doubleValue ?? 880
+            let h = windowFeatures.height?.doubleValue ?? 920
+            let child = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
+            child.uiDelegate = self
+            child.navigationDelegate = self
+            child.allowsBackForwardNavigationGestures = true
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered, defer: false
+            )
+            window.title = "Anvil"
+            window.contentView = child
+            window.isReleasedWhenClosed = false
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            popoutWindows[child] = window
+            return child
+        }
+
+        // window.close() from a pop-out — tear down its window and drop the reference.
+        func webViewDidClose(_ webView: WKWebView) {
+            popoutWindows[webView]?.close()
+            popoutWindows[webView] = nil
+        }
+
+        // Reflect the popped-out document's <title> on its window once it renders.
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            if let window = popoutWindows[webView], let t = webView.title, !t.isEmpty {
+                window.title = t
+            }
         }
     }
 }

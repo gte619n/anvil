@@ -54,9 +54,16 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #app { display: flex; height: 100vh; height: 100dvh; }
 
 #sidebar {
-  width: 280px; flex: 0 0 280px; border-right: 1px solid var(--border);
+  width: var(--sidebar-w, 280px); flex: 0 0 var(--sidebar-w, 280px); border-right: 1px solid var(--border);
   background: var(--panel); display: flex; flex-direction: column; padding: 12px; gap: 10px;
+  position: relative;
 }
+/* Drag handles straddling the sidebar / side-panel borders to resize each pane (desktop only). */
+.resizer { position: absolute; top: 0; bottom: 0; width: 9px; z-index: 9; cursor: col-resize; touch-action: none; }
+#sidebar-resizer { right: -5px; }
+#panel-resizer { left: -5px; }
+.resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; transform: translateX(-50%); background: transparent; transition: background 0.12s; }
+.resizer:hover::after, .resizer.dragging::after { background: var(--accent); }
 .side-head { display: flex; align-items: center; gap: 8px; }
 .side-head-spacer { flex: 1; }
 .icon-btn { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; display: inline-flex; }
@@ -125,11 +132,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .section-head { display: flex; align-items: center; justify-content: space-between; }
 .card { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px 16px; margin-bottom: 10px; }
 .card-main { display: flex; align-items: center; gap: 8px; }
-/* per-server group header + empty placeholder in the sidebar session list (fleet grouping) */
-.server-sep { display: flex; align-items: center; gap: 7px; padding: 10px 12px 4px; font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; list-style: none; cursor: default; }
-.server-sep:not(:first-child) { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 12px; }
-.server-sep-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.server-empty { padding: 4px 12px 8px; font-size: 12px; color: var(--muted); list-style: none; }
+/* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
+.session .meta .msym { font-size: 13px; vertical-align: -2px; margin-right: 1px; }
 /* Settings → Servers: add-a-server card, discovered rows, per-server budget, account gauge */
 .add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
@@ -188,6 +192,13 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #header-title .ht { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 #header-left { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
 #header-left > #btn-sidebar, #header-left > .conn-dot { flex-shrink: 0; }
+/* current git branch chip, next to the session title */
+.header-branch { display: inline-flex; align-items: center; gap: 4px; max-width: 30ch; flex-shrink: 0; padding: 2px 9px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel); color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; }
+.header-branch[hidden] { display: none; }
+.header-branch:hover { border-color: var(--accent); color: var(--text); }
+.header-branch .msym { font-size: 15px; color: var(--accent); }
+.header-branch .hb-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+@media (max-width: 700px) { .header-branch { max-width: 16ch; } }
 #header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
 .hbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -199,7 +210,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .scroll-bottom[hidden] { display: none; }
 .scroll-bottom:hover { background: var(--panel); }
 /* slides over the conversation instead of pushing it */
-#side-panel { position: absolute; top: 0; right: 0; bottom: 0; width: 460px; max-width: 92%; background: var(--bg); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; transform: translateX(100%); transition: transform 0.2s ease; box-shadow: -6px 0 22px rgba(0, 0, 0, 0.18); z-index: 8; }
+#side-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--panel-w, 460px); max-width: 92%; background: var(--bg); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; transform: translateX(100%); transition: transform 0.2s ease; box-shadow: -6px 0 22px rgba(0, 0, 0, 0.18); z-index: 8; }
 #side-panel.open { transform: translateX(0); }
 #panel-tabs { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .ptab { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; padding: 4px 9px; border-radius: 6px; cursor: pointer; color: var(--muted); font: inherit; }
@@ -212,8 +223,12 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .file-list li { padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .file-list li:hover { background: var(--panel); }
 .file-list .dir { font-weight: 600; }
-.reader-head { font-size: 12px; color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; }
+.reader-head { font-size: 12px; color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .reader-head a { color: var(--accent); }
+.reader-head-actions { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.reader-act { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; padding: 2px; }
+.reader-act:hover { color: var(--accent); }
+.reader-act .msym { font-size: 17px; }
 .reader-text { white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
 
 .git-panel { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
@@ -298,6 +313,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .tool code { background: var(--tool-bg); padding: 1px 5px; border-radius: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .tool .file-link { color: var(--accent); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .tool .file-link:hover { text-decoration: underline; }
+/* clickable .md mentions inside Claude's prose → open in the reader */
+.md .md-file-link { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; cursor: pointer; }
+.md .md-file-link:hover { text-decoration-style: solid; }
 details.tool-result { font-size: 12px; color: var(--muted); margin: 4px 0; max-width: 100%; }
 details.tool-result > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; padding: 3px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 details.tool-result > summary::-webkit-details-marker { display: none; }
@@ -344,8 +362,10 @@ details.tool-result.error > summary { color: var(--danger); }
 .q-btn:hover { background: var(--panel); }
 .q-btn.submit { background: var(--accent); color: #fff; border-color: var(--accent); }
 .q-btn:disabled { opacity: 0.5; cursor: default; }
-.bubble.question.resolved { opacity: 0.6; border-color: var(--border); background: var(--tool-bg); }
+.bubble.question.resolved { opacity: 0.75; border-color: var(--border); background: var(--tool-bg); }
+.q-answered { margin-top: 4px; }
 .q-done { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-weight: 600; }
+.q-done .msym { color: var(--accent); }
 .q-done .msym { font-size: 18px; }
 
 .md { min-width: 0; overflow-wrap: anywhere; }
@@ -537,4 +557,6 @@ input:focus, select:focus, textarea:not(#input):focus {
 @media (max-width: 700px) {
   /* on narrow screens the sidebar overlays the conversation instead of squishing it */
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
+  /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
+  .resizer { display: none; }
 }
