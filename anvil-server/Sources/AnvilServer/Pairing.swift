@@ -155,6 +155,40 @@ enum Pairing {
     post(host: host, path: "/anvil-token", body: PairRequest(code: nil, token: token, fleetName: nil, hubServerId: hubServerId), completion: completion)
   }
 
+  /// Best-effort reachability check of a freshly-paired member's daemon, so the hub can tell the
+  /// operator whether it actually came ONLINE — rather than reporting a hollow "joined" while the
+  /// client sits on "connecting" (the exact failure that hid a dead daemon during fleet bring-up).
+  /// Tries plain HTTP on the tailnet (the App-Store-Tailscale direct-bind case) and HTTPS (serve
+  /// mode); retries a few times with a short gap to cover the daemon's first-start delay. Main-thread cb.
+  static func probeHealth(host: String, retries: Int = 4, completion: @escaping (Bool) -> Void) {
+    probeOnce(host: host) { ok in
+      if ok || retries <= 0 {
+        DispatchQueue.main.async { completion(ok) }
+      } else {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { probeHealth(host: host, retries: retries - 1, completion: completion) }
+      }
+    }
+  }
+
+  private static func probeOnce(host: String, completion: @escaping (Bool) -> Void) {
+    let urls = ["http://\(host):\(Paths.port)/api/health", "https://\(host):\(Paths.port)/api/health"].compactMap { URL(string: $0) }
+    guard !urls.isEmpty else { completion(false); return }
+    let lock = NSLock()
+    var remaining = urls.count, anyOK = false
+    for url in urls {
+      var req = URLRequest(url: url)
+      req.timeoutInterval = 4
+      URLSession.shared.dataTask(with: req) { _, resp, _ in
+        lock.lock()
+        if (resp as? HTTPURLResponse)?.statusCode == 200 { anyOK = true }
+        remaining -= 1
+        let done = remaining == 0
+        lock.unlock()
+        if done { completion(anyOK) }
+      }.resume()
+    }
+  }
+
   private static func post(host: String, path: String, body: PairRequest, completion: @escaping (Result<PairReply, Error>) -> Void) {
     guard let url = URL(string: "http://\(host):\(Paths.pairingPort)\(path)") else { // plain HTTP over the tailnet (no serve)
       completion(.failure(NSError(domain: "AnvilPair", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad host"])))

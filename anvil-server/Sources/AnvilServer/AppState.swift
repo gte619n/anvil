@@ -30,7 +30,9 @@ final class AppState: ObservableObject {
       return Pairing.PairReply(ok: false, serverId: nil, serverName: nil, error: "could not save token — \(error.localizedDescription)")
     }
     Daemon.service(.install) { _ in } // service.sh sets up the transport (serve → https, else tailnet-IP http)
-    return Pairing.PairReply(ok: true, serverId: nil, serverName: Tailscale.magicDNSName(), error: nil)
+    // Report a name the hub can record/display: MagicDNS name, or the tailnet IP when the CLI can't
+    // resolve it in the app sandbox (same fallback as the join window — magicDNSName() returns nil there).
+    return Pairing.PairReply(ok: true, serverId: nil, serverName: Tailscale.magicDNSName() ?? Tailscale.tailnetIP(), error: nil)
   }
 
   var isFleetMember: Bool { Pairing.FleetControl.recordedHubId != nil }
