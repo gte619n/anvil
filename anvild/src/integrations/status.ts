@@ -5,11 +5,12 @@
  *
  * Lifecycle:
  *   (none) → planned → building → review → ✓ completed
- *                              ↘ blocked (needs a human decision)
+ *                  │           ↘ blocked (needs a human decision)
+ *                  └→ dismissed (the user rejected the plan in the Autopilot UI; never re-planned)
  */
 export const STATUS_PREFIX = "anvil:";
 
-export const STATUSES = ["planned", "building", "review", "blocked"] as const;
+export const STATUSES = ["planned", "building", "review", "blocked", "dismissed"] as const;
 export type AnvilStatus = (typeof STATUSES)[number];
 
 export function statusLabel(status: AnvilStatus): string {

@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { AutopilotEffort } from "@protocol";
 import { newId } from "../util/ids";
 import type { AnvilStatus } from "./status";
 
@@ -16,6 +17,8 @@ export interface WorkUnit {
   title: string; // short human title for the unit (becomes the worktree/PR name)
   rationale?: string; // why these tasks were grouped
   plan?: string; // the implementation plan (markdown), also posted as a Todoist comment
+  summary?: string; // 1–2 line description for the Autopilot card (planner-emitted)
+  effort?: AutopilotEffort; // rough size + files-touched estimate for the card (planner-emitted)
   status: AnvilStatus; // mirrors the anvil:* label kept on the member tasks
   sessionId?: string; // the worktree session implementing it, once started
   prUrl?: string; // PR opened after validation passes

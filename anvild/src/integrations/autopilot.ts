@@ -1,8 +1,9 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { Model } from "@protocol";
+import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
 import type { TodoistClient, TodoistTask, TodoistSection } from "./todoist";
 import { readStatus, withStatus } from "./status";
+import { extractPlanMeta, PLAN_META_INSTRUCTION } from "./plan-meta";
 import type { WorkUnit, WorkUnitStore } from "./workunit";
 
 /**
@@ -22,6 +23,8 @@ export interface ProposedUnit {
 export interface PlannedUnit extends ProposedUnit {
   tasks: TodoistTask[];
   plan: string; // markdown implementation plan
+  summary?: string; // 1–2 line description for the Autopilot card (from the plan's metadata block)
+  effort?: AutopilotEffort; // rough size + files-touched estimate (from the plan's metadata block)
 }
 
 const agentEnv = buildAgentEnv();
@@ -131,10 +134,40 @@ Why these are bundled: ${unit.rationale}
 Tasks to satisfy:
 ${taskBlock}
 
-Write a focused implementation plan in markdown: the approach, the specific files/functions to change, edge cases, and how to verify. Be concrete and grounded in what you find in the repo. Do not make any edits — planning only.`;
+Write a focused implementation plan in markdown: the approach, the specific files/functions to change, edge cases, and how to verify. Be concrete and grounded in what you find in the repo. Do not make any edits — planning only.
 
-  const plan = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
-  return { ...unit, tasks: members, plan };
+${PLAN_META_INSTRUCTION}`;
+
+  const raw = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  const { plan, summary, effort } = extractPlanMeta(raw);
+  return { ...unit, tasks: members, plan, summary, effort };
+}
+
+/**
+ * REFINE: revise an existing plan from reviewer feedback (the Autopilot "refine with Claude" chat).
+ * Read-only against the repo; returns the full rewritten plan plus refreshed summary/effort metadata.
+ */
+export async function refinePlanQuery(opts: {
+  title: string;
+  currentPlan: string;
+  feedback: string;
+  repoRoot: string;
+  model?: Model;
+}): Promise<{ plan: string; summary?: string; effort?: AutopilotEffort }> {
+  const prompt = `You are revising an implementation plan for the unit of work "${opts.title}" in this repository, based on reviewer feedback. Inspect the codebase (read-only) as needed, then produce the FULL revised plan in markdown — the complete updated plan, not a diff.
+
+Current plan:
+${opts.currentPlan.trim() || "(no plan yet)"}
+
+Reviewer feedback:
+${opts.feedback.trim()}
+
+Rewrite the plan to address the feedback while keeping the parts that are still valid. Do not make any edits to the repo — planning only.
+
+${PLAN_META_INSTRUCTION}`;
+
+  const raw = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  return extractPlanMeta(raw);
 }
 
 /** Tasks eligible for planning: not already in the anvil pipeline (no anvil:* label, no work unit). */
@@ -183,6 +216,8 @@ export async function planAndTagProject(
       title: planned.title,
       rationale: planned.rationale,
       plan: planned.plan,
+      summary: planned.summary,
+      effort: planned.effort,
       status: "planned",
     });
     // Tag every member; post the full plan once (on the first member), pointers on the rest.

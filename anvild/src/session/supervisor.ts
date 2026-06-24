@@ -16,6 +16,12 @@ import {
   type TodoistStatusEvent,
   type TodoistProjectsResultEvent,
   type TodoistProjectInfo,
+  type AutopilotPlanInfo,
+  type AutopilotPlansEvent,
+  type AutopilotPlanResultEvent,
+  type AutopilotStartedEvent,
+  type AutopilotSchedule,
+  type AutopilotScheduleEvent,
   type GitCmd,
   type GitResultEvent,
   type Model,
@@ -43,8 +49,11 @@ import { EventLog } from "../eventlog/log";
 import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
-import { WorkUnitStore } from "../integrations/workunit";
+import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient } from "../integrations/todoist";
+import { withStatus } from "../integrations/status";
+import { planAndTagProject, refinePlanQuery } from "../integrations/autopilot";
+import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { listDir, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -100,6 +109,9 @@ export class Supervisor {
   private readonly envStore: EnvironmentStore;
   private readonly integrations: IntegrationStore;
   private readonly workUnits: WorkUnitStore;
+  private readonly autopilotSchedule: AutopilotScheduleStore;
+  private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
+  private scheduleTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
@@ -110,6 +122,7 @@ export class Supervisor {
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
     this.workUnits = new WorkUnitStore(cfg.stateDir);
+    this.autopilotSchedule = new AutopilotScheduleStore(cfg.stateDir);
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
@@ -119,6 +132,29 @@ export class Supervisor {
       softStopFraction: cfg.softStopFraction ?? 0.95,
     });
     this.restore();
+    this.startAutopilotScheduler();
+  }
+
+  /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether a run
+   *  is due and fire it. `unref` so it never holds the process (or a test) open; a startup tick gives
+   *  the catch-up-on-restart behaviour. */
+  private startAutopilotScheduler(): void {
+    this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), 5 * 60_000);
+    this.scheduleTimer.unref?.();
+    void this.maybeRunScheduled();
+  }
+  private async maybeRunScheduled(): Promise<void> {
+    const sched = this.autopilotSchedule.get();
+    if (this.autopilotRunning || !isRunDue(sched, new Date(), sched.lastRunAt)) return;
+    // Stamp the run NOW so a slow run isn't re-triggered on the next 5-min tick, and so a hard error
+    // (Todoist down, no linked envs) doesn't hammer — it waits for the next scheduled window.
+    this.autopilotSchedule.markRun(now());
+    this.broadcastSchedule();
+    try {
+      await this.runAutopilot({ notify: true, autoStart: sched.autoStart, maxAutoStart: sched.maxAutoStart });
+    } catch {
+      /* swallowed: re-tries at the next due window */
+    }
   }
 
   budget(): Budget {
@@ -280,6 +316,239 @@ export class Supervisor {
     }));
     return { v: PROTOCOL_VERSION, type: "todoist.projects.result", ts: now(), ...(cid ? { cid } : {}), projects: infos };
   }
+
+  // ── Autopilot plan review (anvil-autopilot-ui.md) ─────────────────────────────────
+  /** Pending plans = planned work units not yet started; what the Autopilot card grid shows. */
+  private pendingPlans(): WorkUnit[] {
+    return this.workUnits.list().filter((u) => u.status === "planned" && !u.sessionId);
+  }
+  /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
+  private autopilotPlanInfo(u: WorkUnit): AutopilotPlanInfo {
+    const env = this.envStore.get(u.environmentId);
+    return {
+      id: u.id,
+      environmentId: u.environmentId,
+      ...(env?.name ? { environmentName: env.name } : {}),
+      todoistProjectId: u.todoistProjectId,
+      title: u.title,
+      ...(u.rationale ? { rationale: u.rationale } : {}),
+      ...(u.summary ? { summary: u.summary } : {}),
+      status: u.status,
+      ...(u.effort ? { effort: u.effort } : {}),
+      taskCount: u.taskIds.length,
+      ...(u.plan ? { plan: this.renderer.render(u.plan) } : {}),
+      createdAt: u.createdAt,
+      updatedAt: u.updatedAt,
+    };
+  }
+  autopilotPlansEvent(cid?: string): AutopilotPlansEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "autopilot.plans",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      plans: this.pendingPlans().map((u) => this.autopilotPlanInfo(u)),
+    };
+  }
+  private broadcastAutopilotPlans(): void {
+    this.registry.toAll(this.autopilotPlansEvent());
+  }
+
+  /** Refine a plan from reviewer feedback (Opus, read-only against the repo): persist the revised
+   *  plan + metadata, post it back as a Todoist comment, broadcast, and return the updated plan. */
+  async refinePlan(workUnitId: string, feedback: string, cid?: string): Promise<AutopilotPlanResultEvent> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (!feedback.trim()) throw new BadCommand("feedback is required");
+    const env = this.envStore.get(u.environmentId);
+    if (!env) throw new BadCommand("the plan's environment no longer exists");
+    const revised = await refinePlanQuery({ title: u.title, currentPlan: u.plan ?? "", feedback, repoRoot: env.repoRoot });
+    const updated = this.workUnits.update(u.id, {
+      plan: revised.plan,
+      ...(revised.summary ? { summary: revised.summary } : {}),
+      ...(revised.effort ? { effort: revised.effort } : {}),
+    });
+    void this.postPlanComment(u, `🤖 **anvil** refined the plan for “${u.title}”.\n\n_Feedback: ${feedback.trim()}_\n\n${revised.plan}`);
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
+  }
+
+  /** Reject a plan: label its member tasks `anvil:dismissed` (so the nightly run skips them) and
+   *  drop the card. Best-effort on the Todoist side — the local status change is authoritative. */
+  async dismissPlan(workUnitId: string): Promise<void> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const state = this.integrations.todoist();
+    if (state?.accessToken) {
+      const client = new TodoistClient(state.accessToken);
+      for (const taskId of u.taskIds) {
+        try {
+          const t = await client.getTask(taskId);
+          await client.setTaskLabels(taskId, withStatus(t.labels, "dismissed"));
+        } catch {
+          /* a deleted/closed task — skip it, the local status still drops the card */
+        }
+      }
+    }
+    this.workUnits.update(u.id, { status: "dismissed" });
+    this.broadcastAutopilotPlans();
+  }
+
+  /** Go: create a fresh-worktree session seeded with the plan and start it. Autonomy defaults to
+   *  `bypass` so the work runs without stalling on a permission prompt. The card then leaves the
+   *  pending grid (sessionId set + status building). */
+  startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): AutopilotStartedEvent {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
+    const env = this.envStore.get(u.environmentId);
+    if (!env) throw new BadCommand("the plan's environment no longer exists");
+    const brief = this.autopilotBrief(u);
+    const { id } = this.handoffCreate({
+      environmentId: env.id,
+      source: "fresh-worktree",
+      title: u.title,
+      model: model ?? "opus",
+      autonomy: autonomy ?? "bypass",
+      brief,
+    });
+    this.workUnits.update(u.id, { sessionId: id, status: "building" });
+    void this.tagTasks(u, "building");
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
+  }
+
+  /** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */
+  private autopilotBrief(u: WorkUnit): string {
+    const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
+    const body = u.plan ? `\n\nHere is the plan to implement:\n\n${u.plan}` : "";
+    return `${head}${body}\n\nImplement it end to end in this worktree, then summarize what you changed.`;
+  }
+
+  /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
+   *  scheduled run). Broadcasts refreshed plans; when `autoStart`, launches up to `maxAutoStart` of
+   *  the new units (skipped while the budget is warning); pushes a summary when `notify`. */
+  async runAutopilot(opts: {
+    environmentId?: string;
+    notify?: boolean;
+    autoStart?: boolean;
+    maxAutoStart?: number;
+    onProgress?: (line: string) => void;
+  }): Promise<{ created: number; skipped: number; started: number; output: string }> {
+    if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
+    const client = new TodoistClient(state.accessToken);
+    const envs = this.envStore
+      .list()
+      .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
+    if (envs.length === 0) throw new BadCommand("no environments are linked to a Todoist project");
+    const deps = { client, workUnits: this.workUnits };
+    const log: string[] = [];
+    const emit = (line: string): void => {
+      log.push(line);
+      opts.onProgress?.(line);
+    };
+    this.autopilotRunning = true;
+    const createdUnits: WorkUnit[] = [];
+    let skipped = 0;
+    let started = 0;
+    try {
+      for (const env of envs) {
+        emit(`▸ ${env.name}`);
+        const res = await planAndTagProject(deps, {
+          environmentId: env.id,
+          projectId: env.todoistProjectId!,
+          repoRoot: env.repoRoot,
+          repoName: env.name,
+          onProgress: emit,
+        });
+        createdUnits.push(...res.created);
+        skipped += res.skipped;
+      }
+      // Auto-start the new units, capped, and only when the subscription budget is healthy — an
+      // unattended run must never spawn a swarm of sessions or exhaust the weekly window.
+      if (opts.autoStart && createdUnits.length) {
+        if (this.budget().warn) {
+          emit("⏸ Auto-start skipped — subscription budget is in its warn zone; plans left for review.");
+        } else {
+          const cap = opts.maxAutoStart ?? 3;
+          for (const u of createdUnits.slice(0, cap)) {
+            try {
+              this.startPlan(u.id);
+              started++;
+              emit(`🚀 Started “${u.title}”.`);
+            } catch (e) {
+              emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+          if (createdUnits.length > cap) emit(`${createdUnits.length - cap} more plan(s) left for manual review (cap ${cap}).`);
+        }
+      }
+    } finally {
+      this.autopilotRunning = false;
+    }
+    const created = createdUnits.length;
+    this.broadcastAutopilotPlans();
+    if (opts.notify && created > 0) {
+      const body = started
+        ? `${created} new plan${created === 1 ? "" : "s"} · ${started} started`
+        : `${created} new plan${created === 1 ? "" : "s"} ready to review`;
+      const payload: PushPayload = { title: "Anvil autopilot", body, tag: "autopilot", kind: "result" };
+      void this.webpush.notify(payload);
+      void this.fcm.notify(payload);
+    }
+    return { created, skipped, started, output: log.join("\n") };
+  }
+
+  // ── Autopilot schedule (in-daemon timer) ──────────────────────────────────────────
+  autopilotScheduleEvent(cid?: string): AutopilotScheduleEvent {
+    const schedule = this.autopilotSchedule.get();
+    const next = nextScheduledFire(schedule, new Date());
+    return {
+      v: PROTOCOL_VERSION,
+      type: "autopilot.schedule",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      schedule,
+      ...(next ? { nextRunAt: next.toISOString() } : {}),
+    };
+  }
+  private broadcastSchedule(): void {
+    this.registry.toAll(this.autopilotScheduleEvent());
+  }
+  setAutopilotSchedule(patch: Partial<Omit<AutopilotSchedule, "lastRunAt">>, cid?: string): AutopilotScheduleEvent {
+    this.autopilotSchedule.set(patch);
+    this.broadcastSchedule(); // every device (no cid)
+    return this.autopilotScheduleEvent(cid); // the requester (cid)
+  }
+
+  /** Best-effort: set every member task's anvil status label (used on dismiss/build transitions). */
+  private async tagTasks(u: WorkUnit, status: "building"): Promise<void> {
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) return;
+    const client = new TodoistClient(state.accessToken);
+    for (const taskId of u.taskIds) {
+      try {
+        const t = await client.getTask(taskId);
+        await client.setTaskLabels(taskId, withStatus(t.labels, status));
+      } catch {
+        /* skip a missing task */
+      }
+    }
+  }
+  /** Best-effort: post a comment on the unit's first task (the plan-carrying one). */
+  private async postPlanComment(u: WorkUnit, content: string): Promise<void> {
+    const state = this.integrations.todoist();
+    const taskId = u.taskIds[0];
+    if (!state?.accessToken || !taskId) return;
+    try {
+      await new TodoistClient(state.accessToken).addComment(taskId, content);
+    } catch {
+      /* comment is an audit nicety — never fail the refine over it */
+    }
+  }
+
   removeEnvironment(id: string): void {
     this.envStore.remove(id);
     this.registry.toAll(this.environmentsEvent());
