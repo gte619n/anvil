@@ -23,10 +23,22 @@ enum Provision {
   }
 
   /// True when there's a bundled daemon to install AND the install root is missing, dep-less, or stale.
+  /// "Stale" means a version bump OR — crucially — the bundled launcher script differs from the one
+  /// installed. The latter catches an app update that changes daemon/service code WITHOUT bumping the
+  /// package.json version: otherwise the freshly-installed app would keep driving the OLD installed
+  /// `service.sh` (exactly how a service.sh fix shipped in a new app failed to reach a running Mac).
   static func needed() -> Bool {
-    guard Paths.bundledAnvild != nil else { return false } // dev / bare app — nothing to provision
+    guard let bundled = Paths.bundledAnvild else { return false } // dev / bare app — nothing to provision
     if !Paths.runnable(root) { return true }
-    return installedVersion() != bundledVersion()
+    if installedVersion() != bundledVersion() { return true }
+    return !fileContentsEqual(bundled + "/scripts/service.sh", root + "/scripts/service.sh")
+  }
+
+  /// Byte-compare two files; false if either can't be read (treated as "differs" → re-provision).
+  private static func fileContentsEqual(_ a: String, _ b: String) -> Bool {
+    let fm = FileManager.default
+    guard let da = fm.contents(atPath: a), let db = fm.contents(atPath: b) else { return false }
+    return da == db
   }
 
   /// Copy the bundled source → install root, then `bun install --frozen-lockfile`. Requires Bun.
@@ -38,8 +50,11 @@ enum Provision {
     DispatchQueue.global(qos: .userInitiated).async {
       report("Copying daemon files…")
       try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
-      // Sync source (sans node_modules/.git) into the writable install root.
-      let rs = Shell.run("rsync", ["-a", "--delete", "--exclude", "node_modules", "--exclude", ".git", src + "/", root + "/"])
+      // Sync source (sans node_modules/.git) into the writable install root. -L materializes symlinks
+      // into real files so the install root is self-contained — anvild/protocol.ts points outside the
+      // tree (../docs/plans/anvil-protocol.ts) and would otherwise land as a dangling link that breaks
+      // both `build:web` and the daemon's `@protocol` import.
+      let rs = Shell.run("rsync", ["-aL", "--delete", "--exclude", "node_modules", "--exclude", ".git", src + "/", root + "/"])
       if !rs.ok { return finish(false, "Copy failed: " + String(rs.combined.suffix(300)), completion) }
 
       // First-run dep fetch (~250 MB download, ~1 GB unpacked) is the most failure-prone — and the
