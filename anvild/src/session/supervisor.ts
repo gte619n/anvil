@@ -235,6 +235,33 @@ export class Supervisor {
     };
   }
 
+  /** Validate a personal API token against the API, then persist it and broadcast the new status. */
+  async connectTodoist(token: string, cid?: string): Promise<TodoistStatusEvent> {
+    const trimmed = token.trim();
+    if (!trimmed) throw new BadCommand("A Todoist API token is required");
+    let user;
+    try {
+      user = await new TodoistClient(trimmed).whoami(); // throws on a bad/revoked token
+    } catch (e) {
+      throw new BadCommand(`Todoist rejected that token: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    this.integrations.setTodoistToken(trimmed, user.email ?? user.full_name);
+    this.registry.toAll(this.todoistStatusEvent()); // refresh every connected client
+    return this.todoistStatusEvent(cid);
+  }
+
+  /** The raw stored token, for hub→member fleet replication ONLY. Never sent to a client. */
+  todoistTokenForFleet(): string | undefined {
+    return this.integrations.todoist()?.accessToken;
+  }
+
+  /** Clear the stored token and broadcast the disconnected status. */
+  disconnectTodoist(cid?: string): TodoistStatusEvent {
+    this.integrations.disconnectTodoist();
+    this.registry.toAll(this.todoistStatusEvent());
+    return this.todoistStatusEvent(cid);
+  }
+
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
   async listTodoistProjects(cid?: string): Promise<TodoistProjectsResultEvent> {
     const state = this.integrations.todoist();

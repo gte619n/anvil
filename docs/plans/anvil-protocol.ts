@@ -728,10 +728,23 @@ export interface EnvRemoveCmd extends Envelope, Correlated {
   id: string;
 }
 
-// Todoist integration (task autopilot). The token is set out-of-band (scripts/todoist.ts);
-// these commands drive the link UI and the planner.
+// Todoist integration (task autopilot). The token can be set in-app (todoist.connect) or
+// out-of-band (scripts/todoist.ts); these commands drive the link UI and the planner.
 export interface TodoistStatusCmd extends Envelope, Correlated {
   type: "todoist.status"; // request the current connection state
+}
+export interface TodoistConnectCmd extends Envelope, Correlated {
+  type: "todoist.connect"; // set/replace the personal API token; validated against the API before it's stored
+  token: string;
+}
+export interface TodoistDisconnectCmd extends Envelope, Correlated {
+  type: "todoist.disconnect"; // clear the stored token
+}
+export interface TodoistPropagateCmd extends Envelope, Correlated {
+  // Hub-only: replicate the hub's stored token to fleet members (so autopilot can run where the
+  // repo lives). `targets` = member serverIds; omit to push to every member. A no-op off the hub.
+  type: "todoist.propagate";
+  targets?: string[];
 }
 export interface TodoistProjectsListCmd extends Envelope, Correlated {
   type: "todoist.projects.list"; // fetch the account's projects (live from the API)
@@ -812,6 +825,9 @@ export type ClientCommand =
   | EnvUpdateCmd
   | EnvRemoveCmd
   | TodoistStatusCmd
+  | TodoistConnectCmd
+  | TodoistDisconnectCmd
+  | TodoistPropagateCmd
   | TodoistProjectsListCmd
   | DaemonUpdateCmd
   // terminal
