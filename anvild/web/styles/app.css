@@ -616,6 +616,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-schedule-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-size: 13px; }
 .ap-schedule-bar span { display: inline-flex; align-items: center; gap: 6px; }
 .ap-schedule-bar .msym { font-size: 17px; }
+.schedule-card .card-main { gap: 8px; }
+.schedule-card .card-main span { display: inline-flex; align-items: center; gap: 6px; }
+.schedule-card .card-main .msym { font-size: 17px; }
 .ap-check { display: flex; align-items: center; gap: 8px; flex-direction: row !important; }
 .ap-field { margin: 8px 0; }
 .ap-field > span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }

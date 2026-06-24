@@ -1971,7 +1971,10 @@ function selectSettingsTab(tab: SettingsTab): void {
   settingsTab = tab;
   document.querySelectorAll<HTMLElement>(".settings-view .stab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   document.querySelectorAll<HTMLElement>(".settings-view .settings-panel").forEach((p) => (p.hidden = p.dataset.tab !== tab));
-  if (tab === "todoist") renderTodoistPanel();
+  if (tab === "todoist") {
+    renderTodoistPanel();
+    hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
+  }
 }
 
 // ── Todoist integration ──────────────────────────────────────────────────────────
@@ -2120,6 +2123,7 @@ function renderTodoistPanel(): void {
     .join("");
   host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects
       <button id="todoist-disconnect" class="mini" style="float:right">Disconnect</button></div>
+    ${scheduleSettingsCardHtml()}
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
     <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
   $("#todoist-disconnect").addEventListener("click", () => {
@@ -2127,6 +2131,7 @@ function renderTodoistPanel(): void {
     todoistProjectsLoaded = false;
     todoistProjects.clear();
   });
+  $("#set-sched-edit").addEventListener("click", openScheduleModal);
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
@@ -2450,9 +2455,13 @@ async function runAutopilot(): Promise<void> {
 }
 
 // ── Scheduled run (in-daemon timer; the control targets the hub) ────────────────────
+// Surfaced in two places — the Autopilot view's bar and a card in Settings → Todoist — so changes
+// made in either (or pushed from another device) refresh both.
 function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string): void {
   serverSchedule.set(url, { schedule, nextRunAt });
-  if (url === HUB_URL && document.getElementById("autopilot-schedule")) renderScheduleBar();
+  if (url !== HUB_URL) return;
+  if (document.getElementById("autopilot-schedule")) renderScheduleBar();
+  if (document.getElementById("todoist-panel")) renderTodoistPanel();
 }
 const fmtTime = (hhmm: string): string => {
   const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
@@ -2467,21 +2476,27 @@ const fmtNextRun = (iso?: string): string => {
   const d = new Date(iso);
   return d.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
 };
+/** The hub's schedule as a one-line summary (shared by the Autopilot bar and the Settings card). */
+function scheduleSummaryHtml(): string {
+  const entry = serverSchedule.get(HUB_URL);
+  const s = entry?.schedule;
+  if (!s || !s.enabled) return `<span class="muted">${icon("schedule")} Scheduled run off</span>`;
+  const auto = s.autoStart ? `auto-start ${s.maxAutoStart ?? 3}` : "plan only";
+  const next = entry?.nextRunAt ? ` · next ${esc(fmtNextRun(entry.nextRunAt))}` : "";
+  return `<span>${icon("schedule")} Daily ${esc(fmtTime(s.timeOfDay))} · ${esc(auto)}${next}</span>`;
+}
 function renderScheduleBar(): void {
   const host = document.getElementById("autopilot-schedule");
   if (!host) return;
-  const entry = serverSchedule.get(HUB_URL);
-  const s = entry?.schedule;
-  let summary: string;
-  if (!s || !s.enabled) {
-    summary = `<span class="muted">${icon("schedule")} Scheduled run off</span>`;
-  } else {
-    const auto = s.autoStart ? `auto-start ${s.maxAutoStart ?? 3}` : "plan only";
-    const next = entry?.nextRunAt ? ` · next ${esc(fmtNextRun(entry.nextRunAt))}` : "";
-    summary = `<span>${icon("schedule")} Daily ${esc(fmtTime(s.timeOfDay))} · ${esc(auto)}${next}</span>`;
-  }
-  host.innerHTML = `${summary}<button class="mini" id="ap-sched-edit">${icon("tune")} Schedule</button>`;
+  host.innerHTML = `${scheduleSummaryHtml()}<button class="mini" id="ap-sched-edit">${icon("tune")} Schedule</button>`;
   $("#ap-sched-edit").addEventListener("click", openScheduleModal);
+}
+/** A Settings → Todoist card mirroring the schedule, so it can be configured without opening Autopilot. */
+function scheduleSettingsCardHtml(): string {
+  return `<div class="card schedule-card" id="todoist-schedule">
+    <div class="card-main">${scheduleSummaryHtml()}<button class="mini" id="set-sched-edit" style="margin-left:auto">${icon("tune")} Edit</button></div>
+    <p class="small muted">An in-daemon timer re-plans the linked projects and (when auto-start is on) launches the new work. Review &amp; launch plans in the <b>Autopilot</b> section.</p>
+  </div>`;
 }
 
 function openScheduleModal(): void {

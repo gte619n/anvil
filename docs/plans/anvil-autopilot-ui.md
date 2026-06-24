@@ -157,8 +157,11 @@ own linked environments (same per-server model as `runAutopilot`).
     concurrent `bypass`-autonomy sessions.
   - **Rate-limit guard**: if the subscription budget is in warn/soft-stop, the run still plans +
     notifies but **skips auto-start** (so it can't exhaust the weekly Opus window unattended).
-- **Config** — set from the app (a control in the Autopilot view): enable, time-of-day (server-local
-  `HH:MM`), days (default daily), auto-start on/off, and the cap. Persisted daemon-side.
+- **Config** — set from the app via a shared schedule modal, reachable from **two** places: a bar in
+  the Autopilot view and a card in **Settings → Todoist** (so it's configurable without leaving
+  Settings). Fields: enable, time-of-day (server-local `HH:MM`), days (default daily), auto-start
+  on/off, and the cap. Persisted daemon-side; a change in either surface (or pushed from another
+  device) refreshes both.
 - **Missed runs** — catch up on next startup: the loop computes the most recent scheduled fire at or
   before `now` and compares it to `lastRunAt`; if the daemon was down at the fire time it runs once
   shortly after coming back, then resumes. No separate "was I down?" bookkeeping.
