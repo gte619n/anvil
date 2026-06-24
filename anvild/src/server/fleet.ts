@@ -85,6 +85,19 @@ async function defaultRunTailscale(): Promise<string | null> {
   return null;
 }
 
+/**
+ * Resolve the base URL a freshly-paired member should be reached at, by probing its transport:
+ * https on the MagicDNS name (serve-capable host) first, then plain http (App-Store-Tailscale host
+ * that binds the tailnet IP directly). Defaults to http if neither answers (the member may still be
+ * starting up) so the registry has a usable entry. `host` is a bare MagicDNS name (no scheme).
+ */
+export async function resolveMemberUrl(host: string, port: number, probe: Probe = defaultProbe): Promise<string> {
+  for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
+    if (await probe(base)) return `${base}/`;
+  }
+  return `http://${host}:${port}/`;
+}
+
 async function defaultProbe(baseUrl: string): Promise<ProbeResult | null> {
   try {
     const res = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1500) });
@@ -129,12 +142,18 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
   }
 
   // Only online peers can answer a probe; offline known members are handled by the registry.
+  // A peer's transport depends on ITS host: serve-capable hosts answer over https on the MagicDNS
+  // name; App-Store-Tailscale hosts bind the tailnet IP directly and answer over plain http. So try
+  // https first, then http, and record whichever URL answered (server-side fetch isn't subject to
+  // the browser's ts.net HSTS, so http://<name> reaches a direct-bind peer fine).
   const targets = peers.filter((p) => p.online && p.dnsName);
   const probed = await Promise.all(
     targets.map(async (p) => {
-      const url = `https://${p.dnsName}:${opts.port}`;
-      const r = await probe(url);
-      return r ? { ...r, peer: p, url } : null;
+      for (const url of [`https://${p.dnsName}:${opts.port}`, `http://${p.dnsName}:${opts.port}`]) {
+        const r = await probe(url);
+        if (r) return { ...r, peer: p, url };
+      }
+      return null;
     }),
   );
 

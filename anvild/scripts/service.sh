@@ -48,16 +48,56 @@ build_web() {
   ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null )
 }
 
-# This host's Tailscale IPv4 (100.64.0.0/10), if any — the daemon binds it directly (no `tailscale
-# serve`). Found from interfaces, so it works even when the `tailscale` CLI doesn't.
+# This host's Tailscale IPv4 (100.64.0.0/10), if any. Found from interfaces, so it works even when
+# the `tailscale` CLI doesn't (the App Store build). Used as the plain-HTTP bind/URL fallback.
 tailnet_ip() {
   ifconfig 2>/dev/null | awk '/inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./{print $2; exit}'
 }
 
+# Locate a usable `tailscale` CLI (matches the daemon's TAILSCALE_BINS search order). Empty if none.
+TAILSCALE_BIN=""
+resolve_tailscale() {
+  [ -n "$TAILSCALE_BIN" ] && { echo "$TAILSCALE_BIN"; return 0; }
+  local c
+  for c in tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+    if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then TAILSCALE_BIN="$c"; echo "$c"; return 0; fi
+  done
+  return 1
+}
+
+# This host's MagicDNS name (trailing dot stripped), or empty if Tailscale/CLI is unavailable.
+magicdns_name() {
+  local ts; ts="$(resolve_tailscale)" || return 1
+  local bun; bun="$(find_bun)" || return 1
+  "$ts" status --json 2>/dev/null | "$bun" -e 'const s=JSON.parse(await Bun.stdin.text());process.stdout.write((s.Self?.DNSName||"").replace(/\.$/,""))' 2>/dev/null || true
+}
+
+# Adaptive transport (the ts.net name forces HTTPS in browsers, so plain HTTP only works by IP).
+# Try to front the daemon with `tailscale serve` (HTTPS on the MagicDNS name → loopback). If that
+# works (standalone Tailscale, operator configured), the daemon binds loopback and every client —
+# browser/WebView/fleet — uses https://<name>:PORT. If serve is unavailable (the sandboxed App
+# Store build), fall back to binding the tailnet IP directly over plain HTTP (use http://<ip>:PORT).
+# Sets SERVE_OK=1/0. Idempotent: `tailscale serve --bg` config persists across reboots.
+SERVE_OK=0
+setup_serve() {
+  SERVE_OK=0
+  local ts; ts="$(resolve_tailscale)" || { echo "tailscale CLI not found — daemon will bind the tailnet IP over plain HTTP"; return 0; }
+  if "$ts" serve --bg --https="$PORT" "http://127.0.0.1:$PORT" >/dev/null 2>&1 \
+     && "$ts" serve status 2>/dev/null | grep -q ":$PORT"; then
+    SERVE_OK=1
+    echo "tailscale serve active — daemon will bind loopback, reachable at https://<magicdns>:$PORT"
+  else
+    echo "tailscale serve unavailable (App Store Tailscale?) — daemon will bind the tailnet IP over plain HTTP"
+  fi
+}
+
+# Confirm the daemon answers, without needing to know the transport: in serve mode it binds
+# loopback, in direct mode it binds the tailnet IP — try both.
 wait_health() {
-  local ip; ip="$(tailnet_ip)"; ip="${ip:-127.0.0.1}"
+  local ip; ip="$(tailnet_ip)"
   for _ in $(seq 1 60); do
-    curl -fsS "http://$ip:$PORT/api/health" >/dev/null 2>&1 && return 0
+    curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && return 0
+    [ -n "$ip" ] && curl -fsS "http://$ip:$PORT/api/health" >/dev/null 2>&1 && return 0
     sleep 0.2
   done
   return 1
@@ -83,6 +123,14 @@ do_install() {
 
   build_web
 
+  # Decide the transport BEFORE writing the launcher: if serve is available we bind loopback so
+  # `tailscale serve` can own the tailnet :PORT over HTTPS; otherwise the daemon binds the tailnet
+  # IP itself (auto-detected) over plain HTTP. This is what makes the MagicDNS name usable in a
+  # browser (ts.net forces HTTPS) while still working on App Store Tailscale hosts.
+  setup_serve
+  local host_export=""
+  [ "$SERVE_OK" = "1" ] && host_export="export ANVIL_HOST=127.0.0.1"
+
   # launcher — sources the OAuth token, guarantees no metered key reaches the daemon (arch §3)
   cat > "$LAUNCHER" <<LAUNCH
 #!/bin/sh
@@ -92,8 +140,10 @@ set -a
 set +a
 unset ANTHROPIC_API_KEY
 unset ANTHROPIC_AUTH_TOKEN
-# Bind the tailnet IP directly (reachable over the tailnet via plain HTTP, no \`tailscale serve\`);
-# the daemon falls back to localhost if this host isn't on a tailnet. ANVIL_HOST can override.
+# Transport chosen by service.sh setup_serve: with \`tailscale serve\` active the daemon binds
+# loopback (serve fronts the tailnet port over HTTPS on the MagicDNS name); otherwise it binds the
+# tailnet IP directly over plain HTTP (auto-detected, App-Store-Tailscale safe). ANVIL_HOST overrides.
+$host_export
 export ANVIL_PORT=$PORT
 export ANVIL_MANAGED=launchd
 exec "$bun" run "$ANVILD_DIR/src/main.ts"
@@ -123,19 +173,21 @@ PLISTEOF
   launchctl bootstrap "$DOMAIN" "$PLIST"
   launchctl kickstart -k "$DOMAIN/$LABEL"
 
-  local bind_ip; bind_ip="$(tailnet_ip)"; bind_ip="${bind_ip:-127.0.0.1}"
   if wait_health; then
-    echo "healthy: $(curl -fsS "http://$bind_ip:$PORT/api/health")"
+    echo "healthy: $(curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health")"
   else
     echo "warning: not healthy yet — check $STATE_DIR/anvild.error.log"
   fi
 
-  # Reachable directly on the tailnet over plain HTTP — no `tailscale serve` (it can fail per-machine,
-  # e.g. the App Store Tailscale). WireGuard encrypts the hop; the daemon is bound to the tailnet IP.
-  if command -v tailscale >/dev/null 2>&1; then
-    local dns
-    dns="$(tailscale status --json 2>/dev/null | "$bun" -e 'const s=JSON.parse(await Bun.stdin.text());process.stdout.write((s.Self?.DNSName||"").replace(/\.$/,""))' 2>/dev/null || true)"
-    [ -n "$dns" ] && echo "URL: http://$dns:$PORT/"
+  # Print the URL clients should use for THIS host's transport: serve → HTTPS on the MagicDNS name
+  # (browser-friendly; ts.net forces HTTPS anyway); otherwise plain HTTP on the tailnet IP (the name
+  # can't be used over HTTP in a browser, so we print the IP). WireGuard encrypts the hop either way.
+  local dns; dns="$(magicdns_name)"
+  if [ "$SERVE_OK" = "1" ] && [ -n "$dns" ]; then
+    echo "URL: https://$dns:$PORT/"
+  else
+    local ip; ip="$(tailnet_ip)"
+    [ -n "$ip" ] && echo "URL: http://$ip:$PORT/  (the MagicDNS name forces HTTPS in browsers — use the IP for plain HTTP)"
   fi
   echo "installed $LABEL  (logs: $STATE_DIR/anvild.log)"
 }
@@ -143,8 +195,15 @@ PLISTEOF
 case "${1:-install}" in
   install)   do_install ;;
   uninstall) launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true; rm -f "$PLIST" "$LAUNCHER"; echo "removed $LABEL (state kept at $STATE_DIR)" ;;
-  restart)   build_web; launchctl kickstart -k "$DOMAIN/$LABEL"; wait_health && echo "restarted, healthy" || echo "restarted (health pending)" ;;
-  status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded"; curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null && echo || echo "no health" ;;
+  restart)
+    build_web
+    # Re-assert `tailscale serve` only if this install chose serve mode (loopback bind); doing it in
+    # direct-bind mode would create a tailnet :PORT listener that collides with the daemon's own bind.
+    grep -q 'ANVIL_HOST=127.0.0.1' "$LAUNCHER" 2>/dev/null && setup_serve >/dev/null 2>&1 || true
+    launchctl kickstart -k "$DOMAIN/$LABEL"
+    wait_health && echo "restarted, healthy" || echo "restarted (health pending)"
+    ;;
+  status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded"; { curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health" 2>/dev/null; } && echo || echo "no health" ;;
   logs)      tail -n 80 -f "$STATE_DIR/anvild.log" ;;
   *) echo "usage: service.sh {install|uninstall|restart|status|logs}"; exit 1 ;;
 esac

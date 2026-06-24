@@ -29,7 +29,7 @@ final class AppState: ObservableObject {
     do { try Auth.writeToken(token) } catch {
       return Pairing.PairReply(ok: false, serverId: nil, serverName: nil, error: "could not save token — \(error.localizedDescription)")
     }
-    Daemon.service(.install) { _ in } // the daemon binds the tailnet IP itself (service.sh) — no serve
+    Daemon.service(.install) { _ in } // service.sh sets up the transport (serve → https, else tailnet-IP http)
     return Pairing.PairReply(ok: true, serverId: nil, serverName: Tailscale.magicDNSName(), error: nil)
   }
 
@@ -80,9 +80,15 @@ final class AppState: ObservableObject {
     }
   }
 
-  /// No-op now: the daemon binds its tailnet IP directly (service.sh), so there's no `tailscale serve`
-  /// to set up. Kept so callers don't need to change.
-  func ensureServe() {}
+  /// Best-effort `tailscale serve` so the daemon is reachable over HTTPS on the MagicDNS name (browsers
+  /// force HTTPS on ts.net). `service.sh setup_serve` is the authority during install/restart; this is a
+  /// fallback for when the app manages the host directly (e.g. Tailscale logs in after install). Harmless
+  /// and idempotent; on the sandboxed App Store Tailscale it simply fails and the daemon stays on plain
+  /// HTTP at the tailnet IP.
+  func ensureServe() {
+    let port = Paths.port
+    DispatchQueue.global().async { Tailscale.serve(externalPort: port, localPort: port) }
+  }
 
   // MARK: - Fleet (join + rotation)
 
