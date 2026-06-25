@@ -326,6 +326,10 @@ function setSessionHash(id: string | null, push: boolean): void {
 const deepLinkedSession = sessionFromHash() || new URLSearchParams(location.search).get("session");
 let activeId: string | null = deepLinkedSession || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
+// The cid of a session.create we kicked off from the new-session dialog. The matching
+// session.created echoes this cid back to *us* only (other devices get it cid-less), so we can
+// jump straight into the session we just made without also hijacking sessions created elsewhere.
+let pendingCreateCid: string | null = null;
 window.addEventListener("popstate", () => {
   if (suppressPop > 0) {
     suppressPop--; // our own dismissOverlay() unwind — the layer is already torn down
@@ -885,7 +889,12 @@ function onEvent(url: string, e: ServerEvent): void {
       persistSessions();
       persistRouting();
       renderSessions();
-      if (!activeId) selectSession(e.session.id);
+      // Jump straight into a session we just created from the dialog (cid echoes back to the
+      // creator only). Otherwise only auto-open when nothing's active yet.
+      if (cid && cid === pendingCreateCid) {
+        pendingCreateCid = null;
+        selectSession(e.session.id);
+      } else if (!activeId) selectSession(e.session.id);
       return;
     case "session.updated":
       sessions.set(e.session.id, e.session);
@@ -1008,6 +1017,7 @@ function handleSessionEvent(e: ServerEvent): void {
       // session is actually mid-turn, the live status/message events that follow re-light it.
       finalizeActivity();
       snapshotLoaded.add(e.sessionId);
+      if (e.sessionId === activeId) maybeShowSessionHero(); // no messages yet → show the session title card
       saveConvoCache();
       return;
     case "message.user":
@@ -1086,6 +1096,7 @@ function renderConversationEvent(ev: ConversationEvent): void {
 
 // ── Conversation rendering ─────────────────────────────────────────────────────
 function bubble(role: string): HTMLElement {
+  dropSessionHero(); // real content arriving — retire the blank-session title card
   const el = document.createElement("div");
   el.className = `bubble ${role}`;
   conversation.appendChild(el);
@@ -1194,6 +1205,7 @@ function renderStream(): void {
 const THINK_LABEL: Record<string, string> = { thinking: "Thinking", running_tool: "Working", running: "Working" };
 function showThinking(status: string): void {
   if (activityLive) return; // the live activity block already shows running state
+  dropSessionHero(); // a turn is starting — retire the blank-session title card
   if (!thinkingEl) {
     thinkingEl = document.createElement("div");
     thinkingEl.className = "thinking";
@@ -1320,6 +1332,7 @@ function resetActivity(): void {
 }
 function ensureActivity(): HTMLDetailsElement {
   if (activityEl && activityEl.isConnected) return activityEl;
+  dropSessionHero(); // a turn's activity block is appearing — retire the blank-session title card
   const d = document.createElement("details");
   d.className = "activity live";
   d.innerHTML =
@@ -1533,6 +1546,48 @@ function renderEmptyState(): void {
   // inlined (not a top-level const) so it's safe to call during early module init
   conversation.innerHTML =
     `<div class="empty-state"><img src="/anvil.svg" class="empty-art" alt="Anvil" width="132" height="132" /><p>Select a session, or create a new one.</p></div>`;
+}
+
+// ── Session hero (blank-conversation placeholder) ────────────────────────────────
+// A freshly created session has no messages yet. Rather than a void, fill the conversation with a
+// big, colour-coded title card — the session's icon, name, environment and branch — so it's always
+// unmistakable which session (and project) you're about to talk to. Removed the instant any real
+// content lands (see dropSessionHero in the content-append paths).
+function dropSessionHero(): void {
+  conversation.querySelector(".session-hero")?.remove();
+}
+/** Show the hero iff `activeId` is set and the conversation holds nothing but (optionally) the hero. */
+function maybeShowSessionHero(): void {
+  if (!activeId) return;
+  const s = sessions.get(activeId);
+  if (!s) return;
+  // Any non-hero child means there's real content (a bubble, activity, card, thinking dots) — no hero.
+  if ([...conversation.children].some((c) => !c.classList.contains("session-hero"))) return;
+  dropSessionHero(); // avoid stacking duplicates on repeated calls
+  const env = s.environmentId ? environments.get(s.environmentId) : undefined;
+  const theme = currentTheme();
+  const ord = envOrdinal(s, sessions.values());
+  const accent = env ? stripeColor(env, ord, theme) : "var(--accent)";
+  const bg = env ? sessionBg(env, ord, theme) : "var(--panel)";
+  const branch = !s.isDefault ? s.git?.branch : undefined;
+  const srv = serverOf(s.id);
+  const multi = orderedServers().length > 1;
+  const chip = (ic: string, text: string): string => `<span class="hero-chip">${icon(ic)}<span>${esc(text)}</span></span>`;
+  const chips = [
+    env ? chip("dashboard", env.name) : "",
+    branch ? chip("account_tree", branch) : "",
+    chip("smart_toy", s.model),
+    multi && srv ? chip("dns", srv.name) : "",
+  ].join("");
+  const hero = document.createElement("div");
+  hero.className = "session-hero empty-state"; // empty-state → margin:auto centers it; also stripped from the cache
+  hero.style.setProperty("--hero-accent", accent);
+  hero.style.setProperty("--hero-bg", bg);
+  hero.innerHTML = `<div class="hero-emblem">${icon(sessIcon(s))}</div>
+    <h1 class="hero-title">${esc(s.title)}</h1>
+    <div class="hero-meta">${chips}</div>
+    <p class="hero-hint">${s.pending ? "Queued — will start when you're back online." : "Send a message to get started."}</p>`;
+  conversation.appendChild(hero);
 }
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
@@ -2992,6 +3047,8 @@ function selectSession(id: string, push = true): void {
   if (cached) {
     conversation.innerHTML = cached; // instant, replaced by the snapshot below
     scrollDown();
+  } else {
+    maybeShowSessionHero(); // fresh/empty session: show its title card now (no flash before the snapshot)
   }
   renderSessions();
   const s = sessions.get(id);
@@ -3867,14 +3924,16 @@ function showNewSession(): void {
       model: DEFAULT_MODEL,
       autonomy: selectedAutonomy(),
     };
+    const cid = newCid();
     const cmd = env.isRepo
-      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", ...common }
-      : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, ...common };
+      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", cid, ...common }
+      : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, cid, ...common };
     const srv = serverOfEnv(env.id); // the session is created on the env's server
     if (srv.sock.isOpen()) {
+      pendingCreateCid = cid; // jump into this session when its session.created lands (see onEvent)
       srv.sock.send(cmd);
     } else {
-      createOfflineSession(cmd, env, name, srv.url);
+      createOfflineSession(cmd, env, name, srv.url); // offline path selects the optimistic session itself
     }
     closeModal();
   });
@@ -4086,6 +4145,7 @@ const permCards = new Map<string, HTMLElement>();
 
 function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[]): void {
   if (permCards.has(requestId)) return; // already shown (re-attach replay)
+  dropSessionHero(); // a request landed in a blank session — retire the title card
   hideThinking(); // the turn is parked on this decision, not working
   const card = document.createElement("div");
   card.className = "bubble permission";
@@ -4138,6 +4198,7 @@ const questionCards = new Map<string, HTMLElement>();
 
 function showQuestion(requestId: string, questions: Question[]): void {
   if (questionCards.has(requestId)) return; // already shown (re-attach replay)
+  dropSessionHero(); // a question landed in a blank session — retire the title card
   hideThinking(); // the turn is parked on the answer, not working
   const card = document.createElement("div");
   card.className = "bubble question";
