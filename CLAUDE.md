@@ -2,7 +2,7 @@
 
 Sessions run inside a **git worktree** under `~/.anvil/worktrees/<session-id>` (or
 `.claude/worktrees/...`), branched off `main`. `main` itself is checked out by the canonical
-clone at `~/Development/zellij-android`. Two worktree facts follow from that and cause most of
+clone at `~/Development/anvil`. Two worktree facts follow from that and cause most of
 the end-of-session friction — handle them as below.
 
 ## Merging a session's PR
