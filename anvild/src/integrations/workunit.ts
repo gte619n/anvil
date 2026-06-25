@@ -20,6 +20,7 @@ export interface WorkUnit {
   summary?: string; // 1–2 line description for the Autopilot card (planner-emitted)
   effort?: AutopilotEffort; // rough size + files-touched estimate for the card (planner-emitted)
   status: AnvilStatus; // mirrors the anvil:* label kept on the member tasks
+  source?: "project" | "label"; // how the unit was sourced: a linked project (default) or the Autopilot label
   sessionId?: string; // the worktree session implementing it, once started
   prUrl?: string; // PR opened after validation passes
   validation?: { passed: boolean; log?: string; at?: string }; // last validation result

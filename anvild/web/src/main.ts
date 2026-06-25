@@ -2289,6 +2289,7 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     <span class="plan-meta">
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
+      ${p.source === "label" ? `<span class="ap-chip ap-chip-label">${icon("label")}via label</span>` : ""}
       <span class="ap-chip status-${esc(p.status)}">${esc(p.status)}</span>
     </span>
   </button>`;
@@ -2358,7 +2359,11 @@ function openPlan(id: string): void {
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
       <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
       <span class="plan-reader-actions">
+        <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
+        <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
+        <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign env</button>
+        <button class="mini" id="plan-link">${icon("link")} Link to session</button>
         <button class="primary" id="plan-start">${icon("rocket_launch")} Create session &amp; start</button>
       </span>
     </div>
@@ -2376,7 +2381,11 @@ function openPlan(id: string): void {
     </div>
   </div>`;
   $("#plan-back").addEventListener("click", () => renderAutopilotGrid());
+  $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
+  $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
   $("#plan-dismiss").addEventListener("click", () => void dismissPlan(id));
+  $("#plan-reassign").addEventListener("click", () => void reassignPlan(id));
+  $("#plan-link").addEventListener("click", () => void linkPlanToSession(id));
   $("#plan-start").addEventListener("click", () => void startPlan(id));
   $("#plan-refine-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -2459,6 +2468,38 @@ async function dismissPlan(id: string): Promise<void> {
   }
 }
 
+/** Mark a plan completed or expired and drop its card. Offers to also close the linked Todoist
+ *  task(s) — defaulted on for "completed" (the work is done), off for "expired". */
+async function resolvePlan(id: string, status: "completed" | "expired"): Promise<void> {
+  const p = findPlan(id);
+  const verb = status === "completed" ? "Complete" : "Expire";
+  const res = await confirmDialogWithOption({
+    title: `Mark this plan ${status}?`,
+    body: `“${p?.title ?? "This plan"}” will be labelled anvil:${status} and removed from the pending grid.`,
+    confirmLabel: verb,
+    icon: status === "completed" ? "check_circle" : "schedule",
+    optionLabel: "Also close the linked task(s) in Todoist",
+    optionChecked: status === "completed",
+  });
+  if (!res.ok) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  try {
+    const reply = await sendAwait(srv, { type: "autopilot.resolve", workUnitId: id, status, closeTodoist: res.checked, cid: newCid() }, 60_000);
+    if (reply.type === "command.error") {
+      toast(reply.message);
+      return;
+    }
+    toast(res.checked ? `Plan ${status} · Todoist task closed` : `Plan ${status}`);
+    renderAutopilotGrid(); // the broadcast also refreshes, but don't wait on it
+  } catch (err) {
+    toast(`${verb} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function startPlan(id: string): Promise<void> {
   const srv = planSock(id);
   if (!srv?.sock.isOpen()) {
@@ -2493,6 +2534,95 @@ async function startPlan(id: string): Promise<void> {
   } catch (err) {
     toast(`Couldn't start: ${err instanceof Error ? err.message : String(err)}`);
     reset();
+  }
+}
+
+/** Attach a plan to an existing session that's already doing the work instead of spawning a new one.
+ *  Offers the active sessions in the plan's environment; on pick, links and jumps to that session
+ *  (the card then leaves the grid, exactly like Go). */
+async function linkPlanToSession(id: string): Promise<void> {
+  const p = findPlan(id);
+  if (!p) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  // Active sessions on the plan's server, in the same environment (concierge/archived excluded).
+  const candidates = [...sessions.values()].filter(
+    (s) => !s.isDefault && !s.archived && s.environmentId === p.environmentId && sessionServer.get(s.id) === srv.url,
+  );
+  if (!candidates.length) {
+    toast("No active session in this plan's environment to link to");
+    return;
+  }
+  const sid = await pickListDialog(
+    `Link “${p.title}” to…`,
+    candidates.map((s) => ({ id: s.id, label: s.title || s.id, icon: s.icon ?? "terminal" })),
+  );
+  if (!sid) return;
+  try {
+    const res = await sendAwait(srv, { type: "autopilot.link", workUnitId: id, sessionId: sid, cid: newCid() }, 60_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type !== "autopilot.started") return;
+    dismissOverlay("autopilot");
+    selectSession(res.sessionId);
+  } catch (err) {
+    toast(`Link failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Reassign a (possibly mis-routed, e.g. label-sourced) plan to a different environment and re-evaluate
+ *  it against that repo. Picks from the environments on the plan's server; updates the open reader in
+ *  place when the replan returns (the slow part — a fresh read-only Opus pass). */
+async function reassignPlan(id: string): Promise<void> {
+  const p = findPlan(id);
+  if (!p) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  const candidates = [...environments.values()].filter((e) => envServer.get(e.id) === srv.url && e.id !== p.environmentId);
+  if (!candidates.length) {
+    toast("No other environment on this server to reassign to");
+    return;
+  }
+  const envId = await pickListDialog(
+    `Re-evaluate “${p.title}” against…`,
+    candidates.map((e) => ({ id: e.id, label: e.name, icon: "folder" })),
+    "swap_horiz",
+  );
+  if (!envId) return;
+  const doc = document.getElementById("plan-doc");
+  const btn = document.getElementById("plan-reassign") as HTMLButtonElement | null;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `${icon("hourglass_empty")} Re-evaluating…`;
+  }
+  doc?.classList.add("dim");
+  try {
+    // A reassign re-plans the unit against the new repo (read-only Opus) — allow the same generous
+    // budget as refine rather than the default short cap.
+    const res = await sendAwait(srv, { type: "autopilot.reassign", workUnitId: id, environmentId: envId, cid: newCid() }, 600_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type !== "autopilot.plan") return;
+    toast("Plan re-evaluated");
+    if (doc && res.plan.plan) doc.innerHTML = res.plan.plan.html; // refresh the reader in place (grid re-flows via broadcast)
+  } catch (err) {
+    toast(`Reassign failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    doc?.classList.remove("dim");
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("swap_horiz")} Reassign env`;
+    }
   }
 }
 
@@ -2590,6 +2720,11 @@ function openScheduleModal(): void {
   const dayBtns = DAY_LABEL.map(
     (d, i) => `<button type="button" class="ap-day${days.has(i) ? " on" : ""}" data-day="${i}">${d}</button>`,
   ).join("");
+  // The label-sourcing catch-all targets one of the hub's environments (the schedule modal is hub-scoped).
+  const hubEnvs = [...environments.values()].filter((e) => envServer.get(e.id) === HUB_URL);
+  const envOptions =
+    `<option value="">— none —</option>` +
+    hubEnvs.map((e) => `<option value="${esc(e.id)}"${e.id === s.defaultEnvironmentId ? " selected" : ""}>${esc(e.name)}</option>`).join("");
   const m = document.createElement("div");
   m.className = "modal";
   const toggle = (id: string, on: boolean, label: string): string =>
@@ -2602,6 +2737,8 @@ function openScheduleModal(): void {
       <div class="ap-field"><span>Days</span><div class="ap-days" id="ap-days">${dayBtns}</div></div>
       ${toggle("ap-autostart", s.autoStart, "Auto-start sessions for new plans")}
       <label class="ap-field-row"><span>Auto-start at most</span><input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /><span class="small muted">per run (the rest wait for manual launch; skipped while the budget is in its warn zone)</span></label>
+      <label class="ap-field-row"><span>Autopilot label</span><input type="text" id="ap-label" value="${esc(s.label ?? "")}" placeholder="Autopilot" /><span class="small muted">tasks with this Todoist label are pulled in from <b>any</b> project (blank = off)</span></label>
+      <label class="ap-field-row"><span>Default environment</span><select id="ap-defenv">${envOptions}</select><span class="small muted">where label-sourced tasks are planned &amp; built — always review-only</span></label>
     </div>
     <div class="btns"><button type="button" id="ap-sched-cancel">Cancel</button><button type="button" id="ap-sched-save" class="primary">Save</button></div></div>`;
   showModal(m);
@@ -2632,8 +2769,10 @@ async function saveSchedule(): Promise<void> {
   const on = [...document.querySelectorAll<HTMLElement>("#ap-days .ap-day.on")].map((b) => Number(b.dataset.day));
   // all 7 selected → send [] (every day); none selected → keep it simple and treat as every day too
   const days = on.length === 0 || on.length === 7 ? [] : on.sort((a, b) => a - b);
+  const label = $<HTMLInputElement>("#ap-label").value.trim();
+  const defaultEnvironmentId = $<HTMLSelectElement>("#ap-defenv").value;
   try {
-    const res = await sendAwait(hub(), { type: "autopilot.schedule.set", enabled, timeOfDay, days, autoStart, maxAutoStart, cid: newCid() }, 20_000);
+    const res = await sendAwait(hub(), { type: "autopilot.schedule.set", enabled, timeOfDay, days, autoStart, maxAutoStart, label, defaultEnvironmentId, cid: newCid() }, 20_000);
     if (res.type === "command.error") {
       toast(res.message);
       return;
@@ -4331,5 +4470,96 @@ function confirmDialog(opts: { title: string; body?: string; confirmLabel?: stri
     });
     // Focus a default button so Enter confirms; a destructive dialog defaults to the safe Cancel.
     (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+  });
+}
+
+/** Like confirmDialog, but with one extra checkbox toggle. Resolves { ok, checked }; cancelling
+ *  (button, Escape, Back, backdrop) resolves { ok:false } and the checkbox state is irrelevant. */
+function confirmDialogWithOption(opts: {
+  title: string;
+  body?: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  icon?: string;
+  optionLabel: string;
+  optionChecked?: boolean;
+}): Promise<{ ok: boolean; checked: boolean }> {
+  return new Promise((resolve) => {
+    const m = document.createElement("div");
+    m.className = "modal";
+    m.innerHTML = `<div class="modal-box">
+      <h3>${opts.icon ? icon(opts.icon) + " " : ""}${esc(opts.title)}</h3>
+      ${opts.body ? `<p class="small muted">${esc(opts.body)}</p>` : ""}
+      <label class="cd-option"><input type="checkbox" id="cd-option"${opts.optionChecked ? " checked" : ""}> ${esc(opts.optionLabel)}</label>
+      <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
+    </div>`;
+    showModal(m);
+    const checked = (): boolean => $<HTMLInputElement>("#cd-option").checked;
+    let settled = false;
+    const done = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok, checked: ok && checked() }); // resolve BEFORE teardown so the explicit choice wins
+      closeModal();
+    };
+    // Any other dismissal (Escape, device Back, backdrop tap) counts as Cancel and must resolve so the
+    // awaiting caller doesn't hang — mirror confirmDialog's overlay-close augmentation.
+    const top = overlays[overlays.length - 1];
+    if (top && top.name === "modal") {
+      const origClose = top.close;
+      top.close = () => {
+        origClose();
+        if (!settled) {
+          settled = true;
+          resolve({ ok: false, checked: false });
+        }
+      };
+    }
+    $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
+    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
+    m.addEventListener("click", (e) => {
+      if (e.target === m) done(false); // click backdrop to cancel
+    });
+    (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+  });
+}
+
+/** Pick one item from a list (link a plan to a session, reassign a plan's environment, …). Resolves the
+ *  chosen id, or null if cancelled (button, Escape, Back, backdrop). */
+function pickListDialog(title: string, items: { id: string; label: string; icon?: string }[], headIcon = "link"): Promise<string | null> {
+  return new Promise((resolve) => {
+    const m = document.createElement("div");
+    m.className = "modal";
+    m.innerHTML = `<div class="modal-box">
+      <h3>${icon(headIcon)} ${esc(title)}</h3>
+      <div class="pick-list">${items
+        .map((it) => `<button type="button" class="pick-item" data-id="${esc(it.id)}">${icon(it.icon ?? "terminal")} ${esc(it.label || it.id)}</button>`)
+        .join("")}</div>
+      <div class="btns"><button type="button" id="cd-cancel">Cancel</button></div>
+    </div>`;
+    showModal(m);
+    let settled = false;
+    const done = (v: string | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v); // resolve BEFORE teardown so the explicit choice wins over cancel-on-close
+      closeModal();
+    };
+    const top = overlays[overlays.length - 1];
+    if (top && top.name === "modal") {
+      const origClose = top.close;
+      top.close = () => {
+        origClose();
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      };
+    }
+    m.querySelectorAll<HTMLElement>(".pick-item").forEach((b) => (b.onclick = () => done(b.dataset.id!)));
+    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(null);
+    m.addEventListener("click", (e) => {
+      if (e.target === m) done(null); // click backdrop to cancel
+    });
   });
 }

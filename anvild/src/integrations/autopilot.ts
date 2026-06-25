@@ -233,6 +233,59 @@ export async function planAndTagProject(
 }
 
 /**
+ * Phase 2A for label-sourced tasks: bundle + plan an explicit task list (gathered account-wide by the
+ * Autopilot label, not a single project) against the catch-all environment. Same persistence/tag/comment
+ * side effects as planAndTagProject, but each unit is marked `source: "label"` and carries the first
+ * member's own project id. Caller is responsible for excluding tasks already covered by a linked project.
+ */
+export async function planAndTagTasks(
+  deps: { client: TodoistClient; workUnits: WorkUnitStore },
+  opts: {
+    environmentId: string;
+    repoRoot: string;
+    repoName?: string;
+    tasks: TodoistTask[];
+    bundleModel?: Model;
+    planModel?: Model;
+    onProgress?: (msg: string) => void;
+  },
+): Promise<{ created: WorkUnit[]; skipped: number }> {
+  const log = opts.onProgress ?? (() => {});
+  const candidates = candidateTasks(opts.tasks, deps.workUnits);
+  const skipped = opts.tasks.length - candidates.length;
+  log(`${opts.tasks.length} labelled tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
+  if (candidates.length === 0) return { created: [], skipped };
+
+  const units = await bundleTasks(candidates, [], { model: opts.bundleModel, repoName: opts.repoName });
+  log(`Bundled into ${units.length} units. Planning + tagging…`);
+  const created: WorkUnit[] = [];
+  for (const [i, unit] of units.entries()) {
+    log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot });
+    const wu = deps.workUnits.create({
+      environmentId: opts.environmentId,
+      todoistProjectId: planned.tasks[0]?.project_id ?? "",
+      taskIds: planned.taskIds,
+      title: planned.title,
+      rationale: planned.rationale,
+      plan: planned.plan,
+      summary: planned.summary,
+      effort: planned.effort,
+      status: "planned",
+      source: "label",
+    });
+    for (const [j, t] of planned.tasks.entries()) {
+      await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
+      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
+      else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
+    }
+    created.push(wu);
+  }
+  log(`Created ${created.length} planned work units from the Autopilot label.`);
+  return { created, skipped };
+}
+
+/**
  * Dry-run BUNDLE+PLAN for a linked project: pull active tasks, bundle, and plan each unit.
  * Writes nothing. Returns the planned units for inspection.
  */

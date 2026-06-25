@@ -50,9 +50,9 @@ import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
-import { TodoistClient } from "../integrations/todoist";
+import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { withStatus } from "../integrations/status";
-import { planAndTagProject, refinePlanQuery } from "../integrations/autopilot";
+import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
 import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
@@ -334,6 +334,7 @@ export class Supervisor {
       ...(u.rationale ? { rationale: u.rationale } : {}),
       ...(u.summary ? { summary: u.summary } : {}),
       status: u.status,
+      ...(u.source ? { source: u.source } : {}),
       ...(u.effort ? { effort: u.effort } : {}),
       taskCount: u.taskIds.length,
       ...(u.plan ? { plan: this.renderer.render(u.plan) } : {}),
@@ -373,6 +374,44 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
   }
 
+  /** Reassign a plan to a different environment (repo) and re-evaluate it there: re-plan the unit's
+   *  existing tasks against the new repo, persist the fresh plan/summary/effort, note it on Todoist,
+   *  broadcast, and return the updated plan. Used to correct a mis-routed (e.g. label-sourced) plan. */
+  async reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session; can't reassign it");
+    const env = this.envStore.get(environmentId);
+    if (!env) throw new BadCommand("no such environment");
+    if (env.id === u.environmentId) throw new BadCommand("the plan is already in that environment");
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
+    const client = new TodoistClient(state.accessToken);
+    const tasks: TodoistTask[] = [];
+    for (const id of u.taskIds) {
+      try {
+        tasks.push(await client.getTask(id));
+      } catch {
+        /* skip a deleted/closed task */
+      }
+    }
+    if (tasks.length === 0) throw new BadCommand("this plan has no live tasks to re-evaluate");
+    const planned = await planUnit(
+      { title: u.title, rationale: u.rationale ?? "", taskIds: tasks.map((t) => t.id) },
+      tasks,
+      { repoRoot: env.repoRoot },
+    );
+    const updated = this.workUnits.update(u.id, {
+      environmentId: env.id,
+      plan: planned.plan,
+      ...(planned.summary ? { summary: planned.summary } : {}),
+      ...(planned.effort ? { effort: planned.effort } : {}),
+    });
+    void this.postPlanComment(u, `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.plan}`);
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
+  }
+
   /** Reject a plan: label its member tasks `anvil:dismissed` (so the nightly run skips them) and
    *  drop the card. Best-effort on the Todoist side — the local status change is authoritative. */
   async dismissPlan(workUnitId: string): Promise<void> {
@@ -391,6 +430,29 @@ export class Supervisor {
       }
     }
     this.workUnits.update(u.id, { status: "dismissed" });
+    this.broadcastAutopilotPlans();
+  }
+
+  /** Mark a plan completed or expired: relabel its member tasks (anvil:completed / anvil:expired) and,
+   *  when `closeTodoist`, close them in Todoist too. Drops the card (status is no longer "planned").
+   *  Best-effort on the Todoist side — the local status change is authoritative. */
+  async resolvePlan(workUnitId: string, status: "completed" | "expired", closeTodoist: boolean): Promise<void> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const state = this.integrations.todoist();
+    if (state?.accessToken) {
+      const client = new TodoistClient(state.accessToken);
+      for (const taskId of u.taskIds) {
+        try {
+          const t = await client.getTask(taskId);
+          await client.setTaskLabels(taskId, withStatus(t.labels, status));
+          if (closeTodoist) await client.closeTask(taskId);
+        } catch {
+          /* a deleted/closed task — skip it, the local status still drops the card */
+        }
+      }
+    }
+    this.workUnits.update(u.id, { status });
     this.broadcastAutopilotPlans();
   }
 
@@ -418,6 +480,22 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
   }
 
+  /** Link a plan to an existing session that's already doing the work, instead of spawning a new one
+   *  via Go. Sets the unit's sessionId + status building and tags its tasks — the card then leaves the
+   *  pending grid, exactly like startPlan. The session must belong to the plan's environment. */
+  linkPlan(workUnitId: string, sessionId: string, cid?: string): AutopilotStartedEvent {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new BadCommand("no such session");
+    if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
+    this.workUnits.update(u.id, { sessionId, status: "building" });
+    void this.tagTasks(u, "building");
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
+  }
+
   /** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */
   private autopilotBrief(u: WorkUnit): string {
     const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
@@ -442,7 +520,12 @@ export class Supervisor {
     const envs = this.envStore
       .list()
       .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
-    if (envs.length === 0) throw new BadCommand("no environments are linked to a Todoist project");
+    const schedule = this.autopilotSchedule.get();
+    const defaultEnv = schedule.defaultEnvironmentId ? this.envStore.get(schedule.defaultEnvironmentId) : undefined;
+    // The account-wide Autopilot-label pass runs only on a full run (no single-env scope) and needs both a
+    // label and a resolvable catch-all environment configured.
+    const labelPass = !opts.environmentId && !!schedule.label && !!defaultEnv;
+    if (envs.length === 0 && !labelPass) throw new BadCommand("no environments are linked to a Todoist project");
     const deps = { client, workUnits: this.workUnits };
     const log: string[] = [];
     const emit = (line: string): void => {
@@ -466,14 +549,36 @@ export class Supervisor {
         createdUnits.push(...res.created);
         skipped += res.skipped;
       }
+      // Account-wide label pass: pull every @<label> task, drop those a linked project already covers
+      // (coexist + dedup), and plan the rest against the catch-all env. These are review-only (below).
+      if (labelPass && defaultEnv && schedule.label) {
+        emit(`▸ @${schedule.label} → ${defaultEnv.name}`);
+        const linkedProjectIds = new Set(
+          this.envStore.list().map((e) => e.todoistProjectId).filter((id): id is string => !!id),
+        );
+        const labelled = await client.tasksByLabel(schedule.label);
+        const external = labelled.filter((t) => !linkedProjectIds.has(t.project_id));
+        emit(`  ${labelled.length} @${schedule.label} task(s) · ${external.length} outside linked projects.`);
+        const res = await planAndTagTasks(deps, {
+          environmentId: defaultEnv.id,
+          repoRoot: defaultEnv.repoRoot,
+          repoName: defaultEnv.name,
+          tasks: external,
+          onProgress: emit,
+        });
+        createdUnits.push(...res.created);
+        skipped += res.skipped;
+      }
       // Auto-start the new units, capped, and only when the subscription budget is healthy — an
-      // unattended run must never spawn a swarm of sessions or exhaust the weekly window.
-      if (opts.autoStart && createdUnits.length) {
+      // unattended run must never spawn a swarm of sessions or exhaust the weekly window. Label-sourced
+      // units are never auto-started (they may be mis-routed to the catch-all env → always review first).
+      const autoStartable = createdUnits.filter((u) => u.source !== "label");
+      if (opts.autoStart && autoStartable.length) {
         if (this.budget().warn) {
           emit("⏸ Auto-start skipped — subscription budget is in its warn zone; plans left for review.");
         } else {
           const cap = opts.maxAutoStart ?? 3;
-          for (const u of createdUnits.slice(0, cap)) {
+          for (const u of autoStartable.slice(0, cap)) {
             try {
               this.startPlan(u.id);
               started++;
@@ -482,7 +587,7 @@ export class Supervisor {
               emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
             }
           }
-          if (createdUnits.length > cap) emit(`${createdUnits.length - cap} more plan(s) left for manual review (cap ${cap}).`);
+          if (autoStartable.length > cap) emit(`${autoStartable.length - cap} more plan(s) left for manual review (cap ${cap}).`);
         }
       }
     } finally {

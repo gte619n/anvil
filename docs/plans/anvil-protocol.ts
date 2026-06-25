@@ -382,7 +382,7 @@ export interface AutopilotEffort {
 }
 /** The anvil autopilot's status, mirrored from the `anvil:*` Todoist labels. Kept in lockstep with
  *  STATUSES in src/integrations/status.ts (the server is the source of truth). */
-export type AnvilStatus = "planned" | "building" | "review" | "blocked" | "dismissed";
+export type AnvilStatus = "planned" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
 /** A pending (or just-started) autopilot work unit, shaped for the Autopilot card grid + reader. */
 export interface AutopilotPlanInfo {
   id: string; // WorkUnit id
@@ -393,6 +393,7 @@ export interface AutopilotPlanInfo {
   rationale?: string;
   summary?: string; // 1–2 line description for the card
   status: AnvilStatus;
+  source?: "project" | "label"; // "label" = pulled in account-wide by the Autopilot label (catch-all env)
   effort?: AutopilotEffort;
   taskCount: number; // Todoist tasks bundled into the unit
   plan?: RenderedMarkdown; // full implementation plan (source + sanitized HTML) for the reader
@@ -443,6 +444,10 @@ export interface AutopilotSchedule {
   autoStart: boolean; // after planning, also start worktree sessions for the new units
   maxAutoStart?: number; // cap how many sessions a single run may auto-start (default 3)
   lastRunAt?: Iso8601; // server-set: when the scheduler last fired (read-only to clients)
+  // ── Account-wide label sourcing (autopilot-wide settings, carried on the same config object) ──
+  label?: string; // a Todoist label (default "Autopilot"): tasks carrying it are pulled in from ANY
+  // project, bundled against `defaultEnvironmentId`, and left for review (never auto-started).
+  defaultEnvironmentId?: string; // catch-all environment label-sourced tasks are planned/built against
 }
 /** The current schedule — answer to `autopilot.schedule.get`/`.set` (cid) and broadcast on change. */
 export interface AutopilotScheduleEvent extends Envelope {
@@ -871,6 +876,22 @@ export interface AutopilotStartCmd extends Envelope, Correlated {
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "bypass" (auto-start working without permission stalls)
 }
+export interface AutopilotResolveCmd extends Envelope, Correlated {
+  type: "autopilot.resolve"; // mark a plan completed/expired (drops the card); optionally close its Todoist tasks
+  workUnitId: string;
+  status: "completed" | "expired";
+  closeTodoist: boolean; // also close the member tasks in Todoist (not just relabel them)
+}
+export interface AutopilotLinkCmd extends Envelope, Correlated {
+  type: "autopilot.link"; // attach a plan to an existing session already doing the work → autopilot.started
+  workUnitId: string;
+  sessionId: string; // an active session in the plan's environment
+}
+export interface AutopilotReassignCmd extends Envelope, Correlated {
+  type: "autopilot.reassign"; // move a plan to a different environment and re-evaluate it there → autopilot.plan
+  workUnitId: string;
+  environmentId: string; // the environment (repo) to re-plan the unit's tasks against
+}
 export interface AutopilotRunCmd extends Envelope, Correlated {
   type: "autopilot.run"; // re-plan linked Todoist projects on this server → autopilot.run.result
   environmentId?: string; // limit to one environment; omitted = every linked environment
@@ -885,6 +906,8 @@ export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   days?: number[];
   autoStart?: boolean;
   maxAutoStart?: number;
+  label?: string; // "" clears it (disables label sourcing)
+  defaultEnvironmentId?: string; // "" clears it
 }
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
@@ -970,6 +993,9 @@ export type ClientCommand =
   | AutopilotRefineCmd
   | AutopilotDismissCmd
   | AutopilotStartCmd
+  | AutopilotResolveCmd
+  | AutopilotLinkCmd
+  | AutopilotReassignCmd
   | AutopilotRunCmd
   | AutopilotScheduleGetCmd
   | AutopilotScheduleSetCmd

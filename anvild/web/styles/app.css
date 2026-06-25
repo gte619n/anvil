@@ -436,6 +436,11 @@ details.tool-result.error > summary { color: var(--danger); }
 .modal-box pre { background: var(--tool-bg); padding: 8px; border-radius: 8px; overflow-x: auto; max-height: 220px; }
 .modal-box label { display: block; margin: 10px 0; font-size: 13px; }
 .modal-box input, .modal-box select { width: 100%; padding: 7px; margin-top: 4px; border: 1px solid var(--border); border-radius: 8px; font: inherit; }
+.modal-box label.cd-option { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.modal-box label.cd-option input { width: auto; margin: 0; flex: none; }
+.pick-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; max-height: 320px; overflow-y: auto; }
+.pick-item { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; text-align: left; }
+.pick-item:hover { background: var(--panel); border-color: var(--muted); }
 .modal-box .btns { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 14px; }
 .modal-box .btns button { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-weight: 600; transition: background 0.12s, border-color 0.12s; }
 .modal-box .btns button:hover { background: var(--panel); border-color: var(--muted); }
@@ -608,6 +613,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-chip.status-building { color: #f2c037; border-color: #f2c03766; }
 .ap-chip.status-review { color: #21ba45; border-color: #21ba4566; }
 .ap-chip.status-blocked, .ap-chip.status-dismissed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.ap-chip.ap-chip-label { color: #8e7cc3; border-color: #8e7cc366; }
+.ap-chip.status-completed { color: #21ba45; border-color: #21ba4566; }
+.ap-chip.status-expired { color: var(--muted); border-color: var(--border); text-decoration: line-through; }
 .ap-chip.eff-xs, .ap-chip.eff-s { color: #21ba45; }
 .ap-chip.eff-m { color: #f2c037; }
 .ap-chip.eff-l, .ap-chip.eff-xl { color: #e8703a; }

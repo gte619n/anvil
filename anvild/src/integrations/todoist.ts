@@ -140,6 +140,11 @@ export class TodoistClient {
     return this.getAll<TodoistTask>("/tasks", projectId ? { project_id: projectId } : {});
   }
 
+  /** Active tasks carrying `label` (by name), across EVERY project in the account. */
+  tasksByLabel(label: string): Promise<TodoistTask[]> {
+    return this.getAll<TodoistTask>("/tasks", { label });
+  }
+
   getTask(taskId: string): Promise<TodoistTask> {
     return this.request<TodoistTask>("GET", `/tasks/${taskId}`);
   }

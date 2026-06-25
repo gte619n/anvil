@@ -296,6 +296,26 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         send(deps.supervisor.startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid));
         return;
 
+      case "autopilot.resolve":
+        deps.supervisor
+          .resolvePlan(cmd.workUnitId, cmd.status, cmd.closeTodoist)
+          .then(() => {
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "autopilot.link":
+        send(deps.supervisor.linkPlan(cmd.workUnitId, cmd.sessionId, cid));
+        return;
+
+      case "autopilot.reassign":
+        deps.supervisor
+          .reassignPlan(cmd.workUnitId, cmd.environmentId, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "autopilot.run":
         deps.supervisor
           .runAutopilot({
