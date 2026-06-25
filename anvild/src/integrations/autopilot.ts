@@ -27,7 +27,17 @@ export interface PlannedUnit extends ProposedUnit {
   effort?: AutopilotEffort; // rough size + files-touched estimate (from the plan's metadata block)
 }
 
-const agentEnv = buildAgentEnv();
+/**
+ * Instruction appended to every planning prompt so the plan commits to a concrete way to PROVE the
+ * work is done — form and function — rather than leaving "how to verify" vague. The build session
+ * gets this plan as its brief, so naming the validation up front is what makes the autopilot able to
+ * self-check its own implementation (it's also what the per-environment validation gate runs).
+ */
+export const VALIDATION_INSTRUCTION = `Include a dedicated "## Validation" section near the end of the plan that specifies, concretely, how to prove BOTH that the change is wired up (form) and that it behaves correctly (function). Don't hand-wave "test it" — name the actual mechanism and make it runnable:
+- Prefer automated checks: the exact unit/integration test files to add or extend and the command to run them (e.g. \`bun test path/to/x.test.ts\`), plus any typecheck/build/lint command that must pass.
+- For UI or end-to-end behaviour, describe a debug-browser / headless (e.g. Playwright or the project's existing harness) check: the URL or screen to drive, the steps, and the observable signal that proves success.
+- When neither fits, give a precise manual repro: the commands to run and the exact expected output/state.
+State the expected passing outcome for each check so success is unambiguous. Ground every command in tooling that actually exists in this repo (inspect package.json / scripts / existing tests first).`;
 
 /**
  * Run a one-shot SDK query. `readonly` uses plan mode (no writes), where the model delivers its plan
@@ -46,7 +56,9 @@ async function runQuery(prompt: string, opts: { model: Model; cwd?: string; read
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
       executable: "bun",
-      env: agentEnv,
+      // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
+      // effect for the next planning/refine run without restarting the daemon. See AuthStore.
+      env: buildAgentEnv(),
     },
   });
   let text = "";
@@ -162,7 +174,9 @@ Why these are bundled: ${unit.rationale}
 Tasks to satisfy:
 ${taskBlock}
 
-Write a focused implementation plan in markdown: the approach, the specific files/functions to change, edge cases, and how to verify. Be concrete and grounded in what you find in the repo. Do not make any edits — planning only.
+Write a focused implementation plan in markdown: the approach, the specific files/functions to change, and edge cases. Be concrete and grounded in what you find in the repo. Do not make any edits — planning only.
+
+${VALIDATION_INSTRUCTION}
 
 ${PLAN_META_INSTRUCTION}`;
 
@@ -191,6 +205,8 @@ Reviewer feedback:
 ${opts.feedback.trim()}
 
 Rewrite the plan to address the feedback while keeping the parts that are still valid. Do not make any edits to the repo — planning only.
+
+${VALIDATION_INSTRUCTION}
 
 ${PLAN_META_INSTRUCTION}`;
 

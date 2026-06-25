@@ -273,6 +273,18 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      case "auth.status":
+        send(deps.supervisor.authStatus(cid));
+        return;
+
+      case "auth.set":
+        send(deps.supervisor.setAuthToken(cmd.token, cid)); // BadCommand (empty/metered key) → command.error via the outer catch
+        return;
+
+      case "auth.clear":
+        send(deps.supervisor.clearAuthToken(cid));
+        return;
+
       case "autopilot.plans.list":
         send(deps.supervisor.autopilotPlansEvent(cid));
         return;
@@ -326,6 +338,20 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           })
           .then((r) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: true, created: r.created, skipped: r.skipped, output: r.output }))
           .catch((e) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: false, created: 0, skipped: 0, output: errMsg(e) }));
+        return;
+
+      case "autopilot.tags.reset":
+        deps.supervisor
+          .resetAnvilTags(cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "autopilot.clear":
+        deps.supervisor
+          .clearAutopilot(cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "autopilot.schedule.get":

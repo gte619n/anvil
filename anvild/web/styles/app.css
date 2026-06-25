@@ -272,6 +272,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .todoist-projects .td-indent { color: var(--muted); white-space: pre; }
 .todoist-connect { display: flex; gap: 8px; margin-top: 10px; }
 .todoist-connect input { flex: 1; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background-color: var(--bg); color: var(--text); }
+/* Autopilot maintenance (reset tags / clear) + the "more providers coming" placeholder card. */
+.ap-maint-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.models-soon { opacity: 0.65; }
 .session.archived { opacity: 0.55; }
 .session.pending .title .msym { color: var(--warn); }
 /* A session being cleaned up: disabled + greyed until the daemon confirms deletion (§8). */
@@ -747,6 +750,18 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-sched-summary > span { display: inline-flex; align-items: center; gap: 6px; }
 .ap-sched-summary .msym { font-size: 16px; }
 .ap-sched-edit-btn { padding: 3px 9px !important; font-size: 11.5px !important; }
+
+/* Run-autopilot button shrinks with the viewport: full label on desktop, "Run" on a tablet, icon-only
+   on a phone (the title attribute keeps it discoverable). Breakpoints align with the 700px phone cut. */
+.ap-run-btn { display: inline-flex; align-items: center; gap: 6px; }
+.ap-run-btn .ap-run-mid { display: none; }
+@media (max-width: 900px) {
+  .ap-run-btn .ap-run-full { display: none; }
+  .ap-run-btn .ap-run-mid { display: inline; }
+}
+@media (max-width: 700px) {
+  .ap-run-btn .ap-run-mid { display: none; } /* icon only */
+}
 
 /* Run status banner (above the raw log): running indicator, live progress line, per-server tallies. */
 .ap-run-status { margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; padding: 10px 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-size: 13px; display: flex; flex-direction: column; gap: 5px; }

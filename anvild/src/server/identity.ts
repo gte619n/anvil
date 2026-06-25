@@ -39,8 +39,11 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  * frozen number, so it can't express "supports X but not Y" across a partially-updated fleet.
  *  - "autopilot": the plan-review + in-daemon scheduler command family (autopilot.plans.list,
  *    autopilot.schedule.get/set, refine/dismiss/start/resolve/link/reassign/run). Added in PR #51.
+ *  - "autopilot-maintenance": reset anvil:* tags / clear the pipeline (autopilot.tags.reset,
+ *    autopilot.clear) — the Todoist-settings maintenance buttons.
+ *  - "auth": model-provider token management (auth.status/set/clear) — the Settings → Models card.
  */
-export const SERVER_CAPABILITIES: readonly string[] = ["autopilot"];
+export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth"];
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
 export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {

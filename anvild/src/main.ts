@@ -1,8 +1,12 @@
 import { loadConfig } from "./config";
 import { assertSubscriptionAuth } from "./auth/guard";
+import { loadPersistedClaudeToken } from "./auth/store";
 import { createServer, VERSION } from "./server/http";
 import { createMarkdownRenderer } from "./render/markdown-pipeline";
 
+// A token set/reset from the UI (auth.set) is persisted to the launcher's env file. If the launcher
+// didn't export it (dev run), load just that key before the §3 guard so the UI-set token is honoured.
+loadPersistedClaudeToken();
 // arch §3: refuse to start unless the subscription-auth invariant holds.
 assertSubscriptionAuth();
 

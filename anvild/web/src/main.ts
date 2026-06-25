@@ -20,6 +20,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
 };
 import type {
   AttachmentRef,
+  AuthStatusEvent,
   AutopilotPlanInfo,
   AutopilotSchedule,
   AutonomyPolicy,
@@ -320,7 +321,7 @@ const planFromHash = (): string | null => {
 // uses the swipe gesture, the PWA/browser uses its own Back — all surface as `popstate`,
 // which closes the topmost layer. Each entry records how many layers were open (`anvilDepth`)
 // so a single popstate can unwind to exactly the right place.
-type OverlayName = "modal" | "settings" | "autopilot" | "panel" | "sidebar";
+type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel";
 interface Overlay {
   name: OverlayName;
   close: () => void; // pure DOM/state teardown — must NOT touch history itself
@@ -384,7 +385,10 @@ window.addEventListener("popstate", () => {
   // panels dismiss before we navigate sessions or leave the app).
   const depth = typeof (history.state as { anvilDepth?: number } | null)?.anvilDepth === "number" ? (history.state as { anvilDepth: number }).anvilDepth : 0;
   while (overlays.length > depth) overlays.pop()!.close();
-  // Then reflect the session hash (Back/Forward between sessions, then out of the app).
+  // Then reflect the session hash (Back/Forward between sessions, then out of the app) — but only once
+  // every soft layer is closed. While an overlay is still open (e.g. Back from a plan reader landing on
+  // the hash-less autopilot URL), the session underneath must stay selected, not get deselected.
+  if (overlays.length > 0) return;
   const id = sessionFromHash();
   if (id && sessions.has(id)) {
     if (id !== activeId) selectSession(id, false);
@@ -992,6 +996,8 @@ function onEvent(url: string, e: ServerEvent): void {
         srv!.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
         srv!.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
       }
+      // Pull the hub's model-provider auth state so the Settings → Models card is live (hub-scoped).
+      if (url === HUB_URL && serverSupports(srv, "auth")) srv!.sock.send({ type: "auth.status" });
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
@@ -1018,6 +1024,13 @@ function onEvent(url: string, e: ServerEvent): void {
       return;
     case "todoist.projects.result":
       return; // resolved via cidWaiter (loadTodoistProjects)
+    case "auth.status":
+      // Model-provider auth is hub-scoped (the token lives on the hub daemon; the Models card routes
+      // to hub()). Ignore a fleet member's own status so it can't clobber the hub's.
+      if (url === HUB_URL) onAuthStatus(e);
+      return;
+    case "autopilot.maintenance.result":
+      return; // resolved via cidWaiter (resetAnvilTags / clearAutopilot)
     case "autopilot.plans":
       onAutopilotPlans(url, e.plans);
       return;
@@ -2055,7 +2068,7 @@ function onEnvironments(url: string, list: Environment[]): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "todoist";
+type SettingsTab = "servers" | "environments" | "todoist" | "models";
 let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
@@ -2068,6 +2081,7 @@ function openSettings(): void {
       <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
+      <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
     </div>
     <div class="settings-body">
       <section class="settings-panel" data-tab="environments">
@@ -2082,6 +2096,11 @@ function openSettings(): void {
         <div class="section-head"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
         <p class="small muted">Link a Todoist project to an environment, then the nightly autopilot plans &amp; builds its tasks. Set the token with <code>bun run scripts/todoist.ts set</code>.</p>
         <div id="todoist-panel"><p class="small muted">Loading…</p></div>
+      </section>
+      <section class="settings-panel" data-tab="models">
+        <div class="section-head"><h3>Models</h3></div>
+        <p class="small muted">The model provider Anvil drives. Set or reset the Claude subscription token here instead of editing the daemon's service file.</p>
+        <div id="models-panel"><p class="small muted">Loading…</p></div>
       </section>
     </div>
   </div>`;
@@ -2103,6 +2122,10 @@ function selectSettingsTab(tab: SettingsTab): void {
   if (tab === "todoist") {
     renderTodoistPanel();
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
+  }
+  if (tab === "models") {
+    renderModelsPanel();
+    if (serverSupports(hub(), "auth")) hub().sock.send({ type: "auth.status" }); // refresh once per tab open
   }
 }
 
@@ -2275,17 +2298,172 @@ function renderTodoistPanel(): void {
       <button id="todoist-disconnect" class="mini" style="margin-left:auto">Disconnect</button></div></div>
     ${scheduleSettingsCardHtml()}
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
-    <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
+    <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>
+    ${autopilotMaintenanceCardHtml()}`;
   $("#todoist-disconnect").addEventListener("click", () => {
     hub().sock.send({ type: "todoist.disconnect", cid: newCid() });
     todoistProjectsLoaded = false;
     todoistProjects.clear();
   });
   $("#set-sched-edit").addEventListener("click", openScheduleModal);
+  document.getElementById("ap-tags-reset")?.addEventListener("click", () => void resetAnvilTags());
+  document.getElementById("ap-clear")?.addEventListener("click", () => void clearAutopilotUi());
+}
+
+/** Maintenance card (Todoist tab): reset anvil:* tags so tasks re-plan, or clear the pipeline. Hidden
+ *  on a daemon too old to handle the commands. */
+function autopilotMaintenanceCardHtml(): string {
+  if (!serverSupports(hub(), "autopilot-maintenance")) return "";
+  return `<div class="card ap-maint"><b>${icon("build")} Autopilot maintenance</b>
+    <p class="small muted">Reset clears every <code>anvil:*</code> status label from your tasks (your <b>Autopilot</b> sourcing label is kept) and drops pending plans that aren't building, so the next run re-plans them. Clear wipes the whole pipeline.</p>
+    <div class="ap-maint-actions">
+      <button id="ap-tags-reset" class="mini">${icon("restart_alt")} Reset anvil tags</button>
+      <button id="ap-clear" class="mini danger">${icon("delete_sweep")} Clear autopilot</button>
+    </div></div>`;
+}
+
+async function resetAnvilTags(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Reset Autopilot tags?",
+    body: "Removes every anvil:* status label from your Todoist tasks (your Autopilot sourcing label and other labels stay) and drops pending plans that aren't being built, so the next run re-plans them from scratch.",
+    confirmLabel: "Reset tags",
+    icon: "restart_alt",
+  });
+  if (!ok) return;
+  try {
+    const res = await sendAwait(hub(), { type: "autopilot.tags.reset", cid: newCid() }, 120_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type === "autopilot.maintenance.result") {
+      toast(`Reset ${res.tasksCleared} task${res.tasksCleared === 1 ? "" : "s"} · ${res.unitsRemoved} plan${res.unitsRemoved === 1 ? "" : "s"} cleared`);
+    }
+  } catch (err) {
+    toast(`Reset failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function clearAutopilotUi(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Clear the autopilot entirely?",
+    body: "Wipes every pending plan and removes all anvil:* labels from their Todoist tasks. Running build sessions aren't stopped, but their plans are forgotten. This can't be undone.",
+    confirmLabel: "Clear everything",
+    danger: true,
+    icon: "delete_sweep",
+  });
+  if (!ok) return;
+  try {
+    const res = await sendAwait(hub(), { type: "autopilot.clear", cid: newCid() }, 120_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type === "autopilot.maintenance.result") {
+      toast(`Cleared ${res.unitsRemoved} plan${res.unitsRemoved === 1 ? "" : "s"} · ${res.tasksCleared} task${res.tasksCleared === 1 ? "" : "s"} relabelled`);
+    }
+  } catch (err) {
+    toast(`Clear failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
   $("#settings-root").innerHTML = "";
+}
+
+// ── Model providers (Settings → Models) ───────────────────────────────────────────
+// The daemon drives Claude (Agent SDK). The token is set/reset here so it doesn't require SSHing in
+// to edit the launcher env. Hub-scoped, like Todoist. Gemini/ChatGPT are placeholders for now — the
+// daemon is Claude-only, but the section is shaped so a future provider slots in without a redesign.
+let claudeAuth: { connected: boolean; persisted: boolean; masked?: string } | null = null;
+function onAuthStatus(e: AuthStatusEvent): void {
+  if (e.provider !== "claude") return;
+  claudeAuth = { connected: e.connected, persisted: e.persisted, ...(e.masked ? { masked: e.masked } : {}) };
+  if (document.getElementById("models-panel")) renderModelsPanel();
+}
+
+/** Persist a new/replacement Claude OAuth token on the hub daemon. */
+async function saveClaudeToken(token: string, btn?: HTMLButtonElement): Promise<void> {
+  const t = token.trim();
+  if (!t) {
+    toast("Paste your Claude OAuth token first.");
+    return;
+  }
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "auth.set", token: t, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message); // e.g. "that looks like a metered API key…"
+      return;
+    }
+    toast("Claude token saved — it applies to the next run."); // the auth.status reply/broadcast re-renders
+  } catch (err) {
+    toast(`Couldn't save the token: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
+async function clearClaudeTokenUi(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Clear the Claude token?",
+    body: "The daemon will have no model credential until you set a new one — autopilot and chat can't run without it. The token is removed from the daemon and its env file.",
+    confirmLabel: "Clear token",
+    danger: true,
+    icon: "key_off",
+  });
+  if (!ok) return;
+  hub().sock.send({ type: "auth.clear", cid: newCid() }); // the auth.status broadcast re-renders the card
+  toast("Claude token cleared");
+}
+
+function renderModelsPanel(): void {
+  const host = document.getElementById("models-panel");
+  if (!host) return;
+  if (!serverSupports(hub(), "auth")) {
+    host.innerHTML = `<div class="card"><b>Update required.</b><p class="small muted">This daemon is too old to manage the model token from the app. Update Anvil, or set <code>CLAUDE_CODE_OAUTH_TOKEN</code> in <code>~/.config/anvil/env</code>.</p></div>`;
+    return;
+  }
+  if (!claudeAuth) {
+    host.innerHTML = `<p class="small muted">Loading…</p>`;
+    return;
+  }
+  const tokenForm = (saveLabel: string): string => `<div class="todoist-connect">
+      <input id="claude-token" type="password" autocomplete="off" spellcheck="false" placeholder="Claude OAuth token (sk-ant-oat…)" />
+      <button id="claude-save" class="primary">${saveLabel}</button>
+    </div>`;
+  const futureCard = `<div class="card models-soon"><div class="card-main"><span class="conn-dot"></span><span>Gemini · ChatGPT — <b>coming soon</b>. Anvil currently drives Claude only.</span></div></div>`;
+  if (!claudeAuth.connected) {
+    host.innerHTML = `<div class="card"><b>No Claude token set.</b>
+      <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
+      ${tokenForm("Save")}</div>
+      ${futureCard}`;
+  } else {
+    const warn = claudeAuth.persisted
+      ? ""
+      : `<p class="small muted" style="margin-top:8px">${icon("warning")} Not written to the launcher env file — it will revert to the previous token on the next service restart.</p>`;
+    host.innerHTML = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+        <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
+        <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${warn}</div>
+      <div class="card"><b>Replace token</b>
+        <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
+        ${tokenForm("Replace")}</div>
+      ${futureCard}`;
+    $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
+  }
+  const input = $<HTMLInputElement>("#claude-token");
+  const btn = $<HTMLButtonElement>("#claude-save");
+  btn.addEventListener("click", () => void saveClaudeToken(input.value, btn));
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") void saveClaudeToken(input.value, btn);
+  });
 }
 // ── Autopilot (plan review & launch; anvil-autopilot-ui.md) ────────────────────────
 const autopilotLog: string[] = []; // streamed progress lines for the current/last run
@@ -2348,7 +2526,7 @@ function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
   // A reader open on a plan that just vanished (dismissed/started elsewhere) falls back to the grid;
   // otherwise leave an open reader untouched (refine updates it in place) and only re-flow the grid.
   if (openPlanId) {
-    if (!findPlan(openPlanId)) renderAutopilotGrid();
+    if (!findPlan(openPlanId)) backToGrid(); // the open plan vanished (dismissed/started) → unwind to the grid
   } else {
     renderAutopilotGrid();
   }
@@ -2410,7 +2588,7 @@ function openAutopilot(): void {
         <span class="ap-sched-summary" id="autopilot-schedule"></span>
       </div>
       <span class="ap-head-actions">
-        <button id="autopilot-run" class="primary">${icon("play_arrow")} Run autopilot</button>
+        <button id="autopilot-run" class="primary ap-run-btn" title="Run autopilot">${icon("play_arrow")}<span class="ap-run-full">Run autopilot</span><span class="ap-run-mid">Run</span></button>
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
     </div>
@@ -2515,6 +2693,13 @@ function renderAutopilotGrid(): void {
   );
 }
 
+/** Return from a plan reader to the grid. When the reader is an active back-stack layer, dismiss it
+ *  (which unwinds its history entry and renders the grid); otherwise just render the grid. */
+function backToGrid(): void {
+  if (overlayOpen("plan")) dismissOverlay("plan");
+  else renderAutopilotGrid();
+}
+
 /** The full-plan reader + refine chat + Dismiss/Go, rendered in place of the grid (same overlay). */
 function openPlan(id: string): void {
   const p = findPlan(id);
@@ -2548,7 +2733,11 @@ function openPlan(id: string): void {
       </aside>
     </div>
   </div>`;
-  $("#plan-back").addEventListener("click", () => renderAutopilotGrid());
+  // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
+  // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
+  // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
+  openOverlay("plan", () => renderAutopilotGrid());
+  $("#plan-back").addEventListener("click", () => backToGrid());
   $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
   $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
   $("#plan-dismiss").addEventListener("click", () => void dismissPlan(id));
@@ -2630,7 +2819,7 @@ async function dismissPlan(id: string): Promise<void> {
       return;
     }
     toast("Plan dismissed");
-    renderAutopilotGrid(); // the broadcast also refreshes, but don't wait on it
+    backToGrid(); // the broadcast also refreshes, but don't wait on it
   } catch (err) {
     toast(`Dismiss failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -2662,7 +2851,7 @@ async function resolvePlan(id: string, status: "completed" | "expired"): Promise
       return;
     }
     toast(res.checked ? `Plan ${status} · Todoist task closed` : `Plan ${status}`);
-    renderAutopilotGrid(); // the broadcast also refreshes, but don't wait on it
+    backToGrid(); // the broadcast also refreshes, but don't wait on it
   } catch (err) {
     toast(`${verb} failed: ${err instanceof Error ? err.message : String(err)}`);
   }

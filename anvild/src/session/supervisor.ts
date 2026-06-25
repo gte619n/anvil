@@ -22,6 +22,8 @@ import {
   type AutopilotStartedEvent,
   type AutopilotSchedule,
   type AutopilotScheduleEvent,
+  type AutopilotMaintenanceResultEvent,
+  type AuthStatusEvent,
   type GitCmd,
   type GitResultEvent,
   type Model,
@@ -51,7 +53,8 @@ import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
-import { withStatus } from "../integrations/status";
+import { readStatus, withStatus } from "../integrations/status";
+import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { planAndTagProject, planAndTagTasks, planDeepLink, planUnit, refinePlanQuery } from "../integrations/autopilot";
 import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
@@ -99,7 +102,11 @@ export class Supervisor {
    *  "clear" push to dismiss it everywhere once the session is viewed/answered (UI refinement §1). */
   private readonly notified = new Set<string>();
   private readonly renderer: MarkdownRenderer;
-  private readonly agentEnv = buildAgentEnv();
+  /** The §3 allow-list env for spawned agents/terminals. Built fresh per call (not cached) so a token
+   *  set/reset via the UI (auth.set) reaches the next session/run without a daemon restart. */
+  private agentEnv(): Record<string, string> {
+    return buildAgentEnv();
+  }
   /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
    *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
   private readonly defaultToolsServer = buildDefaultToolsServer({
@@ -316,6 +323,32 @@ export class Supervisor {
     return this.todoistStatusEvent(cid);
   }
 
+  // ── Model-provider auth (Settings → Models; Claude OAuth token set/reset) ──────────
+  private authStatusEvent(cid?: string): AuthStatusEvent {
+    return { v: PROTOCOL_VERSION, type: "auth.status", ts: now(), ...(cid ? { cid } : {}), ...claudeAuthStatus() };
+  }
+  /** Current Claude credential state for the Models card. */
+  authStatus(cid?: string): AuthStatusEvent {
+    return this.authStatusEvent(cid);
+  }
+  /** Set/replace the Claude OAuth token (persisted to the launcher env file + applied live). Throws
+   *  BadCommand on an empty or metered-looking key so the UI can surface the reason. */
+  setAuthToken(token: string, cid?: string): AuthStatusEvent {
+    try {
+      setClaudeToken(token);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    this.registry.toAll(this.authStatusEvent());
+    return this.authStatusEvent(cid);
+  }
+  /** Remove the Claude OAuth token from the daemon + env file. */
+  clearAuthToken(cid?: string): AuthStatusEvent {
+    clearClaudeToken();
+    this.registry.toAll(this.authStatusEvent());
+    return this.authStatusEvent(cid);
+  }
+
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
   async listTodoistProjects(cid?: string): Promise<TodoistProjectsResultEvent> {
     const state = this.integrations.todoist();
@@ -480,6 +513,51 @@ export class Supervisor {
     }
     this.workUnits.update(u.id, { status });
     this.broadcastAutopilotPlans();
+  }
+
+  // ── Autopilot maintenance (Todoist-settings buttons) ──────────────────────────────
+  /** Remove every anvil:* status label from the given units' member tasks (best-effort), keeping the
+   *  user's own labels — including the "Autopilot" sourcing label — intact. Returns how many tasks
+   *  actually had a label removed. */
+  private async stripAnvilLabels(units: WorkUnit[]): Promise<number> {
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) return 0;
+    const client = new TodoistClient(state.accessToken);
+    const taskIds = new Set<string>();
+    for (const u of units) for (const id of u.taskIds) taskIds.add(id);
+    let cleared = 0;
+    for (const taskId of taskIds) {
+      try {
+        const t = await client.getTask(taskId);
+        if (!readStatus(t.labels)) continue; // no anvil:* label → nothing to strip
+        await client.setTaskLabels(taskId, withStatus(t.labels, undefined));
+        cleared++;
+      } catch {
+        /* a deleted/closed task — skip it */
+      }
+    }
+    return cleared;
+  }
+
+  /** Reset the pipeline so tasks can be re-planned: strip anvil:* labels and drop the work units that
+   *  aren't tied to a live session (in-progress builds are left alone). The "Autopilot" sourcing label
+   *  is preserved, so the next run picks the tasks straight back up. */
+  async resetAnvilTags(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
+    const resettable = this.workUnits.list().filter((u) => !(u.sessionId && this.sessions.has(u.sessionId)));
+    const tasksCleared = await this.stripAnvilLabels(resettable);
+    for (const u of resettable) this.workUnits.remove(u.id);
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "reset", tasksCleared, unitsRemoved: resettable.length };
+  }
+
+  /** Clear the autopilot entirely: strip anvil:* labels from every unit's tasks and remove ALL work
+   *  units (the pending grid empties). Running sessions are not killed, but their unit is forgotten. */
+  async clearAutopilot(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
+    const units = this.workUnits.list();
+    const tasksCleared = await this.stripAnvilLabels(units);
+    for (const u of units) this.workUnits.remove(u.id);
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "clear", tasksCleared, unitsRemoved: units.length };
   }
 
   /** Go: create a fresh-worktree session seeded with the plan and start it. Autonomy defaults to
@@ -824,7 +902,7 @@ export class Supervisor {
   /** Fire-and-forget: ask Sonnet for a fitting icon, then push it via session.updated. */
   private async assignIcon(s: Session): Promise<void> {
     try {
-      const icon = await pickIcon(s.data.title, this.agentEnv);
+      const icon = await pickIcon(s.data.title, this.agentEnv());
       if (icon && this.sessions.has(s.data.id)) {
         s.data.icon = icon;
         this.persist();
@@ -1112,7 +1190,7 @@ export class Supervisor {
     });
     rec.pty = term;
     const shell = process.env.SHELL || "/bin/zsh";
-    rec.proc = BunAny.spawn([shell], { terminal: term, cwd: s.data.cwd, env: { ...this.agentEnv, TERM: "xterm-256color" } });
+    rec.proc = BunAny.spawn([shell], { terminal: term, cwd: s.data.cwd, env: { ...this.agentEnv(), TERM: "xterm-256color" } });
     this.terminals.set(sessionId, rec);
     rec.proc.exited.then((code: number | null) => {
       s.emit({ type: "terminal.exit", code: code ?? 0 });
@@ -1178,7 +1256,7 @@ export class Supervisor {
         this.renderer,
         this.broker,
         this.questionBroker,
-        this.agentEnv,
+        this.agentEnv(),
         (usage) => this.onAgentResult(id, usage),
         isDefault ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer } : undefined,
         isDefault ? DEFAULT_TOOL_IDS : undefined,
