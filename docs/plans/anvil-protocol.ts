@@ -106,6 +106,7 @@ export interface Environment {
   isRepo: boolean; // git repo → fresh worktree per session; otherwise work in the folder directly
   defaultBase?: string; // branch/commit to branch worktrees from (default "HEAD")
   color?: string; // base color (hex, e.g. "#335999") for env/session tinting; absent → hue hashed from name
+  icon?: string; // Material Symbols name (e.g. "rocket_launch") shown in selectors/cards; absent → folder/account_tree by repo kind
   todoistProjectId?: string; // linked Todoist project; its active tasks feed the nightly planner
   validation?: EnvironmentValidation; // gate a WorkUnit must pass before reaching anvil:review
 }
@@ -807,6 +808,7 @@ export interface EnvAddCmd extends Envelope, Correlated {
   repoRoot: string; // must be a git repo
   defaultBase?: string;
   color?: string; // base color (hex) for tinting
+  icon?: string; // Material Symbols name
 }
 export interface EnvCloneCmd extends Envelope, Correlated {
   type: "env.clone";
@@ -814,6 +816,7 @@ export interface EnvCloneCmd extends Envelope, Correlated {
   name?: string; // display name; defaults to the repo name from the URL
   defaultBase?: string;
   color?: string; // base color (hex) for tinting
+  icon?: string; // Material Symbols name
 }
 export interface EnvUpdateCmd extends Envelope, Correlated {
   type: "env.update";
@@ -821,6 +824,7 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
   name?: string;
   defaultBase?: string; // "" clears it (back to HEAD)
   color?: string; // base color (hex); "" clears it (back to hashed hue)
+  icon?: string; // Material Symbols name; "" clears it (back to the default by repo kind)
   todoistProjectId?: string; // link to a Todoist project; "" unlinks
   validation?: EnvironmentValidation | null; // null clears the validation gate
 }

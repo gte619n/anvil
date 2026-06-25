@@ -1,5 +1,6 @@
 import MarkdownIt from "markdown-it";
 import Sortable from "sortablejs";
+import TomSelect from "tom-select";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
@@ -55,6 +56,37 @@ const icon = (name: string): string => `<span class="msym">${name}</span>`;
 $("#brand-version").textContent = `v${__APP_VERSION__}`;
 const sessIcon = (s: Session): string =>
   s.isDefault ? "robot_2" : s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder");
+// An environment's display glyph: its chosen Material Symbol, else a sensible default by repo kind.
+const envIcon = (e: Environment): string => e.icon || (e.isRepo ? "account_tree" : "folder");
+// Case-insensitive name sort for environment lists (selector + settings, per server).
+const byEnvName = (a: Environment, b: Environment): number => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+
+// ── Stylized selectors (Tom Select) ──────────────────────────────────────────
+// Native <select>s are upgraded to themed Tom Select dropdowns so options can carry a Material
+// Symbol icon and a color dot. Each <option> may set data-icon / data-color; the render below
+// picks them up (Tom Select copies an option's data-* attributes onto its option data). All our
+// selects live inside modals, so instances are tracked and torn down when the modal closes.
+let modalTomSelects: TomSelect[] = [];
+const renderTomOption = (data: { [k: string]: unknown }, escape: (s: string) => string): string => {
+  const ic = data.icon ? `<span class="msym ts-ic">${escape(String(data.icon))}</span>` : "";
+  const dot = data.color ? `<span class="ts-dot" style="background:${escape(String(data.color))}"></span>` : "";
+  return `<div class="ts-opt">${ic}${dot}<span class="ts-lbl">${escape(String(data.text ?? ""))}</span></div>`;
+};
+/** Upgrade a native <select> into a stylized Tom Select. `search` shows the filter box (long lists). */
+function enhanceSelect(sel: HTMLSelectElement | null, search = false): void {
+  if (!sel) return;
+  const base = { maxOptions: null, hideSelected: false, render: { option: renderTomOption, item: renderTomOption } };
+  modalTomSelects.push(new TomSelect(sel, search ? base : { ...base, controlInput: null }));
+}
+/** Re-read options/value from the underlying <select> after it's been repopulated programmatically. */
+function refreshSelect(sel: HTMLSelectElement | null): void {
+  if (sel) modalTomSelects.find((t) => t.input === sel)?.sync();
+}
+/** Tear down every modal Tom Select (removes its global listeners) — called when a modal closes. */
+function destroyModalSelects(): void {
+  for (const t of modalTomSelects) t.destroy();
+  modalTomSelects = [];
+}
 const conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
 let stickToBottom = true;
@@ -718,6 +750,10 @@ function updateOutboxBadge(): void {
 // every server in the registry (fleet — they merge into one view).
 ensureServer(HUB_URL);
 for (const u of loadExtraServers()) ensureServer(u);
+// Adopt the rest of the fleet up front (not just on first Settings open) so fleet sessions AND
+// environments merge into the view immediately — otherwise the new-session picker shows hub-only
+// environments until the user happens to visit Settings → Servers.
+void loadFleetMembers();
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
@@ -2811,6 +2847,7 @@ function showAddMac(): void {
     <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
   </div>`;
   showModal(m);
+  enhanceSelect(document.getElementById("fleet-host") as HTMLSelectElement | null);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
   $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
@@ -2901,11 +2938,12 @@ async function loadFleetPeers(): Promise<void> {
     } else if (!candidates.length) {
       sel.innerHTML = `<option value="">No other Macs found on your tailnet</option>`;
     } else {
-      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}">${esc(p.name)}</option>`).join("");
+      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}</option>`).join("");
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
   }
+  refreshSelect(sel); // re-read the freshly-populated options into the Tom Select instance
 }
 /** Wire one server card's "Update Anvil" button: pull that daemon's source, rebuild, and restart it.
  *  Each Mac self-updates independently — the hub no longer has a monopoly on updates. Only a hub
@@ -2984,7 +3022,7 @@ function renderEnvCards(): void {
   const envCard = (e: Environment): string => `<div class="card env-card" data-env="${esc(e.id)}">
       <div class="env-head">
         <div class="env-meta">
-          <b><span class="env-dot" style="background:${stripeColor(e, 0, currentTheme())}"></span>${esc(e.name)}</b>
+          <b><span class="env-glyph msym" style="color:${stripeColor(e, 0, currentTheme())}">${envIcon(e)}</span>${esc(e.name)}</b>
           <div class="small muted"><code>${esc(e.repoRoot)}</code></div>
           <div class="small muted">${icon("account_tree")} off <code>${esc(e.defaultBase ?? "HEAD")}</code></div>
           ${e.todoistProjectId ? `<div class="small muted">${icon("checklist")} ${esc(todoistProjectName(e.todoistProjectId) ?? "Todoist project")}</div>` : ""}
@@ -3001,7 +3039,7 @@ function renderEnvCards(): void {
     `<div class="env-server-head"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> <span class="small muted"><code>${esc(hostOf(srv.url))}</code></span></div>`;
   host.innerHTML = orderedServers()
     .map((srv) => {
-      const group = all.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url);
+      const group = all.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url).sort(byEnvName);
       const body = group.length ? group.map(envCard).join("") : `<p class="small muted">No environments on this server yet.</p>`;
       return srvHead(srv) + body;
     })
@@ -3764,6 +3802,7 @@ function showModal(el: HTMLElement): void {
 /** Tear down the modal (DOM/state only). Reached via Back (popstate) or closeModal(). */
 function closeModalDom(): void {
   onDirs = null;
+  destroyModalSelects(); // drop Tom Select instances (and their document listeners) before the DOM goes
   $("#modal-root").innerHTML = "";
 }
 const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
@@ -3772,10 +3811,10 @@ const closeModal = (): void => dismissOverlay("modal"); // programmatic close �
 const DEFAULT_MODEL = "opus";
 const DEFAULT_AUTONOMY: AutonomyPolicy = "bypass";
 const AUTONOMY_PICKER = `<label>Autonomy<select id="ns-auto">
-  <option value="bypass" selected>Bypass — skip all permission prompts ⚠️</option>
-  <option value="mostly-autonomous">Mostly autonomous</option>
-  <option value="allowlist">Allowlist</option>
-  <option value="prompt-all">Prompt all</option>
+  <option value="bypass" data-icon="bolt" selected>Bypass — skip all permission prompts ⚠️</option>
+  <option value="mostly-autonomous" data-icon="auto_mode">Mostly autonomous</option>
+  <option value="allowlist" data-icon="playlist_add_check">Allowlist</option>
+  <option value="prompt-all" data-icon="front_hand">Prompt all</option>
 </select></label>`;
 /** The chosen autonomy from the open dialog's picker, or the default if it isn't present. */
 const selectedAutonomy = (): AutonomyPolicy =>
@@ -3785,7 +3824,7 @@ const selectedAutonomy = (): AutonomyPolicy =>
 function serverPickerMarkup(): string {
   const list = orderedServers();
   if (list.length <= 1) return "";
-  const opts = list.map((s) => `<option value="${esc(s.url)}">${esc(s.name)}</option>`).join("");
+  const opts = list.map((s) => `<option value="${esc(s.url)}" data-icon="dns">${esc(s.name)}</option>`).join("");
   return `<label>Server<div class="env-row"><select id="ns-server">${opts}</select></div></label>`;
 }
 /** Initialise browse.serverUrl (→ hub) and, if the picker is shown, re-list on change. Call before wireBrowser(). */
@@ -3799,6 +3838,7 @@ function wireServerPicker(): void {
     browse.path = "";
     browseServer().sock.send({ type: "dirs.list" }); // re-list from the newly-chosen server's root
   });
+  enhanceSelect(sel);
 }
 /** A reusable directory browser (used by add-environment and one-off). */
 function browserMarkup(): string {
@@ -3842,15 +3882,16 @@ function showNewSession(): void {
     // Group the environments by the server they live on (the chosen env determines the server the
     // session is created on). With a single server, render a flat list — no optgroup noise.
     const multi = orderedServers().length > 1;
-    const opt = (e: Environment): string => `<option value="${esc(e.id)}">${esc(e.name)}</option>`;
+    const opt = (e: Environment): string =>
+      `<option value="${esc(e.id)}" data-icon="${esc(envIcon(e))}" data-color="${esc(stripeColor(e, 0, currentTheme()))}">${esc(e.name)}</option>`;
     const opts = multi
       ? orderedServers()
           .map((srv) => {
-            const group = envs.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url);
+            const group = envs.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url).sort(byEnvName);
             return group.length ? `<optgroup label="${esc(srv.name)}">${group.map(opt).join("")}</optgroup>` : "";
           })
           .join("")
-      : envs.map(opt).join("");
+      : [...envs].sort(byEnvName).map(opt).join("");
     m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
       <label>Environment<div class="env-row"><select id="ns-env">${opts}</select></div></label>
       <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
@@ -3910,6 +3951,8 @@ function showNewSession(): void {
       createBtn.click();
     }
   });
+  enhanceSelect(envSel, true); // searchable — environment lists can grow long
+  enhanceSelect(document.getElementById("ns-auto") as HTMLSelectElement | null);
   nameInp?.focus();
   validate();
 
@@ -3993,6 +4036,39 @@ function selectedSwatch(): string {
   return sel?.dataset.hex ?? "";
 }
 
+// ── Icon picker (environment icon) ───────────────────────────────────────────
+// A curated grid of Material Symbols so an environment can carry a glyph (shown in the env selector
+// and cards). "Auto" falls back to folder/account_tree by repo kind. Mirrors the swatch picker.
+const ENV_ICONS = [
+  "account_tree", "folder", "rocket_launch", "code", "terminal", "bug_report", "science", "smartphone",
+  "web", "dns", "cloud", "database", "api", "bolt", "build", "extension", "hub", "layers", "palette",
+  "dashboard", "robot_2", "smart_toy", "widgets", "memory", "lightbulb", "favorite", "star", "flag",
+  "bookmark", "work", "home", "school", "sports_esports", "music_note", "photo_camera", "savings", "public",
+];
+/** A grid of icon buttons plus an "auto" option; `selected` pre-selects one. */
+function iconPickerMarkup(selected?: string): string {
+  const norm = (selected ?? "").trim();
+  const auto = `<button type="button" class="iconpick iconpick-auto${norm ? "" : " selected"}" data-icon="" title="Auto — default by repo kind">${icon("hide_source")}</button>`;
+  const cells = ENV_ICONS.map(
+    (n) => `<button type="button" class="iconpick${n === norm ? " selected" : ""}" data-icon="${esc(n)}" title="${esc(n)}">${icon(n)}</button>`,
+  ).join("");
+  return `<label>Icon<div class="icon-row" id="icon-row">${auto}${cells}</div></label>`;
+}
+function wireIconPicker(): void {
+  const row = document.getElementById("icon-row");
+  if (!row) return;
+  row.querySelectorAll<HTMLElement>(".iconpick").forEach((b) =>
+    b.addEventListener("click", () => {
+      row.querySelectorAll(".iconpick").forEach((x) => x.classList.remove("selected"));
+      b.classList.add("selected");
+    }),
+  );
+}
+/** The picked Material Symbol name, or "" for auto. */
+function selectedIcon(): string {
+  return document.querySelector<HTMLElement>("#icon-row .iconpick.selected")?.dataset.icon ?? "";
+}
+
 /** Register a project repo as an environment — clone from a git URL, or pick a local repo. */
 function showAddEnvironment(): void {
   const m = document.createElement("div");
@@ -4004,6 +4080,7 @@ function showAddEnvironment(): void {
     <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
     <label>Default branch (optional)<input id="ae-base" placeholder="e.g. main or dev — leave blank for HEAD" /></label>
     ${swatchPickerMarkup()}
+    ${iconPickerMarkup()}
     <p class="small muted">Or pick an existing local <b>git repository</b>:</p>
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
@@ -4011,12 +4088,14 @@ function showAddEnvironment(): void {
   wireServerPicker();
   wireBrowser();
   wireSwatchPicker();
+  wireIconPicker();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
   $<HTMLButtonElement>("#ae-save").onclick = async () => {
     const url = $<HTMLInputElement>("#ae-url").value.trim();
     const name = $<HTMLInputElement>("#ae-name").value.trim();
     const defaultBase = $<HTMLInputElement>("#ae-base").value.trim();
     const color = selectedSwatch();
+    const iconName = selectedIcon();
     if (url) {
       const btn = $<HTMLButtonElement>("#ae-save");
       btn.disabled = true;
@@ -4024,7 +4103,7 @@ function showAddEnvironment(): void {
       try {
         const res = await sendAwait(
           browseServer(),
-          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), cid: newCid() },
+          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), ...(iconName ? { icon: iconName } : {}), cid: newCid() },
           120_000,
         );
         if (res.type === "command.error") {
@@ -4048,6 +4127,7 @@ function showAddEnvironment(): void {
       repoRoot: browse.path,
       ...(defaultBase ? { defaultBase } : {}),
       ...(color ? { color } : {}),
+      ...(iconName ? { icon: iconName } : {}),
     });
     closeModal(); // the environments broadcast refreshes Settings / the new-session list
   };
@@ -4064,6 +4144,7 @@ function showEditEnvironment(id: string): void {
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
     ${swatchPickerMarkup(env.color)}
+    ${iconPickerMarkup(env.icon)}
     <label>Todoist project
       <select id="ee-todoist">${projectOptions}</select>
     </label>
@@ -4072,6 +4153,8 @@ function showEditEnvironment(id: string): void {
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
   wireSwatchPicker();
+  wireIconPicker();
+  enhanceSelect(document.getElementById("ee-todoist") as HTMLSelectElement | null, true);
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
@@ -4091,6 +4174,7 @@ function showEditEnvironment(id: string): void {
       name: $<HTMLInputElement>("#ee-name").value,
       defaultBase: $<HTMLInputElement>("#ee-base").value,
       color: selectedSwatch(),
+      icon: selectedIcon(), // "" resets to the default by repo kind
       todoistProjectId: $<HTMLSelectElement>("#ee-todoist").value, // "" unlinks
       // validation gate omitted: autopilot doesn't auto-build/PR yet. Omitting the field preserves
       // any stored value (env.update only writes validation when it's present).
@@ -4125,6 +4209,7 @@ function showOneOff(): void {
   showModal(m);
   wireServerPicker();
   wireBrowser();
+  enhanceSelect(document.getElementById("ns-auto") as HTMLSelectElement | null);
   $<HTMLButtonElement>("#oo-back").onclick = () => showNewSession();
   $<HTMLButtonElement>("#oo-create").onclick = () => {
     if (!browse.path) return;

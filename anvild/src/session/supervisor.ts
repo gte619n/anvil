@@ -112,6 +112,7 @@ export class Supervisor {
   private readonly autopilotSchedule: AutopilotScheduleStore;
   private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
   private scheduleTimer?: ReturnType<typeof setInterval>;
+  private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
@@ -133,6 +134,7 @@ export class Supervisor {
     });
     this.restore();
     this.startAutopilotScheduler();
+    this.startPrStateSweeper();
   }
 
   /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether a run
@@ -142,6 +144,16 @@ export class Supervisor {
     this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), 5 * 60_000);
     this.scheduleTimer.unref?.();
     void this.maybeRunScheduled();
+  }
+  /** Keep the sidebar's PR/merge badges fresh for an already-open app: a connect triggers a sweep, but
+   *  if the app stays connected while a PR is merged on GitHub nothing else would catch it. Sweep every
+   *  few minutes, but only while a client is actually watching (no point spawning `gh` for nobody).
+   *  `unref` so it never holds the process/test open. */
+  private startPrStateSweeper(): void {
+    this.prSweepTimer = setInterval(() => {
+      if (this.registry.all().length > 0) void this.refreshAllPrStates();
+    }, 4 * 60_000);
+    this.prSweepTimer.unref?.();
   }
   private async maybeRunScheduled(): Promise<void> {
     const sched = this.autopilotSchedule.get();
@@ -170,16 +182,16 @@ export class Supervisor {
   getEnvironment(id: string): Environment | undefined {
     return this.envStore.get(id);
   }
-  addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string): void {
+  addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string, icon?: string): void {
     try {
-      this.envStore.add(name, repoRoot, defaultBase, color);
+      this.envStore.add(name, repoRoot, defaultBase, color, icon);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     this.registry.toAll(this.environmentsEvent());
   }
   /** Clone a git URL into ~/Development (host git auth) and register it as an environment. */
-  cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string): void {
+  cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string, icon?: string): void {
     let dest: string;
     try {
       dest = git.cloneRepo(url).dest;
@@ -187,7 +199,7 @@ export class Supervisor {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     try {
-      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color);
+      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color, icon);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
@@ -250,6 +262,7 @@ export class Supervisor {
       name?: string;
       defaultBase?: string;
       color?: string;
+      icon?: string;
       todoistProjectId?: string | null;
       validation?: EnvironmentValidation | null;
     },
@@ -877,6 +890,40 @@ export class Supervisor {
     cur.data.git.prBranch = badge.prBranch;
     this.persist();
     this.broadcastUpdated(cur.data);
+  }
+
+  private prSweepRunning = false; // a sweep is in flight — don't stack `gh` storms
+  private lastPrSweepAt = 0; // throttle: at most one sweep per PR_SWEEP_THROTTLE_MS
+  /** Refresh PR badges for EVERY eligible session, not just the one a client has open. The per-session
+   *  attach refresh (`refreshPrState`) only covers the session you click into, so a PR merged on
+   *  GitHub, from another device, or in another session left the rest of the sidebar's merge badges
+   *  frozen at their last-known state. This reconciles the whole list. Bounded concurrency keeps us
+   *  from spawning a `gh` per session at once on the single-threaded daemon; `refreshPrState` already
+   *  skips terminal-merged and branchless sessions cheaply (no network). */
+  async refreshAllPrStates(force = false): Promise<void> {
+    if (this.prSweepRunning) return;
+    const t = Date.now();
+    if (!force && t - this.lastPrSweepAt < 30_000) return; // coalesce bursts (e.g. many clients reconnecting)
+    this.prSweepRunning = true;
+    this.lastPrSweepAt = t;
+    try {
+      // Only sessions that could have a live PR worth a network probe: on a branch, and not already
+      // terminal-merged on that same branch. Mirrors refreshPrState's own guards to avoid the work.
+      const ids = [...this.sessions.values()]
+        .filter((s) => {
+          const g = s.data.git;
+          const branch = s.data.worktree?.branch || g?.branch;
+          if (!branch) return false;
+          return !(g?.prState === "merged" && g.prBranch === g.branch);
+        })
+        .map((s) => s.id);
+      const LIMIT = 4;
+      for (let i = 0; i < ids.length; i += LIMIT) {
+        await Promise.all(ids.slice(i, i + LIMIT).map((id) => this.refreshPrState(id).catch(() => {})));
+      }
+    } finally {
+      this.prSweepRunning = false;
+    }
   }
 
   /** Archive: stop the agent + terminal/watchers, keep the worktree/branch/history. */

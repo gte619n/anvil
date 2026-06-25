@@ -150,6 +150,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
+      // The session list above is the persisted (possibly stale) snapshot; reconcile every session's
+      // PR/merge badge in the background so a PR merged on GitHub / another device shows up in the
+      // sidebar without the user opening each session. Throttled + coalesced inside the supervisor.
+      void supervisor.refreshAllPrStates();
     },
     close(ws: ServerWebSocket<ConnState>) {
       registry.remove(ws);

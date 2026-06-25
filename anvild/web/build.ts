@@ -52,6 +52,9 @@ cpSync(join(katex, "fonts"), join(next, "katex/fonts"), { recursive: true });
 
 // xterm.js stylesheet (terminal)
 cpSync(join(root, "../node_modules/@xterm/xterm/css/xterm.css"), join(next, "xterm.css"));
+// Tom Select stylesheet (stylized selectors) — structural base; app.css overrides the colors to
+// match the active theme. See the `.ts-*`/`.ts-wrapper` overrides in app.css.
+cpSync(join(root, "../node_modules/tom-select/dist/css/tom-select.css"), join(next, "tom-select.css"));
 // Material Symbols: web loads the font from Google's CDN (index.html); the `material-symbols`
 // dep stays installed so the native client apps can bundle the woff2 offline.
 
