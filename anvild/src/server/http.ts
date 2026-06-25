@@ -11,6 +11,7 @@ import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
+import { tailnetIPv4 } from "../config";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
 import { VERSION } from "../version";
@@ -106,12 +107,16 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const fleet = new FleetStore(opts.stateDir);
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
+  // Reachable web URL for deep-linking plans in Todoist comments. Prefer the tailnet IP (reachable
+  // from the user's phone over the tailnet); fall back to the bound host, then localhost.
+  const webBaseUrl = `http://${tailnetIPv4() ?? opts.host ?? "127.0.0.1"}:${opts.port}`;
   const supervisor = new Supervisor(
     {
       stateDir: opts.stateDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
       renderer: opts.renderer,
+      webBaseUrl,
     },
     registry,
   );

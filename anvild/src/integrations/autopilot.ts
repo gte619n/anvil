@@ -29,8 +29,14 @@ export interface PlannedUnit extends ProposedUnit {
 
 const agentEnv = buildAgentEnv();
 
-/** Run a one-shot SDK query and return its final text. `readonly` uses plan mode (no writes). */
-async function runQuery(prompt: string, opts: { model: Model; cwd?: string; readonly?: boolean }): Promise<string> {
+/**
+ * Run a one-shot SDK query. `readonly` uses plan mode (no writes), where the model delivers its plan
+ * via an `ExitPlanMode` tool call rather than the final message — its `result` text is only a
+ * conversational wrap-up ("the plan is ready at …"). We therefore capture BOTH: `plan` is the
+ * `ExitPlanMode` input (the actual markdown plan, when present) and `text` is the closing message.
+ * Planning callers want `plan`; the JSON-emitting bundler wants `text`.
+ */
+async function runQuery(prompt: string, opts: { model: Model; cwd?: string; readonly?: boolean }): Promise<{ text: string; plan?: string }> {
   const q = query({
     prompt,
     options: {
@@ -44,10 +50,32 @@ async function runQuery(prompt: string, opts: { model: Model; cwd?: string; read
     },
   });
   let text = "";
+  let plan: string | undefined;
   for await (const msg of q) {
+    if (msg.type === "assistant") {
+      // The plan rides in the ExitPlanMode tool call's `input.plan`, not the final result text.
+      for (const block of msg.message.content) {
+        if (block.type === "tool_use" && block.name === "ExitPlanMode") {
+          const p = (block.input as { plan?: unknown }).plan;
+          if (typeof p === "string" && p.trim()) plan = p.trim();
+        }
+      }
+    }
     if (msg.type === "result" && "result" in msg && typeof msg.result === "string") text = msg.result;
   }
-  return text.trim();
+  return { text: text.trim(), ...(plan ? { plan } : {}) };
+}
+
+/**
+ * Resolve a read-only planning query into a clean plan + metadata. Prefers the ExitPlanMode plan and
+ * falls back to the wrap-up text. The model is told to append a ```json metadata block "after the
+ * plan"; it may land in either the plan or the wrap-up, so we look in both for summary/effort.
+ */
+function resolvePlan(out: { text: string; plan?: string }): { plan: string; summary?: string; effort?: AutopilotEffort } {
+  const primary = extractPlanMeta(out.plan ?? out.text);
+  if (primary.summary || !out.plan) return primary; // metadata found, or nothing else to look at
+  const fromText = extractPlanMeta(out.text); // plan had no block — try the wrap-up for summary/effort
+  return { plan: primary.plan, ...(fromText.summary ? { summary: fromText.summary } : {}), ...(fromText.effort ? { effort: fromText.effort } : {}) };
 }
 
 /** Pull the first JSON value (object or array) out of a model response that may wrap it in prose/fences. */
@@ -107,7 +135,7 @@ Respond with ONLY a JSON array, no prose:
 [{"title": "...", "rationale": "...", "taskIds": ["id1","id2"]}]`;
 
   const out = await runQuery(prompt, { model: opts.model ?? "sonnet" });
-  const units = extractJson<ProposedUnit[]>(out);
+  const units = extractJson<ProposedUnit[]>(out.text);
   // Defensive: keep only real candidate ids, drop empty units.
   const valid = new Set(tasks.map((t) => t.id));
   return units
@@ -138,8 +166,8 @@ Write a focused implementation plan in markdown: the approach, the specific file
 
 ${PLAN_META_INSTRUCTION}`;
 
-  const raw = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
-  const { plan, summary, effort } = extractPlanMeta(raw);
+  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  const { plan, summary, effort } = resolvePlan(out);
   return { ...unit, tasks: members, plan, summary, effort };
 }
 
@@ -166,8 +194,8 @@ Rewrite the plan to address the feedback while keeping the parts that are still 
 
 ${PLAN_META_INSTRUCTION}`;
 
-  const raw = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
-  return extractPlanMeta(raw);
+  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  return resolvePlan(out);
 }
 
 /** Tasks eligible for planning: not already in the anvil pipeline (no anvil:* label, no work unit). */
@@ -175,8 +203,18 @@ function candidateTasks(tasks: TodoistTask[], workUnits: WorkUnitStore): Todoist
   return tasks.filter((t) => !readStatus(t.labels) && !workUnits.forTask(t.id));
 }
 
-function planComment(unit: PlannedUnit): string {
-  return `🤖 **anvil** bundled this into work unit “${unit.title}”.\n\n_${unit.rationale}_\n\n${unit.plan}`;
+/** The Todoist comment for a freshly planned unit: a short summary, not the whole plan — the full
+ *  plan lives in Anvil's Autopilot view, where it can be read and refined. `planUrl` (when known) is
+ *  a deep link straight to this plan's reader. */
+function planComment(unit: PlannedUnit, planUrl?: string): string {
+  const summary = unit.summary?.trim() || unit.rationale.trim() || "Implementation plan ready.";
+  const review = planUrl ? `🔗 Review & refine in Anvil: ${planUrl}` : "_Review & refine the full plan in Anvil → Autopilot._";
+  return `🤖 **anvil** planned “${unit.title}”.\n\n${summary}\n\n${review}`;
+}
+
+/** Deep link to a plan's reader in the Anvil web UI, or undefined when the daemon's URL is unknown. */
+export function planDeepLink(webBaseUrl: string | undefined, workUnitId: string): string | undefined {
+  return webBaseUrl ? `${webBaseUrl.replace(/\/$/, "")}/#p/${workUnitId}` : undefined;
 }
 
 /**
@@ -193,6 +231,7 @@ export async function planAndTagProject(
     repoName?: string;
     bundleModel?: Model;
     planModel?: Model;
+    webBaseUrl?: string; // for the Todoist comment's "review in Anvil" deep link
     onProgress?: (msg: string) => void;
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
@@ -220,10 +259,10 @@ export async function planAndTagProject(
       effort: planned.effort,
       status: "planned",
     });
-    // Tag every member; post the full plan once (on the first member), pointers on the rest.
+    // Tag every member; post the summary + deep link once (on the first member), pointers on the rest.
     for (const [j, t] of planned.tasks.entries()) {
       await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
-      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
+      if (j === 0) await deps.client.addComment(t.id, planComment(planned, planDeepLink(opts.webBaseUrl, wu.id)));
       else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
     }
     created.push(wu);
@@ -247,6 +286,7 @@ export async function planAndTagTasks(
     tasks: TodoistTask[];
     bundleModel?: Model;
     planModel?: Model;
+    webBaseUrl?: string; // for the Todoist comment's "review in Anvil" deep link
     onProgress?: (msg: string) => void;
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
@@ -276,7 +316,7 @@ export async function planAndTagTasks(
     });
     for (const [j, t] of planned.tasks.entries()) {
       await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
-      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
+      if (j === 0) await deps.client.addComment(t.id, planComment(planned, planDeepLink(opts.webBaseUrl, wu.id)));
       else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
     }
     created.push(wu);

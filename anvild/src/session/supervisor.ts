@@ -52,7 +52,7 @@ import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { withStatus } from "../integrations/status";
-import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
+import { planAndTagProject, planAndTagTasks, planDeepLink, planUnit, refinePlanQuery } from "../integrations/autopilot";
 import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
@@ -75,6 +75,9 @@ export interface SupervisorConfig {
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
+  /** This daemon's reachable web URL (e.g. http://100.x.y.z:7701), used to deep-link plans in
+   *  Todoist comments. Undefined → comments fall back to a plain "open Autopilot" pointer. */
+  webBaseUrl?: string;
 }
 
 /**
@@ -116,9 +119,11 @@ export class Supervisor {
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
+  private readonly webBaseUrl?: string;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
+    this.webBaseUrl = cfg.webBaseUrl;
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -382,7 +387,11 @@ export class Supervisor {
       ...(revised.summary ? { summary: revised.summary } : {}),
       ...(revised.effort ? { effort: revised.effort } : {}),
     });
-    void this.postPlanComment(u, `🤖 **anvil** refined the plan for “${u.title}”.\n\n_Feedback: ${feedback.trim()}_\n\n${revised.plan}`);
+    const refineLink = planDeepLink(this.webBaseUrl, u.id);
+    void this.postPlanComment(
+      u,
+      `🤖 **anvil** refined the plan for “${u.title}”.\n\n${revised.summary?.trim() || "Plan updated."}\n\n_Feedback: ${feedback.trim()}_\n\n${refineLink ? `🔗 Read the full plan in Anvil: ${refineLink}` : "_Read the full plan in Anvil → Autopilot._"}`,
+    );
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
   }
@@ -420,7 +429,11 @@ export class Supervisor {
       ...(planned.summary ? { summary: planned.summary } : {}),
       ...(planned.effort ? { effort: planned.effort } : {}),
     });
-    void this.postPlanComment(u, `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.plan}`);
+    const reassignLink = planDeepLink(this.webBaseUrl, u.id);
+    void this.postPlanComment(
+      u,
+      `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.summary?.trim() || "Plan updated."}\n\n${reassignLink ? `🔗 Read the full plan in Anvil: ${reassignLink}` : "_Read the full plan in Anvil → Autopilot._"}`,
+    );
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
   }
@@ -557,6 +570,7 @@ export class Supervisor {
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
           repoName: env.name,
+          ...(this.webBaseUrl ? { webBaseUrl: this.webBaseUrl } : {}),
           onProgress: emit,
         });
         createdUnits.push(...res.created);
@@ -577,6 +591,7 @@ export class Supervisor {
           repoRoot: defaultEnv.repoRoot,
           repoName: defaultEnv.name,
           tasks: external,
+          ...(this.webBaseUrl ? { webBaseUrl: this.webBaseUrl } : {}),
           onProgress: emit,
         });
         createdUnits.push(...res.created);

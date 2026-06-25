@@ -146,8 +146,12 @@ interface Server {
   sock: AnvilSocket;
   status: "connecting" | "connected" | "disconnected";
   version?: string; // anvild version (from server.hello)
+  capabilities?: string[]; // feature flags from server.hello; undefined on pre-capability builds
   budget?: Budget; // last budget snapshot (aggregate gauge, §7)
 }
+/** Whether a server advertised support for a capability (e.g. "autopilot"). A pre-capability build
+ *  omits the list → treated as unsupported, so we never send it a command it can't handle. */
+const serverSupports = (srv: Server | undefined, cap: string): boolean => !!srv?.capabilities?.includes(cap);
 const cssId = (s: string): string => s.replace(/[^a-z0-9]/gi, "_"); // safe element-id suffix from a URL
 const HUB_URL = daemonBase();
 const hostOf = (url: string): string => {
@@ -302,6 +306,12 @@ const sessionFromHash = (): string | null => {
   const m = location.hash.match(/^#s\/(.+)$/);
   return m ? decodeURIComponent(m[1]!) : null;
 };
+// A plan deep link (#p/<workUnitId>) opens the Autopilot view straight to that plan's reader — the
+// URL the autopilot posts in its Todoist comment. Used on cold load and on warm hashchange.
+const planFromHash = (): string | null => {
+  const m = location.hash.match(/^#p\/(.+)$/);
+  return m ? decodeURIComponent(m[1]!) : null;
+};
 
 // ── Back-stack: device/browser Back dismisses the top UI layer before leaving ─────────
 // Modals/dialogs, the settings view, the side panel and the (mobile) expanded sidebar are
@@ -356,6 +366,9 @@ function setSessionHash(id: string | null, push: boolean): void {
 // tap — as opposed to just restoring the last-active session from storage. On a phone we then jump
 // straight into that conversation with the sidebar hidden (see the collapse below). (UI refinement §4)
 const deepLinkedSession = sessionFromHash() || new URLSearchParams(location.search).get("session");
+// Captured before setSessionHash() below rewrites the URL and discards a #p/<id> fragment. Acted on
+// once the app has booted (the plan may not have synced yet — openPlanDeepLink waits for it).
+const deepLinkedPlan = planFromHash();
 let activeId: string | null = deepLinkedSession || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
 // The cid of a session.create we kicked off from the new-session dialog. The matching
@@ -386,6 +399,11 @@ window.addEventListener("popstate", () => {
 // external changes. Without it, a notification tapped while the app is already open didn't switch
 // sessions ("not deep linking every time"). (UI refinement §deep-link)
 window.addEventListener("hashchange", () => {
+  const planId = planFromHash();
+  if (planId) {
+    openPlanDeepLink(planId); // notification tap / shared link into a specific plan
+    return;
+  }
   const id = sessionFromHash();
   if (!id) {
     if (activeId) deselectSession();
@@ -754,6 +772,9 @@ for (const u of loadExtraServers()) ensureServer(u);
 // environments merge into the view immediately — otherwise the new-session picker shows hub-only
 // environments until the user happens to visit Settings → Servers.
 void loadFleetMembers();
+// Cold deep link into a plan (Todoist "Review in Anvil" link): open the Autopilot view now; the
+// reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
+if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
@@ -854,8 +875,8 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
   if (document.querySelector(".settings-view")) renderServerCards(); // live status in Settings
   if (status === "connected") {
     void flushOutbox(); // push anything queued while offline (routed per server)
-    srv?.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
-    srv?.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
+    // The autopilot probes are sent from the server.hello handler instead — hello is the first frame
+    // after open and carries the server's capabilities, so we only probe servers that support autopilot.
   }
   if (pendingRestartReload && url === HUB_URL) {
     if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
@@ -881,9 +902,11 @@ function refreshConnDot(): void {
 function onEvent(url: string, e: ServerEvent): void {
   if ("seq" in e && "sessionId" in e && typeof e.seq === "number") seqStore.set(e.sessionId, e.seq);
   const cid = (e as { cid?: string }).cid;
+  let awaited = false;
   if (cid && cidWaiters.has(cid)) {
-    cidWaiters.get(cid)!(e); // resolve an outbox flush awaiting this command's response
+    cidWaiters.get(cid)!(e); // hand the frame to the sendAwait promise tracking this cid
     cidWaiters.delete(cid);
+    awaited = true;
   }
 
   switch (e.type) {
@@ -960,6 +983,14 @@ function onEvent(url: string, e: ServerEvent): void {
         srv.id = e.serverId;
         srv.name = e.serverName || srv.name;
         srv.version = e.version;
+        srv.capabilities = e.capabilities;
+      }
+      // Now that we know this server's capabilities, pull its autopilot state — but only if it's new
+      // enough to handle these commands. An older member (no "autopilot" capability) is skipped, so it
+      // never gets `unknown command type` and just sits out the federated plan view until it's updated.
+      if (serverSupports(srv, "autopilot")) {
+        srv!.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
+        srv!.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
       }
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
@@ -1015,7 +1046,12 @@ function onEvent(url: string, e: ServerEvent): void {
       if (e.sessionId === activeId) showGitResult(e);
       return;
     case "command.error":
-      toast(e.message);
+      // Only surface errors for a command we issued and are still tracking. Skip it when a sendAwait
+      // already took it (the caller decides how to show it — avoids a double toast) and when it has no
+      // cid: a cid-less command.error is an unsolicited reply to a fire-and-forget command — e.g. the
+      // connect-time autopilot.plans.list / schedule.get probe reaching a fleet member on an older
+      // build that doesn't recognise it. That's benign cross-version noise, so don't toast it.
+      if (cid && !awaited) toast(e.message);
       return;
     case "ack":
       return;
@@ -2261,12 +2297,32 @@ function updateAutopilotBadge(): void {
   badge.textContent = n ? String(n) : "";
   badge.hidden = n === 0;
 }
+// A plan deep link (#p/<id>) may arrive before that plan has synced from its server. Hold the id here
+// and open the reader the moment the plan shows up (see onAutopilotPlans → tryOpenPendingPlan).
+let pendingPlanDeepLink: string | null = null;
+/** Open the Autopilot view at a specific plan (deep link). Opens the view if needed; if the plan
+ *  isn't loaded yet, remembers it and opens once its server delivers it. */
+function openPlanDeepLink(id: string): void {
+  pendingPlanDeepLink = id;
+  if (!overlayOpen("autopilot")) openAutopilot(); // renders the grid + pulls plans from every server
+  tryOpenPendingPlan();
+}
+/** If a deep-linked plan is now present, open its reader and clear the pending id. No-op otherwise. */
+function tryOpenPendingPlan(): void {
+  if (!pendingPlanDeepLink || !overlayOpen("autopilot")) return;
+  if (!findPlan(pendingPlanDeepLink)) return; // not synced yet — wait for the next autopilot.plans
+  const id = pendingPlanDeepLink;
+  pendingPlanDeepLink = null;
+  openPlan(id);
+}
+
 /** A server delivered its pending plans: re-tag routing, refresh the badge and (if open) the view. */
 function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
   serverPlans.set(url, plans);
   for (const [pid, u] of [...planServer]) if (u === url) planServer.delete(pid);
   for (const p of plans) planServer.set(p.id, url);
   updateAutopilotBadge();
+  tryOpenPendingPlan(); // a deep-linked plan may have just arrived
   if (!document.querySelector(".autopilot-view")) return;
   // A reader open on a plan that just vanished (dismissed/started elsewhere) falls back to the grid;
   // otherwise leave an open reader untouched (refine updates it in place) and only re-flow the grid.
@@ -2353,8 +2409,8 @@ function openAutopilot(): void {
   openOverlay("autopilot", closeAutopilot, "#autopilot"); // own URL; Back reverts it & closes the view
   renderAutopilotGrid();
   for (const s of orderedServers())
-    if (s.sock.isOpen()) {
-      s.sock.send({ type: "autopilot.plans.list" }); // fresh pull
+    if (s.sock.isOpen() && serverSupports(s, "autopilot")) {
+      s.sock.send({ type: "autopilot.plans.list" }); // fresh pull (autopilot-capable servers only)
       s.sock.send({ type: "autopilot.schedule.get" });
     }
 }
@@ -2719,9 +2775,10 @@ async function reassignPlan(id: string): Promise<void> {
 
 /** Re-plan linked Todoist projects on every connected server; stream progress into the log. */
 async function runAutopilot(): Promise<void> {
-  const targets = orderedServers().filter((s) => s.sock.isOpen());
+  // Only servers new enough to run the autopilot pipeline — an older member would just reject it.
+  const targets = orderedServers().filter((s) => s.sock.isOpen() && serverSupports(s, "autopilot"));
   if (!targets.length) {
-    toast("No connected servers");
+    toast("No autopilot-capable servers connected");
     return;
   }
   autopilotLog.length = 0;
@@ -2743,6 +2800,11 @@ async function runAutopilot(): Promise<void> {
           created += res.created;
           runState.results.push({ name: srv.name, ok: res.ok, created: res.created, skipped: res.skipped, error: res.ok ? undefined : res.output });
           onAutopilotProgress(res.ok ? `✓ ${srv.name}: ${res.created} new · ${res.skipped} already in pipeline` : `⚠ ${srv.name}: ${res.output}`);
+        } else if (res.type === "command.error") {
+          // e.g. "an autopilot run is already in progress" — record it per-server (the global
+          // command.error toast no longer fires for awaited commands).
+          runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: res.message });
+          onAutopilotProgress(`⚠ ${srv.name}: ${res.message}`);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

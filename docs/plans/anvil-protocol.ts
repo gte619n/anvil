@@ -350,6 +350,10 @@ export interface ServerHelloEvent extends Envelope {
   serverName: string; // display name, default: hostname
   version: string; // anvild version
   protocolVersion: ProtocolVersion;
+  // Coarse feature flags this build supports (e.g. "autopilot"). Lets a newer client skip commands a
+  // member is too old to handle instead of getting `unknown command type` back. Absent on pre-capability
+  // builds → the client treats every capability as unsupported for that server (graceful degradation).
+  capabilities?: string[];
 }
 /** A Todoist project, trimmed to what the link UI / planner needs. */
 export interface TodoistProjectInfo {
