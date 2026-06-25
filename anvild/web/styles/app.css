@@ -269,6 +269,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .todoist-projects { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
 .todoist-projects th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .todoist-projects td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.todoist-projects .td-indent { color: var(--muted); white-space: pre; }
 .todoist-connect { display: flex; gap: 8px; margin-top: 10px; }
 .todoist-connect input { flex: 1; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background-color: var(--bg); color: var(--text); }
 .session.archived { opacity: 0.55; }
