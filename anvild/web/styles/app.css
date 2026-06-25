@@ -587,6 +587,11 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-server-sep { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; color: var(--muted); margin: 18px 0 10px; }
 .ap-server-sep:first-child { margin-top: 0; }
 .ap-server-empty { margin: 0 0 8px; }
+/* Per-environment separator above each env's card grid (colour dot + name + count). */
+.ap-env-sep { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; color: var(--text); margin: 16px 0 9px; padding-bottom: 7px; border-bottom: 1px solid var(--border); }
+.ap-env-sep:first-child { margin-top: 0; }
+.ap-env-sep .env-dot { margin-right: 0; }
+.ap-env-sep .ap-env-count { margin-left: auto; font-weight: 600; font-size: 11px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
 
 .plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-bottom: 8px; }
 /* Each card is tinted by its environment (--plan-stripe set inline): a coloured left rail ties the
@@ -639,6 +644,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 
 /* Run status banner (above the raw log): running indicator, live progress line, per-server tallies. */
 .ap-run-status { margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; padding: 10px 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-size: 13px; display: flex; flex-direction: column; gap: 5px; }
+/* `display:flex` above outranks the [hidden] UA rule, so re-hide explicitly (else an empty bordered
+   box shows where the schedule bar used to be when there's no run in progress). */
+.ap-run-status[hidden] { display: none; }
 .ap-status-head { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
 .ap-status-head .msym { font-size: 17px; }
 .ap-status-line { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }

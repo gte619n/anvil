@@ -286,10 +286,13 @@ interface Overlay {
 const overlays: Overlay[] = [];
 let suppressPop = 0; // popstates from our own dismissOverlay() unwind — teardown already done
 const overlayOpen = (name: OverlayName): boolean => overlays.some((o) => o.name === name);
-function openOverlay(name: OverlayName, close: () => void): void {
+function openOverlay(name: OverlayName, close: () => void, hash?: string): void {
   if (overlayOpen(name)) return; // already open (e.g. swapping a modal's contents in place)
   overlays.push({ name, close });
-  history.pushState({ anvilDepth: overlays.length }, ""); // keep the current URL (session hash)
+  // `hash` (e.g. "#autopilot") gives the overlay its own URL so it's a real history entry — Back
+  // reverts the URL and pops the layer. Omit it to keep the current URL (the session hash).
+  const url = hash ? `${location.pathname}${hash}` : undefined;
+  history.pushState({ anvilDepth: overlays.length }, "", url);
 }
 /** Programmatically dismiss `name` and anything stacked above it (Cancel / X / backdrop). Tears
  *  down synchronously, then unwinds our own history entries (the resulting popstate is swallowed
@@ -2121,8 +2124,8 @@ function renderTodoistPanel(): void {
       </tr>`;
     })
     .join("");
-  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects
-      <button id="todoist-disconnect" class="mini" style="float:right">Disconnect</button></div>
+  host.innerHTML = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span><span>Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects</span>
+      <button id="todoist-disconnect" class="mini" style="margin-left:auto">Disconnect</button></div></div>
     ${scheduleSettingsCardHtml()}
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
     <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
@@ -2257,7 +2260,7 @@ function openAutopilot(): void {
     log.hidden = false;
     log.textContent = autopilotLog.join("\n");
   }
-  openOverlay("autopilot", closeAutopilot); // Back closes it (no-op if it's already a layer)
+  openOverlay("autopilot", closeAutopilot, "#autopilot"); // own URL; Back reverts it & closes the view
   renderAutopilotGrid();
   for (const s of orderedServers())
     if (s.sock.isOpen()) {
@@ -2273,9 +2276,9 @@ function closeAutopilot(): void {
 
 function planCardHtml(p: AutopilotPlanInfo): string {
   const localEnv = p.environmentId ? environments.get(p.environmentId) : undefined;
-  const env = p.environmentName ?? localEnv?.name;
   // Tint each card with its environment's colour (same hue the sidebar/session rows use), so a plan is
   // visually tied to the repo it belongs to. Falls back to the accent when the env isn't local.
+  // The environment name itself is carried by the group separator above the grid, not repeated here.
   const stripe = localEnv ? stripeColor(localEnv, 0, currentTheme()) : "var(--accent)";
   const summary = p.summary ?? p.rationale ?? "";
   const eff = p.effort
@@ -2285,18 +2288,30 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     <span class="plan-title">${esc(p.title)}</span>
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
     <span class="plan-meta">
-      ${env ? `<span class="ap-chip"><span class="env-dot" style="background:${stripe}"></span>${esc(env)}</span>` : ""}
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
       <span class="ap-chip status-${esc(p.status)}">${esc(p.status)}</span>
     </span>
   </button>`;
 }
-/** Plans for one server, ordered by environment (name) then title — so a repo's plans sit together. */
-function plansByEnvironment(list: AutopilotPlanInfo[]): AutopilotPlanInfo[] {
-  const envName = (p: AutopilotPlanInfo): string =>
-    (p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "~").toLowerCase();
-  return [...list].sort((a, b) => envName(a).localeCompare(envName(b)) || a.title.localeCompare(b.title));
+/** A plan's environment display name (local env → broadcast name → fallback). */
+function planEnvName(p: AutopilotPlanInfo): string {
+  return p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "Unlinked";
+}
+/** Group a server's plans by environment, ordered by environment name then title, so a repo's plans
+ *  sit together under one separator. */
+function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: string; plans: AutopilotPlanInfo[] }[] {
+  const groups = new Map<string, { envId?: string; name: string; plans: AutopilotPlanInfo[] }>();
+  for (const p of list) {
+    const name = planEnvName(p);
+    const key = p.environmentId ?? `~${name}`;
+    let g = groups.get(key);
+    if (!g) groups.set(key, (g = { envId: p.environmentId, name, plans: [] }));
+    g.plans.push(p);
+  }
+  const out = [...groups.values()];
+  for (const g of out) g.plans.sort((a, b) => a.title.localeCompare(b.title));
+  return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 /** The flowing card grid, grouped by server when the fleet has more than one. */
 function renderAutopilotGrid(): void {
@@ -2318,7 +2333,13 @@ function renderAutopilotGrid(): void {
       if (multi) html += `<p class="small muted ap-server-empty">No plans</p>`;
       continue;
     }
-    html += `<div class="plan-grid">${plansByEnvironment(list).map(planCardHtml).join("")}</div>`;
+    // A labeled separator per environment (colour dot + name), then that env's card grid.
+    for (const g of plansByEnvironment(list)) {
+      const env = g.envId ? environments.get(g.envId) : undefined;
+      const dot = env ? stripeColor(env, 0, currentTheme()) : "var(--muted)";
+      html += `<div class="ap-env-sep"><span class="env-dot" style="background:${dot}"></span>${esc(g.name)}<span class="ap-env-count">${g.plans.length}</span></div>`;
+      html += `<div class="plan-grid">${g.plans.map(planCardHtml).join("")}</div>`;
+    }
   }
   host.innerHTML = html;
   host.querySelectorAll<HTMLElement>(".plan-card").forEach((c) =>
@@ -3403,7 +3424,10 @@ function popOutReader(path: string): void {
     .join("");
   const theme = document.documentElement.dataset.theme ?? "light";
   const title = path.split("/").pop() || path;
-  const win = window.open("", "_blank", "noopener,width=860,height=920");
+  // NB: no "noopener" here — with it, window.open() returns null (the opener link is severed), so we
+  // could never write into the window and were left with a blank about:blank pop-up. We need the
+  // handle to document.write our own content; it's same-origin self-authored markup, so this is safe.
+  const win = window.open("", "_blank", "width=860,height=920");
   if (!win) {
     toast("Allow pop-ups to open the reader in its own window");
     return;
