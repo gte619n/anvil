@@ -134,13 +134,11 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
 .session .meta .msym { font-size: 13px; vertical-align: -2px; margin-right: 1px; }
-/* Settings → Servers: add-a-server card, discovered rows, per-server budget, account gauge */
+/* Settings → Servers: add-a-server card, discovered rows */
 .add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
 .discover-row code { word-break: break-all; }
-.srv-budget { margin-top: 6px; }
 .server-card.removing { opacity: 0.5; pointer-events: none; transition: opacity 0.15s ease; }
-.warn-card { border-color: var(--danger); }
 /* per-server section header on the Environments tab (fleet grouping) */
 .env-server-head { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
 .env-server-head + .env-server-head, .env-card + .env-server-head { margin-top: 18px; }

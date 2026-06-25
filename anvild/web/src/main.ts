@@ -928,8 +928,7 @@ function onEvent(url: string, e: ServerEvent): void {
     }
     case "budget": {
       const srv = servers.get(url);
-      if (srv) srv.budget = e.budget;
-      renderAggregateBudget(); // sum across servers (§7)
+      if (srv) srv.budget = e.budget; // stored for any future use; no longer surfaced in the UI
       return;
     }
     case "environments":
@@ -2646,7 +2645,7 @@ async function saveSchedule(): Promise<void> {
   }
 }
 
-/** One card per server in the fleet (hub first): live status, version, budget, update & remove. */
+/** One card per server in the fleet (hub first): live status, version, update & remove. */
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
   const id = cssId(srv.url);
@@ -2660,7 +2659,6 @@ function serverCardHtml(srv: Server): string {
     ${removeX}
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
-    <div id="srv-budget-${id}" class="small muted srv-budget"></div>
     <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
     <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
@@ -2672,7 +2670,6 @@ function renderServerCards(): void {
   // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
-    `<div id="fleet-budget"></div>` +
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
     `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
     `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
@@ -2688,7 +2685,6 @@ function renderServerCards(): void {
   document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
-  renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
       const el = document.getElementById("adb-output");
@@ -2855,36 +2851,6 @@ async function loadFleetPeers(): Promise<void> {
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
   }
-}
-const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
-/** Per-server budget lines + one aggregate "account usage" gauge (fleet §7). No-op if Settings is closed. */
-function renderAggregateBudget(): void {
-  for (const srv of servers.values()) {
-    const el = document.getElementById(`srv-budget-${cssId(srv.url)}`);
-    if (!el) continue;
-    const b = srv.budget;
-    el.innerHTML = b?.available
-      ? `Opus ${fmtPct(b.weekOpus)} · week ${fmtPct(b.week)}${b.warn ? ` ${icon("warning")}` : ""}`
-      : `budget: n/a`;
-  }
-  const agg = document.getElementById("fleet-budget");
-  if (!agg) return;
-  // All servers draw from ONE account, so each reports the same account-wide usage via the SDK.
-  // The honest aggregate is therefore the highest utilization any server reports — the real ceiling
-  // (§7) — not a sum. Shown only when there's more than one server.
-  const budgets = [...servers.values()].map((s) => s.budget).filter((b): b is Budget => !!b?.available);
-  if (orderedServers().length <= 1 || budgets.length === 0) {
-    agg.innerHTML = "";
-    return;
-  }
-  const maxU = (pick: (b: Budget) => number): number => Math.round(Math.max(0, ...budgets.map(pick)));
-  const opus = maxU((b) => b.weekOpus?.utilization ?? 0);
-  const week = maxU((b) => b.week?.utilization ?? 0);
-  const warn = budgets.some((b) => b.warn) || opus >= 80;
-  agg.innerHTML = `<div class="card${warn ? " warn-card" : ""}">
-    <div class="card-main">${icon("monitoring")} <b>Account usage</b></div>
-    <div class="small muted">Shared Max pool across the fleet — Opus <b>${opus}%</b> · week <b>${week}%</b> (highest any server reports).${warn ? " ⚠️ approaching the weekly limit." : ""}</div>
-  </div>`;
 }
 /** Wire one server card's "Update Anvil" button: pull that daemon's source, rebuild, and restart it.
  *  Each Mac self-updates independently — the hub no longer has a monopoly on updates. Only a hub
