@@ -1,107 +1,117 @@
-# anvild
+# anvild — the Anvil daemon
 
-The Anvil daemon — supervises Claude Code sessions and serves the Anvil protocol
-(`../docs/plans/anvil-protocol.ts`, symlinked here as `protocol.ts`) over Tailscale.
+The keystone of Anvil. One daemon per Mac: it supervises Claude Code sessions, drives them
+through the Agent SDK, renders markdown, enforces permissions, tracks usage, persists an
+event log, owns the git worktrees, and serves both the web client and the protocol over
+Tailscale.
 
-See the plans in `../docs/plans/`: `anvil-native-architecture.md` (design),
-`anvil-impl-1-daemon-core.md` (this component), `anvil-impl-INDEX.md` (all components).
+- **Architecture tour:** [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)
+- **Full design:** [`../docs/plans/anvil-native-architecture.md`](../docs/plans/anvil-native-architecture.md)
+- **Wire protocol:** [`protocol.ts`](protocol.ts) → symlink to [`../docs/plans/anvil-protocol.ts`](../docs/plans/anvil-protocol.ts)
+
+---
 
 ## Run
 
+Requires [Bun](https://bun.sh) ≥ 1.3.14 and a Claude **Max** subscription.
+
 ```sh
 bun install
-# Auth (arch §3): subscription OAuth token, and NO metered API key in the env.
+
+# Auth via your subscription — NOT a metered API key (see "Auth & billing" below).
 export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"   # one-time
-bun run start          # http://localhost:7701  (ws: /ws · health: /api/health)
+
+bun run start          # http://localhost:7701   (ws: /ws · health: /api/health)
 bun run dev            # watch mode
 bun test               # unit + integration (no token/network needed — uses a mock)
 bun run typecheck
 ```
 
-The daemon **refuses to start** if `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` is set
-(they outrank the OAuth token and would meter billing — arch §3).
+> [!IMPORTANT]
+> **Auth & billing.** The daemon **refuses to start** if `ANTHROPIC_API_KEY` /
+> `ANTHROPIC_AUTH_TOKEN` is set — they outrank the OAuth token and would silently switch
+> every turn from your subscription to metered pay-per-token billing. Anvil only ever drives
+> Claude through the Agent SDK with the subscription OAuth token. Full rationale:
+> [`anvil-native-architecture.md` §3](../docs/plans/anvil-native-architecture.md).
 
-## Milestone status (impl plan 1)
-
-- [x] **M1** — skeleton, auth/billing guard (§3), `GET /api/health` (`subscriptionAuthOk`)
-- [x] **M2** — WS server, envelope dispatch, `cid` ack/error correlation, push register/unregister
-- [x] **M3** — session registry + persistence (`sessions.json`) + per-session `seq`; `session.list` on connect; create/attach/detach/kill/set_model/set_autonomy
-- [x] **M4** — fresh-worktree create (`git worktree add`) + process-group kill/reap (`detached` spawn, SIGTERM→SIGKILL group), worktree removal on kill
-- [x] **M5** — Agent SDK streaming driver (`SDKMessage` → `ServerEvent`): `prompt.send`/`interrupt`,
-      streaming `assistant.delta` → `assistant.message`, `tool.use`/`tool.result`, status
-      transitions, `claudeSessionId` capture for resume, usage accounting. Verified live
-      (`test/tools/live-prompt.ts`): plain reply + Bash tool execution both stream correctly.
-- [x] **M6** — event-log persistence (`events.ndjson`) + resume: `session.attach{lastSeq}`
-      replays `seq > lastSeq`, cold attach folds a `conversation.snapshot` (incl. `message.user`).
-      Deltas/terminal events excluded from the durable log. Verified live (reconnect → snapshot + replay).
-- [x] **M7** — authoritative permissions via a **`PreToolUse` hook** (fires on every tool, so the
-      daemon's autonomy policy + danger list govern all tools — `canUseTool` alone only sees ops
-      the CLI already flags). `permission.request`/`respond` round-trip + per-session `allow_always`.
-      Verified live: a benign tool prompts under `prompt-all`; auto-allowed under `mostly-autonomous`.
-- [x] **M8** — budget tracker: accumulates per-model USD-equivalent cost over a rolling 7-day
-      window, converts to an hours-estimate (calibratable), emits `budget` on connect + per turn,
-      `warn` threshold + one-shot soft-stop advisory. Verified live (budget event after each turn).
-
-**Daemon core (M1–M8) complete.**
-
-- [x] **Rendering pipeline (impl plan 2, daemon side)** — `src/render/markdown-pipeline.ts`:
-      markdown-it (with `data-line` source attrs) → Shiki dual-theme highlighting → KaTeX math
-      (`trust:false`) → DOMPurify (jsdom). Mermaid stays inert `<pre class="mermaid">` for the
-      WebView. Loaded once at startup; `render()` stays sync. Verified live: daemon emits real
-      Shiki/`data-line` HTML (CSS-var theming survives sanitization). `PassthroughRenderer`
-      remains the fallback when no renderer is injected.
-
-- [x] **Web client** (`web/`) — a browser client and the reusable rendering core for the
-      future native shells. Vanilla TS + the daemon's server-rendered HTML; streaming via a
-      live bubble that snaps to rendered HTML on completion; mermaid loads lazily; KaTeX is
-      server-rendered (CSS only on the client). Session list + budget gauge, native textarea
-      (Shift+Enter = newline), permission dialogs, reconnect + `session.attach` resume. Served
-      by the daemon at `/` behind a CSP. Builds + serves; **interactive UI to be eyeballed in a browser.**
-
-Remaining: streaming morph polish + select-to-cite in the web client; terminal + file
-browser (plan 4); native clients (plans 3, 5); push/ops (plan 6).
-
-## Web client
-
-```sh
-bun run build:web     # bundle web/src → web/dist
-bun run start         # daemon serves the app at http://localhost:7701/
-```
-
-Over Tailscale (use from your phone + desktop):
+### Over Tailscale (drive from your phone + desktop)
 
 ```sh
 tailscale serve --bg --https=443 http://localhost:7701
-# then open https://<your-magicdns-host>/   (WS connects same-origin to /ws)
+# then open https://<your-magicdns-host>/   (the WS connects same-origin to /ws)
 ```
 
-Rebuild with `bun run build:web` after editing `web/src`. Typecheck with `bun run typecheck:web`.
+---
+
+## Web client
+
+The web client (`web/`) is both the daily-driver browser UI and the reusable render surface
+bundled into the native shells.
+
+```sh
+bun run build:web         # bundle web/src → web/dist
+bun run start             # daemon serves the app at http://localhost:7701/
+bun run typecheck:web
+```
+
+Rebuild with `bun run build:web` after editing `web/src`. The native shells get the same
+bundle via `web/bundle-native.ts`.
+
+---
 
 ## Service (macOS LaunchAgent)
 
 ```sh
 ./scripts/service.sh install     # build web, install + load the LaunchAgent, wire tailscale serve
 ./scripts/service.sh status      # service state + /api/health
-./scripts/service.sh restart     # kickstart
+./scripts/service.sh restart     # kickstart (forces past launchd's restart backoff)
 ./scripts/service.sh logs        # tail the daemon log
 ./scripts/service.sh uninstall   # bootout + remove plist/launcher (keeps state)
 ```
 
-Installs `~/.local/bin/anvild-launch` (sources `~/.config/anvil/env`, unsets
-`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` — arch §3) and
-`~/Library/LaunchAgents/com.anvil.anvild.plist` (`RunAtLoad` + `KeepAlive`). No secrets in
-the plist. Logs to `~/.local/state/anvil/`. Starts at login and restarts on crash.
+`install` lays down `~/.local/bin/anvild-launch` (sources `~/.config/anvil/env` and unsets
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`) and
+`~/Library/LaunchAgents/com.anvil.anvild.plist` (`RunAtLoad` + `KeepAlive`). No secrets live
+in the plist; logs go to `~/.local/state/anvil/`. The service starts at login and restarts
+on crash.
 
-Note: launchd applies a restart-backoff penalty if the job is killed rapidly many times in
-a row (e.g. during testing); `kickstart`/`./scripts/service.sh restart` force-starts past it.
-Normal operation and reboot are unaffected.
+> The daemon runs with `settingSources: []`, so it does **not** inherit your ambient Claude
+> Code allow-rules — the daemon is the permission authority. Trade-off: the repo's
+> `CLAUDE.md` isn't auto-loaded; project-context injection is a later item.
 
-Note: the daemon runs with `settingSources: []` so it does NOT inherit your ambient Claude
-Code allow-rules — the daemon is the permission authority (arch §6.6). Trade-off: the repo's
-`CLAUDE.md` isn't auto-loaded; project-context injection is a later item.
+For a terminal-free install + multi-Mac fleet setup, use the menu-bar
+[Anvil Server](../anvil-server/) app, which shells out to `service.sh`.
 
-## Layout
+---
 
-`src/auth` guard · `src/server` (http/dispatch/registry) · `src/push` registry ·
-`src/budget` tracker (stub) · `src/session` `src/agent` `src/eventlog` `src/render` (M3+).
-`bun:sqlite`/files for state land with M3.
+## What's inside
+
+| Area | Path | Responsibility |
+|---|---|---|
+| Server | [`src/server/`](src/server/) | HTTP + WebSocket, envelope dispatch, connection registry, fleet endpoints |
+| Session | [`src/session/`](src/session/) | supervisor, process groups, worktree create/kill/reap, persistence |
+| Agent | [`src/agent/`](src/agent/) | Agent SDK driver, permissions, input queue, default tools, danger list |
+| Render | [`src/render/`](src/render/) | markdown-it → Shiki → KaTeX → DOMPurify pipeline (mermaid stays client-side) |
+| Git | [`src/git/`](src/git/) | branch/diffstat metadata, commit/push/PR/merge ops |
+| Event log | [`src/eventlog/`](src/eventlog/) | append-only `events.ndjson` — the source of truth for resume |
+| Budget | [`src/budget/`](src/budget/) | rolling 7-day usage → Opus/Sonnet hours, warn + soft-stop |
+| Push | [`src/push/`](src/push/) | Web Push / FCM / APNs registries |
+| Fleet | [`src/fleet/`](src/fleet/) | multi-server discovery, token push/rotation |
+| Integrations | [`src/integrations/`](src/integrations/) | Todoist autopilot, scheduling, work units |
+| Web client | [`web/`](web/) | the browser UI + shared render surface |
+
+---
+
+## Auth & billing — read first
+
+Anvil draws on the **Max subscription pool**, never metered API billing. Two rules make that
+true, and the daemon enforces both at startup:
+
+1. **Always go through the Agent SDK / Claude Code** — never the raw Messages API.
+2. **Authenticate with `CLAUDE_CODE_OAUTH_TOKEN`** (from `claude setup-token`), and keep
+   `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` out of the environment.
+
+This is a hard constraint, not a preference — see
+[`anvil-native-architecture.md` §3](../docs/plans/anvil-native-architecture.md) for the
+caveats worth tracking (the announced-then-paused Agent-SDK billing split, the shared usage
+pool, and unattended-use ToS notes).

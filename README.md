@@ -1,258 +1,321 @@
-# ZellijConnect
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/anvil-banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/anvil-banner-light.svg">
+    <img alt="Anvil — Drive Claude Code from anywhere." src="docs/assets/anvil-banner-light.svg" width="560">
+  </picture>
+</p>
 
-A native Android app for connecting to Zellij terminal sessions via the Zellij web client. Built specifically for the Samsung Galaxy Fold 7 running Android 15.
+<p align="center">
+  <em>A native, multi-device client for <a href="https://www.claude.com/product/claude-code">Claude Code</a> — talk to your agent from your phone, tablet, or laptop, over your own private network.</em>
+</p>
 
-## Features
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#repository-layout">Repo layout</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
-- **Multi-tab support** - Open multiple Zellij sessions in separate tabs
-- **Automatic keyboard switching** - Switches to terminal keyboard (Unexpected Keyboard) when focused, Gboard when unfocused
-- **Volume key scrolling** - Use volume buttons to scroll terminal history
-- **Keep-alive service** - Maintains WebSocket connections in background
-- **Immersive mode** - Hide system bars for maximum terminal space
-- **External link handling** - HTTP links open in phone browser
-- **Copy/paste support** - Long-press to select and copy text
+---
 
-## Setup
+## What is Anvil?
 
-### 1. Configure `local.properties`
+Anvil lets you **run Claude Code on your dev machine and drive it from anywhere** — your
+phone on the couch, a tablet, or another laptop. A small daemon (`anvild`) supervises your
+Claude Code sessions and streams them as **structured data** — markdown, tool calls, diffs,
+git state — to thin native clients over [Tailscale](https://tailscale.com). Nothing is
+public; your machine and your devices talk directly over your private tailnet.
 
-Create `local.properties` in the project root (this file is gitignored):
+It's the kind of thing you reach for when you want to kick off a task on your workstation,
+put your phone in your pocket, and get pulled back by a push notification when Claude
+finishes — or needs your permission for something risky.
 
-```properties
-# Android SDK location
-sdk.dir=/path/to/your/android/sdk
+> [!NOTE]
+> **Anvil started life as a Zellij-in-a-WebView app and was rebuilt from the ground up.**
+> The old approach scraped a terminal grid; the current one drives Claude Code through the
+> [Agent SDK](https://docs.claude.com/en/docs/claude-code/sdk) and forwards typed events.
+> See [Why a rebuild?](#why-a-rebuild) and [`docs/plans/anvil-native-architecture.md`](docs/plans/anvil-native-architecture.md).
 
-# Zellij server configuration
-ZELLIJ_BASE_URL=https://your-server:7600
-ZELLIJ_GATEWAY_PATH=/gateway
+### What you get
 
-# Zellij authentication token
-ZELLIJ_TOKEN=your-token-here
+- 💬 **Conversation, not a terminal grid** — reflowable markdown, syntax-highlighted code,
+  tables, math, and **mermaid diagrams**, rendered once on the daemon and shown identically
+  on every device. Proportional fonts, real text inputs (Shift+Enter is a newline).
+- 📱 **Multi-device, no shared viewport** — pick up your phone mid-conversation and it
+  reconciles to exactly where your laptop left off. No "disconnect the other client" dance.
+- 🌳 **Worktree-per-session** — each task can spin up its own git worktree off a base branch.
+  Branch, diffstat, and git lifecycle (commit / push / PR / merge) are first-class.
+- 🛡️ **Mostly-autonomous with a danger-list backstop** — auto-allows ordinary tool use,
+  prompts only on genuinely risky ops (`rm -rf`, force-push, secret access). Permission
+  prompts become native dialogs answerable from any device.
+- 🔔 **Push when it matters** — a notification when a session needs a decision or a turn
+  completes. Web Push today; FCM (Android) / APNs (Apple) for native shells.
+- 🖥️ **A real terminal when you need one** — a persistent, server-side PTY per session,
+  with durable scrollback across device switches.
+- 📄 **Live markdown reader** — open a doc and chat about it side-by-side; it re-renders in
+  place as Claude edits it, with select-to-cite back into the conversation.
+- 🔗 **Fleet-ready** — one client can manage `anvild` across several Macs on one Max plan.
 
-# IME package IDs (verify with: adb shell ime list -s)
-TERMINAL_IME_ID=juloo.keyboard2/.Keyboard2
-DEFAULT_IME_ID=com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+---
+
+## Quick start
+
+You need a machine with [Bun](https://bun.sh) ≥ 1.3.14, a Claude **Max** subscription, and
+[Tailscale](https://tailscale.com) on every device you want to drive from.
+
+```sh
+# 1. Install dependencies
+cd anvild
+bun install
+
+# 2. Authenticate with your Claude subscription (one-time).
+#    This uses the subscription pool — NOT a metered API key (see "Auth & billing" below).
+export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"
+
+# 3. Run the daemon — serves the web client + WebSocket API on :7701
+bun run start
+#    → open http://localhost:7701
 ```
 
-### 2. Build and Install
+Then expose it to your other devices over Tailscale:
 
-```bash
-./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+```sh
+tailscale serve --bg --https=443 http://localhost:7701
+#    → open https://<your-magicdns-host>/  from your phone or tablet
 ```
 
-### 3. Grant Permissions
+For an always-on install (macOS LaunchAgent that restarts on crash and at login), and a
+non-technical, terminal-free setup, see [Running it for real](#running-it-for-real).
 
-The app needs `WRITE_SECURE_SETTINGS` for automatic keyboard switching:
+> [!IMPORTANT]
+> **Auth & billing is a hard constraint.** Anvil only ever drives Claude through the Agent
+> SDK, authenticated by your subscription's OAuth token. `ANTHROPIC_API_KEY` /
+> `ANTHROPIC_AUTH_TOKEN` **must be unset** — a stray API key silently switches every turn to
+> metered pay-per-token billing, so the daemon **refuses to start** if one is present.
+> Full rationale: [`anvil-native-architecture.md` §3](docs/plans/anvil-native-architecture.md).
 
-```bash
-adb shell pm grant com.zellijconnect.app android.permission.WRITE_SECURE_SETTINGS
+---
+
+## System overview
+
+A single daemon on your dev box hosts Claude Code and forwards structured events; thin
+native shells render them. Everything between them rides your private tailnet.
+
+```mermaid
+flowchart TB
+    subgraph dev["🖥️  Your dev machine"]
+        direction TB
+        anvild["<b>anvild</b> — the daemon<br/>session supervisor · Agent SDK stream<br/>event log · git/worktree · render pipeline<br/>permissions · budget · push"]
+        cc["Claude Code<br/>(Agent SDK)"]
+        wt["git worktrees<br/>(one per session)"]
+        anvild <-->|"drives"| cc
+        anvild <-->|"owns"| wt
+    end
+
+    subgraph cloud["☁️  Push (optional)"]
+        push["FCM · APNs · Web Push"]
+    end
+
+    anvild -.->|"alerts"| push
+
+    subgraph clients["📱  Your devices"]
+        direction LR
+        web["Web client<br/>(browser)"]
+        android["Android app<br/>(WebView shell)"]
+        apple["Apple app<br/>(SwiftUI shell)"]
+    end
+
+    anvild <==>|"WebSocket + REST<br/><b>Tailscale</b> (MagicDNS · ACLs)"| clients
+    push -.->|"wake"| clients
+
+    classDef daemon fill:#D39450,stroke:#2F2739,color:#2F2739;
+    classDef box fill:#635F6A,stroke:#2F2739,color:#F0F6FC;
+    class anvild daemon;
+    class web,android,apple,cc,wt,push box;
 ```
 
-## Volume Key Scrolling
+`anvild` replaces **both** the old Python status server *and* Zellij — it owns the session
+lifecycle end-to-end, so there are no sockets to negotiate or husk processes to reap.
 
-Volume keys can scroll the terminal, but require Zellij keybinding configuration.
+---
 
-### Zellij Configuration
+## How it works
 
-Add to `~/.config/zellij/config.kdl` on your Zellij server:
+### A session is one conversation against one working tree
 
-```kdl
-keybinds {
-    shared {
-        bind "Ctrl Shift Alt k" { ScrollUp; }
-        bind "Ctrl Shift Alt j" { ScrollDown; }
-    }
-}
+You create a session by pointing it at an **existing directory** (a quick poke) or asking
+for a **fresh git worktree** off a base branch (an isolated task). The daemon spawns a
+supervised Claude Code process in its own process group, records the session, and persists
+an append-only event log that is the source of truth for replay.
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle: session.create
+    idle --> thinking: prompt.send
+    thinking --> running_tool: tool_use
+    running_tool --> thinking: tool_result
+    thinking --> awaiting_permission: danger-list hit
+    running_tool --> awaiting_permission: danger-list hit
+    awaiting_permission --> running_tool: permission.respond (allow)
+    awaiting_permission --> thinking: permission.respond (deny)
+    thinking --> idle: result (turn complete)
+    running_tool --> error: crash
+    idle --> exited: session.kill
+    error --> exited: reap
+    exited --> [*]
 ```
 
-Then restart your Zellij sessions for the config to take effect.
+### A turn, end to end
 
-### How it works
+Every server→client event carries a per-session monotonic `seq`, which is the backbone of
+resume: a client persists the highest `seq` it has rendered and, on reconnect, asks the
+daemon to replay everything newer (or sends a full snapshot if the client is too far behind).
 
-- **Volume Up** - Sends `Ctrl+Shift+Alt+K` (scroll up)
-- **Volume Down** - Sends `Ctrl+Shift+Alt+J` (scroll down)
+```mermaid
+sequenceDiagram
+    participant U as You (any device)
+    participant D as anvild
+    participant C as Claude Code (Agent SDK)
 
-## UI Controls
-
-| Control | Action |
-|---------|--------|
-| **ESC button** | Sends Escape key to terminal |
-| **+ button** | Opens new Zellij session tab |
-| **Browser button** | Opens phone browser to server:5173 |
-| **Fullscreen button** | Toggles immersive mode |
-| **X on tab** | Detaches Zellij session and closes tab |
-| **Swipe up on tab** | Same as X button |
-
-## Clipboard Integration
-
-ZellijConnect supports bidirectional clipboard sync between Android and your Zellij sessions using OSC 52 escape sequences.
-
-### How it works
-
-- **Paste (Android → Terminal)**: Long-press in terminal → Paste, or use keyboard paste
-- **Copy (Terminal → Android)**: Terminal apps using OSC 52 will copy to Android clipboard
-
-### Server-side Configuration
-
-For clipboard sync from terminal to Android, Zellij must forward OSC 52 sequences. This is the default behavior, but ensure your config doesn't override it:
-
-```kdl
-# ~/.config/zellij/config.kdl
-
-# Leave copy_command unset to use OSC 52 (default)
-# copy_command "pbcopy"  # Don't set this for web client use
-
-copy_clipboard "system"
-copy_on_select true
+    U->>D: prompt.send { text }
+    D->>C: drive turn
+    C-->>D: assistant deltas (streaming)
+    D-->>U: assistant.delta … (seq++)
+    C->>D: tool_use (e.g. Edit)
+    D->>D: autonomy policy + danger-list
+    alt risky op
+        D-->>U: permission.request  +  📲 push
+        U->>D: permission.respond { allow }
+    end
+    D->>C: run tool
+    C-->>D: tool_result
+    D-->>U: tool.use / tool.result (seq++)
+    C->>D: turn complete
+    D-->>U: result + budget  +  📲 push
 ```
 
-### Testing OSC 52
+### Why markdown is rendered on the daemon
 
-Test clipboard copy from terminal to Android:
+Markdown (chat bubbles **and** the reader pane) is rendered **once, in the daemon**, and
+displayed in a scoped, read-only WebView in the native shells:
 
-```bash
-# This should copy "hello" to your Android clipboard
-printf '\e]52;c;%s\a' "$(echo -n 'hello' | base64)"
+```mermaid
+flowchart LR
+    md["Markdown"] --> mdit["markdown-it<br/>(+ data-line attrs)"]
+    mdit --> shiki["Shiki<br/>syntax highlight"]
+    shiki --> katex["KaTeX<br/>math → HTML"]
+    katex --> purify["DOMPurify<br/>sanitize"]
+    purify --> html["Safe HTML"]
+    html --> wv["WebView"]
+    mermaid["mermaid.js<br/>(strict CSP)"] --> wv
+    classDef step fill:#635F6A,stroke:#2F2739,color:#F0F6FC;
+    class mdit,shiki,katex,purify,mermaid step;
+    classDef out fill:#D39450,stroke:#2F2739,color:#2F2739;
+    class html,wv out;
 ```
 
-### Supported Apps
+This buys **one** rendering pipeline across web/Android/Apple (mermaid, math, and
+select-to-cite all work) instead of maintaining divergent native renderers. The native
+shells still own everything else: navigation, layout, lists, input, terminal, and file tree.
+Full reasoning in [`anvil-native-architecture.md` §8.3](docs/plans/anvil-native-architecture.md).
 
-Apps that use OSC 52 will automatically sync to Android clipboard:
-- Neovim (with `set clipboard=unnamedplus`)
-- tmux (with `set -g set-clipboard on`)
-- vim-oscyank plugin
-- Most modern terminal apps with clipboard support
+---
 
-## Building
+## Components
 
-Requirements:
-- Android SDK 35 (Android 15)
-- Java 21
-- Gradle 8.x
+| Component | Path | Stack | What it is |
+|---|---|---|---|
+| **Daemon** | [`anvild/`](anvild/) | TypeScript · Bun | Session supervisor, Agent SDK streaming, event log, git/worktree ops, permissions, budget, render pipeline, push. The keystone. |
+| **Web client** | [`anvild/web/`](anvild/web/) | Vanilla TS | The daily-driver UI and the reusable render surface, served by the daemon at `/`. Also bundled into the native shells. |
+| **Android app** | [`app/`](app/) | Kotlin | A WebView shell hosting the web client over Tailscale + native FCM push, ADB-over-Tailscale, offline app-shell. `com.gte619n.anvil`. |
+| **Apple app** | [`apple/`](apple/) | SwiftUI · WKWebView | macOS-first hybrid shell (same model as Android); iOS + APNs gated on an Apple Developer account. |
+| **Server control panel** | [`anvil-server/`](anvil-server/) | SwiftUI | A macOS menu-bar app that stands up and manages `anvild` and joins Macs into a fleet — terminal-free setup. |
+| **Build & release scripts** | [`scripts/`](scripts/) | Bash · TS | CI release notes + Apple Developer ID signing. |
 
-```bash
-# Build debug APK
-./gradlew assembleDebug
+---
 
-# Build and install
-./gradlew installDebug
+## Running it for real
 
-# View logs
-adb logcat -s ZellijConnect:V
+The daemon is built to run unattended on a macOS LaunchAgent.
+
+```sh
+cd anvild
+./scripts/service.sh install     # build web, install + load the LaunchAgent, wire tailscale serve
+./scripts/service.sh status      # service state + /api/health
+./scripts/service.sh restart     # kickstart past launchd backoff
+./scripts/service.sh logs        # tail the daemon log
 ```
 
-### Deploying to Firebase App Distribution
+It installs a launcher that sources `~/.config/anvil/env`, strips any
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment, runs at login, and
+restarts on crash. No secrets live in the plist. See [`anvild/README.md`](anvild/README.md).
 
-**Always bump the version first.** Edit `app/build.gradle` and increase **both**:
+For a **terminal-free** setup — install Bun, capture the OAuth token, wire Tailscale, and
+join several Macs into a fleet from a menu-bar UI — use the **Anvil Server** app in
+[`anvil-server/`](anvil-server/).
 
-- `versionCode` — integer, +1 every deploy (App Distribution orders releases by it).
-- `appVersionName` — the user-visible version (e.g. `2.0.1` → `2.0.2`). This is the APK
-  `versionName` **and** the version shown next to the "Anvil" title in the app, so testers can
-  confirm they're on the latest build.
+---
 
-Then build + upload (emails the testers configured in `firebaseAppDistribution {}`):
+## Why a rebuild?
 
-```bash
-export JAVA_HOME="$HOME/.sdkman/candidates/java/current"   # JDK 21
-./gradlew :app:assembleDebug :app:appDistributionUploadDebug
+The original Anvil drove Claude Code inside a PTY, inside Zellij, surfaced through Zellij's
+browser web client, wrapped in a WebView. Nearly every frustration traced to one root cause:
+**using a terminal multiplexer for something that isn't fundamentally terminal work.**
+
+| Pain point (Zellij era) | Root cause | Fixed by |
+|---|---|---|
+| Monospace prose hard to read | bytes-on-a-grid | structured markdown, proportional fonts |
+| Shift+Enter ≠ newline | terminal key encoding | native text inputs |
+| Viewport fights across devices / foldables | one shared character grid | reflowable structure, no shared viewport |
+| Can't paste/drag images & files | a PTY only takes byte streams | first-class structured attachments |
+| Sessions opaque, won't die | Zellij owned lifecycle via sockets/husks | daemon owns lifecycle + process-group kill |
+| All tabs/titles look identical | no structured metadata | rich session list with previews + git state |
+
+The reframe: **Anvil is a Claude client that occasionally needs a terminal**, not a
+terminal that occasionally talks to Claude. The full design — including the load-bearing
+auth/billing constraint and the protocol — lives in
+[`docs/plans/anvil-native-architecture.md`](docs/plans/anvil-native-architecture.md).
+
+---
+
+## Repository layout
+
+```
+anvil/
+├── anvild/              # 🔨 the daemon (TS/Bun) — the keystone
+│   ├── src/             #    server · session · agent · render · git · push · fleet …
+│   ├── web/             #    the web client + render surface (served at /)
+│   ├── protocol.ts      #    → symlink to docs/plans/anvil-protocol.ts
+│   └── scripts/         #    service.sh (LaunchAgent), merge-session.sh
+├── app/                 # 🤖 Android WebView shell (Kotlin) — com.gte619n.anvil
+├── apple/               # 🍎 Apple SwiftUI WebView shell (macOS first)
+├── anvil-server/        # 🖥️  macOS menu-bar control panel for anvild + fleet
+├── docs/
+│   ├── ARCHITECTURE.md  #    approachable overview with diagrams (start here)
+│   ├── assets/          #    brand assets (logo, banners)
+│   └── plans/           #    deep design + implementation specs
+├── scripts/             #    build/release utilities (CI release notes, Apple signing)
+└── .github/workflows/   #    Android release → Firebase App Distribution
 ```
 
-Notes:
-- `assembleDebug` must run in the same invocation — the upload task doesn't build the APK.
-- `bundleWebAssets` rebuilds the web client into the APK, so web changes ship automatically;
-  it passes `appVersionName` to the web build as `APP_VERSION`.
-- Update `releaseNotes` in `app/build.gradle` to describe what changed.
+---
 
-#### Automated builds on merge to `main` (GitHub Actions)
+## Documentation
 
-Every push/merge to `main` runs `.github/workflows/android-release.yml`, which builds the
-debug APK and distributes it to the testers (`evan.ruff@gmail.com`) on Firebase App
-Distribution — no manual `gradlew` needed. It also uploads the APK as a workflow artifact and
-can be triggered manually from the Actions tab (**Run workflow**).
+| Doc | What's in it |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **Start here.** Approachable architecture tour with diagrams. |
+| [`docs/plans/anvil-native-architecture.md`](docs/plans/anvil-native-architecture.md) | The full design: auth/billing, sessions, protocol, render pipeline, decisions. |
+| [`docs/plans/anvil-protocol.ts`](docs/plans/anvil-protocol.ts) | The wire protocol — every envelope, event, and command (the source of truth). |
+| [`docs/plans/anvil-impl-INDEX.md`](docs/plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans. |
+| [`docs/plans/anvil-multi-server.md`](docs/plans/anvil-multi-server.md) | Multi-server fleet design (one client, many Macs, one Max plan). |
+| [`docs/plans/anvil-server-app.md`](docs/plans/anvil-server-app.md) | The menu-bar control panel design. |
+| [`anvild/README.md`](anvild/README.md) | Running, building, and developing the daemon + web client. |
+| [`apple/README.md`](apple/README.md) · [`anvil-server/README.md`](anvil-server/README.md) | Apple client + control-panel build notes. |
 
-What the workflow handles for you:
-
-- **Version** — `ANVIL_BUILD_NUMBER` (the run number) drives a unique, monotonic `versionCode`
-  (`100 + run`) and appends `(build N)` to the visible version, so testers can confirm at a
-  glance they're on the latest. Bump `baseVersionName` in `app/build.gradle` for real releases.
-- **Release notes** — generated from the commit subjects that landed in the push and written to
-  `app/release-notes.txt`, which the Firebase plugin uses as `releaseNotesFile`.
-
-**One-time setup:** add a repo secret `FIREBASE_SERVICE_ACCOUNT` (Settings → Secrets and
-variables → Actions) containing the full JSON key for a service account with the **Firebase App
-Distribution Admin** role. The workflow writes it to a temp file and points
-`GOOGLE_APPLICATION_CREDENTIALS` at it.
-
-## Session Status Server (Optional)
-
-The `scripts/` directory contains a session status server that provides:
-
-- List of active Zellij sessions with working directory
-- Claude Code activity status and description per session
-- Git branch status (uncommitted changes, unpushed commits, worktree detection)
-- Session deletion with optional worktree/branch cleanup
-- **HTTPS support via Tailscale** for secure remote access from Android
-
-### Quick Install (on Zellij server)
-
-Works on **macOS** and **Linux** — no `sudo` required:
-
-```bash
-cd scripts/
-./install.sh
-```
-
-The installer automatically:
-- Installs scripts to `~/.local/bin/`
-- Sets up auto-start: macOS LaunchAgent or Linux systemd user service
-- Configures Tailscale HTTPS proxy on port 7601
-- Adds Claude Code hooks to `~/.claude/settings.json`
-
-```bash
-# Update scripts only (no reinstall)
-./install.sh --update
-
-# Uninstall
-./install.sh --uninstall
-```
-
-See `scripts/README.md` for full setup instructions including Linux prerequisites and manual steps.
-
-### Prerequisites
-
-**macOS:** `brew install python3 git zellij`
-
-**Linux:** `sudo apt install python3 git` + [install zellij](https://zellij.dev/documentation/installation)
-
-### API Endpoints
-
-**HTTPS (via Tailscale):**
-```
-GET https://your-tailscale-host:7601/api/sessions
-GET https://your-tailscale-host:7601/api/health
-DELETE https://your-tailscale-host:7601/api/sessions/{name}
-```
-
-**Local HTTP (testing only):**
-```
-GET http://localhost:7601/api/sessions
-GET http://localhost:7601/api/health
-```
-
-Session response includes Claude status, description, and full git info (branch, uncommitted changes, unpushed commit count).
-
-## Architecture
-
-- `MainActivity` - Main UI, tab management, keyboard/volume handling
-- `TabManager` - Tab state and SharedPreferences persistence
-- `TabAdapter` - RecyclerView adapter for tab strip
-- `WebViewPool` - WebView lifecycle and JavaScript bridge
-- `IMESwitchManager` - Automatic keyboard switching via Settings.Secure
-- `KeepAliveService` - Foreground service with wake lock
-- `ConnectionMonitor` - Error detection and retry banner
-- `ClipboardBridge` - OSC 52 clipboard sync (Zellij <-> Android)
-- `AppConfig` - BuildConfig value access
+---
 
 ## License
 
