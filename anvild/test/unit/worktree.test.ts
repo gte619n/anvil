@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { carryPrBadge, createWorktree, prBadgeFor, removeWorktree, gitStatus } from "../../src/session/worktree";
@@ -39,6 +39,47 @@ test("create + remove a fresh worktree off HEAD", () => {
   removeWorktree(repo, created.cwd);
   expect(existsSync(created.cwd)).toBe(false);
 
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(wtRoot, { recursive: true, force: true });
+});
+
+test("createWorktree symlinks the canonical node_modules into the worktree (root + subdir)", () => {
+  const repo = makeRepo();
+  const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
+
+  // Installed deps live in node_modules dirs that git never tracks — at the repo root and in a
+  // package subdir (monorepo layout). The subdir itself IS tracked (it has a committed file).
+  mkdirSync(join(repo, "node_modules"));
+  writeFileSync(join(repo, "node_modules", "marker"), "root-deps\n");
+  mkdirSync(join(repo, "pkg"));
+  writeFileSync(join(repo, "pkg", "keep.txt"), "x\n");
+  mkdirSync(join(repo, "pkg", "node_modules"));
+  writeFileSync(join(repo, "pkg", "node_modules", "marker"), "pkg-deps\n");
+  git(["add", "pkg/keep.txt"], repo);
+  git(["commit", "-q", "-m", "add pkg"], repo);
+
+  const created = createWorktree(repo, "HEAD", "deps-task", wtRoot, "sess_deps1");
+
+  // Both node_modules are symlinks in the worktree, and reading through them hits the canonical deps.
+  expect(lstatSync(join(created.cwd, "node_modules")).isSymbolicLink()).toBe(true);
+  expect(readFileSync(join(created.cwd, "node_modules", "marker"), "utf8")).toBe("root-deps\n");
+  expect(lstatSync(join(created.cwd, "pkg", "node_modules")).isSymbolicLink()).toBe(true);
+  expect(readFileSync(join(created.cwd, "pkg", "node_modules", "marker"), "utf8")).toBe("pkg-deps\n");
+
+  removeWorktree(repo, created.cwd);
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(wtRoot, { recursive: true, force: true });
+});
+
+test("createWorktree is fine when the repo has no deps to link", () => {
+  const repo = makeRepo(); // no node_modules anywhere
+  const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
+
+  const created = createWorktree(repo, "HEAD", "no-deps", wtRoot, "sess_nodeps1");
+  expect(existsSync(created.cwd)).toBe(true);
+  expect(existsSync(join(created.cwd, "node_modules"))).toBe(false);
+
+  removeWorktree(repo, created.cwd);
   rmSync(repo, { recursive: true, force: true });
   rmSync(wtRoot, { recursive: true, force: true });
 });
