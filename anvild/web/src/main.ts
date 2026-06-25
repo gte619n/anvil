@@ -3392,12 +3392,27 @@ function renderReader(content: FileContent): void {
   if (content.path !== readerPath) return;
   panelView = "reader";
   setPanelTabs();
+  const popoutBtn = content.choices // a picker has nothing to pop out yet
+    ? ""
+    : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
   const head =
     `<div class="reader-head"><b>${esc(content.path)}</b>` +
-    `<span class="reader-head-actions">` +
-    `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>` +
+    `<span class="reader-head-actions">${popoutBtn}` +
     `<a href="#" id="reader-back">← files</a></span></div>`;
-  if (content.markdown) {
+  if (content.choices) {
+    // A prose-named file (e.g. "design.md") matched several paths — let the user pick which to open.
+    const items = content.choices
+      .map((p) => `<li><a href="#" class="file-link reader-choice" data-path="${esc(p)}">${esc(p)}</a></li>`)
+      .join("");
+    panelContent.innerHTML = head + `<div class="reader-choices"><p class="muted small">${esc(content.path)} matches several files — pick one:</p><ul>${items}</ul></div>`;
+    for (const a of panelContent.querySelectorAll<HTMLElement>(".reader-choice")) {
+      a.onclick = (e) => {
+        e.preventDefault();
+        const p = a.dataset.path;
+        if (p) openFile(p);
+      };
+    }
+  } else if (content.markdown) {
     panelContent.innerHTML = head + `<div class="md reader-md">${content.markdown.html}</div>`;
     void runMermaid(panelContent.querySelector(".reader-md") as HTMLElement);
   } else if (content.text !== undefined) {

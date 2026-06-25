@@ -257,6 +257,7 @@ export interface FileContent {
   text?: string; // populated for other text files (may be truncated — see below)
   truncated?: boolean; // text was capped (large file); fetch more via fs.read range
   binaryUrl?: string; // REST URL for images/binaries
+  choices?: string[]; // a prose-named file (e.g. "design.md") matched 2+ paths — the client picks one and re-reads
 }
 
 export interface DirEntry {

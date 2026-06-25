@@ -243,6 +243,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .reader-act:hover { color: var(--accent); }
 .reader-act .msym { font-size: 17px; }
 .reader-text { white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.reader-choices ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.reader-choices .reader-choice { display: block; padding: 8px 10px; border-radius: 6px; color: var(--accent); text-decoration: none; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.reader-choices .reader-choice:hover { background: var(--surface-2, rgba(127,127,127,0.12)); }
 
 .git-panel { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .git-status { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }

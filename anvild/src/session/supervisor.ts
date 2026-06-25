@@ -55,7 +55,7 @@ import { withStatus } from "../integrations/status";
 import { planAndTagProject, refinePlanQuery } from "../integrations/autopilot";
 import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
-import { listDir, readFile, resolveInside } from "../fs/session-fs";
+import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
 import { VERSION } from "../version";
@@ -709,7 +709,14 @@ export class Supervisor {
     return listDir(this.require(sessionId).data.cwd, path);
   }
   fsRead(sessionId: string, path: string): FileContent {
-    return readFile(this.require(sessionId).data.cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p));
+    const cwd = this.require(sessionId).data.cwd;
+    try {
+      return readFile(cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p));
+    } catch (e) {
+      // A missing file is user-facing ("Couldn't find X"), not an internal error — surface it cleanly.
+      if (e instanceof FileNotFound) throw new BadCommand(e.message);
+      throw e;
+    }
   }
   fsResolve(sessionId: string, path: string): string {
     return resolveInside(this.require(sessionId).data.cwd, path);
@@ -718,7 +725,14 @@ export class Supervisor {
     const key = `${sessionId}:${path}`;
     if (this.watchers.has(key)) return;
     const s = this.require(sessionId);
-    const abs = resolveInside(s.data.cwd, path);
+    let located: ReturnType<typeof locateInside>;
+    try {
+      located = locateInside(s.data.cwd, path); // watch the file fs.read actually resolved (subdir match included)
+    } catch {
+      return; // not found / not yet created — nothing to watch (read already reported the error)
+    }
+    if (located.kind !== "file") return; // an ambiguous basename has no single file to watch until the user picks
+    const abs = located.abs;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const onChange = (): void => {
       clearTimeout(timer);
