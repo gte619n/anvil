@@ -2203,12 +2203,33 @@ function renderTodoistPanel(): void {
   // Which env (if any) each project is linked to.
   const linkedBy = new Map<string, string>();
   for (const e of environments.values()) if (e.todoistProjectId) linkedBy.set(e.todoistProjectId, e.name);
-  const rows = [...todoistProjects.values()]
-    .sort((a, b) => (b.taskCount ?? 0) - (a.taskCount ?? 0))
-    .map((p) => {
+  // Order projects by their Todoist hierarchy: each parent immediately followed
+  // by its sub-projects, depth-first. Within a level, sort by task count desc.
+  const all = [...todoistProjects.values()];
+  const ids = new Set(all.map((p) => p.id));
+  const childrenOf = new Map<string, TodoistProjectInfo[]>();
+  const roots: TodoistProjectInfo[] = [];
+  for (const p of all) {
+    // Treat a project whose parent isn't in the set as a root (orphan-safe).
+    if (p.parentId && ids.has(p.parentId)) {
+      const arr = childrenOf.get(p.parentId) ?? [];
+      arr.push(p);
+      childrenOf.set(p.parentId, arr);
+    } else roots.push(p);
+  }
+  const byTasks = (a: TodoistProjectInfo, b: TodoistProjectInfo) => (b.taskCount ?? 0) - (a.taskCount ?? 0);
+  const ordered: Array<{ p: TodoistProjectInfo; depth: number }> = [];
+  const walk = (p: TodoistProjectInfo, depth: number) => {
+    ordered.push({ p, depth });
+    for (const c of (childrenOf.get(p.id) ?? []).sort(byTasks)) walk(c, depth + 1);
+  };
+  for (const r of roots.sort(byTasks)) walk(r, 0);
+  const rows = ordered
+    .map(({ p, depth }) => {
       const link = linkedBy.get(p.id);
+      const indent = depth ? `<span class="td-indent">${"&nbsp;".repeat(depth * 4)}↳ </span>` : "";
       return `<tr>
-        <td>${esc(p.name)}${p.parentId ? ` <span class="small muted">(sub)</span>` : ""}</td>
+        <td>${indent}${esc(p.name)}</td>
         <td class="small muted">${p.taskCount ?? 0}</td>
         <td>${link ? `<span class="small">${icon("link")} ${esc(link)}</span>` : `<span class="small muted">—</span>`}</td>
       </tr>`;
