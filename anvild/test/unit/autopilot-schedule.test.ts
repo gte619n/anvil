@@ -6,7 +6,7 @@ import type { AutopilotSchedule } from "../../protocol";
 import {
   AutopilotScheduleStore,
   DEFAULT_SCHEDULE,
-  isRunDue,
+  scheduledFireDue,
   lastScheduledFire,
   nextScheduledFire,
   parseTimeOfDay,
@@ -16,6 +16,7 @@ import {
 const sched = (over: Partial<AutopilotSchedule> = {}): AutopilotSchedule => ({ ...DEFAULT_SCHEDULE, enabled: true, timeOfDay: "02:00", ...over });
 // A fixed local clock so the day-of-week / time math is deterministic.
 const at = (s: string): Date => new Date(s);
+const W = 10 * 60_000; // the daemon's scheduled-run window (SCHEDULE_RUN_WINDOW_MS)
 
 test("parseTimeOfDay accepts valid, rejects junk", () => {
   expect(parseTimeOfDay("02:00")).toBe(120);
@@ -29,7 +30,7 @@ test("parseTimeOfDay accepts valid, rejects junk", () => {
 test("a disabled schedule never fires", () => {
   const s = sched({ enabled: false });
   expect(lastScheduledFire(s, at("2026-06-24T09:00:00"))).toBeUndefined();
-  expect(isRunDue(s, at("2026-06-24T09:00:00"))).toBe(false);
+  expect(scheduledFireDue(s, at("2026-06-24T09:00:00"), W)).toBe(false);
 });
 
 test("lastScheduledFire is today's time once it has passed, else yesterday's", () => {
@@ -40,31 +41,40 @@ test("lastScheduledFire is today's time once it has passed, else yesterday's", (
   expect(lastScheduledFire(s, at("2026-06-24T01:00:00"))?.toISOString()).toBe(new Date("2026-06-23T02:00:00").toISOString());
 });
 
-test("isRunDue fires when no prior run and a fire time has passed", () => {
+test("scheduledFireDue fires within the window of the scheduled time, not long after", () => {
   const s = sched({ timeOfDay: "02:00" });
-  expect(isRunDue(s, at("2026-06-24T09:00:00"))).toBe(true); // lastRunAt undefined
+  // 02:06 — 6 min after the 02:00 fire, inside the 10-min window, never run → fires
+  expect(scheduledFireDue(s, at("2026-06-24T02:06:00"), W)).toBe(true);
+  // 09:00 — hours past the fire → outside the window → does NOT fire (no catch-up on a late check)
+  expect(scheduledFireDue(s, at("2026-06-24T09:00:00"), W)).toBe(false);
+  // 01:00 — before today's fire; the most recent fire is yesterday's, long past → no fire
+  expect(scheduledFireDue(s, at("2026-06-24T01:00:00"), W)).toBe(false);
 });
 
-test("isRunDue is false once we've run since the last fire, true after the next fire", () => {
+test("scheduledFireDue won't refire after running this window, but fires again the next day", () => {
   const s = sched({ timeOfDay: "02:00" });
-  // ran at 02:05 today → not due at 09:00
-  expect(isRunDue(s, at("2026-06-24T09:00:00"), "2026-06-24T02:05:00")).toBe(false);
-  // same run, but now it's tomorrow past 02:00 → due again (catch-up / next day)
-  expect(isRunDue(s, at("2026-06-25T03:00:00"), "2026-06-24T02:05:00")).toBe(true);
+  // ran at 02:03 today → a later in-window tick at 02:08 must not refire
+  expect(scheduledFireDue(s, at("2026-06-24T02:08:00"), W, "2026-06-24T02:03:00")).toBe(false);
+  // next day, in-window at 02:04, last run was yesterday → fires
+  expect(scheduledFireDue(s, at("2026-06-25T02:04:00"), W, "2026-06-24T02:03:00")).toBe(true);
 });
 
-test("catch-up: down at 02:00, started at 07:00 with last run two days ago → due", () => {
+test("no catch-up on restart: a daemon coming up hours after the scheduled time does NOT run", () => {
   const s = sched({ timeOfDay: "02:00" });
-  expect(isRunDue(s, at("2026-06-24T07:00:00"), "2026-06-22T02:01:00")).toBe(true);
+  // up at 07:00 having missed 02:00 (last run two days ago). The old behaviour fired a run + spinner on
+  // every such (re)start; now it must skip until the next scheduled time arrives while it's running.
+  expect(scheduledFireDue(s, at("2026-06-24T07:00:00"), W, "2026-06-22T02:01:00")).toBe(false);
 });
 
-test("days restriction: only fires on enabled weekdays", () => {
-  // 2026-06-24 is a Wednesday (day 3). Restrict to Mon/Fri (1,5).
+test("days restriction: fires only within the window on enabled weekdays", () => {
+  // 2026-06-26 is a Friday (day 5); restrict to Mon/Fri (1,5).
   const s = sched({ timeOfDay: "02:00", days: [1, 5] });
-  expect(lastScheduledFire(s, at("2026-06-24T09:00:00"))?.getDay()).toBe(1); // most recent enabled day = Mon 22nd
-  expect(isRunDue(s, at("2026-06-24T09:00:00"), "2026-06-22T02:05:00")).toBe(false); // already ran Monday
-  // Friday the 26th after 02:00 → due
-  expect(isRunDue(s, at("2026-06-26T03:00:00"), "2026-06-22T02:05:00")).toBe(true);
+  // Friday 02:05 — in window, enabled day, last run Monday → fires
+  expect(scheduledFireDue(s, at("2026-06-26T02:05:00"), W, "2026-06-22T02:05:00")).toBe(true);
+  // Wednesday 02:05 — not an enabled day (most recent fire is Mon, long past) → no fire
+  expect(scheduledFireDue(s, at("2026-06-24T02:05:00"), W, "2026-06-22T02:05:00")).toBe(false);
+  // Friday 09:00 — enabled day but hours past the fire → outside the window → no fire
+  expect(scheduledFireDue(s, at("2026-06-26T09:00:00"), W, "2026-06-22T02:05:00")).toBe(false);
 });
 
 test("nextScheduledFire is strictly in the future and on an enabled day", () => {

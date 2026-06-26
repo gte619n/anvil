@@ -77,12 +77,23 @@ export function runWithinBudget(startedAt: number | undefined, now: number, budg
   return startedAt !== undefined && now - startedAt < budgetMs;
 }
 
-/** Due = enabled, a fire time has passed, and we haven't run since that fire (catch-up included). */
-export function isRunDue(sched: AutopilotSchedule, now: Date, lastRunAt?: string): boolean {
+/**
+ * Should the daemon fire the scheduled run *right now*? This is edge-triggered, NOT catch-up: it's true
+ * only when `now` is within `windowMs` of the most recent scheduled fire AND we haven't already run
+ * since that fire. So the run happens as the clock crosses the scheduled time while the daemon is
+ * running — a restart hours later sees the fire is long past (outside the window) and does NOT run.
+ *
+ * This deliberately drops the old "catch-up on (re)start" behaviour: that fired a brand-new run — and
+ * its "autopilot running" spinner — every time the daemon was restarted, which is surprising and was
+ * read as a stuck spinner. Trade-off: if the Mac is off/asleep through the whole window, that day is
+ * skipped. The window must exceed the scheduler's tick interval so a tick always lands inside it.
+ */
+export function scheduledFireDue(sched: AutopilotSchedule, now: Date, windowMs: number, lastRunAt?: string): boolean {
   const fire = lastScheduledFire(sched, now);
   if (!fire) return false;
-  if (!lastRunAt) return true; // never run, and a fire time has already passed
-  return new Date(lastRunAt).getTime() < fire.getTime();
+  if (now.getTime() - fire.getTime() >= windowMs) return false; // fire is in the past, not now → no catch-up
+  if (lastRunAt && new Date(lastRunAt).getTime() >= fire.getTime()) return false; // already ran this window
+  return true;
 }
 
 export class AutopilotScheduleStore {
