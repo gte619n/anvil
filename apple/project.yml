@@ -55,6 +55,9 @@ targets:
       path: Resources/Info-iOS.plist
       properties:
         CFBundleDisplayName: Anvil
+        # Anvil only uses iOS's standard HTTPS/TLS (no custom crypto) → export-compliance exempt.
+        # Setting this clears the App Store Connect encryption prompt on every upload.
+        ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes:
           - remote-notification
         UILaunchScreen: {}
