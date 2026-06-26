@@ -69,23 +69,25 @@ ARCHIVE="$BUILD_DIR/Anvil.xcarchive"
 EXPORT_DIR="$BUILD_DIR/export"
 rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
 
-# Auth flags shared by archive + export: let xcodebuild manage the profile via the API key.
-AUTH=(-allowProvisioningUpdates
-  -authenticationKeyPath "$APPLE_API_KEY_PATH"
-  -authenticationKeyID "$APPLE_API_KEY"
-  -authenticationKeyIssuerID "$APPLE_API_ISSUER")
+# Manual signing: the Apple Distribution cert is in the keychain and the App Store provisioning
+# profile is installed (CI: from the IOS_PROVISIONING_PROFILE_BASE64 secret; locally: provision.sh).
+# Automatic signing can't work headless here — with only a distribution cert it tries to mint an iOS
+# *Development* profile, which needs registered devices. The API key is still used to authenticate
+# the upload on export.
+PROFILE_NAME="${IOS_PROFILE_NAME:-Anvil iOS App Store CI}"
 
-# ── 3. archive (Release → production APNs entitlement, automatic signing) ───
-echo "▸ archiving (build $BUILD_NUMBER)…"
+# ── 3. archive (Release → production APNs entitlement, manual distribution signing) ───
+echo "▸ archiving (build $BUILD_NUMBER) with profile '$PROFILE_NAME'…"
 xcodebuild archive \
   -project "$XCODEPROJ" -scheme "$SCHEME" -configuration Release \
   -archivePath "$ARCHIVE" \
   -destination 'generic/platform=iOS' \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  CODE_SIGN_STYLE=Automatic \
+  CODE_SIGN_STYLE=Manual \
+  CODE_SIGN_IDENTITY="Apple Distribution" \
+  PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
   CODE_SIGN_ENTITLEMENTS="$RELEASE_ENTITLEMENTS" \
-  CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
-  "${AUTH[@]}"
+  CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
 # ── 4. ExportOptions → export + upload straight to App Store Connect ────────
 cat > "$BUILD_DIR/ExportOptions.plist" <<PLIST
@@ -93,11 +95,16 @@ cat > "$BUILD_DIR/ExportOptions.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>method</key>          <string>app-store</string>
-    <key>destination</key>     <string>upload</string>
-    <key>teamID</key>          <string>$APPLE_TEAM_ID</string>
-    <key>signingStyle</key>    <string>automatic</string>
-    <key>uploadSymbols</key>   <true/>
+    <key>method</key>                 <string>app-store</string>
+    <key>destination</key>            <string>upload</string>
+    <key>teamID</key>                 <string>$APPLE_TEAM_ID</string>
+    <key>signingStyle</key>           <string>manual</string>
+    <key>signingCertificate</key>     <string>Apple Distribution</string>
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>com.gte619n.anvil</key>  <string>$PROFILE_NAME</string>
+    </dict>
+    <key>uploadSymbols</key>          <true/>
 </dict>
 </plist>
 PLIST
@@ -107,7 +114,10 @@ xcodebuild -exportArchive \
   -archivePath "$ARCHIVE" \
   -exportOptionsPlist "$BUILD_DIR/ExportOptions.plist" \
   -exportPath "$EXPORT_DIR" \
-  "${AUTH[@]}"
+  -allowProvisioningUpdates \
+  -authenticationKeyPath "$APPLE_API_KEY_PATH" \
+  -authenticationKeyID "$APPLE_API_KEY" \
+  -authenticationKeyIssuerID "$APPLE_API_ISSUER"
 
 echo
 echo "✓ uploaded build $BUILD_NUMBER to App Store Connect."
