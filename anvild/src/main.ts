@@ -16,6 +16,7 @@ const server = createServer({
   host: config.host,
   port: config.port,
   stateDir: config.stateDir,
+  clonesDir: config.clonesDir,
   warnFraction: config.warnFraction,
   softStopFraction: config.softStopFraction,
   renderer,

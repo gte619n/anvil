@@ -5,6 +5,8 @@ export interface Config {
   host: string;
   port: number;
   stateDir: string;
+  /** Where the daemon clones repos added by git URL. Independent of the app's install location. */
+  clonesDir: string;
   /** Warn threshold as a fraction (0–1) of any rate-limit window's utilization (arch §3). */
   warnFraction: number;
   /** Soft-stop threshold as a fraction (0–1) of the 7-day window's utilization (arch §3). */
@@ -39,6 +41,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     host,
     port: Number(env.ANVIL_PORT ?? 7701),
     stateDir: expandHome(env.ANVIL_STATE_DIR ?? "~/.anvil", home),
+    clonesDir: expandHome(env.ANVIL_CLONES_DIR ?? "~/.anvil/repos", home),
     warnFraction: Number(env.ANVIL_BUDGET_WARN ?? 0.8),
     softStopFraction: Number(env.ANVIL_BUDGET_SOFTSTOP ?? 0.95),
   };
