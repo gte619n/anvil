@@ -213,12 +213,12 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "env.add":
-        deps.supervisor.addEnvironment(cmd.name, cmd.repoRoot, cmd.defaultBase, cmd.color);
+        deps.supervisor.addEnvironment(cmd.name, cmd.repoRoot, cmd.defaultBase, cmd.color, cmd.icon);
         if (cid) send(ack(cid));
         return;
 
       case "env.clone":
-        deps.supervisor.cloneEnvironment(cmd.url, cmd.name, cmd.defaultBase, cmd.color);
+        deps.supervisor.cloneEnvironment(cmd.url, cmd.name, cmd.defaultBase, cmd.color, cmd.icon);
         if (cid) send(ack(cid));
         return;
 
@@ -234,6 +234,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           name: cmd.name,
           defaultBase: cmd.defaultBase,
           color: cmd.color,
+          icon: cmd.icon,
           todoistProjectId: cmd.todoistProjectId,
           validation: cmd.validation,
         });
@@ -272,6 +273,18 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      case "auth.status":
+        send(deps.supervisor.authStatus(cid));
+        return;
+
+      case "auth.set":
+        send(deps.supervisor.setAuthToken(cmd.token, cid)); // BadCommand (empty/metered key) → command.error via the outer catch
+        return;
+
+      case "auth.clear":
+        send(deps.supervisor.clearAuthToken(cid));
+        return;
+
       case "autopilot.plans.list":
         send(deps.supervisor.autopilotPlansEvent(cid));
         return;
@@ -296,6 +309,26 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         send(deps.supervisor.startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid));
         return;
 
+      case "autopilot.resolve":
+        deps.supervisor
+          .resolvePlan(cmd.workUnitId, cmd.status, cmd.closeTodoist)
+          .then(() => {
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "autopilot.link":
+        send(deps.supervisor.linkPlan(cmd.workUnitId, cmd.sessionId, cid));
+        return;
+
+      case "autopilot.reassign":
+        deps.supervisor
+          .reassignPlan(cmd.workUnitId, cmd.environmentId, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "autopilot.run":
         deps.supervisor
           .runAutopilot({
@@ -305,6 +338,20 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           })
           .then((r) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: true, created: r.created, skipped: r.skipped, output: r.output }))
           .catch((e) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: false, created: 0, skipped: 0, output: errMsg(e) }));
+        return;
+
+      case "autopilot.tags.reset":
+        deps.supervisor
+          .resetAnvilTags(cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "autopilot.clear":
+        deps.supervisor
+          .clearAutopilot(cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "autopilot.schedule.get":

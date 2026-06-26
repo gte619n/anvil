@@ -114,9 +114,12 @@ export function createPr(cwd: string, title: string, body: string): { ok: boolea
  * Merge the PR for the current branch. NB: no `--delete-branch` — letting gh delete the merged
  * branch forces the local checkout off it (onto the default branch, or a detached HEAD when the
  * default is already checked out in another worktree), which orphans a session worktree on the
- * "wrong branch" forever. Instead, when `branch` is given (a worktree session), we roll the worktree
- * onto a fresh `<branch>_followup` branch based on the freshly-merged default and delete the merged
- * branch locally ourselves — so work can continue cleanly and the health check stays happy.
+ * "wrong branch" forever (and, because gh switches the checkout *before* it deletes the remote
+ * branch, the failed switch aborts the whole cleanup so the remote branch is left behind too).
+ * Instead, when `branch` is given (a worktree session), we roll the worktree onto a fresh
+ * `<branch>_followup` branch based on the freshly-merged default, delete the merged branch locally,
+ * and delete the remote branch with a plain push (which never touches the checkout) — so work can
+ * continue cleanly, no remote branch is orphaned, and the health check stays happy.
  * Returns `newBranch` when a rollover happened so the caller can update the session's recorded branch.
  */
 export function mergePr(
@@ -131,6 +134,13 @@ export function mergePr(
   // Pull the merged state down so the follow-up branch starts from the new default-branch tip
   // (after a squash/rebase merge the local merged-branch tip has diverged from it).
   run(["git", "fetch", "origin"], cwd);
+
+  // Delete the remote branch ourselves — what `--delete-branch` would have done, but as a plain push
+  // so it never tries to move the local checkout and can't abort the rest of the cleanup. Best-effort:
+  // the remote may already be gone (e.g. branch-protection auto-delete) and that's not a failure.
+  const remoteDeleted = run(["git", "push", "origin", "--delete", branch], cwd).code === 0;
+  const remoteNote = remoteDeleted ? `; deleted remote ${branch}` : "";
+
   const def = defaultBranch(cwd);
   const start = def ? `origin/${def}` : "HEAD";
   const followup = freeFollowupBranch(cwd, branch);
@@ -138,10 +148,10 @@ export function mergePr(
   if (co.code !== 0) {
     // Couldn't roll over (e.g. uncommitted changes block the checkout) — leave the worktree on the
     // merged branch, which is still fine to keep working on. Surface it rather than failing silently.
-    return { ok: true, output: `${r.out}\n(merged; stayed on ${branch}: ${co.out})` };
+    return { ok: true, output: `${r.out}\n(merged${remoteNote}; stayed on ${branch}: ${co.out})` };
   }
   run(["git", "branch", "-D", branch], cwd); // local-only; the merge is safely on the remote default
-  return { ok: true, output: `${r.out}\nrolled onto ${followup} (off ${start}); deleted local ${branch}`, newBranch: followup };
+  return { ok: true, output: `${r.out}\nrolled onto ${followup} (off ${start}); deleted local ${branch}${remoteNote}`, newBranch: followup };
 }
 
 /** The remote's default branch (e.g. "main") via origin/HEAD; undefined if it isn't set locally. */
@@ -176,7 +186,7 @@ function checkedOutBranches(cwd: string): Set<string> {
   const out = new Set<string>();
   for (const line of r.out.split("\n")) {
     const m = line.match(/^branch refs\/heads\/(.+)$/);
-    if (m) out.add(m[1]);
+    if (m?.[1]) out.add(m[1]);
   }
   return out;
 }

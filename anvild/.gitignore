@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: also ignore the `node_modules` *symlink* that worktrees get (linkDeps in
+# src/session/worktree.ts) — a `node_modules/` dir-only pattern wouldn't match the symlink, leaving
+# every worktree perpetually "dirty".
+node_modules
 *.log
 .env
 web/dist/

@@ -134,13 +134,11 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
 .session .meta .msym { font-size: 13px; vertical-align: -2px; margin-right: 1px; }
-/* Settings → Servers: add-a-server card, discovered rows, per-server budget, account gauge */
+/* Settings → Servers: add-a-server card, discovered rows */
 .add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
 .discover-row code { word-break: break-all; }
-.srv-budget { margin-top: 6px; }
 .server-card.removing { opacity: 0.5; pointer-events: none; transition: opacity 0.15s ease; }
-.warn-card { border-color: var(--danger); }
 /* per-server section header on the Environments tab (fleet grouping) */
 .env-server-head { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
 .env-server-head + .env-server-head, .env-card + .env-server-head { margin-top: 18px; }
@@ -243,6 +241,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .reader-act:hover { color: var(--accent); }
 .reader-act .msym { font-size: 17px; }
 .reader-text { white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.reader-choices ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.reader-choices .reader-choice { display: block; padding: 8px 10px; border-radius: 6px; color: var(--accent); text-decoration: none; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+.reader-choices .reader-choice:hover { background: var(--surface-2, rgba(127,127,127,0.12)); }
 
 .git-panel { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .git-status { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
@@ -268,8 +269,12 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .todoist-projects { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
 .todoist-projects th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .todoist-projects td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.todoist-projects .td-indent { color: var(--muted); white-space: pre; }
 .todoist-connect { display: flex; gap: 8px; margin-top: 10px; }
 .todoist-connect input { flex: 1; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background-color: var(--bg); color: var(--text); }
+/* Autopilot maintenance (reset tags / clear) + the "more providers coming" placeholder card. */
+.ap-maint-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.models-soon { opacity: 0.65; }
 .session.archived { opacity: 0.55; }
 .session.pending .title .msym { color: var(--warn); }
 /* A session being cleaned up: disabled + greyed until the daemon confirms deletion (§8). */
@@ -303,6 +308,26 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .empty-state { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 18px; color: var(--muted); text-align: center; }
 .empty-art { width: 172px; height: 172px; opacity: 0.3; filter: grayscale(0.7); }
 .empty-state p { margin: 0; font-size: 14px; }
+
+/* Blank-conversation hero: a big, colour-coded title card so you always know which session you're on. */
+.session-hero { gap: 22px; padding: 24px; max-width: 520px; }
+.session-hero .hero-emblem {
+  width: 112px; height: 112px; border-radius: 28px; display: grid; place-items: center;
+  background: var(--hero-bg); color: var(--hero-accent);
+  border: 2px solid color-mix(in srgb, var(--hero-accent) 45%, transparent);
+  box-shadow: 0 10px 34px color-mix(in srgb, var(--hero-accent) 22%, transparent);
+}
+.session-hero .hero-emblem .msym { font-size: 60px; }
+.session-hero .hero-title { margin: 0; font-size: 30px; line-height: 1.15; font-weight: 700; color: var(--text); letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.session-hero .hero-meta { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.session-hero .hero-chip {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--text);
+  padding: 4px 11px; border-radius: 999px;
+  background: color-mix(in srgb, var(--hero-accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--hero-accent) 30%, transparent);
+}
+.session-hero .hero-chip .msym { font-size: 15px; color: var(--hero-accent); }
+.session-hero .hero-hint { font-size: 13px; }
 
 .thinking { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; align-self: flex-start; padding: 2px 0; }
 .thinking .dots { display: inline-flex; gap: 4px; }
@@ -435,6 +460,11 @@ details.tool-result.error > summary { color: var(--danger); }
 .modal-box pre { background: var(--tool-bg); padding: 8px; border-radius: 8px; overflow-x: auto; max-height: 220px; }
 .modal-box label { display: block; margin: 10px 0; font-size: 13px; }
 .modal-box input, .modal-box select { width: 100%; padding: 7px; margin-top: 4px; border: 1px solid var(--border); border-radius: 8px; font: inherit; }
+.modal-box label.cd-option { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.modal-box label.cd-option input { width: auto; margin: 0; flex: none; }
+.pick-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; max-height: 320px; overflow-y: auto; }
+.pick-item { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; text-align: left; }
+.pick-item:hover { background: var(--panel); border-color: var(--muted); }
 .modal-box .btns { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 14px; }
 .modal-box .btns button { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-weight: 600; transition: background 0.12s, border-color 0.12s; }
 .modal-box .btns button:hover { background: var(--panel); border-color: var(--muted); }
@@ -499,6 +529,82 @@ input:focus, select:focus, textarea:not(#input):focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
+
+/* ── Tom Select (stylized selectors) ──────────────────────────────────────────
+   tom-select.css ships the structure; these rules repaint it in the app's theme so the
+   dropdowns match every other control (and carry a Material Symbol icon + color dot per option).
+   Loaded after tom-select.css (see index.html) so equal-specificity rules win. */
+.ts-wrapper { margin-top: 4px; }
+.modal-box .ts-wrapper { width: 100%; }
+.env-row .ts-wrapper { flex: 1; margin-top: 0; }
+.ts-control {
+  background-color: var(--bg) !important;
+  color: var(--text);
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  padding: 6px 9px !important;
+  box-shadow: none !important;
+  font: inherit;
+}
+/* reuse the exact chevron the native selects draw, for a seamless look */
+.ts-wrapper.single .ts-control {
+  cursor: pointer;
+  padding-right: 30px !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23888c92' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 13px;
+}
+.ts-wrapper.single .ts-control::after { display: none !important; } /* hide the default triangle */
+.ts-wrapper.focus .ts-control {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent) !important;
+}
+.ts-control input { color: var(--text) !important; }
+.ts-control input::placeholder { color: var(--muted) !important; }
+.ts-wrapper.disabled .ts-control { opacity: 0.6; }
+.ts-dropdown {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  margin-top: 4px;
+  z-index: 1200;
+}
+.ts-dropdown .option { padding: 8px 10px; border-radius: 6px; }
+.ts-dropdown .active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--text); }
+.ts-dropdown .optgroup-header {
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 10px 2px;
+}
+.ts-dropdown .optgroup:not(:first-child) .optgroup-header { border-top: 1px solid var(--border); margin-top: 4px; }
+.ts-dropdown [aria-disabled="true"] { opacity: 0.45; }
+/* the icon + color dot + label rendered inside each option/selected item */
+.ts-opt { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ts-opt .ts-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ts-ic { font-size: 18px; color: var(--muted); flex: none; }
+.ts-control .item .ts-ic { color: var(--text); }
+.ts-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; border: 1px solid rgba(0, 0, 0, 0.18); }
+
+/* icon picker (add/edit environment) — mirrors the color swatch grid */
+.icon-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; max-height: 170px; overflow-y: auto; }
+.iconpick {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; border-radius: 8px;
+  border: 2px solid transparent; outline: 1px solid var(--border);
+  background: var(--bg); color: var(--text); cursor: pointer; padding: 0;
+}
+.iconpick .msym { font-size: 19px; }
+.iconpick:hover { background: var(--panel); }
+.iconpick.selected { border-color: var(--accent); color: var(--accent); }
+.iconpick-auto { color: var(--muted); }
+.env-glyph { font-size: 18px; margin-right: 7px; vertical-align: -3px; }
 
 #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1c2024; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 1100; }
 #toast.show { opacity: 1; }
@@ -587,6 +693,11 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-server-sep { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13px; color: var(--muted); margin: 18px 0 10px; }
 .ap-server-sep:first-child { margin-top: 0; }
 .ap-server-empty { margin: 0 0 8px; }
+/* Per-environment separator above each env's card grid (colour dot + name + count). */
+.ap-env-sep { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; color: var(--text); margin: 16px 0 9px; padding-bottom: 7px; border-bottom: 1px solid var(--border); }
+.ap-env-sep:first-child { margin-top: 0; }
+.ap-env-sep .env-dot { margin-right: 0; }
+.ap-env-sep .ap-env-count { margin-left: auto; font-weight: 600; font-size: 11px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
 
 .plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-bottom: 8px; }
 /* Each card is tinted by its environment (--plan-stripe set inline): a coloured left rail ties the
@@ -602,6 +713,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-chip.status-building { color: #f2c037; border-color: #f2c03766; }
 .ap-chip.status-review { color: #21ba45; border-color: #21ba4566; }
 .ap-chip.status-blocked, .ap-chip.status-dismissed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.ap-chip.ap-chip-label { color: #8e7cc3; border-color: #8e7cc366; }
+.ap-chip.status-completed { color: #21ba45; border-color: #21ba4566; }
+.ap-chip.status-expired { color: var(--muted); border-color: var(--border); text-decoration: line-through; }
 .ap-chip.eff-xs, .ap-chip.eff-s { color: #21ba45; }
 .ap-chip.eff-m { color: #f2c037; }
 .ap-chip.eff-l, .ap-chip.eff-xl { color: #e8703a; }
@@ -637,8 +751,23 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-sched-summary .msym { font-size: 16px; }
 .ap-sched-edit-btn { padding: 3px 9px !important; font-size: 11.5px !important; }
 
+/* Run-autopilot button shrinks with the viewport: full label on desktop, "Run" on a tablet, icon-only
+   on a phone (the title attribute keeps it discoverable). Breakpoints align with the 700px phone cut. */
+.ap-run-btn { display: inline-flex; align-items: center; gap: 6px; }
+.ap-run-btn .ap-run-mid { display: none; }
+@media (max-width: 900px) {
+  .ap-run-btn .ap-run-full { display: none; }
+  .ap-run-btn .ap-run-mid { display: inline; }
+}
+@media (max-width: 700px) {
+  .ap-run-btn .ap-run-mid { display: none; } /* icon only */
+}
+
 /* Run status banner (above the raw log): running indicator, live progress line, per-server tallies. */
 .ap-run-status { margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; padding: 10px 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); font-size: 13px; display: flex; flex-direction: column; gap: 5px; }
+/* `display:flex` above outranks the [hidden] UA rule, so re-hide explicitly (else an empty bordered
+   box shows where the schedule bar used to be when there's no run in progress). */
+.ap-run-status[hidden] { display: none; }
 .ap-status-head { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
 .ap-status-head .msym { font-size: 17px; }
 .ap-status-line { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }

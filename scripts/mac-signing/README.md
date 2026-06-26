@@ -48,7 +48,7 @@ source ~/.config/oxos-signing/env.sh
 # Slates:
 cd ~/Development/slates/desktop && npm run tauri:build
 # Anvil:
-cd ~/Development/zellij-android/apple && ./make-app.sh
+cd ~/Development/anvil/apple && ./make-app.sh
 ```
 Both read `APPLE_SIGNING_IDENTITY` + the `APPLE_API_*` vars from `env.sh`. Without
 sourcing it, `make-app.sh` falls back to ad-hoc signing (local debug, unchanged).

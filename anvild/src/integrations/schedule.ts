@@ -14,6 +14,7 @@ export const DEFAULT_SCHEDULE: AutopilotSchedule = {
   timeOfDay: "02:00",
   autoStart: true,
   maxAutoStart: 3,
+  label: "Autopilot",
 };
 
 /** Parse "HH:MM" → minutes since midnight, or undefined if malformed / out of range. */
@@ -97,6 +98,9 @@ export class AutopilotScheduleStore {
     if (patch.days !== undefined) next.days = patch.days;
     if (patch.autoStart !== undefined) next.autoStart = patch.autoStart;
     if (patch.maxAutoStart !== undefined) next.maxAutoStart = Math.max(0, Math.round(patch.maxAutoStart));
+    // Empty string clears label sourcing / the catch-all env; a value sets it.
+    if (patch.label !== undefined) next.label = patch.label.trim() || undefined;
+    if (patch.defaultEnvironmentId !== undefined) next.defaultEnvironmentId = patch.defaultEnvironmentId || undefined;
     this.state = next;
     this.save();
     return this.get();

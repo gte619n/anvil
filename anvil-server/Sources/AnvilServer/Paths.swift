@@ -27,7 +27,7 @@ enum Paths {
     if let s = UserDefaults.standard.string(forKey: "anvildDir"), valid(s) { return s }
     if let e = ProcessInfo.processInfo.environment["ANVILD_DIR"], valid(e) { return e }
     if runnable(installRoot) { return installRoot }
-    for guess in [home + "/Development/zellij-android/anvild"] where valid(guess) { return guess }
+    for guess in [home + "/Development/anvil/anvild", home + "/Development/zellij-android/anvild"] where valid(guess) { return guess }
     return nil
   }
 

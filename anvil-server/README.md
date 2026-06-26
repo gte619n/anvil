@@ -24,7 +24,7 @@ open "Anvil Server.app"
 
 First run: the app needs to know where the `anvild` checkout is (for `service.sh`). It looks at, in
 order: the `anvildDir` setting → `ANVILD_DIR` env → a bundled `Contents/Resources/anvild` → a
-dev-checkout guess (`~/Development/zellij-android/anvild`). For dev:
+dev-checkout guess (`~/Development/anvil/anvild`). For dev:
 
 ```sh
 ANVILD_DIR=/path/to/anvild open "Anvil Server.app"

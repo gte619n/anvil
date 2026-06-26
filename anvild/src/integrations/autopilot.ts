@@ -27,10 +27,26 @@ export interface PlannedUnit extends ProposedUnit {
   effort?: AutopilotEffort; // rough size + files-touched estimate (from the plan's metadata block)
 }
 
-const agentEnv = buildAgentEnv();
+/**
+ * Instruction appended to every planning prompt so the plan commits to a concrete way to PROVE the
+ * work is done — form and function — rather than leaving "how to verify" vague. The build session
+ * gets this plan as its brief, so naming the validation up front is what makes the autopilot able to
+ * self-check its own implementation (it's also what the per-environment validation gate runs).
+ */
+export const VALIDATION_INSTRUCTION = `Include a dedicated "## Validation" section near the end of the plan that specifies, concretely, how to prove BOTH that the change is wired up (form) and that it behaves correctly (function). Don't hand-wave "test it" — name the actual mechanism and make it runnable:
+- Prefer automated checks: the exact unit/integration test files to add or extend and the command to run them (e.g. \`bun test path/to/x.test.ts\`), plus any typecheck/build/lint command that must pass.
+- For UI or end-to-end behaviour, describe a debug-browser / headless (e.g. Playwright or the project's existing harness) check: the URL or screen to drive, the steps, and the observable signal that proves success.
+- When neither fits, give a precise manual repro: the commands to run and the exact expected output/state.
+State the expected passing outcome for each check so success is unambiguous. Ground every command in tooling that actually exists in this repo (inspect package.json / scripts / existing tests first).`;
 
-/** Run a one-shot SDK query and return its final text. `readonly` uses plan mode (no writes). */
-async function runQuery(prompt: string, opts: { model: Model; cwd?: string; readonly?: boolean }): Promise<string> {
+/**
+ * Run a one-shot SDK query. `readonly` uses plan mode (no writes), where the model delivers its plan
+ * via an `ExitPlanMode` tool call rather than the final message — its `result` text is only a
+ * conversational wrap-up ("the plan is ready at …"). We therefore capture BOTH: `plan` is the
+ * `ExitPlanMode` input (the actual markdown plan, when present) and `text` is the closing message.
+ * Planning callers want `plan`; the JSON-emitting bundler wants `text`.
+ */
+async function runQuery(prompt: string, opts: { model: Model; cwd?: string; readonly?: boolean }): Promise<{ text: string; plan?: string }> {
   const q = query({
     prompt,
     options: {
@@ -40,14 +56,38 @@ async function runQuery(prompt: string, opts: { model: Model; cwd?: string; read
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
       executable: "bun",
-      env: agentEnv,
+      // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
+      // effect for the next planning/refine run without restarting the daemon. See AuthStore.
+      env: buildAgentEnv(),
     },
   });
   let text = "";
+  let plan: string | undefined;
   for await (const msg of q) {
+    if (msg.type === "assistant") {
+      // The plan rides in the ExitPlanMode tool call's `input.plan`, not the final result text.
+      for (const block of msg.message.content) {
+        if (block.type === "tool_use" && block.name === "ExitPlanMode") {
+          const p = (block.input as { plan?: unknown }).plan;
+          if (typeof p === "string" && p.trim()) plan = p.trim();
+        }
+      }
+    }
     if (msg.type === "result" && "result" in msg && typeof msg.result === "string") text = msg.result;
   }
-  return text.trim();
+  return { text: text.trim(), ...(plan ? { plan } : {}) };
+}
+
+/**
+ * Resolve a read-only planning query into a clean plan + metadata. Prefers the ExitPlanMode plan and
+ * falls back to the wrap-up text. The model is told to append a ```json metadata block "after the
+ * plan"; it may land in either the plan or the wrap-up, so we look in both for summary/effort.
+ */
+function resolvePlan(out: { text: string; plan?: string }): { plan: string; summary?: string; effort?: AutopilotEffort } {
+  const primary = extractPlanMeta(out.plan ?? out.text);
+  if (primary.summary || !out.plan) return primary; // metadata found, or nothing else to look at
+  const fromText = extractPlanMeta(out.text); // plan had no block — try the wrap-up for summary/effort
+  return { plan: primary.plan, ...(fromText.summary ? { summary: fromText.summary } : {}), ...(fromText.effort ? { effort: fromText.effort } : {}) };
 }
 
 /** Pull the first JSON value (object or array) out of a model response that may wrap it in prose/fences. */
@@ -107,7 +147,7 @@ Respond with ONLY a JSON array, no prose:
 [{"title": "...", "rationale": "...", "taskIds": ["id1","id2"]}]`;
 
   const out = await runQuery(prompt, { model: opts.model ?? "sonnet" });
-  const units = extractJson<ProposedUnit[]>(out);
+  const units = extractJson<ProposedUnit[]>(out.text);
   // Defensive: keep only real candidate ids, drop empty units.
   const valid = new Set(tasks.map((t) => t.id));
   return units
@@ -134,12 +174,14 @@ Why these are bundled: ${unit.rationale}
 Tasks to satisfy:
 ${taskBlock}
 
-Write a focused implementation plan in markdown: the approach, the specific files/functions to change, edge cases, and how to verify. Be concrete and grounded in what you find in the repo. Do not make any edits — planning only.
+Write a focused implementation plan in markdown: the approach, the specific files/functions to change, and edge cases. Be concrete and grounded in what you find in the repo. Do not make any edits — planning only.
+
+${VALIDATION_INSTRUCTION}
 
 ${PLAN_META_INSTRUCTION}`;
 
-  const raw = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
-  const { plan, summary, effort } = extractPlanMeta(raw);
+  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  const { plan, summary, effort } = resolvePlan(out);
   return { ...unit, tasks: members, plan, summary, effort };
 }
 
@@ -164,10 +206,12 @@ ${opts.feedback.trim()}
 
 Rewrite the plan to address the feedback while keeping the parts that are still valid. Do not make any edits to the repo — planning only.
 
+${VALIDATION_INSTRUCTION}
+
 ${PLAN_META_INSTRUCTION}`;
 
-  const raw = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
-  return extractPlanMeta(raw);
+  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  return resolvePlan(out);
 }
 
 /** Tasks eligible for planning: not already in the anvil pipeline (no anvil:* label, no work unit). */
@@ -175,8 +219,18 @@ function candidateTasks(tasks: TodoistTask[], workUnits: WorkUnitStore): Todoist
   return tasks.filter((t) => !readStatus(t.labels) && !workUnits.forTask(t.id));
 }
 
-function planComment(unit: PlannedUnit): string {
-  return `🤖 **anvil** bundled this into work unit “${unit.title}”.\n\n_${unit.rationale}_\n\n${unit.plan}`;
+/** The Todoist comment for a freshly planned unit: a short summary, not the whole plan — the full
+ *  plan lives in Anvil's Autopilot view, where it can be read and refined. `planUrl` (when known) is
+ *  a deep link straight to this plan's reader. */
+function planComment(unit: PlannedUnit, planUrl?: string): string {
+  const summary = unit.summary?.trim() || unit.rationale.trim() || "Implementation plan ready.";
+  const review = planUrl ? `🔗 Review & refine in Anvil: ${planUrl}` : "_Review & refine the full plan in Anvil → Autopilot._";
+  return `🤖 **anvil** planned “${unit.title}”.\n\n${summary}\n\n${review}`;
+}
+
+/** Deep link to a plan's reader in the Anvil web UI, or undefined when the daemon's URL is unknown. */
+export function planDeepLink(webBaseUrl: string | undefined, workUnitId: string): string | undefined {
+  return webBaseUrl ? `${webBaseUrl.replace(/\/$/, "")}/#p/${workUnitId}` : undefined;
 }
 
 /**
@@ -193,6 +247,7 @@ export async function planAndTagProject(
     repoName?: string;
     bundleModel?: Model;
     planModel?: Model;
+    webBaseUrl?: string; // for the Todoist comment's "review in Anvil" deep link
     onProgress?: (msg: string) => void;
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
@@ -220,15 +275,69 @@ export async function planAndTagProject(
       effort: planned.effort,
       status: "planned",
     });
-    // Tag every member; post the full plan once (on the first member), pointers on the rest.
+    // Tag every member; post the summary + deep link once (on the first member), pointers on the rest.
     for (const [j, t] of planned.tasks.entries()) {
       await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
-      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
+      if (j === 0) await deps.client.addComment(t.id, planComment(planned, planDeepLink(opts.webBaseUrl, wu.id)));
       else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
     }
     created.push(wu);
   }
   log(`Created ${created.length} planned work units.`);
+  return { created, skipped };
+}
+
+/**
+ * Phase 2A for label-sourced tasks: bundle + plan an explicit task list (gathered account-wide by the
+ * Autopilot label, not a single project) against the catch-all environment. Same persistence/tag/comment
+ * side effects as planAndTagProject, but each unit is marked `source: "label"` and carries the first
+ * member's own project id. Caller is responsible for excluding tasks already covered by a linked project.
+ */
+export async function planAndTagTasks(
+  deps: { client: TodoistClient; workUnits: WorkUnitStore },
+  opts: {
+    environmentId: string;
+    repoRoot: string;
+    repoName?: string;
+    tasks: TodoistTask[];
+    bundleModel?: Model;
+    planModel?: Model;
+    webBaseUrl?: string; // for the Todoist comment's "review in Anvil" deep link
+    onProgress?: (msg: string) => void;
+  },
+): Promise<{ created: WorkUnit[]; skipped: number }> {
+  const log = opts.onProgress ?? (() => {});
+  const candidates = candidateTasks(opts.tasks, deps.workUnits);
+  const skipped = opts.tasks.length - candidates.length;
+  log(`${opts.tasks.length} labelled tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
+  if (candidates.length === 0) return { created: [], skipped };
+
+  const units = await bundleTasks(candidates, [], { model: opts.bundleModel, repoName: opts.repoName });
+  log(`Bundled into ${units.length} units. Planning + tagging…`);
+  const created: WorkUnit[] = [];
+  for (const [i, unit] of units.entries()) {
+    log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot });
+    const wu = deps.workUnits.create({
+      environmentId: opts.environmentId,
+      todoistProjectId: planned.tasks[0]?.project_id ?? "",
+      taskIds: planned.taskIds,
+      title: planned.title,
+      rationale: planned.rationale,
+      plan: planned.plan,
+      summary: planned.summary,
+      effort: planned.effort,
+      status: "planned",
+      source: "label",
+    });
+    for (const [j, t] of planned.tasks.entries()) {
+      await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
+      if (j === 0) await deps.client.addComment(t.id, planComment(planned, planDeepLink(opts.webBaseUrl, wu.id)));
+      else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
+    }
+    created.push(wu);
+  }
+  log(`Created ${created.length} planned work units from the Autopilot label.`);
   return { created, skipped };
 }
 

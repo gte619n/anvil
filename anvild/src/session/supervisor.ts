@@ -22,6 +22,8 @@ import {
   type AutopilotStartedEvent,
   type AutopilotSchedule,
   type AutopilotScheduleEvent,
+  type AutopilotMaintenanceResultEvent,
+  type AuthStatusEvent,
   type GitCmd,
   type GitResultEvent,
   type Model,
@@ -50,12 +52,13 @@ import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
-import { TodoistClient } from "../integrations/todoist";
-import { withStatus } from "../integrations/status";
-import { planAndTagProject, refinePlanQuery } from "../integrations/autopilot";
+import { TodoistClient, type TodoistTask } from "../integrations/todoist";
+import { readStatus, withStatus } from "../integrations/status";
+import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
+import { planAndTagProject, planAndTagTasks, planDeepLink, planUnit, refinePlanQuery } from "../integrations/autopilot";
 import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
-import { listDir, readFile, resolveInside } from "../fs/session-fs";
+import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
 import { VERSION } from "../version";
@@ -76,6 +79,9 @@ export interface SupervisorConfig {
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
+  /** This daemon's reachable web URL (e.g. http://100.x.y.z:7701), used to deep-link plans in
+   *  Todoist comments. Undefined → comments fall back to a plain "open Autopilot" pointer. */
+  webBaseUrl?: string;
 }
 
 /**
@@ -97,7 +103,11 @@ export class Supervisor {
    *  "clear" push to dismiss it everywhere once the session is viewed/answered (UI refinement §1). */
   private readonly notified = new Set<string>();
   private readonly renderer: MarkdownRenderer;
-  private readonly agentEnv = buildAgentEnv();
+  /** The §3 allow-list env for spawned agents/terminals. Built fresh per call (not cached) so a token
+   *  set/reset via the UI (auth.set) reaches the next session/run without a daemon restart. */
+  private agentEnv(): Record<string, string> {
+    return buildAgentEnv();
+  }
   /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
    *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
   private readonly defaultToolsServer = buildDefaultToolsServer({
@@ -113,13 +123,16 @@ export class Supervisor {
   private readonly autopilotSchedule: AutopilotScheduleStore;
   private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
   private scheduleTimer?: ReturnType<typeof setInterval>;
+  private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
   readonly apns: Apns;
+  private readonly webBaseUrl?: string;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
+    this.webBaseUrl = cfg.webBaseUrl;
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -136,6 +149,7 @@ export class Supervisor {
     });
     this.restore();
     this.startAutopilotScheduler();
+    this.startPrStateSweeper();
   }
 
   /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether a run
@@ -145,6 +159,16 @@ export class Supervisor {
     this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), 5 * 60_000);
     this.scheduleTimer.unref?.();
     void this.maybeRunScheduled();
+  }
+  /** Keep the sidebar's PR/merge badges fresh for an already-open app: a connect triggers a sweep, but
+   *  if the app stays connected while a PR is merged on GitHub nothing else would catch it. Sweep every
+   *  few minutes, but only while a client is actually watching (no point spawning `gh` for nobody).
+   *  `unref` so it never holds the process/test open. */
+  private startPrStateSweeper(): void {
+    this.prSweepTimer = setInterval(() => {
+      if (this.registry.all().length > 0) void this.refreshAllPrStates();
+    }, 4 * 60_000);
+    this.prSweepTimer.unref?.();
   }
   private async maybeRunScheduled(): Promise<void> {
     const sched = this.autopilotSchedule.get();
@@ -173,16 +197,16 @@ export class Supervisor {
   getEnvironment(id: string): Environment | undefined {
     return this.envStore.get(id);
   }
-  addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string): void {
+  addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string, icon?: string): void {
     try {
-      this.envStore.add(name, repoRoot, defaultBase, color);
+      this.envStore.add(name, repoRoot, defaultBase, color, icon);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     this.registry.toAll(this.environmentsEvent());
   }
   /** Clone a git URL into ~/Development (host git auth) and register it as an environment. */
-  cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string): void {
+  cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string, icon?: string): void {
     let dest: string;
     try {
       dest = git.cloneRepo(url).dest;
@@ -190,7 +214,7 @@ export class Supervisor {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
     try {
-      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color);
+      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color, icon);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
@@ -253,6 +277,7 @@ export class Supervisor {
       name?: string;
       defaultBase?: string;
       color?: string;
+      icon?: string;
       todoistProjectId?: string | null;
       validation?: EnvironmentValidation | null;
     },
@@ -301,6 +326,32 @@ export class Supervisor {
     return this.todoistStatusEvent(cid);
   }
 
+  // ── Model-provider auth (Settings → Models; Claude OAuth token set/reset) ──────────
+  private authStatusEvent(cid?: string): AuthStatusEvent {
+    return { v: PROTOCOL_VERSION, type: "auth.status", ts: now(), ...(cid ? { cid } : {}), ...claudeAuthStatus() };
+  }
+  /** Current Claude credential state for the Models card. */
+  authStatus(cid?: string): AuthStatusEvent {
+    return this.authStatusEvent(cid);
+  }
+  /** Set/replace the Claude OAuth token (persisted to the launcher env file + applied live). Throws
+   *  BadCommand on an empty or metered-looking key so the UI can surface the reason. */
+  setAuthToken(token: string, cid?: string): AuthStatusEvent {
+    try {
+      setClaudeToken(token);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    this.registry.toAll(this.authStatusEvent());
+    return this.authStatusEvent(cid);
+  }
+  /** Remove the Claude OAuth token from the daemon + env file. */
+  clearAuthToken(cid?: string): AuthStatusEvent {
+    clearClaudeToken();
+    this.registry.toAll(this.authStatusEvent());
+    return this.authStatusEvent(cid);
+  }
+
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
   async listTodoistProjects(cid?: string): Promise<TodoistProjectsResultEvent> {
     const state = this.integrations.todoist();
@@ -337,6 +388,7 @@ export class Supervisor {
       ...(u.rationale ? { rationale: u.rationale } : {}),
       ...(u.summary ? { summary: u.summary } : {}),
       status: u.status,
+      ...(u.source ? { source: u.source } : {}),
       ...(u.effort ? { effort: u.effort } : {}),
       taskCount: u.taskIds.length,
       ...(u.plan ? { plan: this.renderer.render(u.plan) } : {}),
@@ -371,7 +423,53 @@ export class Supervisor {
       ...(revised.summary ? { summary: revised.summary } : {}),
       ...(revised.effort ? { effort: revised.effort } : {}),
     });
-    void this.postPlanComment(u, `🤖 **anvil** refined the plan for “${u.title}”.\n\n_Feedback: ${feedback.trim()}_\n\n${revised.plan}`);
+    const refineLink = planDeepLink(this.webBaseUrl, u.id);
+    void this.postPlanComment(
+      u,
+      `🤖 **anvil** refined the plan for “${u.title}”.\n\n${revised.summary?.trim() || "Plan updated."}\n\n_Feedback: ${feedback.trim()}_\n\n${refineLink ? `🔗 Read the full plan in Anvil: ${refineLink}` : "_Read the full plan in Anvil → Autopilot._"}`,
+    );
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
+  }
+
+  /** Reassign a plan to a different environment (repo) and re-evaluate it there: re-plan the unit's
+   *  existing tasks against the new repo, persist the fresh plan/summary/effort, note it on Todoist,
+   *  broadcast, and return the updated plan. Used to correct a mis-routed (e.g. label-sourced) plan. */
+  async reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session; can't reassign it");
+    const env = this.envStore.get(environmentId);
+    if (!env) throw new BadCommand("no such environment");
+    if (env.id === u.environmentId) throw new BadCommand("the plan is already in that environment");
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
+    const client = new TodoistClient(state.accessToken);
+    const tasks: TodoistTask[] = [];
+    for (const id of u.taskIds) {
+      try {
+        tasks.push(await client.getTask(id));
+      } catch {
+        /* skip a deleted/closed task */
+      }
+    }
+    if (tasks.length === 0) throw new BadCommand("this plan has no live tasks to re-evaluate");
+    const planned = await planUnit(
+      { title: u.title, rationale: u.rationale ?? "", taskIds: tasks.map((t) => t.id) },
+      tasks,
+      { repoRoot: env.repoRoot },
+    );
+    const updated = this.workUnits.update(u.id, {
+      environmentId: env.id,
+      plan: planned.plan,
+      ...(planned.summary ? { summary: planned.summary } : {}),
+      ...(planned.effort ? { effort: planned.effort } : {}),
+    });
+    const reassignLink = planDeepLink(this.webBaseUrl, u.id);
+    void this.postPlanComment(
+      u,
+      `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.summary?.trim() || "Plan updated."}\n\n${reassignLink ? `🔗 Read the full plan in Anvil: ${reassignLink}` : "_Read the full plan in Anvil → Autopilot._"}`,
+    );
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
   }
@@ -395,6 +493,74 @@ export class Supervisor {
     }
     this.workUnits.update(u.id, { status: "dismissed" });
     this.broadcastAutopilotPlans();
+  }
+
+  /** Mark a plan completed or expired: relabel its member tasks (anvil:completed / anvil:expired) and,
+   *  when `closeTodoist`, close them in Todoist too. Drops the card (status is no longer "planned").
+   *  Best-effort on the Todoist side — the local status change is authoritative. */
+  async resolvePlan(workUnitId: string, status: "completed" | "expired", closeTodoist: boolean): Promise<void> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const state = this.integrations.todoist();
+    if (state?.accessToken) {
+      const client = new TodoistClient(state.accessToken);
+      for (const taskId of u.taskIds) {
+        try {
+          const t = await client.getTask(taskId);
+          await client.setTaskLabels(taskId, withStatus(t.labels, status));
+          if (closeTodoist) await client.closeTask(taskId);
+        } catch {
+          /* a deleted/closed task — skip it, the local status still drops the card */
+        }
+      }
+    }
+    this.workUnits.update(u.id, { status });
+    this.broadcastAutopilotPlans();
+  }
+
+  // ── Autopilot maintenance (Todoist-settings buttons) ──────────────────────────────
+  /** Remove every anvil:* status label from the given units' member tasks (best-effort), keeping the
+   *  user's own labels — including the "Autopilot" sourcing label — intact. Returns how many tasks
+   *  actually had a label removed. */
+  private async stripAnvilLabels(units: WorkUnit[]): Promise<number> {
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) return 0;
+    const client = new TodoistClient(state.accessToken);
+    const taskIds = new Set<string>();
+    for (const u of units) for (const id of u.taskIds) taskIds.add(id);
+    let cleared = 0;
+    for (const taskId of taskIds) {
+      try {
+        const t = await client.getTask(taskId);
+        if (!readStatus(t.labels)) continue; // no anvil:* label → nothing to strip
+        await client.setTaskLabels(taskId, withStatus(t.labels, undefined));
+        cleared++;
+      } catch {
+        /* a deleted/closed task — skip it */
+      }
+    }
+    return cleared;
+  }
+
+  /** Reset the pipeline so tasks can be re-planned: strip anvil:* labels and drop the work units that
+   *  aren't tied to a live session (in-progress builds are left alone). The "Autopilot" sourcing label
+   *  is preserved, so the next run picks the tasks straight back up. */
+  async resetAnvilTags(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
+    const resettable = this.workUnits.list().filter((u) => !(u.sessionId && this.sessions.has(u.sessionId)));
+    const tasksCleared = await this.stripAnvilLabels(resettable);
+    for (const u of resettable) this.workUnits.remove(u.id);
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "reset", tasksCleared, unitsRemoved: resettable.length };
+  }
+
+  /** Clear the autopilot entirely: strip anvil:* labels from every unit's tasks and remove ALL work
+   *  units (the pending grid empties). Running sessions are not killed, but their unit is forgotten. */
+  async clearAutopilot(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
+    const units = this.workUnits.list();
+    const tasksCleared = await this.stripAnvilLabels(units);
+    for (const u of units) this.workUnits.remove(u.id);
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "clear", tasksCleared, unitsRemoved: units.length };
   }
 
   /** Go: create a fresh-worktree session seeded with the plan and start it. Autonomy defaults to
@@ -421,6 +587,22 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
   }
 
+  /** Link a plan to an existing session that's already doing the work, instead of spawning a new one
+   *  via Go. Sets the unit's sessionId + status building and tags its tasks — the card then leaves the
+   *  pending grid, exactly like startPlan. The session must belong to the plan's environment. */
+  linkPlan(workUnitId: string, sessionId: string, cid?: string): AutopilotStartedEvent {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new BadCommand("no such session");
+    if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
+    this.workUnits.update(u.id, { sessionId, status: "building" });
+    void this.tagTasks(u, "building");
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
+  }
+
   /** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */
   private autopilotBrief(u: WorkUnit): string {
     const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
@@ -445,7 +627,12 @@ export class Supervisor {
     const envs = this.envStore
       .list()
       .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
-    if (envs.length === 0) throw new BadCommand("no environments are linked to a Todoist project");
+    const schedule = this.autopilotSchedule.get();
+    const defaultEnv = schedule.defaultEnvironmentId ? this.envStore.get(schedule.defaultEnvironmentId) : undefined;
+    // The account-wide Autopilot-label pass runs only on a full run (no single-env scope) and needs both a
+    // label and a resolvable catch-all environment configured.
+    const labelPass = !opts.environmentId && !!schedule.label && !!defaultEnv;
+    if (envs.length === 0 && !labelPass) throw new BadCommand("no environments are linked to a Todoist project");
     const deps = { client, workUnits: this.workUnits };
     const log: string[] = [];
     const emit = (line: string): void => {
@@ -464,19 +651,43 @@ export class Supervisor {
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
           repoName: env.name,
+          ...(this.webBaseUrl ? { webBaseUrl: this.webBaseUrl } : {}),
+          onProgress: emit,
+        });
+        createdUnits.push(...res.created);
+        skipped += res.skipped;
+      }
+      // Account-wide label pass: pull every @<label> task, drop those a linked project already covers
+      // (coexist + dedup), and plan the rest against the catch-all env. These are review-only (below).
+      if (labelPass && defaultEnv && schedule.label) {
+        emit(`▸ @${schedule.label} → ${defaultEnv.name}`);
+        const linkedProjectIds = new Set(
+          this.envStore.list().map((e) => e.todoistProjectId).filter((id): id is string => !!id),
+        );
+        const labelled = await client.tasksByLabel(schedule.label);
+        const external = labelled.filter((t) => !linkedProjectIds.has(t.project_id));
+        emit(`  ${labelled.length} @${schedule.label} task(s) · ${external.length} outside linked projects.`);
+        const res = await planAndTagTasks(deps, {
+          environmentId: defaultEnv.id,
+          repoRoot: defaultEnv.repoRoot,
+          repoName: defaultEnv.name,
+          tasks: external,
+          ...(this.webBaseUrl ? { webBaseUrl: this.webBaseUrl } : {}),
           onProgress: emit,
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
       }
       // Auto-start the new units, capped, and only when the subscription budget is healthy — an
-      // unattended run must never spawn a swarm of sessions or exhaust the weekly window.
-      if (opts.autoStart && createdUnits.length) {
+      // unattended run must never spawn a swarm of sessions or exhaust the weekly window. Label-sourced
+      // units are never auto-started (they may be mis-routed to the catch-all env → always review first).
+      const autoStartable = createdUnits.filter((u) => u.source !== "label");
+      if (opts.autoStart && autoStartable.length) {
         if (this.budget().warn) {
           emit("⏸ Auto-start skipped — subscription budget is in its warn zone; plans left for review.");
         } else {
           const cap = opts.maxAutoStart ?? 3;
-          for (const u of createdUnits.slice(0, cap)) {
+          for (const u of autoStartable.slice(0, cap)) {
             try {
               this.startPlan(u.id);
               started++;
@@ -485,7 +696,7 @@ export class Supervisor {
               emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
             }
           }
-          if (createdUnits.length > cap) emit(`${createdUnits.length - cap} more plan(s) left for manual review (cap ${cap}).`);
+          if (autoStartable.length > cap) emit(`${autoStartable.length - cap} more plan(s) left for manual review (cap ${cap}).`);
         }
       }
     } finally {
@@ -695,7 +906,7 @@ export class Supervisor {
   /** Fire-and-forget: ask Sonnet for a fitting icon, then push it via session.updated. */
   private async assignIcon(s: Session): Promise<void> {
     try {
-      const icon = await pickIcon(s.data.title, this.agentEnv);
+      const icon = await pickIcon(s.data.title, this.agentEnv());
       if (icon && this.sessions.has(s.data.id)) {
         s.data.icon = icon;
         this.persist();
@@ -713,7 +924,14 @@ export class Supervisor {
     return listDir(this.require(sessionId).data.cwd, path);
   }
   fsRead(sessionId: string, path: string): FileContent {
-    return readFile(this.require(sessionId).data.cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p));
+    const cwd = this.require(sessionId).data.cwd;
+    try {
+      return readFile(cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p));
+    } catch (e) {
+      // A missing file is user-facing ("Couldn't find X"), not an internal error — surface it cleanly.
+      if (e instanceof FileNotFound) throw new BadCommand(e.message);
+      throw e;
+    }
   }
   fsResolve(sessionId: string, path: string): string {
     return resolveInside(this.require(sessionId).data.cwd, path);
@@ -722,7 +940,14 @@ export class Supervisor {
     const key = `${sessionId}:${path}`;
     if (this.watchers.has(key)) return;
     const s = this.require(sessionId);
-    const abs = resolveInside(s.data.cwd, path);
+    let located: ReturnType<typeof locateInside>;
+    try {
+      located = locateInside(s.data.cwd, path); // watch the file fs.read actually resolved (subdir match included)
+    } catch {
+      return; // not found / not yet created — nothing to watch (read already reported the error)
+    }
+    if (located.kind !== "file") return; // an ambiguous basename has no single file to watch until the user picks
+    const abs = located.abs;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const onChange = (): void => {
       clearTimeout(timer);
@@ -869,6 +1094,40 @@ export class Supervisor {
     this.broadcastUpdated(cur.data);
   }
 
+  private prSweepRunning = false; // a sweep is in flight — don't stack `gh` storms
+  private lastPrSweepAt = 0; // throttle: at most one sweep per PR_SWEEP_THROTTLE_MS
+  /** Refresh PR badges for EVERY eligible session, not just the one a client has open. The per-session
+   *  attach refresh (`refreshPrState`) only covers the session you click into, so a PR merged on
+   *  GitHub, from another device, or in another session left the rest of the sidebar's merge badges
+   *  frozen at their last-known state. This reconciles the whole list. Bounded concurrency keeps us
+   *  from spawning a `gh` per session at once on the single-threaded daemon; `refreshPrState` already
+   *  skips terminal-merged and branchless sessions cheaply (no network). */
+  async refreshAllPrStates(force = false): Promise<void> {
+    if (this.prSweepRunning) return;
+    const t = Date.now();
+    if (!force && t - this.lastPrSweepAt < 30_000) return; // coalesce bursts (e.g. many clients reconnecting)
+    this.prSweepRunning = true;
+    this.lastPrSweepAt = t;
+    try {
+      // Only sessions that could have a live PR worth a network probe: on a branch, and not already
+      // terminal-merged on that same branch. Mirrors refreshPrState's own guards to avoid the work.
+      const ids = [...this.sessions.values()]
+        .filter((s) => {
+          const g = s.data.git;
+          const branch = s.data.worktree?.branch || g?.branch;
+          if (!branch) return false;
+          return !(g?.prState === "merged" && g.prBranch === g.branch);
+        })
+        .map((s) => s.id);
+      const LIMIT = 4;
+      for (let i = 0; i < ids.length; i += LIMIT) {
+        await Promise.all(ids.slice(i, i + LIMIT).map((id) => this.refreshPrState(id).catch(() => {})));
+      }
+    } finally {
+      this.prSweepRunning = false;
+    }
+  }
+
   /** Archive: stop the agent + terminal/watchers, keep the worktree/branch/history. */
   async archive(id: string): Promise<void> {
     if (id === DEFAULT_SESSION_ID) throw new BadCommand("the default chat cannot be archived");
@@ -935,7 +1194,7 @@ export class Supervisor {
     });
     rec.pty = term;
     const shell = process.env.SHELL || "/bin/zsh";
-    rec.proc = BunAny.spawn([shell], { terminal: term, cwd: s.data.cwd, env: { ...this.agentEnv, TERM: "xterm-256color" } });
+    rec.proc = BunAny.spawn([shell], { terminal: term, cwd: s.data.cwd, env: { ...this.agentEnv(), TERM: "xterm-256color" } });
     this.terminals.set(sessionId, rec);
     rec.proc.exited.then((code: number | null) => {
       s.emit({ type: "terminal.exit", code: code ?? 0 });
@@ -1001,7 +1260,7 @@ export class Supervisor {
         this.renderer,
         this.broker,
         this.questionBroker,
-        this.agentEnv,
+        this.agentEnv(),
         (usage) => this.onAgentResult(id, usage),
         isDefault ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer } : undefined,
         isDefault ? DEFAULT_TOOL_IDS : undefined,

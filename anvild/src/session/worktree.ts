@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { GitStatus, Worktree } from "@protocol";
 
@@ -6,6 +6,35 @@ import type { GitStatus, Worktree } from "@protocol";
 function git(args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
   const r = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
   return { code: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+}
+
+/**
+ * Symlink the canonical checkout's installed dependencies into a freshly-created worktree
+ * (best-effort). `git worktree add` only checks out tracked files, so a new worktree has no
+ * `node_modules` and an in-worktree `tsc` / `build:web` can't run — sessions could only do a
+ * syntax-level check before merging. We link (not copy — zero install cost) the repo root and each
+ * immediate subdirectory that has its own `node_modules`, which covers monorepo layouts like
+ * `anvild/node_modules`. Skips anything already present so it never clobbers real installs.
+ */
+function linkDeps(repoRoot: string, cwd: string): void {
+  const candidates = ["."];
+  try {
+    for (const e of readdirSync(repoRoot, { withFileTypes: true })) {
+      if (e.isDirectory() && e.name !== ".git" && e.name !== "node_modules") candidates.push(e.name);
+    }
+  } catch {
+    return; // can't read the repo root — skip linking entirely
+  }
+  for (const rel of candidates) {
+    const src = join(repoRoot, rel, "node_modules");
+    const dest = join(cwd, rel, "node_modules");
+    if (!existsSync(src) || existsSync(dest)) continue;
+    try {
+      symlinkSync(src, dest, "dir");
+    } catch {
+      // best-effort: a missing parent dir or FS error just means this dir goes unlinked
+    }
+  }
 }
 
 export interface CreatedWorktree {
@@ -34,6 +63,7 @@ export function createWorktree(
     }
     throw new Error(r.stderr.trim() || r.stdout.trim() || "git worktree add failed");
   }
+  linkDeps(repoRoot, cwd);
   return { worktree: { repoRoot, branch, base }, cwd };
 }
 
@@ -83,6 +113,7 @@ export function recreateWorktree(repoRoot: string, cwd: string, branch: string, 
     ? git(["worktree", "add", cwd, branch], repoRoot)
     : git(["worktree", "add", "-b", branch, cwd, base], repoRoot);
   if (add.code !== 0) return { ok: false, error: add.stderr.trim() || add.stdout.trim() || "git worktree add failed" };
+  linkDeps(repoRoot, cwd);
   return { ok: true };
 }
 

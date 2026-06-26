@@ -1,0 +1,34 @@
+# Anvil documentation
+
+Start with the [root README](../README.md) for the overview, then:
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the approachable tour, with diagrams. Read this first.
+
+## Design & implementation plans (`plans/`)
+
+The deep specs. They are the source of truth for *why* the system is shaped the way it is.
+
+| Plan | What it covers |
+|---|---|
+| [anvil-native-architecture.md](plans/anvil-native-architecture.md) | The master design: auth/billing, sessions, protocol, render pipeline, every decision. |
+| [anvil-protocol.ts](plans/anvil-protocol.ts) | The wire protocol — every envelope, event, and command (typed, `PROTOCOL_VERSION = 1`). |
+| [anvil-impl-INDEX.md](plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans (daemon, render, clients, terminal, push). |
+| [anvil-impl-1-daemon-core.md](plans/anvil-impl-1-daemon-core.md) … [6](plans/anvil-impl-6-push-tailscale-ops.md) | The component-by-component build plans. |
+| [anvil-multi-server.md](plans/anvil-multi-server.md) | Multi-server fleet: one client, many Macs, one Max plan. |
+| [anvil-server-app.md](plans/anvil-server-app.md) | The macOS menu-bar control panel. |
+| [anvil-autopilot-ui.md](plans/anvil-autopilot-ui.md) · [anvil-todoist-integration.md](plans/anvil-todoist-integration.md) | The Todoist autopilot and its plan-review UI. |
+| [anvil-restart-robustness.md](plans/anvil-restart-robustness.md) | Daemon restart / self-update safety. |
+| [file-browser-sftp.md](plans/file-browser-sftp.md) | Earlier file-browser thinking, now sourced from the daemon `fs.*` API. |
+
+## Assets (`assets/`)
+
+Brand assets — the logo and the README banners. See [assets/README.md](assets/README.md).
+
+## Component docs
+
+Each component keeps its own build/run notes:
+
+- [anvild/README.md](../anvild/README.md) — the daemon + web client
+- [apple/README.md](../apple/README.md) — Apple (macOS-first) shell
+- [anvil-server/README.md](../anvil-server/README.md) — the menu-bar control panel
+- [scripts/README.md](../scripts/README.md) — build/release utilities (CI release notes, Apple signing)

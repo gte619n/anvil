@@ -11,6 +11,7 @@ import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
+import { tailnetIPv4 } from "../config";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
 import { VERSION } from "../version";
@@ -106,12 +107,16 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const fleet = new FleetStore(opts.stateDir);
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
+  // Reachable web URL for deep-linking plans in Todoist comments. Prefer the tailnet IP (reachable
+  // from the user's phone over the tailnet); fall back to the bound host, then localhost.
+  const webBaseUrl = `http://${tailnetIPv4() ?? opts.host ?? "127.0.0.1"}:${opts.port}`;
   const supervisor = new Supervisor(
     {
       stateDir: opts.stateDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
       renderer: opts.renderer,
+      webBaseUrl,
     },
     registry,
   );
@@ -150,6 +155,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
+      // The session list above is the persisted (possibly stale) snapshot; reconcile every session's
+      // PR/merge badge in the background so a PR merged on GitHub / another device shows up in the
+      // sidebar without the user opening each session. Throttled + coalesced inside the supervisor.
+      void supervisor.refreshAllPrStates();
     },
     close(ws: ServerWebSocket<ConnState>) {
       registry.remove(ws);

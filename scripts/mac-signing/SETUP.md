@@ -136,7 +136,7 @@ Then build:
 ```sh
 source ~/.config/oxos-signing/env.sh
 # Anvil:
-cd ~/Development/zellij-android/apple && ./make-app.sh
+cd ~/Development/anvil/apple && ./make-app.sh
 # Slates:
 cd ~/Development/slates/desktop && npm run tauri:build
 ```

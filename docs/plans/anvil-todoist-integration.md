@@ -38,7 +38,7 @@ anvild already registers these repos; the obvious links:
 
 | Environment (repo) | Todoist project | Notes |
 |---|---|---|
-| Anvil (`zellij-android`) | **Anvil** (9) | this repo |
+| Anvil (`anvil`) | **Anvil** (9) | this repo |
 | Tesseta | **Tesseta** (6) | |
 | Slates | **Slates** (3) | |
 | OXOS Bots (`oxos/bots`) | **OES** (`6cg5wwxVQQjHRv4j`, 30 tasks) | confirmed |

@@ -1,5 +1,6 @@
 import MarkdownIt from "markdown-it";
 import Sortable from "sortablejs";
+import TomSelect from "tom-select";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
@@ -19,6 +20,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
 };
 import type {
   AttachmentRef,
+  AuthStatusEvent,
   AutopilotPlanInfo,
   AutopilotSchedule,
   AutonomyPolicy,
@@ -55,6 +57,37 @@ const icon = (name: string): string => `<span class="msym">${name}</span>`;
 $("#brand-version").textContent = `v${__APP_VERSION__}`;
 const sessIcon = (s: Session): string =>
   s.isDefault ? "robot_2" : s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder");
+// An environment's display glyph: its chosen Material Symbol, else a sensible default by repo kind.
+const envIcon = (e: Environment): string => e.icon || (e.isRepo ? "account_tree" : "folder");
+// Case-insensitive name sort for environment lists (selector + settings, per server).
+const byEnvName = (a: Environment, b: Environment): number => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+
+// ── Stylized selectors (Tom Select) ──────────────────────────────────────────
+// Native <select>s are upgraded to themed Tom Select dropdowns so options can carry a Material
+// Symbol icon and a color dot. Each <option> may set data-icon / data-color; the render below
+// picks them up (Tom Select copies an option's data-* attributes onto its option data). All our
+// selects live inside modals, so instances are tracked and torn down when the modal closes.
+let modalTomSelects: TomSelect[] = [];
+const renderTomOption = (data: { [k: string]: unknown }, escape: (s: string) => string): string => {
+  const ic = data.icon ? `<span class="msym ts-ic">${escape(String(data.icon))}</span>` : "";
+  const dot = data.color ? `<span class="ts-dot" style="background:${escape(String(data.color))}"></span>` : "";
+  return `<div class="ts-opt">${ic}${dot}<span class="ts-lbl">${escape(String(data.text ?? ""))}</span></div>`;
+};
+/** Upgrade a native <select> into a stylized Tom Select. `search` shows the filter box (long lists). */
+function enhanceSelect(sel: HTMLSelectElement | null, search = false): void {
+  if (!sel) return;
+  const base = { maxOptions: null, hideSelected: false, render: { option: renderTomOption, item: renderTomOption } };
+  modalTomSelects.push(new TomSelect(sel, search ? base : { ...base, controlInput: null }));
+}
+/** Re-read options/value from the underlying <select> after it's been repopulated programmatically. */
+function refreshSelect(sel: HTMLSelectElement | null): void {
+  if (sel) modalTomSelects.find((t) => t.input === sel)?.sync();
+}
+/** Tear down every modal Tom Select (removes its global listeners) — called when a modal closes. */
+function destroyModalSelects(): void {
+  for (const t of modalTomSelects) t.destroy();
+  modalTomSelects = [];
+}
 const conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
 let stickToBottom = true;
@@ -114,8 +147,12 @@ interface Server {
   sock: AnvilSocket;
   status: "connecting" | "connected" | "disconnected";
   version?: string; // anvild version (from server.hello)
+  capabilities?: string[]; // feature flags from server.hello; undefined on pre-capability builds
   budget?: Budget; // last budget snapshot (aggregate gauge, §7)
 }
+/** Whether a server advertised support for a capability (e.g. "autopilot"). A pre-capability build
+ *  omits the list → treated as unsupported, so we never send it a command it can't handle. */
+const serverSupports = (srv: Server | undefined, cap: string): boolean => !!srv?.capabilities?.includes(cap);
 const cssId = (s: string): string => s.replace(/[^a-z0-9]/gi, "_"); // safe element-id suffix from a URL
 const HUB_URL = daemonBase();
 const hostOf = (url: string): string => {
@@ -270,6 +307,12 @@ const sessionFromHash = (): string | null => {
   const m = location.hash.match(/^#s\/(.+)$/);
   return m ? decodeURIComponent(m[1]!) : null;
 };
+// A plan deep link (#p/<workUnitId>) opens the Autopilot view straight to that plan's reader — the
+// URL the autopilot posts in its Todoist comment. Used on cold load and on warm hashchange.
+const planFromHash = (): string | null => {
+  const m = location.hash.match(/^#p\/(.+)$/);
+  return m ? decodeURIComponent(m[1]!) : null;
+};
 
 // ── Back-stack: device/browser Back dismisses the top UI layer before leaving ─────────
 // Modals/dialogs, the settings view, the side panel and the (mobile) expanded sidebar are
@@ -278,7 +321,7 @@ const sessionFromHash = (): string | null => {
 // uses the swipe gesture, the PWA/browser uses its own Back — all surface as `popstate`,
 // which closes the topmost layer. Each entry records how many layers were open (`anvilDepth`)
 // so a single popstate can unwind to exactly the right place.
-type OverlayName = "modal" | "settings" | "autopilot" | "panel" | "sidebar";
+type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel";
 interface Overlay {
   name: OverlayName;
   close: () => void; // pure DOM/state teardown — must NOT touch history itself
@@ -286,10 +329,13 @@ interface Overlay {
 const overlays: Overlay[] = [];
 let suppressPop = 0; // popstates from our own dismissOverlay() unwind — teardown already done
 const overlayOpen = (name: OverlayName): boolean => overlays.some((o) => o.name === name);
-function openOverlay(name: OverlayName, close: () => void): void {
+function openOverlay(name: OverlayName, close: () => void, hash?: string): void {
   if (overlayOpen(name)) return; // already open (e.g. swapping a modal's contents in place)
   overlays.push({ name, close });
-  history.pushState({ anvilDepth: overlays.length }, ""); // keep the current URL (session hash)
+  // `hash` (e.g. "#autopilot") gives the overlay its own URL so it's a real history entry — Back
+  // reverts the URL and pops the layer. Omit it to keep the current URL (the session hash).
+  const url = hash ? `${location.pathname}${hash}` : undefined;
+  history.pushState({ anvilDepth: overlays.length }, "", url);
 }
 /** Programmatically dismiss `name` and anything stacked above it (Cancel / X / backdrop). Tears
  *  down synchronously, then unwinds our own history entries (the resulting popstate is swallowed
@@ -321,8 +367,15 @@ function setSessionHash(id: string | null, push: boolean): void {
 // tap — as opposed to just restoring the last-active session from storage. On a phone we then jump
 // straight into that conversation with the sidebar hidden (see the collapse below). (UI refinement §4)
 const deepLinkedSession = sessionFromHash() || new URLSearchParams(location.search).get("session");
+// Captured before setSessionHash() below rewrites the URL and discards a #p/<id> fragment. Acted on
+// once the app has booted (the plan may not have synced yet — openPlanDeepLink waits for it).
+const deepLinkedPlan = planFromHash();
 let activeId: string | null = deepLinkedSession || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
+// The cid of a session.create we kicked off from the new-session dialog. The matching
+// session.created echoes this cid back to *us* only (other devices get it cid-less), so we can
+// jump straight into the session we just made without also hijacking sessions created elsewhere.
+let pendingCreateCid: string | null = null;
 window.addEventListener("popstate", () => {
   if (suppressPop > 0) {
     suppressPop--; // our own dismissOverlay() unwind — the layer is already torn down
@@ -332,7 +385,10 @@ window.addEventListener("popstate", () => {
   // panels dismiss before we navigate sessions or leave the app).
   const depth = typeof (history.state as { anvilDepth?: number } | null)?.anvilDepth === "number" ? (history.state as { anvilDepth: number }).anvilDepth : 0;
   while (overlays.length > depth) overlays.pop()!.close();
-  // Then reflect the session hash (Back/Forward between sessions, then out of the app).
+  // Then reflect the session hash (Back/Forward between sessions, then out of the app) — but only once
+  // every soft layer is closed. While an overlay is still open (e.g. Back from a plan reader landing on
+  // the hash-less autopilot URL), the session underneath must stay selected, not get deselected.
+  if (overlays.length > 0) return;
   const id = sessionFromHash();
   if (id && sessions.has(id)) {
     if (id !== activeId) selectSession(id, false);
@@ -347,6 +403,11 @@ window.addEventListener("popstate", () => {
 // external changes. Without it, a notification tapped while the app is already open didn't switch
 // sessions ("not deep linking every time"). (UI refinement §deep-link)
 window.addEventListener("hashchange", () => {
+  const planId = planFromHash();
+  if (planId) {
+    openPlanDeepLink(planId); // notification tap / shared link into a specific plan
+    return;
+  }
   const id = sessionFromHash();
   if (!id) {
     if (activeId) deselectSession();
@@ -711,6 +772,13 @@ function updateOutboxBadge(): void {
 // every server in the registry (fleet — they merge into one view).
 ensureServer(HUB_URL);
 for (const u of loadExtraServers()) ensureServer(u);
+// Adopt the rest of the fleet up front (not just on first Settings open) so fleet sessions AND
+// environments merge into the view immediately — otherwise the new-session picker shows hub-only
+// environments until the user happens to visit Settings → Servers.
+void loadFleetMembers();
+// Cold deep link into a plan (Todoist "Review in Anvil" link): open the Autopilot view now; the
+// reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
+if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
@@ -811,8 +879,8 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
   if (document.querySelector(".settings-view")) renderServerCards(); // live status in Settings
   if (status === "connected") {
     void flushOutbox(); // push anything queued while offline (routed per server)
-    srv?.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
-    srv?.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
+    // The autopilot probes are sent from the server.hello handler instead — hello is the first frame
+    // after open and carries the server's capabilities, so we only probe servers that support autopilot.
   }
   if (pendingRestartReload && url === HUB_URL) {
     if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
@@ -838,9 +906,11 @@ function refreshConnDot(): void {
 function onEvent(url: string, e: ServerEvent): void {
   if ("seq" in e && "sessionId" in e && typeof e.seq === "number") seqStore.set(e.sessionId, e.seq);
   const cid = (e as { cid?: string }).cid;
+  let awaited = false;
   if (cid && cidWaiters.has(cid)) {
-    cidWaiters.get(cid)!(e); // resolve an outbox flush awaiting this command's response
+    cidWaiters.get(cid)!(e); // hand the frame to the sendAwait promise tracking this cid
     cidWaiters.delete(cid);
+    awaited = true;
   }
 
   switch (e.type) {
@@ -882,7 +952,12 @@ function onEvent(url: string, e: ServerEvent): void {
       persistSessions();
       persistRouting();
       renderSessions();
-      if (!activeId) selectSession(e.session.id);
+      // Jump straight into a session we just created from the dialog (cid echoes back to the
+      // creator only). Otherwise only auto-open when nothing's active yet.
+      if (cid && cid === pendingCreateCid) {
+        pendingCreateCid = null;
+        selectSession(e.session.id);
+      } else if (!activeId) selectSession(e.session.id);
       return;
     case "session.updated":
       sessions.set(e.session.id, e.session);
@@ -912,7 +987,17 @@ function onEvent(url: string, e: ServerEvent): void {
         srv.id = e.serverId;
         srv.name = e.serverName || srv.name;
         srv.version = e.version;
+        srv.capabilities = e.capabilities;
       }
+      // Now that we know this server's capabilities, pull its autopilot state — but only if it's new
+      // enough to handle these commands. An older member (no "autopilot" capability) is skipped, so it
+      // never gets `unknown command type` and just sits out the federated plan view until it's updated.
+      if (serverSupports(srv, "autopilot")) {
+        srv!.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
+        srv!.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
+      }
+      // Pull the hub's model-provider auth state so the Settings → Models card is live (hub-scoped).
+      if (url === HUB_URL && serverSupports(srv, "auth")) srv!.sock.send({ type: "auth.status" });
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
@@ -925,8 +1010,7 @@ function onEvent(url: string, e: ServerEvent): void {
     }
     case "budget": {
       const srv = servers.get(url);
-      if (srv) srv.budget = e.budget;
-      renderAggregateBudget(); // sum across servers (§7)
+      if (srv) srv.budget = e.budget; // stored for any future use; no longer surfaced in the UI
       return;
     }
     case "environments":
@@ -940,6 +1024,13 @@ function onEvent(url: string, e: ServerEvent): void {
       return;
     case "todoist.projects.result":
       return; // resolved via cidWaiter (loadTodoistProjects)
+    case "auth.status":
+      // Model-provider auth is hub-scoped (the token lives on the hub daemon; the Models card routes
+      // to hub()). Ignore a fleet member's own status so it can't clobber the hub's.
+      if (url === HUB_URL) onAuthStatus(e);
+      return;
+    case "autopilot.maintenance.result":
+      return; // resolved via cidWaiter (resetAnvilTags / clearAutopilot)
     case "autopilot.plans":
       onAutopilotPlans(url, e.plans);
       return;
@@ -968,7 +1059,12 @@ function onEvent(url: string, e: ServerEvent): void {
       if (e.sessionId === activeId) showGitResult(e);
       return;
     case "command.error":
-      toast(e.message);
+      // Only surface errors for a command we issued and are still tracking. Skip it when a sendAwait
+      // already took it (the caller decides how to show it — avoids a double toast) and when it has no
+      // cid: a cid-less command.error is an unsolicited reply to a fire-and-forget command — e.g. the
+      // connect-time autopilot.plans.list / schedule.get probe reaching a fleet member on an older
+      // build that doesn't recognise it. That's benign cross-version noise, so don't toast it.
+      if (cid && !awaited) toast(e.message);
       return;
     case "ack":
       return;
@@ -1006,6 +1102,7 @@ function handleSessionEvent(e: ServerEvent): void {
       // session is actually mid-turn, the live status/message events that follow re-light it.
       finalizeActivity();
       snapshotLoaded.add(e.sessionId);
+      if (e.sessionId === activeId) maybeShowSessionHero(); // no messages yet → show the session title card
       saveConvoCache();
       return;
     case "message.user":
@@ -1084,6 +1181,7 @@ function renderConversationEvent(ev: ConversationEvent): void {
 
 // ── Conversation rendering ─────────────────────────────────────────────────────
 function bubble(role: string): HTMLElement {
+  dropSessionHero(); // real content arriving — retire the blank-session title card
   const el = document.createElement("div");
   el.className = `bubble ${role}`;
   conversation.appendChild(el);
@@ -1192,6 +1290,7 @@ function renderStream(): void {
 const THINK_LABEL: Record<string, string> = { thinking: "Thinking", running_tool: "Working", running: "Working" };
 function showThinking(status: string): void {
   if (activityLive) return; // the live activity block already shows running state
+  dropSessionHero(); // a turn is starting — retire the blank-session title card
   if (!thinkingEl) {
     thinkingEl = document.createElement("div");
     thinkingEl.className = "thinking";
@@ -1318,6 +1417,7 @@ function resetActivity(): void {
 }
 function ensureActivity(): HTMLDetailsElement {
   if (activityEl && activityEl.isConnected) return activityEl;
+  dropSessionHero(); // a turn's activity block is appearing — retire the blank-session title card
   const d = document.createElement("details");
   d.className = "activity live";
   d.innerHTML =
@@ -1531,6 +1631,48 @@ function renderEmptyState(): void {
   // inlined (not a top-level const) so it's safe to call during early module init
   conversation.innerHTML =
     `<div class="empty-state"><img src="/anvil.svg" class="empty-art" alt="Anvil" width="132" height="132" /><p>Select a session, or create a new one.</p></div>`;
+}
+
+// ── Session hero (blank-conversation placeholder) ────────────────────────────────
+// A freshly created session has no messages yet. Rather than a void, fill the conversation with a
+// big, colour-coded title card — the session's icon, name, environment and branch — so it's always
+// unmistakable which session (and project) you're about to talk to. Removed the instant any real
+// content lands (see dropSessionHero in the content-append paths).
+function dropSessionHero(): void {
+  conversation.querySelector(".session-hero")?.remove();
+}
+/** Show the hero iff `activeId` is set and the conversation holds nothing but (optionally) the hero. */
+function maybeShowSessionHero(): void {
+  if (!activeId) return;
+  const s = sessions.get(activeId);
+  if (!s) return;
+  // Any non-hero child means there's real content (a bubble, activity, card, thinking dots) — no hero.
+  if ([...conversation.children].some((c) => !c.classList.contains("session-hero"))) return;
+  dropSessionHero(); // avoid stacking duplicates on repeated calls
+  const env = s.environmentId ? environments.get(s.environmentId) : undefined;
+  const theme = currentTheme();
+  const ord = envOrdinal(s, sessions.values());
+  const accent = env ? stripeColor(env, ord, theme) : "var(--accent)";
+  const bg = env ? sessionBg(env, ord, theme) : "var(--panel)";
+  const branch = !s.isDefault ? s.git?.branch : undefined;
+  const srv = serverOf(s.id);
+  const multi = orderedServers().length > 1;
+  const chip = (ic: string, text: string): string => `<span class="hero-chip">${icon(ic)}<span>${esc(text)}</span></span>`;
+  const chips = [
+    env ? chip("dashboard", env.name) : "",
+    branch ? chip("account_tree", branch) : "",
+    chip("smart_toy", s.model),
+    multi && srv ? chip("dns", srv.name) : "",
+  ].join("");
+  const hero = document.createElement("div");
+  hero.className = "session-hero empty-state"; // empty-state → margin:auto centers it; also stripped from the cache
+  hero.style.setProperty("--hero-accent", accent);
+  hero.style.setProperty("--hero-bg", bg);
+  hero.innerHTML = `<div class="hero-emblem">${icon(sessIcon(s))}</div>
+    <h1 class="hero-title">${esc(s.title)}</h1>
+    <div class="hero-meta">${chips}</div>
+    <p class="hero-hint">${s.pending ? "Queued — will start when you're back online." : "Send a message to get started."}</p>`;
+  conversation.appendChild(hero);
 }
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
@@ -1926,7 +2068,7 @@ function onEnvironments(url: string, list: Environment[]): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "todoist";
+type SettingsTab = "servers" | "environments" | "todoist" | "models";
 let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
@@ -1939,6 +2081,7 @@ function openSettings(): void {
       <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
+      <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
     </div>
     <div class="settings-body">
       <section class="settings-panel" data-tab="environments">
@@ -1953,6 +2096,11 @@ function openSettings(): void {
         <div class="section-head"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
         <p class="small muted">Link a Todoist project to an environment, then the nightly autopilot plans &amp; builds its tasks. Set the token with <code>bun run scripts/todoist.ts set</code>.</p>
         <div id="todoist-panel"><p class="small muted">Loading…</p></div>
+      </section>
+      <section class="settings-panel" data-tab="models">
+        <div class="section-head"><h3>Models</h3></div>
+        <p class="small muted">The model provider Anvil drives. Set or reset the Claude subscription token here instead of editing the daemon's service file.</p>
+        <div id="models-panel"><p class="small muted">Loading…</p></div>
       </section>
     </div>
   </div>`;
@@ -1974,6 +2122,10 @@ function selectSettingsTab(tab: SettingsTab): void {
   if (tab === "todoist") {
     renderTodoistPanel();
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
+  }
+  if (tab === "models") {
+    renderModelsPanel();
+    if (serverSupports(hub(), "auth")) hub().sock.send({ type: "auth.status" }); // refresh once per tab open
   }
 }
 
@@ -2110,32 +2262,208 @@ function renderTodoistPanel(): void {
   // Which env (if any) each project is linked to.
   const linkedBy = new Map<string, string>();
   for (const e of environments.values()) if (e.todoistProjectId) linkedBy.set(e.todoistProjectId, e.name);
-  const rows = [...todoistProjects.values()]
-    .sort((a, b) => (b.taskCount ?? 0) - (a.taskCount ?? 0))
-    .map((p) => {
+  // Order projects by their Todoist hierarchy: each parent immediately followed
+  // by its sub-projects, depth-first. Within a level, sort by task count desc.
+  const all = [...todoistProjects.values()];
+  const ids = new Set(all.map((p) => p.id));
+  const childrenOf = new Map<string, TodoistProjectInfo[]>();
+  const roots: TodoistProjectInfo[] = [];
+  for (const p of all) {
+    // Treat a project whose parent isn't in the set as a root (orphan-safe).
+    if (p.parentId && ids.has(p.parentId)) {
+      const arr = childrenOf.get(p.parentId) ?? [];
+      arr.push(p);
+      childrenOf.set(p.parentId, arr);
+    } else roots.push(p);
+  }
+  const byTasks = (a: TodoistProjectInfo, b: TodoistProjectInfo) => (b.taskCount ?? 0) - (a.taskCount ?? 0);
+  const ordered: Array<{ p: TodoistProjectInfo; depth: number }> = [];
+  const walk = (p: TodoistProjectInfo, depth: number) => {
+    ordered.push({ p, depth });
+    for (const c of (childrenOf.get(p.id) ?? []).sort(byTasks)) walk(c, depth + 1);
+  };
+  for (const r of roots.sort(byTasks)) walk(r, 0);
+  const rows = ordered
+    .map(({ p, depth }) => {
       const link = linkedBy.get(p.id);
+      const indent = depth ? `<span class="td-indent">${"&nbsp;".repeat(depth * 4)}↳ </span>` : "";
       return `<tr>
-        <td>${esc(p.name)}${p.parentId ? ` <span class="small muted">(sub)</span>` : ""}</td>
+        <td>${indent}${esc(p.name)}</td>
         <td class="small muted">${p.taskCount ?? 0}</td>
         <td>${link ? `<span class="small">${icon("link")} ${esc(link)}</span>` : `<span class="small muted">—</span>`}</td>
       </tr>`;
     })
     .join("");
-  host.innerHTML = `<div class="card"><span class="conn-dot connected"></span> Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects
-      <button id="todoist-disconnect" class="mini" style="float:right">Disconnect</button></div>
+  host.innerHTML = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span><span>Connected${todoistAccount ? ` as <b>${esc(todoistAccount)}</b>` : ""} · ${todoistProjects.size} projects</span>
+      <button id="todoist-disconnect" class="mini" style="margin-left:auto">Disconnect</button></div></div>
     ${scheduleSettingsCardHtml()}
     <table class="todoist-projects"><thead><tr><th>Project</th><th>Tasks</th><th>Linked environment</th></tr></thead><tbody>${rows}</tbody></table>
-    <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>`;
+    <p class="small muted">Link a project to an environment from <b>Environments → Edit</b>.</p>
+    ${autopilotMaintenanceCardHtml()}`;
   $("#todoist-disconnect").addEventListener("click", () => {
     hub().sock.send({ type: "todoist.disconnect", cid: newCid() });
     todoistProjectsLoaded = false;
     todoistProjects.clear();
   });
   $("#set-sched-edit").addEventListener("click", openScheduleModal);
+  document.getElementById("ap-tags-reset")?.addEventListener("click", () => void resetAnvilTags());
+  document.getElementById("ap-clear")?.addEventListener("click", () => void clearAutopilotUi());
+}
+
+/** Maintenance card (Todoist tab): reset anvil:* tags so tasks re-plan, or clear the pipeline. Hidden
+ *  on a daemon too old to handle the commands. */
+function autopilotMaintenanceCardHtml(): string {
+  if (!serverSupports(hub(), "autopilot-maintenance")) return "";
+  return `<div class="card ap-maint"><b>${icon("build")} Autopilot maintenance</b>
+    <p class="small muted">Reset clears every <code>anvil:*</code> status label from your tasks (your <b>Autopilot</b> sourcing label is kept) and drops pending plans that aren't building, so the next run re-plans them. Clear wipes the whole pipeline.</p>
+    <div class="ap-maint-actions">
+      <button id="ap-tags-reset" class="mini">${icon("restart_alt")} Reset anvil tags</button>
+      <button id="ap-clear" class="mini danger">${icon("delete_sweep")} Clear autopilot</button>
+    </div></div>`;
+}
+
+async function resetAnvilTags(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Reset Autopilot tags?",
+    body: "Removes every anvil:* status label from your Todoist tasks (your Autopilot sourcing label and other labels stay) and drops pending plans that aren't being built, so the next run re-plans them from scratch.",
+    confirmLabel: "Reset tags",
+    icon: "restart_alt",
+  });
+  if (!ok) return;
+  try {
+    const res = await sendAwait(hub(), { type: "autopilot.tags.reset", cid: newCid() }, 120_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type === "autopilot.maintenance.result") {
+      toast(`Reset ${res.tasksCleared} task${res.tasksCleared === 1 ? "" : "s"} · ${res.unitsRemoved} plan${res.unitsRemoved === 1 ? "" : "s"} cleared`);
+    }
+  } catch (err) {
+    toast(`Reset failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function clearAutopilotUi(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Clear the autopilot entirely?",
+    body: "Wipes every pending plan and removes all anvil:* labels from their Todoist tasks. Running build sessions aren't stopped, but their plans are forgotten. This can't be undone.",
+    confirmLabel: "Clear everything",
+    danger: true,
+    icon: "delete_sweep",
+  });
+  if (!ok) return;
+  try {
+    const res = await sendAwait(hub(), { type: "autopilot.clear", cid: newCid() }, 120_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type === "autopilot.maintenance.result") {
+      toast(`Cleared ${res.unitsRemoved} plan${res.unitsRemoved === 1 ? "" : "s"} · ${res.tasksCleared} task${res.tasksCleared === 1 ? "" : "s"} relabelled`);
+    }
+  } catch (err) {
+    toast(`Clear failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 /** Tear down the settings view (DOM only). Reached via Back (popstate) or dismissOverlay. */
 function closeSettings(): void {
   $("#settings-root").innerHTML = "";
+}
+
+// ── Model providers (Settings → Models) ───────────────────────────────────────────
+// The daemon drives Claude (Agent SDK). The token is set/reset here so it doesn't require SSHing in
+// to edit the launcher env. Hub-scoped, like Todoist. Gemini/ChatGPT are placeholders for now — the
+// daemon is Claude-only, but the section is shaped so a future provider slots in without a redesign.
+let claudeAuth: { connected: boolean; persisted: boolean; masked?: string } | null = null;
+function onAuthStatus(e: AuthStatusEvent): void {
+  if (e.provider !== "claude") return;
+  claudeAuth = { connected: e.connected, persisted: e.persisted, ...(e.masked ? { masked: e.masked } : {}) };
+  if (document.getElementById("models-panel")) renderModelsPanel();
+}
+
+/** Persist a new/replacement Claude OAuth token on the hub daemon. */
+async function saveClaudeToken(token: string, btn?: HTMLButtonElement): Promise<void> {
+  const t = token.trim();
+  if (!t) {
+    toast("Paste your Claude OAuth token first.");
+    return;
+  }
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "auth.set", token: t, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message); // e.g. "that looks like a metered API key…"
+      return;
+    }
+    toast("Claude token saved — it applies to the next run."); // the auth.status reply/broadcast re-renders
+  } catch (err) {
+    toast(`Couldn't save the token: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
+async function clearClaudeTokenUi(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Clear the Claude token?",
+    body: "The daemon will have no model credential until you set a new one — autopilot and chat can't run without it. The token is removed from the daemon and its env file.",
+    confirmLabel: "Clear token",
+    danger: true,
+    icon: "key_off",
+  });
+  if (!ok) return;
+  hub().sock.send({ type: "auth.clear", cid: newCid() }); // the auth.status broadcast re-renders the card
+  toast("Claude token cleared");
+}
+
+function renderModelsPanel(): void {
+  const host = document.getElementById("models-panel");
+  if (!host) return;
+  if (!serverSupports(hub(), "auth")) {
+    host.innerHTML = `<div class="card"><b>Update required.</b><p class="small muted">This daemon is too old to manage the model token from the app. Update Anvil, or set <code>CLAUDE_CODE_OAUTH_TOKEN</code> in <code>~/.config/anvil/env</code>.</p></div>`;
+    return;
+  }
+  if (!claudeAuth) {
+    host.innerHTML = `<p class="small muted">Loading…</p>`;
+    return;
+  }
+  const tokenForm = (saveLabel: string): string => `<div class="todoist-connect">
+      <input id="claude-token" type="password" autocomplete="off" spellcheck="false" placeholder="Claude OAuth token (sk-ant-oat…)" />
+      <button id="claude-save" class="primary">${saveLabel}</button>
+    </div>`;
+  const futureCard = `<div class="card models-soon"><div class="card-main"><span class="conn-dot"></span><span>Gemini · ChatGPT — <b>coming soon</b>. Anvil currently drives Claude only.</span></div></div>`;
+  if (!claudeAuth.connected) {
+    host.innerHTML = `<div class="card"><b>No Claude token set.</b>
+      <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
+      ${tokenForm("Save")}</div>
+      ${futureCard}`;
+  } else {
+    const warn = claudeAuth.persisted
+      ? ""
+      : `<p class="small muted" style="margin-top:8px">${icon("warning")} Not written to the launcher env file — it will revert to the previous token on the next service restart.</p>`;
+    host.innerHTML = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+        <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
+        <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${warn}</div>
+      <div class="card"><b>Replace token</b>
+        <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
+        ${tokenForm("Replace")}</div>
+      ${futureCard}`;
+    $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
+  }
+  const input = $<HTMLInputElement>("#claude-token");
+  const btn = $<HTMLButtonElement>("#claude-save");
+  btn.addEventListener("click", () => void saveClaudeToken(input.value, btn));
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") void saveClaudeToken(input.value, btn);
+  });
 }
 // ── Autopilot (plan review & launch; anvil-autopilot-ui.md) ────────────────────────
 const autopilotLog: string[] = []; // streamed progress lines for the current/last run
@@ -2168,17 +2496,37 @@ function updateAutopilotBadge(): void {
   badge.textContent = n ? String(n) : "";
   badge.hidden = n === 0;
 }
+// A plan deep link (#p/<id>) may arrive before that plan has synced from its server. Hold the id here
+// and open the reader the moment the plan shows up (see onAutopilotPlans → tryOpenPendingPlan).
+let pendingPlanDeepLink: string | null = null;
+/** Open the Autopilot view at a specific plan (deep link). Opens the view if needed; if the plan
+ *  isn't loaded yet, remembers it and opens once its server delivers it. */
+function openPlanDeepLink(id: string): void {
+  pendingPlanDeepLink = id;
+  if (!overlayOpen("autopilot")) openAutopilot(); // renders the grid + pulls plans from every server
+  tryOpenPendingPlan();
+}
+/** If a deep-linked plan is now present, open its reader and clear the pending id. No-op otherwise. */
+function tryOpenPendingPlan(): void {
+  if (!pendingPlanDeepLink || !overlayOpen("autopilot")) return;
+  if (!findPlan(pendingPlanDeepLink)) return; // not synced yet — wait for the next autopilot.plans
+  const id = pendingPlanDeepLink;
+  pendingPlanDeepLink = null;
+  openPlan(id);
+}
+
 /** A server delivered its pending plans: re-tag routing, refresh the badge and (if open) the view. */
 function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
   serverPlans.set(url, plans);
   for (const [pid, u] of [...planServer]) if (u === url) planServer.delete(pid);
   for (const p of plans) planServer.set(p.id, url);
   updateAutopilotBadge();
+  tryOpenPendingPlan(); // a deep-linked plan may have just arrived
   if (!document.querySelector(".autopilot-view")) return;
   // A reader open on a plan that just vanished (dismissed/started elsewhere) falls back to the grid;
   // otherwise leave an open reader untouched (refine updates it in place) and only re-flow the grid.
   if (openPlanId) {
-    if (!findPlan(openPlanId)) renderAutopilotGrid();
+    if (!findPlan(openPlanId)) backToGrid(); // the open plan vanished (dismissed/started) → unwind to the grid
   } else {
     renderAutopilotGrid();
   }
@@ -2240,7 +2588,7 @@ function openAutopilot(): void {
         <span class="ap-sched-summary" id="autopilot-schedule"></span>
       </div>
       <span class="ap-head-actions">
-        <button id="autopilot-run" class="primary">${icon("play_arrow")} Run autopilot</button>
+        <button id="autopilot-run" class="primary ap-run-btn" title="Run autopilot">${icon("play_arrow")}<span class="ap-run-full">Run autopilot</span><span class="ap-run-mid">Run</span></button>
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
     </div>
@@ -2257,11 +2605,11 @@ function openAutopilot(): void {
     log.hidden = false;
     log.textContent = autopilotLog.join("\n");
   }
-  openOverlay("autopilot", closeAutopilot); // Back closes it (no-op if it's already a layer)
+  openOverlay("autopilot", closeAutopilot, "#autopilot"); // own URL; Back reverts it & closes the view
   renderAutopilotGrid();
   for (const s of orderedServers())
-    if (s.sock.isOpen()) {
-      s.sock.send({ type: "autopilot.plans.list" }); // fresh pull
+    if (s.sock.isOpen() && serverSupports(s, "autopilot")) {
+      s.sock.send({ type: "autopilot.plans.list" }); // fresh pull (autopilot-capable servers only)
       s.sock.send({ type: "autopilot.schedule.get" });
     }
 }
@@ -2273,9 +2621,9 @@ function closeAutopilot(): void {
 
 function planCardHtml(p: AutopilotPlanInfo): string {
   const localEnv = p.environmentId ? environments.get(p.environmentId) : undefined;
-  const env = p.environmentName ?? localEnv?.name;
   // Tint each card with its environment's colour (same hue the sidebar/session rows use), so a plan is
   // visually tied to the repo it belongs to. Falls back to the accent when the env isn't local.
+  // The environment name itself is carried by the group separator above the grid, not repeated here.
   const stripe = localEnv ? stripeColor(localEnv, 0, currentTheme()) : "var(--accent)";
   const summary = p.summary ?? p.rationale ?? "";
   const eff = p.effort
@@ -2285,18 +2633,31 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     <span class="plan-title">${esc(p.title)}</span>
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
     <span class="plan-meta">
-      ${env ? `<span class="ap-chip"><span class="env-dot" style="background:${stripe}"></span>${esc(env)}</span>` : ""}
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
+      ${p.source === "label" ? `<span class="ap-chip ap-chip-label">${icon("label")}via label</span>` : ""}
       <span class="ap-chip status-${esc(p.status)}">${esc(p.status)}</span>
     </span>
   </button>`;
 }
-/** Plans for one server, ordered by environment (name) then title — so a repo's plans sit together. */
-function plansByEnvironment(list: AutopilotPlanInfo[]): AutopilotPlanInfo[] {
-  const envName = (p: AutopilotPlanInfo): string =>
-    (p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "~").toLowerCase();
-  return [...list].sort((a, b) => envName(a).localeCompare(envName(b)) || a.title.localeCompare(b.title));
+/** A plan's environment display name (local env → broadcast name → fallback). */
+function planEnvName(p: AutopilotPlanInfo): string {
+  return p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "Unlinked";
+}
+/** Group a server's plans by environment, ordered by environment name then title, so a repo's plans
+ *  sit together under one separator. */
+function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: string; plans: AutopilotPlanInfo[] }[] {
+  const groups = new Map<string, { envId?: string; name: string; plans: AutopilotPlanInfo[] }>();
+  for (const p of list) {
+    const name = planEnvName(p);
+    const key = p.environmentId ?? `~${name}`;
+    let g = groups.get(key);
+    if (!g) groups.set(key, (g = { envId: p.environmentId, name, plans: [] }));
+    g.plans.push(p);
+  }
+  const out = [...groups.values()];
+  for (const g of out) g.plans.sort((a, b) => a.title.localeCompare(b.title));
+  return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 /** The flowing card grid, grouped by server when the fleet has more than one. */
 function renderAutopilotGrid(): void {
@@ -2318,12 +2679,25 @@ function renderAutopilotGrid(): void {
       if (multi) html += `<p class="small muted ap-server-empty">No plans</p>`;
       continue;
     }
-    html += `<div class="plan-grid">${plansByEnvironment(list).map(planCardHtml).join("")}</div>`;
+    // A labeled separator per environment (colour dot + name), then that env's card grid.
+    for (const g of plansByEnvironment(list)) {
+      const env = g.envId ? environments.get(g.envId) : undefined;
+      const dot = env ? stripeColor(env, 0, currentTheme()) : "var(--muted)";
+      html += `<div class="ap-env-sep"><span class="env-dot" style="background:${dot}"></span>${esc(g.name)}<span class="ap-env-count">${g.plans.length}</span></div>`;
+      html += `<div class="plan-grid">${g.plans.map(planCardHtml).join("")}</div>`;
+    }
   }
   host.innerHTML = html;
   host.querySelectorAll<HTMLElement>(".plan-card").forEach((c) =>
     c.addEventListener("click", () => openPlan(c.dataset.id!)),
   );
+}
+
+/** Return from a plan reader to the grid. When the reader is an active back-stack layer, dismiss it
+ *  (which unwinds its history entry and renders the grid); otherwise just render the grid. */
+function backToGrid(): void {
+  if (overlayOpen("plan")) dismissOverlay("plan");
+  else renderAutopilotGrid();
 }
 
 /** The full-plan reader + refine chat + Dismiss/Go, rendered in place of the grid (same overlay). */
@@ -2338,7 +2712,11 @@ function openPlan(id: string): void {
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
       <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
       <span class="plan-reader-actions">
+        <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
+        <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
+        <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign env</button>
+        <button class="mini" id="plan-link">${icon("link")} Link to session</button>
         <button class="primary" id="plan-start">${icon("rocket_launch")} Create session &amp; start</button>
       </span>
     </div>
@@ -2355,8 +2733,16 @@ function openPlan(id: string): void {
       </aside>
     </div>
   </div>`;
-  $("#plan-back").addEventListener("click", () => renderAutopilotGrid());
+  // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
+  // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
+  // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
+  openOverlay("plan", () => renderAutopilotGrid());
+  $("#plan-back").addEventListener("click", () => backToGrid());
+  $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
+  $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
   $("#plan-dismiss").addEventListener("click", () => void dismissPlan(id));
+  $("#plan-reassign").addEventListener("click", () => void reassignPlan(id));
+  $("#plan-link").addEventListener("click", () => void linkPlanToSession(id));
   $("#plan-start").addEventListener("click", () => void startPlan(id));
   $("#plan-refine-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -2433,9 +2819,41 @@ async function dismissPlan(id: string): Promise<void> {
       return;
     }
     toast("Plan dismissed");
-    renderAutopilotGrid(); // the broadcast also refreshes, but don't wait on it
+    backToGrid(); // the broadcast also refreshes, but don't wait on it
   } catch (err) {
     toast(`Dismiss failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Mark a plan completed or expired and drop its card. Offers to also close the linked Todoist
+ *  task(s) — defaulted on for "completed" (the work is done), off for "expired". */
+async function resolvePlan(id: string, status: "completed" | "expired"): Promise<void> {
+  const p = findPlan(id);
+  const verb = status === "completed" ? "Complete" : "Expire";
+  const res = await confirmDialogWithOption({
+    title: `Mark this plan ${status}?`,
+    body: `“${p?.title ?? "This plan"}” will be labelled anvil:${status} and removed from the pending grid.`,
+    confirmLabel: verb,
+    icon: status === "completed" ? "check_circle" : "schedule",
+    optionLabel: "Also close the linked task(s) in Todoist",
+    optionChecked: status === "completed",
+  });
+  if (!res.ok) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  try {
+    const reply = await sendAwait(srv, { type: "autopilot.resolve", workUnitId: id, status, closeTodoist: res.checked, cid: newCid() }, 60_000);
+    if (reply.type === "command.error") {
+      toast(reply.message);
+      return;
+    }
+    toast(res.checked ? `Plan ${status} · Todoist task closed` : `Plan ${status}`);
+    backToGrid(); // the broadcast also refreshes, but don't wait on it
+  } catch (err) {
+    toast(`${verb} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -2476,11 +2894,101 @@ async function startPlan(id: string): Promise<void> {
   }
 }
 
+/** Attach a plan to an existing session that's already doing the work instead of spawning a new one.
+ *  Offers the active sessions in the plan's environment; on pick, links and jumps to that session
+ *  (the card then leaves the grid, exactly like Go). */
+async function linkPlanToSession(id: string): Promise<void> {
+  const p = findPlan(id);
+  if (!p) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  // Active sessions on the plan's server, in the same environment (concierge/archived excluded).
+  const candidates = [...sessions.values()].filter(
+    (s) => !s.isDefault && !s.archived && s.environmentId === p.environmentId && sessionServer.get(s.id) === srv.url,
+  );
+  if (!candidates.length) {
+    toast("No active session in this plan's environment to link to");
+    return;
+  }
+  const sid = await pickListDialog(
+    `Link “${p.title}” to…`,
+    candidates.map((s) => ({ id: s.id, label: s.title || s.id, icon: s.icon ?? "terminal" })),
+  );
+  if (!sid) return;
+  try {
+    const res = await sendAwait(srv, { type: "autopilot.link", workUnitId: id, sessionId: sid, cid: newCid() }, 60_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type !== "autopilot.started") return;
+    dismissOverlay("autopilot");
+    selectSession(res.sessionId);
+  } catch (err) {
+    toast(`Link failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Reassign a (possibly mis-routed, e.g. label-sourced) plan to a different environment and re-evaluate
+ *  it against that repo. Picks from the environments on the plan's server; updates the open reader in
+ *  place when the replan returns (the slow part — a fresh read-only Opus pass). */
+async function reassignPlan(id: string): Promise<void> {
+  const p = findPlan(id);
+  if (!p) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  const candidates = [...environments.values()].filter((e) => envServer.get(e.id) === srv.url && e.id !== p.environmentId);
+  if (!candidates.length) {
+    toast("No other environment on this server to reassign to");
+    return;
+  }
+  const envId = await pickListDialog(
+    `Re-evaluate “${p.title}” against…`,
+    candidates.map((e) => ({ id: e.id, label: e.name, icon: "folder" })),
+    "swap_horiz",
+  );
+  if (!envId) return;
+  const doc = document.getElementById("plan-doc");
+  const btn = document.getElementById("plan-reassign") as HTMLButtonElement | null;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `${icon("hourglass_empty")} Re-evaluating…`;
+  }
+  doc?.classList.add("dim");
+  try {
+    // A reassign re-plans the unit against the new repo (read-only Opus) — allow the same generous
+    // budget as refine rather than the default short cap.
+    const res = await sendAwait(srv, { type: "autopilot.reassign", workUnitId: id, environmentId: envId, cid: newCid() }, 600_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    if (res.type !== "autopilot.plan") return;
+    toast("Plan re-evaluated");
+    if (doc && res.plan.plan) doc.innerHTML = res.plan.plan.html; // refresh the reader in place (grid re-flows via broadcast)
+  } catch (err) {
+    toast(`Reassign failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    doc?.classList.remove("dim");
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("swap_horiz")} Reassign env`;
+    }
+  }
+}
+
 /** Re-plan linked Todoist projects on every connected server; stream progress into the log. */
 async function runAutopilot(): Promise<void> {
-  const targets = orderedServers().filter((s) => s.sock.isOpen());
+  // Only servers new enough to run the autopilot pipeline — an older member would just reject it.
+  const targets = orderedServers().filter((s) => s.sock.isOpen() && serverSupports(s, "autopilot"));
   if (!targets.length) {
-    toast("No connected servers");
+    toast("No autopilot-capable servers connected");
     return;
   }
   autopilotLog.length = 0;
@@ -2502,6 +3010,11 @@ async function runAutopilot(): Promise<void> {
           created += res.created;
           runState.results.push({ name: srv.name, ok: res.ok, created: res.created, skipped: res.skipped, error: res.ok ? undefined : res.output });
           onAutopilotProgress(res.ok ? `✓ ${srv.name}: ${res.created} new · ${res.skipped} already in pipeline` : `⚠ ${srv.name}: ${res.output}`);
+        } else if (res.type === "command.error") {
+          // e.g. "an autopilot run is already in progress" — record it per-server (the global
+          // command.error toast no longer fires for awaited commands).
+          runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: res.message });
+          onAutopilotProgress(`⚠ ${srv.name}: ${res.message}`);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -2570,6 +3083,11 @@ function openScheduleModal(): void {
   const dayBtns = DAY_LABEL.map(
     (d, i) => `<button type="button" class="ap-day${days.has(i) ? " on" : ""}" data-day="${i}">${d}</button>`,
   ).join("");
+  // The label-sourcing catch-all targets one of the hub's environments (the schedule modal is hub-scoped).
+  const hubEnvs = [...environments.values()].filter((e) => envServer.get(e.id) === HUB_URL);
+  const envOptions =
+    `<option value="">— none —</option>` +
+    hubEnvs.map((e) => `<option value="${esc(e.id)}"${e.id === s.defaultEnvironmentId ? " selected" : ""}>${esc(e.name)}</option>`).join("");
   const m = document.createElement("div");
   m.className = "modal";
   const toggle = (id: string, on: boolean, label: string): string =>
@@ -2582,6 +3100,8 @@ function openScheduleModal(): void {
       <div class="ap-field"><span>Days</span><div class="ap-days" id="ap-days">${dayBtns}</div></div>
       ${toggle("ap-autostart", s.autoStart, "Auto-start sessions for new plans")}
       <label class="ap-field-row"><span>Auto-start at most</span><input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /><span class="small muted">per run (the rest wait for manual launch; skipped while the budget is in its warn zone)</span></label>
+      <label class="ap-field-row"><span>Autopilot label</span><input type="text" id="ap-label" value="${esc(s.label ?? "")}" placeholder="Autopilot" /><span class="small muted">tasks with this Todoist label are pulled in from <b>any</b> project (blank = off)</span></label>
+      <label class="ap-field-row"><span>Default environment</span><select id="ap-defenv">${envOptions}</select><span class="small muted">where label-sourced tasks are planned &amp; built — always review-only</span></label>
     </div>
     <div class="btns"><button type="button" id="ap-sched-cancel">Cancel</button><button type="button" id="ap-sched-save" class="primary">Save</button></div></div>`;
   showModal(m);
@@ -2612,8 +3132,10 @@ async function saveSchedule(): Promise<void> {
   const on = [...document.querySelectorAll<HTMLElement>("#ap-days .ap-day.on")].map((b) => Number(b.dataset.day));
   // all 7 selected → send [] (every day); none selected → keep it simple and treat as every day too
   const days = on.length === 0 || on.length === 7 ? [] : on.sort((a, b) => a - b);
+  const label = $<HTMLInputElement>("#ap-label").value.trim();
+  const defaultEnvironmentId = $<HTMLSelectElement>("#ap-defenv").value;
   try {
-    const res = await sendAwait(hub(), { type: "autopilot.schedule.set", enabled, timeOfDay, days, autoStart, maxAutoStart, cid: newCid() }, 20_000);
+    const res = await sendAwait(hub(), { type: "autopilot.schedule.set", enabled, timeOfDay, days, autoStart, maxAutoStart, label, defaultEnvironmentId, cid: newCid() }, 20_000);
     if (res.type === "command.error") {
       toast(res.message);
       return;
@@ -2625,7 +3147,7 @@ async function saveSchedule(): Promise<void> {
   }
 }
 
-/** One card per server in the fleet (hub first): live status, version, budget, update & remove. */
+/** One card per server in the fleet (hub first): live status, version, update & remove. */
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
   const id = cssId(srv.url);
@@ -2639,7 +3161,6 @@ function serverCardHtml(srv: Server): string {
     ${removeX}
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
-    <div id="srv-budget-${id}" class="small muted srv-budget"></div>
     <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
     <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
@@ -2651,7 +3172,6 @@ function renderServerCards(): void {
   // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
-    `<div id="fleet-budget"></div>` +
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
     `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
     `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
@@ -2667,7 +3187,6 @@ function renderServerCards(): void {
   document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
-  renderAggregateBudget();
   if (nativeBridge) {
     const setOut = (t: string): void => {
       const el = document.getElementById("adb-output");
@@ -2739,6 +3258,7 @@ function showAddMac(): void {
     <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
   </div>`;
   showModal(m);
+  enhanceSelect(document.getElementById("fleet-host") as HTMLSelectElement | null);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
   $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
@@ -2829,41 +3349,12 @@ async function loadFleetPeers(): Promise<void> {
     } else if (!candidates.length) {
       sel.innerHTML = `<option value="">No other Macs found on your tailnet</option>`;
     } else {
-      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}">${esc(p.name)}</option>`).join("");
+      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}</option>`).join("");
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
   }
-}
-const fmtPct = (w?: { utilization: number }): string => (w ? `${Math.round(w.utilization)}%` : "—");
-/** Per-server budget lines + one aggregate "account usage" gauge (fleet §7). No-op if Settings is closed. */
-function renderAggregateBudget(): void {
-  for (const srv of servers.values()) {
-    const el = document.getElementById(`srv-budget-${cssId(srv.url)}`);
-    if (!el) continue;
-    const b = srv.budget;
-    el.innerHTML = b?.available
-      ? `Opus ${fmtPct(b.weekOpus)} · week ${fmtPct(b.week)}${b.warn ? ` ${icon("warning")}` : ""}`
-      : `budget: n/a`;
-  }
-  const agg = document.getElementById("fleet-budget");
-  if (!agg) return;
-  // All servers draw from ONE account, so each reports the same account-wide usage via the SDK.
-  // The honest aggregate is therefore the highest utilization any server reports — the real ceiling
-  // (§7) — not a sum. Shown only when there's more than one server.
-  const budgets = [...servers.values()].map((s) => s.budget).filter((b): b is Budget => !!b?.available);
-  if (orderedServers().length <= 1 || budgets.length === 0) {
-    agg.innerHTML = "";
-    return;
-  }
-  const maxU = (pick: (b: Budget) => number): number => Math.round(Math.max(0, ...budgets.map(pick)));
-  const opus = maxU((b) => b.weekOpus?.utilization ?? 0);
-  const week = maxU((b) => b.week?.utilization ?? 0);
-  const warn = budgets.some((b) => b.warn) || opus >= 80;
-  agg.innerHTML = `<div class="card${warn ? " warn-card" : ""}">
-    <div class="card-main">${icon("monitoring")} <b>Account usage</b></div>
-    <div class="small muted">Shared Max pool across the fleet — Opus <b>${opus}%</b> · week <b>${week}%</b> (highest any server reports).${warn ? " ⚠️ approaching the weekly limit." : ""}</div>
-  </div>`;
+  refreshSelect(sel); // re-read the freshly-populated options into the Tom Select instance
 }
 /** Wire one server card's "Update Anvil" button: pull that daemon's source, rebuild, and restart it.
  *  Each Mac self-updates independently — the hub no longer has a monopoly on updates. Only a hub
@@ -2942,7 +3433,7 @@ function renderEnvCards(): void {
   const envCard = (e: Environment): string => `<div class="card env-card" data-env="${esc(e.id)}">
       <div class="env-head">
         <div class="env-meta">
-          <b><span class="env-dot" style="background:${stripeColor(e, 0, currentTheme())}"></span>${esc(e.name)}</b>
+          <b><span class="env-glyph msym" style="color:${stripeColor(e, 0, currentTheme())}">${envIcon(e)}</span>${esc(e.name)}</b>
           <div class="small muted"><code>${esc(e.repoRoot)}</code></div>
           <div class="small muted">${icon("account_tree")} off <code>${esc(e.defaultBase ?? "HEAD")}</code></div>
           ${e.todoistProjectId ? `<div class="small muted">${icon("checklist")} ${esc(todoistProjectName(e.todoistProjectId) ?? "Todoist project")}</div>` : ""}
@@ -2959,7 +3450,7 @@ function renderEnvCards(): void {
     `<div class="env-server-head"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> <span class="small muted"><code>${esc(hostOf(srv.url))}</code></span></div>`;
   host.innerHTML = orderedServers()
     .map((srv) => {
-      const group = all.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url);
+      const group = all.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url).sort(byEnvName);
       const body = group.length ? group.map(envCard).join("") : `<p class="small muted">No environments on this server yet.</p>`;
       return srvHead(srv) + body;
     })
@@ -3005,6 +3496,8 @@ function selectSession(id: string, push = true): void {
   if (cached) {
     conversation.innerHTML = cached; // instant, replaced by the snapshot below
     scrollDown();
+  } else {
+    maybeShowSessionHero(); // fresh/empty session: show its title card now (no flash before the snapshot)
   }
   renderSessions();
   const s = sessions.get(id);
@@ -3371,12 +3864,27 @@ function renderReader(content: FileContent): void {
   if (content.path !== readerPath) return;
   panelView = "reader";
   setPanelTabs();
+  const popoutBtn = content.choices // a picker has nothing to pop out yet
+    ? ""
+    : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
   const head =
     `<div class="reader-head"><b>${esc(content.path)}</b>` +
-    `<span class="reader-head-actions">` +
-    `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>` +
+    `<span class="reader-head-actions">${popoutBtn}` +
     `<a href="#" id="reader-back">← files</a></span></div>`;
-  if (content.markdown) {
+  if (content.choices) {
+    // A prose-named file (e.g. "design.md") matched several paths — let the user pick which to open.
+    const items = content.choices
+      .map((p) => `<li><a href="#" class="file-link reader-choice" data-path="${esc(p)}">${esc(p)}</a></li>`)
+      .join("");
+    panelContent.innerHTML = head + `<div class="reader-choices"><p class="muted small">${esc(content.path)} matches several files — pick one:</p><ul>${items}</ul></div>`;
+    for (const a of panelContent.querySelectorAll<HTMLElement>(".reader-choice")) {
+      a.onclick = (e) => {
+        e.preventDefault();
+        const p = a.dataset.path;
+        if (p) openFile(p);
+      };
+    }
+  } else if (content.markdown) {
     panelContent.innerHTML = head + `<div class="md reader-md">${content.markdown.html}</div>`;
     void runMermaid(panelContent.querySelector(".reader-md") as HTMLElement);
   } else if (content.text !== undefined) {
@@ -3403,7 +3911,10 @@ function popOutReader(path: string): void {
     .join("");
   const theme = document.documentElement.dataset.theme ?? "light";
   const title = path.split("/").pop() || path;
-  const win = window.open("", "_blank", "noopener,width=860,height=920");
+  // NB: no "noopener" here — with it, window.open() returns null (the opener link is severed), so we
+  // could never write into the window and were left with a blank about:blank pop-up. We need the
+  // handle to document.write our own content; it's same-origin self-authored markup, so this is safe.
+  const win = window.open("", "_blank", "width=860,height=920");
   if (!win) {
     toast("Allow pop-ups to open the reader in its own window");
     return;
@@ -3432,7 +3943,7 @@ const STAGE_PROMPT: Record<Stage, string> = {
   commit: "In this worktree, stage and commit all current changes with a clear, conventional commit message based on what changed. If there's nothing to commit, say so.",
   push: "In this worktree: commit all current changes with a clear conventional message (if any are uncommitted), then push the branch to its origin remote (set the upstream with -u if needed).",
   pr: "In this worktree, take the branch to an open PR: commit any uncommitted changes (good conventional message), push to origin, then create a GitHub pull request with the gh CLI (concise title + summary) if one doesn't already exist. Give me the PR URL.",
-  merge: "In this worktree, take the branch all the way to merged: commit any uncommitted changes (good message), push to origin, create a GitHub PR with gh if none exists, then merge it into the repo's default branch with `gh pr merge --squash --delete-branch`. Report each step and confirm when it's merged.",
+  merge: "In this worktree, take the branch all the way to merged: commit any uncommitted changes (good message), push to origin, create a GitHub PR with gh if none exists, then merge it with `gh pr merge --squash` (NOT `--delete-branch`). IMPORTANT: this is a git worktree and the repo's default branch is checked out by another worktree, so do NOT try to switch this worktree to the default branch and do NOT use `--delete-branch` — it switches the checkout before deleting the remote branch, fails on the occupied default, and aborts, leaving the worktree stranded and the remote branch undeleted. After the merge succeeds, delete the remote branch yourself with `git push origin --delete <branch>` (a plain push that never touches the checkout), and leave this worktree on its current branch — staying on the merged branch is expected and correct. Report each step and confirm when it's merged.",
 };
 const STAGE_META: { key: Stage; icon: string; label: string }[] = [
   { key: "commit", icon: "commit", label: "Commit" },
@@ -3702,6 +4213,7 @@ function showModal(el: HTMLElement): void {
 /** Tear down the modal (DOM/state only). Reached via Back (popstate) or closeModal(). */
 function closeModalDom(): void {
   onDirs = null;
+  destroyModalSelects(); // drop Tom Select instances (and their document listeners) before the DOM goes
   $("#modal-root").innerHTML = "";
 }
 const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
@@ -3710,10 +4222,10 @@ const closeModal = (): void => dismissOverlay("modal"); // programmatic close �
 const DEFAULT_MODEL = "opus";
 const DEFAULT_AUTONOMY: AutonomyPolicy = "bypass";
 const AUTONOMY_PICKER = `<label>Autonomy<select id="ns-auto">
-  <option value="bypass" selected>Bypass — skip all permission prompts ⚠️</option>
-  <option value="mostly-autonomous">Mostly autonomous</option>
-  <option value="allowlist">Allowlist</option>
-  <option value="prompt-all">Prompt all</option>
+  <option value="bypass" data-icon="bolt" selected>Bypass — skip all permission prompts ⚠️</option>
+  <option value="mostly-autonomous" data-icon="auto_mode">Mostly autonomous</option>
+  <option value="allowlist" data-icon="playlist_add_check">Allowlist</option>
+  <option value="prompt-all" data-icon="front_hand">Prompt all</option>
 </select></label>`;
 /** The chosen autonomy from the open dialog's picker, or the default if it isn't present. */
 const selectedAutonomy = (): AutonomyPolicy =>
@@ -3723,7 +4235,7 @@ const selectedAutonomy = (): AutonomyPolicy =>
 function serverPickerMarkup(): string {
   const list = orderedServers();
   if (list.length <= 1) return "";
-  const opts = list.map((s) => `<option value="${esc(s.url)}">${esc(s.name)}</option>`).join("");
+  const opts = list.map((s) => `<option value="${esc(s.url)}" data-icon="dns">${esc(s.name)}</option>`).join("");
   return `<label>Server<div class="env-row"><select id="ns-server">${opts}</select></div></label>`;
 }
 /** Initialise browse.serverUrl (→ hub) and, if the picker is shown, re-list on change. Call before wireBrowser(). */
@@ -3737,6 +4249,7 @@ function wireServerPicker(): void {
     browse.path = "";
     browseServer().sock.send({ type: "dirs.list" }); // re-list from the newly-chosen server's root
   });
+  enhanceSelect(sel);
 }
 /** A reusable directory browser (used by add-environment and one-off). */
 function browserMarkup(): string {
@@ -3780,15 +4293,16 @@ function showNewSession(): void {
     // Group the environments by the server they live on (the chosen env determines the server the
     // session is created on). With a single server, render a flat list — no optgroup noise.
     const multi = orderedServers().length > 1;
-    const opt = (e: Environment): string => `<option value="${esc(e.id)}">${esc(e.name)}</option>`;
+    const opt = (e: Environment): string =>
+      `<option value="${esc(e.id)}" data-icon="${esc(envIcon(e))}" data-color="${esc(stripeColor(e, 0, currentTheme()))}">${esc(e.name)}</option>`;
     const opts = multi
       ? orderedServers()
           .map((srv) => {
-            const group = envs.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url);
+            const group = envs.filter((e) => (envServer.get(e.id) ?? HUB_URL) === srv.url).sort(byEnvName);
             return group.length ? `<optgroup label="${esc(srv.name)}">${group.map(opt).join("")}</optgroup>` : "";
           })
           .join("")
-      : envs.map(opt).join("");
+      : [...envs].sort(byEnvName).map(opt).join("");
     m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
       <label>Environment<div class="env-row"><select id="ns-env">${opts}</select></div></label>
       <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
@@ -3848,6 +4362,8 @@ function showNewSession(): void {
       createBtn.click();
     }
   });
+  enhanceSelect(envSel, true); // searchable — environment lists can grow long
+  enhanceSelect(document.getElementById("ns-auto") as HTMLSelectElement | null);
   nameInp?.focus();
   validate();
 
@@ -3862,14 +4378,16 @@ function showNewSession(): void {
       model: DEFAULT_MODEL,
       autonomy: selectedAutonomy(),
     };
+    const cid = newCid();
     const cmd = env.isRepo
-      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", ...common }
-      : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, ...common };
+      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", cid, ...common }
+      : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, cid, ...common };
     const srv = serverOfEnv(env.id); // the session is created on the env's server
     if (srv.sock.isOpen()) {
+      pendingCreateCid = cid; // jump into this session when its session.created lands (see onEvent)
       srv.sock.send(cmd);
     } else {
-      createOfflineSession(cmd, env, name, srv.url);
+      createOfflineSession(cmd, env, name, srv.url); // offline path selects the optimistic session itself
     }
     closeModal();
   });
@@ -3929,6 +4447,39 @@ function selectedSwatch(): string {
   return sel?.dataset.hex ?? "";
 }
 
+// ── Icon picker (environment icon) ───────────────────────────────────────────
+// A curated grid of Material Symbols so an environment can carry a glyph (shown in the env selector
+// and cards). "Auto" falls back to folder/account_tree by repo kind. Mirrors the swatch picker.
+const ENV_ICONS = [
+  "account_tree", "folder", "rocket_launch", "code", "terminal", "bug_report", "science", "smartphone",
+  "web", "dns", "cloud", "database", "api", "bolt", "build", "extension", "hub", "layers", "palette",
+  "dashboard", "robot_2", "smart_toy", "widgets", "memory", "lightbulb", "favorite", "star", "flag",
+  "bookmark", "work", "home", "school", "sports_esports", "music_note", "photo_camera", "savings", "public",
+];
+/** A grid of icon buttons plus an "auto" option; `selected` pre-selects one. */
+function iconPickerMarkup(selected?: string): string {
+  const norm = (selected ?? "").trim();
+  const auto = `<button type="button" class="iconpick iconpick-auto${norm ? "" : " selected"}" data-icon="" title="Auto — default by repo kind">${icon("hide_source")}</button>`;
+  const cells = ENV_ICONS.map(
+    (n) => `<button type="button" class="iconpick${n === norm ? " selected" : ""}" data-icon="${esc(n)}" title="${esc(n)}">${icon(n)}</button>`,
+  ).join("");
+  return `<label>Icon<div class="icon-row" id="icon-row">${auto}${cells}</div></label>`;
+}
+function wireIconPicker(): void {
+  const row = document.getElementById("icon-row");
+  if (!row) return;
+  row.querySelectorAll<HTMLElement>(".iconpick").forEach((b) =>
+    b.addEventListener("click", () => {
+      row.querySelectorAll(".iconpick").forEach((x) => x.classList.remove("selected"));
+      b.classList.add("selected");
+    }),
+  );
+}
+/** The picked Material Symbol name, or "" for auto. */
+function selectedIcon(): string {
+  return document.querySelector<HTMLElement>("#icon-row .iconpick.selected")?.dataset.icon ?? "";
+}
+
 /** Register a project repo as an environment — clone from a git URL, or pick a local repo. */
 function showAddEnvironment(): void {
   const m = document.createElement("div");
@@ -3940,6 +4491,7 @@ function showAddEnvironment(): void {
     <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
     <label>Default branch (optional)<input id="ae-base" placeholder="e.g. main or dev — leave blank for HEAD" /></label>
     ${swatchPickerMarkup()}
+    ${iconPickerMarkup()}
     <p class="small muted">Or pick an existing local <b>git repository</b>:</p>
     ${browserMarkup()}
     <div class="btns"><button type="button" id="ae-back">Cancel</button><button type="button" id="ae-save" class="primary">Add</button></div></div>`;
@@ -3947,12 +4499,14 @@ function showAddEnvironment(): void {
   wireServerPicker();
   wireBrowser();
   wireSwatchPicker();
+  wireIconPicker();
   $<HTMLButtonElement>("#ae-back").onclick = closeModal; // returns to Settings underneath
   $<HTMLButtonElement>("#ae-save").onclick = async () => {
     const url = $<HTMLInputElement>("#ae-url").value.trim();
     const name = $<HTMLInputElement>("#ae-name").value.trim();
     const defaultBase = $<HTMLInputElement>("#ae-base").value.trim();
     const color = selectedSwatch();
+    const iconName = selectedIcon();
     if (url) {
       const btn = $<HTMLButtonElement>("#ae-save");
       btn.disabled = true;
@@ -3960,7 +4514,7 @@ function showAddEnvironment(): void {
       try {
         const res = await sendAwait(
           browseServer(),
-          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), cid: newCid() },
+          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), ...(iconName ? { icon: iconName } : {}), cid: newCid() },
           120_000,
         );
         if (res.type === "command.error") {
@@ -3984,6 +4538,7 @@ function showAddEnvironment(): void {
       repoRoot: browse.path,
       ...(defaultBase ? { defaultBase } : {}),
       ...(color ? { color } : {}),
+      ...(iconName ? { icon: iconName } : {}),
     });
     closeModal(); // the environments broadcast refreshes Settings / the new-session list
   };
@@ -4000,6 +4555,7 @@ function showEditEnvironment(id: string): void {
     <label>Name<input id="ee-name" value="${esc(env.name)}" /></label>
     <label>Default branch<input id="ee-base" value="${esc(env.defaultBase ?? "")}" placeholder="e.g. main or dev — blank for HEAD" /></label>
     ${swatchPickerMarkup(env.color)}
+    ${iconPickerMarkup(env.icon)}
     <label>Todoist project
       <select id="ee-todoist">${projectOptions}</select>
     </label>
@@ -4008,6 +4564,8 @@ function showEditEnvironment(id: string): void {
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
   wireSwatchPicker();
+  wireIconPicker();
+  enhanceSelect(document.getElementById("ee-todoist") as HTMLSelectElement | null, true);
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
@@ -4027,6 +4585,7 @@ function showEditEnvironment(id: string): void {
       name: $<HTMLInputElement>("#ee-name").value,
       defaultBase: $<HTMLInputElement>("#ee-base").value,
       color: selectedSwatch(),
+      icon: selectedIcon(), // "" resets to the default by repo kind
       todoistProjectId: $<HTMLSelectElement>("#ee-todoist").value, // "" unlinks
       // validation gate omitted: autopilot doesn't auto-build/PR yet. Omitting the field preserves
       // any stored value (env.update only writes validation when it's present).
@@ -4061,6 +4620,7 @@ function showOneOff(): void {
   showModal(m);
   wireServerPicker();
   wireBrowser();
+  enhanceSelect(document.getElementById("ns-auto") as HTMLSelectElement | null);
   $<HTMLButtonElement>("#oo-back").onclick = () => showNewSession();
   $<HTMLButtonElement>("#oo-create").onclick = () => {
     if (!browse.path) return;
@@ -4081,6 +4641,7 @@ const permCards = new Map<string, HTMLElement>();
 
 function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[]): void {
   if (permCards.has(requestId)) return; // already shown (re-attach replay)
+  dropSessionHero(); // a request landed in a blank session — retire the title card
   hideThinking(); // the turn is parked on this decision, not working
   const card = document.createElement("div");
   card.className = "bubble permission";
@@ -4133,6 +4694,7 @@ const questionCards = new Map<string, HTMLElement>();
 
 function showQuestion(requestId: string, questions: Question[]): void {
   if (questionCards.has(requestId)) return; // already shown (re-attach replay)
+  dropSessionHero(); // a question landed in a blank session — retire the title card
   hideThinking(); // the turn is parked on the answer, not working
   const card = document.createElement("div");
   card.className = "bubble question";
@@ -4326,5 +4888,96 @@ function confirmDialog(opts: { title: string; body?: string; confirmLabel?: stri
     });
     // Focus a default button so Enter confirms; a destructive dialog defaults to the safe Cancel.
     (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+  });
+}
+
+/** Like confirmDialog, but with one extra checkbox toggle. Resolves { ok, checked }; cancelling
+ *  (button, Escape, Back, backdrop) resolves { ok:false } and the checkbox state is irrelevant. */
+function confirmDialogWithOption(opts: {
+  title: string;
+  body?: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  icon?: string;
+  optionLabel: string;
+  optionChecked?: boolean;
+}): Promise<{ ok: boolean; checked: boolean }> {
+  return new Promise((resolve) => {
+    const m = document.createElement("div");
+    m.className = "modal";
+    m.innerHTML = `<div class="modal-box">
+      <h3>${opts.icon ? icon(opts.icon) + " " : ""}${esc(opts.title)}</h3>
+      ${opts.body ? `<p class="small muted">${esc(opts.body)}</p>` : ""}
+      <label class="cd-option"><input type="checkbox" id="cd-option"${opts.optionChecked ? " checked" : ""}> ${esc(opts.optionLabel)}</label>
+      <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
+    </div>`;
+    showModal(m);
+    const checked = (): boolean => $<HTMLInputElement>("#cd-option").checked;
+    let settled = false;
+    const done = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok, checked: ok && checked() }); // resolve BEFORE teardown so the explicit choice wins
+      closeModal();
+    };
+    // Any other dismissal (Escape, device Back, backdrop tap) counts as Cancel and must resolve so the
+    // awaiting caller doesn't hang — mirror confirmDialog's overlay-close augmentation.
+    const top = overlays[overlays.length - 1];
+    if (top && top.name === "modal") {
+      const origClose = top.close;
+      top.close = () => {
+        origClose();
+        if (!settled) {
+          settled = true;
+          resolve({ ok: false, checked: false });
+        }
+      };
+    }
+    $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
+    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
+    m.addEventListener("click", (e) => {
+      if (e.target === m) done(false); // click backdrop to cancel
+    });
+    (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+  });
+}
+
+/** Pick one item from a list (link a plan to a session, reassign a plan's environment, …). Resolves the
+ *  chosen id, or null if cancelled (button, Escape, Back, backdrop). */
+function pickListDialog(title: string, items: { id: string; label: string; icon?: string }[], headIcon = "link"): Promise<string | null> {
+  return new Promise((resolve) => {
+    const m = document.createElement("div");
+    m.className = "modal";
+    m.innerHTML = `<div class="modal-box">
+      <h3>${icon(headIcon)} ${esc(title)}</h3>
+      <div class="pick-list">${items
+        .map((it) => `<button type="button" class="pick-item" data-id="${esc(it.id)}">${icon(it.icon ?? "terminal")} ${esc(it.label || it.id)}</button>`)
+        .join("")}</div>
+      <div class="btns"><button type="button" id="cd-cancel">Cancel</button></div>
+    </div>`;
+    showModal(m);
+    let settled = false;
+    const done = (v: string | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v); // resolve BEFORE teardown so the explicit choice wins over cancel-on-close
+      closeModal();
+    };
+    const top = overlays[overlays.length - 1];
+    if (top && top.name === "modal") {
+      const origClose = top.close;
+      top.close = () => {
+        origClose();
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      };
+    }
+    m.querySelectorAll<HTMLElement>(".pick-item").forEach((b) => (b.onclick = () => done(b.dataset.id!)));
+    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(null);
+    m.addEventListener("click", (e) => {
+      if (e.target === m) done(null); // click backdrop to cancel
+    });
   });
 }

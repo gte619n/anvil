@@ -26,7 +26,7 @@ export class EnvironmentStore {
   }
 
   /** @throws if `repoRoot` doesn't exist or isn't a git repo (environments are git repos). */
-  add(name: string, repoRoot: string, defaultBase?: string, color?: string): Environment {
+  add(name: string, repoRoot: string, defaultBase?: string, color?: string, icon?: string): Environment {
     if (!existsSync(repoRoot)) {
       throw new Error(`no such directory: ${repoRoot}`);
     }
@@ -40,6 +40,7 @@ export class EnvironmentStore {
       isRepo: existsSync(join(repoRoot, ".git")),
       defaultBase,
       ...(color?.trim() ? { color: color.trim() } : {}),
+      ...(icon?.trim() ? { icon: icon.trim() } : {}),
     };
     this.environments.push(env);
     this.save();
@@ -52,6 +53,7 @@ export class EnvironmentStore {
       name?: string;
       defaultBase?: string;
       color?: string;
+      icon?: string;
       todoistProjectId?: string | null;
       validation?: EnvironmentValidation | null;
     },
@@ -61,6 +63,7 @@ export class EnvironmentStore {
     if (fields.name !== undefined && fields.name.trim()) env.name = fields.name.trim();
     if (fields.defaultBase !== undefined) env.defaultBase = fields.defaultBase.trim() || undefined;
     if (fields.color !== undefined) env.color = fields.color.trim() || undefined;
+    if (fields.icon !== undefined) env.icon = fields.icon.trim() || undefined;
     // null explicitly clears the link/gate; undefined leaves it untouched.
     if (fields.todoistProjectId !== undefined)
       env.todoistProjectId = fields.todoistProjectId?.trim() || undefined;

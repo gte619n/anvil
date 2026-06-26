@@ -106,6 +106,7 @@ export interface Environment {
   isRepo: boolean; // git repo → fresh worktree per session; otherwise work in the folder directly
   defaultBase?: string; // branch/commit to branch worktrees from (default "HEAD")
   color?: string; // base color (hex, e.g. "#335999") for env/session tinting; absent → hue hashed from name
+  icon?: string; // Material Symbols name (e.g. "rocket_launch") shown in selectors/cards; absent → folder/account_tree by repo kind
   todoistProjectId?: string; // linked Todoist project; its active tasks feed the nightly planner
   validation?: EnvironmentValidation; // gate a WorkUnit must pass before reaching anvil:review
 }
@@ -257,6 +258,7 @@ export interface FileContent {
   text?: string; // populated for other text files (may be truncated — see below)
   truncated?: boolean; // text was capped (large file); fetch more via fs.read range
   binaryUrl?: string; // REST URL for images/binaries
+  choices?: string[]; // a prose-named file (e.g. "design.md") matched 2+ paths — the client picks one and re-reads
 }
 
 export interface DirEntry {
@@ -348,6 +350,10 @@ export interface ServerHelloEvent extends Envelope {
   serverName: string; // display name, default: hostname
   version: string; // anvild version
   protocolVersion: ProtocolVersion;
+  // Coarse feature flags this build supports (e.g. "autopilot"). Lets a newer client skip commands a
+  // member is too old to handle instead of getting `unknown command type` back. Absent on pre-capability
+  // builds → the client treats every capability as unsupported for that server (graceful degradation).
+  capabilities?: string[];
 }
 /** A Todoist project, trimmed to what the link UI / planner needs. */
 export interface TodoistProjectInfo {
@@ -372,6 +378,21 @@ export interface TodoistProjectsResultEvent extends Envelope {
   projects: TodoistProjectInfo[];
 }
 
+/** Model-provider auth. Only "claude" is functional today (the Agent SDK is Claude-only); the field
+ *  exists so the Settings → Models UI and the daemon can grow Gemini/ChatGPT entries without a
+ *  protocol change. The full secret is never sent to clients — only `masked` + the connected flag. */
+export type AuthProvider = "claude";
+/** Connection state for a model provider's credential — answer to `auth.status`/`auth.set`/`auth.clear`
+ *  (carries cid) and broadcast (no cid) when it changes. */
+export interface AuthStatusEvent extends Envelope {
+  type: "auth.status";
+  cid?: Cid;
+  provider: AuthProvider;
+  connected: boolean; // a token is present in the daemon's environment (agents can run)
+  persisted: boolean; // the token is written to the launcher's env file → survives a service restart
+  masked?: string; // e.g. "sk-ant-…lt4f2" — enough to recognise, never the full secret
+}
+
 // ── Autopilot (task-autopilot plan review UI; see anvil-autopilot-ui.md) ──────────────
 /** Rough size estimate the planner emits for a work unit; surfaced on the Autopilot card. */
 export type AutopilotSize = "xs" | "s" | "m" | "l" | "xl";
@@ -381,7 +402,7 @@ export interface AutopilotEffort {
 }
 /** The anvil autopilot's status, mirrored from the `anvil:*` Todoist labels. Kept in lockstep with
  *  STATUSES in src/integrations/status.ts (the server is the source of truth). */
-export type AnvilStatus = "planned" | "building" | "review" | "blocked" | "dismissed";
+export type AnvilStatus = "planned" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
 /** A pending (or just-started) autopilot work unit, shaped for the Autopilot card grid + reader. */
 export interface AutopilotPlanInfo {
   id: string; // WorkUnit id
@@ -392,6 +413,7 @@ export interface AutopilotPlanInfo {
   rationale?: string;
   summary?: string; // 1–2 line description for the card
   status: AnvilStatus;
+  source?: "project" | "label"; // "label" = pulled in account-wide by the Autopilot label (catch-all env)
   effort?: AutopilotEffort;
   taskCount: number; // Todoist tasks bundled into the unit
   plan?: RenderedMarkdown; // full implementation plan (source + sanitized HTML) for the reader
@@ -432,6 +454,16 @@ export interface AutopilotRunResultEvent extends Envelope {
   skipped: number; // tasks already in the pipeline
   output: string; // human-readable log (or the error message when ok=false)
 }
+/** Result of an autopilot maintenance command (`autopilot.tags.reset` / `autopilot.clear`). "reset"
+ *  strips anvil:* status labels (keeping the user's Autopilot sourcing label) so tasks re-enter the
+ *  candidate pool; "clear" additionally wipes the whole pending pipeline. Carries cid. */
+export interface AutopilotMaintenanceResultEvent extends Envelope {
+  type: "autopilot.maintenance.result";
+  cid?: Cid;
+  op: "reset" | "clear";
+  tasksCleared: number; // Todoist tasks that had an anvil:* label removed
+  unitsRemoved: number; // local work units dropped from the pipeline
+}
 /** The daemon's autopilot schedule (in-daemon timer; anvil-autopilot-ui.md → Scheduling). Times are
  *  server-local. A run plans the linked projects and, when `autoStart`, launches up to `maxAutoStart`
  *  of the new units (skipped if the subscription budget is warning). */
@@ -442,6 +474,10 @@ export interface AutopilotSchedule {
   autoStart: boolean; // after planning, also start worktree sessions for the new units
   maxAutoStart?: number; // cap how many sessions a single run may auto-start (default 3)
   lastRunAt?: Iso8601; // server-set: when the scheduler last fired (read-only to clients)
+  // ── Account-wide label sourcing (autopilot-wide settings, carried on the same config object) ──
+  label?: string; // a Todoist label (default "Autopilot"): tasks carrying it are pulled in from ANY
+  // project, bundled against `defaultEnvironmentId`, and left for review (never auto-started).
+  defaultEnvironmentId?: string; // catch-all environment label-sourced tasks are planned/built against
 }
 /** The current schedule — answer to `autopilot.schedule.get`/`.set` (cid) and broadcast on change. */
 export interface AutopilotScheduleEvent extends Envelope {
@@ -627,11 +663,13 @@ export type ServerEvent =
   | EnvironmentsEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
+  | AuthStatusEvent
   | AutopilotPlansEvent
   | AutopilotPlanResultEvent
   | AutopilotStartedEvent
   | AutopilotRunProgressEvent
   | AutopilotRunResultEvent
+  | AutopilotMaintenanceResultEvent
   | AutopilotScheduleEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
@@ -806,6 +844,7 @@ export interface EnvAddCmd extends Envelope, Correlated {
   repoRoot: string; // must be a git repo
   defaultBase?: string;
   color?: string; // base color (hex) for tinting
+  icon?: string; // Material Symbols name
 }
 export interface EnvCloneCmd extends Envelope, Correlated {
   type: "env.clone";
@@ -813,6 +852,7 @@ export interface EnvCloneCmd extends Envelope, Correlated {
   name?: string; // display name; defaults to the repo name from the URL
   defaultBase?: string;
   color?: string; // base color (hex) for tinting
+  icon?: string; // Material Symbols name
 }
 export interface EnvUpdateCmd extends Envelope, Correlated {
   type: "env.update";
@@ -820,6 +860,7 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
   name?: string;
   defaultBase?: string; // "" clears it (back to HEAD)
   color?: string; // base color (hex); "" clears it (back to hashed hue)
+  icon?: string; // Material Symbols name; "" clears it (back to the default by repo kind)
   todoistProjectId?: string; // link to a Todoist project; "" unlinks
   validation?: EnvironmentValidation | null; // null clears the validation gate
 }
@@ -850,6 +891,23 @@ export interface TodoistProjectsListCmd extends Envelope, Correlated {
   type: "todoist.projects.list"; // fetch the account's projects (live from the API)
 }
 
+// Model-provider auth (Settings → Models). Set/reset the daemon's Claude subscription OAuth token from
+// the UI without SSHing in to edit the launcher env. The token is persisted to the launcher's env file
+// (survives a service restart) and applied live to the next agent run. `provider` defaults to "claude".
+export interface AuthStatusCmd extends Envelope, Correlated {
+  type: "auth.status"; // request the current credential state → auth.status
+  provider?: AuthProvider;
+}
+export interface AuthSetCmd extends Envelope, Correlated {
+  type: "auth.set"; // set/replace the provider's token (rejected if it looks like a metered API key) → auth.status
+  provider?: AuthProvider;
+  token: string;
+}
+export interface AuthClearCmd extends Envelope, Correlated {
+  type: "auth.clear"; // remove the provider's token from the daemon + env file → auth.status
+  provider?: AuthProvider;
+}
+
 // Autopilot plan review (anvil-autopilot-ui.md). These drive the Autopilot section: list/refine/
 // dismiss pending plans, launch one into a worktree session, or re-plan the linked projects.
 export interface AutopilotPlansListCmd extends Envelope, Correlated {
@@ -870,9 +928,31 @@ export interface AutopilotStartCmd extends Envelope, Correlated {
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "bypass" (auto-start working without permission stalls)
 }
+export interface AutopilotResolveCmd extends Envelope, Correlated {
+  type: "autopilot.resolve"; // mark a plan completed/expired (drops the card); optionally close its Todoist tasks
+  workUnitId: string;
+  status: "completed" | "expired";
+  closeTodoist: boolean; // also close the member tasks in Todoist (not just relabel them)
+}
+export interface AutopilotLinkCmd extends Envelope, Correlated {
+  type: "autopilot.link"; // attach a plan to an existing session already doing the work → autopilot.started
+  workUnitId: string;
+  sessionId: string; // an active session in the plan's environment
+}
+export interface AutopilotReassignCmd extends Envelope, Correlated {
+  type: "autopilot.reassign"; // move a plan to a different environment and re-evaluate it there → autopilot.plan
+  workUnitId: string;
+  environmentId: string; // the environment (repo) to re-plan the unit's tasks against
+}
 export interface AutopilotRunCmd extends Envelope, Correlated {
   type: "autopilot.run"; // re-plan linked Todoist projects on this server → autopilot.run.result
   environmentId?: string; // limit to one environment; omitted = every linked environment
+}
+export interface AutopilotTagsResetCmd extends Envelope, Correlated {
+  type: "autopilot.tags.reset"; // strip anvil:* labels (keep the Autopilot sourcing label) so tasks re-plan → autopilot.maintenance.result
+}
+export interface AutopilotClearCmd extends Envelope, Correlated {
+  type: "autopilot.clear"; // wipe the whole pending pipeline AND strip anvil:* labels → autopilot.maintenance.result
 }
 export interface AutopilotScheduleGetCmd extends Envelope, Correlated {
   type: "autopilot.schedule.get"; // current schedule → autopilot.schedule
@@ -884,6 +964,8 @@ export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   days?: number[];
   autoStart?: boolean;
   maxAutoStart?: number;
+  label?: string; // "" clears it (disables label sourcing)
+  defaultEnvironmentId?: string; // "" clears it
 }
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
@@ -965,11 +1047,19 @@ export type ClientCommand =
   | TodoistDisconnectCmd
   | TodoistPropagateCmd
   | TodoistProjectsListCmd
+  | AuthStatusCmd
+  | AuthSetCmd
+  | AuthClearCmd
   | AutopilotPlansListCmd
   | AutopilotRefineCmd
   | AutopilotDismissCmd
   | AutopilotStartCmd
+  | AutopilotResolveCmd
+  | AutopilotLinkCmd
+  | AutopilotReassignCmd
   | AutopilotRunCmd
+  | AutopilotTagsResetCmd
+  | AutopilotClearCmd
   | AutopilotScheduleGetCmd
   | AutopilotScheduleSetCmd
   | DaemonUpdateCmd

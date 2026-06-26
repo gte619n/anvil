@@ -1,7 +1,11 @@
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { basename, join, resolve, sep } from "node:path";
 import type { DirEntry, FileContent } from "@protocol";
 import type { MarkdownRenderer } from "../render/markdown";
+
+/** Thrown when a requested path can't be located in the worktree — translated to a clean
+ *  client error (not "internal error") by the supervisor. */
+export class FileNotFound extends Error {}
 
 /**
  * Confine `userPath` to the session worktree `root` (arch §8.1). Resolves symlinks so a
@@ -15,6 +19,53 @@ export function resolveInside(root: string, userPath: string): string {
     throw new Error("path escapes the session tree");
   }
   return real;
+}
+
+/** Recursively collect files matching `name` (basename), worktree-relative. Bounded so a stray
+ *  click can't walk a huge tree: skips .git/node_modules, caps depth and hit count. */
+function findByBasename(root: string, name: string, limit = 50, maxDepth = 8): { rel: string }[] {
+  const out: { rel: string }[] = [];
+  const walk = (dir: string, rel: string, depth: number): void => {
+    if (out.length >= limit || depth > maxDepth) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const d of entries) {
+      if (SKIP.has(d.name)) continue;
+      const childRel = rel ? `${rel}/${d.name}` : d.name;
+      if (d.isDirectory()) walk(join(dir, d.name), childRel, depth + 1);
+      else if (d.name === name) out.push({ rel: childRel });
+      if (out.length >= limit) return;
+    }
+  };
+  walk(root, "", 0);
+  return out;
+}
+
+/** Either a single resolved file (`abs`) or, when a bare basename matched 2+ paths, the ambiguous
+ *  candidates for the client to pick from (worktree-relative, sorted). */
+export type Located = { kind: "file"; abs: string } | { kind: "choices"; paths: string[] };
+
+/**
+ * Resolve `userPath` to a real file inside the worktree, with a forgiving fallback: Claude often
+ * names a markdown file by basename in prose (`design.md`) while it actually lives in a subdir
+ * (`docs/plans/design.md`). When the literal path doesn't exist, search the worktree for a basename
+ * match. If the user typed a path (with a `/`), narrow to matches ending in that suffix. A single
+ * match resolves to a file; 2+ become `choices` for the client to disambiguate; none throws FileNotFound.
+ */
+export function locateInside(root: string, userPath: string): Located {
+  const direct = resolveInside(root, userPath);
+  if (existsSync(direct)) return { kind: "file", abs: direct };
+  const suffix = userPath.replace(/^\.?\/+/, "");
+  const all = findByBasename(root, basename(suffix));
+  // A typed-out path narrows by suffix; a bare basename keeps every match (and may be ambiguous).
+  const matches = suffix.includes("/") ? all.filter((m) => m.rel === suffix || m.rel.endsWith(`/${suffix}`)) : all;
+  if (matches.length === 0) throw new FileNotFound(`Couldn't find ${userPath} in this session.`);
+  if (matches.length === 1) return { kind: "file", abs: resolveInside(root, matches[0].rel) }; // re-check boundary
+  return { kind: "choices", paths: matches.map((m) => m.rel).sort() };
 }
 
 const MIME: Record<string, string> = {
@@ -75,7 +126,9 @@ export function readFile(
   renderer: MarkdownRenderer,
   binaryUrlFor: (relPath: string) => string,
 ): FileContent {
-  const file = resolveInside(root, userPath);
+  const located = locateInside(root, userPath);
+  if (located.kind === "choices") return { path: userPath, rev: "", mime: "", choices: located.paths };
+  const file = located.abs;
   const st = statSync(file);
   const rev = `${st.mtimeMs}:${st.size}`;
   const mime = mimeFor(userPath);
