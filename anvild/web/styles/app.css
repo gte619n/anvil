@@ -737,14 +737,25 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-chip.eff-m { color: #f2c037; }
 .ap-chip.eff-l, .ap-chip.eff-xl { color: #e8703a; }
 
-/* Plan reader + refine chat */
-.plan-reader { display: flex; flex-direction: column; height: 100%; }
+/* Plan reader + refine chat. The plan reads full-width; the refine conversation is a slide-over drawer
+   (Option A), so `position: relative` anchors that drawer and `overflow: hidden` clips it off-screen
+   when closed (the body owns the vertical scroll, so this never clips the document). */
+.plan-reader { display: flex; flex-direction: column; height: 100%; position: relative; overflow: hidden; }
 .plan-reader-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .plan-reader-title { font-weight: 700; font-size: 15px; flex: 1; min-width: 140px; }
-.plan-reader-actions { display: inline-flex; align-items: center; gap: 8px; }
-.plan-reader-body { display: grid; grid-template-columns: 1fr 320px; gap: 18px; align-items: start; }
-.plan-doc { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 16px 20px; max-height: calc(100vh - 200px); overflow: auto; }
+.plan-reader-actions { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.plan-reader-body { flex: 1; min-height: 0; overflow: auto; }
+.plan-doc { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 16px 20px; max-width: 980px; margin: 0 auto; }
 .plan-refine { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px; position: sticky; top: 0; }
+/* Refine drawer: slides in over the plan's right edge; dismissible via a close button or the backdrop. */
+.plan-refine-drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 380px; max-width: 92%; margin: 0; border: none; border-left: 1px solid var(--border); border-radius: 0; box-shadow: -6px 0 22px rgba(0, 0, 0, 0.18); display: flex; flex-direction: column; transform: translateX(100%); transition: transform 0.2s ease; z-index: 8; }
+.plan-refine-drawer.open { transform: translateX(0); }
+.plan-refine-head { display: flex; align-items: center; gap: 8px; }
+.plan-refine-head h4 { margin: 0; flex: 1; }
+.plan-refine-drawer .plan-refine-log { flex: 1; max-height: none; }
+.plan-refine-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.18); z-index: 7; }
+.plan-refine-backdrop[hidden] { display: none; }
+.autopilot-view .mini[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .plan-refine h4 { margin: 0 0 4px; display: flex; align-items: center; gap: 6px; font-size: 14px; }
 .plan-refine h4 .msym { font-size: 18px; color: var(--accent); }
 .plan-refine-log { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; max-height: 40vh; overflow: auto; }
@@ -820,10 +831,8 @@ input:focus, select:focus, textarea:not(#input):focus {
 @media (max-width: 700px) {
   /* on narrow screens the sidebar overlays the conversation instead of squishing it */
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
-  /* the plan reader stacks: full-width doc, refine chat below it */
-  .plan-reader-body { grid-template-columns: 1fr; }
-  .plan-doc { max-height: none; }
-  .plan-refine { position: static; }
+  /* the refine drawer goes full-screen on a phone (the plan doc already reads full-width) */
+  .plan-refine-drawer { width: 100%; max-width: 100%; }
   /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
   .resizer { display: none; }
 }

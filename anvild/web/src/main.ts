@@ -899,6 +899,17 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
     // The autopilot probes are sent from the server.hello handler instead — hello is the first frame
     // after open and carries the server's capabilities, so we only probe servers that support autopilot.
   }
+  if (status === "disconnected") {
+    // A disconnected server can't be mid-run from our point of view, so clear any stale `running` it
+    // left behind. Without this the autopilot spinner latches on forever when a daemon drops mid-run
+    // before its `running: false` broadcast lands — e.g. a forced exit skips the run's finally. The
+    // schedule itself is kept for display; on reconnect the server re-asserts its true running state.
+    const entry = serverSchedule.get(url);
+    if (entry?.running) {
+      serverSchedule.set(url, { ...entry, running: false });
+      reflectAutopilotRunning();
+    }
+  }
   if (pendingRestartReload && url === HUB_URL) {
     if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
     else if (status === "connected") {
@@ -2773,6 +2784,7 @@ function openPlan(id: string): void {
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
       <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
       <span class="plan-reader-actions">
+        <button class="mini" id="plan-refine-toggle" aria-pressed="false">${icon("auto_awesome")} Refine</button>
         <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
@@ -2783,21 +2795,40 @@ function openPlan(id: string): void {
     </div>
     <div class="plan-reader-body">
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
-      <aside class="plan-refine">
-        <h4>${icon("auto_awesome")} Refine with Claude</h4>
-        <p class="small muted">Suggest a change; Claude rewrites the plan and saves it back to Todoist.</p>
-        <div id="plan-refine-log" class="plan-refine-log"></div>
-        <form id="plan-refine-form" class="plan-refine-form">
-          <textarea id="plan-refine-input" rows="2" placeholder="e.g. also cover the offline case, and keep the existing API"></textarea>
-          <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
-        </form>
-      </aside>
     </div>
+    <div class="plan-refine-backdrop" id="plan-refine-backdrop" hidden></div>
+    <aside class="plan-refine plan-refine-drawer" id="plan-refine" aria-hidden="true">
+      <div class="plan-refine-head">
+        <h4>${icon("auto_awesome")} Refine with Claude</h4>
+        <button class="icon-btn" id="plan-refine-close" title="Close">${icon("close")}</button>
+      </div>
+      <p class="small muted">Suggest a change; Claude rewrites the plan and saves it back to Todoist.</p>
+      <div id="plan-refine-log" class="plan-refine-log"></div>
+      <form id="plan-refine-form" class="plan-refine-form">
+        <textarea id="plan-refine-input" rows="2" placeholder="e.g. also cover the offline case, and keep the existing API"></textarea>
+        <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
+      </form>
+    </aside>
   </div>`;
   // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
   // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
   // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
   openOverlay("plan", () => renderAutopilotGrid());
+  // The refine conversation is a dismissible side drawer (Option A): the plan reads full-width and the
+  // chat slides in over the right edge on demand, so investigating a plan never squeezes the document.
+  const refineDrawer = $("#plan-refine");
+  const refineBackdrop = $("#plan-refine-backdrop");
+  const refineToggle = $("#plan-refine-toggle");
+  const setRefineOpen = (open: boolean): void => {
+    refineDrawer.classList.toggle("open", open);
+    refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
+    refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
+    refineBackdrop.hidden = !open;
+    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus();
+  };
+  refineToggle.addEventListener("click", () => setRefineOpen(!refineDrawer.classList.contains("open")));
+  $("#plan-refine-close").addEventListener("click", () => setRefineOpen(false));
+  refineBackdrop.addEventListener("click", () => setRefineOpen(false));
   $("#plan-back").addEventListener("click", () => backToGrid());
   $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
   $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
