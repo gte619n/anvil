@@ -483,11 +483,8 @@ function saveConvoCache(): void {
 }
 
 // Resolve the theme before the first render so JS-computed session tints use the right band.
-(function initTheme() {
-  const stored = localStorage.getItem("anvil.theme");
-  const theme = stored ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  document.documentElement.dataset.theme = theme;
-})();
+// (themePref/resolveTheme are hoisted function declarations, defined in the Theme section below.)
+document.documentElement.dataset.theme = resolveTheme(themePref());
 
 // instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
 // fully offline; the daemon refreshes everything once the WS connects).
@@ -504,29 +501,43 @@ if (activeId) {
   renderEmptyState();
 }
 
-// ── Theme (system default + persisted toggle) ────────────────────────────────
+// ── Theme (light / dark / system, chosen in Settings → Appearance) ────────────
+type ThemePref = "light" | "dark" | "system";
+/** The user's stored preference; absence (or anything unexpected) means "follow the OS". */
+function themePref(): ThemePref {
+  const s = localStorage.getItem("anvil.theme");
+  return s === "light" || s === "dark" ? s : "system";
+}
+/** The concrete theme currently painted on <html>. */
 function currentTheme(): "light" | "dark" {
   return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
 }
-function applyThemeIcon(): void {
-  $("#theme-toggle").innerHTML = icon(currentTheme() === "dark" ? "light_mode" : "dark_mode");
+/** Resolve a preference to a concrete theme, consulting the OS for "system". */
+function resolveTheme(pref: ThemePref): "light" | "dark" {
+  if (pref === "system") return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return pref;
 }
-applyThemeIcon(); // data-theme is resolved earlier, before the first render
-$("#theme-toggle").addEventListener("click", () => {
-  const next = currentTheme() === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem("anvil.theme", next);
-  applyThemeIcon();
-  renderSessions(); // re-clamp session tints for the new theme
-  applyActiveTint();
-});
-// Follow the OS theme live when the user hasn't pinned a preference.
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-  if (localStorage.getItem("anvil.theme")) return; // a manual choice wins
-  document.documentElement.dataset.theme = e.matches ? "dark" : "light";
-  applyThemeIcon();
+/** Paint the resolved theme and re-clamp session tints to the new band. */
+function applyTheme(): void {
+  document.documentElement.dataset.theme = resolveTheme(themePref());
   renderSessions();
   applyActiveTint();
+}
+/** Persist a new preference ("system" clears the key), repaint, and reflect it in any open Settings UI. */
+function setThemePref(pref: ThemePref): void {
+  if (pref === "system") localStorage.removeItem("anvil.theme");
+  else localStorage.setItem("anvil.theme", pref);
+  applyTheme();
+  updateThemeControls();
+}
+/** Mark the active swatch in Settings → Appearance (no-op when Settings isn't open). */
+function updateThemeControls(): void {
+  const pref = themePref();
+  document.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) => b.classList.toggle("active", b.dataset.themePref === pref));
+}
+// Follow the OS theme live while the preference is "system".
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (themePref() === "system") applyTheme();
 });
 
 // ── Sidebar collapse ─────────────────────────────────────────────────────────────
@@ -1904,17 +1915,7 @@ function renderSessionItem(s: Session): HTMLLIElement {
   });
   li.append(a);
   if (s.isDefault) {
-    // The concierge is pinned; its row carries the "+" that opens the new-session flow.
-    const add = document.createElement("button");
-    add.className = "row-btn new-session";
-    add.title = "New session";
-    add.innerHTML = icon("add");
-    add.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      showNewSession();
-    });
-    li.append(add);
+    // The concierge is pinned; the new-session "+" lives in the sidebar header (see #new-session-top).
   } else if (!removing) {
     const open = document.createElement("button");
     open.className = "row-btn open-tab";
@@ -2077,7 +2078,7 @@ function onEnvironments(url: string, list: Environment[]): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "todoist" | "models";
+type SettingsTab = "servers" | "environments" | "todoist" | "models" | "appearance";
 let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
@@ -2091,6 +2092,7 @@ function openSettings(): void {
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
       <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
+      <button class="stab" data-tab="appearance">${icon("palette")} Appearance</button>
     </div>
     <div class="settings-body">
       <section class="settings-panel" data-tab="environments">
@@ -2111,11 +2113,24 @@ function openSettings(): void {
         <p class="small muted">The model provider Anvil drives. Set or reset the Claude subscription token here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
       </section>
+      <section class="settings-panel" data-tab="appearance">
+        <div class="section-head"><h3>Appearance</h3></div>
+        <p class="small muted">Choose how Anvil looks. <b>System</b> follows your device's light or dark setting.</p>
+        <div class="theme-options">
+          <button type="button" class="theme-opt" data-theme-pref="light">${icon("light_mode")} Light</button>
+          <button type="button" class="theme-opt" data-theme-pref="dark">${icon("dark_mode")} Dark</button>
+          <button type="button" class="theme-opt" data-theme-pref="system">${icon("brightness_auto")} System</button>
+        </div>
+      </section>
     </div>
   </div>`;
   $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
   $("#todoist-refresh").addEventListener("click", () => loadTodoistProjects(true));
+  root.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) =>
+    b.addEventListener("click", () => setThemePref(b.dataset.themePref as ThemePref)),
+  );
+  updateThemeControls();
   root.querySelectorAll<HTMLElement>(".stab").forEach((t) =>
     t.addEventListener("click", () => selectSettingsTab(t.dataset.tab as SettingsTab)),
   );
@@ -4276,6 +4291,7 @@ const browseServer = (): Server => servers.get(browse.serverUrl) ?? hub();
 initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
 $("#open-autopilot").addEventListener("click", openAutopilot);
+$("#new-session-top").addEventListener("click", () => showNewSession());
 
 /** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so
  *  Back/Cancel dismisses it. Swapping one modal's contents for another reuses the same layer. */
