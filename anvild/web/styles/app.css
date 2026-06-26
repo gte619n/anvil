@@ -687,6 +687,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 
 /* ── Autopilot (plan review & launch) ──────────────────────────────────────────── */
 .foot-badge { margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+/* Live "autopilot is running" spinner in the sidebar foot — visible on every client while a run is in flight, even with the Autopilot view closed. margin-left:auto pushes it (and any badge after it) to the right. */
+.foot-spin { margin-left: auto; font-size: 18px; color: var(--accent); }
+.foot-spin + .foot-badge { margin-left: 6px; }
 .autopilot-view { position: fixed; inset: 0; z-index: 50; background: var(--panel); display: flex; flex-direction: column; }
 .ap-head-actions { display: inline-flex; align-items: center; gap: 10px; }
 .autopilot-view .primary { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }

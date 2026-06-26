@@ -22,6 +22,7 @@ import {
   type AutopilotStartedEvent,
   type AutopilotSchedule,
   type AutopilotScheduleEvent,
+  type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
   type AuthStatusEvent,
   type GitCmd,
@@ -120,6 +121,7 @@ export class Supervisor {
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
   private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
+  private autopilotRunLog: string[] = []; // the live run's progress lines, retained so a connecting/refreshed client can replay them
   private scheduleTimer?: ReturnType<typeof setInterval>;
   private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
@@ -642,7 +644,6 @@ export class Supervisor {
     notify?: boolean;
     autoStart?: boolean;
     maxAutoStart?: number;
-    onProgress?: (line: string) => void;
   }): Promise<{ created: number; skipped: number; started: number; output: string }> {
     if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
     const state = this.integrations.todoist();
@@ -658,12 +659,16 @@ export class Supervisor {
     const labelPass = !opts.environmentId && !!schedule.label && !!defaultEnv;
     if (envs.length === 0 && !labelPass) throw new BadCommand("no environments are linked to a Todoist project");
     const deps = { client, workUnits: this.workUnits };
-    const log: string[] = [];
+    this.autopilotRunLog = [];
     const emit = (line: string): void => {
-      log.push(line);
-      opts.onProgress?.(line);
+      this.autopilotRunLog.push(line);
+      this.broadcastRunProgress(line); // every client, live — not just the one that triggered the run
     };
+    // Each unit broadcasts the refreshed plan list the moment it's persisted, so every client's grid
+    // climbs in real time (12 → 13 → …) instead of only filling in when the whole run finishes.
+    const onUnitCreated = (): void => this.broadcastAutopilotPlans();
     this.autopilotRunning = true;
+    this.broadcastSchedule(); // tell every client a run just started (running: true)
     const createdUnits: WorkUnit[] = [];
     let skipped = 0;
     let started = 0;
@@ -676,6 +681,7 @@ export class Supervisor {
           repoRoot: env.repoRoot,
           repoName: env.name,
           onProgress: emit,
+          onUnitCreated,
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
@@ -696,6 +702,7 @@ export class Supervisor {
           repoName: defaultEnv.name,
           tasks: external,
           onProgress: emit,
+          onUnitCreated,
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
@@ -723,6 +730,7 @@ export class Supervisor {
       }
     } finally {
       this.autopilotRunning = false;
+      this.broadcastSchedule(); // run finished (or errored) — tell every client (running: false)
     }
     const created = createdUnits.length;
     this.broadcastAutopilotPlans();
@@ -734,7 +742,7 @@ export class Supervisor {
       void this.webpush.notify(payload);
       void this.fcm.notify(payload);
     }
-    return { created, skipped, started, output: log.join("\n") };
+    return { created, skipped, started, output: this.autopilotRunLog.join("\n") };
   }
 
   // ── Autopilot schedule (in-daemon timer) ──────────────────────────────────────────
@@ -748,10 +756,28 @@ export class Supervisor {
       ...(cid ? { cid } : {}),
       schedule,
       ...(next ? { nextRunAt: next.toISOString() } : {}),
+      running: this.autopilotRunning,
     };
   }
   private broadcastSchedule(): void {
     this.registry.toAll(this.autopilotScheduleEvent());
+  }
+  /** Stream one run-progress line to every connected client (live, regardless of who started the run —
+   *  or whether it was the scheduler). Centralized here so manual and scheduled runs behave the same. */
+  private broadcastRunProgress(line: string): void {
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "autopilot.run.progress", ts: now(), line });
+  }
+  /** The live run's accumulated progress, for replay to a client that connects/refreshes mid-run so it
+   *  restores the running view instead of blanking. `log` is empty when no run is in flight. */
+  autopilotRunSnapshotEvent(cid?: string): AutopilotRunSnapshotEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "autopilot.run.snapshot",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      running: this.autopilotRunning,
+      log: this.autopilotRunning ? [...this.autopilotRunLog] : [],
+    };
   }
   setAutopilotSchedule(patch: Partial<Omit<AutopilotSchedule, "lastRunAt">>, cid?: string): AutopilotScheduleEvent {
     this.autopilotSchedule.set(patch);

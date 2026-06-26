@@ -153,6 +153,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
+      const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state
+      ws.send(JSON.stringify(sched));
+      if (sched.running) ws.send(JSON.stringify(supervisor.autopilotRunSnapshotEvent())); // replay the in-flight run's log
+
       // The session list above is the persisted (possibly stale) snapshot; reconcile every session's
       // PR/merge badge in the background so a PR merged on GitHub / another device shows up in the
       // sidebar without the user opening each session. Throttled + coalesced inside the supervisor.

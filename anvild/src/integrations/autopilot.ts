@@ -242,6 +242,7 @@ export async function planAndTagProject(
     bundleModel?: Model;
     planModel?: Model;
     onProgress?: (msg: string) => void;
+    onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
   const log = opts.onProgress ?? (() => {});
@@ -275,6 +276,7 @@ export async function planAndTagProject(
       else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
     }
     created.push(wu);
+    opts.onUnitCreated?.(wu);
   }
   log(`Created ${created.length} planned work units.`);
   return { created, skipped };
@@ -296,6 +298,7 @@ export async function planAndTagTasks(
     bundleModel?: Model;
     planModel?: Model;
     onProgress?: (msg: string) => void;
+    onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
   const log = opts.onProgress ?? (() => {});
@@ -328,6 +331,7 @@ export async function planAndTagTasks(
       else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
     }
     created.push(wu);
+    opts.onUnitCreated?.(wu);
   }
   log(`Created ${created.length} planned work units from the Autopilot label.`);
   return { created, skipped };

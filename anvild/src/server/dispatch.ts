@@ -331,10 +331,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "autopilot.run":
         deps.supervisor
+          // Progress + plan-grid updates broadcast to every client from inside the supervisor (so manual
+          // and scheduled runs behave identically); only the final result returns to the caller (cid).
           .runAutopilot({
             environmentId: cmd.environmentId,
             notify: false, // interactive run — the open screen updates live; push is for scheduled runs
-            onProgress: (line) => deps.registry.toAll({ v: PROTOCOL_VERSION, type: "autopilot.run.progress", ts: now(), line }),
           })
           .then((r) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: true, created: r.created, skipped: r.skipped, output: r.output }))
           .catch((e) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: false, created: 0, skipped: 0, output: errMsg(e) }));

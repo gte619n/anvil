@@ -1049,8 +1049,11 @@ function onEvent(url: string, e: ServerEvent): void {
     case "autopilot.run.progress":
       onAutopilotProgress(e.line);
       return;
+    case "autopilot.run.snapshot":
+      onAutopilotRunSnapshot(e.log);
+      return;
     case "autopilot.schedule":
-      onAutopilotSchedule(url, e.schedule, e.nextRunAt);
+      onAutopilotSchedule(url, e.schedule, e.nextRunAt, e.running);
       return;
     case "dirs.list.result":
       onDirs?.(e);
@@ -2477,7 +2480,23 @@ let openPlanId: string | null = null; // the plan open in the reader, if any (el
 const SIZE_LABEL: Record<string, string> = { xs: "XS", s: "S", m: "M", l: "L", xl: "XL" };
 const DAY_LABEL = ["S", "M", "T", "W", "T", "F", "S"]; // Sun..Sat, for the schedule day toggles
 // Each server's autopilot schedule (the UI control targets the hub; the daemon supports per-server).
-const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string }>();
+// `running` is the server-authoritative live run state, broadcast on start/finish + sent on connect.
+const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string; running: boolean }>();
+
+/** Is an autopilot run in flight anywhere? True if any server reports it, OR this client started one. */
+function anyServerRunning(): boolean {
+  if (runState.running) return true;
+  for (const s of serverSchedule.values()) if (s.running) return true;
+  return false;
+}
+
+/** Reflect the live run state everywhere it shows: the always-present sidebar spinner (visible even
+ *  with the Autopilot view closed) and, when the view is open, the in-view status banner. */
+function reflectAutopilotRunning(): void {
+  const spin = document.getElementById("autopilot-running");
+  if (spin) (spin as HTMLElement).hidden = !anyServerRunning();
+  renderRunStatus();
+}
 
 /** Every server's pending plans, hub first, in the sidebar/grouping order. */
 function allPlans(): AutopilotPlanInfo[] {
@@ -2537,6 +2556,21 @@ function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
     renderAutopilotGrid();
   }
 }
+/** Restore the in-flight run's log on (re)connect. The schedule event already set `running`; this
+ *  refills the log panel + banner so refreshing mid-run no longer blanks the live view. Only sent by
+ *  the server while a run is actually in flight. */
+function onAutopilotRunSnapshot(log: string[]): void {
+  autopilotLog.length = 0;
+  autopilotLog.push(...log);
+  runState.lastLine = log[log.length - 1] ?? "";
+  const el = document.getElementById("autopilot-log");
+  if (el) {
+    el.hidden = false;
+    el.textContent = autopilotLog.join("\n");
+    el.scrollTop = el.scrollHeight;
+  }
+  reflectAutopilotRunning();
+}
 function onAutopilotProgress(line: string): void {
   autopilotLog.push(line);
   runState.lastLine = line;
@@ -2546,7 +2580,7 @@ function onAutopilotProgress(line: string): void {
     log.textContent = autopilotLog.join("\n");
     log.scrollTop = log.scrollHeight;
   }
-  renderRunStatus();
+  reflectAutopilotRunning();
 }
 
 // Live status of the current/last "Run autopilot", surfaced as a banner above the log so the run is
@@ -2562,17 +2596,23 @@ const runState: RunState = { running: false, serversTotal: 0, lastLine: "", resu
 function renderRunStatus(): void {
   const host = document.getElementById("autopilot-status");
   if (!host) return;
-  if (!runState.running && runState.results.length === 0) {
+  const running = anyServerRunning();
+  if (!running && runState.results.length === 0) {
     host.hidden = true;
     host.innerHTML = "";
     return;
   }
   host.hidden = false;
   const createdTotal = runState.results.reduce((n, r) => n + r.created, 0);
-  const head = runState.running
-    ? `<span class="ap-status-head"><span class="msym spin">progress_activity</span> Evaluating ${runState.serversTotal} project source${runState.serversTotal === 1 ? "" : "s"}…</span>`
+  // "Evaluating N sources" only when THIS client drove the run (it knows the target count); a run
+  // observed from another device just shows a generic "running" head (its progress still streams in).
+  const runningHead = runState.running && runState.serversTotal
+    ? `Evaluating ${runState.serversTotal} project source${runState.serversTotal === 1 ? "" : "s"}…`
+    : "Autopilot is running…";
+  const head = running
+    ? `<span class="ap-status-head"><span class="msym spin">progress_activity</span> ${runningHead}</span>`
     : `<span class="ap-status-head">${icon("check_circle")} ${createdTotal ? `${createdTotal} new plan${createdTotal === 1 ? "" : "s"}` : "No new plans"}</span>`;
-  const live = runState.running && runState.lastLine
+  const live = running && runState.lastLine
     ? `<div class="ap-status-line">${esc(runState.lastLine)}</div>`
     : "";
   const rows = runState.results
@@ -3002,7 +3042,7 @@ async function runAutopilot(): Promise<void> {
   runState.serversTotal = targets.length;
   runState.lastLine = "";
   runState.results = [];
-  renderRunStatus();
+  reflectAutopilotRunning();
   onAutopilotProgress("Running autopilot…");
   const btn = $<HTMLButtonElement>("#autopilot-run");
   btn.disabled = true;
@@ -3031,7 +3071,7 @@ async function runAutopilot(): Promise<void> {
     toast(created ? `${created} new plan${created === 1 ? "" : "s"}` : "No new plans");
   } finally {
     runState.running = false;
-    renderRunStatus();
+    reflectAutopilotRunning();
     btn.disabled = false;
     btn.innerHTML = `${icon("play_arrow")} Run autopilot`;
   }
@@ -3040,8 +3080,9 @@ async function runAutopilot(): Promise<void> {
 // ── Scheduled run (in-daemon timer; the control targets the hub) ────────────────────
 // Surfaced in two places — the Autopilot view's bar and a card in Settings → Todoist — so changes
 // made in either (or pushed from another device) refresh both.
-function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string): void {
-  serverSchedule.set(url, { schedule, nextRunAt });
+function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string, running = false): void {
+  serverSchedule.set(url, { schedule, nextRunAt, running });
+  reflectAutopilotRunning(); // a run on ANY server (incl. one started from another device) shows here
   if (url !== HUB_URL) return;
   if (document.getElementById("autopilot-schedule")) renderScheduleBar();
   if (document.getElementById("todoist-panel")) renderTodoistPanel();
