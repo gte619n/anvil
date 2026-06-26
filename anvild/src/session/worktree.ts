@@ -149,12 +149,32 @@ export function carryPrBadge(prev: GitStatus | undefined, next: GitStatus): PrBa
   return prBadgeFor(prev.prState, prev.prUrl, next.branch, next.dirtyFileCount);
 }
 
+/**
+ * True for a `git status --porcelain` line that is an untracked `node_modules` entry — the symlink
+ * linkDeps injects into every worktree (and never user work). We can't rely on the target repo's
+ * `.gitignore` to hide it: a dir-only `node_modules/` pattern (trailing slash) matches a directory
+ * but NOT the symlink git sees, so such repos report the link as untracked and the worktree looks
+ * perpetually dirty. That phantom file inflates the "changed" count, keeps the commit/push/merge
+ * buttons live, and (via prBadgeFor) hides the "merged" badge. Drop it here so dirtyFileCount tracks
+ * only real changes regardless of the repo's ignore conventions. (Anvil's own .gitignore uses the
+ * slash-less form; this makes every other managed repo behave the same way without editing theirs.)
+ */
+function isLinkedNodeModules(porcelainLine: string): boolean {
+  const m = porcelainLine.match(/^\?\? (.+)$/); // `??` = untracked
+  if (!m) return false;
+  const path = m[1]!.replace(/^"|"$/g, "").replace(/\/$/, ""); // unquote + drop any trailing slash
+  return path === "node_modules" || path.endsWith("/node_modules");
+}
+
 /** Best-effort git state for the worktree panel (arch §8); undefined if `cwd` isn't a repo. */
 export function gitStatus(cwd: string): GitStatus | undefined {
   const branch = git(["branch", "--show-current"], cwd);
   if (branch.code !== 0) return undefined;
 
-  const dirty = git(["status", "--porcelain"], cwd).stdout.split("\n").filter((l) => l.trim().length > 0);
+  const dirty = git(["status", "--porcelain"], cwd).stdout
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .filter((l) => !isLinkedNodeModules(l));
 
   let ahead = 0;
   let behind = 0;

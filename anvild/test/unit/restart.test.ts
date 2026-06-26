@@ -58,7 +58,9 @@ test("restore: a malformed session entry is quarantined; the good one still load
 
   const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry()); // must NOT throw
   expect(sup2.get(good.id)).toBeDefined();
-  expect(sup2.list().length).toBe(1); // poison row skipped
+  // Only the good session loads (poison row quarantined); the default concierge chat is always
+  // present, so count the non-default sessions.
+  expect(sup2.list().filter((s) => !s.isDefault).length).toBe(1);
   rmSync(dir, { recursive: true, force: true });
 });
 

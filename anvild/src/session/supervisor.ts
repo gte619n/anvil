@@ -1405,7 +1405,20 @@ export class Supervisor {
     this.logs.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
-    void this.teardownSession(id, s);
+    this.trackTeardown(this.teardownSession(id, s));
+  }
+
+  /** In-flight background teardowns, so `settle()` (shutdown/tests) can await their completion. */
+  private readonly teardowns = new Set<Promise<void>>();
+  private trackTeardown(p: Promise<void>): void {
+    this.teardowns.add(p);
+    void p.finally(() => this.teardowns.delete(p));
+  }
+
+  /** Await every in-flight background teardown — for deterministic shutdown and tests. The reap is
+   *  best-effort (teardownSession swallows its own errors), so this never rejects. */
+  async settle(): Promise<void> {
+    await Promise.allSettled([...this.teardowns]);
   }
 
   /** Best-effort background reap of a killed session's agent, terminal, worktree, branch + state. */
@@ -1434,6 +1447,7 @@ export class Supervisor {
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
     for (const id of [...this.terminals.keys()]) this.killTerminal(id);
+    await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
   }
 

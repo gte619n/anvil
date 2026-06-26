@@ -71,6 +71,40 @@ test("createWorktree symlinks the canonical node_modules into the worktree (root
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
+test("gitStatus ignores the linked node_modules even when .gitignore uses a dir-only pattern", () => {
+  // The classic merge-indicator bug: a managed repo whose .gitignore uses `node_modules/` (trailing
+  // slash → directories only) doesn't match the *symlink* linkDeps creates, so git reports it as
+  // untracked. Without filtering, dirtyFileCount > 0 keeps the git buttons live and hides the merged
+  // badge. gitStatus must read a clean tree regardless of the repo's ignore style.
+  const repo = makeRepo();
+  const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
+
+  mkdirSync(join(repo, "node_modules"));
+  writeFileSync(join(repo, "node_modules", "marker"), "root-deps\n");
+  mkdirSync(join(repo, "web"));
+  writeFileSync(join(repo, "web", "keep.txt"), "x\n"); // tracked → web/ exists in the worktree
+  mkdirSync(join(repo, "web", "node_modules"));
+  writeFileSync(join(repo, "web", "node_modules", "marker"), "web-deps\n");
+  writeFileSync(join(repo, ".gitignore"), "node_modules/\n"); // dir-only — does NOT match the symlink
+  git(["add", ".gitignore", "web/keep.txt"], repo);
+  git(["commit", "-q", "-m", "add gitignore + web"], repo);
+
+  const created = createWorktree(repo, "HEAD", "ignore-task", wtRoot, "sess_ignore1");
+
+  // The worktree has node_modules symlinks at root + web/, yet the tree reads clean.
+  expect(lstatSync(join(created.cwd, "node_modules")).isSymbolicLink()).toBe(true);
+  expect(lstatSync(join(created.cwd, "web", "node_modules")).isSymbolicLink()).toBe(true);
+  expect(gitStatus(created.cwd)?.dirtyFileCount).toBe(0);
+
+  // A real edit still counts — we only drop the node_modules links, not actual work.
+  writeFileSync(join(created.cwd, "README.md"), "changed\n");
+  expect(gitStatus(created.cwd)?.dirtyFileCount).toBe(1);
+
+  removeWorktree(repo, created.cwd);
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(wtRoot, { recursive: true, force: true });
+});
+
 test("createWorktree is fine when the repo has no deps to link", () => {
   const repo = makeRepo(); // no node_modules anywhere
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
