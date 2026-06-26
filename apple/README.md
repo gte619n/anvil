@@ -71,8 +71,22 @@ open Anvil.xcodeproj
 Push setup (see `docs/plans/anvil-ios-ipados-clients.md`): register App ID `com.gte619n.anvil`
 with the Push Notifications capability, create a token-based APNs key (`.p8`), and drop it at
 `~/.config/anvil/apns-key.json` (`{ keyId, teamId, bundleId, key, production }`) on the daemon
-host. Flip `aps-environment` in `Resources/Anvil-iOS.entitlements` (and `production` in the key
-file) to `production` for TestFlight builds.
+host. Release builds use `Resources/Anvil-iOS-Release.entitlements` (production APNs); the default
+`Anvil-iOS.entitlements` stays `development` for local Xcode device debugging.
+
+## Signed TestFlight builds — `make-ios.sh`
+
+`make-ios.sh` archives, exports, and uploads to TestFlight using automatic signing driven by an
+App Store Connect API key (so xcodebuild manages the provisioning profile). It needs full Xcode and
+the signing env from `scripts/mac-signing/provision.sh`:
+
+```sh
+source ~/.config/oxos-signing/env.sh   # APPLE_TEAM_ID + APPLE_API_* (after ./provision.sh)
+cd apple && ./make-ios.sh              # rebundle web → archive → export → upload
+```
+
+CI does the same on a macOS runner via `.github/workflows/ios-release.yml` (manual trigger). All
+certs/keys live in Google Secret Manager; see `scripts/mac-signing/SETUP.md` §5.
 
 ## Roadmap
 
