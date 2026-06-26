@@ -78,7 +78,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .conn-dot.connected { background: #21ba45; }
 .conn-dot.connecting { background: #f2c037; animation: think-pulse 1.4s infinite ease-in-out; }
 .conn-dot.disconnected { background: var(--danger); }
-#theme-toggle { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; }
+#new-session-top { color: var(--accent); }
 /* Concierge row: pinned at the top, never scrolls or reorders. */
 #concierge-list { list-style: none; margin: 0; padding: 0; flex-shrink: 0; }
 #session-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; min-height: 60px; }
@@ -92,8 +92,6 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #finished-list { min-height: 6px; border-radius: 8px; max-height: 34vh; overflow-y: auto; }
 #finished-list.drag-over { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 #finished-list:empty::after { content: "Drop finished sessions here"; display: block; color: var(--muted); font-size: 11px; font-style: italic; text-align: center; padding: 12px 8px; margin-top: 2px; border: 1px dashed var(--border); border-radius: 8px; }
-/* + button that opens the new-session flow, sitting on the pinned concierge row. */
-.session .new-session { color: var(--accent); }
 /* Drag-to-reorder (SortableJS): rows aren't text-selectable so an Android long-press lifts the row
    instead of triggering copy/paste selection. */
 .session { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
@@ -130,6 +128,12 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .settings-section { margin-bottom: 28px; }
 .settings-section h3 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
 .section-head { display: flex; align-items: center; justify-content: space-between; }
+/* Settings → Appearance: light / dark / system theme swatches. */
+.theme-options { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.theme-opt { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; font-size: 13px; }
+.theme-opt .msym { font-size: 18px; }
+.theme-opt:hover { border-color: var(--accent); }
+.theme-opt.active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--bg)); }
 .card { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px 16px; margin-bottom: 10px; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
