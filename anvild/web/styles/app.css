@@ -50,6 +50,11 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "liga";
 }
+/* `.msym { display: inline-block }` outranks the UA `[hidden] { display: none }`, so ANY icon with the
+ * `hidden` attribute would otherwise stay visible — that's why the autopilot spinner (#autopilot-running)
+ * spun forever no matter the run state. Re-hide every hidden icon here so this can't recur per-element
+ * (cf. the one-off #send[hidden] / .ap-run-status[hidden] patches elsewhere). */
+.msym[hidden] { display: none !important; }
 
 #app { display: flex; height: 100vh; height: 100dvh; }
 
