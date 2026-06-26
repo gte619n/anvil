@@ -236,6 +236,11 @@ function removeServer(url: string): void {
   for (const [eid, u] of [...envServer]) if (u === url) { envServer.delete(eid); environments.delete(eid); }
   serverPlans.delete(url);
   for (const [pid, u] of [...planServer]) if (u === url) planServer.delete(pid);
+  // Drop the removed server's autopilot state too, else a lingering `running: true` keeps the fleet-wide
+  // spinner spinning for a server that no longer exists (and the user's "remove it" never clears it).
+  clearStaleRunTimer(url);
+  serverSchedule.delete(url);
+  reflectAutopilotRunning();
   updateAutopilotBadge();
   saveExtraServers([...servers.keys()].filter((u) => u !== HUB_URL));
   persistSessions();
@@ -904,6 +909,7 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
     // left behind. Without this the autopilot spinner latches on forever when a daemon drops mid-run
     // before its `running: false` broadcast lands — e.g. a forced exit skips the run's finally. The
     // schedule itself is kept for display; on reconnect the server re-asserts its true running state.
+    clearStaleRunTimer(url); // a gone server can't go stale-running; tidy its backstop
     const entry = serverSchedule.get(url);
     if (entry?.running) {
       serverSchedule.set(url, { ...entry, running: false });
@@ -2509,6 +2515,36 @@ const DAY_LABEL = ["S", "M", "T", "W", "T", "F", "S"]; // Sun..Sat, for the sche
 // `running` is the server-authoritative live run state, broadcast on start/finish + sent on connect.
 const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string; running: boolean }>();
 
+// Client-side backstop against a server that reports `running: true` and never takes it back — an old
+// daemon with a latched flag, or one that died without a clean `running: false`. A healthy current
+// daemon caps its own run (30 min) and broadcasts false well before this fires, so this only bites a
+// stuck/old server: if no clearing event arrives within the budget, we drop that server's run locally
+// so the fleet-wide spinner can't be pinned on forever by one misbehaving member.
+const STALE_RUN_MS = 35 * 60_000;
+const staleRunTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function clearStaleRunTimer(url: string): void {
+  const t = staleRunTimers.get(url);
+  if (t !== undefined) {
+    clearTimeout(t);
+    staleRunTimers.delete(url);
+  }
+}
+/** Arm (or re-arm) the stale-run backstop for a server now reporting a live run. */
+function armStaleRunTimer(url: string): void {
+  clearStaleRunTimer(url);
+  staleRunTimers.set(
+    url,
+    setTimeout(() => {
+      staleRunTimers.delete(url);
+      const entry = serverSchedule.get(url);
+      if (entry?.running) {
+        serverSchedule.set(url, { ...entry, running: false });
+        reflectAutopilotRunning();
+      }
+    }, STALE_RUN_MS),
+  );
+}
+
 /** Is an autopilot run in flight anywhere? True if any server reports it, OR this client started one. */
 function anyServerRunning(): boolean {
   if (runState.running) return true;
@@ -3128,6 +3164,10 @@ async function runAutopilot(): Promise<void> {
 // made in either (or pushed from another device) refresh both.
 function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string, running = false): void {
   serverSchedule.set(url, { schedule, nextRunAt, running });
+  // Arm the backstop while this server says it's running; disarm the moment it reports done, so a normal
+  // run never trips it and only a server that never sends `false` ages out.
+  if (running) armStaleRunTimer(url);
+  else clearStaleRunTimer(url);
   reflectAutopilotRunning(); // a run on ANY server (incl. one started from another device) shows here
   if (url !== HUB_URL) return;
   if (document.getElementById("autopilot-schedule")) renderScheduleBar();
