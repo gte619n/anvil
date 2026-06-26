@@ -3933,7 +3933,10 @@ function popOutReader(path: string): void {
     `<!doctype html><html lang="en" data-theme="${esc(theme)}"><head><meta charset="utf-8" />` +
       `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
       `<title>${esc(title)}</title>${styles}` +
-      `<style>body{margin:0;background:var(--bg);color:var(--text)}` +
+      // The shared app stylesheets pin html/body to height:100%;overflow:hidden so the in-app
+      // shell never scrolls — but in this standalone window that traps the content and kills the
+      // scrollbar. Reset both back to a normal, scrollable document.
+      `<style>html,body{margin:0;height:auto;overflow:auto;background:var(--bg);color:var(--text)}` +
       `.popout-wrap{max-width:880px;margin:0 auto;padding:28px clamp(16px,4vw,40px)}` +
       `.popout-head{font:600 12px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-bottom:16px;word-break:break-all}</style>` +
       `</head><body><div class="popout-wrap"><div class="popout-head">${esc(path)}</div>${clone.innerHTML}</div></body></html>`,
