@@ -74,6 +74,12 @@ export class BadCommand extends Error {}
  *  so this can never collide with an ordinary session. */
 export const DEFAULT_SESSION_ID = "sess_default";
 
+/** Hard ceiling on a single autopilot run. A run awaits unbounded planning/Todoist work; if any of it
+ *  hangs the run never finishes, so `autopilotRunning` (and the live spinner on every client) latches
+ *  open. The watchdog aborts the in-flight work and forces the flag down once a run outlives this. A
+ *  full multi-env run plans several units with Opus, so keep it generous. */
+const AUTOPILOT_RUN_TIMEOUT_MS = 20 * 60_000;
+
 export interface SupervisorConfig {
   stateDir: string;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
@@ -648,7 +654,10 @@ export class Supervisor {
     if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
     const state = this.integrations.todoist();
     if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
-    const client = new TodoistClient(state.accessToken);
+    // Run-level abort: the watchdog (below) fires it on timeout so every in-flight Todoist/SDK call
+    // unwinds instead of hanging the run open. Threaded into the client and the planning calls.
+    const ac = new AbortController();
+    const client = new TodoistClient(state.accessToken, ac.signal);
     const envs = this.envStore
       .list()
       .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
@@ -669,6 +678,19 @@ export class Supervisor {
     const onUnitCreated = (): void => this.broadcastAutopilotPlans();
     this.autopilotRunning = true;
     this.broadcastSchedule(); // tell every client a run just started (running: true)
+    // Watchdog: a run that hangs (a Todoist socket or planning subprocess with no natural end) must
+    // never latch `autopilotRunning` true — the daemon stays alive, so it would re-assert `running`
+    // to every client on connect and the spinner would spin forever. On timeout, abort the in-flight
+    // work AND force the flag down + rebroadcast, so the spinner clears even if a call ignores abort.
+    // (The client clears a *disconnected* server's stale flag; this covers the alive-but-hung case.)
+    const watchdog = setTimeout(() => {
+      if (!this.autopilotRunning) return;
+      emit("⚠ Autopilot run exceeded its time budget — ending it. Check the daemon log if this recurs.");
+      ac.abort();
+      this.autopilotRunning = false;
+      this.broadcastSchedule();
+    }, AUTOPILOT_RUN_TIMEOUT_MS);
+    watchdog.unref?.(); // a pending watchdog must never keep the daemon alive on its own
     const createdUnits: WorkUnit[] = [];
     let skipped = 0;
     let started = 0;
@@ -680,6 +702,7 @@ export class Supervisor {
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
           repoName: env.name,
+          signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
         });
@@ -701,6 +724,7 @@ export class Supervisor {
           repoRoot: defaultEnv.repoRoot,
           repoName: defaultEnv.name,
           tasks: external,
+          signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
         });
@@ -729,6 +753,7 @@ export class Supervisor {
         }
       }
     } finally {
+      clearTimeout(watchdog);
       this.autopilotRunning = false;
       this.broadcastSchedule(); // run finished (or errored) — tell every client (running: false)
     }
