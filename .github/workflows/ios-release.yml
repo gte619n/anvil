@@ -25,6 +25,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Runners default xcode-select at the CLT; point it at the full Xcode (with the iOS SDK).
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:

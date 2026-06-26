@@ -40,7 +40,10 @@ done
 die() { echo "✗ $*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 require xcodegen; require xcodebuild; require bun
-xcode-select -p 2>/dev/null | grep -q "Xcode.app" || die "full Xcode.app required (xcode-select -p points at the CLT). Install Xcode and: sudo xcode-select -s /Applications/Xcode.app"
+# Need a full Xcode (with the iOS SDK), not just the Command Line Tools. Check the SDK directly
+# rather than grepping the xcode-select path (CI runners point xcode-select at versioned Xcode dirs).
+xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1 \
+  || die "iOS SDK not found — need full Xcode.app (xcode-select -p = $(xcode-select -p)). Select it: sudo xcode-select -s /Applications/Xcode.app"
 
 : "${APPLE_TEAM_ID:?set APPLE_TEAM_ID (source ~/.config/oxos-signing/env.sh after provision.sh)}"
 : "${APPLE_API_KEY:?set APPLE_API_KEY (App Store Connect Key ID)}"
