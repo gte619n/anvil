@@ -66,6 +66,20 @@ function runAdb(args: string[]): { ok: boolean; output: string } {
   return { ok: false, output: "adb not found on the server (install Android platform-tools)" };
 }
 
+/**
+ * Cache-Control for a served web asset. The mutable app shell — index.html, main.js, app.css, sw.js,
+ * manifest, vendored css — lives at STABLE, unhashed URLs, so it MUST revalidate on every load: with
+ * no directive the browser heuristically caches it and a new deploy is invisible (the daemon serves
+ * fresh bytes but the browser keeps the old main.js across git pull / restart / hard refresh — and,
+ * because the service worker's fetch reads through the HTTP cache, the stale bundle is sticky). Only
+ * Bun's content-hashed split chunks and binary font/image assets are safe to cache hard.
+ */
+export function webCacheControl(rel: string): string {
+  if (/(^|\/)chunk-[A-Za-z0-9]+\.js$/.test(rel)) return "public, max-age=31536000, immutable";
+  if (/\.(woff2?|ttf|otf|svg|png|ico)$/.test(rel)) return "public, max-age=604800";
+  return "no-cache"; // revalidate every load — never serve a stale app shell
+}
+
 /** Serve a file from the built web client; `/` → index.html. Returns null if not found. */
 async function serveWeb(pathname: string): Promise<Response | null> {
   const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
@@ -73,10 +87,9 @@ async function serveWeb(pathname: string): Promise<Response | null> {
   if (!filePath.startsWith(WEB_DIR)) return null; // path-traversal guard
   const file = Bun.file(filePath);
   if (!(await file.exists())) return null;
-  const isHtml = filePath.endsWith(".html");
-  return new Response(file, {
-    headers: isHtml ? { "Content-Security-Policy": CSP, "Cache-Control": "no-cache" } : undefined,
-  });
+  const headers: Record<string, string> = { "Cache-Control": webCacheControl(rel) };
+  if (filePath.endsWith(".html")) headers["Content-Security-Policy"] = CSP;
+  return new Response(file, { headers });
 }
 
 export interface ServerHandle {
