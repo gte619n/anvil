@@ -57,7 +57,7 @@ import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { readStatus, withStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
-import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
+import { AutopilotScheduleStore, isRunDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -74,11 +74,11 @@ export class BadCommand extends Error {}
  *  so this can never collide with an ordinary session. */
 export const DEFAULT_SESSION_ID = "sess_default";
 
-/** Hard ceiling on a single autopilot run. A run awaits unbounded planning/Todoist work; if any of it
- *  hangs the run never finishes, so `autopilotRunning` (and the live spinner on every client) latches
- *  open. The watchdog aborts the in-flight work and forces the flag down once a run outlives this. A
- *  full multi-env run plans several units with Opus, so keep it generous. */
-const AUTOPILOT_RUN_TIMEOUT_MS = 20 * 60_000;
+/** Hard ceiling on a single autopilot run, and the budget the DERIVED `running` state uses: a run older
+ *  than this reports `running: false` to every client no matter what, so a hung run (an await that never
+ *  settles, a skipped finally) can't latch the live spinner. A full multi-env run plans several units
+ *  with Opus, so keep it generous enough to never cut off legitimate work. */
+const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -126,7 +126,19 @@ export class Supervisor {
   private readonly integrations: IntegrationStore;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
-  private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
+  // The live run is tracked by a START TIMESTAMP, not a boolean — `running` is DERIVED from it (below),
+  // so it physically cannot latch: once a run outlives AUTOPILOT_RUN_TIMEOUT_MS, every reader (schedule
+  // event, connect handshake, the re-run guard) sees `running: false` automatically, even if the run's
+  // cleanup never fires (a hung await, a skipped finally). A monotonically-increasing token disambiguates
+  // overlapping runs so a slow run's late cleanup can't clear a newer run's state. undefined = idle.
+  private autopilotRunStartedAt: number | undefined;
+  private autopilotRunToken = 0;
+  /** Derived live-run state: a run is "running" only while its start is within the time budget. This is
+   *  the single source of truth broadcast to clients; being time-bounded is what makes the spinner
+   *  un-latchable. */
+  private get autopilotRunning(): boolean {
+    return runWithinBudget(this.autopilotRunStartedAt, Date.now(), AUTOPILOT_RUN_TIMEOUT_MS);
+  }
   private autopilotRunLog: string[] = []; // the live run's progress lines, retained so a connecting/refreshed client can replay them
   private scheduleTimer?: ReturnType<typeof setInterval>;
   private prSweepTimer?: ReturnType<typeof setInterval>;
@@ -676,18 +688,18 @@ export class Supervisor {
     // Each unit broadcasts the refreshed plan list the moment it's persisted, so every client's grid
     // climbs in real time (12 → 13 → …) instead of only filling in when the whole run finishes.
     const onUnitCreated = (): void => this.broadcastAutopilotPlans();
-    this.autopilotRunning = true;
+    const token = ++this.autopilotRunToken;
+    this.autopilotRunStartedAt = Date.now();
     this.broadcastSchedule(); // tell every client a run just started (running: true)
-    // Watchdog: a run that hangs (a Todoist socket or planning subprocess with no natural end) must
-    // never latch `autopilotRunning` true — the daemon stays alive, so it would re-assert `running`
-    // to every client on connect and the spinner would spin forever. On timeout, abort the in-flight
-    // work AND force the flag down + rebroadcast, so the spinner clears even if a call ignores abort.
-    // (The client clears a *disconnected* server's stale flag; this covers the alive-but-hung case.)
+    // Watchdog: clients only re-render `running` when they RECEIVE a schedule event, so once the derived
+    // state flips to false (run outlived its budget) we proactively abort the hung work and broadcast it,
+    // rather than waiting for the next connect. The derived getter already guarantees correctness; this
+    // just makes the spinner clear promptly and frees the in-flight subprocess/socket.
     const watchdog = setTimeout(() => {
-      if (!this.autopilotRunning) return;
+      if (this.autopilotRunToken !== token) return; // a newer run already owns the state
       emit("⚠ Autopilot run exceeded its time budget — ending it. Check the daemon log if this recurs.");
       ac.abort();
-      this.autopilotRunning = false;
+      this.autopilotRunStartedAt = undefined;
       this.broadcastSchedule();
     }, AUTOPILOT_RUN_TIMEOUT_MS);
     watchdog.unref?.(); // a pending watchdog must never keep the daemon alive on its own
@@ -754,7 +766,9 @@ export class Supervisor {
       }
     } finally {
       clearTimeout(watchdog);
-      this.autopilotRunning = false;
+      // Only clear if THIS run still owns the state — a watchdog-timed-out run that's been superseded by
+      // a newer run must not wipe the newer run's start timestamp when its own late cleanup finally runs.
+      if (this.autopilotRunToken === token) this.autopilotRunStartedAt = undefined;
       this.broadcastSchedule(); // run finished (or errored) — tell every client (running: false)
     }
     const created = createdUnits.length;

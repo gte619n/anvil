@@ -10,6 +10,7 @@ import {
   lastScheduledFire,
   nextScheduledFire,
   parseTimeOfDay,
+  runWithinBudget,
 } from "../../src/integrations/schedule";
 
 const sched = (over: Partial<AutopilotSchedule> = {}): AutopilotSchedule => ({ ...DEFAULT_SCHEDULE, enabled: true, timeOfDay: "02:00", ...over });
@@ -91,4 +92,16 @@ test("store round-trips, merges patches, ignores lastRunAt in set, and clamps th
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The live-run spinner is DERIVED from this, not a stored boolean — that's what makes it un-latchable.
+
+test("runWithinBudget treats an over-budget run as not-running (the un-latchable spinner)", () => {
+  const budget = 30 * 60_000; // 30 min
+  const t0 = 1_000_000_000_000;
+  expect(runWithinBudget(undefined, t0, budget)).toBe(false); // idle
+  expect(runWithinBudget(t0, t0, budget)).toBe(true); // just started
+  expect(runWithinBudget(t0, t0 + budget - 1, budget)).toBe(true); // within budget
+  expect(runWithinBudget(t0, t0 + budget, budget)).toBe(false); // at the ceiling → reported done
+  expect(runWithinBudget(t0, t0 + budget + 60_000, budget)).toBe(false); // a hung run never latches
 });
