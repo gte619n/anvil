@@ -3,7 +3,7 @@
 // cache whose key != CACHE, so a new version forces existing browsers to purge the old app-shell bundle
 // (the daemon now also serves the shell `no-cache`, but this guarantees a one-time purge of anything a
 // prior build cached under the old key). v2: flush bundles cached before the no-cache header fix.
-const CACHE = "anvil-shell-v3";
+const CACHE = "anvil-shell-v4";
 const CORE = ["/", "/index.html", "/main.js", "/app.css", "/xterm.css", "/katex/katex.min.css", "/anvil.svg", "/manifest.json"];
 
 self.addEventListener("install", (event) => {
