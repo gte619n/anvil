@@ -77,8 +77,10 @@ targets:
         # 1 = iPhone, 2 = iPad → one universal binary covers iPhone, iPad, and iPad Mini.
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Signing is set per-developer in Xcode (needs the Apple Developer Program for push).
+        # Automatic signing; xcodebuild/Xcode resolve the provisioning profile from the team +
+        # the App Store Connect API key (make-ios.sh passes -allowProvisioningUpdates).
         CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 5WX3DS8SZQ
     entitlements:
       path: Resources/Anvil-iOS.entitlements
       properties:
