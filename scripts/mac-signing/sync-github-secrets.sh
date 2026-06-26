@@ -19,7 +19,8 @@ check_gcloud_auth
 REPO_FLAG=()
 [ $# -gt 0 ] && REPO_FLAG=(--repo "$1")
 
-set_secret() { gh secret set "$1" "${REPO_FLAG[@]}" --body "$2" >/dev/null && echo "  ✓ $1"; }
+# ${arr[@]+…} guards the expansion so an empty array doesn't trip `set -u` on bash 3.2 (macOS default).
+set_secret() { gh secret set "$1" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} --body "$2" >/dev/null && echo "  ✓ $1"; }
 
 echo "▸ mirroring Secret Manager → GitHub Actions secrets…"
 

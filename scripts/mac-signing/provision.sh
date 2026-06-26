@@ -36,7 +36,7 @@ TEAM_ID=""; secret_exists "$SECRET_TEAM_ID" && TEAM_ID="$(secret_get "$SECRET_TE
 # Per-machine random keychain password; never leaves this Mac.
 KC_PASS="$(security find-generic-password -s oxos-signing-kc -w 2>/dev/null || true)"
 if [ -z "$KC_PASS" ]; then
-  KC_PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)"
+  KC_PASS="$(openssl rand -hex 32)"   # pipe-free (tr|head SIGPIPEs under set -o pipefail)
   security add-generic-password -s oxos-signing-kc -a "$USER" -w "$KC_PASS" 2>/dev/null || true
 fi
 
@@ -57,6 +57,22 @@ security import "$tmp/cert.p12" -k "$KEYCHAIN_PATH" -P "$P12_PASS" \
   -T /usr/bin/codesign -T /usr/bin/security 2>/dev/null || true
 # Allow codesign to use the key without an interactive prompt.
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN_PATH" >/dev/null
+
+# Apple intermediate CAs. A .p12 built with `openssl pkcs12` holds ONLY the leaf cert, so the chain
+# can't validate (find-identity -v shows 0 valid) until the issuing intermediate is in the keychain.
+# Keychain Access exports bundle these automatically; openssl ones don't. Import the ones our certs
+# chain to (Developer ID → G2, Apple Distribution/WWDR → G3). Roots are already system-trusted.
+import_apple_ca() {
+  local url="$1"
+  local out="$tmp/$(basename "$url")"
+  if curl -fsSL "$url" -o "$out" 2>/dev/null; then
+    security import "$out" -k "$KEYCHAIN_PATH" 2>/dev/null || true
+  else
+    echo "  ! could not fetch $(basename "$url") — chain may not validate offline"
+  fi
+}
+import_apple_ca https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+import_apple_ca https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
 
 # --- verify the identity is usable -----------------------------------------
 if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q "$IDENTITY"; then
