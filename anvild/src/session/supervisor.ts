@@ -57,7 +57,7 @@ import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { readStatus, withStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
-import { AutopilotScheduleStore, isRunDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
+import { AutopilotScheduleStore, scheduledFireDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -80,6 +80,13 @@ export const DEFAULT_SESSION_ID = "sess_default";
  *  settles, a skipped finally) can't latch the live spinner. A full multi-env run plans several units
  *  with Opus, so keep it generous enough to never cut off legitimate work. */
 const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
+
+/** How often the scheduler checks whether the scheduled time has arrived. */
+const SCHEDULE_TICK_MS = 5 * 60_000;
+/** A scheduled run fires only if the daemon notices within this window of the scheduled time. Must be
+ *  > SCHEDULE_TICK_MS so a tick always lands inside it; small enough that a restart well away from the
+ *  scheduled time never trips it (see scheduledFireDue — restarts must not launch a run). */
+const SCHEDULE_RUN_WINDOW_MS = 10 * 60_000;
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -171,13 +178,15 @@ export class Supervisor {
     this.startPrStateSweeper();
   }
 
-  /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether a run
-   *  is due and fire it. `unref` so it never holds the process (or a test) open; a startup tick gives
-   *  the catch-up-on-restart behaviour. */
+  /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether the
+   *  scheduled time has just arrived and fire it then. `unref` so it never holds the process (or a
+   *  test) open. NO startup tick on purpose — a (re)start must not kick off a run (that fired a fresh
+   *  run + spinner on every restart); the run happens only when the clock crosses the scheduled time
+   *  while the daemon is already running. SCHEDULE_TICK_MS must stay < SCHEDULE_RUN_WINDOW_MS so a tick
+   *  always lands inside the window. */
   private startAutopilotScheduler(): void {
-    this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), 5 * 60_000);
+    this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), SCHEDULE_TICK_MS);
     this.scheduleTimer.unref?.();
-    void this.maybeRunScheduled();
   }
   /** Keep the sidebar's PR/merge badges fresh for an already-open app: a connect triggers a sweep, but
    *  if the app stays connected while a PR is merged on GitHub nothing else would catch it. Sweep every
@@ -191,7 +200,7 @@ export class Supervisor {
   }
   private async maybeRunScheduled(): Promise<void> {
     const sched = this.autopilotSchedule.get();
-    if (this.autopilotRunning || !isRunDue(sched, new Date(), sched.lastRunAt)) return;
+    if (this.autopilotRunning || !scheduledFireDue(sched, new Date(), SCHEDULE_RUN_WINDOW_MS, sched.lastRunAt)) return;
     // Stamp the run NOW so a slow run isn't re-triggered on the next 5-min tick, and so a hard error
     // (Todoist down, no linked envs) doesn't hammer — it waits for the next scheduled window.
     this.autopilotSchedule.markRun(now());
