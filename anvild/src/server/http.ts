@@ -90,6 +90,8 @@ export interface ServerOptions {
   host?: string;
   port: number;
   stateDir: string;
+  /** Clone destination for repos added by git URL (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
+  clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
@@ -109,6 +111,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const supervisor = new Supervisor(
     {
       stateDir: opts.stateDir,
+      clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
       renderer: opts.renderer,

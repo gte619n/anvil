@@ -75,6 +75,8 @@ export const DEFAULT_SESSION_ID = "sess_default";
 
 export interface SupervisorConfig {
   stateDir: string;
+  /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
+  clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
@@ -123,9 +125,11 @@ export class Supervisor {
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
+  private readonly clonesDir: string;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
+    this.clonesDir = cfg.clonesDir ?? join(cfg.stateDir, "repos");
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -197,11 +201,11 @@ export class Supervisor {
     }
     this.registry.toAll(this.environmentsEvent());
   }
-  /** Clone a git URL into ~/Development (host git auth) and register it as an environment. */
+  /** Clone a git URL into `clonesDir` (host git auth) and register it as an environment. */
   cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string, icon?: string): void {
     let dest: string;
     try {
-      dest = git.cloneRepo(url).dest;
+      dest = git.cloneRepo(url, this.clonesDir).dest;
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }

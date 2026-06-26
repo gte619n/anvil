@@ -245,6 +245,16 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .reader-choices .reader-choice { display: block; padding: 8px 10px; border-radius: 6px; color: var(--accent); text-decoration: none; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
 .reader-choices .reader-choice:hover { background: var(--surface-2, rgba(127,127,127,0.12)); }
 
+/* Android in-app full-screen reader (the WebView shell can't open a real second window). Full-bleed
+   over the app, its own scroll, a header with the filename + a close ✕; the device Back also closes it. */
+.reader-fs { position: fixed; inset: 0; z-index: 60; background: var(--bg); display: flex; flex-direction: column; animation: modal-fade 0.15s ease; }
+.reader-fs-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.reader-fs-title { flex: 1; min-width: 0; font: 600 13px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reader-fs-close { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; padding: 4px; flex-shrink: 0; }
+.reader-fs-close:hover { color: var(--accent); }
+.reader-fs-close .msym { font-size: 22px; }
+.reader-fs-body { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; padding: 18px clamp(16px, 4vw, 32px); }
+
 .git-panel { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .git-status { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
 .git-panel label { display: block; }

@@ -321,7 +321,7 @@ const planFromHash = (): string | null => {
 // uses the swipe gesture, the PWA/browser uses its own Back — all surface as `popstate`,
 // which closes the topmost layer. Each entry records how many layers were open (`anvilDepth`)
 // so a single popstate can unwind to exactly the right place.
-type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel";
+type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader";
 interface Overlay {
   name: OverlayName;
   close: () => void; // pure DOM/state teardown — must NOT touch history itself
@@ -782,6 +782,12 @@ if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
+// The Android WebView shell can't host a second window (no onCreateWindow / multi-window support), so
+// window.open() there is a dead end (a chrome-less, Back-less, unscrollable takeover). The reader's
+// "pop out" therefore opens an in-app full-screen overlay on Android instead of a standalone window
+// (macOS gets a real NSWindow, the web a real tab). The Apple shell doesn't expose AnvilNative, so
+// this matches the Android app specifically, not Mac.
+const isAndroidApp = !!nativeBridge && /Android/i.test(navigator.userAgent);
 if (nativeBridge) {
   nativeBridge.onmessage = (e) => {
     try {
@@ -3864,9 +3870,13 @@ function renderReader(content: FileContent): void {
   if (content.path !== readerPath) return;
   panelView = "reader";
   setPanelTabs();
-  const popoutBtn = content.choices // a picker has nothing to pop out yet
+  // A picker has nothing to pop out yet. Otherwise: on the Android shell (no real second window)
+  // the button opens an in-app full-screen overlay; on Mac/web it pops out a standalone window.
+  const popoutBtn = content.choices
     ? ""
-    : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
+    : isAndroidApp
+      ? `<button type="button" id="reader-popout" class="reader-act" title="Full screen">${icon("fullscreen")}</button>`
+      : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
   const head =
     `<div class="reader-head"><b>${esc(content.path)}</b>` +
     `<span class="reader-head-actions">${popoutBtn}` +
@@ -3897,7 +3907,7 @@ function renderReader(content: FileContent): void {
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
   const popout = document.getElementById("reader-popout");
-  if (popout) popout.onclick = () => popOutReader(content.path);
+  if (popout) popout.onclick = () => (isAndroidApp ? openFullScreenReader(content.path) : popOutReader(content.path));
 }
 /** Open the currently-rendered reader content in a standalone window (Mac + Web). Reuses the page's
  *  stylesheets + theme and the already-rendered DOM (Mermaid/KaTeX/code highlighting intact), minus
@@ -3929,6 +3939,27 @@ function popOutReader(path: string): void {
       `</head><body><div class="popout-wrap"><div class="popout-head">${esc(path)}</div>${clone.innerHTML}</div></body></html>`,
   );
   win.document.close();
+}
+/** Android in-app full-screen reader. The WebView shell can't make a real second window, so instead of
+ *  popOutReader's standalone window we overlay the whole document with a clean, full-bleed, scrollable
+ *  copy of the already-rendered file (Mermaid/KaTeX/highlighting intact), minus the in-app chrome. It's
+ *  a back-stack layer, so the device Back button and the on-screen ✕ both close it. */
+function openFullScreenReader(path: string): void {
+  const clone = panelContent.cloneNode(true) as HTMLElement;
+  clone.querySelector(".reader-head")?.remove(); // the panel's header + back link don't belong full-screen
+  clone.querySelectorAll(".copy-btn").forEach((b) => b.remove()); // their click handlers don't survive the clone
+  document.getElementById("reader-fs")?.remove(); // never stack two
+  const title = path.split("/").pop() || path;
+  const fs = document.createElement("div");
+  fs.className = "reader-fs";
+  fs.id = "reader-fs";
+  fs.innerHTML =
+    `<div class="reader-fs-head"><span class="reader-fs-title" title="${esc(path)}">${esc(title)}</span>` +
+    `<button type="button" class="reader-fs-close" aria-label="Close" title="Close">${icon("close")}</button></div>` +
+    `<div class="reader-fs-body">${clone.innerHTML}</div>`;
+  document.body.appendChild(fs);
+  fs.querySelector(".reader-fs-close")?.addEventListener("click", () => dismissOverlay("reader"));
+  openOverlay("reader", () => document.getElementById("reader-fs")?.remove());
 }
 // ── Git panel ──────────────────────────────────────────────────────────────────
 function askClaude(instruction: string): void {
@@ -4186,7 +4217,7 @@ document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.addEventListene
 // handlers' click.
 document.addEventListener("pointerdown", (e) => {
   if (!panelView) return; // panel already closed
-  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot")) return; // a dialog/settings/autopilot is on top — leave the panel be
+  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader")) return; // a dialog/settings/autopilot/full-screen reader is on top — leave the panel be
   const t = e.target as HTMLElement;
   if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root") || t.closest("#autopilot-root") || t.closest(".resizer")) return;
   closePanel();
