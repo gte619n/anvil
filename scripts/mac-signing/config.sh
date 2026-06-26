@@ -17,6 +17,7 @@ SECRET_NOTARY_ISSUER="mac-signing-notary-issuer-id"  # App Store Connect Issuer 
 # --- iOS distribution (TestFlight / App Store) ---
 SECRET_IOS_P12="ios-distribution-p12"                # base64 of the Apple Distribution .p12
 SECRET_IOS_P12_PASS="ios-distribution-p12-pass"      # its export password
+SECRET_IOS_PROFILE="ios-provisioning-profile"        # base64 of the App Store .mobileprovision
 SECRET_TEAM_ID="apple-team-id"                        # 10-char Apple Developer Team ID
 # --- APNs auth key for the daemon's push sender (anvild/src/push/apns.ts) ---
 SECRET_APNS_P8="apns-auth-key-p8"                    # base64 of the APNs AuthKey_*.p8

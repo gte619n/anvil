@@ -28,6 +28,7 @@ echo "▸ mirroring Secret Manager → GitHub Actions secrets…"
 # pass the base64 text straight through as the GitHub secret body.
 set_secret IOS_DIST_P12_BASE64   "$(secret_get "$SECRET_IOS_P12")"
 set_secret IOS_DIST_P12_PASSWORD "$(secret_get "$SECRET_IOS_P12_PASS")"
+set_secret IOS_PROVISIONING_PROFILE_BASE64 "$(secret_get "$SECRET_IOS_PROFILE")"
 set_secret APPLE_TEAM_ID         "$(secret_get "$SECRET_TEAM_ID")"
 set_secret APPLE_API_KEY_BASE64  "$(secret_get "$SECRET_NOTARY_P8")"
 set_secret APPLE_API_KEY_ID      "$(secret_get "$SECRET_NOTARY_KEY_ID")"
