@@ -22,6 +22,7 @@ import {
   type AutopilotStartedEvent,
   type AutopilotSchedule,
   type AutopilotScheduleEvent,
+  type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
   type AuthStatusEvent,
   type GitCmd,
@@ -55,8 +56,8 @@ import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { readStatus, withStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
-import { planAndTagProject, planAndTagTasks, planDeepLink, planUnit, refinePlanQuery } from "../integrations/autopilot";
-import { AutopilotScheduleStore, isRunDue, nextScheduledFire } from "../integrations/schedule";
+import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
+import { AutopilotScheduleStore, isRunDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
 import * as git from "../git/ops";
@@ -74,14 +75,19 @@ export class BadCommand extends Error {}
  *  so this can never collide with an ordinary session. */
 export const DEFAULT_SESSION_ID = "sess_default";
 
+/** Hard ceiling on a single autopilot run, and the budget the DERIVED `running` state uses: a run older
+ *  than this reports `running: false` to every client no matter what, so a hung run (an await that never
+ *  settles, a skipped finally) can't latch the live spinner. A full multi-env run plans several units
+ *  with Opus, so keep it generous enough to never cut off legitimate work. */
+const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
+
 export interface SupervisorConfig {
   stateDir: string;
+  /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
+  clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
-  /** This daemon's reachable web URL (e.g. http://100.x.y.z:7701), used to deep-link plans in
-   *  Todoist comments. Undefined → comments fall back to a plain "open Autopilot" pointer. */
-  webBaseUrl?: string;
 }
 
 /**
@@ -121,18 +127,31 @@ export class Supervisor {
   private readonly integrations: IntegrationStore;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
-  private autopilotRunning = false; // one autopilot run at a time (manual click + scheduled tick)
+  // The live run is tracked by a START TIMESTAMP, not a boolean — `running` is DERIVED from it (below),
+  // so it physically cannot latch: once a run outlives AUTOPILOT_RUN_TIMEOUT_MS, every reader (schedule
+  // event, connect handshake, the re-run guard) sees `running: false` automatically, even if the run's
+  // cleanup never fires (a hung await, a skipped finally). A monotonically-increasing token disambiguates
+  // overlapping runs so a slow run's late cleanup can't clear a newer run's state. undefined = idle.
+  private autopilotRunStartedAt: number | undefined;
+  private autopilotRunToken = 0;
+  /** Derived live-run state: a run is "running" only while its start is within the time budget. This is
+   *  the single source of truth broadcast to clients; being time-bounded is what makes the spinner
+   *  un-latchable. */
+  private get autopilotRunning(): boolean {
+    return runWithinBudget(this.autopilotRunStartedAt, Date.now(), AUTOPILOT_RUN_TIMEOUT_MS);
+  }
+  private autopilotRunLog: string[] = []; // the live run's progress lines, retained so a connecting/refreshed client can replay them
   private scheduleTimer?: ReturnType<typeof setInterval>;
   private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
   readonly apns: Apns;
-  private readonly webBaseUrl?: string;
+  private readonly clonesDir: string;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
-    this.webBaseUrl = cfg.webBaseUrl;
+    this.clonesDir = cfg.clonesDir ?? join(cfg.stateDir, "repos");
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -205,11 +224,11 @@ export class Supervisor {
     }
     this.registry.toAll(this.environmentsEvent());
   }
-  /** Clone a git URL into ~/Development (host git auth) and register it as an environment. */
+  /** Clone a git URL into `clonesDir` (host git auth) and register it as an environment. */
   cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string, icon?: string): void {
     let dest: string;
     try {
-      dest = git.cloneRepo(url).dest;
+      dest = git.cloneRepo(url, this.clonesDir).dest;
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
@@ -423,11 +442,7 @@ export class Supervisor {
       ...(revised.summary ? { summary: revised.summary } : {}),
       ...(revised.effort ? { effort: revised.effort } : {}),
     });
-    const refineLink = planDeepLink(this.webBaseUrl, u.id);
-    void this.postPlanComment(
-      u,
-      `🤖 **anvil** refined the plan for “${u.title}”.\n\n${revised.summary?.trim() || "Plan updated."}\n\n_Feedback: ${feedback.trim()}_\n\n${refineLink ? `🔗 Read the full plan in Anvil: ${refineLink}` : "_Read the full plan in Anvil → Autopilot._"}`,
-    );
+    void this.postPlanComment(u, `🤖 **anvil** refined the plan for “${u.title}”.\n\n${revised.summary?.trim() || "Plan updated."}`);
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
   }
@@ -465,10 +480,9 @@ export class Supervisor {
       ...(planned.summary ? { summary: planned.summary } : {}),
       ...(planned.effort ? { effort: planned.effort } : {}),
     });
-    const reassignLink = planDeepLink(this.webBaseUrl, u.id);
     void this.postPlanComment(
       u,
-      `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.summary?.trim() || "Plan updated."}\n\n${reassignLink ? `🔗 Read the full plan in Anvil: ${reassignLink}` : "_Read the full plan in Anvil → Autopilot._"}`,
+      `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.summary?.trim() || "Plan updated."}`,
     );
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
@@ -519,17 +533,14 @@ export class Supervisor {
   }
 
   // ── Autopilot maintenance (Todoist-settings buttons) ──────────────────────────────
-  /** Remove every anvil:* status label from the given units' member tasks (best-effort), keeping the
-   *  user's own labels — including the "Autopilot" sourcing label — intact. Returns how many tasks
-   *  actually had a label removed. */
-  private async stripAnvilLabels(units: WorkUnit[]): Promise<number> {
+  /** Remove the anvil:* status label from each given task (best-effort), keeping the user's own labels —
+   *  including the "Autopilot" sourcing label — intact. Returns how many tasks actually had one removed. */
+  private async stripAnvilLabels(taskIds: Iterable<string>): Promise<number> {
     const state = this.integrations.todoist();
     if (!state?.accessToken) return 0;
     const client = new TodoistClient(state.accessToken);
-    const taskIds = new Set<string>();
-    for (const u of units) for (const id of u.taskIds) taskIds.add(id);
     let cleared = 0;
-    for (const taskId of taskIds) {
+    for (const taskId of new Set(taskIds)) {
       try {
         const t = await client.getTask(taskId);
         if (!readStatus(t.labels)) continue; // no anvil:* label → nothing to strip
@@ -542,12 +553,46 @@ export class Supervisor {
     return cleared;
   }
 
+  /** Every Todoist task currently carrying an anvil:* status label, swept straight from Todoist across
+   *  all linked project boards and the Autopilot sourcing label. This sees labels orphaned from a work
+   *  unit that no longer exists (e.g. a wiped/lost store) — which the known-units list cannot — so Reset
+   *  can clear them and let the task be re-planned. Best-effort: returns whatever it managed to gather. */
+  private async taggedTaskIds(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) return ids;
+    const client = new TodoistClient(state.accessToken);
+    const label = this.autopilotSchedule.get().label;
+    try {
+      const swept: TodoistTask[] = [];
+      for (const env of this.envStore.list()) {
+        if (env.todoistProjectId) swept.push(...(await client.tasks(env.todoistProjectId)));
+      }
+      if (label) swept.push(...(await client.tasksByLabel(label)));
+      for (const t of swept) if (readStatus(t.labels)) ids.add(t.id);
+    } catch {
+      /* best-effort sweep — fall back to whatever was gathered */
+    }
+    return ids;
+  }
+
   /** Reset the pipeline so tasks can be re-planned: strip anvil:* labels and drop the work units that
    *  aren't tied to a live session (in-progress builds are left alone). The "Autopilot" sourcing label
-   *  is preserved, so the next run picks the tasks straight back up. */
+   *  is preserved, so the next run picks the tasks straight back up. Sweeps Todoist directly for tagged
+   *  tasks too, so labels orphaned by a lost work unit don't block a re-plan forever. */
   async resetAnvilTags(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
-    const resettable = this.workUnits.list().filter((u) => !(u.sessionId && this.sessions.has(u.sessionId)));
-    const tasksCleared = await this.stripAnvilLabels(resettable);
+    const all = this.workUnits.list();
+    const isLive = (u: WorkUnit) => !!u.sessionId && this.sessions.has(u.sessionId);
+    const resettable = all.filter((u) => !isLive(u));
+    // Tasks owned by a live build session keep their labels — the running session depends on them.
+    const protectedIds = new Set<string>();
+    for (const u of all) if (isLive(u)) for (const id of u.taskIds) protectedIds.add(id);
+    // Clear every anvil-tagged task: the resettable units' members PLUS any orphaned by a lost unit
+    // (swept straight from Todoist), minus the protected live-session ones.
+    const toClear = await this.taggedTaskIds();
+    for (const u of resettable) for (const id of u.taskIds) toClear.add(id);
+    for (const id of protectedIds) toClear.delete(id);
+    const tasksCleared = await this.stripAnvilLabels(toClear);
     for (const u of resettable) this.workUnits.remove(u.id);
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "reset", tasksCleared, unitsRemoved: resettable.length };
@@ -557,7 +602,9 @@ export class Supervisor {
    *  units (the pending grid empties). Running sessions are not killed, but their unit is forgotten. */
   async clearAutopilot(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
     const units = this.workUnits.list();
-    const tasksCleared = await this.stripAnvilLabels(units);
+    const taskIds = new Set<string>();
+    for (const u of units) for (const id of u.taskIds) taskIds.add(id);
+    const tasksCleared = await this.stripAnvilLabels(taskIds);
     for (const u of units) this.workUnits.remove(u.id);
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "clear", tasksCleared, unitsRemoved: units.length };
@@ -618,12 +665,14 @@ export class Supervisor {
     notify?: boolean;
     autoStart?: boolean;
     maxAutoStart?: number;
-    onProgress?: (line: string) => void;
   }): Promise<{ created: number; skipped: number; started: number; output: string }> {
     if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
     const state = this.integrations.todoist();
     if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
-    const client = new TodoistClient(state.accessToken);
+    // Run-level abort: the watchdog (below) fires it on timeout so every in-flight Todoist/SDK call
+    // unwinds instead of hanging the run open. Threaded into the client and the planning calls.
+    const ac = new AbortController();
+    const client = new TodoistClient(state.accessToken, ac.signal);
     const envs = this.envStore
       .list()
       .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
@@ -634,12 +683,29 @@ export class Supervisor {
     const labelPass = !opts.environmentId && !!schedule.label && !!defaultEnv;
     if (envs.length === 0 && !labelPass) throw new BadCommand("no environments are linked to a Todoist project");
     const deps = { client, workUnits: this.workUnits };
-    const log: string[] = [];
+    this.autopilotRunLog = [];
     const emit = (line: string): void => {
-      log.push(line);
-      opts.onProgress?.(line);
+      this.autopilotRunLog.push(line);
+      this.broadcastRunProgress(line); // every client, live — not just the one that triggered the run
     };
-    this.autopilotRunning = true;
+    // Each unit broadcasts the refreshed plan list the moment it's persisted, so every client's grid
+    // climbs in real time (12 → 13 → …) instead of only filling in when the whole run finishes.
+    const onUnitCreated = (): void => this.broadcastAutopilotPlans();
+    const token = ++this.autopilotRunToken;
+    this.autopilotRunStartedAt = Date.now();
+    this.broadcastSchedule(); // tell every client a run just started (running: true)
+    // Watchdog: clients only re-render `running` when they RECEIVE a schedule event, so once the derived
+    // state flips to false (run outlived its budget) we proactively abort the hung work and broadcast it,
+    // rather than waiting for the next connect. The derived getter already guarantees correctness; this
+    // just makes the spinner clear promptly and frees the in-flight subprocess/socket.
+    const watchdog = setTimeout(() => {
+      if (this.autopilotRunToken !== token) return; // a newer run already owns the state
+      emit("⚠ Autopilot run exceeded its time budget — ending it. Check the daemon log if this recurs.");
+      ac.abort();
+      this.autopilotRunStartedAt = undefined;
+      this.broadcastSchedule();
+    }, AUTOPILOT_RUN_TIMEOUT_MS);
+    watchdog.unref?.(); // a pending watchdog must never keep the daemon alive on its own
     const createdUnits: WorkUnit[] = [];
     let skipped = 0;
     let started = 0;
@@ -651,8 +717,9 @@ export class Supervisor {
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
           repoName: env.name,
-          ...(this.webBaseUrl ? { webBaseUrl: this.webBaseUrl } : {}),
+          signal: ac.signal,
           onProgress: emit,
+          onUnitCreated,
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
@@ -672,8 +739,9 @@ export class Supervisor {
           repoRoot: defaultEnv.repoRoot,
           repoName: defaultEnv.name,
           tasks: external,
-          ...(this.webBaseUrl ? { webBaseUrl: this.webBaseUrl } : {}),
+          signal: ac.signal,
           onProgress: emit,
+          onUnitCreated,
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
@@ -700,7 +768,11 @@ export class Supervisor {
         }
       }
     } finally {
-      this.autopilotRunning = false;
+      clearTimeout(watchdog);
+      // Only clear if THIS run still owns the state — a watchdog-timed-out run that's been superseded by
+      // a newer run must not wipe the newer run's start timestamp when its own late cleanup finally runs.
+      if (this.autopilotRunToken === token) this.autopilotRunStartedAt = undefined;
+      this.broadcastSchedule(); // run finished (or errored) — tell every client (running: false)
     }
     const created = createdUnits.length;
     this.broadcastAutopilotPlans();
@@ -713,7 +785,7 @@ export class Supervisor {
       void this.fcm.notify(payload);
       void this.apns.notify(payload);
     }
-    return { created, skipped, started, output: log.join("\n") };
+    return { created, skipped, started, output: this.autopilotRunLog.join("\n") };
   }
 
   // ── Autopilot schedule (in-daemon timer) ──────────────────────────────────────────
@@ -727,10 +799,28 @@ export class Supervisor {
       ...(cid ? { cid } : {}),
       schedule,
       ...(next ? { nextRunAt: next.toISOString() } : {}),
+      running: this.autopilotRunning,
     };
   }
   private broadcastSchedule(): void {
     this.registry.toAll(this.autopilotScheduleEvent());
+  }
+  /** Stream one run-progress line to every connected client (live, regardless of who started the run —
+   *  or whether it was the scheduler). Centralized here so manual and scheduled runs behave the same. */
+  private broadcastRunProgress(line: string): void {
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "autopilot.run.progress", ts: now(), line });
+  }
+  /** The live run's accumulated progress, for replay to a client that connects/refreshes mid-run so it
+   *  restores the running view instead of blanking. `log` is empty when no run is in flight. */
+  autopilotRunSnapshotEvent(cid?: string): AutopilotRunSnapshotEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "autopilot.run.snapshot",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      running: this.autopilotRunning,
+      log: this.autopilotRunning ? [...this.autopilotRunLog] : [],
+    };
   }
   setAutopilotSchedule(patch: Partial<Omit<AutopilotSchedule, "lastRunAt">>, cid?: string): AutopilotScheduleEvent {
     this.autopilotSchedule.set(patch);
@@ -1359,7 +1449,20 @@ export class Supervisor {
     this.logs.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
-    void this.teardownSession(id, s);
+    this.trackTeardown(this.teardownSession(id, s));
+  }
+
+  /** In-flight background teardowns, so `settle()` (shutdown/tests) can await their completion. */
+  private readonly teardowns = new Set<Promise<void>>();
+  private trackTeardown(p: Promise<void>): void {
+    this.teardowns.add(p);
+    void p.finally(() => this.teardowns.delete(p));
+  }
+
+  /** Await every in-flight background teardown — for deterministic shutdown and tests. The reap is
+   *  best-effort (teardownSession swallows its own errors), so this never rejects. */
+  async settle(): Promise<void> {
+    await Promise.allSettled([...this.teardowns]);
   }
 
   /** Best-effort background reap of a killed session's agent, terminal, worktree, branch + state. */
@@ -1388,6 +1491,7 @@ export class Supervisor {
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
     for (const id of [...this.terminals.keys()]) this.killTerminal(id);
+    await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
   }
 

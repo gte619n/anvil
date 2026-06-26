@@ -236,6 +236,11 @@ function removeServer(url: string): void {
   for (const [eid, u] of [...envServer]) if (u === url) { envServer.delete(eid); environments.delete(eid); }
   serverPlans.delete(url);
   for (const [pid, u] of [...planServer]) if (u === url) planServer.delete(pid);
+  // Drop the removed server's autopilot state too, else a lingering `running: true` keeps the fleet-wide
+  // spinner spinning for a server that no longer exists (and the user's "remove it" never clears it).
+  clearStaleRunTimer(url);
+  serverSchedule.delete(url);
+  reflectAutopilotRunning();
   updateAutopilotBadge();
   saveExtraServers([...servers.keys()].filter((u) => u !== HUB_URL));
   persistSessions();
@@ -321,7 +326,7 @@ const planFromHash = (): string | null => {
 // uses the swipe gesture, the PWA/browser uses its own Back — all surface as `popstate`,
 // which closes the topmost layer. Each entry records how many layers were open (`anvilDepth`)
 // so a single popstate can unwind to exactly the right place.
-type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel";
+type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader";
 interface Overlay {
   name: OverlayName;
   close: () => void; // pure DOM/state teardown — must NOT touch history itself
@@ -483,11 +488,8 @@ function saveConvoCache(): void {
 }
 
 // Resolve the theme before the first render so JS-computed session tints use the right band.
-(function initTheme() {
-  const stored = localStorage.getItem("anvil.theme");
-  const theme = stored ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  document.documentElement.dataset.theme = theme;
-})();
+// (themePref/resolveTheme are hoisted function declarations, defined in the Theme section below.)
+document.documentElement.dataset.theme = resolveTheme(themePref());
 
 // instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
 // fully offline; the daemon refreshes everything once the WS connects).
@@ -504,29 +506,43 @@ if (activeId) {
   renderEmptyState();
 }
 
-// ── Theme (system default + persisted toggle) ────────────────────────────────
+// ── Theme (light / dark / system, chosen in Settings → Appearance) ────────────
+type ThemePref = "light" | "dark" | "system";
+/** The user's stored preference; absence (or anything unexpected) means "follow the OS". */
+function themePref(): ThemePref {
+  const s = localStorage.getItem("anvil.theme");
+  return s === "light" || s === "dark" ? s : "system";
+}
+/** The concrete theme currently painted on <html>. */
 function currentTheme(): "light" | "dark" {
   return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
 }
-function applyThemeIcon(): void {
-  $("#theme-toggle").innerHTML = icon(currentTheme() === "dark" ? "light_mode" : "dark_mode");
+/** Resolve a preference to a concrete theme, consulting the OS for "system". */
+function resolveTheme(pref: ThemePref): "light" | "dark" {
+  if (pref === "system") return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return pref;
 }
-applyThemeIcon(); // data-theme is resolved earlier, before the first render
-$("#theme-toggle").addEventListener("click", () => {
-  const next = currentTheme() === "dark" ? "light" : "dark";
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem("anvil.theme", next);
-  applyThemeIcon();
-  renderSessions(); // re-clamp session tints for the new theme
-  applyActiveTint();
-});
-// Follow the OS theme live when the user hasn't pinned a preference.
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-  if (localStorage.getItem("anvil.theme")) return; // a manual choice wins
-  document.documentElement.dataset.theme = e.matches ? "dark" : "light";
-  applyThemeIcon();
+/** Paint the resolved theme and re-clamp session tints to the new band. */
+function applyTheme(): void {
+  document.documentElement.dataset.theme = resolveTheme(themePref());
   renderSessions();
   applyActiveTint();
+}
+/** Persist a new preference ("system" clears the key), repaint, and reflect it in any open Settings UI. */
+function setThemePref(pref: ThemePref): void {
+  if (pref === "system") localStorage.removeItem("anvil.theme");
+  else localStorage.setItem("anvil.theme", pref);
+  applyTheme();
+  updateThemeControls();
+}
+/** Mark the active swatch in Settings → Appearance (no-op when Settings isn't open). */
+function updateThemeControls(): void {
+  const pref = themePref();
+  document.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) => b.classList.toggle("active", b.dataset.themePref === pref));
+}
+// Follow the OS theme live while the preference is "system".
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (themePref() === "system") applyTheme();
 });
 
 // ── Sidebar collapse ─────────────────────────────────────────────────────────────
@@ -782,6 +798,12 @@ if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
+// The Android WebView shell can't host a second window (no onCreateWindow / multi-window support), so
+// window.open() there is a dead end (a chrome-less, Back-less, unscrollable takeover). The reader's
+// "pop out" therefore opens an in-app full-screen overlay on Android instead of a standalone window
+// (macOS gets a real NSWindow, the web a real tab). The Apple shell doesn't expose AnvilNative, so
+// this matches the Android app specifically, not Mac.
+const isAndroidApp = !!nativeBridge && /Android/i.test(navigator.userAgent);
 if (nativeBridge) {
   nativeBridge.onmessage = (e) => {
     try {
@@ -881,6 +903,18 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
     void flushOutbox(); // push anything queued while offline (routed per server)
     // The autopilot probes are sent from the server.hello handler instead — hello is the first frame
     // after open and carries the server's capabilities, so we only probe servers that support autopilot.
+  }
+  if (status === "disconnected") {
+    // A disconnected server can't be mid-run from our point of view, so clear any stale `running` it
+    // left behind. Without this the autopilot spinner latches on forever when a daemon drops mid-run
+    // before its `running: false` broadcast lands — e.g. a forced exit skips the run's finally. The
+    // schedule itself is kept for display; on reconnect the server re-asserts its true running state.
+    clearStaleRunTimer(url); // a gone server can't go stale-running; tidy its backstop
+    const entry = serverSchedule.get(url);
+    if (entry?.running) {
+      serverSchedule.set(url, { ...entry, running: false });
+      reflectAutopilotRunning();
+    }
   }
   if (pendingRestartReload && url === HUB_URL) {
     if (status === "disconnected") setUpdateStatus("Daemon is restarting…");
@@ -1043,8 +1077,11 @@ function onEvent(url: string, e: ServerEvent): void {
     case "autopilot.run.progress":
       onAutopilotProgress(e.line);
       return;
+    case "autopilot.run.snapshot":
+      onAutopilotRunSnapshot(e.log);
+      return;
     case "autopilot.schedule":
-      onAutopilotSchedule(url, e.schedule, e.nextRunAt);
+      onAutopilotSchedule(url, e.schedule, e.nextRunAt, e.running);
       return;
     case "dirs.list.result":
       onDirs?.(e);
@@ -1895,17 +1932,7 @@ function renderSessionItem(s: Session): HTMLLIElement {
   });
   li.append(a);
   if (s.isDefault) {
-    // The concierge is pinned; its row carries the "+" that opens the new-session flow.
-    const add = document.createElement("button");
-    add.className = "row-btn new-session";
-    add.title = "New session";
-    add.innerHTML = icon("add");
-    add.addEventListener("click", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      showNewSession();
-    });
-    li.append(add);
+    // The concierge is pinned; the new-session "+" lives in the sidebar header (see #new-session-top).
   } else if (!removing) {
     const open = document.createElement("button");
     open.className = "row-btn open-tab";
@@ -2068,7 +2095,7 @@ function onEnvironments(url: string, list: Environment[]): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "todoist" | "models";
+type SettingsTab = "servers" | "environments" | "todoist" | "models" | "appearance";
 let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
@@ -2082,6 +2109,7 @@ function openSettings(): void {
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
       <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
+      <button class="stab" data-tab="appearance">${icon("palette")} Appearance</button>
     </div>
     <div class="settings-body">
       <section class="settings-panel" data-tab="environments">
@@ -2102,11 +2130,24 @@ function openSettings(): void {
         <p class="small muted">The model provider Anvil drives. Set or reset the Claude subscription token here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
       </section>
+      <section class="settings-panel" data-tab="appearance">
+        <div class="section-head"><h3>Appearance</h3></div>
+        <p class="small muted">Choose how Anvil looks. <b>System</b> follows your device's light or dark setting.</p>
+        <div class="theme-options">
+          <button type="button" class="theme-opt" data-theme-pref="light">${icon("light_mode")} Light</button>
+          <button type="button" class="theme-opt" data-theme-pref="dark">${icon("dark_mode")} Dark</button>
+          <button type="button" class="theme-opt" data-theme-pref="system">${icon("brightness_auto")} System</button>
+        </div>
+      </section>
     </div>
   </div>`;
   $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
   $("#todoist-refresh").addEventListener("click", () => loadTodoistProjects(true));
+  root.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) =>
+    b.addEventListener("click", () => setThemePref(b.dataset.themePref as ThemePref)),
+  );
+  updateThemeControls();
   root.querySelectorAll<HTMLElement>(".stab").forEach((t) =>
     t.addEventListener("click", () => selectSettingsTab(t.dataset.tab as SettingsTab)),
   );
@@ -2471,7 +2512,53 @@ let openPlanId: string | null = null; // the plan open in the reader, if any (el
 const SIZE_LABEL: Record<string, string> = { xs: "XS", s: "S", m: "M", l: "L", xl: "XL" };
 const DAY_LABEL = ["S", "M", "T", "W", "T", "F", "S"]; // Sun..Sat, for the schedule day toggles
 // Each server's autopilot schedule (the UI control targets the hub; the daemon supports per-server).
-const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string }>();
+// `running` is the server-authoritative live run state, broadcast on start/finish + sent on connect.
+const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string; running: boolean }>();
+
+// Client-side backstop against a server that reports `running: true` and never takes it back — an old
+// daemon with a latched flag, or one that died without a clean `running: false`. A healthy current
+// daemon caps its own run (30 min) and broadcasts false well before this fires, so this only bites a
+// stuck/old server: if no clearing event arrives within the budget, we drop that server's run locally
+// so the fleet-wide spinner can't be pinned on forever by one misbehaving member.
+const STALE_RUN_MS = 35 * 60_000;
+const staleRunTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function clearStaleRunTimer(url: string): void {
+  const t = staleRunTimers.get(url);
+  if (t !== undefined) {
+    clearTimeout(t);
+    staleRunTimers.delete(url);
+  }
+}
+/** Arm (or re-arm) the stale-run backstop for a server now reporting a live run. */
+function armStaleRunTimer(url: string): void {
+  clearStaleRunTimer(url);
+  staleRunTimers.set(
+    url,
+    setTimeout(() => {
+      staleRunTimers.delete(url);
+      const entry = serverSchedule.get(url);
+      if (entry?.running) {
+        serverSchedule.set(url, { ...entry, running: false });
+        reflectAutopilotRunning();
+      }
+    }, STALE_RUN_MS),
+  );
+}
+
+/** Is an autopilot run in flight anywhere? True if any server reports it, OR this client started one. */
+function anyServerRunning(): boolean {
+  if (runState.running) return true;
+  for (const s of serverSchedule.values()) if (s.running) return true;
+  return false;
+}
+
+/** Reflect the live run state everywhere it shows: the always-present sidebar spinner (visible even
+ *  with the Autopilot view closed) and, when the view is open, the in-view status banner. */
+function reflectAutopilotRunning(): void {
+  const spin = document.getElementById("autopilot-running");
+  if (spin) (spin as HTMLElement).hidden = !anyServerRunning();
+  renderRunStatus();
+}
 
 /** Every server's pending plans, hub first, in the sidebar/grouping order. */
 function allPlans(): AutopilotPlanInfo[] {
@@ -2531,6 +2618,21 @@ function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
     renderAutopilotGrid();
   }
 }
+/** Restore the in-flight run's log on (re)connect. The schedule event already set `running`; this
+ *  refills the log panel + banner so refreshing mid-run no longer blanks the live view. Only sent by
+ *  the server while a run is actually in flight. */
+function onAutopilotRunSnapshot(log: string[]): void {
+  autopilotLog.length = 0;
+  autopilotLog.push(...log);
+  runState.lastLine = log[log.length - 1] ?? "";
+  const el = document.getElementById("autopilot-log");
+  if (el) {
+    el.hidden = false;
+    el.textContent = autopilotLog.join("\n");
+    el.scrollTop = el.scrollHeight;
+  }
+  reflectAutopilotRunning();
+}
 function onAutopilotProgress(line: string): void {
   autopilotLog.push(line);
   runState.lastLine = line;
@@ -2540,7 +2642,7 @@ function onAutopilotProgress(line: string): void {
     log.textContent = autopilotLog.join("\n");
     log.scrollTop = log.scrollHeight;
   }
-  renderRunStatus();
+  reflectAutopilotRunning();
 }
 
 // Live status of the current/last "Run autopilot", surfaced as a banner above the log so the run is
@@ -2556,17 +2658,23 @@ const runState: RunState = { running: false, serversTotal: 0, lastLine: "", resu
 function renderRunStatus(): void {
   const host = document.getElementById("autopilot-status");
   if (!host) return;
-  if (!runState.running && runState.results.length === 0) {
+  const running = anyServerRunning();
+  if (!running && runState.results.length === 0) {
     host.hidden = true;
     host.innerHTML = "";
     return;
   }
   host.hidden = false;
   const createdTotal = runState.results.reduce((n, r) => n + r.created, 0);
-  const head = runState.running
-    ? `<span class="ap-status-head"><span class="msym spin">progress_activity</span> Evaluating ${runState.serversTotal} project source${runState.serversTotal === 1 ? "" : "s"}…</span>`
+  // "Evaluating N sources" only when THIS client drove the run (it knows the target count); a run
+  // observed from another device just shows a generic "running" head (its progress still streams in).
+  const runningHead = runState.running && runState.serversTotal
+    ? `Evaluating ${runState.serversTotal} project source${runState.serversTotal === 1 ? "" : "s"}…`
+    : "Autopilot is running…";
+  const head = running
+    ? `<span class="ap-status-head"><span class="msym spin">progress_activity</span> ${runningHead}</span>`
     : `<span class="ap-status-head">${icon("check_circle")} ${createdTotal ? `${createdTotal} new plan${createdTotal === 1 ? "" : "s"}` : "No new plans"}</span>`;
-  const live = runState.running && runState.lastLine
+  const live = running && runState.lastLine
     ? `<div class="ap-status-line">${esc(runState.lastLine)}</div>`
     : "";
   const rows = runState.results
@@ -2712,6 +2820,7 @@ function openPlan(id: string): void {
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
       <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
       <span class="plan-reader-actions">
+        <button class="mini" id="plan-refine-toggle" aria-pressed="false">${icon("auto_awesome")} Refine</button>
         <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
@@ -2722,21 +2831,40 @@ function openPlan(id: string): void {
     </div>
     <div class="plan-reader-body">
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
-      <aside class="plan-refine">
-        <h4>${icon("auto_awesome")} Refine with Claude</h4>
-        <p class="small muted">Suggest a change; Claude rewrites the plan and saves it back to Todoist.</p>
-        <div id="plan-refine-log" class="plan-refine-log"></div>
-        <form id="plan-refine-form" class="plan-refine-form">
-          <textarea id="plan-refine-input" rows="2" placeholder="e.g. also cover the offline case, and keep the existing API"></textarea>
-          <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
-        </form>
-      </aside>
     </div>
+    <div class="plan-refine-backdrop" id="plan-refine-backdrop" hidden></div>
+    <aside class="plan-refine plan-refine-drawer" id="plan-refine" aria-hidden="true">
+      <div class="plan-refine-head">
+        <h4>${icon("auto_awesome")} Refine with Claude</h4>
+        <button class="icon-btn" id="plan-refine-close" title="Close">${icon("close")}</button>
+      </div>
+      <p class="small muted">Suggest a change; Claude rewrites the plan and saves it back to Todoist.</p>
+      <div id="plan-refine-log" class="plan-refine-log"></div>
+      <form id="plan-refine-form" class="plan-refine-form">
+        <textarea id="plan-refine-input" rows="2" placeholder="e.g. also cover the offline case, and keep the existing API"></textarea>
+        <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
+      </form>
+    </aside>
   </div>`;
   // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
   // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
   // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
   openOverlay("plan", () => renderAutopilotGrid());
+  // The refine conversation is a dismissible side drawer (Option A): the plan reads full-width and the
+  // chat slides in over the right edge on demand, so investigating a plan never squeezes the document.
+  const refineDrawer = $("#plan-refine");
+  const refineBackdrop = $("#plan-refine-backdrop");
+  const refineToggle = $("#plan-refine-toggle");
+  const setRefineOpen = (open: boolean): void => {
+    refineDrawer.classList.toggle("open", open);
+    refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
+    refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
+    refineBackdrop.hidden = !open;
+    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus();
+  };
+  refineToggle.addEventListener("click", () => setRefineOpen(!refineDrawer.classList.contains("open")));
+  $("#plan-refine-close").addEventListener("click", () => setRefineOpen(false));
+  refineBackdrop.addEventListener("click", () => setRefineOpen(false));
   $("#plan-back").addEventListener("click", () => backToGrid());
   $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
   $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
@@ -2996,7 +3124,7 @@ async function runAutopilot(): Promise<void> {
   runState.serversTotal = targets.length;
   runState.lastLine = "";
   runState.results = [];
-  renderRunStatus();
+  reflectAutopilotRunning();
   onAutopilotProgress("Running autopilot…");
   const btn = $<HTMLButtonElement>("#autopilot-run");
   btn.disabled = true;
@@ -3025,7 +3153,7 @@ async function runAutopilot(): Promise<void> {
     toast(created ? `${created} new plan${created === 1 ? "" : "s"}` : "No new plans");
   } finally {
     runState.running = false;
-    renderRunStatus();
+    reflectAutopilotRunning();
     btn.disabled = false;
     btn.innerHTML = `${icon("play_arrow")} Run autopilot`;
   }
@@ -3034,8 +3162,13 @@ async function runAutopilot(): Promise<void> {
 // ── Scheduled run (in-daemon timer; the control targets the hub) ────────────────────
 // Surfaced in two places — the Autopilot view's bar and a card in Settings → Todoist — so changes
 // made in either (or pushed from another device) refresh both.
-function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string): void {
-  serverSchedule.set(url, { schedule, nextRunAt });
+function onAutopilotSchedule(url: string, schedule: AutopilotSchedule, nextRunAt?: string, running = false): void {
+  serverSchedule.set(url, { schedule, nextRunAt, running });
+  // Arm the backstop while this server says it's running; disarm the moment it reports done, so a normal
+  // run never trips it and only a server that never sends `false` ages out.
+  if (running) armStaleRunTimer(url);
+  else clearStaleRunTimer(url);
+  reflectAutopilotRunning(); // a run on ANY server (incl. one started from another device) shows here
   if (url !== HUB_URL) return;
   if (document.getElementById("autopilot-schedule")) renderScheduleBar();
   if (document.getElementById("todoist-panel")) renderTodoistPanel();
@@ -3864,9 +3997,13 @@ function renderReader(content: FileContent): void {
   if (content.path !== readerPath) return;
   panelView = "reader";
   setPanelTabs();
-  const popoutBtn = content.choices // a picker has nothing to pop out yet
+  // A picker has nothing to pop out yet. Otherwise: on the Android shell (no real second window)
+  // the button opens an in-app full-screen overlay; on Mac/web it pops out a standalone window.
+  const popoutBtn = content.choices
     ? ""
-    : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
+    : isAndroidApp
+      ? `<button type="button" id="reader-popout" class="reader-act" title="Full screen">${icon("fullscreen")}</button>`
+      : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
   const head =
     `<div class="reader-head"><b>${esc(content.path)}</b>` +
     `<span class="reader-head-actions">${popoutBtn}` +
@@ -3897,7 +4034,7 @@ function renderReader(content: FileContent): void {
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
   const popout = document.getElementById("reader-popout");
-  if (popout) popout.onclick = () => popOutReader(content.path);
+  if (popout) popout.onclick = () => (isAndroidApp ? openFullScreenReader(content.path) : popOutReader(content.path));
 }
 /** Open the currently-rendered reader content in a standalone window (Mac + Web). Reuses the page's
  *  stylesheets + theme and the already-rendered DOM (Mermaid/KaTeX/code highlighting intact), minus
@@ -3923,12 +4060,36 @@ function popOutReader(path: string): void {
     `<!doctype html><html lang="en" data-theme="${esc(theme)}"><head><meta charset="utf-8" />` +
       `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
       `<title>${esc(title)}</title>${styles}` +
-      `<style>body{margin:0;background:var(--bg);color:var(--text)}` +
+      // The shared app stylesheets pin html/body to height:100%;overflow:hidden so the in-app
+      // shell never scrolls — but in this standalone window that traps the content and kills the
+      // scrollbar. Reset both back to a normal, scrollable document.
+      `<style>html,body{margin:0;height:auto;overflow:auto;background:var(--bg);color:var(--text)}` +
       `.popout-wrap{max-width:880px;margin:0 auto;padding:28px clamp(16px,4vw,40px)}` +
       `.popout-head{font:600 12px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-bottom:16px;word-break:break-all}</style>` +
       `</head><body><div class="popout-wrap"><div class="popout-head">${esc(path)}</div>${clone.innerHTML}</div></body></html>`,
   );
   win.document.close();
+}
+/** Android in-app full-screen reader. The WebView shell can't make a real second window, so instead of
+ *  popOutReader's standalone window we overlay the whole document with a clean, full-bleed, scrollable
+ *  copy of the already-rendered file (Mermaid/KaTeX/highlighting intact), minus the in-app chrome. It's
+ *  a back-stack layer, so the device Back button and the on-screen ✕ both close it. */
+function openFullScreenReader(path: string): void {
+  const clone = panelContent.cloneNode(true) as HTMLElement;
+  clone.querySelector(".reader-head")?.remove(); // the panel's header + back link don't belong full-screen
+  clone.querySelectorAll(".copy-btn").forEach((b) => b.remove()); // their click handlers don't survive the clone
+  document.getElementById("reader-fs")?.remove(); // never stack two
+  const title = path.split("/").pop() || path;
+  const fs = document.createElement("div");
+  fs.className = "reader-fs";
+  fs.id = "reader-fs";
+  fs.innerHTML =
+    `<div class="reader-fs-head"><span class="reader-fs-title" title="${esc(path)}">${esc(title)}</span>` +
+    `<button type="button" class="reader-fs-close" aria-label="Close" title="Close">${icon("close")}</button></div>` +
+    `<div class="reader-fs-body">${clone.innerHTML}</div>`;
+  document.body.appendChild(fs);
+  fs.querySelector(".reader-fs-close")?.addEventListener("click", () => dismissOverlay("reader"));
+  openOverlay("reader", () => document.getElementById("reader-fs")?.remove());
 }
 // ── Git panel ──────────────────────────────────────────────────────────────────
 function askClaude(instruction: string): void {
@@ -4186,7 +4347,7 @@ document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.addEventListene
 // handlers' click.
 document.addEventListener("pointerdown", (e) => {
   if (!panelView) return; // panel already closed
-  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot")) return; // a dialog/settings/autopilot is on top — leave the panel be
+  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader")) return; // a dialog/settings/autopilot/full-screen reader is on top — leave the panel be
   const t = e.target as HTMLElement;
   if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root") || t.closest("#autopilot-root") || t.closest(".resizer")) return;
   closePanel();
@@ -4201,6 +4362,7 @@ const browseServer = (): Server => servers.get(browse.serverUrl) ?? hub();
 initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
 $("#open-autopilot").addEventListener("click", openAutopilot);
+$("#new-session-top").addEventListener("click", () => showNewSession());
 
 /** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so
  *  Back/Cancel dismisses it. Swapping one modal's contents for another reuses the same layer. */

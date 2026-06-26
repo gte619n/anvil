@@ -3,18 +3,12 @@
  * stdout+stderr so the UI can show exactly what happened. PR ops use the `gh` CLI.
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 function run(cmd: string[], cwd: string): { code: number; out: string } {
   const r = Bun.spawnSync(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
   const out = `${r.stdout.toString()}${r.stderr.toString()}`.trim();
   return { code: r.exitCode, out };
-}
-
-/** Where freshly-cloned environment repos land. */
-export function clonesParent(): string {
-  return join(homedir(), "Development");
 }
 
 /**
@@ -29,16 +23,16 @@ export function repoNameFromUrl(url: string): string {
 }
 
 /**
- * Clone `url` into `~/Development/<repo-name>` using the host's git auth (SSH keys,
- * credential helpers). Synchronous. Throws on a bad URL, an existing destination, or a
- * git failure (message carries git's combined output so the UI can show it).
+ * Clone `url` into `<parent>/<repo-name>` using the host's git auth (SSH keys,
+ * credential helpers). `parent` is caller-supplied (configurable; see `Config.clonesDir`) so the
+ * clone destination never depends on the daemon's install location. Synchronous. Throws on a bad
+ * URL, an existing destination, or a git failure (message carries git's combined output for the UI).
  */
-export function cloneRepo(url: string): { dest: string; output: string } {
+export function cloneRepo(url: string, parent: string): { dest: string; output: string } {
   const trimmed = url.trim();
   if (!trimmed) throw new Error("a git URL is required");
   const name = repoNameFromUrl(trimmed);
   if (!name) throw new Error(`could not derive a repo name from URL: ${url}`);
-  const parent = clonesParent();
   const dest = join(parent, name);
   if (existsSync(dest)) {
     throw new Error(`destination already exists: ${dest}`);

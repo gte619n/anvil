@@ -78,7 +78,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .conn-dot.connected { background: #21ba45; }
 .conn-dot.connecting { background: #f2c037; animation: think-pulse 1.4s infinite ease-in-out; }
 .conn-dot.disconnected { background: var(--danger); }
-#theme-toggle { background: none; border: none; cursor: pointer; color: var(--muted); padding: 2px; }
+#new-session-top { color: var(--accent); }
 /* Concierge row: pinned at the top, never scrolls or reorders. */
 #concierge-list { list-style: none; margin: 0; padding: 0; flex-shrink: 0; }
 #session-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; min-height: 60px; }
@@ -92,8 +92,6 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 #finished-list { min-height: 6px; border-radius: 8px; max-height: 34vh; overflow-y: auto; }
 #finished-list.drag-over { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 #finished-list:empty::after { content: "Drop finished sessions here"; display: block; color: var(--muted); font-size: 11px; font-style: italic; text-align: center; padding: 12px 8px; margin-top: 2px; border: 1px dashed var(--border); border-radius: 8px; }
-/* + button that opens the new-session flow, sitting on the pinned concierge row. */
-.session .new-session { color: var(--accent); }
 /* Drag-to-reorder (SortableJS): rows aren't text-selectable so an Android long-press lifts the row
    instead of triggering copy/paste selection. */
 .session { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
@@ -130,6 +128,12 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .settings-section { margin-bottom: 28px; }
 .settings-section h3 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
 .section-head { display: flex; align-items: center; justify-content: space-between; }
+/* Settings → Appearance: light / dark / system theme swatches. */
+.theme-options { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.theme-opt { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; font-size: 13px; }
+.theme-opt .msym { font-size: 18px; }
+.theme-opt:hover { border-color: var(--accent); }
+.theme-opt.active { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--bg)); }
 .card { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px 16px; margin-bottom: 10px; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
@@ -244,6 +248,16 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .reader-choices ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .reader-choices .reader-choice { display: block; padding: 8px 10px; border-radius: 6px; color: var(--accent); text-decoration: none; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
 .reader-choices .reader-choice:hover { background: var(--surface-2, rgba(127,127,127,0.12)); }
+
+/* Android in-app full-screen reader (the WebView shell can't open a real second window). Full-bleed
+   over the app, its own scroll, a header with the filename + a close ✕; the device Back also closes it. */
+.reader-fs { position: fixed; inset: 0; z-index: 60; background: var(--bg); display: flex; flex-direction: column; animation: modal-fade 0.15s ease; }
+.reader-fs-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.reader-fs-title { flex: 1; min-width: 0; font: 600 13px/1.4 ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reader-fs-close { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; padding: 4px; flex-shrink: 0; }
+.reader-fs-close:hover { color: var(--accent); }
+.reader-fs-close .msym { font-size: 22px; }
+.reader-fs-body { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; padding: 18px clamp(16px, 4vw, 32px); }
 
 .git-panel { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .git-status { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
@@ -677,6 +691,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 
 /* ── Autopilot (plan review & launch) ──────────────────────────────────────────── */
 .foot-badge { margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+/* Live "autopilot is running" spinner in the sidebar foot — visible on every client while a run is in flight, even with the Autopilot view closed. margin-left:auto pushes it (and any badge after it) to the right. */
+.foot-spin { margin-left: auto; font-size: 18px; color: var(--accent); }
+.foot-spin + .foot-badge { margin-left: 6px; }
 .autopilot-view { position: fixed; inset: 0; z-index: 50; background: var(--panel); display: flex; flex-direction: column; }
 .ap-head-actions { display: inline-flex; align-items: center; gap: 10px; }
 .autopilot-view .primary { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }
@@ -720,14 +737,25 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-chip.eff-m { color: #f2c037; }
 .ap-chip.eff-l, .ap-chip.eff-xl { color: #e8703a; }
 
-/* Plan reader + refine chat */
-.plan-reader { display: flex; flex-direction: column; height: 100%; }
+/* Plan reader + refine chat. The plan reads full-width; the refine conversation is a slide-over drawer
+   (Option A), so `position: relative` anchors that drawer and `overflow: hidden` clips it off-screen
+   when closed (the body owns the vertical scroll, so this never clips the document). */
+.plan-reader { display: flex; flex-direction: column; height: 100%; position: relative; overflow: hidden; }
 .plan-reader-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .plan-reader-title { font-weight: 700; font-size: 15px; flex: 1; min-width: 140px; }
-.plan-reader-actions { display: inline-flex; align-items: center; gap: 8px; }
-.plan-reader-body { display: grid; grid-template-columns: 1fr 320px; gap: 18px; align-items: start; }
-.plan-doc { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 16px 20px; max-height: calc(100vh - 200px); overflow: auto; }
+.plan-reader-actions { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.plan-reader-body { flex: 1; min-height: 0; overflow: auto; }
+.plan-doc { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 16px 20px; max-width: 980px; margin: 0 auto; }
 .plan-refine { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px; position: sticky; top: 0; }
+/* Refine drawer: slides in over the plan's right edge; dismissible via a close button or the backdrop. */
+.plan-refine-drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 380px; max-width: 92%; margin: 0; border: none; border-left: 1px solid var(--border); border-radius: 0; box-shadow: -6px 0 22px rgba(0, 0, 0, 0.18); display: flex; flex-direction: column; transform: translateX(100%); transition: transform 0.2s ease; z-index: 8; }
+.plan-refine-drawer.open { transform: translateX(0); }
+.plan-refine-head { display: flex; align-items: center; gap: 8px; }
+.plan-refine-head h4 { margin: 0; flex: 1; }
+.plan-refine-drawer .plan-refine-log { flex: 1; max-height: none; }
+.plan-refine-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.18); z-index: 7; }
+.plan-refine-backdrop[hidden] { display: none; }
+.autopilot-view .mini[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .plan-refine h4 { margin: 0 0 4px; display: flex; align-items: center; gap: 6px; font-size: 14px; }
 .plan-refine h4 .msym { font-size: 18px; color: var(--accent); }
 .plan-refine-log { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; max-height: 40vh; overflow: auto; }
@@ -803,10 +831,8 @@ input:focus, select:focus, textarea:not(#input):focus {
 @media (max-width: 700px) {
   /* on narrow screens the sidebar overlays the conversation instead of squishing it */
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
-  /* the plan reader stacks: full-width doc, refine chat below it */
-  .plan-reader-body { grid-template-columns: 1fr; }
-  .plan-doc { max-height: none; }
-  .plan-refine { position: static; }
+  /* the refine drawer goes full-screen on a phone (the plan doc already reads full-width) */
+  .plan-refine-drawer { width: 100%; max-width: 100%; }
   /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
   .resizer { display: none; }
 }

@@ -67,6 +67,16 @@ export function nextScheduledFire(sched: AutopilotSchedule, now: Date): Date | u
   return undefined;
 }
 
+/**
+ * Whether a run that began at `startedAt` (epoch ms) still counts as live, given a `budgetMs` ceiling.
+ * The live-run state the daemon broadcasts is DERIVED from this rather than stored as a boolean: a run
+ * older than the budget reports not-running automatically, so a hung run (an await that never settles,
+ * a finally that never fires) can never latch the "autopilot running" spinner. `undefined` = idle.
+ */
+export function runWithinBudget(startedAt: number | undefined, now: number, budgetMs: number): boolean {
+  return startedAt !== undefined && now - startedAt < budgetMs;
+}
+
 /** Due = enabled, a fire time has passed, and we haven't run since that fire (catch-up included). */
 export function isRunDue(sched: AutopilotSchedule, now: Date, lastRunAt?: string): boolean {
   const fire = lastScheduledFire(sched, now);

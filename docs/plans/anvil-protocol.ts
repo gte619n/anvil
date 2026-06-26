@@ -454,6 +454,14 @@ export interface AutopilotRunResultEvent extends Envelope {
   skipped: number; // tasks already in the pipeline
   output: string; // human-readable log (or the error message when ok=false)
 }
+/** The in-flight run's accumulated progress, sent to a client on connect so a refreshed or late-joining
+ *  screen restores the live view (running header + log) instead of blanking. `log` is empty when idle. */
+export interface AutopilotRunSnapshotEvent extends Envelope {
+  type: "autopilot.run.snapshot";
+  cid?: Cid;
+  running: boolean;
+  log: string[]; // progress lines so far, oldest first
+}
 /** Result of an autopilot maintenance command (`autopilot.tags.reset` / `autopilot.clear`). "reset"
  *  strips anvil:* status labels (keeping the user's Autopilot sourcing label) so tasks re-enter the
  *  candidate pool; "clear" additionally wipes the whole pending pipeline. Carries cid. */
@@ -479,12 +487,15 @@ export interface AutopilotSchedule {
   // project, bundled against `defaultEnvironmentId`, and left for review (never auto-started).
   defaultEnvironmentId?: string; // catch-all environment label-sourced tasks are planned/built against
 }
-/** The current schedule — answer to `autopilot.schedule.get`/`.set` (cid) and broadcast on change. */
+/** The current schedule — answer to `autopilot.schedule.get`/`.set` (cid) and broadcast on change.
+ *  Also broadcast (to every client) whenever a run starts or finishes, so any device — including one
+ *  that didn't trigger the run, or that connected mid-run — can reflect the live `running` state. */
 export interface AutopilotScheduleEvent extends Envelope {
   type: "autopilot.schedule";
   cid?: Cid;
   schedule: AutopilotSchedule;
   nextRunAt?: Iso8601; // computed next fire, for display
+  running: boolean; // whether an autopilot run is in progress right now (server-authoritative)
 }
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
 export type GitOp = "status" | "diff" | "commit" | "push" | "create-pr" | "merge-pr";
@@ -669,6 +680,7 @@ export type ServerEvent =
   | AutopilotStartedEvent
   | AutopilotRunProgressEvent
   | AutopilotRunResultEvent
+  | AutopilotRunSnapshotEvent
   | AutopilotMaintenanceResultEvent
   | AutopilotScheduleEvent
   | GitResultEvent

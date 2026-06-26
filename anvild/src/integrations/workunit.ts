@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AutopilotEffort } from "@protocol";
 import { newId } from "../util/ids";
@@ -87,11 +87,24 @@ export class WorkUnitStore {
     if (!existsSync(this.file)) return;
     try {
       this.units = (JSON.parse(readFileSync(this.file, "utf8")).workunits ?? []) as WorkUnit[];
-    } catch {
-      /* start empty on a corrupt file */
+    } catch (e) {
+      // A truncated/corrupt file must NOT silently wipe every work unit — the next save() would then
+      // persist the empty list and the autopilot history is gone for good (with the member tasks left
+      // orphan-tagged anvil:*). Move the bad file aside (kept for forensics) and start empty so the
+      // daemon can still come up; mirrors SessionStore.loadAll().
+      const backup = `${this.file}.corrupt-${Date.now()}`;
+      try {
+        renameSync(this.file, backup);
+        console.error(`[workunit] workunits.json was unreadable (${e instanceof Error ? e.message : e}); backed up to ${backup}`);
+      } catch {
+        /* best-effort */
+      }
     }
   }
+  /** Atomic write (tmp + rename) so a crash mid-write can never truncate the store. */
   private save(): void {
-    writeFileSync(this.file, JSON.stringify({ workunits: this.units }, null, 2));
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ workunits: this.units }, null, 2));
+    renameSync(tmp, this.file);
   }
 }

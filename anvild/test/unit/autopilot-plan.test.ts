@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { extractPlanMeta } from "../../src/integrations/plan-meta";
 import { readStatus, withStatus, STATUSES } from "../../src/integrations/status";
 import { WorkUnitStore } from "../../src/integrations/workunit";
+import { TodoistClient } from "../../src/integrations/todoist";
 
 // extractPlanMeta is the pure (SDK-free) parser for the planner's trailing metadata block.
 
@@ -56,6 +57,16 @@ test("dismissed is a first-class anvil status", () => {
   expect(labels).toContain("waiting"); // user labels preserved
   expect(labels).not.toContain("anvil:planned"); // exactly one anvil status at a time
   expect(readStatus(labels)).toBe("dismissed");
+});
+
+// The autopilot run's watchdog cancels via a run-level AbortSignal threaded into the Todoist client.
+// An already-aborted signal must short-circuit a request before it touches the network — that's the
+// wiring that lets a hung run unwind instead of latching the "running" spinner open forever.
+
+test("TodoistClient honors a run-level abort signal (no network)", async () => {
+  const client = new TodoistClient("fake-token", AbortSignal.abort());
+  // whoami() → request() → fetch with the aborted signal: rejects immediately, never connects.
+  await expect(client.whoami()).rejects.toMatchObject({ name: "AbortError" });
 });
 
 // pendingPlans() (supervisor) = status "planned" && no sessionId; mirror that filter over the store.
