@@ -378,6 +378,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
           return new Response("bad request", { status: 400 });
         }
       }
+      if (url.pathname === "/api/push/apns/register" && req.method === "POST") {
+        try {
+          const { token } = (await req.json()) as { token?: string };
+          if (token) supervisor.apns.register(token);
+          return Response.json({ ok: true });
+        } catch {
+          return new Response("bad request", { status: 400 });
+        }
+      }
+      if (url.pathname === "/api/push/apns/unregister" && req.method === "POST") {
+        try {
+          const { token } = (await req.json()) as { token?: string };
+          if (token) supervisor.apns.unregister(token);
+          return Response.json({ ok: true });
+        } catch {
+          return new Response("bad request", { status: 400 });
+        }
+      }
       if (url.pathname === "/api/push/unsubscribe" && req.method === "POST") {
         try {
           const { endpoint } = (await req.json()) as { endpoint?: string };

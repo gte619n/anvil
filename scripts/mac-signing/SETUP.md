@@ -60,14 +60,16 @@ Exchange (.p12)** → save as `DeveloperID.p12` → set an **export password**
 
 ---
 
-## 2. Create the App Store Connect API key (for notarization)
+## 2. Create the App Store Connect API key (notarization + iOS upload)
 
-Notarization needs credentials to talk to Apple. An API key is cleaner than an
-app-specific password (no expiry surprises).
+Notarization needs credentials to talk to Apple, and so does the iOS TestFlight
+upload. **One** API key serves both. An API key is cleaner than an app-specific
+password (no expiry surprises).
 
 1. <https://appstoreconnect.apple.com/access/integrations/api> → **Team Keys**
    (or **Integrations → App Store Connect API**) → **+** to generate a key.
-2. **Name**: e.g. "mac notarization". **Access**: **Developer** role is enough.
+2. **Name**: e.g. "anvil ci". **Access**: **App Manager** — needed so the same key
+   can upload builds to TestFlight (the Developer role only covers notarization).
 3. **Generate**, then **Download** the `AuthKey_XXXXXXXX.p8` — *you only get one
    download*. Save it.
 4. Note two values from that page:
@@ -150,6 +152,42 @@ spctl -a -vvv --type exec /path/to/App.app
 ```
 
 ---
+
+## 5. iOS / iPadOS → TestFlight
+
+The iOS app reuses the API key from step 2 and adds an **Apple Distribution**
+cert. Signing is automatic (xcodebuild manages the provisioning profile via the
+API key), so you only store the cert + Team ID — no profile to manage.
+
+1. **Apple Distribution cert** — create it the same CSR way as step 1 (pick
+   *Apple Distribution* in the portal), export the `.p12` with a password. Or all
+   in `openssl` (see `apple/README.md`).
+2. **Team ID** — the 10-char id from developer.apple.com → Membership details.
+3. **APNs auth key** — Keys → **+** → Apple Push Notifications service → download
+   the `AuthKey_*.p8`, note its Key ID. (Token-based; one key for dev + prod.)
+4. **App record** — App Store Connect → Apps → **+** → New App, bundle id
+   `com.gte619n.anvil`. TestFlight needs somewhere to receive the build.
+5. Push the iOS secrets (groups are independent — add to what step 3 already pushed):
+   ```sh
+   ./push-secrets.sh \
+     --ios-p12 ~/ios_dist.p12 --ios-p12-pass 'pw' --team-id TEAMID \
+     --apns-p8 ~/AuthKey_TPMBBMT6MZ.p8 --apns-key-id TPMBBMT6MZ
+   ```
+6. **Build locally** (full Xcode required): `source ~/.config/oxos-signing/env.sh`
+   then `cd apple && ./make-ios.sh`.
+7. **CI** (`.github/workflows/ios-release.yml`): mirror the secrets into GitHub
+   once with `./sync-github-secrets.sh`, then `gh workflow run ios-release.yml`.
+
+| iOS secret name | Contents |
+|---|---|
+| `ios-distribution-p12` | base64 of the Apple Distribution `.p12` |
+| `ios-distribution-p12-pass` | its export password |
+| `apple-team-id` | 10-char Team ID |
+| `apns-auth-key-p8` | base64 of the APNs `AuthKey_*.p8` |
+| `apns-key-id` | the APNs key's Key ID |
+
+`provision.sh` on the daemon host also assembles `~/.config/anvil/apns-key.json`
+from the APNs secret + Team ID, so the push sender is ready after a restart.
 
 ## Rotation / renewal
 - **Cert expires** (Developer ID certs last 5 years): create a new one (step 1),

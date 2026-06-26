@@ -836,3 +836,30 @@ input:focus, select:focus, textarea:not(#input):focus {
   /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
   .resizer { display: none; }
 }
+
+/* ── Safe-area insets (iOS notch / Dynamic Island / home indicator) ──────────────
+   index.html sets viewport-fit=cover, so the native WebView extends edge-to-edge
+   under the device safe areas. env(safe-area-inset-*) is 0 on desktop, Android, and
+   non-notched devices, so every calc() below is a no-op there — these only take
+   effect on iPhone/iPad where the chrome would otherwise sit under the status bar,
+   the home indicator, or (in landscape) the notch. */
+#header {
+  padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  padding-right: calc(16px + env(safe-area-inset-right, 0px));
+}
+#composer {
+  padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  padding-right: calc(16px + env(safe-area-inset-right, 0px));
+}
+#sidebar {
+  padding-left: calc(12px + env(safe-area-inset-left, 0px));
+  padding-top: calc(12px + env(safe-area-inset-top, 0px));
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+}
+/* Full-screen overlays fill behind the status bar (their bg covers it); push their
+   own content below the notch. */
+.settings-view,
+.autopilot-view,
+#side-panel {
+  padding-top: env(safe-area-inset-top, 0px);
+}

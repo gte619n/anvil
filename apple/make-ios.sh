@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# Build the iOS/iPadOS app and upload it to TestFlight (App Store Connect).
+#
+# Unlike make-app.sh (macOS, Command-Line-Tools only), this needs FULL Xcode.app and an Apple
+# Developer Program account. It uses AUTOMATIC signing driven by an App Store Connect API key:
+# xcodebuild creates/updates the provisioning profile itself (-allowProvisioningUpdates), so the
+# only thing that must already be in a keychain on the search list is the Apple Distribution cert
+# (provision.sh imports it locally; the CI workflow imports it into a temp keychain).
+#
+# Required env (provision.sh writes these into ~/.config/oxos-signing/env.sh):
+#   APPLE_TEAM_ID        10-char Apple Developer Team ID
+#   APPLE_API_KEY        App Store Connect API Key ID
+#   APPLE_API_ISSUER     App Store Connect Issuer ID (UUID)
+#   APPLE_API_KEY_PATH   path to the AuthKey_*.p8
+# Optional:
+#   ANVIL_BUILD_NUMBER   CFBundleVersion (must be unique per TestFlight upload; default 1)
+#
+# Usage:
+#   source ~/.config/oxos-signing/env.sh
+#   ./make-ios.sh             # rebundle web, archive, export, upload
+#   ./make-ios.sh --skip-web  # reuse the existing Sources/Anvil/web bundle
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # apple/
+ROOT="$(cd "$HERE/.." && pwd)"                          # repo root
+SCHEME="Anvil-iOS"
+XCODEPROJ="$HERE/Anvil.xcodeproj"
+RELEASE_ENTITLEMENTS="$HERE/Resources/Anvil-iOS-Release.entitlements"
+BUILD_NUMBER="${ANVIL_BUILD_NUMBER:-1}"
+SKIP_WEB=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --skip-web) SKIP_WEB=1 ;;
+    *) echo "unknown arg: $arg (supported: --skip-web)" >&2; exit 2 ;;
+  esac
+done
+
+die() { echo "✗ $*" >&2; exit 1; }
+require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+require xcodegen; require xcodebuild; require bun
+xcode-select -p 2>/dev/null | grep -q "Xcode.app" || die "full Xcode.app required (xcode-select -p points at the CLT). Install Xcode and: sudo xcode-select -s /Applications/Xcode.app"
+
+: "${APPLE_TEAM_ID:?set APPLE_TEAM_ID (source ~/.config/oxos-signing/env.sh after provision.sh)}"
+: "${APPLE_API_KEY:?set APPLE_API_KEY (App Store Connect Key ID)}"
+: "${APPLE_API_ISSUER:?set APPLE_API_ISSUER (App Store Connect Issuer ID)}"
+: "${APPLE_API_KEY_PATH:?set APPLE_API_KEY_PATH (path to AuthKey_*.p8)}"
+[ -f "$APPLE_API_KEY_PATH" ] || die "APPLE_API_KEY_PATH not found: $APPLE_API_KEY_PATH"
+
+# ── 1. bundle the web client (same generator the macOS app + Android use) ───
+if [[ "$SKIP_WEB" == "0" ]]; then
+  echo "▸ bundling web client…"
+  ( cd "$ROOT/anvild" && bun run build:web )
+  ( cd "$ROOT/anvild" && bun run web/bundle-native.ts "$HERE/Sources/Anvil/web" )
+else
+  [[ -f "$HERE/Sources/Anvil/web/index.html" ]] || die "Sources/Anvil/web missing — run without --skip-web"
+fi
+
+# ── 2. generate the Xcode project ───────────────────────────────────────────
+echo "▸ xcodegen generate…"
+( cd "$HERE" && xcodegen generate )
+
+BUILD_DIR="$HERE/build"
+ARCHIVE="$BUILD_DIR/Anvil.xcarchive"
+EXPORT_DIR="$BUILD_DIR/export"
+rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
+
+# Auth flags shared by archive + export: let xcodebuild manage the profile via the API key.
+AUTH=(-allowProvisioningUpdates
+  -authenticationKeyPath "$APPLE_API_KEY_PATH"
+  -authenticationKeyID "$APPLE_API_KEY"
+  -authenticationKeyIssuerID "$APPLE_API_ISSUER")
+
+# ── 3. archive (Release → production APNs entitlement, automatic signing) ───
+echo "▸ archiving (build $BUILD_NUMBER)…"
+xcodebuild archive \
+  -project "$XCODEPROJ" -scheme "$SCHEME" -configuration Release \
+  -archivePath "$ARCHIVE" \
+  -destination 'generic/platform=iOS' \
+  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+  CODE_SIGN_STYLE=Automatic \
+  CODE_SIGN_ENTITLEMENTS="$RELEASE_ENTITLEMENTS" \
+  CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+  "${AUTH[@]}"
+
+# ── 4. ExportOptions → export + upload straight to App Store Connect ────────
+cat > "$BUILD_DIR/ExportOptions.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>          <string>app-store</string>
+    <key>destination</key>     <string>upload</string>
+    <key>teamID</key>          <string>$APPLE_TEAM_ID</string>
+    <key>signingStyle</key>    <string>automatic</string>
+    <key>uploadSymbols</key>   <true/>
+</dict>
+</plist>
+PLIST
+
+echo "▸ exporting + uploading to TestFlight…"
+xcodebuild -exportArchive \
+  -archivePath "$ARCHIVE" \
+  -exportOptionsPlist "$BUILD_DIR/ExportOptions.plist" \
+  -exportPath "$EXPORT_DIR" \
+  "${AUTH[@]}"
+
+echo
+echo "✓ uploaded build $BUILD_NUMBER to App Store Connect."
+echo "  It appears under TestFlight after Apple finishes processing (a few minutes)."

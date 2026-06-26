@@ -29,12 +29,14 @@ P12_PASS="$(secret_get "$SECRET_P12_PASS")"
 IDENTITY="$(secret_get "$SECRET_IDENTITY")"
 KEY_ID="$(secret_get "$SECRET_NOTARY_KEY_ID")"
 ISSUER="$(secret_get "$SECRET_NOTARY_ISSUER")"
+# Apple Team ID + iOS cert are optional — present once the iOS client is set up.
+TEAM_ID=""; secret_exists "$SECRET_TEAM_ID" && TEAM_ID="$(secret_get "$SECRET_TEAM_ID")"
 
 # --- dedicated keychain -----------------------------------------------------
 # Per-machine random keychain password; never leaves this Mac.
 KC_PASS="$(security find-generic-password -s oxos-signing-kc -w 2>/dev/null || true)"
 if [ -z "$KC_PASS" ]; then
-  KC_PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)"
+  KC_PASS="$(openssl rand -hex 32)"   # pipe-free (tr|head SIGPIPEs under set -o pipefail)
   security add-generic-password -s oxos-signing-kc -a "$USER" -w "$KC_PASS" 2>/dev/null || true
 fi
 
@@ -56,11 +58,42 @@ security import "$tmp/cert.p12" -k "$KEYCHAIN_PATH" -P "$P12_PASS" \
 # Allow codesign to use the key without an interactive prompt.
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN_PATH" >/dev/null
 
+# Apple intermediate CAs. A .p12 built with `openssl pkcs12` holds ONLY the leaf cert, so the chain
+# can't validate (find-identity -v shows 0 valid) until the issuing intermediate is in the keychain.
+# Keychain Access exports bundle these automatically; openssl ones don't. Import the ones our certs
+# chain to (Developer ID → G2, Apple Distribution/WWDR → G3). Roots are already system-trusted.
+import_apple_ca() {
+  local url="$1"
+  local out="$tmp/$(basename "$url")"
+  if curl -fsSL "$url" -o "$out" 2>/dev/null; then
+    security import "$out" -k "$KEYCHAIN_PATH" 2>/dev/null || true
+  else
+    echo "  ! could not fetch $(basename "$url") — chain may not validate offline"
+  fi
+}
+import_apple_ca https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+import_apple_ca https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+
 # --- verify the identity is usable -----------------------------------------
 if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q "$IDENTITY"; then
   die "identity not found in keychain after import: $IDENTITY"
 fi
 echo "✓ signing identity ready: $IDENTITY"
+
+# --- iOS distribution cert (optional) --------------------------------------
+# Imported into the same keychain so a local `apple/make-ios.sh` can sign + upload to TestFlight.
+if secret_exists "$SECRET_IOS_P12"; then
+  secret_get "$SECRET_IOS_P12" | base64 -D -o "$tmp/ios.p12"
+  IOS_P12_PASS="$(secret_get "$SECRET_IOS_P12_PASS")"
+  security import "$tmp/ios.p12" -k "$KEYCHAIN_PATH" -P "$IOS_P12_PASS" \
+    -T /usr/bin/codesign -T /usr/bin/xcodebuild 2>/dev/null || true
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KEYCHAIN_PATH" >/dev/null
+  if security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -q "Apple Distribution"; then
+    echo "✓ iOS Apple Distribution cert imported"
+  else
+    echo "  ! iOS cert imported but 'Apple Distribution' identity not visible — check the .p12"
+  fi
+fi
 
 # --- env file the builds source --------------------------------------------
 cat > "$ENV_FILE" <<EOF
@@ -69,11 +102,26 @@ export APPLE_SIGNING_IDENTITY="$IDENTITY"
 export APPLE_API_KEY="$KEY_ID"          # App Store Connect Key ID
 export APPLE_API_ISSUER="$ISSUER"       # App Store Connect Issuer ID
 export APPLE_API_KEY_PATH="$P8_PATH"    # path to the AuthKey .p8
+export APPLE_TEAM_ID="$TEAM_ID"         # 10-char Team ID (consumed by apple/make-ios.sh)
 export SIGN_ID="\$APPLE_SIGNING_IDENTITY"  # alias consumed by Anvil's make-app.sh
 EOF
 chmod 600 "$ENV_FILE"
 
 echo "✓ wrote $ENV_FILE"
+
+# --- daemon APNs config (optional) -----------------------------------------
+# If the APNs key is in Secret Manager, assemble ~/.config/anvil/apns-key.json so the daemon's
+# push sender (anvild/src/push/apns.ts) is ready. Only meaningful on the daemon host.
+if secret_exists "$SECRET_APNS_P8" && [ -n "$TEAM_ID" ]; then
+  require jq
+  mkdir -p "$ANVIL_CONFIG_DIR"; chmod 700 "$ANVIL_CONFIG_DIR"
+  secret_get "$SECRET_APNS_P8" | base64 -D -o "$tmp/apns.p8"
+  APNS_KEY_ID="$(secret_get "$SECRET_APNS_KEY_ID")"
+  jq -n --arg key "$(cat "$tmp/apns.p8")" --arg kid "$APNS_KEY_ID" --arg team "$TEAM_ID" --arg bundle "$APNS_BUNDLE_ID" \
+    '{keyId:$kid, teamId:$team, bundleId:$bundle, key:$key, production:true}' > "$APNS_KEY_JSON"
+  chmod 600 "$APNS_KEY_JSON"
+  echo "✓ wrote $APNS_KEY_JSON (restart the daemon to pick it up)"
+fi
 echo
 echo "Next: in any build shell run"
 echo "    source \"$ENV_FILE\""

@@ -66,6 +66,7 @@ import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
 import { WebPush, type PushPayload } from "../push/webpush";
 import { Fcm } from "../push/fcm";
+import { Apns } from "../push/apns";
 
 /** A client command that can't be honored (bad args, no such session). → command.error. */
 export class BadCommand extends Error {}
@@ -145,6 +146,7 @@ export class Supervisor {
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
+  readonly apns: Apns;
   private readonly clonesDir: string;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
@@ -158,6 +160,7 @@ export class Supervisor {
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
+    this.apns = new Apns(cfg.stateDir);
     this.rateLimits = new RateLimitTracker({
       stateDir: cfg.stateDir,
       warnFraction: cfg.warnFraction ?? 0.8,
@@ -780,6 +783,7 @@ export class Supervisor {
       const payload: PushPayload = { title: "Anvil autopilot", body, tag: "autopilot", kind: "result" };
       void this.webpush.notify(payload);
       void this.fcm.notify(payload);
+      void this.apns.notify(payload);
     }
     return { created, skipped, started, output: this.autopilotRunLog.join("\n") };
   }
@@ -1408,6 +1412,7 @@ export class Supervisor {
     const payload: PushPayload = { title: data?.title ?? "Anvil", body: "", sessionId, tag: sessionId, kind: "clear" };
     void this.webpush.notify(payload);
     void this.fcm.notify(payload);
+    void this.apns.notify(payload);
   }
 
   setModel(id: string, model: Model): void {
@@ -1660,6 +1665,7 @@ export class Supervisor {
       this.notified.add(sessionId); // remember so a later view/answer can dismiss it everywhere
       void this.webpush.notify(payload); // desktop browsers
       void this.fcm.notify(payload); // Android client
+      void this.apns.notify(payload); // iOS/iPadOS client
     }
   }
 
