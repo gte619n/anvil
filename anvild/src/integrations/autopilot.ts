@@ -46,7 +46,17 @@ State the expected passing outcome for each check so success is unambiguous. Gro
  * `ExitPlanMode` input (the actual markdown plan, when present) and `text` is the closing message.
  * Planning callers want `plan`; the JSON-emitting bundler wants `text`.
  */
-async function runQuery(prompt: string, opts: { model: Model; cwd?: string; readonly?: boolean }): Promise<{ text: string; plan?: string }> {
+async function runQuery(
+  prompt: string,
+  opts: { model: Model; cwd?: string; readonly?: boolean; signal?: AbortSignal },
+): Promise<{ text: string; plan?: string }> {
+  // Bridge the run-level signal to the SDK's AbortController so a cancelled/timed-out run tears down the
+  // planning subprocess instead of leaving it spinning (and the run — and its spinner — pinned open).
+  const ac = new AbortController();
+  if (opts.signal) {
+    if (opts.signal.aborted) ac.abort();
+    else opts.signal.addEventListener("abort", () => ac.abort(), { once: true });
+  }
   const q = query({
     prompt,
     options: {
@@ -56,6 +66,7 @@ async function runQuery(prompt: string, opts: { model: Model; cwd?: string; read
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
       executable: "bun",
+      abortController: ac,
       // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
       // effect for the next planning/refine run without restarting the daemon. See AuthStore.
       env: buildAgentEnv(),
@@ -128,7 +139,7 @@ function taskLine(t: TodoistTask, sectionName?: string): string {
 export async function bundleTasks(
   tasks: TodoistTask[],
   sections: TodoistSection[],
-  opts: { model?: Model; repoName?: string } = {},
+  opts: { model?: Model; repoName?: string; signal?: AbortSignal } = {},
 ): Promise<ProposedUnit[]> {
   if (tasks.length === 0) return [];
   const sectionName = (id?: string | null) => sections.find((s) => s.id === id)?.name;
@@ -146,7 +157,7 @@ ${list}
 Respond with ONLY a JSON array, no prose:
 [{"title": "...", "rationale": "...", "taskIds": ["id1","id2"]}]`;
 
-  const out = await runQuery(prompt, { model: opts.model ?? "sonnet" });
+  const out = await runQuery(prompt, { model: opts.model ?? "sonnet", signal: opts.signal });
   const units = extractJson<ProposedUnit[]>(out.text);
   // Defensive: keep only real candidate ids, drop empty units.
   const valid = new Set(tasks.map((t) => t.id));
@@ -162,7 +173,7 @@ Respond with ONLY a JSON array, no prose:
 export async function planUnit(
   unit: ProposedUnit,
   tasks: TodoistTask[],
-  opts: { model?: Model; repoRoot: string },
+  opts: { model?: Model; repoRoot: string; signal?: AbortSignal },
 ): Promise<PlannedUnit> {
   const members = tasks.filter((t) => unit.taskIds.includes(t.id));
   const taskBlock = members.map((t) => taskLine(t)).join("\n");
@@ -180,7 +191,7 @@ ${VALIDATION_INSTRUCTION}
 
 ${PLAN_META_INSTRUCTION}`;
 
-  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true, signal: opts.signal });
   const { plan, summary, effort } = resolvePlan(out);
   return { ...unit, tasks: members, plan, summary, effort };
 }
@@ -241,6 +252,7 @@ export async function planAndTagProject(
     repoName?: string;
     bundleModel?: Model;
     planModel?: Model;
+    signal?: AbortSignal; // run-level abort: a cancelled/timed-out run unwinds in-flight planning
     onProgress?: (msg: string) => void;
     onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
   },
@@ -252,12 +264,12 @@ export async function planAndTagProject(
   log(`${tasks.length} active tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
   if (candidates.length === 0) return { created: [], skipped };
 
-  const units = await bundleTasks(candidates, sections, { model: opts.bundleModel, repoName: opts.repoName });
+  const units = await bundleTasks(candidates, sections, { model: opts.bundleModel, repoName: opts.repoName, signal: opts.signal });
   log(`Bundled into ${units.length} units. Planning + tagging…`);
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot });
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal });
     const wu = deps.workUnits.create({
       environmentId: opts.environmentId,
       todoistProjectId: opts.projectId,
@@ -297,6 +309,7 @@ export async function planAndTagTasks(
     tasks: TodoistTask[];
     bundleModel?: Model;
     planModel?: Model;
+    signal?: AbortSignal; // run-level abort: a cancelled/timed-out run unwinds in-flight planning
     onProgress?: (msg: string) => void;
     onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
   },
@@ -307,12 +320,12 @@ export async function planAndTagTasks(
   log(`${opts.tasks.length} labelled tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
   if (candidates.length === 0) return { created: [], skipped };
 
-  const units = await bundleTasks(candidates, [], { model: opts.bundleModel, repoName: opts.repoName });
+  const units = await bundleTasks(candidates, [], { model: opts.bundleModel, repoName: opts.repoName, signal: opts.signal });
   log(`Bundled into ${units.length} units. Planning + tagging…`);
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot });
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal });
     const wu = deps.workUnits.create({
       environmentId: opts.environmentId,
       todoistProjectId: planned.tasks[0]?.project_id ?? "",

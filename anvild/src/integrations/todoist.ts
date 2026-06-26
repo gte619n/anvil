@@ -4,6 +4,10 @@
  * are cursor-paginated: `{ results, next_cursor }` — `getAll` walks the cursor for us.
  */
 const API_BASE = "https://api.todoist.com/api/v1";
+// A single hung request must never block a caller forever — Todoist calls are quick, so cap each one.
+// (An autopilot run awaits many of these; without a per-call ceiling one stalled socket latches the
+// whole run, and with it the "running" spinner. See TodoistClient's run-level signal too.)
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export interface TodoistUser {
   id: string;
@@ -83,15 +87,25 @@ export class TodoistError extends Error {
 }
 
 export class TodoistClient {
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    /** Optional run-level abort: when the caller's run is cancelled (e.g. the autopilot watchdog), every
+     *  in-flight request unwinds instead of hanging. Composed with a per-request timeout below. */
+    private readonly signal?: AbortSignal,
+  ) {}
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    // Abort the request when EITHER the run is cancelled OR this call outlives REQUEST_TIMEOUT_MS, so a
+    // stalled connection can't latch a run (and the spinner) open. The run-level signal is optional.
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const signal = this.signal ? AbortSignal.any([this.signal, timeout]) : timeout;
     const res = await fetch(`${API_BASE}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${this.token}`,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
+      signal,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     if (!res.ok) {
