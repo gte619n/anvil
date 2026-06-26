@@ -185,6 +185,7 @@ test("fresh-worktree session: create checks out a worktree, kill removes it", as
   expect(existsSync(s.data.cwd)).toBe(true);
 
   await sup.kill(s.id);
+  await sup.settle(); // kill backgrounds the worktree reap — wait for it before asserting
   expect(existsSync(s.data.cwd)).toBe(false);
 
   rmSync(dir, { recursive: true, force: true });
@@ -199,6 +200,7 @@ test("killing a session removes it and its state dir", async () => {
   expect(existsSync(stateSub)).toBe(true);
 
   await sup.kill(s.id);
+  await sup.settle(); // kill backgrounds the state-dir reap — wait for it before asserting
   expect(sup.get(s.id)).toBeUndefined();
   expect(existsSync(stateSub)).toBe(false);
   rmSync(dir, { recursive: true, force: true });

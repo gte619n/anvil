@@ -64,7 +64,7 @@ export function locateInside(root: string, userPath: string): Located {
   // A typed-out path narrows by suffix; a bare basename keeps every match (and may be ambiguous).
   const matches = suffix.includes("/") ? all.filter((m) => m.rel === suffix || m.rel.endsWith(`/${suffix}`)) : all;
   if (matches.length === 0) throw new FileNotFound(`Couldn't find ${userPath} in this session.`);
-  if (matches.length === 1) return { kind: "file", abs: resolveInside(root, matches[0].rel) }; // re-check boundary
+  if (matches.length === 1) return { kind: "file", abs: resolveInside(root, matches[0]!.rel) }; // re-check boundary
   return { kind: "choices", paths: matches.map((m) => m.rel).sort() };
 }
 
