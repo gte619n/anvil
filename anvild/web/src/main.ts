@@ -2827,6 +2827,21 @@ function backToGrid(): void {
   else renderAutopilotGrid();
 }
 
+// Keep the floating Refine window clear of the on-screen keyboard. interactive-widget=resizes-content
+// handles this on Android (the layout viewport shrinks, so a bottom-anchored fixed element rides up),
+// but iOS/PWA overlay the keyboard without resizing — there `window.innerHeight` stays full while
+// `visualViewport.height` shrinks, and that gap is the keyboard's height. Lift the window by it so the
+// input never ends up buried. No-op (inset 0) when the keyboard is closed or interactive-widget applies.
+function positionRefineWindow(): void {
+  const win = document.getElementById("plan-refine");
+  if (!win || !win.classList.contains("open")) return;
+  const vv = window.visualViewport;
+  const inset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  (win as HTMLElement).style.bottom = `${inset + 16}px`;
+}
+window.visualViewport?.addEventListener("resize", positionRefineWindow);
+window.visualViewport?.addEventListener("scroll", positionRefineWindow);
+
 /** The full-plan reader + refine chat + Dismiss/Go, rendered in place of the grid (same overlay). */
 function openPlan(id: string): void {
   const p = findPlan(id);
@@ -2879,6 +2894,7 @@ function openPlan(id: string): void {
     refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
     refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
     refineBackdrop.hidden = !open;
+    positionRefineWindow(); // sit the window above the keyboard before it animates in
     // preventScroll: focusing the textarea otherwise makes the browser scroll the plan body to reveal
     // it, snapping the document to the bottom every time the window opens.
     if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus({ preventScroll: true });
