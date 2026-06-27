@@ -207,9 +207,17 @@ const serverWsUrl = (base: string): string => {
   // the socket now handles gracefully — instead of taking the whole app down.
   return typeof location !== "undefined" && location.protocol === "https:" ? ws.replace(/^ws:\/\//i, "wss://") : ws;
 };
+/** When the page is served over https, a plain-http fetch/subresource to a fleet member is blocked by the
+ *  browser as active mixed content (silently — uploads/downloads to non-hub sessions just fail). The WS
+ *  path already force-upgrades ws→wss for this exact reason (serverWsUrl/wsUrl); mirror it here so a member
+ *  stored with an http:// base (tailnet-IP bind, behind `tailscale serve`) is reached over https to match
+ *  the page's security context. If that peer doesn't actually serve https it fails to connect — same
+ *  tradeoff as the WS upgrade — instead of being silently blocked. http pages are left untouched. */
+const securePageUrl = (url: string): string =>
+  typeof location !== "undefined" && location.protocol === "https:" ? url.replace(/^http:\/\//i, "https://") : url;
 /** Resolve a daemon-relative path against a specific server (session-scoped REST routing). */
 const serverApiUrl = (base: string, path: string): string =>
-  /^https?:\/\//i.test(path) ? path : base.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`);
+  securePageUrl(/^https?:\/\//i.test(path) ? path : base.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`));
 const serverFetch = (base: string, path: string, init?: RequestInit): Promise<Response> => fetch(serverApiUrl(base, path), init);
 function ensureServer(url: string): Server {
   const clean = url.replace(/\/+$/, "");
