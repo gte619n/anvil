@@ -19,6 +19,7 @@ import {
   sessionHref,
   setSessionHash,
 } from "./overlays";
+import { initPush, isAndroidApp, nativeBridge } from "./push";
 
 const strToB64 = (s: string): string => {
   const bytes = new TextEncoder().encode(s);
@@ -78,7 +79,7 @@ conversation.addEventListener("scroll", () => {
 });
 
 // ── State ────────────────────────────────────────────────────────────────────
-const sessions = new Map<string, Session>();
+export const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
 // Sessions being cleaned up: shown disabled in the sidebar until the daemon confirms deletion
 // (session.deleted). Transient — not persisted. (UI refinement §8)
@@ -692,80 +693,7 @@ void loadFleetMembers();
 // reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
 if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 
-// Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
-const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
-// The Android WebView shell can't host a second window (no onCreateWindow / multi-window support), so
-// window.open() there is a dead end (a chrome-less, Back-less, unscrollable takeover). The reader's
-// "pop out" therefore opens an in-app full-screen overlay on Android instead of a standalone window
-// (macOS gets a real NSWindow, the web a real tab). The Apple shell doesn't expose AnvilNative, so
-// this matches the Android app specifically, not Mac.
-const isAndroidApp = !!nativeBridge && /Android/i.test(navigator.userAgent);
-if (nativeBridge) {
-  nativeBridge.onmessage = (e) => {
-    try {
-      const r = JSON.parse(e.data) as { ok?: boolean; message?: string };
-      const out = document.getElementById("adb-output");
-      if (out) out.textContent = `${r.ok ? "✓ " : "⚠ "}${r.message ?? ""}`;
-      else toast(r.message ?? "done");
-    } catch {
-      /* ignore */
-    }
-  };
-}
-
-// ── Web Push (arch §6.7) ──────────────────────────────────────────────────────────
-let swReg: ServiceWorkerRegistration | null = null;
-const pushSupported = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-function urlB64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
-  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
-  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
-  const arr = new Uint8Array(new ArrayBuffer(raw.length));
-  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-  return arr;
-}
-async function initPush(): Promise<void> {
-  if (nativeBridge) return; // native shells use platform push (FCM/APNs), not web push / service worker
-  if (!pushSupported) return; // unsupported (e.g. iOS Safari until installed as a PWA)
-  const bell = $("#btn-notify");
-  bell.hidden = false;
-  try {
-    swReg = await navigator.serviceWorker.register("/sw.js");
-  } catch {
-    bell.hidden = true;
-    return;
-  }
-  navigator.serviceWorker.addEventListener("message", (e) => {
-    if (e.data?.type === "open-session" && e.data.sessionId && sessions.has(e.data.sessionId)) selectSession(e.data.sessionId);
-  });
-  bell.addEventListener("click", () => void toggleNotify());
-  void refreshBell();
-}
-async function refreshBell(): Promise<void> {
-  const sub = await swReg?.pushManager.getSubscription();
-  const on = Notification.permission === "granted" && !!sub;
-  const bell = $("#btn-notify");
-  bell.innerHTML = icon(on ? "notifications_active" : "notifications_off");
-  bell.classList.toggle("active", on);
-}
-async function toggleNotify(): Promise<void> {
-  if (!swReg) return;
-  const existing = await swReg.pushManager.getSubscription();
-  if (existing) {
-    await apiFetch("/api/push/unsubscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: existing.endpoint }) });
-    await existing.unsubscribe();
-    toast("Notifications off");
-  } else {
-    if ((await Notification.requestPermission()) !== "granted") {
-      toast("Notifications blocked in browser settings");
-      return;
-    }
-    const { publicKey } = (await (await apiFetch("/api/push/key")).json()) as { publicKey: string };
-    const sub = await swReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToBytes(publicKey) });
-    await apiFetch("/api/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(sub) });
-    toast("Notifications on");
-  }
-  void refreshBell();
-}
+// The native shell bridge (nativeBridge/isAndroidApp) and Web Push live in push.ts.
 void initPush();
 updateOutboxBadge(); // reflect any queued-offline writes on load
 
@@ -3257,6 +3185,7 @@ function renderServerCards(): void {
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   if (nativeBridge) {
+    const bridge = nativeBridge; // local const so the non-undefined narrowing flows into the closures below
     const setOut = (t: string): void => {
       const el = document.getElementById("adb-output");
       if (el) el.textContent = t;
@@ -3276,7 +3205,7 @@ function renderServerCards(): void {
     );
     $("#adb-connect").addEventListener("click", () => {
       setOut("Discovering phone…");
-      nativeBridge.postMessage(JSON.stringify({ type: "adb.connect" }));
+      bridge.postMessage(JSON.stringify({ type: "adb.connect" }));
     });
     $("#adb-pair").addEventListener("click", () => {
       const code = $<HTMLInputElement>("#adb-pair-code").value.trim();
@@ -3285,7 +3214,7 @@ function renderServerCards(): void {
         return;
       }
       setOut("Pairing… (keep the pairing dialog open on the phone)");
-      nativeBridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
+      bridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
     });
     void apiFetch("/api/adb/info")
       .then((r) => r.json())
@@ -3546,7 +3475,7 @@ async function toggleReadme(id: string): Promise<void> {
     body.innerHTML = `<p class="small muted">Couldn't load the README.</p>`;
   }
 }
-function selectSession(id: string, push = true): void {
+export function selectSession(id: string, push = true): void {
   if (id !== activeId) saveDraft(activeId, input.value); // stash the outgoing session's unsent draft before we switch
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
   // the session (replace, don't push) so Back stays balanced.
@@ -4939,7 +4868,7 @@ function clearQuestionCards(): void {
 
 // ── Toast ──────────────────────────────────────────────────────────────────────
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-function toast(msg: string): void {
+export function toast(msg: string): void {
   const el = $("#toast");
   el.textContent = msg;
   el.classList.add("show");
