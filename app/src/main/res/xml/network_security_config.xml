@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
+    <!--
+      Trust ONLY the system (publicly-rooted) CA store. The daemon is reached over HTTPS on its
+      *.ts.net MagicDNS name, which `tailscale serve` fronts with a real Let's Encrypt cert — that
+      chains to a system root, so no user-added CA is ever needed. Trusting user-installed CAs
+      (the old `<certificates src="user" />`) lets any locally-installed cert MITM the app's
+      traffic; Google Play Protect reads that as the app trying to bypass Android's security
+      protections and flags it as harmful. Dropping it removes the flag.
+    -->
     <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
-            <certificates src="user" />
         </trust-anchors>
     </base-config>
 </network-security-config>
