@@ -2627,9 +2627,9 @@ function onAutopilotRunSnapshot(log: string[]): void {
   runState.lastLine = log[log.length - 1] ?? "";
   const el = document.getElementById("autopilot-log");
   if (el) {
-    el.hidden = false;
     el.textContent = autopilotLog.join("\n");
-    el.scrollTop = el.scrollHeight;
+    applyAutopilotLogVisibility();
+    if (!el.hidden) el.scrollTop = el.scrollHeight;
   }
   reflectAutopilotRunning();
 }
@@ -2638,11 +2638,28 @@ function onAutopilotProgress(line: string): void {
   runState.lastLine = line;
   const log = document.getElementById("autopilot-log");
   if (log) {
-    log.hidden = false;
     log.textContent = autopilotLog.join("\n");
-    log.scrollTop = log.scrollHeight;
+    applyAutopilotLogVisibility();
+    if (!log.hidden) log.scrollTop = log.scrollHeight;
   }
   reflectAutopilotRunning();
+}
+
+// Whether the user has collapsed the raw run-log panel. Module-level so the choice survives re-renders
+// and live progress: a streamed line must never re-expand a log the user deliberately hid (that's what
+// was burying the plans grid below it on a short/narrow viewport).
+let autopilotLogCollapsed = false;
+/** Sync the run-log panel + its show/hide toggle to `autopilotLogCollapsed`. The toggle only surfaces
+ *  once there's log content; collapsing the log frees the screen for the plans grid underneath. */
+function applyAutopilotLogVisibility(): void {
+  const log = document.getElementById("autopilot-log");
+  const toggle = document.getElementById("autopilot-log-toggle");
+  const hasContent = autopilotLog.length > 0;
+  if (toggle) {
+    (toggle as HTMLElement).hidden = !hasContent;
+    toggle.setAttribute("aria-pressed", String(!autopilotLogCollapsed));
+  }
+  if (log) log.hidden = !hasContent || autopilotLogCollapsed;
 }
 
 // Live status of the current/last "Run autopilot", surfaced as a banner above the log so the run is
@@ -2696,6 +2713,7 @@ function openAutopilot(): void {
         <span class="ap-sched-summary" id="autopilot-schedule"></span>
       </div>
       <span class="ap-head-actions">
+        <button id="autopilot-log-toggle" class="mini" title="Show/hide run log" aria-pressed="true" hidden>${icon("terminal")}<span class="ap-log-toggle-label">Log</span></button>
         <button id="autopilot-run" class="primary ap-run-btn" title="Run autopilot">${icon("play_arrow")}<span class="ap-run-full">Run autopilot</span><span class="ap-run-mid">Run</span></button>
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
@@ -2706,13 +2724,14 @@ function openAutopilot(): void {
   </div>`;
   $("#autopilot-close").addEventListener("click", () => dismissOverlay("autopilot"));
   $("#autopilot-run").addEventListener("click", () => void runAutopilot());
+  $("#autopilot-log-toggle").addEventListener("click", () => {
+    autopilotLogCollapsed = !autopilotLogCollapsed;
+    applyAutopilotLogVisibility();
+  });
   renderScheduleBar();
   renderRunStatus();
-  if (autopilotLog.length) {
-    const log = $("#autopilot-log");
-    log.hidden = false;
-    log.textContent = autopilotLog.join("\n");
-  }
+  if (autopilotLog.length) $("#autopilot-log").textContent = autopilotLog.join("\n");
+  applyAutopilotLogVisibility();
   openOverlay("autopilot", closeAutopilot, "#autopilot"); // own URL; Back reverts it & closes the view
   renderAutopilotGrid();
   for (const s of orderedServers())
@@ -2768,15 +2787,29 @@ function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: 
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 /** The flowing card grid, grouped by server when the fleet has more than one. */
+// The grid and the plan reader render into the same scroll container (.settings-body), so without help
+// every swap inherits the wrong offset: opening a plan kept the grid's scroll (plan opened mid-page),
+// going Back rebuilt the grid at the top, and a live plans refresh snapped it to the top mid-scroll.
+// Remember the grid's offset on the way into a plan and restore it on the way back; reset to the top
+// when entering a plan; preserve the current offset across a same-view re-render.
+const apScrollBody = (): HTMLElement | null => document.querySelector(".autopilot-view .settings-body");
+let apGridScroll = 0;
+
 function renderAutopilotGrid(): void {
+  const body = apScrollBody();
+  // Coming back from a plan reader (openPlanId still set) → restore where the grid was; a same-view
+  // refresh (already null) → keep the current offset so a background plans update doesn't jump.
+  const keepScroll = openPlanId !== null ? apGridScroll : (body?.scrollTop ?? 0);
   openPlanId = null;
   const host = document.getElementById("autopilot-grid");
   if (!host) return;
+  const restoreScroll = (): void => { if (body) body.scrollTop = keepScroll; };
   const multi = orderedServers().length > 1;
   if (pendingPlanCount() === 0) {
     host.innerHTML = `<div class="ap-empty">${icon("inbox")}
       <p>No pending plans.</p>
       <p class="small muted">Link a Todoist project to an environment in Settings, then <b>Run autopilot</b> to generate plans.</p></div>`;
+    restoreScroll();
     return;
   }
   let html = "";
@@ -2799,6 +2832,7 @@ function renderAutopilotGrid(): void {
   host.querySelectorAll<HTMLElement>(".plan-card").forEach((c) =>
     c.addEventListener("click", () => openPlan(c.dataset.id!)),
   );
+  restoreScroll();
 }
 
 /** Return from a plan reader to the grid. When the reader is an active back-stack layer, dismiss it
@@ -2808,11 +2842,30 @@ function backToGrid(): void {
   else renderAutopilotGrid();
 }
 
+// Keep the floating Refine window clear of the on-screen keyboard. interactive-widget=resizes-content
+// handles this on Android (the layout viewport shrinks, so a bottom-anchored fixed element rides up),
+// but iOS/PWA overlay the keyboard without resizing — there `window.innerHeight` stays full while
+// `visualViewport.height` shrinks, and that gap is the keyboard's height. Lift the window by it so the
+// input never ends up buried. No-op (inset 0) when the keyboard is closed or interactive-widget applies.
+function positionRefineWindow(): void {
+  const win = document.getElementById("plan-refine");
+  const fab = document.getElementById("plan-refine-toggle");
+  if (!win && !fab) return;
+  const vv = window.visualViewport;
+  const inset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+  if (win?.classList.contains("open")) (win as HTMLElement).style.bottom = `${inset + 16}px`;
+  if (fab) (fab as HTMLElement).style.bottom = `${inset + 16}px`;
+}
+window.visualViewport?.addEventListener("resize", positionRefineWindow);
+window.visualViewport?.addEventListener("scroll", positionRefineWindow);
+
 /** The full-plan reader + refine chat + Dismiss/Go, rendered in place of the grid (same overlay). */
 function openPlan(id: string): void {
   const p = findPlan(id);
   const host = document.getElementById("autopilot-grid");
   if (!p || !host) return;
+  const body = apScrollBody();
+  if (body && openPlanId === null) apGridScroll = body.scrollTop; // remember where the grid was
   openPlanId = id;
   const env = p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined);
   host.innerHTML = `<div class="plan-reader" data-id="${esc(id)}">
@@ -2820,13 +2873,12 @@ function openPlan(id: string): void {
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
       <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
       <span class="plan-reader-actions">
-        <button class="mini" id="plan-refine-toggle" aria-pressed="false">${icon("auto_awesome")} Refine</button>
         <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
-        <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign env</button>
-        <button class="mini" id="plan-link">${icon("link")} Link to session</button>
-        <button class="primary" id="plan-start">${icon("rocket_launch")} Create session &amp; start</button>
+        <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign</button>
+        <button class="mini" id="plan-link">${icon("link")} Link</button>
+        <button class="primary" id="plan-start">${icon("rocket_launch")} Start</button>
       </span>
     </div>
     <div class="plan-reader-body">
@@ -2845,6 +2897,7 @@ function openPlan(id: string): void {
         <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
       </form>
     </aside>
+    <button class="plan-refine-fab" id="plan-refine-toggle" aria-pressed="false" title="Refine with Claude">${icon("auto_awesome")} Refine</button>
   </div>`;
   // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
   // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
@@ -2859,8 +2912,12 @@ function openPlan(id: string): void {
     refineDrawer.classList.toggle("open", open);
     refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
     refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
+    refineToggle.hidden = open; // the window takes over the corner — hide the FAB behind it
     refineBackdrop.hidden = !open;
-    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus();
+    positionRefineWindow(); // sit the window (and FAB) above the keyboard before it animates in
+    // preventScroll: focusing the textarea otherwise makes the browser scroll the plan body to reveal
+    // it, snapping the document to the bottom every time the window opens.
+    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus({ preventScroll: true });
   };
   refineToggle.addEventListener("click", () => setRefineOpen(!refineDrawer.classList.contains("open")));
   $("#plan-refine-close").addEventListener("click", () => setRefineOpen(false));
@@ -2876,6 +2933,17 @@ function openPlan(id: string): void {
     e.preventDefault();
     void refinePlan(id);
   });
+  // Enter sends, Shift+Enter newlines — same as the main composer, so the chat actually submits
+  // (a bare textarea swallows Enter as a newline, which read as "refine does nothing").
+  $<HTMLTextAreaElement>("#plan-refine-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      $<HTMLFormElement>("#plan-refine-form").requestSubmit();
+    }
+  });
+  // A fresh plan reads from the top, not wherever the grid (or a prior plan) was scrolled to.
+  if (body) body.scrollTop = 0;
+  document.querySelector(".plan-reader-body")?.scrollTo(0, 0);
 }
 
 /** The server that owns a plan (refine/dismiss/start route there), or undefined if offline/unknown. */

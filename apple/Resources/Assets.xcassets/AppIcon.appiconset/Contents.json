@@ -59,6 +59,12 @@
       "idiom": "mac",
       "filename": "icon_512x512@2x.png",
       "scale": "2x"
+    },
+    {
+      "size": "1024x1024",
+      "idiom": "universal",
+      "filename": "AppIcon-ios-1024.png",
+      "platform": "ios"
     }
   ],
   "info": {

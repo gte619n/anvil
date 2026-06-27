@@ -711,6 +711,9 @@ input:focus, select:focus, textarea:not(#input):focus {
 .autopilot-view .mini { display: inline-flex; align-items: center; gap: 4px; padding: 6px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font-size: 12px; font-weight: 600; }
 .autopilot-view .mini .msym { font-size: 15px; }
 .autopilot-view .mini.danger { color: var(--danger); border-color: var(--danger); }
+/* `.mini` is display:inline-flex, which outranks the [hidden] UA rule — re-hide explicitly so the
+ * run-log toggle stays gone until there's a log to show. */
+.autopilot-view .mini[hidden] { display: none; }
 .ap-log { margin: 0 20px 12px; max-width: 880px; width: calc(100% - 40px); align-self: center; }
 
 .ap-empty { text-align: center; color: var(--muted); padding: 48px 16px; }
@@ -756,14 +759,28 @@ input:focus, select:focus, textarea:not(#input):focus {
 .plan-reader-body { flex: 1; min-height: 0; overflow: auto; }
 .plan-doc { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 16px 20px; max-width: 980px; margin: 0 auto; }
 .plan-refine { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px; position: sticky; top: 0; }
-/* Refine drawer: slides in over the plan's right edge; dismissible via a close button or the backdrop. */
-.plan-refine-drawer { position: absolute; top: 0; right: 0; bottom: 0; width: 380px; max-width: 92%; margin: 0; border: none; border-left: 1px solid var(--border); border-radius: 0; box-shadow: -6px 0 22px rgba(0, 0, 0, 0.18); display: flex; flex-direction: column; transform: translateX(100%); transition: transform 0.2s ease; z-index: 8; }
-.plan-refine-drawer.open { transform: translateX(0); }
+/* Refine window: a floating panel anchored to the viewport's bottom-right corner. It fades/scales in
+   over the plan (which stays fully visible and keeps its scroll position) rather than sliding in from the
+   edge; dismissible via its close button, the Refine toggle, or a click outside (the backdrop).
+   `position: fixed` (not absolute) so its bottom tracks the visual viewport — `positionRefineWindow()`
+   lifts it above the on-screen keyboard, which would otherwise bury it on iOS/PWA. `bottom` is set
+   inline from JS; the 16px here is the keyboard-closed fallback. max-height in dvh keeps it on-screen. */
+.plan-refine-drawer { position: fixed; top: auto; left: auto; right: 16px; bottom: 16px; width: 380px; max-width: calc(100% - 32px); max-height: min(72dvh, 560px); margin: 0; border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 14px 44px rgba(0, 0, 0, 0.32); display: flex; flex-direction: column; opacity: 0; transform: translateY(10px) scale(0.98); transform-origin: bottom right; pointer-events: none; transition: opacity 0.16s ease, transform 0.16s ease; z-index: 8; }
+.plan-refine-drawer.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
 .plan-refine-head { display: flex; align-items: center; gap: 8px; }
 .plan-refine-head h4 { margin: 0; flex: 1; }
 .plan-refine-drawer .plan-refine-log { flex: 1; max-height: none; }
-.plan-refine-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.18); z-index: 7; }
+/* Transparent click-catcher: closes the window on an outside click while leaving the plan visible
+   underneath (no dim), so refining reads as a floating window over the document, not a modal. */
+.plan-refine-backdrop { position: absolute; inset: 0; background: transparent; z-index: 7; }
 .plan-refine-backdrop[hidden] { display: none; }
+/* Refine FAB: a floating action button pinned to the viewport's bottom-right. `position: fixed` keeps it
+   put while the plan scrolls; `bottom` is set inline by positionRefineWindow() so it rides above the
+   on-screen keyboard (16px fallback when closed). It hides while the Refine window owns that corner. */
+.plan-refine-fab { position: fixed; right: 16px; bottom: 16px; z-index: 9; display: inline-flex; align-items: center; gap: 6px; padding: 11px 16px; border: 1px solid var(--accent); border-radius: 999px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; font-size: 13px; cursor: pointer; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28); }
+.plan-refine-fab .msym { font-size: 18px; }
+/* display:inline-flex outranks the [hidden] UA rule — re-hide explicitly so the FAB disappears behind the open window. */
+.plan-refine-fab[hidden] { display: none; }
 .autopilot-view .mini[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .plan-refine h4 { margin: 0 0 4px; display: flex; align-items: center; gap: 6px; font-size: 14px; }
 .plan-refine h4 .msym { font-size: 18px; color: var(--accent); }
