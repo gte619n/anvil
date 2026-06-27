@@ -2834,10 +2834,12 @@ function backToGrid(): void {
 // input never ends up buried. No-op (inset 0) when the keyboard is closed or interactive-widget applies.
 function positionRefineWindow(): void {
   const win = document.getElementById("plan-refine");
-  if (!win || !win.classList.contains("open")) return;
+  const fab = document.getElementById("plan-refine-toggle");
+  if (!win && !fab) return;
   const vv = window.visualViewport;
   const inset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  (win as HTMLElement).style.bottom = `${inset + 16}px`;
+  if (win?.classList.contains("open")) (win as HTMLElement).style.bottom = `${inset + 16}px`;
+  if (fab) (fab as HTMLElement).style.bottom = `${inset + 16}px`;
 }
 window.visualViewport?.addEventListener("resize", positionRefineWindow);
 window.visualViewport?.addEventListener("scroll", positionRefineWindow);
@@ -2854,7 +2856,6 @@ function openPlan(id: string): void {
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
       <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
       <span class="plan-reader-actions">
-        <button class="mini" id="plan-refine-toggle" aria-pressed="false">${icon("auto_awesome")} Refine</button>
         <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
@@ -2879,6 +2880,7 @@ function openPlan(id: string): void {
         <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
       </form>
     </aside>
+    <button class="plan-refine-fab" id="plan-refine-toggle" aria-pressed="false" title="Refine with Claude">${icon("auto_awesome")} Refine</button>
   </div>`;
   // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
   // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
@@ -2893,8 +2895,9 @@ function openPlan(id: string): void {
     refineDrawer.classList.toggle("open", open);
     refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
     refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
+    refineToggle.hidden = open; // the window takes over the corner — hide the FAB behind it
     refineBackdrop.hidden = !open;
-    positionRefineWindow(); // sit the window above the keyboard before it animates in
+    positionRefineWindow(); // sit the window (and FAB) above the keyboard before it animates in
     // preventScroll: focusing the textarea otherwise makes the browser scroll the plan body to reveal
     // it, snapping the document to the bottom every time the window opens.
     if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus({ preventScroll: true });
