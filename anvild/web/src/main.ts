@@ -1,10 +1,26 @@
 import MarkdownIt from "markdown-it";
 import Sortable from "sortablejs";
-import TomSelect from "tom-select";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
 import { apiFetch, daemonBase } from "./api";
+import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, refreshSelect, sessIcon, slugify } from "./dom";
+import { currentTheme, resolveTheme, themePref, updateThemeControls } from "./theme";
+import type { ThemePref } from "./theme";
+import { ui } from "./state";
+import {
+  dismissOverlay,
+  dismissTopOverlay,
+  openOverlay,
+  overlayOpen,
+  overlays,
+  planFromHash,
+  sessionFromHash,
+  sessionHref,
+  setSessionHash,
+} from "./overlays";
+import { initPush, isAndroidApp, nativeBridge } from "./push";
+import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 
 const strToB64 = (s: string): string => {
   const bytes = new TextEncoder().encode(s);
@@ -46,48 +62,9 @@ import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
 
-// ── DOM helpers ──────────────────────────────────────────────────────────────
-const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => document.querySelector(sel) as T;
-const esc = (s: string): string => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
-const slugify = (s: string): string =>
-  s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-const icon = (name: string): string => `<span class="msym">${name}</span>`;
-
 // Show the build version next to the brand so it's obvious which app/bundle is running.
 $("#brand-version").textContent = `v${__APP_VERSION__}`;
-const sessIcon = (s: Session): string =>
-  s.isDefault ? "robot_2" : s.pending ? "schedule" : s.icon ?? (s.source === "fresh-worktree" ? "account_tree" : "folder");
-// An environment's display glyph: its chosen Material Symbol, else a sensible default by repo kind.
-const envIcon = (e: Environment): string => e.icon || (e.isRepo ? "account_tree" : "folder");
-// Case-insensitive name sort for environment lists (selector + settings, per server).
-const byEnvName = (a: Environment, b: Environment): number => a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
 
-// ── Stylized selectors (Tom Select) ──────────────────────────────────────────
-// Native <select>s are upgraded to themed Tom Select dropdowns so options can carry a Material
-// Symbol icon and a color dot. Each <option> may set data-icon / data-color; the render below
-// picks them up (Tom Select copies an option's data-* attributes onto its option data). All our
-// selects live inside modals, so instances are tracked and torn down when the modal closes.
-let modalTomSelects: TomSelect[] = [];
-const renderTomOption = (data: { [k: string]: unknown }, escape: (s: string) => string): string => {
-  const ic = data.icon ? `<span class="msym ts-ic">${escape(String(data.icon))}</span>` : "";
-  const dot = data.color ? `<span class="ts-dot" style="background:${escape(String(data.color))}"></span>` : "";
-  return `<div class="ts-opt">${ic}${dot}<span class="ts-lbl">${escape(String(data.text ?? ""))}</span></div>`;
-};
-/** Upgrade a native <select> into a stylized Tom Select. `search` shows the filter box (long lists). */
-function enhanceSelect(sel: HTMLSelectElement | null, search = false): void {
-  if (!sel) return;
-  const base = { maxOptions: null, hideSelected: false, render: { option: renderTomOption, item: renderTomOption } };
-  modalTomSelects.push(new TomSelect(sel, search ? base : { ...base, controlInput: null }));
-}
-/** Re-read options/value from the underlying <select> after it's been repopulated programmatically. */
-function refreshSelect(sel: HTMLSelectElement | null): void {
-  if (sel) modalTomSelects.find((t) => t.input === sel)?.sync();
-}
-/** Tear down every modal Tom Select (removes its global listeners) — called when a modal closes. */
-function destroyModalSelects(): void {
-  for (const t of modalTomSelects) t.destroy();
-  modalTomSelects = [];
-}
 const conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
 let stickToBottom = true;
@@ -103,7 +80,7 @@ conversation.addEventListener("scroll", () => {
 });
 
 // ── State ────────────────────────────────────────────────────────────────────
-const sessions = new Map<string, Session>();
+export const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
 // Sessions being cleaned up: shown disabled in the sidebar until the daemon confirms deletion
 // (session.deleted). Transient — not persisted. (UI refinement §8)
@@ -306,68 +283,8 @@ function persistEnvironments(): void {
     /* corrupt cache — start empty, the daemon repopulates on connect */
   }
 })();
-// URL routing: the active session lives in the hash (#s/<id>) so Back/Forward works and a
-// session is deep-linkable / openable in its own tab. A ?session= query (old push links) still works.
-const sessionFromHash = (): string | null => {
-  const m = location.hash.match(/^#s\/(.+)$/);
-  return m ? decodeURIComponent(m[1]!) : null;
-};
-// A plan deep link (#p/<workUnitId>) opens the Autopilot view straight to that plan's reader — the
-// URL the autopilot posts in its Todoist comment. Used on cold load and on warm hashchange.
-const planFromHash = (): string | null => {
-  const m = location.hash.match(/^#p\/(.+)$/);
-  return m ? decodeURIComponent(m[1]!) : null;
-};
-
-// ── Back-stack: device/browser Back dismisses the top UI layer before leaving ─────────
-// Modals/dialogs, the settings view, the side panel and the (mobile) expanded sidebar are
-// all "soft" layers. Each pushes a history entry when it opens, so Back has somewhere to go
-// instead of exiting the app: Android routes the device button through web.goBack(), macOS
-// uses the swipe gesture, the PWA/browser uses its own Back — all surface as `popstate`,
-// which closes the topmost layer. Each entry records how many layers were open (`anvilDepth`)
-// so a single popstate can unwind to exactly the right place.
-type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader";
-interface Overlay {
-  name: OverlayName;
-  close: () => void; // pure DOM/state teardown — must NOT touch history itself
-}
-const overlays: Overlay[] = [];
-let suppressPop = 0; // popstates from our own dismissOverlay() unwind — teardown already done
-const overlayOpen = (name: OverlayName): boolean => overlays.some((o) => o.name === name);
-function openOverlay(name: OverlayName, close: () => void, hash?: string): void {
-  if (overlayOpen(name)) return; // already open (e.g. swapping a modal's contents in place)
-  overlays.push({ name, close });
-  // `hash` (e.g. "#autopilot") gives the overlay its own URL so it's a real history entry — Back
-  // reverts the URL and pops the layer. Omit it to keep the current URL (the session hash).
-  const url = hash ? `${location.pathname}${hash}` : undefined;
-  history.pushState({ anvilDepth: overlays.length }, "", url);
-}
-/** Programmatically dismiss `name` and anything stacked above it (Cancel / X / backdrop). Tears
- *  down synchronously, then unwinds our own history entries (the resulting popstate is swallowed
- *  by the guard). Closing layers via the device/browser Back goes through popstate directly. */
-function dismissOverlay(name: OverlayName): void {
-  const idx = overlays.map((o) => o.name).lastIndexOf(name);
-  if (idx < 0) return; // already gone — keeps redundant/double closes harmless
-  const n = overlays.length - idx;
-  for (let i = 0; i < n; i++) overlays.pop()!.close();
-  suppressPop++;
-  history.go(-n); // drop our history entries; the one popstate this fires is suppressed below
-}
-/** Dismiss just the topmost soft layer (used by the Escape key) — same teardown as a single Back. */
-function dismissTopOverlay(): boolean {
-  const top = overlays[overlays.length - 1];
-  if (!top) return false;
-  dismissOverlay(top.name);
-  return true;
-}
-
-const sessionHref = (id: string): string => `${location.pathname}#s/${encodeURIComponent(id)}`;
-function setSessionHash(id: string | null, push: boolean): void {
-  const url = id ? sessionHref(id) : location.pathname;
-  const state = { anvilDepth: overlays.length };
-  if (push) history.pushState(state, "", url);
-  else history.replaceState(state, "", url);
-}
+// URL routing + the soft-layer back-stack (overlays, openOverlay/dismissOverlay, hash helpers) live
+// in overlays.ts; the popstate handler and session navigation that consume them stay here.
 // A session in the URL (#s/… or ?session=) means we were opened via a deep link or a notification
 // tap — as opposed to just restoring the last-active session from storage. On a phone we then jump
 // straight into that conversation with the sidebar hidden (see the collapse below). (UI refinement §4)
@@ -382,8 +299,8 @@ setSessionHash(activeId, false); // canonicalize the URL (also strips any ?sessi
 // jump straight into the session we just made without also hijacking sessions created elsewhere.
 let pendingCreateCid: string | null = null;
 window.addEventListener("popstate", () => {
-  if (suppressPop > 0) {
-    suppressPop--; // our own dismissOverlay() unwind — the layer is already torn down
+  if (ui.suppressPop > 0) {
+    ui.suppressPop--; // our own dismissOverlay() unwind — the layer is already torn down
     return;
   }
   // Device/browser Back: close every layer stacked above the depth we landed on (dialogs/menus/
@@ -507,21 +424,8 @@ if (activeId) {
 }
 
 // ── Theme (light / dark / system, chosen in Settings → Appearance) ────────────
-type ThemePref = "light" | "dark" | "system";
-/** The user's stored preference; absence (or anything unexpected) means "follow the OS". */
-function themePref(): ThemePref {
-  const s = localStorage.getItem("anvil.theme");
-  return s === "light" || s === "dark" ? s : "system";
-}
-/** The concrete theme currently painted on <html>. */
-function currentTheme(): "light" | "dark" {
-  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
-}
-/** Resolve a preference to a concrete theme, consulting the OS for "system". */
-function resolveTheme(pref: ThemePref): "light" | "dark" {
-  if (pref === "system") return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  return pref;
-}
+// Pure theme resolution lives in theme.ts; the repaint side stays here because it re-renders the
+// session list.
 /** Paint the resolved theme and re-clamp session tints to the new band. */
 function applyTheme(): void {
   document.documentElement.dataset.theme = resolveTheme(themePref());
@@ -535,115 +439,26 @@ function setThemePref(pref: ThemePref): void {
   applyTheme();
   updateThemeControls();
 }
-/** Mark the active swatch in Settings → Appearance (no-op when Settings isn't open). */
-function updateThemeControls(): void {
-  const pref = themePref();
-  document.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) => b.classList.toggle("active", b.dataset.themePref === pref));
-}
 // Follow the OS theme live while the preference is "system".
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if (themePref() === "system") applyTheme();
 });
 
-// ── Sidebar collapse ─────────────────────────────────────────────────────────────
-// 700px keeps the phone-only layout off the iPad Mini (744px) and the unfolded Galaxy Z Fold
-// (~755px) while still catching every real phone. Must stay in sync with the @media query in app.css.
-const isNarrow = (): boolean => matchMedia("(max-width: 700px)").matches;
-let sidebarCollapsed =
+// ── Sidebar collapse + resizable panes ───────────────────────────────────────────
+// The sidebar/resizer mechanics live in layout.ts; the boot-time seed of ui.sidebarCollapsed and
+// the listener wiring stay here (they read deepLinkedSession/activeId and own page bootstrap).
+ui.sidebarCollapsed =
   localStorage.getItem("anvil.sidebar") === "collapsed" ||
   (localStorage.getItem("anvil.sidebar") === null && isNarrow());
 // Opened via a deep link / notification on a phone: jump straight into the conversation with the
 // session menu hidden, even if the sidebar was last left open. (UI refinement §4)
-if (deepLinkedSession && activeId && isNarrow()) sidebarCollapsed = true;
-function applySidebar(): void {
-  $("#sidebar").classList.toggle("collapsed", sidebarCollapsed);
-}
+if (deepLinkedSession && activeId && isNarrow()) ui.sidebarCollapsed = true;
 applySidebar();
-function toggleSidebar(): void {
-  sidebarCollapsed = !sidebarCollapsed;
-  localStorage.setItem("anvil.sidebar", sidebarCollapsed ? "collapsed" : "open");
-  applySidebar();
-  // On a phone the open sidebar overlays the conversation — make Back close it.
-  if (isNarrow()) {
-    if (!sidebarCollapsed) openOverlay("sidebar", () => { sidebarCollapsed = true; applySidebar(); });
-    else dismissOverlay("sidebar");
-  }
-}
 // both the header ☰ and an in-sidebar button toggle it — the in-sidebar one stays reachable
 // when the open sidebar overlays the header (e.g. unfolding a foldable).
 $("#btn-sidebar").addEventListener("click", toggleSidebar);
 $("#sidebar-collapse").addEventListener("click", toggleSidebar);
-
-// ── Resizable panes (left sidebar + right side panel) ────────────────────────────
-// Each pane's width is a CSS variable on :root, persisted per device. A thin handle straddling the
-// pane's border drives it via pointer events (touch-safe, capture so the drag survives leaving the
-// strip). Disabled on narrow screens, where the sidebar overlays and the panel is near full-bleed.
-const clampN = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
-function initResizers(): void {
-  const root = document.documentElement;
-  const stored = (k: string): number => Number(localStorage.getItem(k)) || 0;
-  const sw = stored("anvil.sidebarW");
-  if (sw) root.style.setProperty("--sidebar-w", `${sw}px`);
-  const pw = stored("anvil.panelW");
-  if (pw) root.style.setProperty("--panel-w", `${pw}px`);
-
-  const wire = (
-    handle: HTMLElement | null,
-    cfg: { cssVar: string; key: string; min: number; maxFn: () => number; width: (clientX: number) => number },
-  ): void => {
-    if (!handle) return;
-    handle.addEventListener("pointerdown", (e: PointerEvent) => {
-      if (isNarrow()) return; // resizing is desktop-only
-      e.preventDefault();
-      handle.setPointerCapture(e.pointerId);
-      handle.classList.add("dragging");
-      document.body.style.userSelect = "none";
-      document.body.style.cursor = "col-resize";
-      let latest = 0;
-      const move = (ev: PointerEvent): void => {
-        latest = clampN(cfg.width(ev.clientX), cfg.min, cfg.maxFn());
-        root.style.setProperty(cfg.cssVar, `${latest}px`);
-      };
-      const up = (): void => {
-        handle.releasePointerCapture(e.pointerId);
-        handle.classList.remove("dragging");
-        handle.removeEventListener("pointermove", move);
-        handle.removeEventListener("pointerup", up);
-        document.body.style.userSelect = "";
-        document.body.style.cursor = "";
-        if (latest) localStorage.setItem(cfg.key, String(Math.round(latest)));
-      };
-      handle.addEventListener("pointermove", move);
-      handle.addEventListener("pointerup", up);
-    });
-  };
-
-  const sidebar = document.getElementById("sidebar");
-  wire(document.getElementById("sidebar-resizer"), {
-    cssVar: "--sidebar-w",
-    key: "anvil.sidebarW",
-    min: 200,
-    maxFn: () => Math.min(620, window.innerWidth - 360), // always leave the conversation room
-    width: (x) => x - (sidebar?.getBoundingClientRect().left ?? 0), // pointer X minus the sidebar's left edge
-  });
-  const sidePanel = document.getElementById("side-panel");
-  wire(document.getElementById("panel-resizer"), {
-    cssVar: "--panel-w",
-    key: "anvil.panelW",
-    min: 320,
-    maxFn: () => Math.min(window.innerWidth * 0.92, 1000),
-    width: (x) => (sidePanel?.getBoundingClientRect().right ?? window.innerWidth) - x, // panel is pinned right, grows leftward
-  });
-}
 initResizers();
-
-// On a phone there isn't room for both panes, so when focus moves to the chat (a tap or the
-// composer gaining focus) we collapse the overlaid session list — never a half-covered chat.
-function collapseSidebarForChat(): void {
-  if (!isNarrow() || sidebarCollapsed) return;
-  if (overlayOpen("sidebar")) dismissOverlay("sidebar"); // also unwinds the Back-stack entry
-  else { sidebarCollapsed = true; applySidebar(); } // open without an overlay entry (e.g. after a resize)
-}
 $("#convo-col").addEventListener("pointerdown", collapseSidebarForChat);
 $("#convo-col").addEventListener("focusin", collapseSidebarForChat);
 
@@ -796,80 +611,7 @@ void loadFleetMembers();
 // reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
 if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 
-// Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
-const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
-// The Android WebView shell can't host a second window (no onCreateWindow / multi-window support), so
-// window.open() there is a dead end (a chrome-less, Back-less, unscrollable takeover). The reader's
-// "pop out" therefore opens an in-app full-screen overlay on Android instead of a standalone window
-// (macOS gets a real NSWindow, the web a real tab). The Apple shell doesn't expose AnvilNative, so
-// this matches the Android app specifically, not Mac.
-const isAndroidApp = !!nativeBridge && /Android/i.test(navigator.userAgent);
-if (nativeBridge) {
-  nativeBridge.onmessage = (e) => {
-    try {
-      const r = JSON.parse(e.data) as { ok?: boolean; message?: string };
-      const out = document.getElementById("adb-output");
-      if (out) out.textContent = `${r.ok ? "✓ " : "⚠ "}${r.message ?? ""}`;
-      else toast(r.message ?? "done");
-    } catch {
-      /* ignore */
-    }
-  };
-}
-
-// ── Web Push (arch §6.7) ──────────────────────────────────────────────────────────
-let swReg: ServiceWorkerRegistration | null = null;
-const pushSupported = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-function urlB64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
-  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
-  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
-  const arr = new Uint8Array(new ArrayBuffer(raw.length));
-  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
-  return arr;
-}
-async function initPush(): Promise<void> {
-  if (nativeBridge) return; // native shells use platform push (FCM/APNs), not web push / service worker
-  if (!pushSupported) return; // unsupported (e.g. iOS Safari until installed as a PWA)
-  const bell = $("#btn-notify");
-  bell.hidden = false;
-  try {
-    swReg = await navigator.serviceWorker.register("/sw.js");
-  } catch {
-    bell.hidden = true;
-    return;
-  }
-  navigator.serviceWorker.addEventListener("message", (e) => {
-    if (e.data?.type === "open-session" && e.data.sessionId && sessions.has(e.data.sessionId)) selectSession(e.data.sessionId);
-  });
-  bell.addEventListener("click", () => void toggleNotify());
-  void refreshBell();
-}
-async function refreshBell(): Promise<void> {
-  const sub = await swReg?.pushManager.getSubscription();
-  const on = Notification.permission === "granted" && !!sub;
-  const bell = $("#btn-notify");
-  bell.innerHTML = icon(on ? "notifications_active" : "notifications_off");
-  bell.classList.toggle("active", on);
-}
-async function toggleNotify(): Promise<void> {
-  if (!swReg) return;
-  const existing = await swReg.pushManager.getSubscription();
-  if (existing) {
-    await apiFetch("/api/push/unsubscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ endpoint: existing.endpoint }) });
-    await existing.unsubscribe();
-    toast("Notifications off");
-  } else {
-    if ((await Notification.requestPermission()) !== "granted") {
-      toast("Notifications blocked in browser settings");
-      return;
-    }
-    const { publicKey } = (await (await apiFetch("/api/push/key")).json()) as { publicKey: string };
-    const sub = await swReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToBytes(publicKey) });
-    await apiFetch("/api/push/subscribe", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(sub) });
-    toast("Notifications on");
-  }
-  void refreshBell();
-}
+// The native shell bridge (nativeBridge/isAndroidApp) and Web Push live in push.ts.
 void initPush();
 updateOutboxBadge(); // reflect any queued-offline writes on load
 
@@ -3389,6 +3131,7 @@ function renderServerCards(): void {
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   if (nativeBridge) {
+    const bridge = nativeBridge; // local const so the non-undefined narrowing flows into the closures below
     const setOut = (t: string): void => {
       const el = document.getElementById("adb-output");
       if (el) el.textContent = t;
@@ -3408,7 +3151,7 @@ function renderServerCards(): void {
     );
     $("#adb-connect").addEventListener("click", () => {
       setOut("Discovering phone…");
-      nativeBridge.postMessage(JSON.stringify({ type: "adb.connect" }));
+      bridge.postMessage(JSON.stringify({ type: "adb.connect" }));
     });
     $("#adb-pair").addEventListener("click", () => {
       const code = $<HTMLInputElement>("#adb-pair-code").value.trim();
@@ -3417,7 +3160,7 @@ function renderServerCards(): void {
         return;
       }
       setOut("Pairing… (keep the pairing dialog open on the phone)");
-      nativeBridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
+      bridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
     });
     void apiFetch("/api/adb/info")
       .then((r) => r.json())
@@ -3678,7 +3421,7 @@ async function toggleReadme(id: string): Promise<void> {
     body.innerHTML = `<p class="small muted">Couldn't load the README.</p>`;
   }
 }
-function selectSession(id: string, push = true): void {
+export function selectSession(id: string, push = true): void {
   if (id !== activeId) saveDraft(activeId, input.value); // stash the outgoing session's unsent draft before we switch
   // On a phone, picking a session collapses the open sidebar. Consume its back-stack entry for
   // the session (replace, don't push) so Back stays balanced.
@@ -3709,8 +3452,8 @@ function selectSession(id: string, push = true): void {
   // daemon also clears it everywhere when we attach below). (UI refinement §1)
   navigator.serviceWorker?.controller?.postMessage({ type: "close-notifications", sessionId: id });
   sendTo(id, { type: "session.attach", sessionId: id }); // full snapshot (always show history)
-  if (isNarrow() && !sidebarCollapsed) {
-    sidebarCollapsed = true;
+  if (isNarrow() && !ui.sidebarCollapsed) {
+    ui.sidebarCollapsed = true;
     applySidebar(); // on a phone, get out of the way once you've picked a session
   }
   // reset the side panel for the new session's worktree
@@ -5071,7 +4814,7 @@ function clearQuestionCards(): void {
 
 // ── Toast ──────────────────────────────────────────────────────────────────────
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-function toast(msg: string): void {
+export function toast(msg: string): void {
   const el = $("#toast");
   el.textContent = msg;
   el.classList.add("show");
