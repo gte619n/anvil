@@ -86,16 +86,25 @@ async function defaultRunTailscale(): Promise<string | null> {
 }
 
 /**
- * Resolve the base URL a freshly-paired member should be reached at, by probing its transport:
- * https on the MagicDNS name (serve-capable host) first, then plain http (App-Store-Tailscale host
- * that binds the tailnet IP directly). Defaults to http if neither answers (the member may still be
- * starting up) so the registry has a usable entry. `host` is a bare MagicDNS name (no scheme).
+ * Resolve a freshly-paired member's reachable URL *and* identity by probing its transport: https on
+ * the MagicDNS name (serve-capable host) first, then plain http (App-Store-Tailscale host that binds
+ * the tailnet IP directly). The probe hits `/api/health`, so we also capture the member's real
+ * serverId/serverName — important because the `:7702` pairing outcome may omit a serverId, and falling
+ * back to the bare host as the serverId silently breaks *targeted* token propagation (members are
+ * matched by serverId). Defaults to http with no identity if neither scheme answers (the member may
+ * still be starting up) so the registry still gets a usable entry. `host` is a bare MagicDNS name.
  */
-export async function resolveMemberUrl(host: string, port: number, probe: Probe = defaultProbe): Promise<string> {
+export async function resolveMember(host: string, port: number, probe: Probe = defaultProbe): Promise<{ url: string; serverId?: string; serverName?: string }> {
   for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
-    if (await probe(base)) return `${base}/`;
+    const r = await probe(base);
+    if (r) return { url: `${base}/`, serverId: r.serverId, serverName: r.serverName };
   }
-  return `http://${host}:${port}/`;
+  return { url: `http://${host}:${port}/` };
+}
+
+/** URL-only convenience over {@link resolveMember} (kept for callers that don't need the identity). */
+export async function resolveMemberUrl(host: string, port: number, probe: Probe = defaultProbe): Promise<string> {
+  return (await resolveMember(host, port, probe)).url;
 }
 
 async function defaultProbe(baseUrl: string): Promise<ProbeResult | null> {
@@ -214,32 +223,65 @@ export async function inviteMac(opts: { host: string; code: string; token: strin
 }
 
 /**
+ * Candidate daemon base URLs for a member, https first then http. We deliberately re-derive these from
+ * the member's host:port and IGNORE the stored scheme: a member's transport can change after pairing
+ * (e.g. `tailscale serve` HTTPS comes up only after the join), and a token POST sent to the wrong scheme
+ * is hard-rejected ("Client sent an HTTP request to an HTTPS server") — silently stranding the member
+ * without a token forever. Trying both schemes lets propagation self-correct a stale registry entry.
+ */
+function memberBases(m: { url: string; host?: string }): string[] {
+  let host = m.host ?? "";
+  let port = "7701";
+  try {
+    const u = new URL(m.url);
+    if (u.hostname) host = u.hostname;
+    if (u.port) port = u.port;
+  } catch {
+    /* malformed stored url — fall back to the bare host on the default port */
+  }
+  return host ? [`https://${host}:${port}`, `http://${host}:${port}`] : [];
+}
+
+/**
  * Replicate the hub's Todoist token to member DAEMONS (anvil-multi-server.md — autopilot runs where
  * the repo lives, so each member that hosts a linked environment needs the token). Unlike the OAuth
  * token (pushed to the Server.app pairing listener on :7702), this lands in the member daemon's own
  * IntegrationStore via its REST API on :7701. Tailnet-gated like the rest of the daemon API; the hop
  * is WireGuard-encrypted. Best-effort + idempotent — unreachable members heal on their next connect.
+ *
+ * Transport-resilient: each member is tried https-then-http (see {@link memberBases}), and the working
+ * base plus the member's self-reported serverId/serverName come back in `resolvedUrl`/`serverId` so the
+ * caller can heal a stale fleet record. `fetchImpl` is injectable for tests.
  */
 export async function propagateTodoist(opts: {
-  members: { url: string; serverName?: string }[];
+  members: { url: string; host?: string; serverId?: string; serverName?: string }[];
   token: string;
-}): Promise<{ url: string; ok: boolean; account?: string; error?: string }[]> {
+  fetchImpl?: typeof fetch;
+}): Promise<{ url: string; resolvedUrl?: string; serverId?: string; serverName?: string; ok: boolean; account?: string; error?: string }[]> {
   if (!opts.token) return opts.members.map((m) => ({ url: m.url, ok: false, error: "no token" }));
+  const doFetch = opts.fetchImpl ?? fetch;
   return Promise.all(
     opts.members.map(async (m) => {
-      const url = `${m.url.replace(/\/?$/, "/")}api/integrations/todoist`;
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ token: opts.token }),
-          signal: AbortSignal.timeout(12_000),
-        });
-        const data = (await res.json().catch(() => ({}))) as { ok?: boolean; account?: string; error?: string };
-        return { url: m.url, ok: res.ok && data.ok !== false, account: data.account, error: data.error };
-      } catch (e) {
-        return { url: m.url, ok: false, error: e instanceof Error ? e.message : String(e) };
+      let lastError = "no reachable transport";
+      // First scheme that accepts the POST wins; report it (and the member's identity) for healing.
+      for (const base of memberBases(m)) {
+        try {
+          const res = await doFetch(`${base}/api/integrations/todoist`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: opts.token }),
+            signal: AbortSignal.timeout(12_000),
+          });
+          const data = (await res.json().catch(() => ({}))) as { ok?: boolean; account?: string; error?: string; serverId?: string; serverName?: string };
+          if (res.ok && data.ok !== false) {
+            return { url: m.url, resolvedUrl: `${base}/`, serverId: data.serverId, serverName: data.serverName, ok: true, account: data.account };
+          }
+          lastError = data.error ?? `HTTP ${res.status}`;
+        } catch (e) {
+          lastError = e instanceof Error ? e.message : String(e);
+        }
       }
+      return { url: m.url, ok: false, error: lastError };
     }),
   );
 }

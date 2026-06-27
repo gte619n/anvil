@@ -1,5 +1,18 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, discoverFleet, tailnetPeers, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, discoverFleet, tailnetPeers, resolveMember, propagateTodoist, type ProbeResult } from "../../src/server/fleet";
+
+/** A fake `fetch` whose handler maps a URL → {status, body}; records every URL it was called with. */
+function fakeFetch(handler: (url: string) => { status?: number; body?: unknown } | "throw") {
+  const calls: string[] = [];
+  const fn = (async (input: string | URL | Request) => {
+    const url = String(input);
+    calls.push(url);
+    const r = handler(url);
+    if (r === "throw") throw new Error("ECONNREFUSED / wrong scheme"); // mimic an https-vs-http transport reject
+    return new Response(JSON.stringify(r.body ?? {}), { status: r.status ?? 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return { fn, calls };
+}
 
 test("tailnetPeers: lists other Macs by short name (Self + offline excluded from the picker)", async () => {
   const status = JSON.stringify({
@@ -82,6 +95,58 @@ test("resolveMemberUrl: prefers https, falls back to http, defaults to http", as
   expect(await resolveMemberUrl("plain.ts.net", 7701, async (u) => (u.startsWith("http://") ? { serverId: "s", serverName: "", version: "" } : null))).toBe("http://plain.ts.net:7701/");
   // not yet up → default http so the registry still has a usable entry
   expect(await resolveMemberUrl("down.ts.net", 7701, async () => null)).toBe("http://down.ts.net:7701/");
+});
+
+test("resolveMember: returns the working URL plus the probed serverId/serverName", async () => {
+  const probe = async (u: string): Promise<ProbeResult | null> =>
+    u.startsWith("https") ? { serverId: "srv_real", serverName: "M1", version: "1.0.0" } : null;
+  expect(await resolveMember("m1.ts.net", 7701, probe)).toEqual({ url: "https://m1.ts.net:7701/", serverId: "srv_real", serverName: "M1" });
+  // not up yet → usable http entry, but no identity to heal from
+  expect(await resolveMember("down.ts.net", 7701, async () => null)).toEqual({ url: "http://down.ts.net:7701/" });
+});
+
+test("propagateTodoist: heals a stale http record by reaching the member over https", async () => {
+  // The registry has the member as http://, but it actually serves https (the original M1 bug). The
+  // first scheme (https) must succeed and come back as the resolvedUrl so the caller can heal the URL.
+  const { fn, calls } = fakeFetch((u) =>
+    u.startsWith("https://m1.ts.net:7701") ? { body: { ok: true, account: "me@x.com", serverId: "srv_m1", serverName: "M1" } } : "throw",
+  );
+  const [r] = await propagateTodoist({
+    members: [{ url: "http://m1.ts.net:7701/", host: "m1.ts.net", serverId: "m1.ts.net" }], // serverId == host (legacy)
+    token: "tok",
+    fetchImpl: fn,
+  });
+  expect(r!.ok).toBe(true);
+  expect(r!.resolvedUrl).toBe("https://m1.ts.net:7701/"); // healed transport
+  expect(r!.serverId).toBe("srv_m1"); // real id echoed back for healing the host-as-serverId record
+  expect(r!.account).toBe("me@x.com");
+  expect(calls[0]).toBe("https://m1.ts.net:7701/api/integrations/todoist"); // https tried first
+});
+
+test("propagateTodoist: falls back to http for a direct-bind (App Store) member", async () => {
+  const { fn, calls } = fakeFetch((u) => (u.startsWith("http://plain.ts.net") ? { body: { ok: true } } : "throw"));
+  const [r] = await propagateTodoist({ members: [{ url: "http://plain.ts.net:7701/", host: "plain.ts.net" }], token: "tok", fetchImpl: fn });
+  expect(r!.ok).toBe(true);
+  expect(r!.resolvedUrl).toBe("http://plain.ts.net:7701/");
+  expect(calls).toEqual([
+    "https://plain.ts.net:7701/api/integrations/todoist", // tried first, threw
+    "http://plain.ts.net:7701/api/integrations/todoist", // fell back
+  ]);
+});
+
+test("propagateTodoist: unreachable on both schemes → ok:false, no throw", async () => {
+  const { fn } = fakeFetch(() => "throw");
+  const [r] = await propagateTodoist({ members: [{ url: "http://gone.ts.net:7701/", host: "gone.ts.net" }], token: "tok", fetchImpl: fn });
+  expect(r!.ok).toBe(false);
+  expect(r!.resolvedUrl).toBeUndefined();
+  expect(r!.error).toBeTruthy();
+});
+
+test("propagateTodoist: no token → ok:false without any network calls", async () => {
+  const { fn, calls } = fakeFetch(() => ({ body: { ok: true } }));
+  const [r] = await propagateTodoist({ members: [{ url: "https://m1.ts.net:7701/", host: "m1.ts.net" }], token: "", fetchImpl: fn });
+  expect(r!.ok).toBe(false);
+  expect(calls).toEqual([]);
 });
 
 test("discoverFleet: same server reachable twice is deduped by serverId", async () => {

@@ -5,7 +5,7 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { loadServerIdentity, serverHelloEvent } from "./identity";
-import { discoverFleet, inviteMac, propagateTodoist, resolveMemberUrl, rotateToken, tailnetPeers } from "./fleet";
+import { discoverFleet, inviteMac, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
@@ -152,8 +152,25 @@ export function createServer(opts: ServerOptions): ServerHandle {
     if (members.length === 0) return;
     void propagateTodoist({ members, token }).then((results) => {
       for (const r of results) {
-        if (r.ok) console.log(`[todoist] replicated token → ${r.url}${r.account ? ` (${r.account})` : ""}`);
-        else console.warn(`[todoist] replication to ${r.url} failed: ${r.error ?? "unknown"}`);
+        if (!r.ok) {
+          console.warn(`[todoist] replication to ${r.url} failed: ${r.error ?? "unknown"}`);
+          continue;
+        }
+        console.log(`[todoist] replicated token → ${r.resolvedUrl ?? r.url}${r.account ? ` (${r.account})` : ""}`);
+        // Heal the stored fleet record from what actually answered: the working transport (e.g.
+        // http→https once the member enabled `tailscale serve`) and the member's real serverId (legacy
+        // records stored the bare host, which breaks targeted propagation). Future pushes/management
+        // then hit the right URL and match the right id without a re-pair.
+        const stored = fleet.list().find((m) => m.url === r.url);
+        if (!stored) continue;
+        const healedUrl = r.resolvedUrl ?? stored.url;
+        const healedServerId = r.serverId ?? stored.serverId;
+        const healedServerName = r.serverName || stored.serverName;
+        if (healedUrl !== stored.url || healedServerId !== stored.serverId || healedServerName !== stored.serverName) {
+          fleet.upsert({ ...stored, url: healedUrl, serverId: healedServerId, serverName: healedServerName });
+          if (healedUrl !== stored.url) console.log(`[fleet] healed member URL ${stored.url} → ${healedUrl}`);
+          if (healedServerId !== stored.serverId) console.log(`[fleet] healed member serverId ${stored.serverId} → ${healedServerId}`);
+        }
       }
     });
   }
@@ -233,12 +250,15 @@ export function createServer(opts: ServerOptions): ServerHandle {
         if (!host || !code) return new Response("host and code required", { status: 400 });
         const outcome = await inviteMac({ host, code, token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
         if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
+        // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
+        // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
+        // breaks targeted token propagation (members are matched by serverId).
+        const resolved = await resolveMember(host, opts.port);
         const member: rest.FleetMember = {
-          serverId: outcome.serverId || host,
-          serverName: outcome.serverName || host,
+          serverId: resolved.serverId || outcome.serverId || host,
+          serverName: outcome.serverName || resolved.serverName || host,
           host,
-          // Probe the joiner's transport: https if it serves, else plain http (tailnet-IP bind).
-          url: await resolveMemberUrl(host, opts.port),
+          url: resolved.url,
         };
         fleet.upsert(member);
         pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
@@ -253,7 +273,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
         if (!token) return Response.json({ ok: false, error: "token required" }, { status: 400 });
         try {
           const ev = await supervisor.connectTodoist(token);
-          return Response.json({ ok: true, account: ev.account });
+          // Echo this daemon's identity so the hub can heal a stale fleet record (real serverId, and
+          // the URL it actually reached us on) off the same POST — no extra probe needed.
+          return Response.json({ ok: true, account: ev.account, serverId: identity.serverId, serverName: identity.serverName });
         } catch (e) {
           return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 400 });
         }

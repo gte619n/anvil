@@ -253,7 +253,13 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       case "todoist.connect":
         deps.supervisor
           .connectTodoist(cmd.token, cid)
-          .then((event) => send(event))
+          .then((event) => {
+            send(event);
+            // Fan the freshly-connected token out to the whole fleet (untargeted) so every member that
+            // hosts a linked environment can run autopilot — and so stale member records self-heal.
+            // No-op on a leaf (empty fleet) or if no token is set.
+            deps.propagateTodoist?.();
+          })
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 

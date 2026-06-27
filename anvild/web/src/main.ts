@@ -3015,7 +3015,7 @@ function renderScheduleBar(): void {
 function scheduleSettingsCardHtml(): string {
   return `<div class="card schedule-card" id="todoist-schedule">
     <div class="card-main">${scheduleSummaryHtml()}<button class="mini" id="set-sched-edit" style="margin-left:auto">${icon("tune")} Edit</button></div>
-    <p class="small muted">An in-daemon timer re-plans the linked projects and (when auto-start is on) launches the new work. Review &amp; launch plans in the <b>Autopilot</b> section.</p>
+    <p class="small muted">An in-daemon timer on every fleet server re-plans its linked projects and (when auto-start is on) launches the new work. Review &amp; launch plans in the <b>Autopilot</b> section.</p>
   </div>`;
 }
 
@@ -3036,7 +3036,7 @@ function openScheduleModal(): void {
   const toggle = (id: string, on: boolean, label: string): string =>
     `<button type="button" class="ap-toggle${on ? " on" : ""}" id="${id}" aria-pressed="${on}"><span class="ap-toggle-box">${icon("check")}</span><span>${label}</span></button>`;
   m.innerHTML = `<div class="modal-box ap-sched-modal" id="ap-sched-modal"><h3>${icon("schedule")} Scheduled autopilot run</h3>
-    <p class="small muted">An in-daemon timer re-plans linked Todoist projects on the hub and (when auto-start is on) launches the new work. Times are the server's local time.</p>
+    <p class="small muted">An in-daemon timer on every server in the fleet re-plans its own linked Todoist projects and (when auto-start is on) launches the new work. Times are each server's local time.</p>
     ${toggle("ap-enabled", s.enabled, "Enable scheduled run")}
     <div class="ap-sched-body" id="ap-sched-body">
       <label class="ap-field-row"><span>Time of day</span><input type="time" id="ap-time" value="${esc(s.timeOfDay)}" /></label>
@@ -3077,14 +3077,27 @@ async function saveSchedule(): Promise<void> {
   const days = on.length === 0 || on.length === 7 ? [] : on.sort((a, b) => a - b);
   const label = $<HTMLInputElement>("#ap-label").value.trim();
   const defaultEnvironmentId = $<HTMLSelectElement>("#ap-defenv").value;
+  // Push the same schedule to EVERY connected autopilot-capable server, not just the hub. Autopilot
+  // runs per-daemon ("autopilot runs where the repo lives"), so a member-hosted project (e.g. lapo on
+  // the M1) only gets nightly cards once ITS daemon's timer is enabled. The catch-all
+  // (defaultEnvironmentId) is a hub env id, so the account-wide label pass still fires on the hub
+  // only — on a member that id won't resolve, so it skips the label pass and just re-plans its own
+  // linked projects. (lastRunAt stays server-owned and per-daemon.)
+  const targets = orderedServers().filter((s) => s.sock.isOpen() && serverSupports(s, "autopilot"));
+  const patch = { type: "autopilot.schedule.set" as const, enabled, timeOfDay, days, autoStart, maxAutoStart, label, defaultEnvironmentId };
   try {
-    const res = await sendAwait(hub(), { type: "autopilot.schedule.set", enabled, timeOfDay, days, autoStart, maxAutoStart, label, defaultEnvironmentId, cid: newCid() }, 20_000);
-    if (res.type === "command.error") {
-      toast(res.message);
+    const hubIdx = targets.findIndex((s) => s.url === HUB_URL);
+    const results = await Promise.allSettled(targets.map((s) => sendAwait(s, { ...patch, cid: newCid() }, 20_000)));
+    const hubRes = hubIdx >= 0 ? results[hubIdx] : undefined;
+    if (hubRes?.status === "fulfilled" && hubRes.value.type === "command.error") {
+      toast(hubRes.value.message); // surface the hub's validation error (it owns the catch-all config)
       return;
     }
+    const failed = results.filter((r) => r.status === "rejected" || (r.status === "fulfilled" && r.value.type === "command.error")).length;
     closeModal();
-    toast(enabled ? "Schedule saved" : "Scheduled run off");
+    if (!enabled) toast("Scheduled run off");
+    else if (failed) toast(`Schedule saved on ${targets.length - failed}/${targets.length} servers`);
+    else toast(targets.length > 1 ? `Schedule saved on all ${targets.length} servers` : "Schedule saved");
   } catch (err) {
     toast(`Couldn't save schedule: ${err instanceof Error ? err.message : String(err)}`);
   }
