@@ -9,6 +9,13 @@ struct AnvilApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     #endif
 
+    init() {
+        #if os(macOS)
+        // Touch the Sparkle controller at launch so its scheduled background update checks start.
+        _ = AnvilSparkle.controller
+        #endif
+    }
+
     var body: some Scene {
         #if os(macOS)
         WindowGroup("Anvil") {
@@ -18,6 +25,9 @@ struct AnvilApp: App {
         .defaultSize(width: 1180, height: 800)
         .commands {
             CommandGroup(after: .appInfo) {
+                // Updates the app shell itself (Sparkle, off the GitHub appcast).
+                Button("Check for Updates…") { AnvilSparkle.checkForUpdates() }
+                // Updates the daemon (git pull + rebuild) — the dev "Update Button". Unchanged.
                 Button("Update Anvil…") { Updater.runUpdate() }
                     .keyboardShortcut("u", modifiers: .command)
             }

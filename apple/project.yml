@@ -2,11 +2,20 @@ name: Anvil
 options:
   bundleIdPrefix: com.gte619n
   createIntermediateGroups: true
+packages:
+  # Sparkle auto-updater for the macOS app shell. CI builds the distributable via make-app.sh
+  # (swift build), but this keeps the macOS target buildable/runnable from Xcode too. The iOS
+  # target intentionally does NOT depend on Sparkle — SparkleUpdater.swift is #if os(macOS).
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
 targets:
   Anvil:
     type: application
     platform: macOS
     deploymentTarget: "13.0"
+    dependencies:
+      - package: Sparkle
     sources:
       - path: Sources/Anvil
         excludes:
@@ -22,7 +31,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gte619n.anvil
         PRODUCT_NAME: Anvil
-        MARKETING_VERSION: "2.0.0"
+        # Dev-only default for raw Xcode builds; make-app.sh / make-ios.sh override this from the
+        # repo-root VERSION file (MAJOR.MINOR.<build>) and from release-* tags. Keep MAJOR.MINOR in sync.
+        MARKETING_VERSION: "2.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
@@ -55,8 +66,9 @@ targets:
       path: Resources/Info-iOS.plist
       properties:
         CFBundleDisplayName: Anvil
-        # Anvil only uses iOS's standard HTTPS/TLS (no custom crypto) → export-compliance exempt.
-        # Setting this clears the App Store Connect encryption prompt on every upload.
+        # Anvil uses only standard/exempt encryption (HTTPS/TLS). Declaring this up front means the
+        # automated App Store submission (submit-appstore.ts) isn't held waiting for a manual export
+        # compliance answer. Flip to true (and file the right docs) if you ever add custom crypto.
         ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes:
           - remote-notification
@@ -75,7 +87,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gte619n.anvil
         PRODUCT_NAME: Anvil
-        MARKETING_VERSION: "2.0.0"
+        # Dev-only default for raw Xcode builds; make-app.sh / make-ios.sh override this from the
+        # repo-root VERSION file (MAJOR.MINOR.<build>) and from release-* tags. Keep MAJOR.MINOR in sync.
+        MARKETING_VERSION: "2.1.0"
         CURRENT_PROJECT_VERSION: "1"
         # 1 = iPhone, 2 = iPad → one universal binary covers iPhone, iPad, and iPad Mini.
         TARGETED_DEVICE_FAMILY: "1,2"

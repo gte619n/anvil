@@ -1,0 +1,416 @@
+name: Release (stores + Sparkle)
+
+# Tag-driven PRODUCTION release for every Anvil artifact. Push a tag like `release-2.1.0` and this:
+#   • android     → signed AAB to the Play Store production track (completed rollout)
+#   • ios         → App Store: upload, then auto-submit with auto-release after approval
+#   • mac-client  → Developer-ID-notarized Anvil.app on a GitHub Release + Sparkle appcast
+#   • mac-server  → Developer-ID-notarized "Anvil Server.app" on a GitHub Release + Sparkle appcast
+#   • pages       → publishes the two Sparkle appcasts to GitHub Pages so installed apps auto-update
+#
+# The marketing version is parsed from the tag (release-2.1.0 → 2.1.0); the build number is the run
+# number. Beta stays separate and untouched: android-release.yml (Firebase, push→main) and
+# ios-release.yml (TestFlight, manual). One-time setup + the full secret list live in RELEASING.md.
+on:
+  push:
+    tags: ['release-*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # create the GitHub Release + upload the macOS zips
+  pages: write      # deploy the appcasts to GitHub Pages
+  id-token: write   # OIDC for the Pages deployment
+
+jobs:
+  # ── parse the tag once, and create the GitHub Release the macOS jobs upload into ──────────────
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#release-}" >> "$GITHUB_OUTPUT"
+      - name: Ensure the GitHub Release exists
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                 --title "$GITHUB_REF_NAME" --notes "Automated release $GITHUB_REF_NAME." --verify-tag
+
+  # ── Android → Play Store production ───────────────────────────────────────────────────────────
+  android:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - name: Make Bun available to login shells
+        run: sudo ln -sf "$(which bun)" /usr/local/bin/bun
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode the Play upload keystore
+        env:
+          ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$ANDROID_UPLOAD_KEYSTORE_BASE64" ] || { echo "::error::ANDROID_UPLOAD_KEYSTORE_BASE64 not set"; exit 1; }
+          echo "$ANDROID_UPLOAD_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload.keystore"
+          echo "ANVIL_RELEASE_STORE_FILE=$RUNNER_TEMP/upload.keystore" >> "$GITHUB_ENV"
+
+      - name: Write the Play service-account credentials
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          [ -n "$PLAY_SERVICE_ACCOUNT_JSON" ] || { echo "::error::PLAY_SERVICE_ACCOUNT_JSON not set"; exit 1; }
+          printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/play-sa.json"
+          echo "PLAY_SERVICE_ACCOUNT_JSON_FILE=$RUNNER_TEMP/play-sa.json" >> "$GITHUB_ENV"
+
+      # Gradle Play Publisher reads the changelog from this listing path.
+      - name: Generate release notes
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/play/release-notes/production
+          bun scripts/gen-release-notes.ts | head -c 500 > app/src/main/play/release-notes/production/en-US.txt
+          echo "----- release notes -----"; cat app/src/main/play/release-notes/production/en-US.txt
+
+      - name: Build AAB & publish to Play production
+        env:
+          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+          ANVIL_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          ANVIL_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          ANVIL_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: ./gradlew :app:bundleRelease :app:publishReleaseBundle --stacktrace
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-release-aab
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+  # ── iOS → App Store (upload, then auto-submit + auto-release) ─────────────────────────────────
+  ios:
+    needs: meta
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
+          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
+          xcodebuild -version
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      - name: Set up signing keychain
+        env:
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$IOS_DIST_P12_BASE64" ] || { echo "::error::IOS_DIST_P12_BASE64 not set"; exit 1; }
+          KC="$RUNNER_TEMP/anvil-signing.keychain-db"; KC_PASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          echo "$IOS_DIST_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -k "$KC" -P "$IOS_DIST_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/xcodebuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          rm -f "$RUNNER_TEMP/dist.p12"
+          echo "SIGNING_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Write App Store Connect API key
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$APPLE_API_KEY_BASE64" ] || { echo "::error::APPLE_API_KEY_BASE64 not set"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/private_keys/AuthKey.p8"
+
+      - name: Install provisioning profile
+        env:
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$IOS_PROVISIONING_PROFILE_BASE64" ] || { echo "::error::IOS_PROVISIONING_PROFILE_BASE64 not set"; exit 1; }
+          dir="$HOME/Library/MobileDevice/Provisioning Profiles"; mkdir -p "$dir"
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$dir/anvil_appstore.mobileprovision"
+
+      - name: Build & upload to App Store Connect
+        working-directory: apple
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey.p8
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
+        run: ./make-ios.sh
+
+      - name: Submit for review + arm auto-release
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey.p8
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
+        run: bun scripts/mac-signing/submit-appstore.ts
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/private_keys"
+
+  # ── macOS client → Developer-ID-notarized Anvil.app + Sparkle ─────────────────────────────────
+  mac-client:
+    needs: meta
+    runs-on: macos-15
+    outputs:
+      ed_signature: ${{ steps.sign.outputs.ed_signature }}
+      length: ${{ steps.sign.outputs.length }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
+          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      - name: Import Developer ID certificate
+        env:
+          MAC_DEVELOPER_ID_P12_BASE64: ${{ secrets.MAC_DEVELOPER_ID_P12_BASE64 }}
+          MAC_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MAC_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$MAC_DEVELOPER_ID_P12_BASE64" ] || { echo "::error::MAC_DEVELOPER_ID_P12_BASE64 not set"; exit 1; }
+          KC="$RUNNER_TEMP/anvil-mac.keychain-db"; KC_PASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          echo "$MAC_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KC" -P "$MAC_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          rm -f "$RUNNER_TEMP/devid.p12"
+          SIGN_ID="$(security find-identity -v -p codesigning "$KC" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$SIGN_ID" ] || { echo "::error::no Developer ID Application identity in the imported cert"; exit 1; }
+          echo "SIGN_ID=$SIGN_ID" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Write App Store Connect API key (for notarization)
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/private_keys/AuthKey.p8"
+
+      - name: Build, notarize & sign Anvil.app
+        working-directory: apple
+        env:
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey.p8
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: ./make-app.sh
+
+      - name: Package, sign update & upload to the Release
+        id: sign
+        working-directory: apple
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent dist/Anvil.app "$RUNNER_TEMP/Anvil.zip"
+          SIGN_UPDATE="$(find .build -path '*/Sparkle/bin/sign_update' | head -1)"
+          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil.zip" -s "$SPARKLE_ED_PRIVATE_KEY")"
+          echo "sign_update: $OUT"
+          echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+          echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/Anvil.zip" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/private_keys"
+
+  # ── macOS server → Developer-ID-notarized "Anvil Server.app" + Sparkle ────────────────────────
+  mac-server:
+    needs: meta
+    runs-on: macos-15
+    outputs:
+      ed_signature: ${{ steps.sign.outputs.ed_signature }}
+      length: ${{ steps.sign.outputs.length }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: |
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
+          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - name: Install + prebuild web client (anvild)
+        working-directory: anvild
+        run: |
+          bun install --frozen-lockfile
+          bun run build:web   # the server bundles anvild source with web/dist prebuilt
+
+      - name: Import Developer ID certificate
+        env:
+          MAC_DEVELOPER_ID_P12_BASE64: ${{ secrets.MAC_DEVELOPER_ID_P12_BASE64 }}
+          MAC_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MAC_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$MAC_DEVELOPER_ID_P12_BASE64" ] || { echo "::error::MAC_DEVELOPER_ID_P12_BASE64 not set"; exit 1; }
+          KC="$RUNNER_TEMP/anvil-mac.keychain-db"; KC_PASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          echo "$MAC_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KC" -P "$MAC_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          rm -f "$RUNNER_TEMP/devid.p12"
+          SIGN_ID="$(security find-identity -v -p codesigning "$KC" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$SIGN_ID" ] || { echo "::error::no Developer ID Application identity"; exit 1; }
+          echo "SIGN_ID=$SIGN_ID" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Write App Store Connect API key (for notarization)
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/private_keys/AuthKey.p8"
+
+      - name: Build, notarize & sign Anvil Server.app
+        working-directory: anvil-server
+        env:
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey.p8
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+          BUNDLE_ANVILD: ../anvild
+        run: ./make-app.sh
+
+      - name: Package, sign update & upload to the Release
+        id: sign
+        working-directory: anvil-server
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "Anvil Server.app" "$RUNNER_TEMP/Anvil-Server.zip"
+          SIGN_UPDATE="$(find .build -path '*/Sparkle/bin/sign_update' | head -1)"
+          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil-Server.zip" -s "$SPARKLE_ED_PRIVATE_KEY")"
+          echo "sign_update: $OUT"
+          echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+          echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/Anvil-Server.zip" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/private_keys"
+
+  # ── publish both Sparkle appcasts to GitHub Pages (so installed apps auto-update) ─────────────
+  pages:
+    needs: [meta, mac-client, mac-server]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      # Start from the currently-published appcasts so history accumulates across releases.
+      - name: Seed from the live appcasts
+        run: |
+          mkdir -p _site
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          curl -fsSL "$base/appcast.xml"        -o _site/appcast.xml        || echo "(no existing client appcast yet)"
+          curl -fsSL "$base/appcast-server.xml" -o _site/appcast-server.xml || echo "(no existing server appcast yet)"
+
+      - name: Update client appcast
+        env:
+          APPCAST_FILE: _site/appcast.xml
+          APP_TITLE: Anvil
+          SHORT_VERSION: ${{ needs.meta.outputs.version }}
+          BUILD_VERSION: ${{ github.run_number }}
+          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/Anvil.zip
+          ED_SIGNATURE: ${{ needs.mac-client.outputs.ed_signature }}
+          LENGTH: ${{ needs.mac-client.outputs.length }}
+          MIN_SYSTEM: '13.0'
+          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: bun scripts/mac-signing/update-appcast.ts
+
+      - name: Update server appcast
+        env:
+          APPCAST_FILE: _site/appcast-server.xml
+          APP_TITLE: Anvil Server
+          SHORT_VERSION: ${{ needs.meta.outputs.version }}
+          BUILD_VERSION: ${{ github.run_number }}
+          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/Anvil-Server.zip
+          ED_SIGNATURE: ${{ needs.mac-server.outputs.ed_signature }}
+          LENGTH: ${{ needs.mac-server.outputs.length }}
+          MIN_SYSTEM: '14.0'
+          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: bun scripts/mac-signing/update-appcast.ts
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with: { path: _site }
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

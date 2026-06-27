@@ -33,13 +33,13 @@ const commitExists = (ref: string): boolean => {
   }
 };
 
-// baseVersionName in app/build.gradle is the single source of truth for the user-visible version.
+// The repo-root VERSION file holds MAJOR.MINOR — the single source of truth shared by every
+// platform. The full user-visible version is MAJOR.MINOR.<build>; this header shows MAJOR.MINOR.
 const baseVersion = ((): string => {
   try {
-    const gradle = readFileSync(new URL("../app/build.gradle", import.meta.url), "utf8");
-    return gradle.match(/baseVersionName\s*=\s*"([^"]+)"/)?.[1] ?? "0.0.0";
+    return readFileSync(new URL("../VERSION", import.meta.url), "utf8").trim() || "0.0";
   } catch {
-    return "0.0.0";
+    return "0.0";
   }
 })();
 

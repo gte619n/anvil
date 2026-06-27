@@ -22,6 +22,16 @@ SECRET_TEAM_ID="apple-team-id"                        # 10-char Apple Developer 
 # --- APNs auth key for the daemon's push sender (anvild/src/push/apns.ts) ---
 SECRET_APNS_P8="apns-auth-key-p8"                    # base64 of the APNs AuthKey_*.p8
 SECRET_APNS_KEY_ID="apns-key-id"                     # the APNs key's Key ID
+# --- Android Play Store upload key (PRODUCTION signing; separate from the committed debug keystore) ---
+SECRET_ANDROID_KEYSTORE="android-upload-keystore"        # base64 of the upload keystore (.jks/.keystore)
+SECRET_ANDROID_STORE_PASS="android-upload-keystore-pass" # keystore (store) password
+SECRET_ANDROID_KEY_ALIAS="android-upload-key-alias"      # key alias inside the keystore
+SECRET_ANDROID_KEY_PASS="android-upload-key-pass"        # key password
+# --- Google Play service account (publishes the AAB to the production track) ---
+SECRET_PLAY_SA="play-service-account-json"               # full service-account JSON (Release manager)
+# --- Sparkle auto-update signing (EdDSA), for the two macOS apps' appcasts ---
+SECRET_SPARKLE_PRIV="sparkle-ed-private-key"             # EdDSA private key string (sign_update -s)
+SECRET_SPARKLE_PUB="sparkle-ed-public-key"               # EdDSA public key string (Info.plist SUPublicEDKey)
 
 # Where provision.sh lands files on each machine.
 SIGNING_HOME="${SIGNING_HOME:-$HOME/.config/oxos-signing}"

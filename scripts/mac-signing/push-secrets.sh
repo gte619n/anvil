@@ -9,6 +9,10 @@
 #   iOS distribution:     --ios-p12 <file> --ios-p12-pass <pw>
 #   Apple Team ID:        --team-id <10-char>            (needed by iOS build + APNs)
 #   APNs auth key:        --apns-p8 <file> --apns-key-id <id>
+#   Android upload key:   --android-keystore <file> --android-keystore-pass <pw> \
+#                         --android-key-alias <alias> --android-key-pass <pw>
+#   Play service account: --play-sa <file.json>
+#   Sparkle EdDSA keys:   --sparkle-priv-file <file> --sparkle-pub <base64>   (from `generate_keys`)
 #
 # Example (everything at once):
 #   ./push-secrets.sh \
@@ -22,6 +26,8 @@ source ./config.sh
 
 P12= P12_PASS= IDENTITY= P8= KEY_ID= ISSUER=
 IOS_P12= IOS_P12_PASS= TEAM_ID= APNS_P8= APNS_KEY_ID=
+ANDROID_KEYSTORE= ANDROID_KEYSTORE_PASS= ANDROID_KEY_ALIAS= ANDROID_KEY_PASS=
+PLAY_SA= SPARKLE_PRIV_FILE= SPARKLE_PUB=
 while [ $# -gt 0 ]; do
   case "$1" in
     --p12)          P12="$2"; shift 2;;
@@ -35,6 +41,13 @@ while [ $# -gt 0 ]; do
     --team-id)      TEAM_ID="$2"; shift 2;;
     --apns-p8)      APNS_P8="$2"; shift 2;;
     --apns-key-id)  APNS_KEY_ID="$2"; shift 2;;
+    --android-keystore)      ANDROID_KEYSTORE="$2"; shift 2;;
+    --android-keystore-pass) ANDROID_KEYSTORE_PASS="$2"; shift 2;;
+    --android-key-alias)     ANDROID_KEY_ALIAS="$2"; shift 2;;
+    --android-key-pass)      ANDROID_KEY_PASS="$2"; shift 2;;
+    --play-sa)               PLAY_SA="$2"; shift 2;;
+    --sparkle-priv-file)     SPARKLE_PRIV_FILE="$2"; shift 2;;
+    --sparkle-pub)           SPARKLE_PUB="$2"; shift 2;;
     *) die "unknown arg: $1";;
   esac
 done
@@ -99,6 +112,40 @@ if [ -n "$APNS_P8" ] || [ -n "$APNS_KEY_ID" ]; then
   secret_put "$SECRET_APNS_P8"     "$tmp/apns.b64"
   secret_put "$SECRET_APNS_KEY_ID" "$tmp/apnskeyid"
   echo "  ✓ APNs auth key"; pushed=1
+fi
+
+# --- Android upload key (Play Store production signing) -----------------------
+if [ -n "$ANDROID_KEYSTORE" ] || [ -n "$ANDROID_KEYSTORE_PASS" ] || [ -n "$ANDROID_KEY_ALIAS" ] || [ -n "$ANDROID_KEY_PASS" ]; then
+  [ -n "$ANDROID_KEYSTORE" ] && [ -f "$ANDROID_KEYSTORE" ] || die "--android-keystore <file> required with the Android group"
+  [ -n "$ANDROID_KEYSTORE_PASS" ] || die "--android-keystore-pass required with the Android group"
+  [ -n "$ANDROID_KEY_ALIAS" ] || die "--android-key-alias required with the Android group"
+  [ -n "$ANDROID_KEY_PASS" ] || die "--android-key-pass required with the Android group"
+  base64 -i "$ANDROID_KEYSTORE" -o "$tmp/android.b64"
+  printf '%s' "$ANDROID_KEYSTORE_PASS" > "$tmp/androidstorepass"
+  printf '%s' "$ANDROID_KEY_ALIAS"     > "$tmp/androidalias"
+  printf '%s' "$ANDROID_KEY_PASS"      > "$tmp/androidkeypass"
+  secret_put "$SECRET_ANDROID_KEYSTORE"   "$tmp/android.b64"
+  secret_put "$SECRET_ANDROID_STORE_PASS" "$tmp/androidstorepass"
+  secret_put "$SECRET_ANDROID_KEY_ALIAS"  "$tmp/androidalias"
+  secret_put "$SECRET_ANDROID_KEY_PASS"   "$tmp/androidkeypass"
+  echo "  ✓ Android upload key"; pushed=1
+fi
+
+# --- Google Play service account ---------------------------------------------
+if [ -n "$PLAY_SA" ]; then
+  [ -f "$PLAY_SA" ] || die "--play-sa <file.json> not found: $PLAY_SA"
+  secret_put "$SECRET_PLAY_SA" "$PLAY_SA"
+  echo "  ✓ Play service account"; pushed=1
+fi
+
+# --- Sparkle EdDSA keys -------------------------------------------------------
+if [ -n "$SPARKLE_PRIV_FILE" ] || [ -n "$SPARKLE_PUB" ]; then
+  [ -n "$SPARKLE_PRIV_FILE" ] && [ -f "$SPARKLE_PRIV_FILE" ] || die "--sparkle-priv-file <file> required with the Sparkle group"
+  [ -n "$SPARKLE_PUB" ] || die "--sparkle-pub <base64> required with the Sparkle group"
+  printf '%s' "$SPARKLE_PUB" > "$tmp/sparklepub"
+  secret_put "$SECRET_SPARKLE_PRIV" "$SPARKLE_PRIV_FILE"
+  secret_put "$SECRET_SPARKLE_PUB"  "$tmp/sparklepub"
+  echo "  ✓ Sparkle EdDSA keys"; pushed=1
 fi
 
 [ "$pushed" = 1 ] || die "nothing to push — pass at least one secret group (see usage at top of this script)"
