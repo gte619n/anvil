@@ -2627,9 +2627,9 @@ function onAutopilotRunSnapshot(log: string[]): void {
   runState.lastLine = log[log.length - 1] ?? "";
   const el = document.getElementById("autopilot-log");
   if (el) {
-    el.hidden = false;
     el.textContent = autopilotLog.join("\n");
-    el.scrollTop = el.scrollHeight;
+    applyAutopilotLogVisibility();
+    if (!el.hidden) el.scrollTop = el.scrollHeight;
   }
   reflectAutopilotRunning();
 }
@@ -2638,11 +2638,28 @@ function onAutopilotProgress(line: string): void {
   runState.lastLine = line;
   const log = document.getElementById("autopilot-log");
   if (log) {
-    log.hidden = false;
     log.textContent = autopilotLog.join("\n");
-    log.scrollTop = log.scrollHeight;
+    applyAutopilotLogVisibility();
+    if (!log.hidden) log.scrollTop = log.scrollHeight;
   }
   reflectAutopilotRunning();
+}
+
+// Whether the user has collapsed the raw run-log panel. Module-level so the choice survives re-renders
+// and live progress: a streamed line must never re-expand a log the user deliberately hid (that's what
+// was burying the plans grid below it on a short/narrow viewport).
+let autopilotLogCollapsed = false;
+/** Sync the run-log panel + its show/hide toggle to `autopilotLogCollapsed`. The toggle only surfaces
+ *  once there's log content; collapsing the log frees the screen for the plans grid underneath. */
+function applyAutopilotLogVisibility(): void {
+  const log = document.getElementById("autopilot-log");
+  const toggle = document.getElementById("autopilot-log-toggle");
+  const hasContent = autopilotLog.length > 0;
+  if (toggle) {
+    (toggle as HTMLElement).hidden = !hasContent;
+    toggle.setAttribute("aria-pressed", String(!autopilotLogCollapsed));
+  }
+  if (log) log.hidden = !hasContent || autopilotLogCollapsed;
 }
 
 // Live status of the current/last "Run autopilot", surfaced as a banner above the log so the run is
@@ -2696,6 +2713,7 @@ function openAutopilot(): void {
         <span class="ap-sched-summary" id="autopilot-schedule"></span>
       </div>
       <span class="ap-head-actions">
+        <button id="autopilot-log-toggle" class="mini" title="Show/hide run log" aria-pressed="true" hidden>${icon("terminal")}<span class="ap-log-toggle-label">Log</span></button>
         <button id="autopilot-run" class="primary ap-run-btn" title="Run autopilot">${icon("play_arrow")}<span class="ap-run-full">Run autopilot</span><span class="ap-run-mid">Run</span></button>
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
@@ -2706,13 +2724,14 @@ function openAutopilot(): void {
   </div>`;
   $("#autopilot-close").addEventListener("click", () => dismissOverlay("autopilot"));
   $("#autopilot-run").addEventListener("click", () => void runAutopilot());
+  $("#autopilot-log-toggle").addEventListener("click", () => {
+    autopilotLogCollapsed = !autopilotLogCollapsed;
+    applyAutopilotLogVisibility();
+  });
   renderScheduleBar();
   renderRunStatus();
-  if (autopilotLog.length) {
-    const log = $("#autopilot-log");
-    log.hidden = false;
-    log.textContent = autopilotLog.join("\n");
-  }
+  if (autopilotLog.length) $("#autopilot-log").textContent = autopilotLog.join("\n");
+  applyAutopilotLogVisibility();
   openOverlay("autopilot", closeAutopilot, "#autopilot"); // own URL; Back reverts it & closes the view
   renderAutopilotGrid();
   for (const s of orderedServers())
@@ -2860,7 +2879,9 @@ function openPlan(id: string): void {
     refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
     refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
     refineBackdrop.hidden = !open;
-    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus();
+    // preventScroll: focusing the textarea otherwise makes the browser scroll the plan body to reveal
+    // it, snapping the document to the bottom every time the window opens.
+    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus({ preventScroll: true });
   };
   refineToggle.addEventListener("click", () => setRefineOpen(!refineDrawer.classList.contains("open")));
   $("#plan-refine-close").addEventListener("click", () => setRefineOpen(false));
