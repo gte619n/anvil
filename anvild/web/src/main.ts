@@ -2858,9 +2858,9 @@ function openPlan(id: string): void {
         <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
-        <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign env</button>
-        <button class="mini" id="plan-link">${icon("link")} Link to session</button>
-        <button class="primary" id="plan-start">${icon("rocket_launch")} Create session &amp; start</button>
+        <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign</button>
+        <button class="mini" id="plan-link">${icon("link")} Link</button>
+        <button class="primary" id="plan-start">${icon("rocket_launch")} Start</button>
       </span>
     </div>
     <div class="plan-reader-body">
