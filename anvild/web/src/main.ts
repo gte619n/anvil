@@ -2787,15 +2787,29 @@ function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: 
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 /** The flowing card grid, grouped by server when the fleet has more than one. */
+// The grid and the plan reader render into the same scroll container (.settings-body), so without help
+// every swap inherits the wrong offset: opening a plan kept the grid's scroll (plan opened mid-page),
+// going Back rebuilt the grid at the top, and a live plans refresh snapped it to the top mid-scroll.
+// Remember the grid's offset on the way into a plan and restore it on the way back; reset to the top
+// when entering a plan; preserve the current offset across a same-view re-render.
+const apScrollBody = (): HTMLElement | null => document.querySelector(".autopilot-view .settings-body");
+let apGridScroll = 0;
+
 function renderAutopilotGrid(): void {
+  const body = apScrollBody();
+  // Coming back from a plan reader (openPlanId still set) → restore where the grid was; a same-view
+  // refresh (already null) → keep the current offset so a background plans update doesn't jump.
+  const keepScroll = openPlanId !== null ? apGridScroll : (body?.scrollTop ?? 0);
   openPlanId = null;
   const host = document.getElementById("autopilot-grid");
   if (!host) return;
+  const restoreScroll = (): void => { if (body) body.scrollTop = keepScroll; };
   const multi = orderedServers().length > 1;
   if (pendingPlanCount() === 0) {
     host.innerHTML = `<div class="ap-empty">${icon("inbox")}
       <p>No pending plans.</p>
       <p class="small muted">Link a Todoist project to an environment in Settings, then <b>Run autopilot</b> to generate plans.</p></div>`;
+    restoreScroll();
     return;
   }
   let html = "";
@@ -2818,6 +2832,7 @@ function renderAutopilotGrid(): void {
   host.querySelectorAll<HTMLElement>(".plan-card").forEach((c) =>
     c.addEventListener("click", () => openPlan(c.dataset.id!)),
   );
+  restoreScroll();
 }
 
 /** Return from a plan reader to the grid. When the reader is an active back-stack layer, dismiss it
@@ -2849,6 +2864,8 @@ function openPlan(id: string): void {
   const p = findPlan(id);
   const host = document.getElementById("autopilot-grid");
   if (!p || !host) return;
+  const body = apScrollBody();
+  if (body && openPlanId === null) apGridScroll = body.scrollTop; // remember where the grid was
   openPlanId = id;
   const env = p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined);
   host.innerHTML = `<div class="plan-reader" data-id="${esc(id)}">
@@ -2916,6 +2933,17 @@ function openPlan(id: string): void {
     e.preventDefault();
     void refinePlan(id);
   });
+  // Enter sends, Shift+Enter newlines — same as the main composer, so the chat actually submits
+  // (a bare textarea swallows Enter as a newline, which read as "refine does nothing").
+  $<HTMLTextAreaElement>("#plan-refine-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      $<HTMLFormElement>("#plan-refine-form").requestSubmit();
+    }
+  });
+  // A fresh plan reads from the top, not wherever the grid (or a prior plan) was scrolled to.
+  if (body) body.scrollTop = 0;
+  document.querySelector(".plan-reader-body")?.scrollTo(0, 0);
 }
 
 /** The server that owns a plan (refine/dismiss/start route there), or undefined if offline/unknown. */
