@@ -3,6 +3,9 @@ plugins {
     id 'org.jetbrains.kotlin.android'
     id 'com.google.gms.google-services'
     id 'com.google.firebase.appdistribution'
+    // Publishes a signed AAB to the Play Store production track (release-* tag). The publish
+    // tasks only run when the release workflow invokes them; configuration is inert otherwise.
+    id 'com.github.triplet.play'
 }
 
 // Load local.properties for the daemon URL (overridable per machine; not committed)
@@ -12,18 +15,20 @@ if (localPropertiesFile.exists()) {
     localProperties.load(new FileInputStream(localPropertiesFile))
 }
 
-// Single source of truth for the user-visible app version. Bump this (and versionCode below)
-// for meaningful releases; it's both the APK versionName and the version shown next to the Anvil
-// brand in the bundled web UI (passed to the web build as APP_VERSION).
-def baseVersionName = "2.0.3"
+// The MAJOR.MINOR of the user-visible version lives in ONE place — the repo-root `VERSION` file —
+// shared by Android, iOS, the macOS client, and the server, so every artifact reports the same
+// version. The full marketing version is MAJOR.MINOR.<build>, so each CI build automatically revs
+// (e.g. 2.1.47) with zero hand-editing. Bump the line in `VERSION` to start a new MAJOR/MINOR.
+def versionFile = rootProject.file("VERSION")
+def majorMinor = versionFile.exists() ? versionFile.text.trim() : "2.1"
 
-// CI (GitHub Actions, .github/workflows/android-release.yml) sets ANVIL_BUILD_NUMBER to the
-// workflow run number on every push to `main`. When present it makes each automated build
-// uniquely identifiable: a monotonic versionCode (offset well past the last hand-bumped code)
-// and a "(build N)" suffix on the user-visible version, so testers can confirm they're on the
-// very latest build straight from the brand label. Local builds keep the plain version above.
+// CI (GitHub Actions) sets ANVIL_BUILD_NUMBER to the workflow run number; it becomes both the
+// version's patch component and a monotonic versionCode (offset past the last hand-bumped code).
+// A `release-*` tag exports ANVIL_MARKETING_VERSION (the exact public number, e.g. 2.1.0) which
+// takes precedence so store releases get the clean number you tagged. Local builds → MAJOR.MINOR.0.
 def ciBuildNumber = System.getenv("ANVIL_BUILD_NUMBER")
-def appVersionName = ciBuildNumber ? "${baseVersionName} (build ${ciBuildNumber})" : baseVersionName
+def buildNumber = ciBuildNumber ?: "0"
+def appVersionName = System.getenv("ANVIL_MARKETING_VERSION") ?: "${majorMinor}.${buildNumber}"
 def computedVersionCode = ciBuildNumber ? (100 + ciBuildNumber.toInteger()) : 8
 
 android {
@@ -57,12 +62,31 @@ android {
             keyAlias "androiddebugkey"
             keyPassword "android"
         }
+        // Production upload key for the Play Store. Unlike the debug keystore this is a real
+        // secret and is NOT committed — the release workflow decodes ANDROID_UPLOAD_KEYSTORE_BASE64
+        // to a file and passes its path + passwords via these env vars. Left unconfigured (and the
+        // release buildType stays unsigned) when the env isn't present, so local/CI debug builds
+        // and the Firebase beta path are completely unaffected.
+        release {
+            def storeFilePath = System.getenv("ANVIL_RELEASE_STORE_FILE")
+            if (storeFilePath) {
+                storeFile file(storeFilePath)
+                storePassword System.getenv("ANVIL_RELEASE_STORE_PASSWORD")
+                keyAlias System.getenv("ANVIL_RELEASE_KEY_ALIAS")
+                keyPassword System.getenv("ANVIL_RELEASE_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Sign with the upload key only when it's been provided (release workflow). Without it
+            // the AAB is unsigned — fine, because only the workflow ever builds the release variant.
+            if (System.getenv("ANVIL_RELEASE_STORE_FILE")) {
+                signingConfig signingConfigs.release
+            }
         }
         debug {
             minifyEnabled false
@@ -122,6 +146,23 @@ firebaseAppDistribution {
         releaseNotesFile = generatedNotes.path
     } else {
         releaseNotes = "v${appVersionName} — Reminders are now per-session: a new alert for a session replaces the old one (no more three stacked reminders), shows which session and what it's asking for (e.g. the command or file), and clears automatically when you tap in to that session."
+    }
+}
+
+// Gradle Play Publisher: `./gradlew :app:publishReleaseBundle` uploads the signed AAB to the
+// Play Store **production** track with a completed (100%) rollout — the auto-release the user asked
+// for. Auth is the Play service-account JSON the release workflow writes from PLAY_SERVICE_ACCOUNT_JSON
+// and points at via PLAY_SERVICE_ACCOUNT_JSON_FILE. The changelog is read from the GPP listing path
+// src/main/play/release-notes/production/en-US.txt, which the workflow fills from the same
+// scripts/gen-release-notes.ts output used for Firebase. Configuration here is inert until a publish
+// task actually runs, so it never affects debug/Firebase builds.
+play {
+    track.set("production")
+    releaseStatus.set(com.github.triplet.gradle.androidpublisher.ReleaseStatus.COMPLETED)
+    defaultToAppBundles.set(true)
+    def saCredsPath = System.getenv("PLAY_SERVICE_ACCOUNT_JSON_FILE")
+    if (saCredsPath) {
+        serviceAccountCredentials.set(file(saCredsPath))
     }
 }
 

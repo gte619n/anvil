@@ -66,6 +66,9 @@ struct MenuView: View {
         menuButton("Manage fleet…", "rectangle.3.group", { state.openAddMac?() }, enabled: state.hasToken)
         menuButton("Restart daemon", "arrow.clockwise", state.restart, enabled: state.hasToken && state.hasCheckout)
         menuButton("Settings…", "gearshape", { state.openWizard?() })
+        // Updates Anvil Server.app itself (Sparkle). The daemon updates separately via Restart/the
+        // web Update button — see SparkleUpdater.swift.
+        menuButton("Check for Updates…", "arrow.down.circle", { AnvilServerSparkle.checkForUpdates() })
       }
       Divider()
       menuButton("Quit Anvil Server", "power", { NSApplication.shared.terminate(nil) }, tint: .secondary)

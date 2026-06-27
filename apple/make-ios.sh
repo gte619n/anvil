@@ -14,7 +14,10 @@
 #   APPLE_API_ISSUER     App Store Connect Issuer ID (UUID)
 #   APPLE_API_KEY_PATH   path to the AuthKey_*.p8
 # Optional:
-#   ANVIL_BUILD_NUMBER   CFBundleVersion (must be unique per TestFlight upload; default 1)
+#   ANVIL_BUILD_NUMBER       CFBundleVersion (must be unique per TestFlight upload; default 1)
+#   ANVIL_MARKETING_VERSION  CFBundleShortVersionString (public version, e.g. 2.1.0). On a
+#                            release-* tag the workflow sets this from the tag so the archived
+#                            version matches what submit-appstore.ts publishes; default = project.yml.
 #
 # Usage:
 #   source ~/.config/oxos-signing/env.sh
@@ -28,6 +31,12 @@ SCHEME="Anvil-iOS"
 XCODEPROJ="$HERE/Anvil.xcodeproj"
 RELEASE_ENTITLEMENTS="$HERE/Resources/Anvil-iOS-Release.entitlements"
 BUILD_NUMBER="${ANVIL_BUILD_NUMBER:-1}"
+# Marketing version: MAJOR.MINOR from the repo-root VERSION file (single source of truth shared by
+# Android, the macOS client, and the server) + the build number → MAJOR.MINOR.<build>, so every CI
+# (TestFlight/App Store) build revs automatically. A release-* tag overrides it via
+# ANVIL_MARKETING_VERSION with the exact public number.
+MAJOR_MINOR="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
+MARKETING_VERSION="${ANVIL_MARKETING_VERSION:-${MAJOR_MINOR:-0.0}.$BUILD_NUMBER}"
 SKIP_WEB=0
 
 for arg in "$@"; do
@@ -77,7 +86,7 @@ rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
 PROFILE_NAME="${IOS_PROFILE_NAME:-Anvil iOS App Store CI}"
 
 # ── 3. archive (Release → production APNs entitlement, manual distribution signing) ───
-echo "▸ archiving (build $BUILD_NUMBER) with profile '$PROFILE_NAME'…"
+echo "▸ archiving (v$MARKETING_VERSION build $BUILD_NUMBER) with profile '$PROFILE_NAME'…"
 xcodebuild archive \
   -project "$XCODEPROJ" -scheme "$SCHEME" -configuration Release \
   -archivePath "$ARCHIVE" \
@@ -87,7 +96,8 @@ xcodebuild archive \
   CODE_SIGN_IDENTITY="Apple Distribution" \
   PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
   CODE_SIGN_ENTITLEMENTS="$RELEASE_ENTITLEMENTS" \
-  CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+  CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+  MARKETING_VERSION="$MARKETING_VERSION"
 
 # ── 4. ExportOptions → export + upload straight to App Store Connect ────────
 cat > "$BUILD_DIR/ExportOptions.plist" <<PLIST

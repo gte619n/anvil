@@ -8,9 +8,16 @@ import PackageDescription
 let package = Package(
   name: "AnvilServer",
   platforms: [.macOS(.v14)],
+  dependencies: [
+    // Auto-update for the Server.app shell (which ships the daemon source inside it). make-app.sh
+    // embeds + signs Sparkle.framework; SparkleUpdater.swift wires the "Check for Updates…" item.
+    // Separate from the daemon git self-update ("Restart daemon" / /api/daemon/update), which stays.
+    .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0")
+  ],
   targets: [
     .executableTarget(
       name: "AnvilServer",
+      dependencies: [.product(name: "Sparkle", package: "Sparkle")],
       swiftSettings: [.swiftLanguageMode(.v5)]
     )
   ]

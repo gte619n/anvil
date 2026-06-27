@@ -28,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     state.startFleetControlIfMember() // a joined Mac listens for token rotations (§4.4)
     refreshIconLoop()
 
+    // Start Sparkle's scheduled background update checks for the Server.app shell (release builds).
+    _ = AnvilServerSparkle.controller
+
     // First run with nothing configured → open the wizard immediately.
     if state.phase == .needsSetup { showWizard() }
   }
