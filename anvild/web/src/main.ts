@@ -3465,6 +3465,12 @@ export function selectSession(id: string, push = true): void {
     maybeShowSessionHero(); // fresh/empty session: show its title card now (no flash before the snapshot)
   }
   renderSessions();
+  // Bring the freshly-selected row into view in the sidebar so starting a project
+  // from Autopilot (or any cross-view jump) lands you on its row, not just its
+  // conversation. `block: "nearest"` is a no-op when the row is already visible,
+  // so manual clicks on on-screen rows don't scroll the list.
+  const activeRow = document.querySelector<HTMLElement>("#sidebar li.session.active");
+  activeRow?.scrollIntoView({ block: "nearest" });
   const s = sessions.get(id);
   setHeaderTitle(s);
   applyActiveTint();
