@@ -26,7 +26,10 @@ const WEB_DIR = process.env.ANVIL_WEB_DIR || join(import.meta.dir, "..", "..", "
 // DOMPurify-sanitized server-side (arch §8.3); scripts are limited to our own bundle.
 const CSP = [
   "default-src 'self'",
-  "img-src 'self' data:",
+  // Attachment images for a member-hosted session render from that member's REST URL
+  // (https://member:7701/api/…/attachments/<id>) — cross-origin, on a non-default port — so the same
+  // *.ts.net:* host-sources as connect-src below are needed, or the <img> is blocked and shows broken.
+  "img-src 'self' data: https://*.ts.net:* http://*.ts.net:*",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com", // Shiki/KaTeX/mermaid + Material Symbols (CDN)
   "script-src 'self'",
   // 'self' = the hub's own daemon; the *.ts.net entries let the hub web app federate other servers on
