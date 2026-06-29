@@ -3290,7 +3290,14 @@ async function loadFleetMembers(): Promise<void> {
     for (const m of members) {
       fleetMemberIdByHost.set(m.host, m.serverId);
       const url = m.url.replace(/\/+$/, "");
-      if (url && url !== HUB_URL && !servers.has(url)) {
+      if (!url || url === HUB_URL) continue;
+      // The hub can heal a member's scheme (http→https once `tailscale serve` is up). If we'd adopted it
+      // under the old scheme, drop that stale entry (same host, different url) so it doesn't linger as a
+      // dead, perpetually-disconnected duplicate next to the healthy one.
+      for (const existing of [...servers.keys()]) {
+        if (existing !== url && existing !== HUB_URL && hostOf(existing) === hostOf(url)) removeServer(existing);
+      }
+      if (!servers.has(url)) {
         saveExtraServers([...loadExtraServers(), url]);
         ensureServer(url);
         adopted = true;

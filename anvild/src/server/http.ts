@@ -175,6 +175,35 @@ export function createServer(opts: ServerOptions): ServerHandle {
     });
   }
 
+  // Re-resolve member records that never got a real identity at invite time. A `serverId` that isn't a
+  // `srv_…` id is a legacy/unresolved record (the :7702 pairing outcome can omit one, so we fell back to
+  // the bare host) — and those records also tend to carry a stale `http://` url even though the member
+  // serves HTTPS behind `tailscale serve`. That stale scheme silently strands HTTP-page clients: the web
+  // client only force-upgrades a member URL to https/wss when the *page itself* is https (securePageUrl /
+  // serverWsUrl), so a client loaded over plain http (e.g. an iPad hitting the hub on the LAN) dials the
+  // stored `http://` member, gets "Client sent an HTTP request to an HTTPS server", and the member never
+  // connects — so its sessions never render and it appears missing. Re-probe https-then-http (a genuinely
+  // http-only member stays http) and heal url + serverId so every client, on any page protocol, gets the
+  // scheme the member actually answers on. Cheap: only unresolved records are probed, and once healed to a
+  // real `srv_…` id they're skipped forever.
+  async function healStaleFleetRecords(): Promise<void> {
+    const stale = fleet.list().filter((m) => !m.serverId.startsWith("srv_"));
+    if (stale.length === 0) return;
+    await Promise.all(
+      stale.map(async (m) => {
+        const port = Number(new URL(m.url).port) || opts.port;
+        const r = await resolveMember(m.host, port);
+        const healedUrl = r.url || m.url;
+        const healedServerId = r.serverId ?? m.serverId;
+        const healedServerName = r.serverName || m.serverName;
+        if (healedUrl === m.url && healedServerId === m.serverId && healedServerName === m.serverName) return;
+        fleet.upsert({ ...m, url: healedUrl, serverId: healedServerId, serverName: healedServerName });
+        if (healedUrl !== m.url) console.log(`[fleet] healed member URL ${m.url} → ${healedUrl}`);
+        if (healedServerId !== m.serverId) console.log(`[fleet] healed member serverId ${m.serverId} → ${healedServerId}`);
+      }),
+    );
+  }
+
   const WS = {
     open(ws: ServerWebSocket<ConnState>) {
       registry.add(ws);
@@ -239,6 +268,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
       // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
       if (url.pathname === "/api/fleet/members" && req.method === "GET") {
+        await healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
       }
       // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
