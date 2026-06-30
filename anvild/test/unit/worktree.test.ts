@@ -43,6 +43,95 @@ test("create + remove a fresh worktree off HEAD", () => {
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
+test("createWorktree branches off the fresh remote tip when the local default branch is stale", () => {
+  // Simulate the real bug: a session's work merges into the remote default, but the canonical
+  // checkout's local `main` never fast-forwards (a fetch only moves origin/main; a GitHub-side merge
+  // teaches the local repo nothing). A new worktree based on HEAD/main must still start from the
+  // merged remote tip — not the stale local commit.
+  const origin = mkdtempSync(join(tmpdir(), "anvil-origin-"));
+  git(["init", "-q", "--bare", "-b", "main"], origin);
+
+  const repo = mkdtempSync(join(tmpdir(), "anvil-repo-"));
+  git(["clone", "-q", origin, repo], tmpdir());
+  git(["config", "user.email", "t@example.com"], repo);
+  git(["config", "user.name", "Test"], repo);
+  writeFileSync(join(repo, "README.md"), "hello\n");
+  git(["add", "."], repo);
+  git(["commit", "-q", "-m", "init"], repo);
+  git(["push", "-q", "origin", "main"], repo);
+
+  // A second clone pushes new work to origin/main — the first checkout's local `main` is now stale.
+  const other = mkdtempSync(join(tmpdir(), "anvil-other-"));
+  git(["clone", "-q", origin, other], tmpdir());
+  git(["config", "user.email", "t@example.com"], other);
+  git(["config", "user.name", "Test"], other);
+  writeFileSync(join(other, "merged.txt"), "merged work\n");
+  git(["add", "."], other);
+  git(["commit", "-q", "-m", "merged PR"], other);
+  git(["push", "-q", "origin", "main"], other);
+
+  const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
+  const created = createWorktree(repo, "HEAD", "fresh-task", wtRoot, "sess_fresh1");
+
+  // The new worktree sees the just-merged file even though the local `main` ref had never advanced.
+  expect(existsSync(join(created.cwd, "merged.txt"))).toBe(true);
+  // And the canonical checkout's local main was opportunistically fast-forwarded to the remote tip
+  // (it was the current branch and the tree was clean), healing the staleness at the source.
+  const localMain = git(["rev-parse", "main"], repo).stdout.toString().trim();
+  const remoteMain = git(["rev-parse", "origin/main"], repo).stdout.toString().trim();
+  expect(localMain).toBe(remoteMain);
+
+  removeWorktree(repo, created.cwd);
+  rmSync(origin, { recursive: true, force: true });
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
+  rmSync(wtRoot, { recursive: true, force: true });
+});
+
+test("createWorktree leaves a dirty canonical checkout's local branch untouched but still bases off the fresh tip", () => {
+  // The fast-forward must never disturb in-progress work: when the canonical checkout has uncommitted
+  // tracked changes, local `main` stays where it is — yet the new worktree still starts from the
+  // freshly-fetched remote tip (via origin/main) so it isn't stale.
+  const origin = mkdtempSync(join(tmpdir(), "anvil-origin-"));
+  git(["init", "-q", "--bare", "-b", "main"], origin);
+
+  const repo = mkdtempSync(join(tmpdir(), "anvil-repo-"));
+  git(["clone", "-q", origin, repo], tmpdir());
+  git(["config", "user.email", "t@example.com"], repo);
+  git(["config", "user.name", "Test"], repo);
+  writeFileSync(join(repo, "README.md"), "hello\n");
+  git(["add", "."], repo);
+  git(["commit", "-q", "-m", "init"], repo);
+  git(["push", "-q", "origin", "main"], repo);
+
+  const other = mkdtempSync(join(tmpdir(), "anvil-other-"));
+  git(["clone", "-q", origin, other], tmpdir());
+  git(["config", "user.email", "t@example.com"], other);
+  git(["config", "user.name", "Test"], other);
+  writeFileSync(join(other, "merged.txt"), "merged work\n");
+  git(["add", "."], other);
+  git(["commit", "-q", "-m", "merged PR"], other);
+  git(["push", "-q", "origin", "main"], other);
+
+  const staleMain = git(["rev-parse", "main"], repo).stdout.toString().trim();
+  writeFileSync(join(repo, "README.md"), "uncommitted local edit\n"); // dirty tracked change
+
+  const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
+  const created = createWorktree(repo, "HEAD", "dirty-task", wtRoot, "sess_dirty1");
+
+  // Worktree still got the fresh remote work...
+  expect(existsSync(join(created.cwd, "merged.txt"))).toBe(true);
+  // ...but the dirty canonical checkout's local main was left exactly where it was.
+  expect(git(["rev-parse", "main"], repo).stdout.toString().trim()).toBe(staleMain);
+  expect(readFileSync(join(repo, "README.md"), "utf8")).toBe("uncommitted local edit\n");
+
+  removeWorktree(repo, created.cwd);
+  rmSync(origin, { recursive: true, force: true });
+  rmSync(repo, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
+  rmSync(wtRoot, { recursive: true, force: true });
+});
+
 test("createWorktree symlinks the canonical node_modules into the worktree (root + subdir)", () => {
   const repo = makeRepo();
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));

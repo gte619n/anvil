@@ -43,9 +43,99 @@ export interface CreatedWorktree {
 }
 
 /**
+ * The local branch a `base` ref refers to, for sync purposes: `HEAD` resolves to the currently
+ * checked-out branch (undefined when detached), a bare local branch name resolves to itself, and
+ * anything else (a remote ref, tag, or raw SHA the caller asked for explicitly) resolves to undefined
+ * so we leave it untouched.
+ */
+function localBranchFor(repoRoot: string, base: string): string | undefined {
+  if (base === "HEAD") {
+    const cur = git(["symbolic-ref", "--short", "HEAD"], repoRoot);
+    return cur.code === 0 ? cur.stdout.trim() : undefined; // detached HEAD → nothing to sync
+  }
+  const name = base.startsWith("refs/heads/") ? base.slice("refs/heads/".length) : base;
+  return git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], repoRoot).code === 0 ? name : undefined;
+}
+
+/** The remote-tracking ref a local branch should sync to: its upstream, else `origin/<branch>` if
+ *  that tracking ref exists. Undefined when the branch tracks nothing on a remote. */
+function remoteTrackingRef(repoRoot: string, branch: string): string | undefined {
+  const up = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`], repoRoot);
+  if (up.code === 0 && up.stdout.trim()) return up.stdout.trim();
+  const guess = `origin/${branch}`;
+  return git(["rev-parse", "--verify", "--quiet", `refs/remotes/${guess}`], repoRoot).code === 0 ? guess : undefined;
+}
+
+/** True if `branch` is checked out in any worktree of this repo (so its ref must not be moved). */
+function isCheckedOutAnywhere(repoRoot: string, branch: string): boolean {
+  const r = git(["worktree", "list", "--porcelain"], repoRoot);
+  if (r.code !== 0) return false;
+  return r.stdout.split("\n").some((l) => l.trim() === `branch refs/heads/${branch}`);
+}
+
+/**
+ * Opportunistically fast-forward the canonical checkout's local `branch` to its freshly-fetched
+ * tracking ref, healing the stale-local-branch problem at the source (not just for the new worktree).
+ * Strictly fast-forward and only when provably safe:
+ *   • does nothing unless `branch` is already an ancestor of `tracking` (never a rewrite or non-ff merge);
+ *   • if `branch` is the canonical checkout's current branch, advances it with `merge --ff-only` only
+ *     when the tree has no tracked changes — so in-progress work is never disturbed;
+ *   • if `branch` is checked out in no worktree, moves the ref directly with `branch -f`;
+ *   • if some *other* worktree has it checked out (a live session), leaves it alone.
+ * Never throws; on any failure the local branch simply stays put (the worktree already bases off
+ * `tracking`, so correctness never depends on this).
+ */
+function fastForwardLocal(repoRoot: string, branch: string, tracking: string): void {
+  if (git(["merge-base", "--is-ancestor", branch, tracking], repoRoot).code !== 0) return; // not a ff
+
+  const here = git(["symbolic-ref", "--short", "HEAD"], repoRoot);
+  if (here.code === 0 && here.stdout.trim() === branch) {
+    const dirty = git(["status", "--porcelain", "--untracked-files=no"], repoRoot).stdout.trim();
+    if (dirty) return; // tracked changes present — don't touch the user's working tree
+    git(["merge", "--ff-only", tracking], repoRoot);
+    return;
+  }
+  if (isCheckedOutAnywhere(repoRoot, branch)) return; // a live session is on it; can't move it safely
+  git(["branch", "-f", branch, tracking], repoRoot);
+}
+
+/**
+ * Resolve the ref a new worktree should actually branch from, keeping it in sync with the remote.
+ *
+ * The canonical checkout's local default branch (e.g. `main`) goes stale: after a session's PR merges
+ * we `git fetch origin` (which only advances the remote-tracking ref `origin/main`) but never
+ * fast-forward the local `main` — and a PR merged on GitHub directly teaches the local repo nothing
+ * at all. A worktree branched off `HEAD`/`main` would then start from pre-merge code and silently
+ * re-introduce just-merged work.
+ *
+ * So when `base` resolves to a local branch that tracks a remote, we fetch that remote branch,
+ * opportunistically fast-forward the local branch to the new tip (see `fastForwardLocal`, healing the
+ * staleness at the source), and return the remote-tracking ref (e.g. `origin/main`) for the worktree
+ * to branch off — so it picks up the freshly-fetched tip even if the local branch couldn't be moved
+ * (e.g. it's dirty or checked out elsewhere). Bases that aren't a tracked local branch — an explicit
+ * remote ref, tag, SHA, or a detached/untracked branch — are honored unchanged. Best-effort: offline /
+ * no-remote / failed fetch all fall back to `base`, so worktree creation never depends on the network.
+ */
+function syncedBase(repoRoot: string, base: string): string {
+  const branch = localBranchFor(repoRoot, base);
+  if (!branch) return base;
+  const tracking = remoteTrackingRef(repoRoot, branch);
+  if (!tracking) return base;
+
+  const slash = tracking.indexOf("/"); // split "origin/feature/x" → remote "origin", branch "feature/x"
+  const remote = tracking.slice(0, slash);
+  const remoteBranch = tracking.slice(slash + 1);
+  const fetched = git(["fetch", remote, remoteBranch], repoRoot); // updates refs/remotes/<tracking>
+  if (fetched.code !== 0) return base;
+  fastForwardLocal(repoRoot, branch, tracking);
+  return tracking;
+}
+
+/**
  * Create a fresh git worktree off `base` (arch §5) on branch `branch` (the session name),
- * checked out at `<worktreeRoot>/<sessionId>`. Throws if the branch already exists so the
- * caller can ask for a different name.
+ * checked out at `<worktreeRoot>/<sessionId>`. The base is first synced to the remote tip when it
+ * targets the default branch (see `syncedBase`) so sessions never start from a stale local `main`.
+ * Throws if the branch already exists so the caller can ask for a different name.
  */
 export function createWorktree(
   repoRoot: string,
@@ -55,6 +145,7 @@ export function createWorktree(
   sessionId: string,
 ): CreatedWorktree {
   const cwd = join(worktreeRoot, sessionId);
+  base = syncedBase(repoRoot, base);
   const r = git(["worktree", "add", "-b", branch, cwd, base], repoRoot);
   if (r.code !== 0) {
     // An empty repo (unborn HEAD) can't branch a worktree — git only says "invalid reference: HEAD".
@@ -111,7 +202,7 @@ export function recreateWorktree(repoRoot: string, cwd: string, branch: string, 
   const branchExists = git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot).code === 0;
   const add = branchExists
     ? git(["worktree", "add", cwd, branch], repoRoot)
-    : git(["worktree", "add", "-b", branch, cwd, base], repoRoot);
+    : git(["worktree", "add", "-b", branch, cwd, syncedBase(repoRoot, base)], repoRoot);
   if (add.code !== 0) return { ok: false, error: add.stderr.trim() || add.stdout.trim() || "git worktree add failed" };
   linkDeps(repoRoot, cwd);
   return { ok: true };
