@@ -109,8 +109,11 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .session .row-btn { background: none; border: none; color: var(--muted); cursor: pointer; padding: 4px 8px; align-self: center; display: flex; }
 .session .row-btn .msym { font-size: 16px; }
 .session .row-btn:hover { color: var(--accent); }
-.session .open-tab { display: none; }
-.session:hover .open-tab, .session.active .open-tab { display: flex; }
+/* Keep the button in flow at all times (visibility, not display) so the text
+   column width never changes on hover — otherwise the meta line rewraps and the
+   row height jumps. */
+.session .open-tab { visibility: hidden; }
+.session:hover .open-tab, .session.active .open-tab { visibility: visible; }
 .sidebar-foot { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; }
 .sidebar-foot:hover { border-color: var(--accent); }
 .sidebar-foot .msym { font-size: 19px; }
