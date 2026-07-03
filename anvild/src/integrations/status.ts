@@ -8,10 +8,15 @@
  *                  │           ↘ blocked (needs a human decision)
  *                  ├→ dismissed (the user rejected the plan in the Autopilot UI; never re-planned)
  *                  └→ expired (the plan went stale / no longer relevant; marked so in the Autopilot UI)
+ *
+ *   needs-clarification: intake (or the planner) judged the task too underspecified to build safely.
+ *     The unit is held on the grid with its open questions, never auto-started; answering via the
+ *     refine chat promotes it back to `planned`. Kept out of the candidate set so it isn't re-planned
+ *     from scratch every night while it waits on a human.
  */
 export const STATUS_PREFIX = "anvil:";
 
-export const STATUSES = ["planned", "building", "review", "blocked", "dismissed", "completed", "expired"] as const;
+export const STATUSES = ["planned", "needs-clarification", "building", "review", "blocked", "dismissed", "completed", "expired"] as const;
 export type AnvilStatus = (typeof STATUSES)[number];
 
 export function statusLabel(status: AnvilStatus): string {

@@ -93,7 +93,9 @@ test("store round-trips, merges patches, ignores lastRunAt in set, and clamps th
     expect(store.get().enabled).toBe(true);
     expect(store.get().timeOfDay).toBe("06:30");
     expect(store.get().maxAutoStart).toBe(3); // rounded
-    expect(store.get().autoStart).toBe(true); // unchanged default preserved
+    expect(store.get().autoStart).toBe(false); // review-only by default; a patch that omits it preserves that
+    store.set({ autoStart: true });
+    expect(store.get().autoStart).toBe(true); // opt-in round-trips
     // usePipeline opts into the autonomous pipeline for auto-started units; defaults off, round-trips.
     expect(store.get().usePipeline).toBe(false);
     store.set({ usePipeline: true });

@@ -741,6 +741,7 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ap-chip { display: inline-flex; align-items: center; gap: 3px; padding: 2px 8px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border); font-size: 11px; color: var(--muted); }
 .ap-chip .msym { font-size: 13px; }
 .ap-chip.status-planned { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.ap-chip.status-needs-clarification { color: #e8730c; border-color: #e8730c66; }
 .ap-chip.status-building { color: #f2c037; border-color: #f2c03766; }
 .ap-chip.status-review { color: #21ba45; border-color: #21ba4566; }
 .ap-chip.status-blocked, .ap-chip.status-dismissed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }

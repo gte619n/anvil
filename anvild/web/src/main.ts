@@ -2768,6 +2768,9 @@ function openPlan(id: string): void {
   if (body && openPlanId === null) apGridScroll = body.scrollTop; // remember where the grid was
   openPlanId = id;
   const env = p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined);
+  // A held (needs-clarification) unit can't be built until its questions are answered: its "plan" is just
+  // the open questions. Disable Start / hide Pipeline and point the reviewer at Refine instead.
+  const held = p.status === "needs-clarification";
   host.innerHTML = `<div class="plan-reader" data-id="${esc(id)}">
     <div class="plan-reader-head">
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
@@ -2778,8 +2781,8 @@ function openPlan(id: string): void {
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
         <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign</button>
         <button class="mini" id="plan-link">${icon("link")} Link</button>
-        <button class="mini" id="plan-pipeline" title="Run the autonomous multi-model pipeline (Claude + GLM) end to end">${icon("hub")} Pipeline</button>
-        <button class="primary" id="plan-start">${icon("rocket_launch")} Start</button>
+        <button class="mini" id="plan-pipeline" title="Run the autonomous multi-model pipeline (Claude + GLM) end to end"${held ? " hidden" : ""}>${icon("hub")} Pipeline</button>
+        <button class="primary" id="plan-start"${held ? ` disabled title="Answer the open questions (Refine) to unblock"` : ""}>${held ? `${icon("lock")} Needs answers` : `${icon("rocket_launch")} Start`}</button>
       </span>
     </div>
     <div class="plan-reader-body">
