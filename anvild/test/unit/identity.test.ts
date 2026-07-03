@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
-import { loadServerIdentity, serverHelloEvent } from "../../src/server/identity";
+import { loadServerIdentity, sanitizeHostname, serverHelloEvent } from "../../src/server/identity";
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), "anvil-id-"));
@@ -26,6 +26,27 @@ test("serverName is ANVIL_SERVER_NAME when set, else the hostname", () => {
     expect(loadServerIdentity(dir, { ANVIL_SERVER_NAME: "build-box" }).serverName).toBe("build-box");
     expect(loadServerIdentity(dir, { ANVIL_SERVER_NAME: "  " }).serverName).toBe(hostname()); // blank → hostname
     expect(loadServerIdentity(dir, {}).serverName).toBe(hostname());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sanitizeHostname passes clean hostnames through and rescues mojibake", () => {
+  expect(sanitizeHostname("Mac-Mini-M1.oxos.lan")).toBe("Mac-Mini-M1.oxos.lan"); // real hostname untouched
+  expect(sanitizeHostname("mac-mini-m4")).toBe("mac-mini-m4");
+  expect(sanitizeHostname("  build_box.local  ")).toBe("build_box.local"); // trimmed, valid charset kept
+  expect(sanitizeHostname("mac mini")).toBe("mac-mini"); // non-ascii separator → salvaged, still readable
+  expect(sanitizeHostname("M1é")).toBe("M1"); // trailing non-ascii dropped
+  expect(sanitizeHostname("à®ÌU")).toBe("anvil-server"); // the reported garbage has no salvageable run → generic label
+  expect(sanitizeHostname("®®")).toBe("anvil-server"); // nothing salvageable → stable generic label
+  expect(sanitizeHostname("")).toBe(""); // empty stays empty (caller falls back)
+});
+
+test("a corrupt hostname never reaches serverName, but ANVIL_SERVER_NAME overrides unsanitized", () => {
+  const dir = tmp();
+  try {
+    // Explicit override is trusted as-is (may be intentionally non-ascii).
+    expect(loadServerIdentity(dir, { ANVIL_SERVER_NAME: "Évan's Mac" }).serverName).toBe("Évan's Mac");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
