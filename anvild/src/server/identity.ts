@@ -18,6 +18,21 @@ export interface ServerIdentity {
   serverName: string;
 }
 
+/**
+ * Guard against a corrupt `os.hostname()`. A real hostname is always ASCII (macOS `scutil` sanitizes
+ * ComputerName→HostName to `[A-Za-z0-9.-]`), but a Mac whose HostName carries non-UTF8 bytes surfaces
+ * from `hostname()` as mojibake (e.g. `à®ÌU`) and then renders as garbage on that machine's fleet card,
+ * since the name travels live in `server.hello`. If the hostname isn't a plausible hostname, salvage the
+ * usable ASCII run (else a stable generic label) so a member never shows up as gibberish. Set
+ * `ANVIL_SERVER_NAME` to override entirely — that path is trusted as-is (it may be intentionally non-ASCII).
+ */
+export function sanitizeHostname(raw: string): string {
+  const name = raw.trim();
+  if (!name || /^[A-Za-z0-9._-]+$/.test(name)) return name;
+  const salvaged = name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "");
+  return /[A-Za-z0-9]{2}/.test(salvaged) ? salvaged : "anvil-server";
+}
+
 export function loadServerIdentity(stateDir: string, env: Record<string, string | undefined> = process.env): ServerIdentity {
   mkdirSync(stateDir, { recursive: true });
   const file = join(stateDir, "server-id");
@@ -27,7 +42,7 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
     serverId = newId("srv");
     writeFileSync(file, `${serverId}\n`);
   }
-  const serverName = (env.ANVIL_SERVER_NAME ?? "").trim() || hostname();
+  const serverName = (env.ANVIL_SERVER_NAME ?? "").trim() || sanitizeHostname(hostname());
   return { serverId, serverName };
 }
 
