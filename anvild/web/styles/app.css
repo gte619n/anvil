@@ -294,9 +294,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .todoist-projects .td-indent { color: var(--muted); white-space: pre; }
 .todoist-connect { display: flex; gap: 8px; margin-top: 10px; }
 .todoist-connect input { flex: 1; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background-color: var(--bg); color: var(--text); }
-/* Autopilot maintenance (reset tags / clear) + the "more providers coming" placeholder card. */
+/* Autopilot maintenance (reset tags / clear). */
 .ap-maint-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.models-soon { opacity: 0.65; }
 .session.archived { opacity: 0.55; }
 .session.pending .title .msym { color: var(--warn); }
 /* A session being cleaned up: disabled + greyed until the daemon confirms deletion (§8). */

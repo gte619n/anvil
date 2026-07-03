@@ -1890,7 +1890,7 @@ function openSettings(): void {
       </section>
       <section class="settings-panel" data-tab="models">
         <div class="section-head"><h3>Models</h3></div>
-        <p class="small muted">The model provider Anvil drives. Set or reset the Claude subscription token here instead of editing the daemon's service file.</p>
+        <p class="small muted">The model providers Anvil drives. Set or reset the Claude subscription token and OpenRouter key here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
       </section>
       <section class="settings-panel" data-tab="appearance">
@@ -2182,7 +2182,7 @@ function closeSettings(): void {
 // ── Model providers (Settings → Models) ───────────────────────────────────────────
 // The daemon drives Claude (Agent SDK); the token is set/reset here so it doesn't require SSHing in to
 // edit the launcher env. OpenRouter powers the adversarial planning panel (a separate metered key). Both
-// are hub-scoped, like Todoist. Gemini/ChatGPT remain placeholders.
+// are hub-scoped, like Todoist.
 type ProviderAuth = { connected: boolean; persisted: boolean; masked?: string };
 let claudeAuth: ProviderAuth | null = null;
 let openRouterAuth: ProviderAuth | null = null;
@@ -2354,8 +2354,7 @@ function renderModelsPanel(): void {
           <p class="small muted">Paste a fresh key to replace the current one.</p>
           ${orForm("Replace")}</div>`;
   }
-  const futureCard = `<div class="card models-soon"><div class="card-main"><span class="conn-dot"></span><span>Gemini · ChatGPT — <b>coming soon</b>. Anvil currently drives Claude only.</span></div></div>`;
-  host.innerHTML = `${claudeSection}${openRouterSection}${futureCard}${pipelineMetricsCard()}`;
+  host.innerHTML = `${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
 
   // Wire Claude controls.
   if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
