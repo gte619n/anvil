@@ -56,10 +56,11 @@ import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
-import { readStatus, withStatus } from "../integrations/status";
+import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
+import { autoStartDecision } from "../integrations/autostart-gate";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
 import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
@@ -444,6 +445,9 @@ export class Supervisor {
     return this.workUnits.list().filter(
       (u) =>
         (u.status === "planned" && !u.sessionId) ||
+        // Held-for-clarification units live on the grid too, so the reviewer can read the open questions and
+        // answer them (via refine, which promotes the unit back to `planned`) or dismiss it.
+        (u.status === "needs-clarification" && !u.sessionId) ||
         // Keep pipeline-completed units on the grid so their trace + PR stay reviewable until the operator
         // resolves them (dismiss/complete). Only pipeline-run units gain this visibility — the old flow is
         // unchanged (a normal planned→built unit has no devPipeline).
@@ -503,7 +507,11 @@ export class Supervisor {
       plan: revised.plan,
       ...(revised.summary ? { summary: revised.summary } : {}),
       ...(revised.effort ? { effort: revised.effort } : {}),
+      // Answering a held unit's questions in the refine chat is what un-holds it: promote it back to
+      // `planned` so it becomes startable again. Re-tag the member tasks to match.
+      ...(u.status === "needs-clarification" ? { status: "planned" as const } : {}),
     });
+    if (u.status === "needs-clarification") void this.tagTasks(u, "planned");
     void this.postPlanComment(u, `🤖 **anvil** refined the plan for “${u.title}”.\n\n${revised.summary?.trim() || "Plan updated."}`);
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
@@ -679,6 +687,9 @@ export class Supervisor {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
+    // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
+    // the reviewer to answer (Refine → promotes it to `planned`) before it can start.
+    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — answer its open questions (Refine) before starting");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
     const brief = this.autopilotBrief(u);
@@ -825,9 +836,18 @@ export class Supervisor {
         skipped += res.skipped;
       }
       // Auto-start the new units, capped, and only when the subscription budget is healthy — an
-      // unattended run must never spawn a swarm of sessions or exhaust the weekly window. Label-sourced
-      // units are never auto-started (they may be mis-routed to the catch-all env → always review first).
-      const autoStartable = createdUnits.filter((u) => u.source !== "label");
+      // unattended run must never spawn a swarm of sessions or exhaust the weekly window. Each unit must
+      // also clear the auto-start gate: label-sourced units are review-only, units held `needs-clarification`
+      // by intake are never built, and a plan the adversarial panel scored below the confidence bar is left
+      // `planned` for a human. (The intake/clarification holds were already logged during planning; only
+      // surface the adversarial-quality holds here so the run log explains a plan that DID get planned but
+      // won't build.)
+      const autoStartable: WorkUnit[] = [];
+      for (const u of createdUnits) {
+        const decision = autoStartDecision(u);
+        if (decision.start) autoStartable.push(u);
+        else if (u.source !== "label" && u.status === "planned" && decision.reason) emit(`⏸ Holding “${u.title}” — ${decision.reason}.`);
+      }
       // Pipeline auto-start needs an OpenRouter key (GLM authors several gates); fall back to a plain build
       // session if the operator asked for the pipeline but no key is set, rather than failing every unit.
       const pipeline = opts.usePipeline && !!openRouterKey;
@@ -889,6 +909,7 @@ export class Supervisor {
   async runDevPipeline(workUnitId: string, opts: { signal?: AbortSignal; onProgress?: (m: string) => void } = {}): Promise<PipelineOutcome> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — answer its open questions (Refine) before running the pipeline");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the work unit's environment no longer exists");
     if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
@@ -971,8 +992,8 @@ export class Supervisor {
     return this.autopilotScheduleEvent(cid); // the requester (cid)
   }
 
-  /** Best-effort: set every member task's anvil status label (used on dismiss/build transitions). */
-  private async tagTasks(u: WorkUnit, status: "building"): Promise<void> {
+  /** Best-effort: set every member task's anvil status label (used on dismiss/build/promotion transitions). */
+  private async tagTasks(u: WorkUnit, status: AnvilStatus): Promise<void> {
     const state = this.integrations.todoist();
     if (!state?.accessToken) return;
     const client = new TodoistClient(state.accessToken);

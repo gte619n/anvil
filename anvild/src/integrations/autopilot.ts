@@ -2,9 +2,10 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
 import type { TodoistClient, TodoistTask, TodoistSection } from "./todoist";
-import { readStatus, withStatus } from "./status";
-import { extractPlanMeta, PLAN_META_INSTRUCTION } from "./plan-meta";
+import { readStatus, withStatus, type AnvilStatus } from "./status";
+import { extractPlanMeta, PLAN_META_INSTRUCTION, type PlanClarification } from "./plan-meta";
 import { extractJson } from "./json";
+import { parseIntakeVerdict, type IntakeVerdict } from "./autostart-gate";
 import { reviewPlan, formatReview, type AdversarialReview } from "./adversarial";
 import type { OpenRouterClient } from "./openrouter";
 import type { WorkUnit, WorkUnitStore } from "./workunit";
@@ -29,6 +30,7 @@ export interface PlannedUnit extends ProposedUnit {
   summary?: string; // 1–2 line description for the Autopilot card (from the plan's metadata block)
   effort?: AutopilotEffort; // rough size + files-touched estimate (from the plan's metadata block)
   adversarial?: AdversarialReview; // competing-model critiques of the plan (undefined when the panel is disabled)
+  clarification?: PlanClarification; // set when the planner judged the task too underspecified to build (Fix B escape hatch)
 }
 
 /** Optional adversarial-panel wiring threaded through the planner. Omitting it disables the panel
@@ -106,11 +108,16 @@ async function runQuery(
  * falls back to the wrap-up text. The model is told to append a ```json metadata block "after the
  * plan"; it may land in either the plan or the wrap-up, so we look in both for summary/effort.
  */
-function resolvePlan(out: { text: string; plan?: string }): { plan: string; summary?: string; effort?: AutopilotEffort } {
+function resolvePlan(out: { text: string; plan?: string }): { plan: string; summary?: string; effort?: AutopilotEffort; clarification?: PlanClarification } {
   const primary = extractPlanMeta(out.plan ?? out.text);
   if (primary.summary || !out.plan) return primary; // metadata found, or nothing else to look at
-  const fromText = extractPlanMeta(out.text); // plan had no block — try the wrap-up for summary/effort
-  return { plan: primary.plan, ...(fromText.summary ? { summary: fromText.summary } : {}), ...(fromText.effort ? { effort: fromText.effort } : {}) };
+  const fromText = extractPlanMeta(out.text); // plan had no block — try the wrap-up for summary/effort/clarification
+  return {
+    plan: primary.plan,
+    ...(fromText.summary ? { summary: fromText.summary } : {}),
+    ...(fromText.effort ? { effort: fromText.effort } : {}),
+    ...(fromText.clarification ? { clarification: fromText.clarification } : {}),
+  };
 }
 
 function taskLine(t: TodoistTask, sectionName?: string): string {
@@ -186,7 +193,7 @@ ${PLAN_META_INSTRUCTION}`;
 
   const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true, signal: opts.signal });
   const resolved = resolvePlan(out);
-  const { summary, effort } = resolved;
+  const { summary, effort, clarification } = resolved;
   let plan = resolved.plan;
 
   // Adversarial panel: competing OpenRouter models critique Claude's plan. Advisory only — never fail
@@ -207,7 +214,147 @@ ${PLAN_META_INSTRUCTION}`;
       adversarial = undefined;
     }
   }
-  return { ...unit, tasks: members, plan, summary, effort, adversarial };
+  return { ...unit, tasks: members, plan, summary, effort, adversarial, ...(clarification ? { clarification } : {}) };
+}
+
+/**
+ * INTAKE (Fix C): before spending a full planning pass — and long before an unattended build — an
+ * independent classifier decides whether the request is even specified well enough to implement without
+ * inventing material product decisions (what to build, where it lives, what "done" means). Runs on Claude
+ * (subscription auth), so this gate applies on EVERY auto-start path, not just the OpenRouter dev-pipeline
+ * whose own P0 intake was the only such check before. Read-only, no repo access — it judges the ask, not the
+ * codebase. Fails OPEN (well-formed) on any error so a flaky classifier can never wedge the whole run.
+ */
+export async function classifyIntake(
+  unit: ProposedUnit,
+  tasks: TodoistTask[],
+  opts: { model?: Model; signal?: AbortSignal } = {},
+): Promise<IntakeVerdict> {
+  const taskBlock = tasks.map((t) => taskLine(t)).join("\n");
+  const prompt = `You are the User Advocate at intake for an autonomous engineering autopilot. If you approve this, it will be implemented UNATTENDED — no human in the loop — and shipped as a pull request. Judge ONLY whether the request is specified well enough to build without inventing material product decisions. Do not plan or solve it.
+
+Classify as exactly one of:
+- "well-formed": a competent engineer could implement this and be confident the result is what was asked. Normal engineering tasks that merely require judgement are well-formed.
+- "needs-clarification": the intent is real but a key decision is missing or ambiguous — what exactly to build, where it should live, which data/source is authoritative, or what "done" means — such that the implementer would have to GUESS, and a wrong guess wastes real work.
+- "out-of-scope": not an actionable software change in this repository (e.g. pure data-entry, ops, or discussion).
+
+Be strict about "needs-clarification": if building it forces you to invent the deliverable, it is NOT well-formed. When it isn't well-formed, list the specific questions a human must answer.
+
+Respond with ONLY JSON, no prose:
+{"classification": "well-formed|needs-clarification|out-of-scope", "reason": "one sentence", "questions": ["...", "..."]}
+
+Unit: ${unit.title}
+Why bundled: ${unit.rationale}
+Tasks:
+${taskBlock}`;
+  try {
+    const out = await runQuery(prompt, { model: opts.model ?? "sonnet", signal: opts.signal });
+    return parseIntakeVerdict(extractJson<unknown>(out.text));
+  } catch {
+    // Never let a classifier hiccup (parse failure, transient SDK error) block planning — fail open.
+    return { classification: "well-formed", wellFormed: true, reason: "", questions: [] };
+  }
+}
+
+/** A held unit's markdown body: the reason + open questions (shown in the plan reader), with any draft plan
+ *  the planner did produce preserved below so its context isn't lost. */
+function clarificationDoc(c: { reason: string; questions: string[] }, draftPlan?: string): string {
+  const qs = c.questions.length ? c.questions.map((q) => `- ${q}`).join("\n") : "- (The task needs more detail before it can be implemented.)";
+  const head = `# Needs clarification\n\n${c.reason || "This task is underspecified — it needs answers before it can be built safely."}\n\n## Open questions\n\n${qs}\n\n_Answer these in the refine chat (or on the Todoist task) and the unit returns to \`planned\`._`;
+  return draftPlan ? `${head}\n\n---\n\n## Draft plan (assumptions — pending the answers above)\n\n${draftPlan}` : head;
+}
+
+/** The Todoist comment for a held unit: the reason + the questions, posted where the user already works. */
+function clarificationComment(unit: { title: string }, c: { reason: string; questions: string[] }): string {
+  const qs = c.questions.length ? c.questions.map((q) => `- ${q}`).join("\n") : "- (needs more detail before it can be built)";
+  return `🤖 **anvil** paused “${unit.title}” — it needs clarification before it can be built.\n\n${c.reason}\n\n**Please answer:**\n${qs}`;
+}
+
+/**
+ * Run one bundled unit through intake → plan → persist, applying both underspecification gates:
+ *  - intake (Fix C) short-circuits before planning when the ask itself is too vague;
+ *  - the planner's own escape hatch (Fix B) catches a task that only reveals its ambiguity mid-plan.
+ * Either way the unit is persisted `needs-clarification` (held on the grid, never auto-started) instead of
+ * `planned`. Shared by the project- and label-sourced planners so the two never drift. Returns the WorkUnit.
+ */
+async function processUnit(
+  deps: { client: TodoistClient; workUnits: WorkUnitStore },
+  unit: ProposedUnit,
+  candidates: TodoistTask[],
+  opts: {
+    environmentId: string;
+    projectId?: string; // fixed project (linked-project source); omit to derive from the first member (label source)
+    repoRoot: string;
+    planModel?: Model;
+    intakeModel?: Model;
+    adversarial?: AdversarialOpts;
+    signal?: AbortSignal;
+    source?: "label";
+  },
+): Promise<WorkUnit> {
+  const members = candidates.filter((t) => unit.taskIds.includes(t.id));
+  const verdict = await classifyIntake(unit, members, { model: opts.intakeModel, signal: opts.signal });
+
+  let clarification: { reason: string; questions: string[] } | undefined;
+  let planned: PlannedUnit | undefined;
+  if (!verdict.wellFormed) {
+    // Skip the (expensive) planning pass entirely — there's nothing concrete to plan against yet.
+    const reason =
+      verdict.reason ||
+      (verdict.classification === "out-of-scope"
+        ? "This doesn't look like an actionable software change in this repo."
+        : "This task is underspecified — it needs answers before it can be built.");
+    clarification = { reason, questions: verdict.questions };
+  } else {
+    planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial });
+    if (planned.clarification) {
+      clarification = {
+        reason: planned.summary?.trim() || "Planning surfaced open questions that must be answered before this can be built.",
+        questions: planned.clarification.questions,
+      };
+    }
+  }
+
+  const projectId = opts.projectId ?? members[0]?.project_id ?? "";
+  const status: AnvilStatus = clarification ? "needs-clarification" : "planned";
+  const wu = deps.workUnits.create(
+    clarification
+      ? {
+          environmentId: opts.environmentId,
+          todoistProjectId: projectId,
+          taskIds: unit.taskIds,
+          title: unit.title,
+          rationale: unit.rationale,
+          plan: clarificationDoc(clarification, planned?.plan),
+          summary: clarification.reason,
+          status,
+          ...(opts.source ? { source: opts.source } : {}),
+        }
+      : {
+          environmentId: opts.environmentId,
+          todoistProjectId: projectId,
+          taskIds: unit.taskIds,
+          title: unit.title,
+          rationale: unit.rationale,
+          plan: planned!.plan,
+          summary: planned!.summary,
+          effort: planned!.effort,
+          adversarial: planned!.adversarial,
+          status,
+          ...(opts.source ? { source: opts.source } : {}),
+        },
+  );
+
+  // Tag every member; post the actionable comment once (on the first member), pointers on the rest.
+  for (const [j, t] of members.entries()) {
+    await deps.client.setTaskLabels(t.id, withStatus(t.labels, status));
+    if (j === 0) {
+      await deps.client.addComment(t.id, clarification ? clarificationComment(unit, clarification) : planComment({ title: unit.title, rationale: unit.rationale, summary: planned!.summary }));
+    } else {
+      await deps.client.addComment(t.id, `🤖 Part of anvil unit “${unit.title}” — ${clarification ? "clarification questions are" : "the plan is"} on “${members[0]!.content}”.`);
+    }
+  }
+  return wu;
 }
 
 /**
@@ -247,7 +394,7 @@ function candidateTasks(tasks: TodoistTask[], workUnits: WorkUnitStore): Todoist
 /** The Todoist comment for a freshly planned unit: just a one-line summary of what's ready. The full
  *  plan and its location live in Anvil's Autopilot view — no need to restate them (or editorialize)
  *  in the comment. */
-function planComment(unit: PlannedUnit): string {
+function planComment(unit: { title: string; rationale: string; summary?: string }): string {
   const summary = unit.summary?.trim() || unit.rationale.trim() || "Implementation plan ready.";
   return `🤖 **anvil** planned “${unit.title}”.\n\n${summary}`;
 }
@@ -284,29 +431,20 @@ export async function planAndTagProject(
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial });
-    const wu = deps.workUnits.create({
+    const wu = await processUnit(deps, unit, candidates, {
       environmentId: opts.environmentId,
-      todoistProjectId: opts.projectId,
-      taskIds: planned.taskIds,
-      title: planned.title,
-      rationale: planned.rationale,
-      plan: planned.plan,
-      summary: planned.summary,
-      effort: planned.effort,
-      adversarial: planned.adversarial,
-      status: "planned",
+      projectId: opts.projectId,
+      repoRoot: opts.repoRoot,
+      planModel: opts.planModel,
+      adversarial: opts.adversarial,
+      signal: opts.signal,
     });
-    // Tag every member; post the summary + deep link once (on the first member), pointers on the rest.
-    for (const [j, t] of planned.tasks.entries()) {
-      await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
-      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
-      else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
-    }
+    if (wu.status === "needs-clarification") log(`      ↳ held for clarification (underspecified).`);
     created.push(wu);
     opts.onUnitCreated?.(wu);
   }
-  log(`Created ${created.length} planned work units.`);
+  const held = created.filter((u) => u.status === "needs-clarification").length;
+  log(`Created ${created.length} work units${held ? ` (${held} held for clarification)` : ""}.`);
   return { created, skipped };
 }
 
@@ -342,29 +480,21 @@ export async function planAndTagTasks(
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial });
-    const wu = deps.workUnits.create({
+    const wu = await processUnit(deps, unit, candidates, {
       environmentId: opts.environmentId,
-      todoistProjectId: planned.tasks[0]?.project_id ?? "",
-      taskIds: planned.taskIds,
-      title: planned.title,
-      rationale: planned.rationale,
-      plan: planned.plan,
-      summary: planned.summary,
-      effort: planned.effort,
-      adversarial: planned.adversarial,
-      status: "planned",
+      // No fixed project: a label-sourced unit records the first member's own project id (derived in processUnit).
+      repoRoot: opts.repoRoot,
+      planModel: opts.planModel,
+      adversarial: opts.adversarial,
+      signal: opts.signal,
       source: "label",
     });
-    for (const [j, t] of planned.tasks.entries()) {
-      await deps.client.setTaskLabels(t.id, withStatus(t.labels, "planned"));
-      if (j === 0) await deps.client.addComment(t.id, planComment(planned));
-      else await deps.client.addComment(t.id, `🤖 Part of anvil unit “${planned.title}” — plan is on “${planned.tasks[0]!.content}”.`);
-    }
+    if (wu.status === "needs-clarification") log(`      ↳ held for clarification (underspecified).`);
     created.push(wu);
     opts.onUnitCreated?.(wu);
   }
-  log(`Created ${created.length} planned work units from the Autopilot label.`);
+  const held = created.filter((u) => u.status === "needs-clarification").length;
+  log(`Created ${created.length} work units from the Autopilot label${held ? ` (${held} held for clarification)` : ""}.`);
   return { created, skipped };
 }
 

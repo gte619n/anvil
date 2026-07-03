@@ -402,7 +402,7 @@ export interface AutopilotEffort {
 }
 /** The anvil autopilot's status, mirrored from the `anvil:*` Todoist labels. Kept in lockstep with
  *  STATUSES in src/integrations/status.ts (the server is the source of truth). */
-export type AnvilStatus = "planned" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
+export type AnvilStatus = "planned" | "needs-clarification" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
 /** A focused projection of the autonomous-dev-pipeline trace record (§7), shaped for the reader. The
  *  full plan markdown stays in `AutopilotPlanInfo.plan`; this carries the gate/assignment residue. */
 export interface PipelineTraceInfo {

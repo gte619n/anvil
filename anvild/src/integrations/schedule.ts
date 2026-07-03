@@ -12,7 +12,11 @@ import type { AutopilotSchedule } from "@protocol";
 export const DEFAULT_SCHEDULE: AutopilotSchedule = {
   enabled: false,
   timeOfDay: "02:00",
-  autoStart: true,
+  // Review-only by default: the nightly run plans and holds, and a human starts the build. Auto-start
+  // an unattended build only when the operator explicitly opts in — an underspecified task should never
+  // reach a bypass-permission build session without someone having chosen that trade-off. See the
+  // intake gate + adversarial-consensus gate that also guard auto-start when it IS enabled.
+  autoStart: false,
   usePipeline: false,
   maxAutoStart: 3,
   label: "Autopilot",
