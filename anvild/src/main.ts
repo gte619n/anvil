@@ -1,12 +1,17 @@
 import { loadConfig } from "./config";
 import { assertSubscriptionAuth } from "./auth/guard";
 import { loadPersistedClaudeToken } from "./auth/store";
+import { loadPersistedOpenRouterKey } from "./auth/openrouter";
 import { createServer, VERSION } from "./server/http";
 import { createMarkdownRenderer } from "./render/markdown-pipeline";
 
 // A token set/reset from the UI (auth.set) is persisted to the launcher's env file. If the launcher
 // didn't export it (dev run), load just that key before the §3 guard so the UI-set token is honoured.
 loadPersistedClaudeToken();
+// The OpenRouter key (adversarial panel) is persisted in the same env file; load it before loadConfig so
+// the panel is enabled on startup when a key was set from the UI. It's a different provider than
+// Anthropic, so it's irrelevant to the §3 guard below.
+loadPersistedOpenRouterKey();
 // arch §3: refuse to start unless the subscription-auth invariant holds.
 assertSubscriptionAuth();
 
@@ -19,6 +24,8 @@ const server = createServer({
   clonesDir: config.clonesDir,
   warnFraction: config.warnFraction,
   softStopFraction: config.softStopFraction,
+  adversarialModels: config.adversarialModels,
+  adversarialProvider: config.adversarialProvider,
   renderer,
 });
 

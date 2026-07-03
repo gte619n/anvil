@@ -1,6 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { envFile, envFileHasKey, mask, readEnvKey, removeEnvLine, upsertEnvLine } from "./env-file";
 
 /**
  * The daemon's Claude subscription OAuth token, set/reset from the UI (auth.set / auth.clear).
@@ -27,19 +25,9 @@ export interface AuthStatus {
   masked?: string; // e.g. "sk-ant-…últ4f2" — enough to recognise, never the full secret
 }
 
-/** The env file the launchd launcher sources (`set -a; . "$HOME/.config/anvil/env"`). Mirrors
- *  scripts/service.sh exactly — do NOT swap in XDG_CONFIG_HOME here or the daemon would write a file
- *  the launcher never reads, and a UI-set token would vanish on the next restart. */
-export function authEnvFile(home: string = homedir()): string {
-  return join(home, ".config", "anvil", "env");
-}
-
-/** Show enough of a token to recognise it without leaking it (first 8 + last 4 chars). */
-function mask(token: string): string {
-  const t = token.trim();
-  if (t.length <= 14) return "•".repeat(t.length);
-  return `${t.slice(0, 8)}…${t.slice(-4)}`;
-}
+/** The env file the launchd launcher sources — see auth/env-file.ts (`envFile`). Re-exported under the
+ *  historical name so existing call sites keep working. */
+export const authEnvFile = envFile;
 
 /** A value that looks like a metered API key rather than a subscription OAuth token. §3 forbids it:
  *  ANTHROPIC_API_KEY-style credentials outrank the OAuth token and would bill per-token. */
@@ -52,21 +40,9 @@ export function claudeAuthStatus(env: NodeJS.ProcessEnv = process.env, file: str
   return {
     provider: "claude",
     connected: tok.length > 0,
-    persisted: envFileHasToken(file),
+    persisted: envFileHasKey(file, CLAUDE_TOKEN_KEY),
     ...(tok ? { masked: mask(tok) } : {}),
   };
-}
-
-/** True if the persisted env file already carries a CLAUDE_CODE_OAUTH_TOKEN line. */
-function envFileHasToken(file: string = authEnvFile()): boolean {
-  if (!existsSync(file)) return false;
-  try {
-    return readFileSync(file, "utf8")
-      .split("\n")
-      .some((l) => l.replace(/^export\s+/, "").startsWith(`${CLAUDE_TOKEN_KEY}=`));
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -83,6 +59,7 @@ export function setClaudeToken(token: string, file: string = authEnvFile()): Aut
   upsertEnvLine(file, CLAUDE_TOKEN_KEY, t);
   return claudeAuthStatus(process.env, file);
 }
+// (env-file read/write primitives live in ./env-file and are shared with the OpenRouter key store.)
 
 /** Remove the Claude token from this process and the persisted env file. The next agent run will have
  *  no token until one is set again (the §3 startup guard still applies on the next restart). */
@@ -100,44 +77,7 @@ export function clearClaudeToken(file: string = authEnvFile()): AuthStatus {
  */
 export function loadPersistedClaudeToken(file: string = authEnvFile()): void {
   if ((process.env[CLAUDE_TOKEN_KEY] ?? "").trim()) return;
-  if (!existsSync(file)) return;
-  try {
-    for (const raw of readFileSync(file, "utf8").split("\n")) {
-      const line = raw.replace(/^export\s+/, "").trim();
-      if (!line.startsWith(`${CLAUDE_TOKEN_KEY}=`)) continue;
-      const value = stripQuotes(line.slice(CLAUDE_TOKEN_KEY.length + 1));
-      if (value && !looksLikeMeteredKey(value)) process.env[CLAUDE_TOKEN_KEY] = value;
-      return;
-    }
-  } catch {
-    /* unreadable file — fall through; the §3 guard reports the missing token */
-  }
-}
-
-function stripQuotes(s: string): string {
-  const t = s.trim();
-  if (t.length >= 2 && ((t[0] === '"' && t.endsWith('"')) || (t[0] === "'" && t.endsWith("'")))) return t.slice(1, -1);
-  return t;
-}
-
-/** Rewrite `file` with `KEY=value` set (preserving every other line), creating it 0600 if absent. */
-function upsertEnvLine(file: string, key: string, value: string): void {
-  mkdirSync(dirname(file), { recursive: true });
-  const lines = existsSync(file) ? readFileSync(file, "utf8").split("\n") : [];
-  const kept = lines.filter((l) => {
-    const bare = l.replace(/^export\s+/, "");
-    return !bare.startsWith(`${key}=`);
-  });
-  // Drop a trailing empty line so we don't accumulate blank lines on repeated writes.
-  while (kept.length && kept[kept.length - 1]!.trim() === "") kept.pop();
-  kept.push(`${key}=${value}`);
-  writeFileSync(file, `${kept.join("\n")}\n`, { mode: 0o600 });
-}
-
-/** Remove any `KEY=…` line from `file` (no-op if the file or line is absent). */
-function removeEnvLine(file: string, key: string): void {
-  if (!existsSync(file)) return;
-  const lines = readFileSync(file, "utf8").split("\n");
-  const kept = lines.filter((l) => !l.replace(/^export\s+/, "").startsWith(`${key}=`));
-  writeFileSync(file, kept.join("\n"), { mode: 0o600 });
+  const value = readEnvKey(file, CLAUDE_TOKEN_KEY);
+  // Never reintroduce a metered key — §3 forbids it, so the guard would refuse to start anyway.
+  if (value && !looksLikeMeteredKey(value)) process.env[CLAUDE_TOKEN_KEY] = value;
 }

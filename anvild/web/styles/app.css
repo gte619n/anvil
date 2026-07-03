@@ -892,3 +892,21 @@ input:focus, select:focus, textarea:not(#input):focus {
 #side-panel {
   padding-top: env(safe-area-inset-top, 0px);
 }
+
+/* Autonomous dev pipeline: trace card (Autopilot reader) + calibration table (Settings → Models) */
+.pipeline-trace { margin-bottom: 14px; }
+.pipeline-trace .pt-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.pt-status { padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+.pt-status.ok { background: color-mix(in srgb, #16a34a 16%, transparent); color: #16a34a; }
+.pt-status.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+.pt-status.danger { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+.pt-checks { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.pt-check { padding: 1px 7px; border-radius: 8px; font-size: 12px; border: 1px solid var(--border); color: var(--muted); }
+.pt-check.pt-pass { color: #16a34a; border-color: color-mix(in srgb, #16a34a 40%, var(--border)); }
+.pt-check.pt-fail { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+.pt-details { margin-top: 6px; }
+.pt-details summary { cursor: pointer; color: var(--muted); }
+.pt-details ul { margin: 6px 0 0; padding-left: 18px; }
+.pt-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+.pt-table th, .pt-table td { text-align: left; padding: 2px 6px; border-bottom: 1px solid var(--border); }
+.pt-table th { color: var(--muted); font-weight: 600; }

@@ -11,7 +11,24 @@ export interface Config {
   warnFraction: number;
   /** Soft-stop threshold as a fraction (0–1) of the 7-day window's utilization (arch §3). */
   softStopFraction: number;
+  /** OpenRouter API key for the adversarial planning panel. Its own provider/key — NOT Anthropic — so
+   *  it lives entirely outside the §3 subscription-auth guard. Absent → the panel is skipped. */
+  openRouterApiKey?: string;
+  /** Competing models the adversarial panel critiques each plan with (OpenRouter slugs). */
+  adversarialModels: string[];
+  /** Whether the adversarial panel runs: true when a key is set, unless ANVIL_ADVERSARIAL=0 disables it. */
+  adversarialEnabled: boolean;
+  /** Preferred OpenRouter provider slug for the panel (e.g. "deepinfra"). Pins the critic to one
+   *  provider so its implicit prompt cache stays warm across the agent loop's rounds — GLM has no
+   *  explicit cache_control, so a stable, cheap-cache-read provider is the real cost lever. Falls back
+   *  to normal routing for any model that provider can't serve (allow_fallbacks). Undefined → default routing. */
+  adversarialProvider?: string;
 }
+
+/** OpenRouter slugs used by the adversarial panel when ANVIL_ADVERSARIAL_MODELS isn't set — an
+ *  OpenAI Codex-class model and GLM 5.2 (1M context, strong at tool use / long agentic tasks, so it's
+ *  well suited to the codebase-reading critic role). */
+const DEFAULT_ADVERSARIAL_MODELS = ["openai/gpt-5-codex", "z-ai/glm-5.2"];
 
 function expandHome(p: string, home: string): string {
   return p.startsWith("~") ? home + p.slice(1) : p;
@@ -37,6 +54,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // Default: bind the tailnet IP (reachable over the tailnet via plain HTTP, no `tailscale serve`),
   // falling back to localhost if this host isn't on a tailnet. `ANVIL_HOST` overrides (e.g. 127.0.0.1).
   const host = env.ANVIL_HOST || tailnetIPv4() || "127.0.0.1";
+  const openRouterApiKey = env.OPENROUTER_API_KEY?.trim() || undefined;
+  const adversarialModels = (env.ANVIL_ADVERSARIAL_MODELS ?? "")
+    .split(",")
+    .map((m) => m.trim())
+    .filter(Boolean);
   return {
     host,
     port: Number(env.ANVIL_PORT ?? 7701),
@@ -44,5 +66,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     clonesDir: expandHome(env.ANVIL_CLONES_DIR ?? "~/.anvil/repos", home),
     warnFraction: Number(env.ANVIL_BUDGET_WARN ?? 0.8),
     softStopFraction: Number(env.ANVIL_BUDGET_SOFTSTOP ?? 0.95),
+    openRouterApiKey,
+    adversarialModels: adversarialModels.length ? adversarialModels : DEFAULT_ADVERSARIAL_MODELS,
+    // On when a key is present, unless explicitly killed via ANVIL_ADVERSARIAL=0.
+    adversarialEnabled: Boolean(openRouterApiKey) && env.ANVIL_ADVERSARIAL !== "0",
+    adversarialProvider: env.ANVIL_ADVERSARIAL_PROVIDER?.trim() || undefined,
   };
 }

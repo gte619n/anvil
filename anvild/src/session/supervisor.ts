@@ -17,6 +17,7 @@ import {
   type TodoistProjectsResultEvent,
   type TodoistProjectInfo,
   type AutopilotPlanInfo,
+  type AutopilotPipelineMetricsEvent,
   type AutopilotPlansEvent,
   type AutopilotPlanResultEvent,
   type AutopilotStartedEvent,
@@ -24,6 +25,7 @@ import {
   type AutopilotScheduleEvent,
   type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
+  type AuthProvider,
   type AuthStatusEvent,
   type GitCmd,
   type GitResultEvent,
@@ -56,7 +58,16 @@ import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { readStatus, withStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
+import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
+import { OpenRouterClient } from "../integrations/openrouter";
+import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
+import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
+import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, toPipelineTraceInfo, adversaryStats } from "../pipeline/daemon-adapters";
+import { loadMetrics, saveMetrics } from "../pipeline/metrics-store";
+import type { AdversaryMetrics } from "../pipeline/metrics";
+import type { PhaseDeps } from "../pipeline/phases";
+import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { AutopilotScheduleStore, scheduledFireDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
@@ -80,6 +91,9 @@ export const DEFAULT_SESSION_ID = "sess_default";
  *  settles, a skipped finally) can't latch the live spinner. A full multi-env run plans several units
  *  with Opus, so keep it generous enough to never cut off legitimate work. */
 const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
+/** Per-unit budget for a background dev-pipeline run auto-started by the scheduler. Generous: a full
+ *  7-gate run with both live models + real checks + loop-backs can legitimately take a while. */
+const PIPELINE_RUN_BUDGET_MS = 45 * 60_000;
 
 /** How often the scheduler checks whether the scheduled time has arrived. */
 const SCHEDULE_TICK_MS = 5 * 60_000;
@@ -95,6 +109,11 @@ export interface SupervisorConfig {
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
+  /** Competing models the adversarial panel critiques plans with (OpenRouter slugs). The KEY itself is
+   *  read live from the environment at run time (Settings → Models writes it), not passed here. */
+  adversarialModels?: string[];
+  /** Preferred OpenRouter provider slug for the panel (see `Config.adversarialProvider`). */
+  adversarialProvider?: string;
 }
 
 /**
@@ -155,10 +174,24 @@ export class Supervisor {
   readonly fcm: Fcm;
   readonly apns: Apns;
   private readonly clonesDir: string;
+  /** Static adversarial-panel config (models + preferred provider). The OpenRouter KEY and the
+   *  ANVIL_ADVERSARIAL kill switch are resolved live from the environment at run time instead — so a key
+   *  set from Settings → Models (which updates process.env + the env file) takes effect on the next run
+   *  without a daemon restart, mirroring how the Claude token is picked up per agent spawn. */
+  private readonly adversarial: { models: string[]; provider?: string };
+  /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
+  private readonly devPipelineMetrics: AdversaryMetrics;
+  private readonly stateDir: string;
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
     this.clonesDir = cfg.clonesDir ?? join(cfg.stateDir, "repos");
+    this.adversarial = {
+      models: cfg.adversarialModels ?? [],
+      provider: cfg.adversarialProvider,
+    };
+    this.stateDir = cfg.stateDir;
+    this.devPipelineMetrics = loadMetrics(cfg.stateDir);
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -206,7 +239,7 @@ export class Supervisor {
     this.autopilotSchedule.markRun(now());
     this.broadcastSchedule();
     try {
-      await this.runAutopilot({ notify: true, autoStart: sched.autoStart, maxAutoStart: sched.maxAutoStart });
+      await this.runAutopilot({ notify: true, autoStart: sched.autoStart, usePipeline: sched.usePipeline, maxAutoStart: sched.maxAutoStart });
     } catch {
       /* swallowed: re-tries at the next due window */
     }
@@ -354,30 +387,36 @@ export class Supervisor {
     return this.todoistStatusEvent(cid);
   }
 
-  // ── Model-provider auth (Settings → Models; Claude OAuth token set/reset) ──────────
-  private authStatusEvent(cid?: string): AuthStatusEvent {
-    return { v: PROTOCOL_VERSION, type: "auth.status", ts: now(), ...(cid ? { cid } : {}), ...claudeAuthStatus() };
+  // ── Model-provider auth (Settings → Models) ──────────
+  // Two providers share this surface: "claude" (the subscription OAuth token driving the Agent SDK) and
+  // "openrouter" (the metered key powering the adversarial planning panel). Each has its own env-file-
+  // backed store; the OpenRouter key is deliberately outside the §3 metered-key guard (different provider).
+  private authStatusEvent(provider: AuthProvider, cid?: string): AuthStatusEvent {
+    const status = provider === "openrouter" ? openRouterAuthStatus() : claudeAuthStatus();
+    return { v: PROTOCOL_VERSION, type: "auth.status", ts: now(), ...(cid ? { cid } : {}), ...status };
   }
-  /** Current Claude credential state for the Models card. */
-  authStatus(cid?: string): AuthStatusEvent {
-    return this.authStatusEvent(cid);
+  /** Current credential state for a provider's Models card (defaults to Claude for back-compat). */
+  authStatus(provider: AuthProvider = "claude", cid?: string): AuthStatusEvent {
+    return this.authStatusEvent(provider, cid);
   }
-  /** Set/replace the Claude OAuth token (persisted to the launcher env file + applied live). Throws
-   *  BadCommand on an empty or metered-looking key so the UI can surface the reason. */
-  setAuthToken(token: string, cid?: string): AuthStatusEvent {
+  /** Set/replace a provider's token (persisted to the launcher env file + applied live). Throws
+   *  BadCommand on an empty or (for Claude) metered-looking key so the UI can surface the reason. */
+  setAuthToken(provider: AuthProvider, token: string, cid?: string): AuthStatusEvent {
     try {
-      setClaudeToken(token);
+      if (provider === "openrouter") setOpenRouterKey(token);
+      else setClaudeToken(token);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    this.registry.toAll(this.authStatusEvent());
-    return this.authStatusEvent(cid);
+    this.registry.toAll(this.authStatusEvent(provider));
+    return this.authStatusEvent(provider, cid);
   }
-  /** Remove the Claude OAuth token from the daemon + env file. */
-  clearAuthToken(cid?: string): AuthStatusEvent {
-    clearClaudeToken();
-    this.registry.toAll(this.authStatusEvent());
-    return this.authStatusEvent(cid);
+  /** Remove a provider's token from the daemon + env file. */
+  clearAuthToken(provider: AuthProvider, cid?: string): AuthStatusEvent {
+    if (provider === "openrouter") clearOpenRouterKey();
+    else clearClaudeToken();
+    this.registry.toAll(this.authStatusEvent(provider));
+    return this.authStatusEvent(provider, cid);
   }
 
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
@@ -402,8 +441,16 @@ export class Supervisor {
   // ── Autopilot plan review (anvil-autopilot-ui.md) ─────────────────────────────────
   /** Pending plans = planned work units not yet started; what the Autopilot card grid shows. */
   private pendingPlans(): WorkUnit[] {
-    return this.workUnits.list().filter((u) => u.status === "planned" && !u.sessionId);
+    return this.workUnits.list().filter(
+      (u) =>
+        (u.status === "planned" && !u.sessionId) ||
+        // Keep pipeline-completed units on the grid so their trace + PR stay reviewable until the operator
+        // resolves them (dismiss/complete). Only pipeline-run units gain this visibility — the old flow is
+        // unchanged (a normal planned→built unit has no devPipeline).
+        (u.devPipeline !== undefined && (u.status === "review" || u.status === "blocked")),
+    );
   }
+
   /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
   private autopilotPlanInfo(u: WorkUnit): AutopilotPlanInfo {
     const env = this.envStore.get(u.environmentId);
@@ -420,9 +467,15 @@ export class Supervisor {
       ...(u.effort ? { effort: u.effort } : {}),
       taskCount: u.taskIds.length,
       ...(u.plan ? { plan: this.renderer.render(u.plan) } : {}),
+      ...(u.devPipeline ? { pipeline: toPipelineTraceInfo(u.devPipeline) } : {}),
       createdAt: u.createdAt,
       updatedAt: u.updatedAt,
     };
+  }
+
+  /** The §6.3 adversary calibration metrics for the Models settings card. */
+  devPipelineMetricsEvent(cid?: string): AutopilotPipelineMetricsEvent {
+    return { v: PROTOCOL_VERSION, type: "autopilot.pipeline.metrics", ts: now(), ...(cid ? { cid } : {}), adversaries: adversaryStats(this.devPipelineMetrics) };
   }
   autopilotPlansEvent(cid?: string): AutopilotPlansEvent {
     return {
@@ -673,6 +726,7 @@ export class Supervisor {
     environmentId?: string;
     notify?: boolean;
     autoStart?: boolean;
+    usePipeline?: boolean; // auto-start units through the autonomous dev pipeline (§4) instead of a plain build session
     maxAutoStart?: number;
   }): Promise<{ created: number; skipped: number; started: number; output: string }> {
     if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
@@ -682,6 +736,19 @@ export class Supervisor {
     // unwinds instead of hanging the run open. Threaded into the client and the planning calls.
     const ac = new AbortController();
     const client = new TodoistClient(state.accessToken, ac.signal);
+    // Build the adversarial panel once for this run — a plain OpenRouter client (its own provider/key,
+    // outside the §3 subscription-auth guard). The key is read LIVE from the environment so a key set via
+    // Settings → Models applies to this run without a restart. Threaded into planning with the same
+    // run-level signal so a timed-out/cancelled run tears down the OpenRouter calls too. Undefined → skipped.
+    const openRouterKey = (process.env[OPENROUTER_KEY] ?? "").trim();
+    const adversarial =
+      openRouterKey && process.env.ANVIL_ADVERSARIAL !== "0" // key present + not killed via ANVIL_ADVERSARIAL=0
+        ? {
+            enabled: true,
+            client: new OpenRouterClient(openRouterKey, ac.signal, this.adversarial.provider),
+            models: this.adversarial.models,
+          }
+        : undefined;
     const envs = this.envStore
       .list()
       .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
@@ -726,6 +793,7 @@ export class Supervisor {
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
           repoName: env.name,
+          adversarial,
           signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
@@ -748,6 +816,7 @@ export class Supervisor {
           repoRoot: defaultEnv.repoRoot,
           repoName: defaultEnv.name,
           tasks: external,
+          adversarial,
           signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
@@ -759,6 +828,10 @@ export class Supervisor {
       // unattended run must never spawn a swarm of sessions or exhaust the weekly window. Label-sourced
       // units are never auto-started (they may be mis-routed to the catch-all env → always review first).
       const autoStartable = createdUnits.filter((u) => u.source !== "label");
+      // Pipeline auto-start needs an OpenRouter key (GLM authors several gates); fall back to a plain build
+      // session if the operator asked for the pipeline but no key is set, rather than failing every unit.
+      const pipeline = opts.usePipeline && !!openRouterKey;
+      if (opts.usePipeline && !openRouterKey) emit("⚠ Pipeline requested but no OpenRouter key is set — falling back to build sessions. Set one in Settings → Models.");
       if (opts.autoStart && autoStartable.length) {
         if (this.budget().warn) {
           emit("⏸ Auto-start skipped — subscription budget is in its warn zone; plans left for review.");
@@ -766,9 +839,18 @@ export class Supervisor {
           const cap = opts.maxAutoStart ?? 3;
           for (const u of autoStartable.slice(0, cap)) {
             try {
-              this.startPlan(u.id);
+              if (pipeline) {
+                // Long-running (all 7 gates, both models, opens a PR). Fire in the background with its own
+                // budget so one slow unit can't pin the scheduled run open; progress + status update live.
+                emit(`🔬 Pipeline “${u.title}”…`);
+                void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) })
+                  .then((o) => emit(`  “${u.title}” → ${o.status} (reached ${o.phaseReached}).`))
+                  .catch((e) => emit(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`));
+              } else {
+                this.startPlan(u.id);
+                emit(`🚀 Started “${u.title}”.`);
+              }
               started++;
-              emit(`🚀 Started “${u.title}”.`);
             } catch (e) {
               emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
             }
@@ -795,6 +877,58 @@ export class Supervisor {
       void this.apns.notify(payload);
     }
     return { created, skipped, started, output: this.autopilotRunLog.join("\n") };
+  }
+
+  /**
+   * Run the autonomous dev pipeline (§4) for a planned work unit: intake → the tier-selected gauntlet,
+   * in a fresh worktree, with the environment's validation commands as the P4 gate and the existing
+   * git/gh ops opening the PR at P6. Both models run through the Agent SDK (GLM via OpenRouter's
+   * Anthropic Skin). Persists the trace record on the unit + the §6.3 metrics on completion. Opt-in
+   * (manual trigger) — it does not replace the existing startPlan build flow.
+   */
+  async runDevPipeline(workUnitId: string, opts: { signal?: AbortSignal; onProgress?: (m: string) => void } = {}): Promise<PipelineOutcome> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const env = this.envStore.get(u.environmentId);
+    if (!env) throw new BadCommand("the work unit's environment no longer exists");
+    if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
+    // Default to broadcasting progress to every client (so the live view updates like an autopilot run).
+    const log = opts.onProgress ?? ((m: string) => this.broadcastRunProgress(m));
+    const runId = newId("pipe");
+    const branch = `${slugify(u.title)}-pipeline`;
+    // One worktree for the whole run: read-only phases inspect it, P3/P4 write, P6 opens the PR from it.
+    const { cwd } = createWorktree(env.repoRoot, env.defaultBase ?? "HEAD", branch, this.store.worktreeRoot(), runId);
+    try {
+      const glmSlug = this.adversarial.models.find((m) => /glm/i.test(m));
+      const deps: PhaseDeps = {
+        task: { id: u.id, text: workUnitTaskText(u) },
+        repoRoot: cwd,
+        ...(glmSlug ? { glmSlug } : {}),
+        agent: defaultAgent,
+        ...(env.validation?.commands?.length ? { checks: envChecks(env.validation.commands) } : {}),
+        openPr: gitPrOpener(branch),
+        captureDiff: captureGitDiff,
+      };
+      const outcome = await executeDevPipeline(deps, { metrics: this.devPipelineMetrics, log, signal: opts.signal });
+      const mapped = pipelineStatusToUnit(outcome);
+      this.workUnits.update(u.id, {
+        devPipeline: { status: outcome.status, phaseReached: outcome.phaseReached, ...(outcome.reason ? { reason: outcome.reason } : {}), trace: outcome.trace },
+        status: mapped.status,
+        ...(mapped.prUrl ? { prUrl: mapped.prUrl } : {}),
+        ...(mapped.blockedReason ? { blockedReason: mapped.blockedReason } : {}),
+      });
+      saveMetrics(this.stateDir, this.devPipelineMetrics);
+      this.broadcastAutopilotPlans();
+      log(`Pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}.`);
+      return outcome;
+    } finally {
+      // The branch (when shipped) is on origin via P6's push; the local worktree is disposable either way.
+      try {
+        removeWorktree(env.repoRoot, cwd, branch);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
   }
 
   // ── Autopilot schedule (in-daemon timer) ──────────────────────────────────────────

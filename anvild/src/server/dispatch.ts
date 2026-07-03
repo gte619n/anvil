@@ -280,15 +280,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "auth.status":
-        send(deps.supervisor.authStatus(cid));
+        send(deps.supervisor.authStatus(cmd.provider ?? "claude", cid));
         return;
 
       case "auth.set":
-        send(deps.supervisor.setAuthToken(cmd.token, cid)); // BadCommand (empty/metered key) → command.error via the outer catch
+        send(deps.supervisor.setAuthToken(cmd.provider ?? "claude", cmd.token, cid)); // BadCommand (empty/metered key) → command.error via the outer catch
         return;
 
       case "auth.clear":
-        send(deps.supervisor.clearAuthToken(cid));
+        send(deps.supervisor.clearAuthToken(cmd.provider ?? "claude", cid));
         return;
 
       case "autopilot.plans.list":
@@ -313,6 +313,19 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "autopilot.start":
         send(deps.supervisor.startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid));
+        return;
+
+      case "autopilot.pipeline.start":
+        // Long-running (many model calls). Progress broadcasts from inside the supervisor; the final
+        // result returns to the caller (cid). Mirrors autopilot.run's fire-and-report shape.
+        deps.supervisor
+          .runDevPipeline(cmd.workUnitId)
+          .then((o) => send({ v: PROTOCOL_VERSION, type: "autopilot.pipeline.result", ts: now(), cid, ok: true, workUnitId: cmd.workUnitId, status: o.status, phaseReached: o.phaseReached, output: o.reason ?? `pipeline ${o.status}` }))
+          .catch((e) => send({ v: PROTOCOL_VERSION, type: "autopilot.pipeline.result", ts: now(), cid, ok: false, workUnitId: cmd.workUnitId, output: errMsg(e) }));
+        return;
+
+      case "autopilot.pipeline.metrics":
+        send(deps.supervisor.devPipelineMetricsEvent(cid));
         return;
 
       case "autopilot.resolve":
@@ -368,7 +381,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       case "autopilot.schedule.set":
         send(
           deps.supervisor.setAutopilotSchedule(
-            { enabled: cmd.enabled, timeOfDay: cmd.timeOfDay, days: cmd.days, autoStart: cmd.autoStart, maxAutoStart: cmd.maxAutoStart },
+            { enabled: cmd.enabled, timeOfDay: cmd.timeOfDay, days: cmd.days, autoStart: cmd.autoStart, usePipeline: cmd.usePipeline, maxAutoStart: cmd.maxAutoStart },
             cid,
           ),
         );

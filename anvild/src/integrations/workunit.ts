@@ -3,6 +3,10 @@ import { join } from "node:path";
 import type { AutopilotEffort } from "@protocol";
 import { newId } from "../util/ids";
 import type { AnvilStatus } from "./status";
+import type { AdversarialReview } from "./adversarial";
+import type { PipelinePhase } from "../agent/model-roster";
+import type { PipelineStatus } from "../pipeline/types";
+import type { TraceRecord } from "../pipeline/trace";
 
 /**
  * A bundle of Todoist tasks the nightly planner decided make sense to implement together,
@@ -19,6 +23,8 @@ export interface WorkUnit {
   plan?: string; // the implementation plan (markdown), also posted as a Todoist comment
   summary?: string; // 1–2 line description for the Autopilot card (planner-emitted)
   effort?: AutopilotEffort; // rough size + files-touched estimate for the card (planner-emitted)
+  adversarial?: AdversarialReview; // competing-model critiques of the plan (present when the OpenRouter panel ran)
+  devPipeline?: { status: PipelineStatus; phaseReached: PipelinePhase; reason?: string; trace: TraceRecord }; // last autonomous-dev-pipeline run (§4)
   status: AnvilStatus; // mirrors the anvil:* label kept on the member tasks
   source?: "project" | "label"; // how the unit was sourced: a linked project (default) or the Autopilot label
   sessionId?: string; // the worktree session implementing it, once started

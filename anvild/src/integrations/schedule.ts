@@ -13,6 +13,7 @@ export const DEFAULT_SCHEDULE: AutopilotSchedule = {
   enabled: false,
   timeOfDay: "02:00",
   autoStart: true,
+  usePipeline: false,
   maxAutoStart: 3,
   label: "Autopilot",
 };
@@ -118,6 +119,7 @@ export class AutopilotScheduleStore {
     if (patch.timeOfDay !== undefined) next.timeOfDay = patch.timeOfDay;
     if (patch.days !== undefined) next.days = patch.days;
     if (patch.autoStart !== undefined) next.autoStart = patch.autoStart;
+    if (patch.usePipeline !== undefined) next.usePipeline = patch.usePipeline;
     if (patch.maxAutoStart !== undefined) next.maxAutoStart = Math.max(0, Math.round(patch.maxAutoStart));
     // Empty string clears label sourcing / the catch-all env; a value sets it.
     if (patch.label !== undefined) next.label = patch.label.trim() || undefined;
