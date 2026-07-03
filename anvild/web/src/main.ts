@@ -38,6 +38,8 @@ import type {
   AttachmentRef,
   AuthStatusEvent,
   AutopilotPlanInfo,
+  PipelineTraceInfo,
+  PipelineAdversaryStat,
   AutopilotSchedule,
   AutonomyPolicy,
   Budget,
@@ -780,8 +782,12 @@ function onEvent(url: string, e: ServerEvent): void {
         srv!.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
         srv!.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
       }
-      // Pull the hub's model-provider auth state so the Settings → Models card is live (hub-scoped).
-      if (url === HUB_URL && serverSupports(srv, "auth")) srv!.sock.send({ type: "auth.status" });
+      // Pull the hub's model-provider auth state so the Settings → Models card is live (hub-scoped) —
+      // one request per provider (Claude + OpenRouter).
+      if (url === HUB_URL && serverSupports(srv, "auth")) {
+        srv!.sock.send({ type: "auth.status" }); // claude (default)
+        srv!.sock.send({ type: "auth.status", provider: "openrouter" });
+      }
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
@@ -824,6 +830,13 @@ function onEvent(url: string, e: ServerEvent): void {
       return; // resolved via cidWaiter (startPlan)
     case "autopilot.run.result":
       return; // resolved via cidWaiter (runAutopilot)
+    case "autopilot.pipeline.result":
+      toast(e.ok ? `Pipeline ${e.status ?? "finished"}${e.phaseReached ? ` at ${e.phaseReached}` : ""}` : `Pipeline failed: ${e.output}`);
+      if (url === HUB_URL) hub().sock.send({ type: "autopilot.pipeline.metrics" }); // refresh calibration after a run
+      return;
+    case "autopilot.pipeline.metrics":
+      if (url === HUB_URL) onPipelineMetrics(e.adversaries);
+      return;
     case "autopilot.run.progress":
       onAutopilotProgress(e.line);
       return;
@@ -1916,7 +1929,11 @@ function selectSettingsTab(tab: SettingsTab): void {
   }
   if (tab === "models") {
     renderModelsPanel();
-    if (serverSupports(hub(), "auth")) hub().sock.send({ type: "auth.status" }); // refresh once per tab open
+    if (serverSupports(hub(), "auth")) {
+      hub().sock.send({ type: "auth.status" }); // claude — refresh once per tab open
+      hub().sock.send({ type: "auth.status", provider: "openrouter" });
+      hub().sock.send({ type: "autopilot.pipeline.metrics" }); // §6.3 calibration card
+    }
   }
 }
 
@@ -2163,13 +2180,16 @@ function closeSettings(): void {
 }
 
 // ── Model providers (Settings → Models) ───────────────────────────────────────────
-// The daemon drives Claude (Agent SDK). The token is set/reset here so it doesn't require SSHing in
-// to edit the launcher env. Hub-scoped, like Todoist. Gemini/ChatGPT are placeholders for now — the
-// daemon is Claude-only, but the section is shaped so a future provider slots in without a redesign.
-let claudeAuth: { connected: boolean; persisted: boolean; masked?: string } | null = null;
+// The daemon drives Claude (Agent SDK); the token is set/reset here so it doesn't require SSHing in to
+// edit the launcher env. OpenRouter powers the adversarial planning panel (a separate metered key). Both
+// are hub-scoped, like Todoist. Gemini/ChatGPT remain placeholders.
+type ProviderAuth = { connected: boolean; persisted: boolean; masked?: string };
+let claudeAuth: ProviderAuth | null = null;
+let openRouterAuth: ProviderAuth | null = null;
 function onAuthStatus(e: AuthStatusEvent): void {
-  if (e.provider !== "claude") return;
-  claudeAuth = { connected: e.connected, persisted: e.persisted, ...(e.masked ? { masked: e.masked } : {}) };
+  const state: ProviderAuth = { connected: e.connected, persisted: e.persisted, ...(e.masked ? { masked: e.masked } : {}) };
+  if (e.provider === "openrouter") openRouterAuth = state;
+  else claudeAuth = state;
   if (document.getElementById("models-panel")) renderModelsPanel();
 }
 
@@ -2215,6 +2235,75 @@ async function clearClaudeTokenUi(): Promise<void> {
   toast("Claude token cleared");
 }
 
+/** Persist a new/replacement OpenRouter API key on the hub daemon (powers the adversarial panel). */
+async function saveOpenRouterKey(key: string, btn?: HTMLButtonElement): Promise<void> {
+  const k = key.trim();
+  if (!k) {
+    toast("Paste your OpenRouter API key first.");
+    return;
+  }
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "auth.set", provider: "openrouter", token: k, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    toast("OpenRouter key saved — the adversarial panel applies it on the next autopilot run.");
+  } catch (err) {
+    toast(`Couldn't save the key: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
+async function clearOpenRouterKeyUi(): Promise<void> {
+  const ok = await confirmDialog({
+    title: "Clear the OpenRouter key?",
+    body: "The adversarial multi-model review will be skipped on future autopilot runs until a new key is set. Planning itself is unaffected. The key is removed from the daemon and its env file.",
+    confirmLabel: "Clear key",
+    danger: true,
+    icon: "key_off",
+  });
+  if (!ok) return;
+  hub().sock.send({ type: "auth.clear", provider: "openrouter", cid: newCid() });
+  toast("OpenRouter key cleared");
+}
+
+// §6.3 adversary calibration metrics, shown under the Models tab. Refreshed on tab open / connect.
+let pipelineMetrics: PipelineAdversaryStat[] | null = null;
+function onPipelineMetrics(stats: PipelineAdversaryStat[]): void {
+  pipelineMetrics = stats;
+  if (document.getElementById("models-panel")) renderModelsPanel();
+}
+/** The adversary calibration card (§6.3): first-pass rejection rate per gate — is the review real? */
+function pipelineMetricsCard(): string {
+  if (!pipelineMetrics || pipelineMetrics.length === 0) {
+    return `<div class="card"><b>Adversary calibration <span class="small muted">(pipeline §6.3)</span></b>
+      <p class="small muted">Once the autonomous pipeline runs, each adversary's first-pass rejection rate per gate appears here. A rate near zero over a real sample means the cross-model review is rubber-stamping — and should be recalibrated.</p></div>`;
+  }
+  const rows = pipelineMetrics
+    .map(
+      (s) => `<tr>
+        <td>${esc(s.gate)}</td><td>${esc(s.adversary)}</td>
+        <td>${Math.round(s.rejectionRate * 100)}%</td>
+        <td class="small muted">${s.firstPassRejections}/${s.firstSubmissions}</td>
+        <td>${s.decorative ? `<span class="warn small">${icon("warning")} decorative</span>` : ""}</td>
+      </tr>`,
+    )
+    .join("");
+  return `<div class="card"><b>Adversary calibration <span class="small muted">(pipeline §6.3)</span></b>
+    <p class="small muted">First-pass rejection rate per gate. "Decorative" flags an adversary that almost never rejects over a real sample.</p>
+    <table class="pt-table small"><thead><tr><th>Gate</th><th>Adversary</th><th>Reject rate</th><th>n</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
 function renderModelsPanel(): void {
   const host = document.getElementById("models-panel");
   if (!host) return;
@@ -2230,31 +2319,62 @@ function renderModelsPanel(): void {
       <input id="claude-token" type="password" autocomplete="off" spellcheck="false" placeholder="Claude OAuth token (sk-ant-oat…)" />
       <button id="claude-save" class="primary">${saveLabel}</button>
     </div>`;
-  const futureCard = `<div class="card models-soon"><div class="card-main"><span class="conn-dot"></span><span>Gemini · ChatGPT — <b>coming soon</b>. Anvil currently drives Claude only.</span></div></div>`;
-  if (!claudeAuth.connected) {
-    host.innerHTML = `<div class="card"><b>No Claude token set.</b>
-      <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
-      ${tokenForm("Save")}</div>
-      ${futureCard}`;
-  } else {
-    const warn = claudeAuth.persisted
+  const persistWarn = (persisted: boolean): string =>
+    persisted
       ? ""
-      : `<p class="small muted" style="margin-top:8px">${icon("warning")} Not written to the launcher env file — it will revert to the previous token on the next service restart.</p>`;
-    host.innerHTML = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
-        <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
-        <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${warn}</div>
-      <div class="card"><b>Replace token</b>
-        <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
-        ${tokenForm("Replace")}</div>
-      ${futureCard}`;
-    $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
+      : `<p class="small muted" style="margin-top:8px">${icon("warning")} Not written to the launcher env file — it will revert on the next service restart.</p>`;
+  // ── Claude (drives the Agent SDK) ──
+  const claudeSection = !claudeAuth.connected
+    ? `<div class="card"><b>No Claude token set.</b>
+        <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
+        ${tokenForm("Save")}</div>`
+    : `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+          <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
+          <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(claudeAuth.persisted)}</div>
+        <div class="card"><b>Replace token</b>
+          <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
+          ${tokenForm("Replace")}</div>`;
+  // ── OpenRouter (drives the adversarial multi-model planning panel) ──
+  const orForm = (saveLabel: string): string => `<div class="todoist-connect">
+      <input id="or-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenRouter API key (sk-or-…)" />
+      <button id="or-save" class="primary">${saveLabel}</button>
+    </div>`;
+  let openRouterSection: string;
+  if (!openRouterAuth) {
+    openRouterSection = `<div class="card"><b>OpenRouter</b><p class="small muted">Loading…</p></div>`;
+  } else if (!openRouterAuth.connected) {
+    openRouterSection = `<div class="card"><b>OpenRouter — not set <span class="small muted">(optional)</span></b>
+        <p class="small muted">Powers the <b>adversarial review</b>: after Claude plans, competing models (e.g. GLM) read the repo and critique the plan. Create a key at <code>openrouter.ai/keys</code>, paste it below, then save. Stored on the hub daemon (mode 0600). Leave unset to skip the panel.</p>
+        ${orForm("Save")}</div>`;
+  } else {
+    openRouterSection = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+          <span>OpenRouter — connected${openRouterAuth.masked ? ` · <code>${esc(openRouterAuth.masked)}</code>` : ""}</span>
+          <button id="or-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(openRouterAuth.persisted)}</div>
+        <div class="card"><b>Replace key</b>
+          <p class="small muted">Paste a fresh key to replace the current one.</p>
+          ${orForm("Replace")}</div>`;
   }
-  const input = $<HTMLInputElement>("#claude-token");
-  const btn = $<HTMLButtonElement>("#claude-save");
-  btn.addEventListener("click", () => void saveClaudeToken(input.value, btn));
-  input.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") void saveClaudeToken(input.value, btn);
+  const futureCard = `<div class="card models-soon"><div class="card-main"><span class="conn-dot"></span><span>Gemini · ChatGPT — <b>coming soon</b>. Anvil currently drives Claude only.</span></div></div>`;
+  host.innerHTML = `${claudeSection}${openRouterSection}${futureCard}${pipelineMetricsCard()}`;
+
+  // Wire Claude controls.
+  if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
+  const cInput = $<HTMLInputElement>("#claude-token");
+  const cBtn = $<HTMLButtonElement>("#claude-save");
+  cBtn.addEventListener("click", () => void saveClaudeToken(cInput.value, cBtn));
+  cInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") void saveClaudeToken(cInput.value, cBtn);
   });
+  // Wire OpenRouter controls (present unless its status is still loading).
+  if (openRouterAuth) {
+    if (openRouterAuth.connected) $("#or-clear").addEventListener("click", () => void clearOpenRouterKeyUi());
+    const oInput = $<HTMLInputElement>("#or-key");
+    const oBtn = $<HTMLButtonElement>("#or-save");
+    oBtn.addEventListener("click", () => void saveOpenRouterKey(oInput.value, oBtn));
+    oInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") void saveOpenRouterKey(oInput.value, oBtn);
+    });
+  }
 }
 // ── Autopilot (plan review & launch; anvil-autopilot-ui.md) ────────────────────────
 const autopilotLog: string[] = []; // streamed progress lines for the current/last run
@@ -2610,6 +2730,37 @@ window.visualViewport?.addEventListener("resize", positionRefineWindow);
 window.visualViewport?.addEventListener("scroll", positionRefineWindow);
 
 /** The full-plan reader + refine chat + Dismiss/Go, rendered in place of the grid (same overlay). */
+/** Render the autonomous-dev-pipeline trace (§7) as a card above the plan doc in the reader. */
+function renderPipelineTrace(t: PipelineTraceInfo): string {
+  const cls = t.status === "shipped" ? "ok" : t.status === "operator_required" ? "warn" : "danger";
+  const prLink = t.prRef
+    ? /^https?:/.test(t.prRef)
+      ? `<a href="${esc(t.prRef)}" target="_blank" rel="noopener">${esc(t.prRef)}</a>`
+      : esc(t.prRef)
+    : "";
+  const check = (label: string, v?: string): string =>
+    v ? `<span class="pt-check pt-${esc(v)}">${label}: ${esc(v)}</span>` : "";
+  const loops = t.loopbacks.filter((l) => l.count > 0).map((l) => `${esc(l.phase)} ×${l.count}`).join(", ");
+  const criteria = t.criteria
+    .map((c) => `<li><code>${esc(c.id)}</code> <span class="small muted">[${esc(c.kind)}]</span> ${esc(c.text)}</li>`)
+    .join("");
+  const rows = t.assignments
+    .map((a) => `<tr><td>${esc(a.phase)}</td><td>${esc(a.author)}</td><td>${a.adversary ? esc(a.adversary) : "—"}</td></tr>`)
+    .join("");
+  return `<section class="card pipeline-trace">
+    <div class="pt-head">${icon("hub")} <b>Autonomous pipeline</b>
+      <span class="pt-status ${cls}">${esc(t.status.replace(/_/g, " "))}</span>
+      <span class="small muted">reached ${esc(t.phaseReached)}${t.riskTier ? ` · ${esc(t.riskTier)} tier` : ""}</span></div>
+    ${t.reason ? `<p class="small">${esc(t.reason)}</p>` : ""}
+    ${prLink ? `<p class="small">PR: ${prLink}</p>` : ""}
+    <div class="pt-checks">${check("criteria", t.verification.criteriaTests)}${check("adversary tests", t.verification.adversaryTests)}${check("lint/types/build", t.verification.lintTypesBuild)}${t.verification.coverage ? `<span class="pt-check">coverage: ${esc(t.verification.coverage)}</span>` : ""}</div>
+    ${loops ? `<p class="small muted">Loop-backs: ${esc(loops)}</p>` : ""}
+    ${t.validationNote ? `<p class="small"><b>Built vs. asked:</b> ${esc(t.validationNote)}</p>` : ""}
+    ${criteria ? `<details class="pt-details"><summary class="small">Acceptance criteria (${t.criteria.length})</summary><ul class="small">${criteria}</ul></details>` : ""}
+    ${rows ? `<details class="pt-details"><summary class="small">Model assignment per phase</summary><table class="pt-table small"><thead><tr><th>Phase</th><th>Author</th><th>Adversary</th></tr></thead><tbody>${rows}</tbody></table></details>` : ""}
+  </section>`;
+}
+
 function openPlan(id: string): void {
   const p = findPlan(id);
   const host = document.getElementById("autopilot-grid");
@@ -2628,10 +2779,12 @@ function openPlan(id: string): void {
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
         <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign</button>
         <button class="mini" id="plan-link">${icon("link")} Link</button>
+        <button class="mini" id="plan-pipeline" title="Run the autonomous multi-model pipeline (Claude + GLM) end to end">${icon("hub")} Pipeline</button>
         <button class="primary" id="plan-start">${icon("rocket_launch")} Start</button>
       </span>
     </div>
     <div class="plan-reader-body">
+      ${p.pipeline ? renderPipelineTrace(p.pipeline) : ""}
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
     </div>
     <div class="plan-refine-backdrop" id="plan-refine-backdrop" hidden></div>
@@ -2679,6 +2832,7 @@ function openPlan(id: string): void {
   $("#plan-reassign").addEventListener("click", () => void reassignPlan(id));
   $("#plan-link").addEventListener("click", () => void linkPlanToSession(id));
   $("#plan-start").addEventListener("click", () => void startPlan(id));
+  $("#plan-pipeline").addEventListener("click", () => void startDevPipeline(id));
   $("#plan-refine-form").addEventListener("submit", (e) => {
     e.preventDefault();
     void refinePlan(id);
@@ -2838,6 +2992,27 @@ async function startPlan(id: string): Promise<void> {
     toast(`Couldn't start: ${err instanceof Error ? err.message : String(err)}`);
     reset();
   }
+}
+
+/** Kick off the autonomous multi-model dev pipeline for a plan (opt-in). Long-running (many model
+ *  calls across both models); progress streams to the autopilot run log and the card status updates on
+ *  completion, so we fire-and-forget rather than blocking on the result. */
+async function startDevPipeline(id: string): Promise<void> {
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  const ok = await confirmDialog({
+    title: "Run the autonomous pipeline?",
+    body: "Claude and GLM run the full gated pipeline — requirements → design → build → verify → validate → PR — on this unit in a fresh worktree. This makes many model calls and can take a while; progress shows in the run log and the card updates when it finishes.",
+    confirmLabel: "Run pipeline",
+    icon: "hub",
+  });
+  if (!ok) return;
+  srv.sock.send({ type: "autopilot.pipeline.start", workUnitId: id, cid: newCid() });
+  toast("Pipeline started — watch the run log for progress.");
+  dismissOverlay("plan");
 }
 
 /** Attach a plan to an existing session that's already doing the work instead of spawning a new one.
@@ -3009,7 +3184,7 @@ function scheduleSummaryHtml(): string {
   const entry = serverSchedule.get(HUB_URL);
   const s = entry?.schedule;
   if (!s || !s.enabled) return `<span class="muted">${icon("schedule")} Scheduled run off</span>`;
-  const auto = s.autoStart ? `auto-start ${s.maxAutoStart ?? 3}` : "plan only";
+  const auto = s.autoStart ? `${s.usePipeline ? "pipeline" : "auto-start"} ${s.maxAutoStart ?? 3}` : "plan only";
   const next = entry?.nextRunAt ? ` · next ${esc(fmtNextRun(entry.nextRunAt))}` : "";
   return `<span>${icon("schedule")} Daily ${esc(fmtTime(s.timeOfDay))} · ${esc(auto)}${next}</span>`;
 }
@@ -3050,6 +3225,8 @@ function openScheduleModal(): void {
       <label class="ap-field-row"><span>Time of day</span><input type="time" id="ap-time" value="${esc(s.timeOfDay)}" /></label>
       <div class="ap-field"><span>Days</span><div class="ap-days" id="ap-days">${dayBtns}</div></div>
       ${toggle("ap-autostart", s.autoStart, "Auto-start sessions for new plans")}
+      ${toggle("ap-pipeline", s.usePipeline ?? false, "Use the autonomous pipeline (Claude + GLM → PR)")}
+      <p class="small muted" style="margin:-2px 0 6px">When on, auto-started units run the full multi-model gauntlet (requirements → build → verify → validate → PR) unattended instead of opening a chat session. Needs an OpenRouter key and, for a real test gate, per-environment validation commands.</p>
       <label class="ap-field-row"><span>Auto-start at most</span><input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /><span class="small muted">per run (the rest wait for manual launch; skipped while the budget is in its warn zone)</span></label>
       <label class="ap-field-row"><span>Autopilot label</span><input type="text" id="ap-label" value="${esc(s.label ?? "")}" placeholder="Autopilot" /><span class="small muted">tasks with this Todoist label are pulled in from <b>any</b> project (blank = off)</span></label>
       <label class="ap-field-row"><span>Default environment</span><select id="ap-defenv">${envOptions}</select><span class="small muted">where label-sourced tasks are planned &amp; built — always review-only</span></label>
@@ -3079,6 +3256,7 @@ async function saveSchedule(): Promise<void> {
   const enabled = isOn("ap-enabled");
   const timeOfDay = $<HTMLInputElement>("#ap-time").value || "02:00";
   const autoStart = isOn("ap-autostart");
+  const usePipeline = isOn("ap-pipeline");
   const maxAutoStart = Math.max(0, Number($<HTMLInputElement>("#ap-cap").value) || 0);
   const on = [...document.querySelectorAll<HTMLElement>("#ap-days .ap-day.on")].map((b) => Number(b.dataset.day));
   // all 7 selected → send [] (every day); none selected → keep it simple and treat as every day too
@@ -3092,7 +3270,7 @@ async function saveSchedule(): Promise<void> {
   // only — on a member that id won't resolve, so it skips the label pass and just re-plans its own
   // linked projects. (lastRunAt stays server-owned and per-daemon.)
   const targets = orderedServers().filter((s) => s.sock.isOpen() && serverSupports(s, "autopilot"));
-  const patch = { type: "autopilot.schedule.set" as const, enabled, timeOfDay, days, autoStart, maxAutoStart, label, defaultEnvironmentId };
+  const patch = { type: "autopilot.schedule.set" as const, enabled, timeOfDay, days, autoStart, usePipeline, maxAutoStart, label, defaultEnvironmentId };
   try {
     const hubIdx = targets.findIndex((s) => s.url === HUB_URL);
     const results = await Promise.allSettled(targets.map((s) => sendAwait(s, { ...patch, cid: newCid() }, 20_000)));

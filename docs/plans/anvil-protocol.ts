@@ -381,7 +381,7 @@ export interface TodoistProjectsResultEvent extends Envelope {
 /** Model-provider auth. Only "claude" is functional today (the Agent SDK is Claude-only); the field
  *  exists so the Settings → Models UI and the daemon can grow Gemini/ChatGPT entries without a
  *  protocol change. The full secret is never sent to clients — only `masked` + the connected flag. */
-export type AuthProvider = "claude";
+export type AuthProvider = "claude" | "openrouter";
 /** Connection state for a model provider's credential — answer to `auth.status`/`auth.set`/`auth.clear`
  *  (carries cid) and broadcast (no cid) when it changes. */
 export interface AuthStatusEvent extends Envelope {
@@ -403,6 +403,21 @@ export interface AutopilotEffort {
 /** The anvil autopilot's status, mirrored from the `anvil:*` Todoist labels. Kept in lockstep with
  *  STATUSES in src/integrations/status.ts (the server is the source of truth). */
 export type AnvilStatus = "planned" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
+/** A focused projection of the autonomous-dev-pipeline trace record (§7), shaped for the reader. The
+ *  full plan markdown stays in `AutopilotPlanInfo.plan`; this carries the gate/assignment residue. */
+export interface PipelineTraceInfo {
+  status: "shipped" | "operator_required" | "blocked";
+  phaseReached: string;
+  reason?: string;
+  riskTier?: string;
+  criteria: { id: string; text: string; kind: "automatable" | "human-validates" }[];
+  nonGoals: string[];
+  verification: { criteriaTests?: string; adversaryTests?: string; lintTypesBuild?: string; coverage?: string };
+  validationNote?: string;
+  prRef?: string;
+  assignments: { phase: string; author: string; adversary?: string }[]; // who authored/adversaried each phase
+  loopbacks: { phase: string; count: number }[]; // per-phase revisit counts
+}
 /** A pending (or just-started) autopilot work unit, shaped for the Autopilot card grid + reader. */
 export interface AutopilotPlanInfo {
   id: string; // WorkUnit id
@@ -417,6 +432,7 @@ export interface AutopilotPlanInfo {
   effort?: AutopilotEffort;
   taskCount: number; // Todoist tasks bundled into the unit
   plan?: RenderedMarkdown; // full implementation plan (source + sanitized HTML) for the reader
+  pipeline?: PipelineTraceInfo; // present once the autonomous dev pipeline (§4) has run on this unit
   createdAt: Iso8601;
   updatedAt: Iso8601;
 }
@@ -456,6 +472,30 @@ export interface AutopilotRunResultEvent extends Envelope {
 }
 /** The in-flight run's accumulated progress, sent to a client on connect so a refreshed or late-joining
  *  screen restores the live view (running header + log) instead of blanking. `log` is empty when idle. */
+export interface AutopilotPipelineResultEvent extends Envelope {
+  type: "autopilot.pipeline.result";
+  cid?: Cid;
+  ok: boolean;
+  workUnitId: string;
+  status?: string; // PipelineStatus: shipped | operator_required | blocked
+  phaseReached?: string;
+  output: string; // human-readable log (or the error message when ok=false)
+}
+/** One adversary's calibration over all pipeline runs (§6.3 collusion/theater metric). */
+export interface PipelineAdversaryStat {
+  gate: string;
+  adversary: string;
+  firstSubmissions: number;
+  firstPassRejections: number;
+  rejectionRate: number; // 0..1 first-pass rejection rate
+  decorative: boolean; // true = suspiciously high approval rate over a real sample (a rubber-stamp)
+}
+/** The §6.3 adversary metrics — answer to `autopilot.pipeline.metrics` (carries cid). */
+export interface AutopilotPipelineMetricsEvent extends Envelope {
+  type: "autopilot.pipeline.metrics";
+  cid?: Cid;
+  adversaries: PipelineAdversaryStat[];
+}
 export interface AutopilotRunSnapshotEvent extends Envelope {
   type: "autopilot.run.snapshot";
   cid?: Cid;
@@ -480,6 +520,7 @@ export interface AutopilotSchedule {
   timeOfDay: string; // "HH:MM", 24h, server-local
   days?: number[]; // 0=Sun..6=Sat; empty/absent = every day
   autoStart: boolean; // after planning, also start worktree sessions for the new units
+  usePipeline?: boolean; // auto-start via the autonomous dev pipeline (§4, Claude+GLM → PR) instead of a plain build session
   maxAutoStart?: number; // cap how many sessions a single run may auto-start (default 3)
   lastRunAt?: Iso8601; // server-set: when the scheduler last fired (read-only to clients)
   // ── Account-wide label sourcing (autopilot-wide settings, carried on the same config object) ──
@@ -680,6 +721,8 @@ export type ServerEvent =
   | AutopilotStartedEvent
   | AutopilotRunProgressEvent
   | AutopilotRunResultEvent
+  | AutopilotPipelineResultEvent
+  | AutopilotPipelineMetricsEvent
   | AutopilotRunSnapshotEvent
   | AutopilotMaintenanceResultEvent
   | AutopilotScheduleEvent
@@ -940,6 +983,13 @@ export interface AutopilotStartCmd extends Envelope, Correlated {
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "bypass" (auto-start working without permission stalls)
 }
+export interface AutopilotPipelineStartCmd extends Envelope, Correlated {
+  type: "autopilot.pipeline.start"; // run the autonomous dev pipeline (§4) for a unit → autopilot.pipeline.result
+  workUnitId: string;
+}
+export interface AutopilotPipelineMetricsCmd extends Envelope, Correlated {
+  type: "autopilot.pipeline.metrics"; // request the §6.3 adversary calibration metrics → autopilot.pipeline.metrics
+}
 export interface AutopilotResolveCmd extends Envelope, Correlated {
   type: "autopilot.resolve"; // mark a plan completed/expired (drops the card); optionally close its Todoist tasks
   workUnitId: string;
@@ -975,6 +1025,7 @@ export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   timeOfDay?: string;
   days?: number[];
   autoStart?: boolean;
+  usePipeline?: boolean; // auto-start via the autonomous dev pipeline (§4) instead of a build session
   maxAutoStart?: number;
   label?: string; // "" clears it (disables label sourcing)
   defaultEnvironmentId?: string; // "" clears it
@@ -1066,6 +1117,8 @@ export type ClientCommand =
   | AutopilotRefineCmd
   | AutopilotDismissCmd
   | AutopilotStartCmd
+  | AutopilotPipelineStartCmd
+  | AutopilotPipelineMetricsCmd
   | AutopilotResolveCmd
   | AutopilotLinkCmd
   | AutopilotReassignCmd

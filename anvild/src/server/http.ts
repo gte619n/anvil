@@ -113,6 +113,9 @@ export interface ServerOptions {
   warnFraction?: number;
   softStopFraction?: number;
   renderer?: MarkdownRenderer;
+  /** OpenRouter key + models for the adversarial planning panel (see `Config`). */
+  adversarialModels?: string[];
+  adversarialProvider?: string;
 }
 
 /**
@@ -133,6 +136,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
       renderer: opts.renderer,
+      adversarialModels: opts.adversarialModels,
+      adversarialProvider: opts.adversarialProvider,
     },
     registry,
   );

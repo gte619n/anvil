@@ -94,10 +94,15 @@ test("store round-trips, merges patches, ignores lastRunAt in set, and clamps th
     expect(store.get().timeOfDay).toBe("06:30");
     expect(store.get().maxAutoStart).toBe(3); // rounded
     expect(store.get().autoStart).toBe(true); // unchanged default preserved
+    // usePipeline opts into the autonomous pipeline for auto-started units; defaults off, round-trips.
+    expect(store.get().usePipeline).toBe(false);
+    store.set({ usePipeline: true });
+    expect(store.get().usePipeline).toBe(true);
     store.markRun("2026-06-24T02:00:00.000Z");
     // reload from disk
     const reloaded = new AutopilotScheduleStore(dir);
     expect(reloaded.get().timeOfDay).toBe("06:30");
+    expect(reloaded.get().usePipeline).toBe(true);
     expect(reloaded.get().lastRunAt).toBe("2026-06-24T02:00:00.000Z");
   } finally {
     rmSync(dir, { recursive: true, force: true });

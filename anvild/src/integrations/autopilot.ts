@@ -4,6 +4,9 @@ import { buildAgentEnv } from "../agent/env";
 import type { TodoistClient, TodoistTask, TodoistSection } from "./todoist";
 import { readStatus, withStatus } from "./status";
 import { extractPlanMeta, PLAN_META_INSTRUCTION } from "./plan-meta";
+import { extractJson } from "./json";
+import { reviewPlan, formatReview, type AdversarialReview } from "./adversarial";
+import type { OpenRouterClient } from "./openrouter";
 import type { WorkUnit, WorkUnitStore } from "./workunit";
 
 /**
@@ -22,9 +25,18 @@ export interface ProposedUnit {
 /** A planned unit: a ProposedUnit plus its implementation plan and resolved task objects. */
 export interface PlannedUnit extends ProposedUnit {
   tasks: TodoistTask[];
-  plan: string; // markdown implementation plan
+  plan: string; // markdown implementation plan (includes the appended "## Adversarial Review" block when a panel ran)
   summary?: string; // 1–2 line description for the Autopilot card (from the plan's metadata block)
   effort?: AutopilotEffort; // rough size + files-touched estimate (from the plan's metadata block)
+  adversarial?: AdversarialReview; // competing-model critiques of the plan (undefined when the panel is disabled)
+}
+
+/** Optional adversarial-panel wiring threaded through the planner. Omitting it disables the panel
+ *  entirely (the feature is inert without an OpenRouter key), so every path stays backward-compatible. */
+export interface AdversarialOpts {
+  enabled: boolean;
+  client: OpenRouterClient;
+  models: string[];
 }
 
 /**
@@ -101,25 +113,6 @@ function resolvePlan(out: { text: string; plan?: string }): { plan: string; summ
   return { plan: primary.plan, ...(fromText.summary ? { summary: fromText.summary } : {}), ...(fromText.effort ? { effort: fromText.effort } : {}) };
 }
 
-/** Pull the first JSON value (object or array) out of a model response that may wrap it in prose/fences. */
-function extractJson<T>(text: string): T {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1]! : text;
-  const start = candidate.search(/[[{]/);
-  if (start === -1) throw new Error(`no JSON found in model output: ${text.slice(0, 200)}`);
-  // Walk to the matching close bracket so trailing prose doesn't break JSON.parse.
-  const open = candidate[start]!;
-  const close = open === "[" ? "]" : "}";
-  let depth = 0;
-  for (let i = start; i < candidate.length; i++) {
-    if (candidate[i] === open) depth++;
-    else if (candidate[i] === close && --depth === 0) {
-      return JSON.parse(candidate.slice(start, i + 1)) as T;
-    }
-  }
-  throw new Error(`unbalanced JSON in model output: ${text.slice(0, 200)}`);
-}
-
 function taskLine(t: TodoistTask, sectionName?: string): string {
   const bits = [
     `id=${t.id}`,
@@ -173,7 +166,7 @@ Respond with ONLY a JSON array, no prose:
 export async function planUnit(
   unit: ProposedUnit,
   tasks: TodoistTask[],
-  opts: { model?: Model; repoRoot: string; signal?: AbortSignal },
+  opts: { model?: Model; repoRoot: string; signal?: AbortSignal; adversarial?: AdversarialOpts },
 ): Promise<PlannedUnit> {
   const members = tasks.filter((t) => unit.taskIds.includes(t.id));
   const taskBlock = members.map((t) => taskLine(t)).join("\n");
@@ -192,8 +185,29 @@ ${VALIDATION_INSTRUCTION}
 ${PLAN_META_INSTRUCTION}`;
 
   const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true, signal: opts.signal });
-  const { plan, summary, effort } = resolvePlan(out);
-  return { ...unit, tasks: members, plan, summary, effort };
+  const resolved = resolvePlan(out);
+  const { summary, effort } = resolved;
+  let plan = resolved.plan;
+
+  // Adversarial panel: competing OpenRouter models critique Claude's plan. Advisory only — never fail
+  // planning because a third-party API hiccuped, so a total throw is swallowed and leaves the plan as-is.
+  let adversarial: AdversarialReview | undefined;
+  if (opts.adversarial?.enabled) {
+    try {
+      adversarial = await reviewPlan(
+        { title: unit.title, rationale: unit.rationale, plan },
+        { client: opts.adversarial.client, models: opts.adversarial.models },
+        // repoRoot switches the critics into agentic mode — they read the actual codebase to check the
+        // plan, not just its prose. Same read-only root Claude planned against.
+        { signal: opts.signal, repoRoot: opts.repoRoot },
+      );
+      // Surface the critique where the plan is read (Todoist comment / build brief).
+      plan = `${plan}\n\n${formatReview(adversarial)}`;
+    } catch {
+      adversarial = undefined;
+    }
+  }
+  return { ...unit, tasks: members, plan, summary, effort, adversarial };
 }
 
 /**
@@ -252,6 +266,7 @@ export async function planAndTagProject(
     repoName?: string;
     bundleModel?: Model;
     planModel?: Model;
+    adversarial?: AdversarialOpts; // competing-model panel; omit/disable to skip it
     signal?: AbortSignal; // run-level abort: a cancelled/timed-out run unwinds in-flight planning
     onProgress?: (msg: string) => void;
     onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
@@ -269,7 +284,7 @@ export async function planAndTagProject(
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal });
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial });
     const wu = deps.workUnits.create({
       environmentId: opts.environmentId,
       todoistProjectId: opts.projectId,
@@ -279,6 +294,7 @@ export async function planAndTagProject(
       plan: planned.plan,
       summary: planned.summary,
       effort: planned.effort,
+      adversarial: planned.adversarial,
       status: "planned",
     });
     // Tag every member; post the summary + deep link once (on the first member), pointers on the rest.
@@ -309,6 +325,7 @@ export async function planAndTagTasks(
     tasks: TodoistTask[];
     bundleModel?: Model;
     planModel?: Model;
+    adversarial?: AdversarialOpts; // competing-model panel; omit/disable to skip it
     signal?: AbortSignal; // run-level abort: a cancelled/timed-out run unwinds in-flight planning
     onProgress?: (msg: string) => void;
     onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
@@ -325,7 +342,7 @@ export async function planAndTagTasks(
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal });
+    const planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial });
     const wu = deps.workUnits.create({
       environmentId: opts.environmentId,
       todoistProjectId: planned.tasks[0]?.project_id ?? "",
@@ -335,6 +352,7 @@ export async function planAndTagTasks(
       plan: planned.plan,
       summary: planned.summary,
       effort: planned.effort,
+      adversarial: planned.adversarial,
       status: "planned",
       source: "label",
     });
@@ -356,7 +374,7 @@ export async function planAndTagTasks(
  */
 export async function dryRunProject(
   client: TodoistClient,
-  opts: { projectId: string; repoRoot: string; repoName?: string; bundleModel?: Model; planModel?: Model; onProgress?: (msg: string) => void },
+  opts: { projectId: string; repoRoot: string; repoName?: string; bundleModel?: Model; planModel?: Model; adversarial?: AdversarialOpts; onProgress?: (msg: string) => void },
 ): Promise<PlannedUnit[]> {
   const log = opts.onProgress ?? (() => {});
   const [tasks, sections] = await Promise.all([client.tasks(opts.projectId), client.sections(opts.projectId)]);
@@ -366,7 +384,7 @@ export async function dryRunProject(
   const planned: PlannedUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] planning "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    planned.push(await planUnit(unit, tasks, { model: opts.planModel, repoRoot: opts.repoRoot }));
+    planned.push(await planUnit(unit, tasks, { model: opts.planModel, repoRoot: opts.repoRoot, adversarial: opts.adversarial }));
   }
   return planned;
 }
