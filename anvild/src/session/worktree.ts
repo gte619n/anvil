@@ -255,6 +255,26 @@ export function carryPrBadge(prev: GitStatus | undefined, next: GitStatus): PrBa
   return prBadgeFor(prev.prState, prev.prUrl, next.branch, next.dirtyFileCount);
 }
 
+/** Copy a badge's fields onto a live git status; returns whether any field actually changed (so the
+ *  caller can skip a persist + broadcast when nothing moved). Dedupes the 3 inline copies in gitOp/
+ *  refreshPrState. */
+export function applyPrBadge(git: GitStatus, badge: PrBadge): boolean {
+  const changed = git.prState !== badge.prState || git.prUrl !== badge.prUrl || git.prBranch !== badge.prBranch;
+  git.prState = badge.prState;
+  git.prUrl = badge.prUrl;
+  git.prBranch = badge.prBranch;
+  return changed;
+}
+
+/** Whether a session is worth a network `gh pr view` probe: it must be on a branch and not already
+ *  terminal-merged on that same branch. Shared by the per-session attach refresh and the fleet-wide
+ *  sweep so their guards can't drift. */
+export function isPrSweepEligible(git: GitStatus | undefined, worktreeBranch: string | undefined): boolean {
+  const branch = worktreeBranch || git?.branch;
+  if (!branch) return false;
+  return !(git?.prState === "merged" && git.prBranch === git.branch);
+}
+
 /**
  * True for a `git status --porcelain` line that is an untracked `node_modules` entry — the symlink
  * linkDeps injects into every worktree (and never user work). We can't rely on the target repo's
