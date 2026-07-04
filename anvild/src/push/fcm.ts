@@ -1,5 +1,6 @@
 import { createSign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileAtomic } from "../util/atomic";
 import { join } from "node:path";
 import type { PushPayload } from "./webpush";
 
@@ -61,7 +62,8 @@ export class Fcm {
     }
   }
   private save(): void {
-    writeFileSync(this.tokensFile, JSON.stringify(this.tokens));
+    // [SEC-L3] device tokens are sensitive — non-world-readable. [BE-9] atomic (tmp+rename).
+    writeFileAtomic(this.tokensFile, JSON.stringify(this.tokens), { mode: 0o600 });
   }
 
   private async accessToken(): Promise<string | undefined> {

@@ -20,6 +20,9 @@ export interface TurnUsage {
 /** Called once per completed turn so the supervisor can refresh the shared rate-limit gauge. */
 export type ResultRecorder = (usage: TurnUsage) => void;
 
+/** The SDK `query` entrypoint — injectable so tests can drive `consume()` without a subprocess. */
+export type QueryFn = typeof query;
+
 /**
  * Drives one Claude Code session via the Agent SDK in streaming-input mode (arch §2).
  * One long-lived `query()` for the session's life; pushes user turns into an InputQueue;
@@ -47,6 +50,8 @@ export class AgentDriver {
     private readonly mcpServers?: Record<string, McpSdkServerConfigWithInstance>,
     /** Extra `allowedTools` (the concierge's `mcp__anvil__*` ids) auto-allowed by the SDK layer. */
     private readonly extraAllowedTools?: string[],
+    /** The SDK query entrypoint; overridable in tests. Defaults to the real `query`. */
+    private readonly queryFn: QueryFn = query,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -130,7 +135,7 @@ export class AgentDriver {
   private ensureStarted(): void {
     if (this.q) return;
     const s = this.session;
-    this.q = query({
+    this.q = this.queryFn({
       prompt: this.input,
       options: {
         model: s.data.model, // "opus" | "sonnet" — Claude Code accepts the aliases
@@ -248,6 +253,18 @@ export class AgentDriver {
       }
     } catch (e) {
       this.session.emitError(e instanceof Error ? e.message : String(e), false);
+    } finally {
+      // [BE-3] End-of-run cleanup. The consume loop only exits when the session ends (input closed
+      // via stop()) or a turn throws. In both cases: unblock any prompt parked in a broker (else the
+      // closure leaks and a client spins on it forever), drop this turn's transient maps, reset a
+      // non-idle status so the UI doesn't spin, and release `this.q` so the session can be restarted
+      // in place after a crash.
+      this.broker.resolveSession(this.session.id, "deny");
+      this.questionBroker.resolveSession(this.session.id);
+      this.pendingOffers.clear();
+      this.askQuestionIds.clear();
+      if (this.session.data.status !== "idle") this.session.setStatus("idle");
+      this.q = undefined;
     }
   }
 }

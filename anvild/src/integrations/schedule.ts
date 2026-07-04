@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AutopilotSchedule } from "@protocol";
+import { writeFileAtomic } from "../util/atomic";
 
 /**
  * The autopilot's in-daemon schedule: when the unattended run fires, and what it does
@@ -147,6 +148,8 @@ export class AutopilotScheduleStore {
     }
   }
   private save(): void {
-    writeFileSync(this.file, JSON.stringify(this.state, null, 2));
+    // [BE-9] atomic (tmp+rename): a torn write here silently reverted the schedule to disabled,
+    // killing the user's nightly autopilot with no notice.
+    writeFileAtomic(this.file, JSON.stringify(this.state, null, 2));
   }
 }

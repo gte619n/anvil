@@ -43,8 +43,18 @@ export function groupAlive(pgid: number): boolean {
   }
 }
 
-/** SIGTERM the group, wait up to `graceMs`, then SIGKILL. */
-export async function killGroup(pgid: number, graceMs = 2000): Promise<void> {
+/**
+ * SIGTERM the group, wait up to `graceMs`, then SIGKILL.
+ *
+ * [BE-10] Takes the whole `Group` (not a bare pgid) so it can refuse to signal once OUR tracked
+ * leader has exited: at that point the leader's pid (== pgid) can be recycled by an unrelated
+ * process that becomes a new group leader, and `process.kill(-pgid, …)` would SIGKILL that foreign
+ * group — the exact orphaned/duplicate-storm class this module exists to prevent. If our child is
+ * already gone there is nothing of ours left to reap.
+ */
+export async function killGroup(group: Group, graceMs = 2000): Promise<void> {
+  if (group.child.exitCode !== null || group.child.signalCode !== null) return;
+  const pgid = group.pgid;
   try {
     process.kill(-pgid, "SIGTERM");
   } catch {

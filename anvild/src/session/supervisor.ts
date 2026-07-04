@@ -938,11 +938,15 @@ export class Supervisor {
         ...(mapped.prUrl ? { prUrl: mapped.prUrl } : {}),
         ...(mapped.blockedReason ? { blockedReason: mapped.blockedReason } : {}),
       });
-      saveMetrics(this.stateDir, this.devPipelineMetrics);
       this.broadcastAutopilotPlans();
       log(`Pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}.`);
       return outcome;
     } finally {
+      // [BE-13] Persist metrics on EVERY exit, not just success. `executeDevPipeline` mutates the
+      // in-memory tallies (recordFirstPass) as it runs; a run that throws is exactly one where the
+      // adversary fired hardest, so saving only on success biased the §6.3 collusion metric toward
+      // clean runs. saveMetrics is atomic (tmp+rename), so a partial write can't corrupt the file.
+      saveMetrics(this.stateDir, this.devPipelineMetrics);
       // The branch (when shipped) is on origin via P6's push; the local worktree is disposable either way.
       try {
         removeWorktree(env.repoRoot, cwd, branch);

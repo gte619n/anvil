@@ -1,6 +1,7 @@
 import webpush from "web-push";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { writeFileAtomic } from "../util/atomic";
 
 interface Subscription {
   endpoint: string;
@@ -53,7 +54,7 @@ export class WebPush {
     const f = join(this.dir, "vapid.json");
     if (existsSync(f)) return JSON.parse(readFileSync(f, "utf8")) as { publicKey: string; privateKey: string };
     const k = webpush.generateVAPIDKeys();
-    writeFileSync(f, JSON.stringify(k), { mode: 0o600 });
+    writeFileAtomic(f, JSON.stringify(k), { mode: 0o600 });
     return k;
   }
   private loadSubs(): Subscription[] {
@@ -66,7 +67,8 @@ export class WebPush {
     }
   }
   private saveSubs(): void {
-    writeFileSync(join(this.dir, "subscriptions.json"), JSON.stringify(this.subs));
+    // [SEC-L3] holds web-push auth/p256dh secrets — never world-readable. [BE-9] atomic (tmp+rename).
+    writeFileAtomic(join(this.dir, "subscriptions.json"), JSON.stringify(this.subs), { mode: 0o600 });
   }
 
   subscribe(sub: Subscription): void {

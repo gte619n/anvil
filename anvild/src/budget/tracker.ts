@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Budget, RateWindow } from "@protocol";
+import { writeFileAtomic } from "../util/atomic";
 
 /**
  * Rate-limit tracker — arch §3, decision #9 (load-bearing).
@@ -115,7 +116,7 @@ export class RateLimitTracker {
   }
 
   private save(): void {
-    writeFileSync(this.file, JSON.stringify(this.state, null, 2));
+    writeFileAtomic(this.file, JSON.stringify(this.state, null, 2)); // [BE-9] atomic (tmp+rename)
   }
 }
 
