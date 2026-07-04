@@ -40,9 +40,27 @@ jobs:
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
                  --title "$GITHUB_REF_NAME" --notes "Automated release $GITHUB_REF_NAME." --verify-tag
 
+  # ── merge gate, re-run at release time so no untested artifact ever ships ─────────────────────
+  # Mirrors ci.yml. Every ship job below `needs:` this, so a tag that fails typecheck/build/test
+  # halts the whole release instead of auto-submitting to Play/App Store.
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: anvild
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.3.14 }
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run typecheck:web
+      - run: bun run build:web
+      - run: bun test
+
   # ── Android → Play Store production ───────────────────────────────────────────────────────────
   android:
-    needs: meta
+    needs: [meta, verify]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (full history for release notes)
@@ -112,7 +130,7 @@ jobs:
 
   # ── iOS → App Store (upload, then auto-submit + auto-release) ─────────────────────────────────
   ios:
-    needs: meta
+    needs: [meta, verify]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -194,7 +212,7 @@ jobs:
 
   # ── macOS client → Developer-ID-notarized Anvil.app + Sparkle ─────────────────────────────────
   mac-client:
-    needs: meta
+    needs: [meta, verify]
     runs-on: macos-15
     outputs:
       ed_signature: ${{ steps.sign.outputs.ed_signature }}
@@ -277,7 +295,7 @@ jobs:
 
   # ── macOS server → Developer-ID-notarized "Anvil Server.app" + Sparkle ────────────────────────
   mac-server:
-    needs: meta
+    needs: [meta, verify]
     runs-on: macos-15
     outputs:
       ed_signature: ${{ steps.sign.outputs.ed_signature }}

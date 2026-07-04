@@ -1,0 +1,42 @@
+name: CodeQL
+
+# Static analysis (SAST) for the TypeScript daemon/web client and the Kotlin Android app. Runs on
+# PRs, pushes to main, and weekly to catch newly-published query updates against unchanged code.
+# Swift is intentionally omitted: CodeQL's Swift analysis needs a full xcodebuild/SPM compile on a
+# macOS runner, which is expensive; the Swift apps are covered by review + the Phase 5 test targets.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 4 * * 1"
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: java-kotlin
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

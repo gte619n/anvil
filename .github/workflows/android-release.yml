@@ -51,6 +51,16 @@ jobs:
         working-directory: anvild
         run: bun install --frozen-lockfile
 
+      # Gate the beta ship on the same checks as ci.yml — this workflow triggers independently on
+      # push→main, so without this a red daemon suite would still distribute an APK to testers.
+      - name: Verify daemon (typecheck + web build + test)
+        working-directory: anvild
+        run: |
+          bun run typecheck
+          bun run typecheck:web
+          bun run build:web
+          bun test
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
