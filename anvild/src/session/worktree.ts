@@ -137,6 +137,19 @@ function syncedBase(repoRoot: string, base: string): string {
  * targets the default branch (see `syncedBase`) so sessions never start from a stale local `main`.
  * Throws if the branch already exists so the caller can ask for a different name.
  */
+// [SEC-L1] `base` (and `branch`) become positional args to `git worktree add`. They're argv, so no
+// shell injection, but a leading-dash value can be parsed as a git option, and git ref names forbid
+// whitespace, `..`, `~^:?*[`, `\`, and control chars anyway. Validate before spawning git.
+export function assertSafeRef(ref: string, label: string): void {
+  const r = ref.trim();
+  if (!r || r !== ref) throw new Error(`invalid git ${label} (empty or padded): ${JSON.stringify(ref)}`);
+  if (r.startsWith("-")) throw new Error(`invalid git ${label} (looks like an option): ${ref}`);
+  // eslint-disable-next-line no-control-regex
+  if (/[\s~^:?*\[\\\x00-\x1f]/.test(r) || r.includes("..")) {
+    throw new Error(`invalid git ${label}: ${ref}`);
+  }
+}
+
 export function createWorktree(
   repoRoot: string,
   base: string,
@@ -144,6 +157,8 @@ export function createWorktree(
   worktreeRoot: string,
   sessionId: string,
 ): CreatedWorktree {
+  assertSafeRef(base, "base");
+  assertSafeRef(branch, "branch");
   const cwd = join(worktreeRoot, sessionId);
   base = syncedBase(repoRoot, base);
   const r = git(["worktree", "add", "-b", branch, cwd, base], repoRoot);

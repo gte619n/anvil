@@ -22,6 +22,25 @@ export function repoNameFromUrl(url: string): string {
   return last.replace(/\.git$/i, "");
 }
 
+// [SEC-H5] Clone-URL guard. `git clone <url>` treats `ext::sh -c '…'` as a remote helper that runs
+// an arbitrary shell command, and a leading-dash "URL" as a git option — both RCE, since the URL is
+// caller-supplied ("add environment from git URL"). We allowlist the intended transports rather than
+// blocklist the dangerous ones (new remote helpers appear); `cloneRepo` additionally passes `--` and
+// disables the ext protocol as defense-in-depth.
+const HTTPS_OR_SSH = /^(https?|ssh):\/\/[^\s]+$/i;
+// scp-form: [user@]host.tld:path — require a dot in the host and a non-empty path, and forbid the
+// `::` remote-helper separator so `ext::…` can't masquerade as scp-form.
+const SCP_FORM = /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}:(?!:)[^\s].*$/;
+
+export function assertSafeCloneUrl(url: string): void {
+  const u = url.trim();
+  if (!u) throw new Error("a git URL is required");
+  if (u.startsWith("-")) throw new Error(`invalid git URL (looks like an option): ${url}`);
+  if (u.includes("::")) throw new Error(`unsupported git URL (remote-helper syntax not allowed): ${url}`);
+  if (HTTPS_OR_SSH.test(u) || SCP_FORM.test(u)) return;
+  throw new Error(`unsupported git URL scheme (use https://, ssh://, or user@host:path): ${url}`);
+}
+
 /**
  * Clone `url` into `<parent>/<repo-name>` using the host's git auth (SSH keys,
  * credential helpers). `parent` is caller-supplied (configurable; see `Config.clonesDir`) so the
@@ -29,8 +48,8 @@ export function repoNameFromUrl(url: string): string {
  * URL, an existing destination, or a git failure (message carries git's combined output for the UI).
  */
 export function cloneRepo(url: string, parent: string): { dest: string; output: string } {
+  assertSafeCloneUrl(url); // [SEC-H5] before any name derivation / mkdir / spawn
   const trimmed = url.trim();
-  if (!trimmed) throw new Error("a git URL is required");
   const name = repoNameFromUrl(trimmed);
   if (!name) throw new Error(`could not derive a repo name from URL: ${url}`);
   const dest = join(parent, name);
@@ -38,7 +57,9 @@ export function cloneRepo(url: string, parent: string): { dest: string; output: 
     throw new Error(`destination already exists: ${dest}`);
   }
   mkdirSync(parent, { recursive: true });
-  const r = run(["git", "clone", trimmed, dest], parent);
+  // `-c protocol.ext.allow=never` neutralizes the ext remote helper even if the allowlist is ever
+  // loosened; `--` stops any dash-leading value from being read as an option.
+  const r = run(["git", "-c", "protocol.ext.allow=never", "clone", "--", trimmed, dest], parent);
   if (r.code !== 0) {
     throw new Error(`git clone failed: ${r.out || `exit ${r.code}`}`);
   }

@@ -4,6 +4,7 @@ import { checkAuth } from "../auth/guard";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
+import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
 import { loadServerIdentity, serverHelloEvent } from "./identity";
 import { discoverFleet, inviteMac, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import { FleetStore } from "../fleet/store";
@@ -469,6 +470,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
       }
 
       if (url.pathname === "/ws") {
+        // [SEC-H3] Reject cross-site WebSocket hijack from a foreign browser origin. WS bypasses
+        // CORS, so this is the one place the browser vector can be closed; native clients and the
+        // same-origin PWA are allowlisted in isAllowedWsOrigin.
+        if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
+          return new Response("forbidden origin", { status: 403 });
+        }
         const data: ConnState = { id: newId("conn"), attached: new Set() };
         if (srv.upgrade(req, { data })) return undefined;
         return new Response("expected a websocket upgrade", { status: 426 });

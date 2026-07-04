@@ -57,6 +57,22 @@ export function inferMediaType(mediaType: string | undefined, name: string): str
   return MEDIA_BY_EXT[ext] ?? mediaType ?? "application/octet-stream";
 }
 
+// [SEC-M2] The stored filename is `<id>.<ext>` where `ext` derives from the client-supplied name.
+// Reduce it to a leading run of lowercase alphanumerics so it can never contain a path separator or
+// `..` and escape the attachments dir. Falls back to the media-type map / "bin" via the caller.
+export function sanitizeExt(raw: string): string {
+  const m = /^[a-z0-9]{1,12}/.exec(raw.toLowerCase());
+  return m ? m[0] : "";
+}
+
+// [SEC-M2] `sessionId` / `id` become path segments (`sessions/<sessionId>/attachments/<id>.<ext>`),
+// so reject anything that isn't a single safe segment before it reaches the filesystem.
+function assertSafeSegment(value: string, label: string): void {
+  if (!value || value.includes("/") || value.includes("\\") || value.includes("\0") || value.split(/[/\\]/).includes("..") || value === "." || value === "..") {
+    throw new Error(`invalid ${label}: ${JSON.stringify(value)}`);
+  }
+}
+
 /**
  * Per-session attachment store (arch §6.5). Pasted/dropped images are written under
  * `~/.anvil/sessions/<id>/attachments/` with a small `.json` sidecar (so serving survives a
@@ -66,6 +82,7 @@ export class AttachmentStore {
   constructor(private readonly stateDir: string) {}
 
   private dir(sessionId: string): string {
+    assertSafeSegment(sessionId, "sessionId"); // [SEC-M2] containment before it becomes a path
     const d = join(this.stateDir, "sessions", sessionId, "attachments");
     mkdirSync(d, { recursive: true });
     return d;
@@ -75,8 +92,9 @@ export class AttachmentStore {
     const id = newId("att");
     const resolved = inferMediaType(mediaType, name);
     // Prefer the original filename's extension so the stored blob stays recognizable for any
-    // type; fall back to the media-type map, then "bin".
-    const nameExt = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+    // type; fall back to the media-type map, then "bin". [SEC-M2] sanitize so the client's name
+    // can't inject path separators into `<id>.<ext>`.
+    const nameExt = name.includes(".") ? sanitizeExt(name.slice(name.lastIndexOf(".") + 1)) : "";
     const ext = nameExt || EXT[resolved] || "bin";
     const dir = this.dir(sessionId);
     const binPath = join(dir, `${id}.${ext}`);
@@ -86,10 +104,12 @@ export class AttachmentStore {
   }
 
   private resolve(sessionId: string, id: string): { binPath: string; mediaType: string; name: string } | undefined {
+    assertSafeSegment(id, "attachment id"); // [SEC-M2] id arrives from the REST GET path
     const metaPath = join(this.dir(sessionId), `${id}.json`);
     if (!existsSync(metaPath)) return undefined;
     const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { mediaType: string; name: string; ext: string };
-    return { binPath: join(this.dir(sessionId), `${id}.${meta.ext}`), mediaType: meta.mediaType, name: meta.name };
+    const ext = sanitizeExt(meta.ext) || "bin"; // defensive: never trust a stored ext into a path
+    return { binPath: join(this.dir(sessionId), `${id}.${ext}`), mediaType: meta.mediaType, name: meta.name };
   }
 
   ref(sessionId: string, id: string): AttachmentRef | undefined {
