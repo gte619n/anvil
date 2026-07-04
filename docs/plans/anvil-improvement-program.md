@@ -196,11 +196,18 @@ extraction *creates* the coverage (these clusters were untestable in place).
 - ✅ **Autopilot plan selection + presentation** (`integrations/autopilot-plans.ts`) — the grid-
   selection rules, card shaping, and build brief (pure). 7 tests. The Supervisor keeps the
   session-coupled orchestration (`runAutopilot`/`startPlan`) and delegates.
-- `supervisor.ts`: 2035 → 1985 lines with 19 new tests across 3 cohesive, independently-testable
-  modules.
-- ⏳ **Remaining**: the autopilot *orchestration* (would need the session-creation machinery mapped),
-  the git-refresh cluster, `http.ts` route table, `dispatch.ts` per-command handlers, push `TokenStore`
-  consolidation (BE-8), and `web/src/main.ts` (gated on the Phase 4 DOM harness).
+- ✅ **PR-badge helpers** (`session/worktree.ts` `applyPrBadge`/`isPrSweepEligible`) — dedupe the
+  badge-apply triple (3× in gitOp/refreshPrState) and the gh-probe eligibility guard (shared by
+  refreshPrState + the fleet sweep). 5 tests. The rest of the git-refresh cluster is session-coupled
+  orchestration whose pure bits were already extracted.
+- ✅ **parseCommandFrame** (`server/command-frame.ts`) — the WS router's envelope-validation gate
+  (JSON/version/type), now pure + unit-tested; dropped the dead `PENDING` set. 6 tests. dispatch.ts
+  435 → 408.
+- `supervisor.ts`: 2035 → 1971 lines; **30 new tests** across 5 cohesive modules.
+- ⏳ **Remaining**: the autopilot *orchestration* (needs the session-creation machinery mapped),
+  `http.ts` route table, `dispatch.ts` per-command handler table (lower value — cases are trivial
+  glue), push `TokenStore` consolidation (BE-8), and `web/src/main.ts` (gated on the Phase 4 DOM
+  harness).
 
 ---
 
