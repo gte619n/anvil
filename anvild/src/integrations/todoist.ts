@@ -3,6 +3,8 @@
  * Auth is a personal API token sent as `Authorization: Bearer <token>`. GET list endpoints
  * are cursor-paginated: `{ results, next_cursor }` — `getAll` walks the cursor for us.
  */
+import { retryAsync, parseRetryAfterMs } from "../util/retry";
+
 const API_BASE = "https://api.todoist.com/api/v1";
 // A single hung request must never block a caller forever — Todoist calls are quick, so cap each one.
 // (An autopilot run awaits many of these; without a per-call ceiling one stalled socket latches the
@@ -80,6 +82,8 @@ export class TodoistError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    /** [BE-5] ms to wait from a 429's Retry-After header, when the server provided one. */
+    readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "TodoistError";
@@ -94,7 +98,17 @@ export class TodoistClient {
     private readonly signal?: AbortSignal,
   ) {}
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    // [BE-5] Retry transient 429/5xx with backoff, honoring Retry-After, so one rate-limit hit no
+    // longer aborts an autopilot tag loop mid-way (which left some tasks tagged and others not).
+    return retryAsync(() => this.doRequest<T>(method, path, body), {
+      isRetryable: (e) => e instanceof TodoistError && (e.status === 429 || (e.status ?? 0) >= 500),
+      retryAfterMs: (e) => (e instanceof TodoistError ? e.retryAfterMs : undefined),
+      signal: this.signal,
+    });
+  }
+
+  private async doRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
     // Abort the request when EITHER the run is cancelled OR this call outlives REQUEST_TIMEOUT_MS, so a
     // stalled connection can't latch a run (and the spinner) open. The run-level signal is optional.
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -113,6 +127,7 @@ export class TodoistClient {
       throw new TodoistError(
         `Todoist ${method} ${path} → ${res.status} ${res.statusText}${text ? `: ${text.slice(0, 200)}` : ""}`,
         res.status,
+        parseRetryAfterMs(res),
       );
     }
     if (res.status === 204) return undefined as T;

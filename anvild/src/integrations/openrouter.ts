@@ -10,6 +10,8 @@
  * model requests `tool_calls`, the daemon executes them (read-only repo tools) and replies with
  * `role:"tool"` messages, and the loop repeats until the model returns a final answer.
  */
+import { retryAsync, parseRetryAfterMs } from "../util/retry";
+
 const API_URL = "https://openrouter.ai/api/v1/chat/completions";
 // A single hung request must never block an autopilot run forever (the panel fans out across models
 // and awaits them); cap each call the way TodoistClient does.
@@ -75,6 +77,23 @@ export class OpenRouterClient {
     if (this.signal?.aborted) {
       throw new DOMException("The operation was aborted.", "AbortError");
     }
+    // [BE-5] Retry transient 429/5xx (the panel fans out across models and can rate-limit the key),
+    // honoring Retry-After. 401/4xx (auth/bad request) are not retried.
+    return retryAsync(() => this.doComplete(model, messages, opts), {
+      isRetryable: (e) => {
+        const s = (e as { status?: number })?.status;
+        return s === 429 || (s ?? 0) >= 500;
+      },
+      retryAfterMs: (e) => (e as { retryAfterMs?: number })?.retryAfterMs,
+      signal: this.signal,
+    });
+  }
+
+  private async doComplete(
+    model: string,
+    messages: OpenRouterMessage[],
+    opts: { temperature?: number; tools?: OpenRouterTool[]; toolChoice?: "auto" | "none" } = {},
+  ): Promise<OpenRouterCompletion> {
     // Abort when EITHER the run is cancelled OR this call outlives REQUEST_TIMEOUT_MS.
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     const signal = this.signal ? AbortSignal.any([this.signal, timeout]) : timeout;
@@ -100,7 +119,12 @@ export class OpenRouterClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`OpenRouter ${model} → ${res.status} ${res.statusText}${text ? `: ${text.slice(0, 200)}` : ""}`);
+      const err = new Error(
+        `OpenRouter ${model} → ${res.status} ${res.statusText}${text ? `: ${text.slice(0, 200)}` : ""}`,
+      ) as Error & { status?: number; retryAfterMs?: number };
+      err.status = res.status;
+      err.retryAfterMs = parseRetryAfterMs(res);
+      throw err;
     }
     const json = (await res.json()) as ChatResponse;
     const choice = json.choices?.[0];

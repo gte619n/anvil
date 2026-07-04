@@ -150,9 +150,15 @@ Highest-ROI first (a single `finally` closes three bugs at once).
 - ✅ **BE-12** — string/escape-aware `extractJson` walker. `test/unit/extract-json.test.ts`.
 - ✅ **BE-10** — `killGroup(group)` refuses to signal once the tracked leader exited (PID-reuse
   guard). `test/unit/procgroup.test.ts`.
-- ⏳ **Remaining**: BE-6 (child reaping on abort), BE-1 (debounced session persistence), BE-4 (async
-  git on request paths), BE-5 (retry/backoff), BE-11 (eventlog index/rotation), BE-14 (async ADB +
-  off-path fleet heal), BE-misc (seq monotonicity, config validation, dead-code removal).
+- ✅ **BE-1** — debounced session-registry persistence (100ms coalesce) on the hot emit path;
+  lifecycle ops flush synchronously; guarded + unref'd timer. `test/unit/persist-debounce.test.ts`.
+- ✅ **BE-6** — `captureGitDiff` awaits child `exited` (no zombie git procs). The terminal-PTY reap
+  on abort is deferred (heavier). `test/unit/capture-diff.test.ts`.
+- ✅ **BE-misc (config)** — validated numeric env (`ANVIL_PORT`/budget fractions) with a clear
+  startup error instead of a silent `NaN`. `test/unit/config.test.ts`.
+- ⏳ **Remaining**: BE-4 (async git on request paths), BE-5 (retry/backoff for Todoist/OpenRouter),
+  BE-11 (eventlog index/rotation), BE-14 (async ADB + off-path fleet heal), BE-misc (seq
+  monotonicity, dead-code removal, terminal-PTY reap).
 
 ---
 
