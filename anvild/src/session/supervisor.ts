@@ -57,6 +57,7 @@ import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
+import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
@@ -66,7 +67,7 @@ import { autoStartDecision } from "../integrations/autostart-gate";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
 import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
-import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, toPipelineTraceInfo, adversaryStats } from "../pipeline/daemon-adapters";
+import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, adversaryStats } from "../pipeline/daemon-adapters";
 import { loadMetrics, saveMetrics } from "../pipeline/metrics-store";
 import type { AdversaryMetrics } from "../pipeline/metrics";
 import type { PhaseDeps } from "../pipeline/phases";
@@ -442,41 +443,16 @@ export class Supervisor {
   }
 
   // ── Autopilot plan review (anvil-autopilot-ui.md) ─────────────────────────────────
+  // Selection + presentation logic lives in integrations/autopilot-plans.ts (pure + unit-tested);
+  // these methods just supply the Supervisor's stores/renderer.
   /** Pending plans = planned work units not yet started; what the Autopilot card grid shows. */
   private pendingPlans(): WorkUnit[] {
-    return this.workUnits.list().filter(
-      (u) =>
-        (u.status === "planned" && !u.sessionId) ||
-        // Held-for-clarification units live on the grid too, so the reviewer can read the open questions and
-        // answer them (via refine, which promotes the unit back to `planned`) or dismiss it.
-        (u.status === "needs-clarification" && !u.sessionId) ||
-        // Keep pipeline-completed units on the grid so their trace + PR stay reviewable until the operator
-        // resolves them (dismiss/complete). Only pipeline-run units gain this visibility — the old flow is
-        // unchanged (a normal planned→built unit has no devPipeline).
-        (u.devPipeline !== undefined && (u.status === "review" || u.status === "blocked")),
-    );
+    return selectPendingPlans(this.workUnits.list());
   }
 
   /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
   private autopilotPlanInfo(u: WorkUnit): AutopilotPlanInfo {
-    const env = this.envStore.get(u.environmentId);
-    return {
-      id: u.id,
-      environmentId: u.environmentId,
-      ...(env?.name ? { environmentName: env.name } : {}),
-      todoistProjectId: u.todoistProjectId,
-      title: u.title,
-      ...(u.rationale ? { rationale: u.rationale } : {}),
-      ...(u.summary ? { summary: u.summary } : {}),
-      status: u.status,
-      ...(u.source ? { source: u.source } : {}),
-      ...(u.effort ? { effort: u.effort } : {}),
-      taskCount: u.taskIds.length,
-      ...(u.plan ? { plan: this.renderer.render(u.plan) } : {}),
-      ...(u.devPipeline ? { pipeline: toPipelineTraceInfo(u.devPipeline) } : {}),
-      createdAt: u.createdAt,
-      updatedAt: u.updatedAt,
-    };
+    return toPlanInfo(u, this.envStore.get(u.environmentId)?.name, this.renderer);
   }
 
   /** The §6.3 adversary calibration metrics for the Models settings card. */
@@ -725,11 +701,9 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
   }
 
-  /** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */
+  /** The opening brief handed to a plan's build session (see integrations/autopilot-plans.ts). */
   private autopilotBrief(u: WorkUnit): string {
-    const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
-    const body = u.plan ? `\n\nHere is the plan to implement:\n\n${u.plan}` : "";
-    return `${head}${body}\n\nImplement it end to end in this worktree, then summarize what you changed.`;
+    return buildAutopilotBrief(u);
   }
 
   /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
