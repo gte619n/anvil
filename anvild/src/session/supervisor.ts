@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { mkdirSync as ensureDir, unwatchFile, watchFile } from "node:fs";
+import { mkdirSync as ensureDir } from "node:fs";
 import { basename, join } from "node:path";
 import {
   PROTOCOL_VERSION,
@@ -44,6 +44,7 @@ import type { ConnectionRegistry } from "../server/registry";
 import { Session } from "./session";
 import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
+import { FileWatchManager } from "./file-watch-manager";
 import { carryPrBadge, createWorktree, gitStatus, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
@@ -1176,8 +1177,19 @@ export class Supervisor {
     }
   }
 
-  // File browser & reader (arch §8.1/§8.2), scoped to the session worktree.
-  private readonly watchers = new Map<string, () => void>(); // `${sessionId}:${path}` → stop fn
+  // File browser & reader (arch §8.1/§8.2), scoped to the session worktree. Change-watching is
+  // extracted to FileWatchManager (unit-tested); the Supervisor injects locate/read/session access.
+  private readonly fileWatchMgr = new FileWatchManager(
+    (sessionId) => {
+      const s = this.require(sessionId);
+      return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
+    },
+    (cwd, path) => locateInside(cwd, path),
+    (sessionId, path) => {
+      const s = this.require(sessionId);
+      return readFile(s.data.cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p));
+    },
+  );
 
   fsList(sessionId: string, path: string): { path: string; entries: DirEntry[] } {
     return listDir(this.require(sessionId).data.cwd, path);
@@ -1196,43 +1208,10 @@ export class Supervisor {
     return resolveInside(this.require(sessionId).data.cwd, path);
   }
   fsWatch(sessionId: string, path: string): void {
-    const key = `${sessionId}:${path}`;
-    if (this.watchers.has(key)) return;
-    const s = this.require(sessionId);
-    let located: ReturnType<typeof locateInside>;
-    try {
-      located = locateInside(s.data.cwd, path); // watch the file fs.read actually resolved (subdir match included)
-    } catch {
-      return; // not found / not yet created — nothing to watch (read already reported the error)
-    }
-    if (located.kind !== "file") return; // an ambiguous basename has no single file to watch until the user picks
-    const abs = located.abs;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const onChange = (): void => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        try {
-          s.emit({ type: "fs.changed", content: readFile(s.data.cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p)) });
-        } catch {
-          /* file deleted / unreadable — ignore */
-        }
-      }, 250);
-    };
-    watchFile(abs, { interval: 1000 }, onChange);
-    this.watchers.set(key, () => unwatchFile(abs, onChange));
+    this.fileWatchMgr.add(sessionId, path);
   }
   fsUnwatch(sessionId: string, path: string): void {
-    const key = `${sessionId}:${path}`;
-    this.watchers.get(key)?.();
-    this.watchers.delete(key);
-  }
-  private clearWatchers(sessionId: string): void {
-    for (const [key, stop] of this.watchers) {
-      if (key.startsWith(`${sessionId}:`)) {
-        stop();
-        this.watchers.delete(key);
-      }
-    }
+    this.fileWatchMgr.unwatch(sessionId, path);
   }
   private fileUrl(sessionId: string, relPath: string): string {
     return `/api/sessions/${sessionId}/files?path=${encodeURIComponent(relPath)}`;
@@ -1393,7 +1372,7 @@ export class Supervisor {
     const s = this.require(id);
     await this.drivers.get(id)?.stop();
     this.drivers.delete(id);
-    this.clearWatchers(id);
+    this.fileWatchMgr.clear(id);
     this.terminalMgr.kill(id);
     s.data.archived = true;
     s.data.status = "idle";
@@ -1597,7 +1576,7 @@ export class Supervisor {
     try {
       await this.drivers.get(id)?.stop(); // interrupt the agent SDK query + close its input
       this.drivers.delete(id);
-      this.clearWatchers(id);
+      this.fileWatchMgr.clear(id);
       this.terminalMgr.kill(id);
       await s.stop(); // reap any attached process group (PTY in Phase 3)
       if (s.data.source === "fresh-worktree" && s.data.worktree) {
@@ -1631,7 +1610,7 @@ export class Supervisor {
     const s = this.require(id);
     await this.drivers.get(id)?.stop(); // a wedged/stale query is dropped; next prompt starts fresh
     this.drivers.delete(id);
-    this.clearWatchers(id);
+    this.fileWatchMgr.clear(id);
     this.terminalMgr.kill(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
