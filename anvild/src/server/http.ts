@@ -56,14 +56,23 @@ function lanIPv4(): string[] {
 }
 const adbTarget = (host: string, port: number): string => (host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`);
 
+// [BE-14] adb connect/pair reach out over the network and can hang for seconds. Run async with a
+// timeout so an ADB call can't freeze the single-threaded daemon (and every other client) — the old
+// Bun.spawnSync blocked the whole event loop for the call's duration.
+const ADB_TIMEOUT_MS = 15_000;
+
 /** Run `adb` (from PATH or the common SDK locations); returns its combined output. */
-function runAdb(args: string[]): { ok: boolean; output: string } {
+async function runAdb(args: string[]): Promise<{ ok: boolean; output: string }> {
   const home = process.env.HOME ?? "";
   const candidates = ["adb", "/opt/homebrew/bin/adb", "/usr/local/bin/adb", join(home, "Library/Android/sdk/platform-tools/adb"), join(home, "Android/Sdk/platform-tools/adb")];
   for (const adb of candidates) {
     try {
-      const r = Bun.spawnSync([adb, ...args], { stdout: "pipe", stderr: "pipe" });
-      const output = `${r.stdout.toString()}${r.stderr.toString()}`.trim();
+      // A missing binary throws synchronously (ENOENT) → try the next path. A present-but-slow adb is
+      // killed by the timeout signal; its reads still resolve with whatever it emitted (ok=false).
+      const p = Bun.spawn([adb, ...args], { stdout: "pipe", stderr: "pipe", signal: AbortSignal.timeout(ADB_TIMEOUT_MS) });
+      const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+      await p.exited;
+      const output = `${out}${err}`.trim();
       return { ok: /connected to/i.test(output) && !/failed|cannot|unable/i.test(output), output: output || "(no output)" };
     } catch {
       /* not at this path — try the next */
@@ -333,13 +342,13 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
       // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint
       if (url.pathname === "/api/adb/info" && req.method === "GET") {
-        return Response.json({ serverIps: lanIPv4(), devices: runAdb(["devices", "-l"]).output });
+        return Response.json({ serverIps: lanIPv4(), devices: (await runAdb(["devices", "-l"])).output });
       }
       if (url.pathname === "/api/adb/connect" && req.method === "POST") {
         try {
           const { host, port } = (await req.json()) as { host?: string; port?: number };
           if (!host || !port) return new Response("host and port required", { status: 400 });
-          return Response.json(runAdb(["connect", adbTarget(host, port)]));
+          return Response.json(await runAdb(["connect", adbTarget(host, port)]));
         } catch {
           return new Response("bad request", { status: 400 });
         }
@@ -348,7 +357,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         try {
           const { host, port, code } = (await req.json()) as { host?: string; port?: number; code?: string };
           if (!host || !port || !code) return new Response("host, port, code required", { status: 400 });
-          const r = runAdb(["pair", adbTarget(host, port), String(code)]);
+          const r = await runAdb(["pair", adbTarget(host, port), String(code)]);
           return Response.json({ ok: /success/i.test(r.output), output: r.output });
         } catch {
           return new Response("bad request", { status: 400 });

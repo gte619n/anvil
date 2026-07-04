@@ -156,9 +156,17 @@ Highest-ROI first (a single `finally` closes three bugs at once).
   on abort is deferred (heavier). `test/unit/capture-diff.test.ts`.
 - ✅ **BE-misc (config)** — validated numeric env (`ANVIL_PORT`/budget fractions) with a clear
   startup error instead of a silent `NaN`. `test/unit/config.test.ts`.
-- ⏳ **Remaining**: BE-4 (async git on request paths), BE-5 (retry/backoff for Todoist/OpenRouter),
-  BE-11 (eventlog index/rotation), BE-14 (async ADB + off-path fleet heal), BE-misc (seq
-  monotonicity, dead-code removal, terminal-PTY reap).
+- ✅ **BE-5** — shared `util/retry.ts` (backoff + jitter + Retry-After); wired into the Todoist and
+  OpenRouter clients (429/5xx only; 401 not retried). `test/unit/retry.test.ts`.
+- ✅ **BE-14 (ADB)** — `runAdb` is async with a 15s timeout (no longer `spawnSync`-blocks the loop).
+- ⏳ **Deferred (need dedicated, carefully-reviewed effort)**:
+  - **BE-4** (async git on request paths) — `run()` backs ~20 fns and `mergePr` is the delicate
+    worktree-rollover logic CLAUDE.md flags as fragile; a broad sync→async conversion should be its
+    own reviewed PR, not rushed. The recurring-hot-path `prStatus` already has an async variant.
+  - **BE-11** (eventlog index/rotation) — needs a format/index design; moderate.
+  - **BE-14 (fleet-heal off GET path)** — move `healStaleFleetRecords` to a timer.
+  - **BE-misc** — seq monotonicity (route fabricated events through `emit()`), dead-code removal
+    (`dispatch.ts` PENDING set, `phases.ts` redundant dynamic import), terminal-PTY reap on abort.
 
 ---
 
