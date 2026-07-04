@@ -135,14 +135,17 @@ test("concurrent AskUserQuestion prompts (sub-agent fan-out) each re-surface and
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("supervisor persists sessions and a fresh instance restores them", () => {
+test("supervisor persists sessions and a fresh instance restores them", async () => {
   const dir = tempState();
   const reg = new ConnectionRegistry();
 
   const sup1 = new Supervisor({ stateDir: dir }, reg);
   const s = sup1.create(createCmd(dir));
-  s.setStatus("thinking"); // advance seq + mark dirty (persisted)
+  s.setStatus("thinking"); // advance seq; [BE-1] emit-driven persistence is debounced
   const id = s.id;
+  // Let the debounced registry write flush (a real turn always outlives the 100ms window) before
+  // simulating the crash-restart, so the persisted "thinking" drives the interrupted-notice path.
+  await new Promise((r) => setTimeout(r, 150));
 
   const sup2 = new Supervisor({ stateDir: dir }, reg);
   const restored = sup2.get(id);

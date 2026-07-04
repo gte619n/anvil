@@ -1785,7 +1785,7 @@ export class Supervisor {
         this.maybeNotify(sessionId, event);
         this.maybeBroadcastAwaiting(sessionId, event);
       },
-      () => this.persist(),
+      () => this.persistSoon(), // [BE-1] high-frequency emit path is debounced; lifecycle ops flush now
       (event) => log.append(event),
     );
   }
@@ -1944,8 +1944,42 @@ export class Supervisor {
     }
   }
 
+  // [BE-1] Coalesce the hot emit-driven persistence. A full-registry re-serialize + fsync per
+  // emitted event (status/prose/seq, many per turn) is the daemon's hottest path; this window batches
+  // a burst into one write. Lifecycle ops (create/kill/shutdown) still call persist() for immediate
+  // durability; the event log is the authoritative per-event stream, so at most PERSIST_DEBOUNCE_MS
+  // of status/seq updates are at risk on a hard crash (restart reconciles them anyway).
+  private static readonly PERSIST_DEBOUNCE_MS = 100;
+  private persistTimer: ReturnType<typeof setTimeout> | undefined;
+  private persistDirty = false;
+
+  /** Immediate, synchronous registry flush. Used by lifecycle ops and satisfies any pending
+   *  debounced write (cancels the timer). */
   private persist(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
+    this.persistDirty = false;
     this.store.saveAll([...this.sessions.values()].map((s) => ({ data: s.data, lastSeq: s.lastSeq })));
+  }
+
+  /** Debounced flush for the high-frequency emit path. */
+  private persistSoon(): void {
+    this.persistDirty = true;
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      // The flush runs OUTSIDE the emit try/catch, so guard it: a transient FS error (or a state dir
+      // that vanished under a test) must be logged, never thrown as an unhandled rejection.
+      try {
+        if (this.persistDirty) this.persist();
+      } catch (e) {
+        console.error(`[supervisor] debounced persist failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }, Supervisor.PERSIST_DEBOUNCE_MS);
+    // Don't let a pending flush hold the process open — shutdown() flushes synchronously.
+    this.persistTimer.unref?.();
   }
 
   private require(id: string): Session {
