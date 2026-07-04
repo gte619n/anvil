@@ -184,6 +184,24 @@ Guarded by the Phase 1–2 tests plus new per-module unit tests. No behavior cha
 
 Each extraction: characterization tests on the current behavior first, then move code, then green.
 
+### Phase 3 status (as implemented)
+
+Method proven: write the full behavioral test suite against the new module's API → move the logic
+with dependencies injected → wire the god-file to delegate → verify typecheck + full suite. The
+extraction *creates* the coverage (these clusters were untestable in place).
+
+- ✅ **TerminalManager** (`session/terminal-manager.ts`) — PTY channel; injected spawn factory. 6 tests.
+- ✅ **FileWatchManager** (`session/file-watch-manager.ts`) — fs-change watching; injected
+  locate/read/watch. 6 tests.
+- ✅ **Autopilot plan selection + presentation** (`integrations/autopilot-plans.ts`) — the grid-
+  selection rules, card shaping, and build brief (pure). 7 tests. The Supervisor keeps the
+  session-coupled orchestration (`runAutopilot`/`startPlan`) and delegates.
+- `supervisor.ts`: 2035 → 1985 lines with 19 new tests across 3 cohesive, independently-testable
+  modules.
+- ⏳ **Remaining**: the autopilot *orchestration* (would need the session-creation machinery mapped),
+  the git-refresh cluster, `http.ts` route table, `dispatch.ts` per-command handlers, push `TokenStore`
+  consolidation (BE-8), and `web/src/main.ts` (gated on the Phase 4 DOM harness).
+
 ---
 
 ## Phase 4 — Web frontend  *(tests + refactor + a11y + PWA; ~1.5 weeks)*
