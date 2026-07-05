@@ -3,7 +3,7 @@ import Sortable from "sortablejs";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
-import { apiFetch, daemonBase } from "./api";
+import { apiFetch, daemonBase, sameServerUrl } from "./api";
 import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, linkifyUrls, refreshSelect, sessIcon, slugify } from "./dom";
 import { currentTheme, resolveTheme, themePref, updateThemeControls } from "./theme";
 import type { ThemePref } from "./theme";
@@ -683,7 +683,7 @@ function onEvent(url: string, e: ServerEvent): void {
       // This server is the source of truth for ITS OWN sessions only — drop the ones it used to
       // own and no longer lists (not other servers' sessions, not optimistic pending locals).
       for (const id of [...sessions.keys()]) {
-        if (sessionServer.get(id) === url && !sessions.get(id)?.pending) {
+        if (sameServerUrl(sessionServer.get(id), url) && !sessions.get(id)?.pending) {
           sessions.delete(id);
           sessionServer.delete(id);
         }
@@ -735,15 +735,7 @@ function onEvent(url: string, e: ServerEvent): void {
       }
       return;
     case "session.deleted":
-      sessions.delete(e.sessionId);
-      sessionServer.delete(e.sessionId);
-      removingSessions.delete(e.sessionId); // cleanup finished — the row goes for good now
-      localStorage.removeItem(`anvil.convo.${e.sessionId}`);
-      localStorage.removeItem(`anvil.draft.${e.sessionId}`); // its unsent draft has nowhere to go now
-      persistSessions();
-      persistRouting();
-      if (activeId === e.sessionId) deselectSession();
-      else renderSessions();
+      purgeSessionLocally(e.sessionId);
       return;
     case "server.hello": {
       // identify the server on this socket as soon as it opens (fleet §3/§6).
@@ -4321,13 +4313,41 @@ async function abandonSession(): Promise<void> {
   });
   if (ok) killSession(id);
 }
+/** Remove a session from the local view + caches — the client-side half of a deletion. Shared by the
+ *  daemon's session.deleted broadcast and the kill path's "no such session" fallback, so a row the
+ *  owning daemon has disowned (a stale-routed ghost) can always be evicted locally. */
+function purgeSessionLocally(id: string): void {
+  sessions.delete(id);
+  sessionServer.delete(id);
+  removingSessions.delete(id); // cleanup finished (or never existed) — the row goes for good now
+  localStorage.removeItem(`anvil.convo.${id}`);
+  localStorage.removeItem(`anvil.draft.${id}`); // its unsent draft has nowhere to go now
+  persistSessions();
+  persistRouting();
+  if (activeId === id) deselectSession();
+  else renderSessions();
+}
 /** Kill a session: disable it immediately and drop its conversation, while the daemon tears the
  *  worktree/branch down in the background. The row stays (greyed, "cleaning up…") until the
  *  daemon's session.deleted broadcast removes it for good — so cleanup never looks like it hung,
- *  and a failed/slow teardown can't leave a half-removed session behind. (UI refinement §8) */
+ *  and a failed/slow teardown can't leave a half-removed session behind. (UI refinement §8)
+ *
+ *  We watch the kill's reply on a cid: if the owning daemon — or the hub we fell back to when the
+ *  routing was stale — answers "no such session", the row is a client-only ghost (its daemon
+ *  disowned it while we were disconnected, or its server url drifted). Evict it locally so Abandon /
+ *  Clean up always frees the row instead of leaving a zombie no daemon can delete for us. A plain
+ *  offline/timeout is NOT treated as disowned — the server may just be unreachable, so the offline
+ *  cache keeps the row. */
 function killSession(id: string): void {
   removingSessions.add(id);
-  sendTo(id, { type: "session.kill", sessionId: id });
+  const srv = serverOf(id) ?? hub();
+  void sendAwait(srv, { type: "session.kill", sessionId: id, cid: newCid() })
+    .then((res) => {
+      if (res.type === "command.error" && /no such session/i.test(res.message)) purgeSessionLocally(id);
+    })
+    .catch(() => {
+      /* offline / timeout — keep the row; a reachable daemon never confirmed it's gone */
+    });
   localStorage.removeItem(`anvil.convo.${id}`);
   localStorage.removeItem(`anvil.draft.${id}`); // abandoning the session — its draft goes with it
   if (panelView) closePanel();
