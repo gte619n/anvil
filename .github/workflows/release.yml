@@ -281,7 +281,10 @@ jobs:
           set -euo pipefail
           ditto -c -k --keepParent dist/Anvil.app "$RUNNER_TEMP/Anvil.zip"
           SIGN_UPDATE="$(find .build -path '*/Sparkle/bin/sign_update' | head -1)"
-          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil.zip" -s "$SPARKLE_ED_PRIVATE_KEY")"
+          # Sparkle 2.9+ removed `-s <key>`; feed the key via a temp file with --ed-key-file.
+          KEYFILE="$(mktemp)"; trap 'rm -f "$KEYFILE"' EXIT
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEYFILE"
+          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil.zip" --ed-key-file "$KEYFILE")"
           echo "sign_update: $OUT"
           echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
           echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -367,7 +370,10 @@ jobs:
           set -euo pipefail
           ditto -c -k --keepParent "Anvil Server.app" "$RUNNER_TEMP/Anvil-Server.zip"
           SIGN_UPDATE="$(find .build -path '*/Sparkle/bin/sign_update' | head -1)"
-          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil-Server.zip" -s "$SPARKLE_ED_PRIVATE_KEY")"
+          # Sparkle 2.9+ removed `-s <key>`; feed the key via a temp file with --ed-key-file.
+          KEYFILE="$(mktemp)"; trap 'rm -f "$KEYFILE"' EXIT
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEYFILE"
+          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil-Server.zip" --ed-key-file "$KEYFILE")"
           echo "sign_update: $OUT"
           echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
           echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
