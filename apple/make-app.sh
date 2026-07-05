@@ -55,7 +55,7 @@ else
 fi
 
 # ── 2. compile ─────────────────────────────────────────────────────────────
-echo "▸ swift build -c $CONFIG…"
+echo "▸ swift build -c ${CONFIG}…"
 ( cd "$HERE" && swift build -c "$CONFIG" )
 BIN_DIR="$HERE/.build/$CONFIG"
 EXE="$BIN_DIR/$APP_NAME"
@@ -66,7 +66,7 @@ RES_BUNDLE="$BIN_DIR/${APP_NAME}_${APP_NAME}.bundle"
 # ── 3. lay out the .app ────────────────────────────────────────────────────
 DIST="$HERE/dist"
 APP="$DIST/$APP_NAME.app"
-echo "▸ assembling $APP…"
+echo "▸ assembling ${APP}…"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
