@@ -267,6 +267,13 @@ extraction *creates* the coverage (these clusters were untestable in place).
 - `[NAT-11]` Protocol-version negotiation: `/api/health` exposes `protocolVersion`/`minClient`;
   clients show an upgrade banner on mismatch.
 - `[TEST-6]` SwiftPM tests for `HTTP.parse` and `Tailscale.tailnetIP`; Kotlin tests for `Net`/NSD.
+  **Prereq found (2026-07):** attempted `HTTP.parse` tests but this env's Command-Line-Tools Swift
+  toolchain ships **neither `XCTest` (needs full Xcode) nor `Testing`/swift-testing**, and
+  `@testable import` of the *executable* target fails emit-module. So native tests need: (a) full
+  Xcode in CI *or* a `swift-testing` package dependency, **and** (b) extracting the pure logic
+  (`HTTP`, tailnet-IP CGNAT check) into a small dependency-free **library target** both the executable
+  and tests depend on (avoids the executable-@testable limitation). A dedicated setup task, not a
+  drop-in — reverted the exploratory attempt rather than commit unrunnable config.
 - `[NAT-misc]` Remove residual "Zellij" branding; centralize duplicated endpoint string literals;
   document the intentionally-committed `anvil-debug.keystore` + `google-services.json` in the README.
 
