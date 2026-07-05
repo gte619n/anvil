@@ -3685,9 +3685,40 @@ function loadDraft(id: string | null): string {
     return "";
   }
 }
+// ── Sent-prompt history (ArrowUp / ArrowDown recall in a blank composer) ──────────
+// Keep the last few sent prompts per session so ArrowUp cycles back through them (ArrowDown
+// forward) — handy after stopping a run to re-edit and resend. Persisted like drafts so it
+// survives a reload. Newest first; capped so the list can't grow unbounded.
+const HISTORY_LIMIT = 10;
+const historyKey = (id: string): string => `anvil.history.${id}`;
+function loadHistory(id: string | null): string[] {
+  if (!id) return [];
+  try {
+    const arr: unknown = JSON.parse(localStorage.getItem(historyKey(id)) ?? "[]");
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+function pushHistory(id: string | null, text: string): void {
+  if (!id || !text.trim()) return;
+  // Drop any prior identical entry so repeats don't stack up, then prepend as newest.
+  const hist = [text, ...loadHistory(id).filter((t) => t !== text)].slice(0, HISTORY_LIMIT);
+  try {
+    localStorage.setItem(historyKey(id), JSON.stringify(hist));
+  } catch {
+    /* quota */
+  }
+}
+// Cursor into the recall list: -1 means "composing fresh text, not navigating history".
+// `historyStash` holds that fresh text so ArrowUp-then-back-down-past-newest restores it.
+let historyIdx = -1;
+let historyStash = "";
+
 /** Put `id`'s saved draft into the composer (or clear it), and resize/enable Send to match. */
 function restoreDraft(id: string | null): void {
   input.value = loadDraft(id);
+  historyIdx = -1; // a fresh composer context — start recall from the top again
   autoGrow();
   updateSendState();
 }
@@ -3724,9 +3755,18 @@ async function sendComposer(): Promise<void> {
     appendOptimisticUser(text);
   }
   saveDraft(activeId, ""); // the draft was just sent — drop the stored copy
+  pushHistory(activeId, text); // remember it for ArrowUp/ArrowDown recall
+  historyIdx = -1; // back to composing fresh text
   input.value = "";
   pendingAttachments.length = 0;
   renderAttachRow();
+  autoGrow();
+  updateSendState();
+}
+/** Drop `text` into the composer as a recalled history entry, caret at the end. */
+function applyRecall(text: string): void {
+  input.value = text;
+  input.setSelectionRange(text.length, text.length);
   autoGrow();
   updateSendState();
 }
@@ -3734,9 +3774,31 @@ input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     $<HTMLFormElement>("#composer").requestSubmit();
+    return;
+  }
+  // ArrowUp/ArrowDown cycle through recently sent prompts so one can be re-edited and resent.
+  // We only start recall from a blank box, so it never steals cursor navigation from a draft;
+  // once navigating, the arrows keep stepping through history until you edit or reach the bottom.
+  if (e.key === "ArrowUp" && (historyIdx >= 0 || !input.value)) {
+    const hist = loadHistory(activeId);
+    if (!hist.length) return;
+    if (historyIdx < 0) historyStash = input.value; // stash the fresh (blank) text to return to
+    if (historyIdx >= hist.length - 1) return; // already at the oldest — nothing older to show
+    e.preventDefault();
+    historyIdx += 1;
+    applyRecall(hist[historyIdx]!);
+    return;
+  }
+  if (e.key === "ArrowDown" && historyIdx >= 0) {
+    const hist = loadHistory(activeId);
+    e.preventDefault();
+    historyIdx -= 1;
+    applyRecall(historyIdx < 0 ? historyStash : (hist[historyIdx] ?? ""));
+    return;
   }
 });
 input.addEventListener("input", () => {
+  historyIdx = -1; // a manual edit leaves history navigation — next ArrowUp starts fresh
   autoGrow();
   updateSendState();
 });
