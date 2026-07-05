@@ -60,6 +60,7 @@ import type {
   TodoistProjectInfo,
 } from "../../protocol";
 import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
+import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
 
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
@@ -476,30 +477,10 @@ $("#convo-col").addEventListener("focusin", collapseSidebarForChat);
 // connect at the bottom, once the outbox state onStatus reads is initialized.)
 
 // ── Outbox: writes made offline are queued and flushed, in order, on reconnect (arch §8) ──────
-interface OutboxItem {
-  cid: string;
-  cmd: Record<string, unknown> & { type: string };
-  tempId?: string; // for session.create: the optimistic local session id to reconcile
-  serverUrl?: string; // target server for commands with no sessionId yet (session.create)
-}
-const newCid = (): string => (crypto.randomUUID ? crypto.randomUUID() : `c_${Date.now()}_${Math.floor(Math.random() * 1e9)}`);
-let outbox: OutboxItem[] = (() => {
-  try {
-    return JSON.parse(localStorage.getItem("anvil.outbox") ?? "[]") as OutboxItem[];
-  } catch {
-    return [];
-  }
-})();
-const saveOutbox = (): void => {
-  try {
-    localStorage.setItem("anvil.outbox", JSON.stringify(outbox));
-  } catch {
-    /* quota */
-  }
-};
+// The queue + persistence live in ./outbox (unit-tested); flush/reconcile orchestration stays here.
+const outboxQueue = new OutboxQueue();
 function enqueue(item: OutboxItem): void {
-  outbox.push(item);
-  saveOutbox();
+  outboxQueue.enqueue(item);
   updateOutboxBadge();
 }
 const cidWaiters = new Map<string, (e: ServerEvent) => void>();
@@ -529,7 +510,7 @@ async function flushOutbox(): Promise<void> {
   const remaining: OutboxItem[] = []; // items whose server is offline / that error stay queued
   const failedTemps = new Set<string>();
   try {
-    for (const item of outbox) {
+    for (const item of outboxQueue.list()) {
       // a create that was just rejected → drop its dependent queued prompts
       if ((item.tempId && failedTemps.has(item.tempId)) || (typeof item.cmd.sessionId === "string" && failedTemps.has(item.cmd.sessionId))) continue;
       const sid = item.cmd.sessionId as string | undefined;
@@ -561,8 +542,7 @@ async function flushOutbox(): Promise<void> {
       }
     }
   } finally {
-    outbox = remaining;
-    saveOutbox();
+    outboxQueue.replace(remaining);
     flushing = false;
     updateOutboxBadge();
     // re-pull authoritative history for the active session so optimistic bubbles are replaced
@@ -591,8 +571,7 @@ function reconcileTemp(tempId: string, realId: string): void {
 function failTemp(tempId: string): void {
   sessions.delete(tempId);
   localStorage.removeItem(`anvil.convo.${tempId}`);
-  outbox = outbox.filter((i) => i.cmd.sessionId !== tempId && i.tempId !== tempId);
-  saveOutbox();
+  outboxQueue.removeWhere((i) => i.cmd.sessionId === tempId || i.tempId === tempId);
   persistSessions();
   if (activeId === tempId) deselectSession();
   else renderSessions();
@@ -600,7 +579,7 @@ function failTemp(tempId: string): void {
 function updateOutboxBadge(): void {
   const el = document.getElementById("offline-banner");
   if (!el) return;
-  const queued = outbox.length;
+  const queued = outboxQueue.size;
   const online = anyOpen();
   el.hidden = online && queued === 0;
   el.innerHTML = online
