@@ -47,13 +47,15 @@
           </span>
           <span id="header-actions">
             <button class="hbtn" id="btn-new-topic" title="New topic — start a fresh context, keep the history" hidden><span class="msym">restart_alt</span></button>
-            <button class="hbtn htxt" id="btn-files" title="Files">Files</button>
             <button class="hbtn" id="btn-git" title="Git"><span class="msym">account_tree</span></button>
             <button class="hbtn" id="btn-terminal" title="Terminal"><span class="msym">terminal</span></button>
-            <button class="hbtn htxt" id="btn-links" title="Links">Links</button>
             <button class="hbtn" id="btn-prompts" title="Prompts" hidden><span class="msym">bookmark</span></button>
-            <button class="hbtn htxt-more" id="btn-more" title="More"><span class="msym">more_vert</span></button>
             <button class="hbtn" id="btn-notify" title="Notifications" hidden><span class="msym">notifications_off</span></button>
+            <!-- Collapsible items last, so Git/Terminal/Prompts keep fixed positions across widths.
+                 On phone the text buttons hide and the ⋮ More menu takes this same end slot. -->
+            <button class="hbtn htxt" id="btn-files" title="Files">Files</button>
+            <button class="hbtn htxt" id="btn-links" title="Links">Links</button>
+            <button class="hbtn htxt-more" id="btn-more" title="More"><span class="msym">more_vert</span></button>
           </span>
         </header>
         <div id="offline-banner" class="offline-banner" role="status" aria-live="polite" hidden></div>
