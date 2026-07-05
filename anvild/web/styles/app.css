@@ -118,16 +118,6 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .sidebar-foot:hover { border-color: var(--accent); }
 .sidebar-foot .msym { font-size: 19px; }
 
-/* Sidebar prompt library — one button per saved prompt (icon + short title), fired into the composer. */
-#prompt-section { flex-shrink: 0; display: flex; flex-direction: column; }
-#prompt-section[hidden] { display: none; }
-#prompt-head { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--border); flex-shrink: 0; }
-#prompt-head .msym { font-size: 14px; }
-#prompt-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 2px 6px; max-height: 152px; overflow-y: auto; }
-.prompt-btn { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
-.prompt-btn:hover { border-color: var(--accent); color: var(--accent); }
-.prompt-btn .msym { font-size: 16px; flex-shrink: 0; }
-.prompt-btn-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Settings & servers — first-class management view */
 .settings-view { position: fixed; inset: 0; z-index: 50; background: var(--panel); display: flex; flex-direction: column; }
@@ -234,8 +224,23 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .header-branch .hb-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 @media (max-width: 700px) { .header-branch { max-width: 16ch; } }
 #header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+.hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; color: var(--text); font: inherit; }
 .hbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* Text-label header actions (Files/Links): inline on desktop, folded into the ⋮ More menu on phone. */
+.hbtn.htxt { font-size: 13px; padding: 4px 10px; }
+.hbtn.htxt-more { display: none; } /* the ⋮ overflow button only appears on narrow widths */
+@media (max-width: 700px) {
+  .hbtn.htxt { display: none; }
+  .hbtn.htxt-more { display: inline-flex; align-items: center; }
+}
+
+/* Anchored dropdown under a header button (Prompts list, phone ⋮ More menu). Positioned by JS. */
+#menu-root:empty { display: none; }
+.header-menu { position: fixed; z-index: 60; min-width: 176px; max-width: min(320px, 92vw); max-height: 60vh; overflow-y: auto; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24); display: flex; flex-direction: column; gap: 2px; }
+.header-menu-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 10px; border: none; border-radius: 7px; background: none; color: var(--text); cursor: pointer; font: inherit; font-size: 13px; }
+.header-menu-item:hover { background: var(--panel); }
+.header-menu-item .msym { font-size: 18px; color: var(--muted); flex-shrink: 0; }
+.header-menu-item .hm-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 #main-body { flex: 1; display: flex; min-height: 0; overflow: hidden; position: relative; }
 /* Active session's derived tint (set on #main by JS); falls back to the theme bg. */

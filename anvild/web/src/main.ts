@@ -87,8 +87,8 @@ conversation.addEventListener("scroll", () => {
 export const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
 // The user's saved prompt library (hub-authoritative; see the Prompt library section below). Seeded
-// from a localStorage cache so the sidebar paints instantly on load, then overwritten by the hub's
-// `prompts` broadcast. Declared HERE — before the instant-restore renderPromptBar() call — so it's
+// from a localStorage cache so the header paints instantly on load, then overwritten by the hub's
+// `prompts` broadcast. Declared HERE — before the instant-restore refreshPromptsButton() call — so it's
 // out of the temporal dead zone by then (web-early-init-decl-order-crash).
 const PROMPTS_CACHE_KEY = "anvil.prompts.cache";
 let prompts: Prompt[] = (() => {
@@ -436,7 +436,7 @@ document.documentElement.dataset.theme = resolveTheme(themePref());
 // instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
 // fully offline; the daemon refreshes everything once the WS connects).
 renderSessions();
-renderPromptBar();
+refreshPromptsButton();
 applyActiveTint();
 if (activeId) {
   if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
@@ -1850,14 +1850,14 @@ function onEnvironments(url: string, list: Environment[]): void {
 
 // ── Prompt library ────────────────────────────────────────────────────────────
 // Reusable prompt snippets the user authors in Settings → Prompts and fires into the composer with
-// one click from the sidebar. Stored on the daemon and broadcast to every connected client so the
-// library syncs across all of a user's devices. Hub-authoritative (like the Todoist link / model
-// auth): the store lives on the hub daemon and every prompt.* command routes there — a fleet
-// member's own prompts event is ignored so it can't clobber the hub's.
+// one click from the header's Prompts dropdown. Stored on the daemon and broadcast to every connected
+// client so the library syncs across all of a user's devices. Hub-authoritative (like the Todoist
+// link / model auth): the store lives on the hub daemon and every prompt.* command routes there — a
+// fleet member's own prompts event is ignored so it can't clobber the hub's.
 //
-// The list + its localStorage cache (so the sidebar paints instantly on load / offline) are declared
-// up in the State section — before the instant-restore render — to stay out of the TDZ. The hub's
-// `prompts` event is the source of truth and overwrites the cache on connect.
+// The list + its localStorage cache (so the header button paints instantly on load / offline) are
+// declared up in the State section — before the instant-restore render — to stay out of the TDZ. The
+// hub's `prompts` event is the source of truth and overwrites the cache on connect.
 
 /** Prompts sorted by short title (the button label), case-insensitive — the display + sidebar order. */
 function sortedPrompts(): Prompt[] {
@@ -1871,7 +1871,7 @@ function onPrompts(list: Prompt[]): void {
   } catch {
     /* quota — the daemon is still the source of truth */
   }
-  renderPromptBar();
+  refreshPromptsButton();
   if (document.getElementById("prompt-cards")) renderPromptsPanel();
 }
 /** True once the hub is connected AND new enough to hold the prompt store. */
@@ -1891,23 +1891,11 @@ function insertPrompt(body: string): void {
   input.scrollTop = input.scrollHeight;
 }
 
-/** Paint the sidebar's Prompts area — one button per prompt (icon + short title), alphabetical. */
-function renderPromptBar(): void {
-  const section = document.getElementById("prompt-section");
-  const host = document.getElementById("prompt-list");
-  if (!section || !host) return;
-  const prompts = sortedPrompts();
-  section.hidden = prompts.length === 0;
-  host.innerHTML = "";
-  for (const p of prompts) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "prompt-btn";
-    btn.title = p.title || p.shortTitle;
-    btn.innerHTML = `${icon(p.icon || "bookmark")}<span class="prompt-btn-lbl">${esc(p.shortTitle || p.title)}</span>`;
-    btn.addEventListener("click", () => insertPrompt(p.body));
-    host.appendChild(btn);
-  }
+/** Show/hide the header's Prompts button by whether the library holds any prompts. The dropdown of
+ *  prompts is built on demand when the button is clicked (see the #btn-prompts handler). */
+function refreshPromptsButton(): void {
+  const btn = document.getElementById("btn-prompts");
+  if (btn) btn.hidden = sortedPrompts().length === 0;
 }
 
 /** Settings → Prompts: the editable list of saved prompts. */
@@ -1916,7 +1904,7 @@ function renderPromptsPanel(): void {
   if (!host) return;
   const prompts = sortedPrompts();
   if (!prompts.length) {
-    host.innerHTML = `<p class="small muted">No prompts yet. Add one and it appears as a button in the sidebar.</p>`;
+    host.innerHTML = `<p class="small muted">No prompts yet. Add one and it appears in the Prompts menu in the header.</p>`;
     return;
   }
   host.innerHTML = prompts
@@ -4130,6 +4118,8 @@ function setPanelTabs(): void {
   $("#btn-git").classList.toggle("active", panelView === "git");
   $("#btn-terminal").classList.toggle("active", panelView === "terminal");
   $("#btn-links").classList.toggle("active", panelView === "links");
+  // On phone the Files/Links buttons collapse into ⋮ More — light it up when either owns the panel.
+  $("#btn-more").classList.toggle("active", panelView === "files" || panelView === "reader" || panelView === "links");
 }
 function openPanel(view: "files" | "reader" | "git" | "terminal" | "links"): void {
   if (!activeId) {
@@ -4603,6 +4593,73 @@ $("#btn-links").addEventListener("click", () => (panelView === "links" ? closePa
 $("#panel-close").addEventListener("click", closePanel);
 document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.addEventListener("click", () => openPanel(t.dataset.view as "files" | "reader" | "git" | "terminal" | "links")));
 
+// ── Header dropdown menus ─────────────────────────────────────────────────────
+// Anchored dropdowns for header actions: the Prompts list, and (on phone) the ⋮ "More" overflow
+// holding the Files/Links actions that are inline text buttons on wider screens. Each registers as a
+// "menu" overlay so Back/Escape dismiss it like every other soft layer; only one is open at a time.
+interface HeaderMenuItem {
+  icon?: string;
+  label: string;
+  title?: string;
+  run: () => void;
+}
+let menuAnchor: HTMLElement | null = null;
+/** Tear down the open menu (DOM only). Reached via Back (popstate), Escape, or closeHeaderMenu(). */
+function closeHeaderMenuDom(): void {
+  $("#menu-root").innerHTML = "";
+  menuAnchor?.classList.remove("active");
+  menuAnchor = null;
+}
+const closeHeaderMenu = (): void => dismissOverlay("menu"); // programmatic close → unwind the back-stack
+/** Open a dropdown of `items` under `anchor`; a second click on the same button just closes it. */
+function toggleHeaderMenu(anchor: HTMLElement, items: HeaderMenuItem[]): void {
+  const wasThis = menuAnchor === anchor;
+  if (overlayOpen("menu")) closeHeaderMenu(); // fold away any open menu first (also clears menuAnchor)
+  if (wasThis || !items.length) return; // re-click closes; nothing to show → stay closed
+  const menu = document.createElement("div");
+  menu.className = "header-menu";
+  for (const it of items) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "header-menu-item";
+    if (it.title) row.title = it.title;
+    row.innerHTML = `${icon(it.icon || "bookmark")}<span class="hm-lbl">${esc(it.label)}</span>`;
+    row.addEventListener("click", () => {
+      closeHeaderMenu();
+      it.run();
+    });
+    menu.appendChild(row);
+  }
+  $("#menu-root").appendChild(menu);
+  // Anchor under the button with right edges aligned; clamp the right offset into the viewport.
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${Math.round(r.bottom + 6)}px`;
+  menu.style.right = `${Math.round(Math.max(8, window.innerWidth - r.right))}px`;
+  anchor.classList.add("active");
+  menuAnchor = anchor;
+  openOverlay("menu", closeHeaderMenuDom); // Back/Escape close it
+}
+$("#btn-prompts").addEventListener("click", () =>
+  toggleHeaderMenu(
+    $("#btn-prompts"),
+    sortedPrompts().map((p) => ({ icon: p.icon || "bookmark", label: p.shortTitle || p.title, title: p.title || p.shortTitle, run: () => insertPrompt(p.body) })),
+  ),
+);
+// Phone-only ⋮ overflow: the Files/Links actions that render as inline text buttons on wider screens.
+$("#btn-more").addEventListener("click", () =>
+  toggleHeaderMenu($("#btn-more"), [
+    { icon: "folder", label: "Files", run: () => openPanel("files") },
+    { icon: "link", label: "Links", run: () => openPanel("links") },
+  ]),
+);
+// Click outside an open menu closes it. The anchor buttons toggle themselves, so they're excluded.
+document.addEventListener("pointerdown", (e) => {
+  if (!overlayOpen("menu")) return;
+  const t = e.target as HTMLElement;
+  if (t.closest(".header-menu") || t.closest("#btn-prompts") || t.closest("#btn-more")) return;
+  closeHeaderMenu();
+});
+
 // Click anywhere off the open side panel to dismiss it. The header toggles, in-conversation
 // file links, and the floating quote button legitimately drive/feed the panel, so they're
 // excluded (they manage their own open/close). Modals/dialogs and the settings view are layers
@@ -4613,9 +4670,9 @@ document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.addEventListene
 // handlers' click.
 document.addEventListener("pointerdown", (e) => {
   if (!panelView) return; // panel already closed
-  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader")) return; // a dialog/settings/autopilot/full-screen reader is on top — leave the panel be
+  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader") || overlayOpen("menu")) return; // a dialog/settings/autopilot/reader/header-menu is on top — leave the panel be
   const t = e.target as HTMLElement;
-  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#settings-root") || t.closest("#autopilot-root") || t.closest(".resizer")) return;
+  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#menu-root") || t.closest("#settings-root") || t.closest("#autopilot-root") || t.closest(".resizer")) return;
   closePanel();
 });
 

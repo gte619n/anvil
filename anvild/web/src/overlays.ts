@@ -23,7 +23,7 @@ export const planFromHash = (): string | null => {
   return m ? decodeURIComponent(m[1]!) : null;
 };
 
-type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader";
+type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader" | "menu";
 interface Overlay {
   name: OverlayName;
   close: () => void; // pure DOM/state teardown — must NOT touch history itself

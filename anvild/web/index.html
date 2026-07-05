@@ -33,10 +33,6 @@
           <div id="finished-head"><span class="msym">check_circle</span> Finished</div>
           <ul id="finished-list"></ul>
         </div>
-        <div id="prompt-section" hidden>
-          <div id="prompt-head"><span class="msym">bookmark</span> Prompts</div>
-          <div id="prompt-list"></div>
-        </div>
         <button id="open-autopilot" class="sidebar-foot"><span class="msym">bolt</span> Autopilot<span id="autopilot-running" class="msym spin foot-spin" title="Autopilot is running" hidden>progress_activity</span><span id="autopilot-badge" class="foot-badge" hidden></span></button>
         <button id="open-settings" class="sidebar-foot"><span class="msym">tune</span> Settings &amp; Servers</button>
         <div id="sidebar-resizer" class="resizer" title="Drag to resize"></div>
@@ -51,10 +47,12 @@
           </span>
           <span id="header-actions">
             <button class="hbtn" id="btn-new-topic" title="New topic — start a fresh context, keep the history" hidden><span class="msym">restart_alt</span></button>
-            <button class="hbtn" id="btn-files" title="Files"><span class="msym">folder</span></button>
+            <button class="hbtn htxt" id="btn-files" title="Files">Files</button>
             <button class="hbtn" id="btn-git" title="Git"><span class="msym">account_tree</span></button>
             <button class="hbtn" id="btn-terminal" title="Terminal"><span class="msym">terminal</span></button>
-            <button class="hbtn" id="btn-links" title="Links"><span class="msym">link</span></button>
+            <button class="hbtn htxt" id="btn-links" title="Links">Links</button>
+            <button class="hbtn" id="btn-prompts" title="Prompts" hidden><span class="msym">bookmark</span></button>
+            <button class="hbtn htxt-more" id="btn-more" title="More"><span class="msym">more_vert</span></button>
             <button class="hbtn" id="btn-notify" title="Notifications" hidden><span class="msym">notifications_off</span></button>
           </span>
         </header>
@@ -100,6 +98,7 @@
     <div id="settings-root"></div>
     <div id="autopilot-root"></div>
     <div id="modal-root"></div>
+    <div id="menu-root"></div>
     <div id="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/main.js"></script>
   </body>
