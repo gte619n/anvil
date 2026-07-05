@@ -41,3 +41,17 @@ test("wsUrl upgrades to wss on an https page (mixed-content guard)", () => {
   (globalThis as any).window.ANVIL_DAEMON_URL = "https://mac.ts.net:7701";
   expect(api.wsUrl()).toBe("wss://mac.ts.net:7701/ws");
 });
+
+test("sameServerUrl matches across scheme + trailing-slash drift (zombie-session reconcile)", () => {
+  // The member URL http/https drift: a session cached under the http:// url the server was added
+  // with must still reconcile against the https:// url it reconnects under, or its row zombies.
+  expect(api.sameServerUrl("http://m1.ts.net:2501", "https://m1.ts.net:2501")).toBe(true);
+  expect(api.sameServerUrl("https://m1.ts.net:2501/", "https://m1.ts.net:2501")).toBe(true);
+  expect(api.sameServerUrl("https://M1.TS.NET:2501", "https://m1.ts.net:2501")).toBe(true);
+});
+
+test("sameServerUrl keeps genuinely different daemons apart", () => {
+  expect(api.sameServerUrl("https://m1.ts.net:2501", "https://m2.ts.net:2501")).toBe(false); // different host
+  expect(api.sameServerUrl("https://m1.ts.net:2501", "https://m1.ts.net:2502")).toBe(false); // different port
+  expect(api.sameServerUrl(undefined, "https://m1.ts.net:2501")).toBe(false); // no recorded owner
+});
