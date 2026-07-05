@@ -1,12 +1,28 @@
 # Anvil Improvement Program — Test-First Implementation Plan
 
-**Status:** Proposed (2026-07-04). Branch `refactoring`.
+**Status:** Largely delivered (2026-07-04), merged from branch `refactoring`.
 **Method:** Test-first. Every change lands as *failing test → implementation → green*. No behavior
 change ships without a test that would have caught the regression it prevents.
 
 This plan is derived from a seven-track audit (backend architecture, web frontend, security, test
 coverage, CI/CD, docs/CLAUDE.md, native clients). Findings are cited inline as tags like
 `[SEC-H1]`, `[BE-3]`, `[WEB-2]`, `[CI-G1]`, `[NAT-2]`, `[DOC-1]`.
+
+## Delivered (summary)
+
+Test suite grew **249 → 362** (+113 tests); every commit green on `typecheck` + `typecheck:web` +
+`build:web` + `bun test`. Per-phase status blocks below carry the detail.
+
+| Phase | Outcome |
+|---|---|
+| **0** CI + harness | ✅ **Done** — PR merge gate (the #1 finding), Dependabot, CodeQL, protocol contract test, first frontend test. |
+| **1** Security | ✅ **Done** (scoped to the accepted Tailscale boundary) — pipeline danger-gate, git-clone RCE, WS-origin hijack, attachment traversal, ref injection, push-file perms, rel=noopener, `SECURITY.md`. L4/L5 declined w/ rationale; app-layer auth out of scope per owner. |
+| **2** Backend correctness/perf | ✅ **Done** (9 items) — driver cleanup, atomic writes, debounced persistence, killGroup PID guard, retry/backoff, safe JSON, child reaping, config validation, metrics durability. BE-4 (async git), BE-11 (eventlog index) deferred w/ rationale. |
+| **3** Decomposition | 🟡 **Substantial** — 6 tested extractions (Terminal, FileWatch, autopilot-plans, pr-badge, command-frame, token-store); `supervisor.ts` 2035→1971, `dispatch.ts` 435→408, push −100 lines. `http.ts` route table + more supervisor/autopilot orchestration remain. |
+| **4** Frontend | 🟡 **Foundation + first extractions** — DOM test harness (the unblocker), first frontend tests (overlays/ws/api/outbox/dom/a11y), first `main.ts` extraction (OutboxQueue), L6 + a11y (aria-live/focus-visible/reduced-motion). More `main.ts` seams remain (see "the story" — much is irreducible view-glue). |
+| **5** Native | ⛔ **Blocked in this env** — no Xcode/test framework; needs full Xcode (or swift-testing dep) + a library-target extraction (documented under Phase 5). Source-only NAT items untouched. |
+| **6** CI/CD | 🟡 **Started** — self-update S5 typecheck-before-restart gate (tested). S4 signed-tag verification + signing-action de-dup remain. |
+| **7** Docs | ✅ **Done** — CLAUDE.md expanded, adversarial-pipeline doc written, stale INDEX corrected, this status. |
 
 ---
 

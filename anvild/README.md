@@ -23,9 +23,14 @@ export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"   # one-time
 
 bun run start          # http://localhost:7701   (ws: /ws · health: /api/health)
 bun run dev            # watch mode
-bun test               # unit + integration (no token/network needed — uses a mock)
-bun run typecheck
+bun test               # unit + integration + contract + web (no token/network needed — uses mocks)
+bun run typecheck      # daemon (src/ + test/);  `bun run typecheck:web` covers web/ separately
 ```
+
+> CI (`.github/workflows/ci.yml`) gates every PR on `typecheck` + `typecheck:web` + `build:web` +
+> `bun test`, and the release workflows re-run the same checks before shipping — so a broken build
+> can't merge or ship. Web-client tests live under `test/web/` (jsdom harness); the protocol
+> contract test under `test/contract/` guards daemon↔client drift.
 
 > [!IMPORTANT]
 > **Auth & billing.** The daemon **refuses to start** if `ANTHROPIC_API_KEY` /
