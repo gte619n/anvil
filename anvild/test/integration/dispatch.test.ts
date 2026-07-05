@@ -25,6 +25,7 @@ const CONNECT_FRAMES = new Set([
   "session.list",
   "budget",
   "environments",
+  "prompts",
   "todoist.status",
   "autopilot.schedule",
   "autopilot.run.snapshot",
@@ -106,6 +107,33 @@ test("env.add rejects a nonexistent path", async () => {
   const r = await rpc({ ...base, type: "env.add", cid: "e1", name: "x", repoRoot: "/no/such/dir/anvil-xyz" });
   expect(r.type).toBe("command.error");
   expect(r.message).toContain("no such directory");
+});
+
+test("prompt.save broadcasts a prompts event and acks (cross-device sync)", async () => {
+  // A save must fan out a `prompts` snapshot to every connection (not just an ack to the sender) —
+  // that broadcast is what syncs the library across a user's devices. Collect both frames.
+  const { ack, broadcast } = await new Promise<{ ack: any; broadcast: any }>((resolve, reject) => {
+    const ws = new WebSocket(`ws://localhost:${srv.port}/ws`);
+    let ackFrame: any, promptsFrame: any;
+    const timer = setTimeout(() => reject(new Error("timeout")), 2000);
+    ws.onopen = () => ws.send(JSON.stringify({ ...base, type: "prompt.save", cid: "p1", title: "Review", shortTitle: "Review", icon: "rate_review", body: "Review this diff." }));
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(String(ev.data));
+      // Ignore the initial connect-burst `prompts` snapshot; keep the one that carries our new prompt.
+      if (m.type === "prompts" && m.prompts.some((p: any) => p.shortTitle === "Review")) promptsFrame = m;
+      if (m.type === "ack" && m.cid === "p1") ackFrame = m;
+      if (ackFrame && promptsFrame) {
+        clearTimeout(timer);
+        resolve({ ack: ackFrame, broadcast: promptsFrame });
+        ws.close();
+      }
+    };
+  });
+  expect(ack.cid).toBe("p1");
+  const saved = broadcast.prompts.find((p: any) => p.shortTitle === "Review");
+  expect(saved.id).toMatch(/^prompt_/);
+  expect(saved.body).toBe("Review this diff.");
+  expect(saved.icon).toBe("rate_review");
 });
 
 test("push.register with cid → ack", async () => {

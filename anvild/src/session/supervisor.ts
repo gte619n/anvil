@@ -13,6 +13,7 @@ import {
   type Environment,
   type EnvironmentsEvent,
   type EnvironmentValidation,
+  type PromptsEvent,
   type TodoistStatusEvent,
   type TodoistProjectsResultEvent,
   type TodoistProjectInfo,
@@ -55,6 +56,7 @@ import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
+import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
@@ -154,6 +156,7 @@ export class Supervisor {
   });
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
+  private readonly promptStore: PromptStore;
   private readonly integrations: IntegrationStore;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
@@ -198,6 +201,7 @@ export class Supervisor {
     this.devPipelineMetrics = loadMetrics(cfg.stateDir);
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
+    this.promptStore = new PromptStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
     this.workUnits = new WorkUnitStore(cfg.stateDir);
     this.autopilotSchedule = new AutopilotScheduleStore(cfg.stateDir);
@@ -349,6 +353,23 @@ export class Supervisor {
   ): void {
     this.envStore.update(id, fields);
     this.registry.toAll(this.environmentsEvent());
+  }
+
+  // ── Prompt library (saved composer snippets, synced across a user's devices) ───
+  promptsEvent(): PromptsEvent {
+    return { v: PROTOCOL_VERSION, type: "prompts", ts: now(), prompts: this.promptStore.list() };
+  }
+  savePrompt(fields: { id?: string; title: string; shortTitle: string; icon: string; body: string }): void {
+    try {
+      this.promptStore.save(fields);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    this.registry.toAll(this.promptsEvent());
+  }
+  removePrompt(id: string): void {
+    this.promptStore.remove(id);
+    this.registry.toAll(this.promptsEvent());
   }
 
   // ── Todoist integration (task autopilot) ──────────────────────────────────

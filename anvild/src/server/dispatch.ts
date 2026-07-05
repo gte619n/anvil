@@ -225,6 +225,21 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "prompt.list":
+        send(deps.supervisor.promptsEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "prompt.save":
+        deps.supervisor.savePrompt({ id: cmd.id, title: cmd.title, shortTitle: cmd.shortTitle, icon: cmd.icon, body: cmd.body });
+        if (cid) send(ack(cid));
+        return;
+
+      case "prompt.remove":
+        deps.supervisor.removePrompt(cmd.id);
+        if (cid) send(ack(cid));
+        return;
+
       case "todoist.status":
         send(deps.supervisor.todoistStatusEvent(cid));
         return;

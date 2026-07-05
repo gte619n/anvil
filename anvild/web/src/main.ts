@@ -53,6 +53,7 @@ import type {
   GitResultEvent,
   GitStatus,
   PermissionSuggestion,
+  Prompt,
   Question,
   QuestionAnswer,
   ServerEvent,
@@ -85,6 +86,19 @@ conversation.addEventListener("scroll", () => {
 // ── State ────────────────────────────────────────────────────────────────────
 export const sessions = new Map<string, Session>();
 const environments = new Map<string, Environment>();
+// The user's saved prompt library (hub-authoritative; see the Prompt library section below). Seeded
+// from a localStorage cache so the sidebar paints instantly on load, then overwritten by the hub's
+// `prompts` broadcast. Declared HERE — before the instant-restore renderPromptBar() call — so it's
+// out of the temporal dead zone by then (web-early-init-decl-order-crash).
+const PROMPTS_CACHE_KEY = "anvil.prompts.cache";
+let prompts: Prompt[] = (() => {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PROMPTS_CACHE_KEY) ?? "[]") as Prompt[];
+    return Array.isArray(raw) ? raw.filter((p) => p && typeof p.id === "string") : [];
+  } catch {
+    return [];
+  }
+})();
 // Sessions being cleaned up: shown disabled in the sidebar until the daemon confirms deletion
 // (session.deleted). Transient — not persisted. (UI refinement §8)
 const removingSessions = new Set<string>();
@@ -422,6 +436,7 @@ document.documentElement.dataset.theme = resolveTheme(themePref());
 // instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
 // fully offline; the daemon refreshes everything once the WS connects).
 renderSessions();
+renderPromptBar();
 applyActiveTint();
 if (activeId) {
   if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
@@ -784,6 +799,11 @@ function onEvent(url: string, e: ServerEvent): void {
     }
     case "environments":
       onEnvironments(url, e.environments);
+      return;
+    case "prompts":
+      // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
+      // own prompts event so it can't clobber the hub's synced library.
+      if (url === HUB_URL) onPrompts(e.prompts);
       return;
     case "todoist.status":
       // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
@@ -1836,8 +1856,160 @@ function onEnvironments(url: string, list: Environment[]): void {
   if (document.getElementById("env-cards")) renderEnvCards(); // refresh an open settings view
 }
 
+// ── Prompt library ────────────────────────────────────────────────────────────
+// Reusable prompt snippets the user authors in Settings → Prompts and fires into the composer with
+// one click from the sidebar. Stored on the daemon and broadcast to every connected client so the
+// library syncs across all of a user's devices. Hub-authoritative (like the Todoist link / model
+// auth): the store lives on the hub daemon and every prompt.* command routes there — a fleet
+// member's own prompts event is ignored so it can't clobber the hub's.
+//
+// The list + its localStorage cache (so the sidebar paints instantly on load / offline) are declared
+// up in the State section — before the instant-restore render — to stay out of the TDZ. The hub's
+// `prompts` event is the source of truth and overwrites the cache on connect.
+
+/** Prompts sorted by short title (the button label), case-insensitive — the display + sidebar order. */
+function sortedPrompts(): Prompt[] {
+  return [...prompts].sort((a, b) => (a.shortTitle || a.title).localeCompare(b.shortTitle || b.title, undefined, { sensitivity: "base" }));
+}
+/** Apply a `prompts` broadcast from the hub: replace the list, cache it, repaint. */
+function onPrompts(list: Prompt[]): void {
+  prompts = list;
+  try {
+    localStorage.setItem(PROMPTS_CACHE_KEY, JSON.stringify(list));
+  } catch {
+    /* quota — the daemon is still the source of truth */
+  }
+  renderPromptBar();
+  if (document.getElementById("prompt-cards")) renderPromptsPanel();
+}
+/** True once the hub is connected AND new enough to hold the prompt store. */
+function promptsSupported(): boolean {
+  return hub().sock.isOpen() && serverSupports(hub(), "prompts");
+}
+
+/** Append a prompt body to the composer; if there's already text, drop it onto a new line. */
+function insertPrompt(body: string): void {
+  const cur = input.value;
+  input.value = cur ? `${cur}\n${body}` : body;
+  saveDraft(activeId, input.value);
+  autoGrow();
+  updateSendState();
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  input.scrollTop = input.scrollHeight;
+}
+
+/** Paint the sidebar's Prompts area — one button per prompt (icon + short title), alphabetical. */
+function renderPromptBar(): void {
+  const section = document.getElementById("prompt-section");
+  const host = document.getElementById("prompt-list");
+  if (!section || !host) return;
+  const prompts = sortedPrompts();
+  section.hidden = prompts.length === 0;
+  host.innerHTML = "";
+  for (const p of prompts) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "prompt-btn";
+    btn.title = p.title || p.shortTitle;
+    btn.innerHTML = `${icon(p.icon || "bookmark")}<span class="prompt-btn-lbl">${esc(p.shortTitle || p.title)}</span>`;
+    btn.addEventListener("click", () => insertPrompt(p.body));
+    host.appendChild(btn);
+  }
+}
+
+/** Settings → Prompts: the editable list of saved prompts. */
+function renderPromptsPanel(): void {
+  const host = document.getElementById("prompt-cards");
+  if (!host) return;
+  const prompts = sortedPrompts();
+  if (!prompts.length) {
+    host.innerHTML = `<p class="small muted">No prompts yet. Add one and it appears as a button in the sidebar.</p>`;
+    return;
+  }
+  host.innerHTML = prompts
+    .map(
+      (p) => `<div class="card prompt-card" data-id="${esc(p.id)}">
+        <div class="prompt-card-main">
+          <span class="env-glyph msym">${esc(p.icon || "bookmark")}</span>
+          <div class="prompt-card-meta">
+            <b>${esc(p.title || p.shortTitle)}</b>
+            <div class="small muted">Button: ${icon(p.icon || "bookmark")} ${esc(p.shortTitle || p.title)}</div>
+          </div>
+          <div class="prompt-card-actions">
+            <button class="mini prompt-edit" data-id="${esc(p.id)}">${icon("edit")} Edit</button>
+            <button class="mini prompt-del" data-id="${esc(p.id)}">${icon("delete")} Delete</button>
+          </div>
+        </div>
+      </div>`,
+    )
+    .join("");
+  host.querySelectorAll<HTMLElement>(".prompt-edit").forEach((b) => b.addEventListener("click", () => showEditPrompt(b.dataset.id)));
+  host.querySelectorAll<HTMLElement>(".prompt-del").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const p = prompts.find((x) => x.id === b.dataset.id);
+      if (!p) return;
+      const ok = await confirmDialog({ title: "Delete prompt?", body: `"${p.title || p.shortTitle}" will be removed from every device.`, confirmLabel: "Delete", danger: true, icon: "delete" });
+      if (ok) hub().sock.send({ type: "prompt.remove", id: p.id, cid: newCid() });
+    }),
+  );
+}
+
+/** Add (no id) or edit an existing prompt in a modal: title, short title, icon, and markdown body. */
+function showEditPrompt(id?: string): void {
+  if (!promptsSupported()) {
+    toast(hub().sock.isOpen() ? "This server is too old for synced prompts — update it." : "Connect to your server to edit prompts.");
+    return;
+  }
+  const existing = id ? prompts.find((p) => p.id === id) : undefined;
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${existing ? "Edit prompt" : "New prompt"}</h3>
+    <label>Title<input id="pe-title" placeholder="e.g. Write unit tests" value="${esc(existing?.title ?? "")}" /></label>
+    <label>Short title (button label)<input id="pe-short" placeholder="e.g. Tests" value="${esc(existing?.shortTitle ?? "")}" /></label>
+    ${iconPickerMarkup(existing?.icon)}
+    <label>Prompt (markdown)<textarea id="pe-body" class="prompt-body-input" rows="8" placeholder="The text inserted into the chat box…">${esc(existing?.body ?? "")}</textarea></label>
+    <div class="prompt-preview-head small muted">Preview</div>
+    <div id="pe-preview" class="md prompt-preview"></div>
+    <div class="btns"><button type="button" id="pe-cancel">Cancel</button><button type="button" id="pe-save" class="primary">${existing ? "Save" : "Add"}</button></div></div>`;
+  showModal(m);
+  wireIconPicker();
+  const bodyEl = $<HTMLTextAreaElement>("#pe-body");
+  const preview = $("#pe-preview");
+  const renderPreview = (): void => {
+    preview.innerHTML = bodyEl.value.trim() ? streamMd.render(bodyEl.value) : `<p class="small muted">Nothing to preview yet.</p>`;
+  };
+  bodyEl.addEventListener("input", renderPreview);
+  renderPreview();
+  $<HTMLButtonElement>("#pe-cancel").onclick = closeModal;
+  $<HTMLButtonElement>("#pe-save").onclick = () => {
+    const title = $<HTMLInputElement>("#pe-title").value.trim();
+    const shortTitle = $<HTMLInputElement>("#pe-short").value.trim();
+    const body = bodyEl.value.trim();
+    if (!body) {
+      toast("Add some prompt text first.");
+      return;
+    }
+    if (!title && !shortTitle) {
+      toast("Give the prompt a title.");
+      return;
+    }
+    hub().sock.send({
+      type: "prompt.save",
+      ...(existing ? { id: existing.id } : {}),
+      title: title || shortTitle,
+      shortTitle: shortTitle || title,
+      icon: selectedIcon() || "bookmark",
+      body,
+      cid: newCid(),
+    });
+    // The hub's `prompts` broadcast re-renders the list + sidebar; close optimistically.
+    closeModal();
+  };
+}
+
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "todoist" | "models" | "appearance";
+type SettingsTab = "servers" | "environments" | "todoist" | "models" | "appearance" | "prompts";
 let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
@@ -1851,6 +2023,7 @@ function openSettings(): void {
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
       <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
+      <button class="stab" data-tab="prompts">${icon("bookmark")} Prompts</button>
       <button class="stab" data-tab="appearance">${icon("palette")} Appearance</button>
     </div>
     <div class="settings-body">
@@ -1872,6 +2045,11 @@ function openSettings(): void {
         <p class="small muted">The model providers Anvil drives. Set or reset the Claude subscription token and OpenRouter key here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
       </section>
+      <section class="settings-panel" data-tab="prompts">
+        <div class="section-head"><h3>Prompts</h3><button id="set-add-prompt" class="primary">${icon("add")} Add prompt</button></div>
+        <p class="small muted">Reusable prompt snippets. Each shows up as a button in the sidebar — click it to drop the prompt into the chat box.</p>
+        <div id="prompt-cards"></div>
+      </section>
       <section class="settings-panel" data-tab="appearance">
         <div class="section-head"><h3>Appearance</h3></div>
         <p class="small muted">Choose how Anvil looks. <b>System</b> follows your device's light or dark setting.</p>
@@ -1885,6 +2063,7 @@ function openSettings(): void {
   </div>`;
   $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
+  $("#set-add-prompt").addEventListener("click", () => showEditPrompt());
   $("#todoist-refresh").addEventListener("click", () => loadTodoistProjects(true));
   root.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) =>
     b.addEventListener("click", () => setThemePref(b.dataset.themePref as ThemePref)),
@@ -1906,6 +2085,7 @@ function selectSettingsTab(tab: SettingsTab): void {
     renderTodoistPanel();
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
   }
+  if (tab === "prompts") renderPromptsPanel();
   if (tab === "models") {
     renderModelsPanel();
     if (serverSupports(hub(), "auth")) {
