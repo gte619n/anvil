@@ -57,8 +57,9 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  *  - "autopilot-maintenance": reset anvil:* tags / clear the pipeline (autopilot.tags.reset,
  *    autopilot.clear) — the Todoist-settings maintenance buttons.
  *  - "auth": model-provider token management (auth.status/set/clear) — the Settings → Models card.
+ *  - "prompts": the saved-prompt library (prompt.list/save/remove) — Settings → Prompts + sidebar.
  */
-export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth"];
+export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts"];
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
 export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {

@@ -2,6 +2,9 @@
  * Anvil wire protocol — shared contract between `anvild` (daemon) and all clients.
  *
  * Status: 0.7-draft (2026-06-23). Companion to `anvil-native-architecture.md` (§6, §8).
+ *   0.8: prompt library — Prompt + prompts event + prompt.list/save/remove. Saved composer
+ *        snippets synced across a user's devices (hub-authoritative). Additive; PROTOCOL_VERSION
+ *        unchanged. Gated by the "prompts" server capability.
  *   0.7: fleet identity (anvil-multi-server.md §3/§6) — server.hello event (first frame on
  *        every WS connection) + HealthResponse.serverId. A stable serverId lets one client
  *        federate many servers and namespace sessions/environments by (serverId, …).
@@ -336,6 +339,24 @@ export interface BudgetEvent extends Envelope {
 export interface EnvironmentsEvent extends Envelope {
   type: "environments";
   environments: Environment[];
+}
+/**
+ * A saved prompt snippet the user fires into the composer with one click (a sidebar button). Stored
+ * on the daemon and broadcast to every connected client so a user's prompt library syncs across all
+ * their devices. Hub-authoritative on the client (like the Todoist link / model auth) — the prompt
+ * store lives on the hub daemon and the UI routes prompt.* commands there.
+ */
+export interface Prompt {
+  id: string;
+  title: string; // full title (the editor heading)
+  shortTitle: string; // the sidebar button label
+  icon: string; // Material Symbols name
+  body: string; // markdown text appended to the composer
+  updatedAt: number; // epoch ms of the last edit (sort/merge aid)
+}
+export interface PromptsEvent extends Envelope {
+  type: "prompts";
+  prompts: Prompt[];
 }
 /**
  * First frame the server sends on every WS connection (before session.list/budget/
@@ -713,6 +734,7 @@ export type ServerEvent =
   | SessionDeletedEvent
   | BudgetEvent
   | EnvironmentsEvent
+  | PromptsEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
   | AuthStatusEvent
@@ -924,6 +946,23 @@ export interface EnvRemoveCmd extends Envelope, Correlated {
   id: string;
 }
 
+// Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
+export interface PromptListCmd extends Envelope, Correlated {
+  type: "prompt.list"; // request the current prompts (also sent on connect)
+}
+export interface PromptSaveCmd extends Envelope, Correlated {
+  type: "prompt.save"; // create (no id) or update (existing id) a prompt
+  id?: string; // omit to create; the daemon mints one
+  title: string;
+  shortTitle: string;
+  icon: string; // Material Symbols name
+  body: string;
+}
+export interface PromptRemoveCmd extends Envelope, Correlated {
+  type: "prompt.remove";
+  id: string;
+}
+
 // Todoist integration (task autopilot). The token can be set in-app (todoist.connect) or
 // out-of-band (scripts/todoist.ts); these commands drive the link UI and the planner.
 export interface TodoistStatusCmd extends Envelope, Correlated {
@@ -1105,6 +1144,9 @@ export type ClientCommand =
   | EnvCloneCmd
   | EnvUpdateCmd
   | EnvRemoveCmd
+  | PromptListCmd
+  | PromptSaveCmd
+  | PromptRemoveCmd
   | TodoistStatusCmd
   | TodoistConnectCmd
   | TodoistDisconnectCmd

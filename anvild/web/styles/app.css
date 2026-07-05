@@ -118,6 +118,17 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .sidebar-foot:hover { border-color: var(--accent); }
 .sidebar-foot .msym { font-size: 19px; }
 
+/* Sidebar prompt library — one button per saved prompt (icon + short title), fired into the composer. */
+#prompt-section { flex-shrink: 0; display: flex; flex-direction: column; }
+#prompt-section[hidden] { display: none; }
+#prompt-head { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--border); flex-shrink: 0; }
+#prompt-head .msym { font-size: 14px; }
+#prompt-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 2px 6px; max-height: 152px; overflow-y: auto; }
+.prompt-btn { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
+.prompt-btn:hover { border-color: var(--accent); color: var(--accent); }
+.prompt-btn .msym { font-size: 16px; flex-shrink: 0; }
+.prompt-btn-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* Settings & servers — first-class management view */
 .settings-view { position: fixed; inset: 0; z-index: 50; background: var(--panel); display: flex; flex-direction: column; }
 .settings-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--bg); }
@@ -626,6 +637,18 @@ input:focus, select:focus, textarea:not(#input):focus {
 .iconpick.selected { border-color: var(--accent); color: var(--accent); }
 .iconpick-auto { color: var(--muted); }
 .env-glyph { font-size: 18px; margin-right: 7px; vertical-align: -3px; }
+
+/* Settings → Prompts: saved-prompt cards + the editor's markdown body/preview. */
+.prompt-card-main { display: flex; align-items: center; gap: 10px; }
+.prompt-card-meta { flex: 1; min-width: 0; }
+.prompt-card-meta b { display: block; }
+.prompt-card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.prompt-card .env-glyph { font-size: 22px; margin: 0; }
+.modal-box textarea.prompt-body-input { width: 100%; padding: 8px; margin-top: 4px; border: 1px solid var(--border); border-radius: 8px; font: inherit; resize: vertical; min-height: 120px; }
+.prompt-preview-head { margin: 6px 0 4px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 700; }
+.prompt-preview { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; max-height: 200px; overflow-y: auto; background: var(--panel); }
+.prompt-preview > :first-child { margin-top: 0; }
+.prompt-preview > :last-child { margin-bottom: 0; }
 
 #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1c2024; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 1100; }
 #toast.show { opacity: 1; }

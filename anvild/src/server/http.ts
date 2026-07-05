@@ -231,6 +231,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.sessionListEvent()));
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
+      ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state
       ws.send(JSON.stringify(sched));
