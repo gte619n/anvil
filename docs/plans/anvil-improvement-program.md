@@ -203,11 +203,14 @@ extraction *creates* the coverage (these clusters were untestable in place).
 - ✅ **parseCommandFrame** (`server/command-frame.ts`) — the WS router's envelope-validation gate
   (JSON/version/type), now pure + unit-tested; dropped the dead `PENDING` set. 6 tests. dispatch.ts
   435 → 408.
-- `supervisor.ts`: 2035 → 1971 lines; **30 new tests** across 5 cohesive modules.
+- ✅ **BE-8 push consolidation** (`push/token-store.ts` `TokenStore<T>` + `fanOut`) — collapses the
+  byte-identical registries + fan-out skeleton across apns/fcm/webpush. 7 tests (the push stack had
+  none); providers shrank apns 159→128, fcm 133→103, webpush 107→84.
+- `supervisor.ts`: 2035 → 1971 lines; **37 new tests** across 6 cohesive modules.
 - ⏳ **Remaining**: the autopilot *orchestration* (needs the session-creation machinery mapped),
-  `http.ts` route table, `dispatch.ts` per-command handler table (lower value — cases are trivial
-  glue), push `TokenStore` consolidation (BE-8), and `web/src/main.ts` (gated on the Phase 4 DOM
-  harness).
+  `http.ts` route table (538-line if-ladder — mechanical, higher churn), `dispatch.ts` per-command
+  handler table (lower value — cases are trivial glue), and `web/src/main.ts` (gated on the Phase 4
+  DOM harness).
 
 ---
 
