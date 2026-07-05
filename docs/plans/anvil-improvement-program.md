@@ -233,6 +233,20 @@ extraction *creates* the coverage (these clusters were untestable in place).
   real tabs pattern or drop the role.
   - UI tests assert: toast has `role=status`; permission dialog traps focus and is announced.
 
+### Phase 4 status (as implemented)
+
+- ✅ **DOM test harness** (`test/web/dom-env.ts`) — jsdom-based `installDom`/`uninstallDom` (no new
+  dep); isolated so backend tests never see a `window`. The unblocker for testing + decomposing
+  `main.ts`.
+- ✅ **First frontend tests** (were zero): `overlays.ts` back-stack (6), `ws.ts` reconnection/backoff
+  (6, with a FakeWS + captured timer), `api.ts` endpoint resolution + wss guard (4).
+- ✅ **First `main.ts` decomposition**: `OutboxQueue` + `newCid` → `web/src/outbox.ts` (8 tests vs a
+  fake Storage); flush/reconcile orchestration stays in `main.ts`. 5170 → 5149.
+- ⏳ **Remaining**: more `main.ts` seams (fleet/routing layer, conversation cache, settings/autopilot
+  views); sidebar diffing/rAF; SW content-hash; accessibility pass (aria-live, dialog focus-trap,
+  focus-visible, reduced-motion); deferred **L5/L6** XSS hardening (client sanitize + rel=noopener),
+  now writable test-first; automated headless UI smoke.
+
 ---
 
 ## Phase 5 — Native clients  *(with tests; ~1 week)*
