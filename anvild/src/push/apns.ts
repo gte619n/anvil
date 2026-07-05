@@ -1,7 +1,8 @@
 import { createSign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PushPayload } from "./webpush";
+import { TokenStore, fanOut } from "./token-store";
 
 interface ApnsKey {
   /** APNs auth key id (the "Key ID" of the .p8). */
@@ -34,15 +35,11 @@ interface ApnsKey {
 export class Apns {
   private readonly cfg?: ApnsKey;
   private readonly host: string;
-  private readonly tokensFile: string;
-  private tokens: string[] = [];
+  private readonly store: TokenStore<string>;
   private jwt?: { token: string; iat: number };
 
   constructor(stateDir: string) {
-    const dir = join(stateDir, "push");
-    mkdirSync(dir, { recursive: true });
-    this.tokensFile = join(dir, "apns-tokens.json");
-    this.tokens = this.loadTokens();
+    this.store = new TokenStore(join(stateDir, "push", "apns-tokens.json"), (t) => t);
     const path = process.env.ANVIL_APNS_KEY || join(process.env.HOME ?? "", ".config/anvil/apns-key.json");
     let cfg: ApnsKey | undefined;
     if (existsSync(path)) {
@@ -62,27 +59,10 @@ export class Apns {
   }
 
   register(token: string): void {
-    if (token && !this.tokens.includes(token)) {
-      this.tokens.push(token);
-      this.save();
-    }
+    if (token) this.store.add(token);
   }
   unregister(token: string): void {
-    const before = this.tokens.length;
-    this.tokens = this.tokens.filter((t) => t !== token);
-    if (this.tokens.length !== before) this.save();
-  }
-
-  private loadTokens(): string[] {
-    if (!existsSync(this.tokensFile)) return [];
-    try {
-      return JSON.parse(readFileSync(this.tokensFile, "utf8")) as string[];
-    } catch {
-      return [];
-    }
-  }
-  private save(): void {
-    writeFileSync(this.tokensFile, JSON.stringify(this.tokens));
+    this.store.remove(token);
   }
 
   /** Provider JWT, ES256-signed with the .p8. Cached and refreshed ~every 40 min. */
@@ -105,7 +85,7 @@ export class Apns {
 
   /** Send to every registered device; prune tokens APNs reports as gone (410 / BadDeviceToken). */
   async notify(payload: PushPayload): Promise<void> {
-    if (!this.cfg || this.tokens.length === 0) return;
+    if (!this.cfg || this.store.size === 0) return;
     const jwt = this.authToken();
     if (!jwt) return;
 
@@ -124,34 +104,25 @@ export class Apns {
     const pushType = silent ? "background" : "alert";
     const priority = silent ? "5" : "10";
 
-    const dead: string[] = [];
-    await Promise.all(
-      this.tokens.map(async (token) => {
-        try {
-          const res = await fetch(`${this.host}/3/device/${token}`, {
-            method: "POST",
-            headers: {
-              authorization: `bearer ${jwt}`,
-              "apns-topic": this.cfg!.bundleId,
-              "apns-push-type": pushType,
-              "apns-priority": priority,
-            },
-            body: json,
-          });
-          if (res.status === 410) {
-            dead.push(token); // device token is no longer valid
-          } else if (!res.ok) {
-            const text = await res.text();
-            if (/BadDeviceToken|Unregistered/i.test(text)) dead.push(token);
-          }
-        } catch {
-          /* network — keep the token, retry next time */
-        }
-      }),
-    );
-    if (dead.length) {
-      this.tokens = this.tokens.filter((t) => !dead.includes(t));
-      this.save();
-    }
+    const dead = await fanOut(this.store.list(), async (token) => {
+      try {
+        const res = await fetch(`${this.host}/3/device/${token}`, {
+          method: "POST",
+          headers: {
+            authorization: `bearer ${jwt}`,
+            "apns-topic": this.cfg!.bundleId,
+            "apns-push-type": pushType,
+            "apns-priority": priority,
+          },
+          body: json,
+        });
+        if (res.status === 410) return true; // device token is no longer valid
+        if (!res.ok) return /BadDeviceToken|Unregistered/i.test(await res.text());
+        return false;
+      } catch {
+        return false; // network — keep the token, retry next time
+      }
+    });
+    this.store.prune(dead);
   }
 }

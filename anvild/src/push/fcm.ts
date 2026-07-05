@@ -1,7 +1,8 @@
 import { createSign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PushPayload } from "./webpush";
+import { TokenStore, fanOut } from "./token-store";
 
 interface ServiceAccount {
   client_email: string;
@@ -17,15 +18,11 @@ interface ServiceAccount {
  */
 export class Fcm {
   private readonly sa?: ServiceAccount;
-  private readonly tokensFile: string;
-  private tokens: string[] = [];
+  private readonly store: TokenStore<string>;
   private access?: { token: string; exp: number };
 
   constructor(stateDir: string) {
-    const dir = join(stateDir, "push");
-    mkdirSync(dir, { recursive: true });
-    this.tokensFile = join(dir, "fcm-tokens.json");
-    this.tokens = this.loadTokens();
+    this.store = new TokenStore(join(stateDir, "push", "fcm-tokens.json"), (t) => t);
     const path = process.env.ANVIL_FCM_SERVICE_ACCOUNT || join(process.env.HOME ?? "", ".config/anvil/fcm-service-account.json");
     if (existsSync(path)) {
       try {
@@ -41,27 +38,10 @@ export class Fcm {
   }
 
   register(token: string): void {
-    if (token && !this.tokens.includes(token)) {
-      this.tokens.push(token);
-      this.save();
-    }
+    if (token) this.store.add(token);
   }
   unregister(token: string): void {
-    const before = this.tokens.length;
-    this.tokens = this.tokens.filter((t) => t !== token);
-    if (this.tokens.length !== before) this.save();
-  }
-
-  private loadTokens(): string[] {
-    if (!existsSync(this.tokensFile)) return [];
-    try {
-      return JSON.parse(readFileSync(this.tokensFile, "utf8")) as string[];
-    } catch {
-      return [];
-    }
-  }
-  private save(): void {
-    writeFileSync(this.tokensFile, JSON.stringify(this.tokens));
+    this.store.remove(token);
   }
 
   private async accessToken(): Promise<string | undefined> {
@@ -87,45 +67,37 @@ export class Fcm {
 
   /** Send to every registered device; prune tokens the FCM service reports as gone. */
   async notify(payload: PushPayload): Promise<void> {
-    if (!this.sa || this.tokens.length === 0) return;
+    if (!this.sa || this.store.size === 0) return;
     const access = await this.accessToken();
     if (!access) return;
     const url = `https://fcm.googleapis.com/v1/projects/${this.sa.project_id}/messages:send`;
-    const dead: string[] = [];
-    await Promise.all(
-      this.tokens.map(async (token) => {
-        // ALL pushes are sent data-only so the Android client's onMessageReceived ALWAYS handles
-        // them (even backgrounded) via Notifications.show(). That path keys the notification id off
-        // sessionId, so a new reminder for a session supersedes the old one instead of stacking,
-        // deep-links to that session on tap, and clears when the app opens it. A notification-payload
-        // message would instead be auto-rendered by the system tray with a fresh id each time —
-        // stacking, no session link, no auto-clear.
-        const data: Record<string, string> = { title: payload.title, body: payload.body };
-        if (payload.sessionId) data.sessionId = payload.sessionId;
-        if (payload.kind) data.kind = payload.kind;
-        if (payload.requestId) data.requestId = payload.requestId;
-        if (payload.tool) data.tool = payload.tool;
-        if (payload.dir) data.dir = payload.dir;
-        if (payload.ask) data.ask = payload.ask;
-        const message: Record<string, unknown> = { token, data, android: { priority: "HIGH" } };
-        try {
-          const res = await fetch(url, {
-            method: "POST",
-            headers: { authorization: `Bearer ${access}`, "content-type": "application/json" },
-            body: JSON.stringify({ message }),
-          });
-          if (!res.ok) {
-            const text = await res.text();
-            if (/UNREGISTERED|NOT_FOUND|InvalidRegistration/i.test(text)) dead.push(token);
-          }
-        } catch {
-          /* network — keep the token, retry next time */
-        }
-      }),
-    );
-    if (dead.length) {
-      this.tokens = this.tokens.filter((t) => !dead.includes(t));
-      this.save();
-    }
+    const dead = await fanOut(this.store.list(), async (token) => {
+      // ALL pushes are sent data-only so the Android client's onMessageReceived ALWAYS handles
+      // them (even backgrounded) via Notifications.show(). That path keys the notification id off
+      // sessionId, so a new reminder for a session supersedes the old one instead of stacking,
+      // deep-links to that session on tap, and clears when the app opens it. A notification-payload
+      // message would instead be auto-rendered by the system tray with a fresh id each time —
+      // stacking, no session link, no auto-clear.
+      const data: Record<string, string> = { title: payload.title, body: payload.body };
+      if (payload.sessionId) data.sessionId = payload.sessionId;
+      if (payload.kind) data.kind = payload.kind;
+      if (payload.requestId) data.requestId = payload.requestId;
+      if (payload.tool) data.tool = payload.tool;
+      if (payload.dir) data.dir = payload.dir;
+      if (payload.ask) data.ask = payload.ask;
+      const message: Record<string, unknown> = { token, data, android: { priority: "HIGH" } };
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { authorization: `Bearer ${access}`, "content-type": "application/json" },
+          body: JSON.stringify({ message }),
+        });
+        if (!res.ok) return /UNREGISTERED|NOT_FOUND|InvalidRegistration/i.test(await res.text());
+        return false;
+      } catch {
+        return false; // network — keep the token, retry next time
+      }
+    });
+    this.store.prune(dead);
   }
 }

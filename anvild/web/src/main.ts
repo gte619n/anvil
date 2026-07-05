@@ -4,7 +4,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
 import { apiFetch, daemonBase } from "./api";
-import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, refreshSelect, sessIcon, slugify } from "./dom";
+import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, linkifyUrls, refreshSelect, sessIcon, slugify } from "./dom";
 import { currentTheme, resolveTheme, themePref, updateThemeControls } from "./theme";
 import type { ThemePref } from "./theme";
 import { ui } from "./state";
@@ -60,6 +60,7 @@ import type {
   TodoistProjectInfo,
 } from "../../protocol";
 import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
+import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
 
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
@@ -476,30 +477,10 @@ $("#convo-col").addEventListener("focusin", collapseSidebarForChat);
 // connect at the bottom, once the outbox state onStatus reads is initialized.)
 
 // ── Outbox: writes made offline are queued and flushed, in order, on reconnect (arch §8) ──────
-interface OutboxItem {
-  cid: string;
-  cmd: Record<string, unknown> & { type: string };
-  tempId?: string; // for session.create: the optimistic local session id to reconcile
-  serverUrl?: string; // target server for commands with no sessionId yet (session.create)
-}
-const newCid = (): string => (crypto.randomUUID ? crypto.randomUUID() : `c_${Date.now()}_${Math.floor(Math.random() * 1e9)}`);
-let outbox: OutboxItem[] = (() => {
-  try {
-    return JSON.parse(localStorage.getItem("anvil.outbox") ?? "[]") as OutboxItem[];
-  } catch {
-    return [];
-  }
-})();
-const saveOutbox = (): void => {
-  try {
-    localStorage.setItem("anvil.outbox", JSON.stringify(outbox));
-  } catch {
-    /* quota */
-  }
-};
+// The queue + persistence live in ./outbox (unit-tested); flush/reconcile orchestration stays here.
+const outboxQueue = new OutboxQueue();
 function enqueue(item: OutboxItem): void {
-  outbox.push(item);
-  saveOutbox();
+  outboxQueue.enqueue(item);
   updateOutboxBadge();
 }
 const cidWaiters = new Map<string, (e: ServerEvent) => void>();
@@ -529,7 +510,7 @@ async function flushOutbox(): Promise<void> {
   const remaining: OutboxItem[] = []; // items whose server is offline / that error stay queued
   const failedTemps = new Set<string>();
   try {
-    for (const item of outbox) {
+    for (const item of outboxQueue.list()) {
       // a create that was just rejected → drop its dependent queued prompts
       if ((item.tempId && failedTemps.has(item.tempId)) || (typeof item.cmd.sessionId === "string" && failedTemps.has(item.cmd.sessionId))) continue;
       const sid = item.cmd.sessionId as string | undefined;
@@ -561,8 +542,7 @@ async function flushOutbox(): Promise<void> {
       }
     }
   } finally {
-    outbox = remaining;
-    saveOutbox();
+    outboxQueue.replace(remaining);
     flushing = false;
     updateOutboxBadge();
     // re-pull authoritative history for the active session so optimistic bubbles are replaced
@@ -591,8 +571,7 @@ function reconcileTemp(tempId: string, realId: string): void {
 function failTemp(tempId: string): void {
   sessions.delete(tempId);
   localStorage.removeItem(`anvil.convo.${tempId}`);
-  outbox = outbox.filter((i) => i.cmd.sessionId !== tempId && i.tempId !== tempId);
-  saveOutbox();
+  outboxQueue.removeWhere((i) => i.cmd.sessionId === tempId || i.tempId === tempId);
   persistSessions();
   if (activeId === tempId) deselectSession();
   else renderSessions();
@@ -600,7 +579,7 @@ function failTemp(tempId: string): void {
 function updateOutboxBadge(): void {
   const el = document.getElementById("offline-banner");
   if (!el) return;
-  const queued = outbox.length;
+  const queued = outboxQueue.size;
   const online = anyOpen();
   el.hidden = online && queued === 0;
   el.innerHTML = online
@@ -4054,7 +4033,7 @@ function renderReader(content: FileContent): void {
   } else if (content.binaryUrl) {
     const burl = serverApiUrl(activeServer().url, content.binaryUrl); // daemon-relative → absolute, routed to the session's server
     panelContent.innerHTML =
-      head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank">Open ${esc(content.path)}</a>`);
+      head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank" rel="noopener noreferrer">Open ${esc(content.path)}</a>`);
   }
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
@@ -4340,7 +4319,7 @@ function showGitResult(e: GitResultEvent): void {
   const el = document.getElementById("git-output");
   if (!el) return;
   const head = e.ok ? "" : "⚠ failed\n";
-  el.innerHTML = esc(head + e.output).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+  el.innerHTML = linkifyUrls(head + e.output); // [SEC-L6] esc + safe new-tab links (rel=noopener)
 }
 
 $("#btn-new-topic").addEventListener("click", async () => {

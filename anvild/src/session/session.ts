@@ -254,7 +254,7 @@ export class Session {
   /** Reap the process group, if any (arch §5). */
   async stop(): Promise<void> {
     if (this.group) {
-      await killGroup(this.group.pgid);
+      await killGroup(this.group); // [BE-10] pass the Group so it won't signal a reused pgid
       this.group = undefined;
     }
   }

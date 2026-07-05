@@ -137,6 +137,19 @@ function syncedBase(repoRoot: string, base: string): string {
  * targets the default branch (see `syncedBase`) so sessions never start from a stale local `main`.
  * Throws if the branch already exists so the caller can ask for a different name.
  */
+// [SEC-L1] `base` (and `branch`) become positional args to `git worktree add`. They're argv, so no
+// shell injection, but a leading-dash value can be parsed as a git option, and git ref names forbid
+// whitespace, `..`, `~^:?*[`, `\`, and control chars anyway. Validate before spawning git.
+export function assertSafeRef(ref: string, label: string): void {
+  const r = ref.trim();
+  if (!r || r !== ref) throw new Error(`invalid git ${label} (empty or padded): ${JSON.stringify(ref)}`);
+  if (r.startsWith("-")) throw new Error(`invalid git ${label} (looks like an option): ${ref}`);
+  // eslint-disable-next-line no-control-regex
+  if (/[\s~^:?*\[\\\x00-\x1f]/.test(r) || r.includes("..")) {
+    throw new Error(`invalid git ${label}: ${ref}`);
+  }
+}
+
 export function createWorktree(
   repoRoot: string,
   base: string,
@@ -144,6 +157,8 @@ export function createWorktree(
   worktreeRoot: string,
   sessionId: string,
 ): CreatedWorktree {
+  assertSafeRef(base, "base");
+  assertSafeRef(branch, "branch");
   const cwd = join(worktreeRoot, sessionId);
   base = syncedBase(repoRoot, base);
   const r = git(["worktree", "add", "-b", branch, cwd, base], repoRoot);
@@ -238,6 +253,26 @@ export function prBadgeFor(
 export function carryPrBadge(prev: GitStatus | undefined, next: GitStatus): PrBadge {
   if (!prev?.prBranch || prev.prBranch !== next.branch) return {};
   return prBadgeFor(prev.prState, prev.prUrl, next.branch, next.dirtyFileCount);
+}
+
+/** Copy a badge's fields onto a live git status; returns whether any field actually changed (so the
+ *  caller can skip a persist + broadcast when nothing moved). Dedupes the 3 inline copies in gitOp/
+ *  refreshPrState. */
+export function applyPrBadge(git: GitStatus, badge: PrBadge): boolean {
+  const changed = git.prState !== badge.prState || git.prUrl !== badge.prUrl || git.prBranch !== badge.prBranch;
+  git.prState = badge.prState;
+  git.prUrl = badge.prUrl;
+  git.prBranch = badge.prBranch;
+  return changed;
+}
+
+/** Whether a session is worth a network `gh pr view` probe: it must be on a branch and not already
+ *  terminal-merged on that same branch. Shared by the per-session attach refresh and the fleet-wide
+ *  sweep so their guards can't drift. */
+export function isPrSweepEligible(git: GitStatus | undefined, worktreeBranch: string | undefined): boolean {
+  const branch = worktreeBranch || git?.branch;
+  if (!branch) return false;
+  return !(git?.prState === "merged" && git.prBranch === git.branch);
 }
 
 /**

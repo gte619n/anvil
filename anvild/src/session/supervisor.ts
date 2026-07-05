@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { mkdirSync as ensureDir, unwatchFile, watchFile } from "node:fs";
+import { mkdirSync as ensureDir } from "node:fs";
 import { basename, join } from "node:path";
 import {
   PROTOCOL_VERSION,
@@ -43,7 +43,9 @@ import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
 import { Session } from "./session";
 import { SessionStore } from "./store";
-import { carryPrBadge, createWorktree, gitStatus, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
+import { TerminalManager } from "./terminal-manager";
+import { FileWatchManager } from "./file-watch-manager";
+import { applyPrBadge, carryPrBadge, createWorktree, gitStatus, isPrSweepEligible, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildAgentEnv } from "../agent/env";
@@ -55,6 +57,7 @@ import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
+import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
@@ -64,7 +67,7 @@ import { autoStartDecision } from "../integrations/autostart-gate";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
 import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
-import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, toPipelineTraceInfo, adversaryStats } from "../pipeline/daemon-adapters";
+import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, adversaryStats } from "../pipeline/daemon-adapters";
 import { loadMetrics, saveMetrics } from "../pipeline/metrics-store";
 import type { AdversaryMetrics } from "../pipeline/metrics";
 import type { PhaseDeps } from "../pipeline/phases";
@@ -440,41 +443,16 @@ export class Supervisor {
   }
 
   // ── Autopilot plan review (anvil-autopilot-ui.md) ─────────────────────────────────
+  // Selection + presentation logic lives in integrations/autopilot-plans.ts (pure + unit-tested);
+  // these methods just supply the Supervisor's stores/renderer.
   /** Pending plans = planned work units not yet started; what the Autopilot card grid shows. */
   private pendingPlans(): WorkUnit[] {
-    return this.workUnits.list().filter(
-      (u) =>
-        (u.status === "planned" && !u.sessionId) ||
-        // Held-for-clarification units live on the grid too, so the reviewer can read the open questions and
-        // answer them (via refine, which promotes the unit back to `planned`) or dismiss it.
-        (u.status === "needs-clarification" && !u.sessionId) ||
-        // Keep pipeline-completed units on the grid so their trace + PR stay reviewable until the operator
-        // resolves them (dismiss/complete). Only pipeline-run units gain this visibility — the old flow is
-        // unchanged (a normal planned→built unit has no devPipeline).
-        (u.devPipeline !== undefined && (u.status === "review" || u.status === "blocked")),
-    );
+    return selectPendingPlans(this.workUnits.list());
   }
 
   /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
   private autopilotPlanInfo(u: WorkUnit): AutopilotPlanInfo {
-    const env = this.envStore.get(u.environmentId);
-    return {
-      id: u.id,
-      environmentId: u.environmentId,
-      ...(env?.name ? { environmentName: env.name } : {}),
-      todoistProjectId: u.todoistProjectId,
-      title: u.title,
-      ...(u.rationale ? { rationale: u.rationale } : {}),
-      ...(u.summary ? { summary: u.summary } : {}),
-      status: u.status,
-      ...(u.source ? { source: u.source } : {}),
-      ...(u.effort ? { effort: u.effort } : {}),
-      taskCount: u.taskIds.length,
-      ...(u.plan ? { plan: this.renderer.render(u.plan) } : {}),
-      ...(u.devPipeline ? { pipeline: toPipelineTraceInfo(u.devPipeline) } : {}),
-      createdAt: u.createdAt,
-      updatedAt: u.updatedAt,
-    };
+    return toPlanInfo(u, this.envStore.get(u.environmentId)?.name, this.renderer);
   }
 
   /** The §6.3 adversary calibration metrics for the Models settings card. */
@@ -723,11 +701,9 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
   }
 
-  /** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */
+  /** The opening brief handed to a plan's build session (see integrations/autopilot-plans.ts). */
   private autopilotBrief(u: WorkUnit): string {
-    const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
-    const body = u.plan ? `\n\nHere is the plan to implement:\n\n${u.plan}` : "";
-    return `${head}${body}\n\nImplement it end to end in this worktree, then summarize what you changed.`;
+    return buildAutopilotBrief(u);
   }
 
   /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
@@ -938,11 +914,15 @@ export class Supervisor {
         ...(mapped.prUrl ? { prUrl: mapped.prUrl } : {}),
         ...(mapped.blockedReason ? { blockedReason: mapped.blockedReason } : {}),
       });
-      saveMetrics(this.stateDir, this.devPipelineMetrics);
       this.broadcastAutopilotPlans();
       log(`Pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}.`);
       return outcome;
     } finally {
+      // [BE-13] Persist metrics on EVERY exit, not just success. `executeDevPipeline` mutates the
+      // in-memory tallies (recordFirstPass) as it runs; a run that throws is exactly one where the
+      // adversary fired hardest, so saving only on success biased the §6.3 collusion metric toward
+      // clean runs. saveMetrics is atomic (tmp+rename), so a partial write can't corrupt the file.
+      saveMetrics(this.stateDir, this.devPipelineMetrics);
       // The branch (when shipped) is on origin via P6's push; the local worktree is disposable either way.
       try {
         removeWorktree(env.repoRoot, cwd, branch);
@@ -1171,8 +1151,19 @@ export class Supervisor {
     }
   }
 
-  // File browser & reader (arch §8.1/§8.2), scoped to the session worktree.
-  private readonly watchers = new Map<string, () => void>(); // `${sessionId}:${path}` → stop fn
+  // File browser & reader (arch §8.1/§8.2), scoped to the session worktree. Change-watching is
+  // extracted to FileWatchManager (unit-tested); the Supervisor injects locate/read/session access.
+  private readonly fileWatchMgr = new FileWatchManager(
+    (sessionId) => {
+      const s = this.require(sessionId);
+      return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
+    },
+    (cwd, path) => locateInside(cwd, path),
+    (sessionId, path) => {
+      const s = this.require(sessionId);
+      return readFile(s.data.cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p));
+    },
+  );
 
   fsList(sessionId: string, path: string): { path: string; entries: DirEntry[] } {
     return listDir(this.require(sessionId).data.cwd, path);
@@ -1191,43 +1182,10 @@ export class Supervisor {
     return resolveInside(this.require(sessionId).data.cwd, path);
   }
   fsWatch(sessionId: string, path: string): void {
-    const key = `${sessionId}:${path}`;
-    if (this.watchers.has(key)) return;
-    const s = this.require(sessionId);
-    let located: ReturnType<typeof locateInside>;
-    try {
-      located = locateInside(s.data.cwd, path); // watch the file fs.read actually resolved (subdir match included)
-    } catch {
-      return; // not found / not yet created — nothing to watch (read already reported the error)
-    }
-    if (located.kind !== "file") return; // an ambiguous basename has no single file to watch until the user picks
-    const abs = located.abs;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const onChange = (): void => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        try {
-          s.emit({ type: "fs.changed", content: readFile(s.data.cwd, path, this.renderer, (p) => this.fileUrl(sessionId, p)) });
-        } catch {
-          /* file deleted / unreadable — ignore */
-        }
-      }, 250);
-    };
-    watchFile(abs, { interval: 1000 }, onChange);
-    this.watchers.set(key, () => unwatchFile(abs, onChange));
+    this.fileWatchMgr.add(sessionId, path);
   }
   fsUnwatch(sessionId: string, path: string): void {
-    const key = `${sessionId}:${path}`;
-    this.watchers.get(key)?.();
-    this.watchers.delete(key);
-  }
-  private clearWatchers(sessionId: string): void {
-    for (const [key, stop] of this.watchers) {
-      if (key.startsWith(`${sessionId}:`)) {
-        stop();
-        this.watchers.delete(key);
-      }
-    }
+    this.fileWatchMgr.unwatch(sessionId, path);
   }
   private fileUrl(sessionId: string, relPath: string): string {
     return `/api/sessions/${sessionId}/files?path=${encodeURIComponent(relPath)}`;
@@ -1247,9 +1205,7 @@ export class Supervisor {
         if (s.data.git) {
           const pr = git.prStatus(cwd); // network: gh pr view
           const badge = prBadgeFor(pr.state, pr.url, s.data.git.branch, s.data.git.dirtyFileCount);
-          s.data.git.prState = badge.prState; // badge is branch-scoped, and merged hides on a dirty tree
-          s.data.git.prUrl = badge.prUrl;
-          s.data.git.prBranch = badge.prBranch;
+          applyPrBadge(s.data.git, badge); // badge is branch-scoped, and merged hides on a dirty tree
           this.persist();
           this.broadcastUpdated(s.data);
           output = `${s.data.git.branch} — ${s.data.git.dirtyFileCount} changed, ${s.data.git.ahead} ahead / ${s.data.git.behind} behind${s.data.git.prState ? ` · PR ${s.data.git.prState}` : ""}`;
@@ -1298,9 +1254,7 @@ export class Supervisor {
             // Show the merged badge scoped to the current branch (the follow-up after a rollover) so
             // it clears once new work starts — a dirty tree, or another branch switch. See prBadgeFor.
             const badge = prBadgeFor("merged", s.data.git.prUrl, s.data.git.branch, s.data.git.dirtyFileCount);
-            s.data.git.prState = badge.prState;
-            s.data.git.prUrl = badge.prUrl;
-            s.data.git.prBranch = badge.prBranch;
+            applyPrBadge(s.data.git, badge);
           }
           this.persist();
           this.broadcastUpdated(s.data);
@@ -1332,18 +1286,13 @@ export class Supervisor {
     if (!s) return;
     this.refreshGit(s); // local: pick up a branch switch / new changes and clear a stale badge first
     const g = s.data.git;
-    if (!g) return;
-    // A merged PR is terminal — skip the gh probe only while we're still on the branch it merged.
-    if (g.prState === "merged" && g.prBranch === g.branch) return;
-    if (!s.data.worktree?.branch && !g.branch) return;
+    // Skip the gh probe for sessions with no branch or already terminal-merged (shared with the sweep).
+    if (!g || !isPrSweepEligible(g, s.data.worktree?.branch)) return;
     const pr = await git.prStatusAsync(s.data.cwd);
     const cur = this.sessions.get(id); // may have changed/closed during the await
     if (!cur?.data.git) return;
     const badge = prBadgeFor(pr.state, pr.url, cur.data.git.branch, cur.data.git.dirtyFileCount);
-    if (cur.data.git.prState === badge.prState && cur.data.git.prUrl === badge.prUrl && cur.data.git.prBranch === badge.prBranch) return;
-    cur.data.git.prState = badge.prState;
-    cur.data.git.prUrl = badge.prUrl;
-    cur.data.git.prBranch = badge.prBranch;
+    if (!applyPrBadge(cur.data.git, badge)) return; // nothing changed → no persist/broadcast
     this.persist();
     this.broadcastUpdated(cur.data);
   }
@@ -1366,12 +1315,7 @@ export class Supervisor {
       // Only sessions that could have a live PR worth a network probe: on a branch, and not already
       // terminal-merged on that same branch. Mirrors refreshPrState's own guards to avoid the work.
       const ids = [...this.sessions.values()]
-        .filter((s) => {
-          const g = s.data.git;
-          const branch = s.data.worktree?.branch || g?.branch;
-          if (!branch) return false;
-          return !(g?.prState === "merged" && g.prBranch === g.branch);
-        })
+        .filter((s) => isPrSweepEligible(s.data.git, s.data.worktree?.branch))
         .map((s) => s.id);
       const LIMIT = 4;
       for (let i = 0; i < ids.length; i += LIMIT) {
@@ -1388,8 +1332,8 @@ export class Supervisor {
     const s = this.require(id);
     await this.drivers.get(id)?.stop();
     this.drivers.delete(id);
-    this.clearWatchers(id);
-    this.killTerminal(id);
+    this.fileWatchMgr.clear(id);
+    this.terminalMgr.kill(id);
     s.data.archived = true;
     s.data.status = "idle";
     s.data.lastActivityAt = now();
@@ -1419,66 +1363,24 @@ export class Supervisor {
     this.persist();
   }
 
-  // Terminal channel (arch §7): a persistent PTY per session via Bun.Terminal.
-  private readonly terminals = new Map<string, { pty: any; proc: any; scrollback: Buffer }>();
+  // Terminal channel (arch §7): a persistent PTY per session via Bun.Terminal. Extracted to
+  // TerminalManager (unit-tested); the Supervisor just adapts a session id to {cwd, emit}.
+  private readonly terminalMgr = new TerminalManager(
+    (sessionId) => {
+      const s = this.require(sessionId);
+      return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
+    },
+    () => this.agentEnv(),
+  );
 
   terminalOpen(sessionId: string, cols: number, rows: number): void {
-    const s = this.require(sessionId);
-    const existing = this.terminals.get(sessionId);
-    if (existing) {
-      if (existing.scrollback.length) s.emit({ type: "terminal.data", data: existing.scrollback.toString("base64") });
-      try {
-        existing.pty.resize(cols, rows);
-      } catch {
-        /* pty gone */
-      }
-      return;
-    }
-    const rec: { pty: any; proc: any; scrollback: Buffer } = { pty: null, proc: null, scrollback: Buffer.alloc(0) };
-    const BunAny = Bun as any;
-    const term = new BunAny.Terminal({
-      cols,
-      rows,
-      data: (_t: unknown, bytes: Uint8Array) => {
-        const buf = Buffer.from(bytes);
-        rec.scrollback = Buffer.concat([rec.scrollback, buf]);
-        if (rec.scrollback.length > 262144) rec.scrollback = rec.scrollback.subarray(rec.scrollback.length - 262144);
-        s.emit({ type: "terminal.data", data: buf.toString("base64") });
-      },
-    });
-    rec.pty = term;
-    const shell = process.env.SHELL || "/bin/zsh";
-    rec.proc = BunAny.spawn([shell], { terminal: term, cwd: s.data.cwd, env: { ...this.agentEnv(), TERM: "xterm-256color" } });
-    this.terminals.set(sessionId, rec);
-    rec.proc.exited.then((code: number | null) => {
-      s.emit({ type: "terminal.exit", code: code ?? 0 });
-      this.terminals.delete(sessionId);
-    });
+    this.terminalMgr.open(sessionId, cols, rows);
   }
   terminalInput(sessionId: string, dataBase64: string): void {
-    try {
-      this.terminals.get(sessionId)?.pty.write(Buffer.from(dataBase64, "base64"));
-    } catch {
-      /* no pty */
-    }
+    this.terminalMgr.input(sessionId, dataBase64);
   }
   terminalResize(sessionId: string, cols: number, rows: number): void {
-    try {
-      this.terminals.get(sessionId)?.pty.resize(cols, rows);
-    } catch {
-      /* no pty */
-    }
-  }
-  private killTerminal(sessionId: string): void {
-    const t = this.terminals.get(sessionId);
-    if (t) {
-      try {
-        t.pty.close();
-      } catch {
-        /* already closed */
-      }
-      this.terminals.delete(sessionId);
-    }
+    this.terminalMgr.resize(sessionId, cols, rows);
   }
 
   // Attachments (arch §6.5) — uploaded via REST, fed to the agent as image blocks.
@@ -1634,8 +1536,8 @@ export class Supervisor {
     try {
       await this.drivers.get(id)?.stop(); // interrupt the agent SDK query + close its input
       this.drivers.delete(id);
-      this.clearWatchers(id);
-      this.killTerminal(id);
+      this.fileWatchMgr.clear(id);
+      this.terminalMgr.kill(id);
       await s.stop(); // reap any attached process group (PTY in Phase 3)
       if (s.data.source === "fresh-worktree" && s.data.worktree) {
         git.deleteRemoteBranch(s.data.cwd, s.data.worktree.branch); // best-effort, before the worktree goes
@@ -1654,7 +1556,7 @@ export class Supervisor {
    */
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
-    for (const id of [...this.terminals.keys()]) this.killTerminal(id);
+    this.terminalMgr.killAll();
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
   }
@@ -1668,8 +1570,8 @@ export class Supervisor {
     const s = this.require(id);
     await this.drivers.get(id)?.stop(); // a wedged/stale query is dropped; next prompt starts fresh
     this.drivers.delete(id);
-    this.clearWatchers(id);
-    this.killTerminal(id);
+    this.fileWatchMgr.clear(id);
+    this.terminalMgr.kill(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
@@ -1781,7 +1683,7 @@ export class Supervisor {
         this.maybeNotify(sessionId, event);
         this.maybeBroadcastAwaiting(sessionId, event);
       },
-      () => this.persist(),
+      () => this.persistSoon(), // [BE-1] high-frequency emit path is debounced; lifecycle ops flush now
       (event) => log.append(event),
     );
   }
@@ -1940,8 +1842,42 @@ export class Supervisor {
     }
   }
 
+  // [BE-1] Coalesce the hot emit-driven persistence. A full-registry re-serialize + fsync per
+  // emitted event (status/prose/seq, many per turn) is the daemon's hottest path; this window batches
+  // a burst into one write. Lifecycle ops (create/kill/shutdown) still call persist() for immediate
+  // durability; the event log is the authoritative per-event stream, so at most PERSIST_DEBOUNCE_MS
+  // of status/seq updates are at risk on a hard crash (restart reconciles them anyway).
+  private static readonly PERSIST_DEBOUNCE_MS = 100;
+  private persistTimer: ReturnType<typeof setTimeout> | undefined;
+  private persistDirty = false;
+
+  /** Immediate, synchronous registry flush. Used by lifecycle ops and satisfies any pending
+   *  debounced write (cancels the timer). */
   private persist(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
+    this.persistDirty = false;
     this.store.saveAll([...this.sessions.values()].map((s) => ({ data: s.data, lastSeq: s.lastSeq })));
+  }
+
+  /** Debounced flush for the high-frequency emit path. */
+  private persistSoon(): void {
+    this.persistDirty = true;
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      // The flush runs OUTSIDE the emit try/catch, so guard it: a transient FS error (or a state dir
+      // that vanished under a test) must be logged, never thrown as an unhandled rejection.
+      try {
+        if (this.persistDirty) this.persist();
+      } catch (e) {
+        console.error(`[supervisor] debounced persist failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }, Supervisor.PERSIST_DEBOUNCE_MS);
+    // Don't let a pending flush hold the process open — shutdown() flushes synchronously.
+    this.persistTimer.unref?.();
   }
 
   private require(id: string): Session {

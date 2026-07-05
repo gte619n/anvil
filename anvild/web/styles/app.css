@@ -910,3 +910,20 @@ input:focus, select:focus, textarea:not(#input):focus {
 .pt-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
 .pt-table th, .pt-table td { text-align: left; padding: 2px 6px; border-bottom: 1px solid var(--border); }
 .pt-table th { color: var(--muted); font-weight: 600; }
+
+/* [Phase 4 / WEB-6] Keyboard focus visibility: icon buttons (.hbtn/.icon-btn/.ptab/.stab) had no
+   visible focus ring. A single :focus-visible rule gives keyboard users a clear indicator without
+   showing a ring on mouse clicks. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* [Phase 4 / WEB-13] Respect the OS "reduce motion" setting. The awaiting-permission blink and the
+   thinking pulse otherwise animate indefinitely — a vestibular-safety (WCAG 2.3.3) and battery
+   concern. Near-instant durations keep state changes legible without motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

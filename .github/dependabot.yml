@@ -1,0 +1,32 @@
+version: 2
+# Weekly dependency PRs for every ecosystem in the repo. Grouped so a week's bumps land as one PR
+# per ecosystem instead of a flood; the CI gate (ci.yml) runs on each so nothing merges untested.
+updates:
+  # The daemon + web client (Bun/npm registry — Dependabot reads package.json/bun.lock).
+  - package-ecosystem: npm
+    directory: /anvild
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      daemon-deps:
+        patterns: ["*"]
+
+  # Android (Gradle).
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      android-deps:
+        patterns: ["*"]
+
+  # The GitHub Actions we pin in the workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

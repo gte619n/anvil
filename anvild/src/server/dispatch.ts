@@ -1,5 +1,6 @@
-import { PROTOCOL_VERSION, type ClientCommand, type ServerEvent } from "@protocol";
+import { PROTOCOL_VERSION, type ServerEvent } from "@protocol";
 import { now } from "../util/envelope";
+import { parseCommandFrame } from "./command-frame";
 import type { ConnState } from "./connection";
 import type { ConnectionRegistry } from "./registry";
 import type { PushRegistry } from "../push/registry";
@@ -27,40 +28,18 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** Command types in the contract but not yet built. */
-const PENDING: ReadonlySet<string> = new Set<string>([]);
-
 /**
- * Routes one inbound client frame (arch §6.1/§6.3): validates the envelope, narrows on
- * `type`, mutates session state via the supervisor, and replies `ack` (for correlated
+ * Routes one inbound client frame (arch §6.1/§6.3): validates the envelope (parseCommandFrame),
+ * narrows on `type`, mutates session state via the supervisor, and replies `ack` (for correlated
  * commands) or `command.error`.
  */
 export function dispatch(conn: ConnState, raw: string, send: Send, deps: DispatchDeps): void {
-  let msg: unknown;
-  try {
-    msg = JSON.parse(raw);
-  } catch {
-    send(cmdError("invalid JSON"));
+  const parsed = parseCommandFrame(raw);
+  if (!parsed.ok) {
+    send(cmdError(parsed.message, parsed.cid));
     return;
   }
-  if (typeof msg !== "object" || msg === null) {
-    send(cmdError("malformed message: expected an object"));
-    return;
-  }
-
-  const record = msg as Record<string, unknown>;
-  const cid = typeof record.cid === "string" ? record.cid : undefined;
-
-  if (record.v !== PROTOCOL_VERSION) {
-    send(cmdError(`unsupported protocol version: ${String(record.v)} (expected ${PROTOCOL_VERSION})`, cid));
-    return;
-  }
-  if (typeof record.type !== "string") {
-    send(cmdError("missing command type", cid));
-    return;
-  }
-
-  const cmd = msg as ClientCommand;
+  const { cmd, cid } = parsed;
   try {
     switch (cmd.type) {
       case "push.register":
@@ -418,14 +397,8 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid)); // PTY persists (arch §7); the client just stops rendering
         return;
 
-      default: {
-        const type = record.type;
-        if (PENDING.has(type)) {
-          send(cmdError(`'${type}' is recognized but not implemented yet (pending a later milestone)`, cid));
-        } else {
-          send(cmdError(`unknown command type: '${type}'`, cid));
-        }
-      }
+      default:
+        send(cmdError(`unknown command type: '${(cmd as { type: string }).type}'`, cid));
     }
   } catch (e) {
     // BadCommand and anything thrown synchronously becomes a clean command.error

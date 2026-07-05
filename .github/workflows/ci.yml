@@ -1,0 +1,54 @@
+name: CI
+
+# The merge gate. Runs on every pull request and every push to `main`, and is the ONLY thing that
+# proves a change typechecks, builds its web bundle, and passes the test suite before it can land.
+# The release workflows (release.yml, android-release.yml, ios-release.yml) all ship AFTER merge, so
+# without this gate a broken build would auto-ship to Play/TestFlight/Firebase. Keep this job fast
+# and green; the production release jobs `needs:` an equivalent verify step so nothing untested ships.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  daemon:
+    name: daemon — typecheck + build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: anvild
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # Pin to the engines floor in anvild/package.json — an unpinned `latest` makes the gate
+          # (and self-update, which reuses these scripts) non-reproducible.
+          bun-version: 1.3.14
+
+      - name: Cache Bun install
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('anvild/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (daemon)
+        run: bun run typecheck
+
+      - name: Typecheck (web — separate tsconfig, not covered by the daemon typecheck)
+        run: bun run typecheck:web
+
+      - name: Build web bundle
+        run: bun run build:web
+
+      - name: Test
+        run: bun test

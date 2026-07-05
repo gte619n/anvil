@@ -24,17 +24,21 @@ export function isManaged(): boolean {
   return process.env.ANVIL_MANAGED === "launchd";
 }
 
-async function run(cmd: string[], cwd: string): Promise<{ code: number; out: string }> {
+/** Runs a command and returns its exit code + combined output. Injectable so the update FLOW can be
+ *  tested without spawning real git/bun (the default spawns for real). */
+export type CommandRunner = (cmd: string[], cwd: string) => Promise<{ code: number; out: string }>;
+
+const runDefault: CommandRunner = async (cmd, cwd) => {
   const p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
   const [stdout, stderr] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
   const code = await p.exited;
   return { code, out: `${stdout}${stderr}`.trim() };
-}
+};
 
 /** Resolve the daemon's own git repo root from the anvild source dir. Throws a human-actionable
  *  message (surfaced verbatim in the client's "Update failed:" line) when this Mac's Anvil wasn't
  *  installed from a git clone — self-update only works on a git checkout it can `git pull`. */
-async function repoRoot(): Promise<string> {
+async function repoRoot(run: CommandRunner): Promise<string> {
   const r = await run(["git", "rev-parse", "--show-toplevel"], anvildDir);
   if (r.code !== 0) {
     throw new Error(
@@ -46,8 +50,8 @@ async function repoRoot(): Promise<string> {
 }
 
 /** Fetch and report how many commits behind upstream the daemon's checkout is. */
-export async function checkForUpdate(): Promise<{ behind: number; output: string }> {
-  const root = await repoRoot();
+export async function checkForUpdate(run: CommandRunner = runDefault): Promise<{ behind: number; output: string }> {
+  const root = await repoRoot(run);
   const fetch = await run(["git", "fetch", "--quiet"], root);
   if (fetch.code !== 0) throw new Error(`git fetch failed: ${fetch.out || `exit ${fetch.code}`}`);
   const upstream = await run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], root);
@@ -63,8 +67,8 @@ export async function checkForUpdate(): Promise<{ behind: number; output: string
 
 /** Fast-forward the checkout, reinstall deps, and rebuild the web bundle. Throws on any failure
  *  (with the failing step's output) so the caller never restarts onto a broken tree. */
-export async function applyUpdate(): Promise<{ output: string }> {
-  const root = await repoRoot();
+export async function applyUpdate(run: CommandRunner = runDefault): Promise<{ output: string }> {
+  const root = await repoRoot(run);
   const log: string[] = [];
 
   const before = (await run(["git", "rev-parse", "HEAD"], root)).out.trim();
@@ -101,6 +105,14 @@ export async function applyUpdate(): Promise<{ output: string }> {
     log.push(`$ bun run build:web\n${build.out}`);
   }
   if (build.code !== 0) throw new Error(`web build failed:\n${build.out}`);
+
+  // [CI-S5] The daemon runs from TS source, so a type error is a latent runtime crash. Verify the
+  // pulled tree typechecks before the caller restarts onto it — build:web only covers the web bundle.
+  // (We deliberately don't run the full `bun test` here: it spawns real git/PTY subprocesses and
+  // would slow a live update; typecheck is the fast, side-effect-free safety gate.)
+  const typecheck = await run(["bun", "run", "typecheck"], anvildDir);
+  log.push(`$ bun run typecheck\n${typecheck.out}`);
+  if (typecheck.code !== 0) throw new Error(`typecheck failed — refusing to restart onto a broken tree:\n${typecheck.out}`);
 
   return { output: log.join("\n\n") };
 }

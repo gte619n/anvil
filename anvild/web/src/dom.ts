@@ -7,6 +7,11 @@ import type { Environment, Session } from "../../protocol";
 
 export const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => document.querySelector(sel) as T;
 export const esc = (s: string): string => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
+// [SEC-L6] Escape text, then turn bare http(s) URLs into new-tab links. `rel="noopener noreferrer"`
+// prevents the opened page from reaching back via `window.opener` (reverse tabnabbing). Text is
+// escaped first, so the URL can't inject tags.
+export const linkifyUrls = (text: string): string =>
+  esc(text).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
 export const slugify = (s: string): string =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 export const icon = (name: string): string => `<span class="msym">${name}</span>`;

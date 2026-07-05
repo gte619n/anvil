@@ -1,6 +1,8 @@
 import webpush from "web-push";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { writeFileAtomic } from "../util/atomic";
+import { TokenStore, fanOut } from "./token-store";
 
 interface Subscription {
   endpoint: string;
@@ -35,13 +37,13 @@ export interface PushPayload {
 export class WebPush {
   private readonly dir: string;
   private readonly keys: { publicKey: string; privateKey: string };
-  private subs: Subscription[] = [];
+  private readonly store: TokenStore<Subscription>;
 
   constructor(stateDir: string) {
     this.dir = join(stateDir, "push");
     mkdirSync(this.dir, { recursive: true });
     this.keys = this.loadKeys();
-    this.subs = this.loadSubs();
+    this.store = new TokenStore(join(this.dir, "subscriptions.json"), (s) => s.endpoint);
     webpush.setVapidDetails("mailto:anvil@localhost", this.keys.publicKey, this.keys.privateKey);
   }
 
@@ -53,53 +55,30 @@ export class WebPush {
     const f = join(this.dir, "vapid.json");
     if (existsSync(f)) return JSON.parse(readFileSync(f, "utf8")) as { publicKey: string; privateKey: string };
     const k = webpush.generateVAPIDKeys();
-    writeFileSync(f, JSON.stringify(k), { mode: 0o600 });
+    writeFileAtomic(f, JSON.stringify(k), { mode: 0o600 });
     return k;
   }
-  private loadSubs(): Subscription[] {
-    const f = join(this.dir, "subscriptions.json");
-    if (!existsSync(f)) return [];
-    try {
-      return JSON.parse(readFileSync(f, "utf8")) as Subscription[];
-    } catch {
-      return [];
-    }
-  }
-  private saveSubs(): void {
-    writeFileSync(join(this.dir, "subscriptions.json"), JSON.stringify(this.subs));
-  }
-
   subscribe(sub: Subscription): void {
-    if (!sub?.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) return;
-    if (!this.subs.some((s) => s.endpoint === sub.endpoint)) {
-      this.subs.push(sub);
-      this.saveSubs();
-    }
+    if (!sub?.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) return; // incomplete — reject
+    this.store.add(sub); // dedupes by endpoint
   }
   unsubscribe(endpoint: string): void {
-    const before = this.subs.length;
-    this.subs = this.subs.filter((s) => s.endpoint !== endpoint);
-    if (this.subs.length !== before) this.saveSubs();
+    this.store.remove(endpoint);
   }
 
   /** Encrypt + send to every subscription; prune ones the push service reports as gone. */
   async notify(payload: PushPayload): Promise<void> {
-    if (this.subs.length === 0) return;
+    if (this.store.size === 0) return;
     const data = JSON.stringify(payload);
-    const dead: string[] = [];
-    await Promise.all(
-      this.subs.map(async (s) => {
-        try {
-          await webpush.sendNotification(s, data, { TTL: 600 });
-        } catch (e) {
-          const code = (e as { statusCode?: number })?.statusCode;
-          if (code === 404 || code === 410) dead.push(s.endpoint); // gone/expired
-        }
-      }),
-    );
-    if (dead.length) {
-      this.subs = this.subs.filter((s) => !dead.includes(s.endpoint));
-      this.saveSubs();
-    }
+    const dead = await fanOut(this.store.list(), async (s) => {
+      try {
+        await webpush.sendNotification(s, data, { TTL: 600 });
+        return false;
+      } catch (e) {
+        const code = (e as { statusCode?: number })?.statusCode;
+        return code === 404 || code === 410; // gone/expired → prune
+      }
+    });
+    this.store.prune(dead);
   }
 }

@@ -1,5 +1,6 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { buildAgentEnv } from "./env";
+import { makePipelineGuardHook } from "./pipeline-guard";
 import type { ModelSpec } from "./model-roster";
 
 /**
@@ -39,6 +40,13 @@ export async function runAgentQuery(
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
+      // [SEC-H4] Unattended runs have no human to prompt, so gate EVERY tool through the danger list
+      // and hard-deny anything it flags. Write phases (readonly:false) otherwise ran a third-party
+      // model with Write/Edit/Bash and no backstop; readonly phases keep this too (cheap, and reads
+      // that touch secret paths are still denied). 3600s timeout matches the interactive gate.
+      hooks: {
+        PreToolUse: [{ hooks: [makePipelineGuardHook(opts.cwd)], timeout: 3600 }],
+      },
       executable: "bun",
       abortController: ac,
       // Built per-call from the model's profile so the right provider/token drives this spawn, and so a

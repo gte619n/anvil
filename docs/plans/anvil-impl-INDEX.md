@@ -1,6 +1,6 @@
 # Anvil Implementation Plans — Index
 
-**Created:** 2026-06-19 | **Updated:** 2026-06-20 | **Status:** plans 1 & 4 shipped; a web client (not planned here) is the daily driver; native clients (2/5) + push send path not started
+**Created:** 2026-06-19 | **Updated:** 2026-07 | **Status:** plans 1 & 4 shipped; the web client (not planned here) is the daily driver and is bundled into all native shells; the native clients shipped as **thin Kotlin/Swift WebView shells** (not the originally-planned Compose/native rewrites); push (Web Push + APNs + FCM) is implemented
 
 These are the component implementation plans for the Anvil re-architecture (dropping
 Zellij). They build on the locked design in `anvil-native-architecture.md` and the wire
@@ -28,7 +28,12 @@ Daemon core (1) + rendering pipeline daemon-side (2) + transport/ops (6, partial
 
 ## Cross-cutting findings from planning (read before starting)
 
-1. **The Android app is Java/Views, NOT Kotlin/Compose.** 26 `.java` files, 0 `.kt`, a multi-WebView pool, no Compose plugins. Phase 2 is a **greenfield Compose rewrite in the same Gradle module**, not a refactor — only ~3 utility classes survive (`KeepAliveService`, `IMESwitchManager`, `SetupGuideActivity`). Re-baseline the Phase-2 estimate accordingly. (Plan 3 §3.)
+1. **~~The Android app is Java/Views, NOT Kotlin/Compose.~~ (SUPERSEDED — 2026-07)** The shipped
+   Android client is now **Kotlin** — a thin WebView shell that hosts the bundled web UI (6 `.kt`
+   files, 0 `.java`; see `app/src/main/java/com/gte619n/anvil/`), matching `docs/ARCHITECTURE.md`
+   ("Android (Kotlin WebView)"). The originally-planned greenfield Compose rewrite did not happen;
+   the WebView-shell approach (shared web UI across web/iOS/Android) won instead. This finding is kept
+   for history — do not plan against the old "26 `.java` files" baseline.
 
 2. **`node-pty`-on-Bun risk is retired.** Bun shipped a native `Bun.Terminal` PTY API in v1.3.5 (Dec 2025); use it, not node-pty. **Pin Bun ≥ 1.3.14** (macOS use-after-free + `fs.watch` rewrite). Keep a thin `PtyBackend` seam to fall back to `bun-pty` (FFI) if needed. (Plan 4 §3.)
 

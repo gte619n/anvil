@@ -17,6 +17,8 @@ The deep specs. They are the source of truth for *why* the system is shaped the 
 | [anvil-multi-server.md](plans/anvil-multi-server.md) | Multi-server fleet: one client, many Macs, one Max plan. |
 | [anvil-server-app.md](plans/anvil-server-app.md) | The macOS menu-bar control panel. |
 | [anvil-autopilot-ui.md](plans/anvil-autopilot-ui.md) · [anvil-todoist-integration.md](plans/anvil-todoist-integration.md) | The Todoist autopilot and its plan-review UI. |
+| [anvil-adversarial-pipeline.md](plans/anvil-adversarial-pipeline.md) | The OpenRouter/GLM integration, the adversarial planning panel + auto-start gates, and the 7-phase adversarial dev pipeline. |
+| [anvil-improvement-program.md](plans/anvil-improvement-program.md) | The test-first improvement program (audit + phased plan) this repo is executing. |
 | [anvil-restart-robustness.md](plans/anvil-restart-robustness.md) | Daemon restart / self-update safety. |
 | [file-browser-sftp.md](plans/file-browser-sftp.md) | Earlier file-browser thinking, now sourced from the daemon `fs.*` API. |
 

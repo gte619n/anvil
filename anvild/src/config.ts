@@ -34,6 +34,23 @@ function expandHome(p: string, home: string): string {
   return p.startsWith("~") ? home + p.slice(1) : p;
 }
 
+/** [BE-misc] Parse a numeric env var with validation — a typo must fail loudly at startup, not
+ *  silently become NaN (which would bind a garbage port or a NaN budget threshold). */
+function numEnv(
+  raw: string | undefined,
+  fallback: number,
+  label: string,
+  opts: { min?: number; max?: number; integer?: boolean } = {},
+): number {
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`invalid ${label}: ${JSON.stringify(raw)} is not a number`);
+  if (opts.integer && !Number.isInteger(n)) throw new Error(`invalid ${label}: ${raw} must be an integer`);
+  if (opts.min !== undefined && n < opts.min) throw new Error(`invalid ${label}: ${n} is below the minimum ${opts.min}`);
+  if (opts.max !== undefined && n > opts.max) throw new Error(`invalid ${label}: ${n} is above the maximum ${opts.max}`);
+  return n;
+}
+
 /** This host's Tailscale IPv4, if any: the CGNAT range 100.64.0.0/10 (second octet 64–127). Found
  *  from the OS network interfaces — no `tailscale` CLI needed. This is how the daemon makes itself
  *  reachable over the tailnet WITHOUT `tailscale serve` (which can fail per-machine). Binding to this
@@ -61,11 +78,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     .filter(Boolean);
   return {
     host,
-    port: Number(env.ANVIL_PORT ?? 7701),
+    port: numEnv(env.ANVIL_PORT, 7701, "ANVIL_PORT", { min: 1, max: 65535, integer: true }),
     stateDir: expandHome(env.ANVIL_STATE_DIR ?? "~/.anvil", home),
     clonesDir: expandHome(env.ANVIL_CLONES_DIR ?? "~/.anvil/repos", home),
-    warnFraction: Number(env.ANVIL_BUDGET_WARN ?? 0.8),
-    softStopFraction: Number(env.ANVIL_BUDGET_SOFTSTOP ?? 0.95),
+    warnFraction: numEnv(env.ANVIL_BUDGET_WARN, 0.8, "ANVIL_BUDGET_WARN", { min: 0, max: 1 }),
+    softStopFraction: numEnv(env.ANVIL_BUDGET_SOFTSTOP, 0.95, "ANVIL_BUDGET_SOFTSTOP", { min: 0, max: 1 }),
     openRouterApiKey,
     adversarialModels: adversarialModels.length ? adversarialModels : DEFAULT_ADVERSARIAL_MODELS,
     // On when a key is present, unless explicitly killed via ANVIL_ADVERSARIAL=0.

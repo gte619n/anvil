@@ -1,6 +1,10 @@
 import { test, expect } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { newTrace, recordAssignment, renderTraceRecord } from "../../src/pipeline/trace";
 import { AdversaryMetrics } from "../../src/pipeline/metrics";
+import { saveMetrics, loadMetrics } from "../../src/pipeline/metrics-store";
 
 // ── Trace record (§7) ──
 
@@ -76,4 +80,24 @@ test("metrics round-trip through JSON for cross-run persistence", () => {
   m.recordFirstPass("verification", "glm", true);
   const restored = AdversaryMetrics.fromJSON(m.toJSON());
   expect(restored.rejectionRate("verification", "glm")).toBe(1);
+});
+
+// ── Metrics persistence (§6.3) — the store BE-13 relies on to survive across runs ──
+test("saveMetrics/loadMetrics round-trips recorded first-pass tallies", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-metrics-"));
+  const m = new AdversaryMetrics();
+  m.recordFirstPass("requirements", "claude", true);
+  m.recordFirstPass("requirements", "claude", false);
+  m.recordFirstPass("design", "glm", true);
+  saveMetrics(dir, m);
+
+  const back = loadMetrics(dir);
+  expect(back.rejectionRate("requirements", "claude")).toBe(0.5);
+  expect(back.rejectionRate("design", "glm")).toBe(1);
+  expect(back.toJSON()).toEqual(m.toJSON()); // exact structural round-trip
+});
+
+test("loadMetrics returns empty (never throws) when the file is absent", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-metrics-empty-"));
+  expect(loadMetrics(dir).rejectionRate("requirements", "claude")).toBeUndefined();
 });

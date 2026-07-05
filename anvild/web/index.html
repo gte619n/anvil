@@ -54,7 +54,7 @@
             <button class="hbtn" id="btn-notify" title="Notifications" hidden><span class="msym">notifications_off</span></button>
           </span>
         </header>
-        <div id="offline-banner" class="offline-banner" hidden></div>
+        <div id="offline-banner" class="offline-banner" role="status" aria-live="polite" hidden></div>
         <div id="main-body">
           <div id="convo-col">
             <div id="conversation"></div>
@@ -96,7 +96,7 @@
     <div id="settings-root"></div>
     <div id="autopilot-root"></div>
     <div id="modal-root"></div>
-    <div id="toast"></div>
+    <div id="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/main.js"></script>
   </body>
 </html>
