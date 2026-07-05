@@ -280,6 +280,20 @@ function serverOfEnv(envId: string | null | undefined): Server {
 function sendTo(sessionId: string | null | undefined, cmd: Record<string, unknown> & { type: string }): boolean {
   return (serverOf(sessionId) ?? hub()).sock.send(cmd);
 }
+/**
+ * Make sure the daemon that owns `sessionId` is in the registry AND has a live socket, so opening
+ * one of its sessions actually delivers history. A member session can be tagged to a server the
+ * client knows from routing (persisted `sessionServer`) but never adopted this page-load — e.g. the
+ * fleet-member fetch hadn't landed yet, or its socket dropped. Without this, `sendTo` falls back to
+ * the hub, which doesn't own the session and answers "no such session" → a silently blank chat that
+ * only self-heals if that member happens to reconnect on its own. Adopt + force-reconnect so the
+ * `session.list` re-attach (in the `session.list` handler) can fire. No-op for hub sessions. */
+function ensureOwningServer(sessionId: string): void {
+  const url = sessionServer.get(sessionId);
+  if (!url) return; // owner unknown (optimistic local / not yet listed) — nothing to reconnect
+  const srv = serverByUrl(url) ?? ensureServer(url);
+  if (!srv.sock.isOpen()) srv.sock.connectNow();
+}
 const anyOpen = (): boolean => {
   for (const s of servers.values()) if (s.sock.isOpen()) return true;
   return false;
@@ -895,9 +909,10 @@ function handleSessionEvent(e: ServerEvent): void {
   }
   switch (e.type) {
     case "conversation.snapshot":
+      if (e.sessionId === activeId) clearAttachDiagnostic(); // history arrived — retire the blank-pane note
       clearConversation();
       replayingSnapshot = true;
-      e.events.forEach(renderConversationEvent);
+      renderSnapshotEvents(e.events);
       replayingSnapshot = false;
       // A replayed history has no `result` event, so the last turn's activity block was rebuilt
       // "live" — finalize it so it shows "Worked" instead of an eternally spinning "Working". If the
@@ -979,6 +994,36 @@ function renderConversationEvent(ev: ConversationEvent): void {
   else if (ev.kind === "assistant") commitAssistant(ev.blocks, ev.ts);
   else if (ev.kind === "tool_result") appendToolResult(ev.content, ev.isError);
   else if (ev.kind === "file_offer") appendFileOffer(ev.file);
+}
+
+/**
+ * Replay a full-history snapshot with per-event isolation. Previously a single un-renderable event
+ * (an unexpected block shape, a stricter WebView engine choking where desktop Chrome tolerates it)
+ * threw out of the forEach — and because the whole frame is handled inside `ws.onmessage`'s
+ * swallow-all try/catch, the ENTIRE conversation silently blanked. Isolating each event means one
+ * bad turn drops to a small placeholder instead of erasing all history; if every event fails we
+ * surface the reason rather than a mysterious void. (This was the phone "no threads" failure: fine
+ * in desktop Chrome, blank in the Android WebView.)
+ */
+function renderSnapshotEvents(events: ConversationEvent[]): void {
+  let failed = 0;
+  let lastErr: unknown;
+  for (const ev of events) {
+    try {
+      renderConversationEvent(ev);
+    } catch (err) {
+      failed++;
+      lastErr = err;
+      console.error("[snapshot] failed to render an event", ev?.kind, err);
+    }
+  }
+  if (failed) {
+    const note = document.createElement("div");
+    note.className = "attach-diag empty-state";
+    const detail = failed === events.length ? `history couldn't be rendered` : `${failed} of ${events.length} messages couldn't be shown`;
+    note.innerHTML = `<p class="small muted">${icon("warning")} ${esc(detail)}${lastErr ? ` — ${esc(String((lastErr as Error)?.message ?? lastErr))}` : ""}</p>`;
+    conversation.appendChild(note);
+  }
 }
 
 // ── Conversation rendering ─────────────────────────────────────────────────────
@@ -1442,6 +1487,7 @@ function renderEmptyState(): void {
 // content lands (see dropSessionHero in the content-append paths).
 function dropSessionHero(): void {
   conversation.querySelector(".session-hero")?.remove();
+  clearAttachDiagnostic(); // real content landed — retire any "couldn't load history" note
 }
 /** Show the hero iff `activeId` is set and the conversation holds nothing but (optionally) the hero. */
 function maybeShowSessionHero(): void {
@@ -1475,6 +1521,48 @@ function maybeShowSessionHero(): void {
     <div class="hero-meta">${chips}</div>
     <p class="hero-hint">${s.pending ? "Queued — will start when you're back online." : "Send a message to get started."}</p>`;
   conversation.appendChild(hero);
+}
+
+// ── Attach diagnostic ────────────────────────────────────────────────────────────
+// A session can appear in the sidebar (from cache or a peer's list) while the daemon that OWNS it
+// isn't reachable/attached from THIS client — most often a fleet member on a phone. The attach then
+// goes nowhere and the pane stays blank ("as if it has no chat"). Rather than a silent void, after a
+// grace period with no history we surface WHICH server owns it and its live socket state, so the
+// failure is legible instead of mysterious. Cleared the moment a snapshot (or any content) lands.
+let attachDiagTimer = 0;
+function armAttachDiagnostic(id: string): void {
+  clearTimeout(attachDiagTimer);
+  attachDiagTimer = window.setTimeout(() => maybeShowAttachDiagnostic(id), 6000);
+}
+function clearAttachDiagnostic(): void {
+  clearTimeout(attachDiagTimer);
+  conversation.querySelector(".attach-diag")?.remove();
+}
+function maybeShowAttachDiagnostic(id: string): void {
+  if (id !== activeId || snapshotLoaded.has(id)) return; // switched away, or history already arrived
+  // Any real content (a bubble/activity/card) means it's working — only the hero/empty may remain.
+  if ([...conversation.children].some((c) => !c.classList.contains("session-hero") && !c.classList.contains("empty-state") && !c.classList.contains("attach-diag"))) return;
+  const url = sessionServer.get(id);
+  const srv = url ? serverByUrl(url) : undefined;
+  const status = srv ? srv.status : url ? "unreachable" : "unknown";
+  const name = srv?.name ?? (url ? hostOf(url) : "its server");
+  const line =
+    status === "connected"
+      ? `Attached to ${esc(name)} but no history has arrived yet…`
+      : `This session lives on ${esc(name)} (${status}). Reconnecting…`;
+  conversation.querySelector(".attach-diag")?.remove();
+  const el = document.createElement("div");
+  el.className = "attach-diag empty-state";
+  el.innerHTML = `<p class="small muted">${icon("cloud_off")} ${line}</p><button class="mini" id="attach-diag-retry">${icon("refresh")} Retry</button>`;
+  el.querySelector("#attach-diag-retry")?.addEventListener("click", () => {
+    ensureOwningServer(id);
+    for (const s of servers.values()) s.sock.connectNow();
+    clearAttachDiagnostic();
+    snapshotLoaded.delete(id);
+    sendTo(id, { type: "session.attach", sessionId: id });
+    armAttachDiagnostic(id);
+  });
+  conversation.appendChild(el);
 }
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
@@ -3815,7 +3903,9 @@ export function selectSession(id: string, push = true): void {
   // Opening a session is acting on it — clear its push reminder on this device immediately (the
   // daemon also clears it everywhere when we attach below). (UI refinement §1)
   navigator.serviceWorker?.controller?.postMessage({ type: "close-notifications", sessionId: id });
+  ensureOwningServer(id); // wake/adopt the owning daemon so a member session's history actually loads
   sendTo(id, { type: "session.attach", sessionId: id }); // full snapshot (always show history)
+  armAttachDiagnostic(id); // if no history arrives, replace the blank pane with a legible reason
   if (isNarrow() && !ui.sidebarCollapsed) {
     ui.sidebarCollapsed = true;
     applySidebar(); // on a phone, get out of the way once you've picked a session
