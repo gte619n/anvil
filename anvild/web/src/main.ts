@@ -252,18 +252,29 @@ function removeServer(url: string): void {
   if (document.getElementById("server-cards")) renderServerCards(); // drop the card from an open Settings view
 }
 const hub = (): Server => servers.get(HUB_URL)!;
+/** Resolve a routing url to its live socket. The `servers` map is keyed by the url a server was
+ *  adopted under, but a session/env's stored routing url can DRIFT from it (a member reconnects under
+ *  a force-upgraded https:// while its rows were tagged http://, or a trailing-slash difference) — see
+ *  {@link sameServerUrl}. An exact miss then silently routed to the hub, which doesn't own the session
+ *  and answers "no such session": the conversation stays blank on the client that didn't create it.
+ *  Fall back to a scheme-insensitive match so a drifted url still finds the connected owner. */
+function serverByUrl(u: string | undefined): Server | undefined {
+  if (!u) return undefined;
+  const exact = servers.get(u);
+  if (exact) return exact;
+  for (const s of servers.values()) if (sameServerUrl(u, s.url)) return s;
+  return undefined;
+}
 function serverOf(sessionId: string | null | undefined): Server | undefined {
   if (!sessionId) return undefined;
-  const u = sessionServer.get(sessionId);
-  return u ? servers.get(u) : undefined;
+  return serverByUrl(sessionServer.get(sessionId));
 }
 function activeServer(): Server {
   return serverOf(activeId) ?? hub();
 }
 /** The server an environment lives on (its repos are local to that daemon). */
 function serverOfEnv(envId: string | null | undefined): Server {
-  const u = envId ? envServer.get(envId) : undefined;
-  return (u ? servers.get(u) : undefined) ?? hub();
+  return serverByUrl(envId ? envServer.get(envId) : undefined) ?? hub();
 }
 /** Route a session-scoped command to the daemon that owns the session (falls back to the hub). */
 function sendTo(sessionId: string | null | undefined, cmd: Record<string, unknown> & { type: string }): boolean {
