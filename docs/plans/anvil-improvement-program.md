@@ -114,9 +114,12 @@ design rather than an apparent gap.
 - ⏭️ **L4 (deferred/declined)** — removing `style` from DOMPurify `ADD_ATTR` would break KaTeX
   (which emits inline `style` for glyph positioning). Not a live injection (DOMPurify filters CSS),
   so the functional regression isn't worth it; left as-is.
-- ⏭️ **L5/L6 → Phase 4** — client-side streaming-markdown DOMPurify pass and `rel="noopener"` on
-  linkified output are pure web-client edits; folded into Phase 4 where the DOM test harness lands so
-  they ship test-first.
+- ✅ **L6 (done in Phase 4)** — `rel="noopener noreferrer"` on the two linkified `target="_blank"`
+  spots (git output, reader file-open), via a reusable tested `linkifyUrls` in `dom.ts` (4 tests).
+- ⏭️ **L5 (declined)** — the streaming markdown renderer already uses `html: false` (markdown-it
+  won't emit raw HTML, so injection is blocked) and the transient stream is replaced by the
+  daemon-DOMPurify-sanitized authoritative render on commit. DOMPurify isn't in the web bundle;
+  adding it for the transient path is disproportionate. Left as-is (like L4).
 
 ---
 

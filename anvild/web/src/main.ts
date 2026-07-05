@@ -4,7 +4,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { AnvilSocket } from "./ws";
 import { apiFetch, daemonBase } from "./api";
-import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, refreshSelect, sessIcon, slugify } from "./dom";
+import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, linkifyUrls, refreshSelect, sessIcon, slugify } from "./dom";
 import { currentTheme, resolveTheme, themePref, updateThemeControls } from "./theme";
 import type { ThemePref } from "./theme";
 import { ui } from "./state";
@@ -4033,7 +4033,7 @@ function renderReader(content: FileContent): void {
   } else if (content.binaryUrl) {
     const burl = serverApiUrl(activeServer().url, content.binaryUrl); // daemon-relative → absolute, routed to the session's server
     panelContent.innerHTML =
-      head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank">Open ${esc(content.path)}</a>`);
+      head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank" rel="noopener noreferrer">Open ${esc(content.path)}</a>`);
   }
   const back = document.getElementById("reader-back");
   if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
@@ -4319,7 +4319,7 @@ function showGitResult(e: GitResultEvent): void {
   const el = document.getElementById("git-output");
   if (!el) return;
   const head = e.ok ? "" : "⚠ failed\n";
-  el.innerHTML = esc(head + e.output).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+  el.innerHTML = linkifyUrls(head + e.output); // [SEC-L6] esc + safe new-tab links (rel=noopener)
 }
 
 $("#btn-new-topic").addEventListener("click", async () => {
