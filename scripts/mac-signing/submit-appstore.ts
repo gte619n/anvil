@@ -97,18 +97,37 @@ let versionId: string | undefined = evj.data?.[0]?.id;
 if (versionId) {
   console.error(`reusing existing App Store version ${VERSION} (${versionId})`);
 } else {
-  const created = await api(`/v1/appStoreVersions`, {
-    method: "POST",
-    body: JSON.stringify({
-      data: {
-        type: "appStoreVersions",
-        attributes: { platform: PLATFORM, versionString: VERSION, releaseType: "AFTER_APPROVAL" },
-        relationships: { app: { data: { type: "apps", id: appId } } },
-      },
-    }),
-  });
-  versionId = created.data.id;
-  console.error(`created App Store version ${VERSION} (${versionId})`);
+  // No version matches VERSION. Apple forbids CREATING a new version while an editable, never-
+  // released one already exists — e.g. the initial "1.0" record auto-created with a brand-new app
+  // listing, or a leftover draft on a different versionString. Creating a second one 409s
+  // ("cannot create a new version of the App in the current state"). So if an editable version
+  // exists, rename it to VERSION and reuse it; only create when there is genuinely none.
+  const EDITABLE = new Set([
+    "PREPARE_FOR_SUBMISSION", "DEVELOPER_REJECTED", "REJECTED", "METADATA_REJECTED", "INVALID_BINARY",
+  ]);
+  const allj = await api(`/v1/apps/${appId}/appStoreVersions?filter[platform]=${PLATFORM}&limit=20`);
+  const editable = (allj.data || []).find((v: any) => EDITABLE.has(v.attributes?.appStoreState));
+  if (editable) {
+    versionId = editable.id;
+    await api(`/v1/appStoreVersions/${versionId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { type: "appStoreVersions", id: versionId, attributes: { versionString: VERSION } } }),
+    });
+    console.error(`renamed existing version ${editable.attributes?.versionString} → ${VERSION} (${versionId}) [was ${editable.attributes?.appStoreState}]`);
+  } else {
+    const created = await api(`/v1/appStoreVersions`, {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          type: "appStoreVersions",
+          attributes: { platform: PLATFORM, versionString: VERSION, releaseType: "AFTER_APPROVAL" },
+          relationships: { app: { data: { type: "apps", id: appId } } },
+        },
+      }),
+    });
+    versionId = created.data.id;
+    console.error(`created App Store version ${VERSION} (${versionId})`);
+  }
 }
 
 // releaseType=AFTER_APPROVAL on an existing record too, so re-runs converge on auto-release.
