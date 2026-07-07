@@ -91,7 +91,11 @@ struct WebView {
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
             let u = navigationAction.request.url
-            if navigationAction.navigationType == .linkActivated, let u, u.scheme != WebView.scheme {
+            // The bundled UI lives on anvil-app://. Any MAIN-FRAME navigation to http(s) is leaving the
+            // app — a tapped external link, or an OAuth authorize page (e.g. lapo's Connect) — so open it
+            // in the system browser and keep the app intact to receive the result over its WebSocket.
+            let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+            if let u, isMainFrame, let scheme = u.scheme, scheme == "http" || scheme == "https" {
                 openExternal(u)
                 decisionHandler(.cancel)
                 return

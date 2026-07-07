@@ -156,6 +156,27 @@ test("discoverResource returns undefined when the extension is absent (falls bac
   }
 });
 
+test("registerClient posts RFC 7591 metadata and returns the issued credentials", async () => {
+  const realFetch = globalThis.fetch;
+  let captured: any;
+  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+    expect(String(url)).toBe("https://app.heylapo.com/oauth/register");
+    captured = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ client_id: "dyn-123", client_secret: "shh" }), { status: 201, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  try {
+    // A client with no clientId can still register (registration doesn't require one).
+    const client = new LapoClient({ ...cfg, clientId: undefined });
+    const reg = await client.registerClient({ registrationEndpoint: "https://app.heylapo.com/oauth/register", redirectUri: "https://host/api/integrations/lapo/callback" });
+    expect(reg).toEqual({ clientId: "dyn-123", clientSecret: "shh" });
+    expect(captured.redirect_uris).toEqual(["https://host/api/integrations/lapo/callback"]);
+    expect(captured.grant_types).toContain("authorization_code");
+    expect(captured.client_name).toBe("Anvil");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("a public client (no secret) is valid config", () => {
   const publicCfg: LapoConfig = { ...cfg, clientSecret: undefined };
   const url = new URL(new LapoClient(publicCfg).authorizeUrl({ redirectUri: "https://h/cb", state: "s" }));

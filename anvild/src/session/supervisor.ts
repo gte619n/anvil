@@ -64,7 +64,7 @@ import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
-import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint } from "../integrations/lapo";
+import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint, type LapoConfig } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
 import { resolveLapoConfig } from "../config";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
@@ -233,6 +233,9 @@ export class Supervisor {
     this.restore();
     this.startAutopilotScheduler();
     this.startPrStateSweeper();
+    // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
+    // the lapo status once discovery completes so an already-connected client sees the callback URL.
+    void this.selfBaseUrl().then(() => this.registry.toAll(this.lapoStatusEvent()));
   }
 
   /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether the
@@ -429,10 +432,12 @@ export class Supervisor {
   }
 
   // ── lapo integration (OAuth2 information-entry reports) ────────────────────
-  /** Current lapo connection state. `configured` is false when ANVIL_LAPO_* isn't set, so the UI can
-   *  show setup guidance instead of a dead Connect button. */
+  /** Current lapo connection state. `configured` is true unless lapo is explicitly disabled — a client
+   *  id is no longer required (the daemon dynamically registers one). `callbackUrl` is the OAuth redirect
+   *  the daemon will use (its own tailnet URL), shown in the UI so the user can register it if needed. */
   lapoStatusEvent(cid?: string): LapoStatusEvent {
     const state = this.integrations.lapo();
+    const callback = this.cachedCallbackUrl();
     return {
       v: PROTOCOL_VERSION,
       type: "lapo.status",
@@ -441,26 +446,59 @@ export class Supervisor {
       connected: !!state?.accessToken,
       configured: !!resolveLapoConfig(),
       ...(state?.account ? { account: state.account } : {}),
+      ...(callback ? { callbackUrl: callback } : {}),
     };
   }
 
-  /** Begin the OAuth authorization-code handshake: discover lapo's endpoints (RFC 8414), pick PKCE when
-   *  the server advertises it (or we have no client secret), stash a CSRF `state` + redirect_uri (+ the
-   *  discovered token endpoint / PKCE verifier), and return the authorize URL for the client to open.
-   *  The browser lands back on the daemon's callback (http.ts). */
+  /** The OAuth callback URL from the cached self base URL (or ANVIL_BASE_URL). Sync — reads the cache
+   *  populated by `selfBaseUrl()`; undefined until discovery has run once. */
+  private cachedCallbackUrl(): string | undefined {
+    const override = process.env.ANVIL_BASE_URL?.trim();
+    const base = override ? override.replace(/\/+$/, "") : this.selfBaseUrlCache?.url;
+    return base ? `${base}${LapoClient.callbackPath()}` : undefined;
+  }
+
+  /** The lapo config with the effective client id/secret filled in: from ANVIL_LAPO_CLIENT_ID if set,
+   *  else the dynamically-registered client. `undefined` only when lapo is disabled. */
+  private effectiveLapoConfig(): LapoConfig | undefined {
+    const base = resolveLapoConfig();
+    if (!base || base.clientId) return base;
+    const reg = this.integrations.lapoRegistration();
+    return reg ? { ...base, clientId: reg.clientId, ...(reg.clientSecret ? { clientSecret: reg.clientSecret } : {}) } : base;
+  }
+
+  /** Begin the OAuth authorization-code handshake. Uses the daemon's OWN self-discovered URL for the
+   *  redirect (the native shells' page origin is a local asset host, not reachable), discovers lapo's
+   *  endpoints (RFC 8414), dynamically registers a client (RFC 7591) if none is configured, picks PKCE,
+   *  stashes the handshake, and returns the authorize URL. The browser lands on the daemon's callback. */
   async beginLapoAuth(redirectBase: string, cid?: string): Promise<LapoAuthorizeEvent> {
-    const cfg = resolveLapoConfig();
-    if (!cfg) throw new BadCommand("lapo isn't configured on this server — set ANVIL_LAPO_CLIENT_ID (and, for a confidential client, ANVIL_LAPO_CLIENT_SECRET) and restart.");
-    const base = redirectBase.trim().replace(/\/+$/, "");
-    if (!/^https?:\/\//.test(base)) throw new BadCommand("a valid redirect origin is required to connect lapo");
-    const redirectUri = `${base}${LapoClient.callbackPath()}`;
-    const state = newId("lapoauth");
+    const baseCfg = resolveLapoConfig();
+    if (!baseCfg) throw new BadCommand("lapo is disabled on this server (ANVIL_LAPO_DISABLE).");
+    // The redirect MUST be the daemon's own URL — a client page origin is a local asset host in the
+    // native shells (appassets.androidplatform.net / anvil-app://), which lapo can't reach.
+    const self = (await this.selfBaseUrl()) ?? redirectBase.trim().replace(/\/+$/, "");
+    if (!/^https?:\/\//.test(self)) throw new BadCommand("couldn't determine this server's URL for the OAuth redirect — set ANVIL_BASE_URL.");
+    const redirectUri = `${self}${LapoClient.callbackPath()}`;
+
+    const disco = new LapoClient(baseCfg);
+    const meta = await disco.discover();
+
+    // Resolve a client id: env → stored registration (matching this redirect) → dynamic registration.
+    let cfg = this.effectiveLapoConfig()!;
+    const reg = this.integrations.lapoRegistration();
+    if (!baseCfg.clientId && (!reg || reg.redirectUri !== redirectUri)) {
+      const regEndpoint = meta?.registrationEndpoint;
+      if (!regEndpoint) throw new BadCommand("this lapo doesn't advertise dynamic registration — set ANVIL_LAPO_CLIENT_ID.");
+      const registered = await disco.registerClient({ registrationEndpoint: regEndpoint, redirectUri, scope: baseCfg.scope });
+      this.integrations.setLapoRegistration({ ...registered, redirectUri });
+      cfg = { ...baseCfg, clientId: registered.clientId, ...(registered.clientSecret ? { clientSecret: registered.clientSecret } : {}) };
+    }
+    if (!cfg.clientId) throw new BadCommand("lapo has no client id.");
+
     const client = new LapoClient(cfg);
-    const meta = await client.discover();
-    // Use PKCE when the server advertises S256, or whenever there's no client secret (a public client
-    // MUST PKCE). Harmless when the server ignores it.
     const usePkce = (meta?.codeChallengeMethodsSupported?.includes("S256") ?? false) || !cfg.clientSecret;
     const pkce = usePkce ? LapoClient.generatePkce() : undefined;
+    const state = newId("lapoauth");
     this.integrations.setLapoPendingAuth(state, redirectUri, {
       ...(pkce ? { codeVerifier: pkce.verifier } : {}),
       ...(meta?.tokenEndpoint ? { tokenEndpoint: meta.tokenEndpoint } : {}),
@@ -479,8 +517,8 @@ export class Supervisor {
    *  broadcast the connected status. Throws BadCommand on a bad/expired handshake or a rejected
    *  exchange. Returns the account label for the callback page. */
   async completeLapoAuth(code: string, state: string): Promise<{ account?: string }> {
-    const cfg = resolveLapoConfig();
-    if (!cfg) throw new BadCommand("lapo isn't configured on this server");
+    const cfg = this.effectiveLapoConfig();
+    if (!cfg?.clientId) throw new BadCommand("lapo isn't ready — start again from Settings → Integrations.");
     const pending = this.integrations.consumeLapoPendingAuth(state);
     if (!pending) throw new BadCommand("this lapo authorization link has expired or didn't match — start again from Settings → Integrations.");
     const client = new LapoClient(cfg);
@@ -543,7 +581,7 @@ export class Supervisor {
     startedIds: Set<string>;
     trigger: "scheduled" | "manual";
   }): Promise<void> {
-    const cfg = resolveLapoConfig();
+    const cfg = this.effectiveLapoConfig();
     if (!cfg || !this.integrations.isLapoConnected()) return;
     const client = new LapoClient(cfg);
     const appBaseUrl = await this.selfBaseUrl(); // deep-link target back into this daemon's Autopilot view

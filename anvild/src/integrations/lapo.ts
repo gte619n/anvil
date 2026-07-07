@@ -30,8 +30,9 @@ export const DEFAULT_LAPO_SCOPE = "journal.append documents.write";
 export interface LapoConfig {
   /** Base origin, no trailing slash — e.g. `https://app.heylapo.com`. Discovery + all paths hang off it. */
   baseUrl: string;
-  /** OAuth client id registered with lapo for this daemon. */
-  clientId: string;
+  /** OAuth client id. Optional — when absent the daemon dynamically registers one (RFC 7591) and the
+   *  supervisor fills this in before any authorize/token call. */
+  clientId?: string;
   /** OAuth client secret — omit for a public (PKCE) client. */
   clientSecret?: string;
   /** Authorize endpoint FALLBACK, used only when discovery fails. Default `/oauth/authorize`. */
@@ -133,10 +134,38 @@ export class LapoClient {
     private readonly signal?: AbortSignal,
   ) {}
 
-  /** The redirect_uri lapo will send the browser back to — the daemon's own callback, same origin as
-   *  the web client that started the flow. Must be registered as an allowed redirect on lapo's side. */
+  /** The redirect_uri lapo will send the browser back to — the daemon's own callback. Built from the
+   *  daemon's self-discovered base URL (NOT the client origin, which is a local asset host in the native
+   *  shells). Registered with lapo automatically as part of dynamic client registration. */
   static callbackPath(): string {
     return "/api/integrations/lapo/callback";
+  }
+
+  /** The client id, throwing if it hasn't been resolved yet (env or dynamic registration). */
+  private get clientId(): string {
+    if (!this.cfg.clientId) throw new LapoError("lapo client_id is not set (registration missing)");
+    return this.cfg.clientId;
+  }
+
+  /**
+   * Dynamically register an OAuth client with lapo (RFC 7591) so no client_id needs to be provisioned by
+   * hand. Returns the issued client_id (+ client_secret when lapo issues a confidential client). The
+   * `redirectUri` is registered as an allowed redirect in the same call, so there's no manual step.
+   */
+  async registerClient(opts: { registrationEndpoint: string; redirectUri: string; scope?: string }): Promise<{ clientId: string; clientSecret?: string }> {
+    const body = {
+      client_name: "Anvil",
+      redirect_uris: [opts.redirectUri],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      scope: opts.scope ?? this.cfg.scope ?? DEFAULT_LAPO_SCOPE,
+      token_endpoint_auth_method: "client_secret_post",
+    };
+    const res = await this.fetch(opts.registrationEndpoint, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body) }, DISCOVERY_TIMEOUT_MS);
+    if (!res.ok) throw await this.error("register", opts.registrationEndpoint, res);
+    const data = (await res.json().catch(() => ({}))) as { client_id?: string; client_secret?: string };
+    if (!data.client_id) throw new LapoError("lapo registration returned no client_id", res.status);
+    return { clientId: data.client_id, ...(data.client_secret ? { clientSecret: data.client_secret } : {}) };
   }
 
   /** Generate a fresh PKCE pair (S256). Stored in the pending handshake and replayed at token exchange. */
@@ -306,7 +335,7 @@ export class LapoClient {
     const endpoint = opts.authorizationEndpoint ?? this.url(this.cfg.authorizePath);
     const params = new URLSearchParams({
       response_type: "code",
-      client_id: this.cfg.clientId,
+      client_id: this.clientId,
       redirect_uri: opts.redirectUri,
       scope: this.cfg.scope ?? DEFAULT_LAPO_SCOPE,
       state: opts.state,
@@ -380,7 +409,7 @@ export class LapoClient {
   private async tokenRequest(tokenEndpoint: string | undefined, fields: Record<string, string>): Promise<LapoTokens> {
     const form = new URLSearchParams({
       ...fields,
-      client_id: this.cfg.clientId,
+      client_id: this.clientId,
       ...(this.cfg.clientSecret ? { client_secret: this.cfg.clientSecret } : {}),
     });
     const endpoint = tokenEndpoint ?? this.url(this.cfg.tokenPath);

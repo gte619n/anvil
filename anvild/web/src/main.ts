@@ -841,7 +841,7 @@ function onEvent(url: string, e: ServerEvent): void {
     case "lapo.status":
       // Lapo is hub-scoped (tokens live on the hub daemon; the card routes to hub()). Ignore a fleet
       // member's own status so a member that isn't configured can't clobber the hub's "connected".
-      if (url === HUB_URL) onLapoStatus(e.connected, e.configured, e.account);
+      if (url === HUB_URL) onLapoStatus(e.connected, e.configured, e.account, e.callbackUrl);
       return;
     case "lapo.authorize":
       return; // resolved via cidWaiter (connectLapo)
@@ -2199,13 +2199,15 @@ function selectSettingsTab(tab: SettingsTab): void {
 // ── Lapo integration (OAuth2 information-entry reports) ────────────────────────────
 let lapoConnected = false;
 let lapoConfigured = false;
-let lapoStatusKnown = false; // avoid a "not configured" flash before the first status arrives
+let lapoStatusKnown = false; // avoid a flash before the first status arrives
 let lapoAccount: string | undefined;
+let lapoCallbackUrl: string | undefined; // the daemon's own OAuth redirect (shown for transparency)
 
-function onLapoStatus(connected: boolean, configured: boolean, account?: string): void {
+function onLapoStatus(connected: boolean, configured: boolean, account?: string, callbackUrl?: string): void {
   lapoConnected = connected;
   lapoConfigured = configured;
   lapoAccount = account;
+  lapoCallbackUrl = callbackUrl;
   lapoStatusKnown = true;
   if (document.getElementById("lapo-panel")) renderLapoPanel();
 }
@@ -2214,7 +2216,12 @@ function onLapoStatus(connected: boolean, configured: boolean, account?: string)
  *  async round-trip and blocked), asks the daemon for the authorize URL, then points the popup at it.
  *  The daemon's callback finishes the exchange and broadcasts lapo.status, which updates this card. */
 async function connectLapo(btn?: HTMLButtonElement): Promise<void> {
-  const popup = window.open("about:blank", "lapo-oauth", "width=560,height=720");
+  // In the native shells the UI is served from a local origin (anvil-app:// / appassets.androidplatform.net);
+  // a popup WKWebView/WebView is janky, so navigate instead — the shell routes the off-origin authorize
+  // URL to the system browser, keeping the app intact to receive the result over its WebSocket. In a real
+  // browser, use a popup so the app page stays put.
+  const nativeShell = location.protocol === "anvil-app:" || location.hostname === "appassets.androidplatform.net";
+  const popup = nativeShell ? null : window.open("about:blank", "lapo-oauth", "width=560,height=720");
   const label = btn?.textContent ?? "";
   if (btn) {
     btn.disabled = true;
@@ -2256,18 +2263,15 @@ function renderLapoPanel(): void {
     return;
   }
   if (!lapoConfigured) {
-    host.innerHTML = `<div class="card"><b>Not configured.</b>
-      <p class="small muted">Set the Lapo OAuth client on the hub daemon (in its launcher env), then restart it. Only the client id is required — the base URL defaults to <code>app.heylapo.com</code> and the OAuth endpoints are discovered automatically. Omit the secret for a public (PKCE) client:</p>
-      <pre class="small" style="white-space:pre-wrap;user-select:all">ANVIL_LAPO_CLIENT_ID=…
-ANVIL_LAPO_CLIENT_SECRET=…   # optional (confidential client)</pre>
-      <p class="small muted">Optional overrides: <code>ANVIL_LAPO_BASE_URL</code>, <code>ANVIL_LAPO_ENTRY_PATH</code>, <code>ANVIL_LAPO_SCOPE</code>, <code>ANVIL_LAPO_COLLECTION</code> (and <code>ANVIL_LAPO_AUTHORIZE_PATH</code>/<code>_TOKEN_PATH</code> as discovery fallbacks). Register <code>${esc(window.location.origin)}/api/integrations/lapo/callback</code> as an allowed redirect in Lapo.</p></div>`;
+    host.innerHTML = `<div class="card"><b>Disabled.</b>
+      <p class="small muted">The Lapo integration is turned off on the hub daemon (<code>ANVIL_LAPO_DISABLE=1</code>).</p></div>`;
     return;
   }
   if (!lapoConnected) {
     host.innerHTML = `<div class="card"><b>Not connected.</b>
-      <p class="small muted">Authorize Anvil to post information entries to your Lapo instance.</p>
+      <p class="small muted">Authorize Anvil to post autopilot reports to your Lapo account. No setup needed — Anvil registers itself with Lapo and you approve the sign-in. It authorizes against <b>your</b> Lapo user; the token is stored on the hub daemon (mode 0600).</p>
       <div class="lapo-connect"><button id="lapo-connect" class="primary">Connect Lapo</button></div>
-      <p class="small muted" style="margin-top:8px">Opens Lapo's authorization page in a popup. Tokens are stored on the hub daemon (mode 0600).</p></div>`;
+      ${lapoCallbackUrl ? `<p class="small muted" style="margin-top:8px">OAuth redirect: <code>${esc(lapoCallbackUrl)}</code></p>` : ""}</div>`;
     $<HTMLButtonElement>("#lapo-connect").addEventListener("click", (ev) => void connectLapo(ev.currentTarget as HTMLButtonElement));
     return;
   }
