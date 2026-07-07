@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
-# anvild macOS service manager (arch §3/§5, impl plan 6).
-#   ./scripts/service.sh install     # install + load the LaunchAgent, build web, wire tailscale
-#   ./scripts/service.sh uninstall   # bootout + remove plist/launcher (keeps state)
-#   ./scripts/service.sh restart     # rebuild the web bundle + kickstart the service (full deploy)
+# anvild service manager (arch §3/§5, impl plan 6). Cross-platform: macOS uses a launchd
+# LaunchAgent; Linux (Fedora/CentOS/Ubuntu/…) uses a systemd --user service. The daemon code,
+# launcher, env file (~/.config/anvil/env) and state dir are identical on both — only the
+# service-manager wiring differs, and that's isolated in the svc_* functions below.
+#   ./scripts/service.sh install     # install + load the service, build web, wire tailscale
+#   ./scripts/service.sh uninstall   # unload + remove unit/launcher (keeps state)
+#   ./scripts/service.sh restart     # rebuild the web bundle + restart the service (full deploy)
 #   ./scripts/service.sh status      # service state + /api/health
 #   ./scripts/service.sh logs        # tail the daemon log
 #
 # DEPLOY NOTE (why `restart` rebuilds web): the daemon serves the *built* web bundle from
 # web/dist (see src/server/http.ts WEB_DIR). The daemon itself runs from TS source, so a bare
-# kickstart picks up daemon code changes — but it does NOT regenerate web/dist. For a long time
-# `restart` only kickstarted, so a `git pull` + `restart` shipped new daemon code while silently
+# restart picks up daemon code changes — but it does NOT regenerate web/dist. For a long time
+# `restart` only restarted, so a `git pull` + `restart` shipped new daemon code while silently
 # serving the OLD web UI (the classic "my change merged but the dropdown/button isn't there"
 # symptom). `restart` now runs `build:web` first so a pull+restart is a true full deploy. To
 # verify the web change actually shipped, query the running daemon (not the browser, which the
@@ -25,8 +28,28 @@ BIN_DIR="$HOME/.local/bin"
 LAUNCHER="$BIN_DIR/anvild-launch"
 STATE_DIR="$HOME/.local/state/anvil"
 CONFIG_ENV="$HOME/.config/anvil/env"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-DOMAIN="gui/$(id -u)"
+
+# --- Per-OS service-manager config (see svc_* functions for the behaviour that hangs off these) ---
+OS="$(uname -s)"
+case "$OS" in
+  Darwin)
+    MANAGED="launchd"
+    PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+    UNIT_DIR="$(dirname "$PLIST")"
+    DOMAIN="gui/$(id -u)"
+    # launchd launcher PATH: Homebrew (Apple silicon + Intel) then the base system dirs.
+    LAUNCHER_PATH='export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"'
+    ;;
+  Linux)
+    MANAGED="systemd"
+    UNIT_DIR="$HOME/.config/systemd/user"
+    UNIT="$UNIT_DIR/$LABEL.service"
+    # systemd launcher PATH: user bins then the base system dirs (no Homebrew).
+    LAUNCHER_PATH='export PATH="$HOME/.bun/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"'
+    ;;
+  *)
+    echo "error: unsupported OS '$OS' (this installer supports macOS and Linux)"; exit 1 ;;
+esac
 
 find_bun() {
   command -v bun 2>/dev/null && return 0
@@ -45,7 +68,7 @@ find_bun() {
 # prebuilt web/dist (Provision copies it into the install root) and build.ts swaps atomically — a
 # failed build leaves the existing dist untouched. So if install/build fails but a usable bundle is
 # already present, warn and carry on with it; only hard-fail when there's no dist to serve at all.
-# (Before this, `set -e` let a failed `build:web` abort `do_install` *before* the LaunchAgent was
+# (Before this, `set -e` let a failed `build:web` abort `do_install` *before* the service was
 # bootstrapped — a transient build error left the daemon dead and fleet clients stuck "connecting".)
 build_web() {
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
@@ -71,16 +94,24 @@ build_web() {
 
 # This host's Tailscale IPv4 (100.64.0.0/10), if any. Found from interfaces, so it works even when
 # the `tailscale` CLI doesn't (the App Store build). Used as the plain-HTTP bind/URL fallback.
+# Prefer `ip` (standard on modern Linux; net-tools/ifconfig is often absent) and fall back to
+# `ifconfig` (always present on macOS).
 tailnet_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+      | awk '/^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./{print; exit}'
+    return
+  fi
   ifconfig 2>/dev/null | awk '/inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./{print $2; exit}'
 }
 
-# Locate a usable `tailscale` CLI (matches the daemon's TAILSCALE_BINS search order). Empty if none.
+# Locate a usable `tailscale` CLI (matches the daemon's TAILSCALE_BINS search order: PATH first,
+# then Linux/Homebrew locations, then the macOS App bundle). Empty if none.
 TAILSCALE_BIN=""
 resolve_tailscale() {
   [ -n "$TAILSCALE_BIN" ] && { echo "$TAILSCALE_BIN"; return 0; }
   local c
-  for c in tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+  for c in tailscale /usr/bin/tailscale /usr/local/bin/tailscale /opt/homebrew/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
     if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then TAILSCALE_BIN="$c"; echo "$c"; return 0; fi
   done
   return 1
@@ -141,15 +172,143 @@ free_port() {
   sleep 0.5
 }
 
+# ------------------------------------------------------------------------------------------------
+# Service-manager abstraction. Everything OS-specific lives here so do_install / the command
+# dispatch stay OS-agnostic. Darwin → launchd (launchctl + plist); Linux → systemd --user.
+# ------------------------------------------------------------------------------------------------
+
+# Preflight: the target manager must actually be usable. Fail early with an actionable message.
+svc_preflight() {
+  case "$OS" in
+    Linux)
+      command -v systemctl >/dev/null 2>&1 || {
+        echo "error: systemctl not found — the Linux installer needs systemd (Fedora/CentOS/Ubuntu ship it)"; exit 1; }
+      # `systemctl --user` needs a running per-user systemd instance (XDG_RUNTIME_DIR + user bus).
+      # It's present on desktop logins and on SSH sessions once lingering is enabled; probe for it.
+      systemctl --user show-environment >/dev/null 2>&1 || {
+        echo "error: no systemd --user instance for this session (is XDG_RUNTIME_DIR set / are you logged in as this user?)."
+        echo "  If installing over SSH, first enable it:  loginctl enable-linger \"$(id -un)\"  then log in again."
+        exit 1; }
+      ;;
+  esac
+}
+
+# Write the service unit (plist / .service) that runs $LAUNCHER. No secrets here — the launcher
+# sources them from ~/.config/anvil/env. Logs go to the same files on both platforms so
+# report_unhealthy works uniformly.
+svc_write_unit() {
+  case "$OS" in
+    Darwin)
+      cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$LAUNCHER</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>WorkingDirectory</key><string>$ANVILD_DIR</string>
+  <key>StandardOutPath</key><string>$STATE_DIR/anvild.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/anvild.error.log</string>
+</dict>
+</plist>
+PLISTEOF
+      ;;
+    Linux)
+      # Restart=always mirrors launchd KeepAlive. append: (systemd v240+, fine on modern
+      # Fedora/CentOS Stream/Ubuntu) mirrors the plist's Std*Path so report_unhealthy reads the
+      # same files. default.target is the user-session equivalent of RunAtLoad.
+      cat > "$UNIT" <<UNITEOF
+[Unit]
+Description=Anvil daemon (anvild)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$LAUNCHER
+WorkingDirectory=$ANVILD_DIR
+Restart=always
+RestartSec=5
+StandardOutput=append:$STATE_DIR/anvild.log
+StandardError=append:$STATE_DIR/anvild.error.log
+
+[Install]
+WantedBy=default.target
+UNITEOF
+      ;;
+  esac
+}
+
+# (Re)load the unit and start a fresh instance.
+svc_bootstrap() {
+  case "$OS" in
+    Darwin)
+      free_port
+      launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
+      launchctl bootstrap "$DOMAIN" "$PLIST"
+      launchctl kickstart -k "$DOMAIN/$LABEL"
+      ;;
+    Linux)
+      free_port
+      systemctl --user daemon-reload
+      systemctl --user enable "$LABEL.service" >/dev/null 2>&1 || true
+      systemctl --user restart "$LABEL.service"
+      # Keep the daemon alive after logout / start it at boot. Needs polkit auth; best-effort so a
+      # desktop install (where the session keeps the user manager up anyway) never hard-fails here.
+      loginctl enable-linger "$(id -un)" >/dev/null 2>&1 \
+        || echo "note: couldn't enable linger — the daemon may stop when you log out. Run: loginctl enable-linger \"$(id -un)\""
+      ;;
+  esac
+}
+
+# Restart the already-installed service in place (used by `restart`, and matches selfupdate.ts).
+svc_restart_only() {
+  case "$OS" in
+    Darwin) launchctl kickstart -k "$DOMAIN/$LABEL" ;;
+    Linux)  systemctl --user restart "$LABEL.service" ;;
+  esac
+}
+
+svc_uninstall() {
+  case "$OS" in
+    Darwin)
+      launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
+      rm -f "$PLIST" "$LAUNCHER"
+      ;;
+    Linux)
+      systemctl --user disable --now "$LABEL.service" 2>/dev/null || true
+      rm -f "$UNIT" "$LAUNCHER"
+      systemctl --user daemon-reload 2>/dev/null || true
+      ;;
+  esac
+}
+
+svc_status() {
+  case "$OS" in
+    Darwin) launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded" ;;
+    Linux)  systemctl --user status "$LABEL.service" --no-pager 2>/dev/null | grep -E 'Active:|Main PID:' || echo "not loaded" ;;
+  esac
+}
+
+# True iff this install chose serve mode (loopback bind). Re-asserting `tailscale serve` in
+# direct-bind mode would create a tailnet :PORT listener that collides with the daemon's own bind.
+launcher_is_serve_mode() {
+  grep -q 'ANVIL_HOST=127.0.0.1' "$LAUNCHER" 2>/dev/null
+}
+
 do_install() {
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
+  svc_preflight
   [ -f "$CONFIG_ENV" ] || {
     echo "error: missing $CONFIG_ENV"
     echo "  Run:  claude setup-token"
     echo "  Then: mkdir -p ~/.config/anvil && umask 077 && printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' '<token>' > $CONFIG_ENV"
     exit 1
   }
-  mkdir -p "$BIN_DIR" "$STATE_DIR" "$(dirname "$PLIST")"
+  mkdir -p "$BIN_DIR" "$STATE_DIR" "$UNIT_DIR"
 
   build_web
 
@@ -170,10 +329,11 @@ do_install() {
   local host_export=""
   [ "$SERVE_OK" = "1" ] && host_export="export ANVIL_HOST=127.0.0.1"
 
-  # launcher — sources the OAuth token, guarantees no metered key reaches the daemon (arch §3)
+  # launcher — sources the OAuth token, guarantees no metered key reaches the daemon (arch §3).
+  # Identical shape on macOS/Linux; only $LAUNCHER_PATH and $MANAGED differ (set per-OS above).
   cat > "$LAUNCHER" <<LAUNCH
 #!/bin/sh
-export PATH="\$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+$LAUNCHER_PATH
 set -a
 [ -f "\$HOME/.config/anvil/env" ] && . "\$HOME/.config/anvil/env"
 set +a
@@ -184,33 +344,13 @@ unset ANTHROPIC_AUTH_TOKEN
 # tailnet IP directly over plain HTTP (auto-detected, App-Store-Tailscale safe). ANVIL_HOST overrides.
 $host_export
 export ANVIL_PORT=$PORT
-export ANVIL_MANAGED=launchd
+export ANVIL_MANAGED=$MANAGED
 exec "$bun" run "$ANVILD_DIR/src/main.ts"
 LAUNCH
   chmod 755 "$LAUNCHER"
 
-  # LaunchAgent (no secrets in the plist — they come from the launcher)
-  cat > "$PLIST" <<PLISTEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array><string>$LAUNCHER</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>5</integer>
-  <key>WorkingDirectory</key><string>$ANVILD_DIR</string>
-  <key>StandardOutPath</key><string>$STATE_DIR/anvild.log</string>
-  <key>StandardErrorPath</key><string>$STATE_DIR/anvild.error.log</string>
-</dict>
-</plist>
-PLISTEOF
-
-  free_port
-  launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
-  launchctl bootstrap "$DOMAIN" "$PLIST"
-  launchctl kickstart -k "$DOMAIN/$LABEL"
+  svc_write_unit
+  svc_bootstrap
 
   if wait_health; then
     echo "healthy: $(curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health")"
@@ -232,21 +372,20 @@ PLISTEOF
     local ip; ip="$(tailnet_ip)"
     [ -n "$ip" ] && echo "URL: http://$ip:$PORT/  (the MagicDNS name forces HTTPS in browsers — use the IP for plain HTTP)"
   fi
-  echo "installed $LABEL  (logs: $STATE_DIR/anvild.log)"
+  echo "installed $LABEL ($MANAGED)  (logs: $STATE_DIR/anvild.log)"
 }
 
 case "${1:-install}" in
   install)   do_install ;;
-  uninstall) launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true; rm -f "$PLIST" "$LAUNCHER"; echo "removed $LABEL (state kept at $STATE_DIR)" ;;
+  uninstall) svc_uninstall; echo "removed $LABEL (state kept at $STATE_DIR)" ;;
   restart)
     build_web
-    # Re-assert `tailscale serve` only if this install chose serve mode (loopback bind); doing it in
-    # direct-bind mode would create a tailnet :PORT listener that collides with the daemon's own bind.
-    grep -q 'ANVIL_HOST=127.0.0.1' "$LAUNCHER" 2>/dev/null && setup_serve >/dev/null 2>&1 || true
-    launchctl kickstart -k "$DOMAIN/$LABEL"
+    # Re-assert `tailscale serve` only if this install chose serve mode (see launcher_is_serve_mode).
+    launcher_is_serve_mode && setup_serve >/dev/null 2>&1 || true
+    svc_restart_only
     if wait_health; then echo "restarted, healthy"; else report_unhealthy; exit 1; fi
     ;;
-  status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || echo "not loaded"; { curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health" 2>/dev/null; } && echo || echo "no health" ;;
+  status)    svc_status; { curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health" 2>/dev/null; } && echo || echo "no health" ;;
   logs)      tail -n 80 -f "$STATE_DIR/anvild.log" ;;
   *) echo "usage: service.sh {install|uninstall|restart|status|logs}"; exit 1 ;;
 esac

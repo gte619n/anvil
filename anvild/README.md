@@ -64,21 +64,30 @@ bundle via `web/bundle-native.ts`.
 
 ---
 
-## Service (macOS LaunchAgent)
+## Service (macOS launchd / Linux systemd)
+
+`service.sh` is cross-platform: on macOS it manages a launchd **LaunchAgent**, and on Linux
+(Fedora / CentOS / Ubuntu / …) a **systemd `--user`** service. The commands are identical:
 
 ```sh
-./scripts/service.sh install     # build web, install + load the LaunchAgent, wire tailscale serve
+./scripts/service.sh install     # build web, install + load the service, wire tailscale serve
 ./scripts/service.sh status      # service state + /api/health
-./scripts/service.sh restart     # kickstart (forces past launchd's restart backoff)
+./scripts/service.sh restart     # rebuild web + restart the service (full deploy)
 ./scripts/service.sh logs        # tail the daemon log
-./scripts/service.sh uninstall   # bootout + remove plist/launcher (keeps state)
+./scripts/service.sh uninstall   # unload + remove the unit/launcher (keeps state)
 ```
 
 `install` lays down `~/.local/bin/anvild-launch` (sources `~/.config/anvil/env` and unsets
-`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`) and
-`~/Library/LaunchAgents/com.anvil.anvild.plist` (`RunAtLoad` + `KeepAlive`). No secrets live
-in the plist; logs go to `~/.local/state/anvil/`. The service starts at login and restarts
-on crash.
+`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`) plus the service unit — on macOS
+`~/Library/LaunchAgents/com.anvil.anvild.plist` (`RunAtLoad` + `KeepAlive`), on Linux
+`~/.config/systemd/user/com.anvil.anvild.service` (`WantedBy=default.target` + `Restart=always`).
+No secrets live in the unit; logs go to `~/.local/state/anvil/` on both. The service starts at
+login and restarts on crash.
+
+> **Linux prerequisites:** [Bun](https://bun.sh) ≥ 1.3.14, a running systemd `--user` instance,
+> and — for the daemon to survive logout / start at boot — user lingering
+> (`loginctl enable-linger "$USER"`; `install` attempts this for you). Installing over SSH?
+> Enable lingering first, then reconnect, so `systemctl --user` has a session bus.
 
 > The daemon runs with `settingSources: []`, so it does **not** inherit your ambient Claude
 > Code allow-rules — the daemon is the permission authority. Trade-off: the repo's
