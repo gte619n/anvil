@@ -4926,6 +4926,14 @@ const AUTONOMY_PICKER = `<label>Autonomy<select id="ns-auto">
 const selectedAutonomy = (): AutonomyPolicy =>
   ((document.getElementById("ns-auto") as HTMLSelectElement | null)?.value as AutonomyPolicy) || DEFAULT_AUTONOMY;
 
+// Opt-in adversarial plan review: when the session plans, competing models critique the plan before
+// it runs (the autopilot panel, in a session). Off by default; needs an OpenRouter key on the server.
+const ADVERSARIAL_PICKER = `<label class="cd-option"><input type="checkbox" id="ns-adv" />
+  <span>Adversarial plan review <span class="small muted">— competing models critique each plan (needs an OpenRouter key)</span></span></label>`;
+/** Whether the open dialog's adversarial-review checkbox is ticked (false if it isn't present). */
+const selectedAdversarial = (): boolean =>
+  (document.getElementById("ns-adv") as HTMLInputElement | null)?.checked ?? false;
+
 /** A server picker for the browse-based modals (add-env, one-off). Hidden when there's one server. */
 function serverPickerMarkup(): string {
   const list = orderedServers();
@@ -5004,6 +5012,7 @@ function showNewSession(): void {
       <p class="small muted" id="ns-note"></p>
       <p class="small warn-text" id="ns-warn"></p>
       ${AUTONOMY_PICKER}
+      ${ADVERSARIAL_PICKER}
       <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-create">Create</button></div>
       <p class="small muted"><a id="ns-manage" href="#">⚙ Manage environments…</a> · <a id="ns-oneoff" href="#">one-off folder…</a></p></div>`;
   }
@@ -5072,6 +5081,7 @@ function showNewSession(): void {
       environmentId: env.id,
       model: DEFAULT_MODEL,
       autonomy: selectedAutonomy(),
+      adversarialReview: selectedAdversarial(),
     };
     const cid = newCid();
     const cmd = env.isRepo
@@ -5311,6 +5321,7 @@ function showOneOff(): void {
     ${serverPickerMarkup()}
     ${browserMarkup()}
     ${AUTONOMY_PICKER}
+    ${ADVERSARIAL_PICKER}
     <div class="btns"><button type="button" id="oo-back">Back</button><button type="button" id="oo-create">Open here</button></div></div>`;
   showModal(m);
   wireServerPicker();
@@ -5325,6 +5336,7 @@ function showOneOff(): void {
       cwd: browse.path,
       model: DEFAULT_MODEL,
       autonomy: selectedAutonomy(),
+      adversarialReview: selectedAdversarial(),
     });
     closeModal();
   };

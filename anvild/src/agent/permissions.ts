@@ -55,15 +55,41 @@ const SUGGESTIONS = (tool: string): PermissionSuggestion[] => [
 ];
 
 /**
+ * Called when the model asks to leave plan mode (ExitPlanMode) with its finished plan. Lets the
+ * daemon run the adversarial panel over the plan before it's approved (advisory only — see the
+ * supervisor's planReviewer). Awaited so the critique lands before execution; must never throw.
+ */
+export type PlanProposedHook = (plan: string) => Promise<void>;
+
+/**
  * The authoritative permission gate (arch §6.6). Registered as a `PreToolUse` hook so it
  * fires on EVERY tool — making the daemon's autonomy policy + danger list govern all tools,
  * rather than deferring to the CLI's own heuristics (which `canUseTool` alone does not).
+ *
+ * `onPlanProposed`, when set, runs the adversarial plan review the moment the model calls
+ * ExitPlanMode and BEFORE the normal permission decision, so the panel's verdict is surfaced
+ * alongside the plan. It's advisory: it never changes the permission outcome.
  */
-export function makePreToolUseHook(session: Session, broker: PermissionBroker): HookCallback {
+export function makePreToolUseHook(
+  session: Session,
+  broker: PermissionBroker,
+  onPlanProposed?: PlanProposedHook,
+): HookCallback {
   return async (input) => {
     const i = input as PreToolUseHookInput;
     const tool = i.tool_name;
     const toolInput = (i.tool_input ?? {}) as Record<string, unknown>;
+
+    // The model is committing to a plan and asking to leave plan mode: run the adversarial panel
+    // over it first (advisory). Awaited so the critique is emitted before ExitPlanMode proceeds;
+    // the hook itself is defensive, but never let a review failure block the tool. (adversarial panel)
+    if (tool === "ExitPlanMode" && onPlanProposed) {
+      try {
+        await onPlanProposed(typeof toolInput.plan === "string" ? toolInput.plan : "");
+      } catch {
+        /* advisory only — a panel failure must never block the plan */
+      }
+    }
 
     // AskUserQuestion must fall through with NO permission decision. Its checkPermissions resolves
     // to "ask", and the SDK only routes that "ask" to our canUseTool (where we surface the question

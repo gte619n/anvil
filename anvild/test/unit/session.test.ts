@@ -195,6 +195,26 @@ test("fresh-worktree session: create checks out a worktree, kill removes it", as
   rmSync(repo, { recursive: true, force: true });
 });
 
+test("adversarial review defaults off, honours the create flag, and is togglable", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+
+  // Default: off (opt-in) unless the create command asks for it.
+  const off = sup.create(createCmd(dir));
+  expect(off.data.adversarialReview).toBe(false);
+
+  const on = sup.create({ ...createCmd(dir), adversarialReview: true });
+  expect(on.data.adversarialReview).toBe(true);
+
+  // Runtime toggle (session.set_adversarial_review) flips it and persists.
+  sup.setAdversarialReview(off.id, true);
+  expect(off.data.adversarialReview).toBe(true);
+  sup.setAdversarialReview(off.id, false);
+  expect(off.data.adversarialReview).toBe(false);
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("killing a session removes it and its state dir", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());

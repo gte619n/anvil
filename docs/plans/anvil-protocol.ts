@@ -2,6 +2,11 @@
  * Anvil wire protocol — shared contract between `anvild` (daemon) and all clients.
  *
  * Status: 0.7-draft (2026-06-23). Companion to `anvil-native-architecture.md` (§6, §8).
+ *   0.9: adversarial plan review in interactive sessions — Session.adversarialReview +
+ *        SessionCreateCmd.adversarialReview + session.set_adversarial_review. When a session plans
+ *        (ExitPlanMode), competing OpenRouter models critique the plan before execution and the
+ *        verdict is emitted as an assistant message. Advisory only; needs an OpenRouter key.
+ *        Additive; PROTOCOL_VERSION unchanged.
  *   0.8: prompt library — Prompt + prompts event + prompt.list/save/remove. Saved composer
  *        snippets synced across a user's devices (hub-authoritative). Additive; PROTOCOL_VERSION
  *        unchanged. Gated by the "prompts" server capability.
@@ -186,6 +191,9 @@ export interface Session {
   git?: GitStatus;
   model: Model; // default "opus" (§3)
   autonomy: AutonomyPolicy; // default "mostly-autonomous" (§6.6)
+  adversarialReview?: boolean; // opt-in: when planning, competing OpenRouter models critique the plan
+  // before execution (the autopilot adversarial panel, brought to interactive sessions). Advisory only;
+  // needs an OpenRouter key. Default off. (§6.6 / adversarial panel)
   claudeSessionId?: string; // Claude Code's own --resume id
   status: SessionStatus;
   createdAt: Iso8601;
@@ -819,6 +827,7 @@ export interface SessionCreateCmd extends Envelope, Correlated {
   environmentId?: string; // the Environment this came from (for grouping/labeling)
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "mostly-autonomous"
+  adversarialReview?: boolean; // defaults to false (adversarial plan review; needs an OpenRouter key)
 }
 /** Resume: replay events with seq > lastSeq, else server sends a snapshot (§6.4). */
 export interface SessionAttachCmd extends Envelope, Correlated {
@@ -874,6 +883,11 @@ export interface SessionSetAutonomyCmd extends Envelope, Correlated {
   type: "session.set_autonomy";
   sessionId: SessionId;
   policy: AutonomyPolicy;
+}
+export interface SessionSetAdversarialReviewCmd extends Envelope, Correlated {
+  type: "session.set_adversarial_review";
+  sessionId: SessionId;
+  enabled: boolean;
 }
 
 // 5b. Conversation
@@ -1163,6 +1177,7 @@ export type ClientCommand =
   | SessionNewTopicCmd
   | SessionSetModelCmd
   | SessionSetAutonomyCmd
+  | SessionSetAdversarialReviewCmd
   | GitCmd
   // conversation
   | PromptSendCmd
