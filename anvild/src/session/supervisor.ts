@@ -323,6 +323,22 @@ export class Supervisor {
       if (checkOnly) {
         return { ...base, ok: true, phase: "check", output: chk.output, behind: chk.behind };
       }
+      // The on-disk checkout is already current with the remote, but the LIVE process is stale (a prior
+      // update pulled new source and its restart never landed). No pull/rebuild needed — just restart
+      // onto the code already on disk. Without this, "up to date" would no-op forever on a stale process.
+      if (chk.behind === 0 && chk.needsRestart) {
+        if (selfupdate.isManaged()) {
+          selfupdate.scheduleRestart();
+          return { ...base, ok: true, phase: "updated", output: chk.output, willRestart: true };
+        }
+        return {
+          ...base,
+          ok: true,
+          phase: "updated",
+          output: `${chk.output}\n\nNot running under the launchd/systemd service — restart the daemon manually to apply.`,
+          willRestart: false,
+        };
+      }
       if (chk.behind === 0) {
         return { ...base, ok: true, phase: "up-to-date", output: chk.output, behind: 0 };
       }

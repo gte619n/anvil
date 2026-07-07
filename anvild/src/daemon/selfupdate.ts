@@ -14,9 +14,22 @@
  *     also respawn a clean exit, but the explicit restart matches launchd's semantics).
  */
 import { join } from "node:path";
+import { VERSION } from "../version";
 
 /** Service label — must match LABEL in scripts/service.sh (launchd) / the systemd unit name. */
 const SERVICE_LABEL = "com.anvil.anvild";
+
+/** The short SHA the RUNNING process was built from — captured once at startup in version.ts (the part
+ *  after `+` in VERSION). Empty when git wasn't reachable at startup. */
+function runningSha(): string {
+  const i = VERSION.indexOf("+");
+  return i >= 0 ? VERSION.slice(i + 1) : "";
+}
+
+/** Whether two abbreviated SHAs refer to the same commit (either may be the shorter abbreviation). */
+function shaMatches(a: string, b: string): boolean {
+  return !!a && !!b && (a.startsWith(b) || b.startsWith(a));
+}
 
 /** The anvild package dir (where package.json + build:web live): .../anvild */
 const anvildDir = join(import.meta.dir, "..", "..");
@@ -61,8 +74,14 @@ async function repoRoot(run: CommandRunner): Promise<string> {
   return r.out.trim();
 }
 
-/** Fetch and report how many commits behind upstream the daemon's checkout is. */
-export async function checkForUpdate(run: CommandRunner = runDefault): Promise<{ behind: number; output: string }> {
+/**
+ * Fetch and report update state: how many commits behind upstream the checkout is, AND whether the
+ * running process is stale relative to the on-disk checkout. The latter catches the case where a prior
+ * update pulled new source but its restart never landed — the checkout is "up to date" with the remote,
+ * yet the live process predates disk HEAD. `needsRestart` flags that so the caller restarts (no re-pull
+ * needed) instead of no-oping on "up to date".
+ */
+export async function checkForUpdate(run: CommandRunner = runDefault): Promise<{ behind: number; output: string; needsRestart: boolean }> {
   const root = await repoRoot(run);
   const fetch = await run(["git", "fetch", "--quiet"], root);
   if (fetch.code !== 0) throw new Error(`git fetch failed: ${fetch.out || `exit ${fetch.code}`}`);
@@ -74,7 +93,17 @@ export async function checkForUpdate(run: CommandRunner = runDefault): Promise<{
   if (counted.code !== 0) throw new Error(`git rev-list failed: ${counted.out || `exit ${counted.code}`}`);
   const behind = Number.parseInt(counted.out.trim(), 10) || 0;
   const ref = upstream.out.trim();
-  return { behind, output: behind === 0 ? `Up to date with ${ref}.` : `${behind} commit(s) behind ${ref}.` };
+  // Running process vs on-disk HEAD (same `git log -1 --format=%h` version.ts used at startup).
+  const head = (await run(["git", "log", "-1", "--format=%h"], root)).out.trim();
+  const running = runningSha();
+  const needsRestart = behind === 0 && !!running && !!head && !shaMatches(running, head);
+  const output =
+    behind > 0
+      ? `${behind} commit(s) behind ${ref}.`
+      : needsRestart
+        ? `On-disk build (${head}) is newer than the running process (${running}) — restart to apply.`
+        : `Up to date with ${ref}.`;
+  return { behind, output, needsRestart };
 }
 
 /** Fast-forward the checkout, reinstall deps, and rebuild the web bundle. Throws on any failure
