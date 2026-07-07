@@ -76,6 +76,7 @@ test("a crashing turn resolves parked brokers, resets status to idle, and releas
     () => {},
     undefined,
     undefined,
+    undefined, // onPlanProposed — not exercised here
     makeQuery() as unknown as never,
   );
 

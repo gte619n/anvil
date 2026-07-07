@@ -86,6 +86,7 @@
     "session.list",
     "session.new_topic",
     "session.reset",
+    "session.set_adversarial_review",
     "session.set_autonomy",
     "session.set_model",
     "session.unarchive",

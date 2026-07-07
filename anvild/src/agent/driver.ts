@@ -4,7 +4,7 @@ import type { Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
-import { makePreToolUseHook, type PermissionBroker } from "./permissions";
+import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { makeCanUseTool, type QuestionBroker } from "./questions";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
@@ -50,6 +50,9 @@ export class AgentDriver {
     private readonly mcpServers?: Record<string, McpSdkServerConfigWithInstance>,
     /** Extra `allowedTools` (the concierge's `mcp__anvil__*` ids) auto-allowed by the SDK layer. */
     private readonly extraAllowedTools?: string[],
+    /** Runs the adversarial plan review when the model calls ExitPlanMode (advisory). Set by the
+     *  supervisor when the session opts into adversarial review; undefined leaves plan mode untouched. */
+    private readonly onPlanProposed?: PlanProposedHook,
     /** The SDK query entrypoint; overridable in tests. Defaults to the real `query`. */
     private readonly queryFn: QueryFn = query,
   ) {}
@@ -153,7 +156,7 @@ export class AgentDriver {
         // phone). This is the authoritative gate (M7); canUseTool alone only sees ops the
         // CLI already flags.
         hooks: {
-          PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker)], timeout: 3600 }],
+          PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker, this.onPlanProposed)], timeout: 3600 }],
         },
         // AskUserQuestion never returns a normal tool result: its checkPermissions always resolves
         // to "ask", and the SDK surfaces that through canUseTool (NOT onUserDialog — verified live

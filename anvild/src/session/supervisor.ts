@@ -51,6 +51,7 @@ import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
 import { applyPrBadge, carryPrBadge, createWorktree, gitStatus, isPrSweepEligible, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
+import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
@@ -73,6 +74,7 @@ import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouter
 import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
 import { OpenRouterClient } from "../integrations/openrouter";
+import { reviewPlan, formatReview } from "../integrations/adversarial";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
 import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
 import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, adversaryStats } from "../pipeline/daemon-adapters";
@@ -1350,6 +1352,7 @@ export class Supervisor {
       git: gitStatus(cwd),
       model: cmd.model ?? "opus",
       autonomy: cmd.autonomy ?? "mostly-autonomous",
+      adversarialReview: cmd.adversarialReview ?? false,
       status: "idle",
       createdAt: now(),
       lastActivityAt: now(),
@@ -1700,6 +1703,7 @@ export class Supervisor {
         (usage) => this.onAgentResult(id, usage),
         isDefault ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer } : undefined,
         isDefault ? DEFAULT_TOOL_IDS : undefined,
+        this.planReviewer(s),
       );
       this.drivers.set(id, driver);
     }
@@ -1775,6 +1779,42 @@ export class Supervisor {
     s.data.lastActivityAt = now();
     this.persist();
     this.broadcastUpdated(s.data);
+  }
+  setAdversarialReview(id: string, enabled: boolean): void {
+    const s = this.require(id);
+    s.data.adversarialReview = enabled;
+    s.data.lastActivityAt = now();
+    this.persist();
+    this.broadcastUpdated(s.data);
+  }
+
+  /**
+   * The ExitPlanMode hook for a session: run the adversarial panel over the plan the model is about to
+   * commit to, and surface its verdict as an assistant message before execution. Advisory only — it
+   * never blocks the plan. Self-gates every call (not at construction) so a toggle flip or an OpenRouter
+   * key set from Settings → Models mid-session takes effect on the very next plan, mirroring how the
+   * autopilot panel resolves its key live (see runAutopilot). (adversarial panel)
+   */
+  private planReviewer(s: Session): PlanProposedHook {
+    return async (plan: string) => {
+      if (!s.data.adversarialReview || !plan.trim()) return; // not opted in / nothing to review
+      const key = (process.env[OPENROUTER_KEY] ?? "").trim();
+      if (!key || process.env.ANVIL_ADVERSARIAL === "0" || !this.adversarial.models.length) return;
+      try {
+        const client = new OpenRouterClient(key, undefined, this.adversarial.provider);
+        const review = await reviewPlan(
+          { title: s.data.title, rationale: "Interactive session — plan review before execution.", plan },
+          { client, models: this.adversarial.models },
+          { repoRoot: s.data.cwd }, // critics read the session's worktree read-only (agentic mode)
+        );
+        // Surface the verdict as an assistant message so it lands in the conversation right after the
+        // plan (and persists in the durable log for resume). formatReview() is the same block the
+        // autopilot appends to a stored plan.
+        s.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(formatReview(review)) }] });
+      } catch (e) {
+        console.error(`[session ${s.id}] adversarial plan review failed: ${e instanceof Error ? e.message : e}`);
+      }
+    };
   }
 
   /**
