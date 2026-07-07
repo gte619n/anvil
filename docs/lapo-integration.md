@@ -42,34 +42,39 @@ Notes the client handles from this:
 - Token auth is **`client_secret_post`** (client id/secret in the form body) — what the client already does.
 - The `ANVIL_LAPO_AUTHORIZE_PATH` / `_TOKEN_PATH` vars are only fallbacks if discovery is unreachable.
 
-## Configuring (hub daemon env)
+## Configuring — nothing to configure
 
-Set these in the hub daemon's launcher env, then restart it. Only the client id is required; until it's
-set the Settings → Integrations card shows setup guidance instead of a Connect button.
+**Zero server config by default.** Lapo advertises a `registration_endpoint`, so on first connect the
+daemon **dynamically registers itself** (RFC 7591) and obtains its own `client_id` — you don't set one.
+Just tap **Connect** (Settings → Integrations → Lapo). Everything below is optional.
 
-| Env var | Required | Default | Meaning |
-|---------|----------|---------|---------|
-| `ANVIL_LAPO_CLIENT_ID` | ✅ | — | OAuth client id registered for this daemon |
-| `ANVIL_LAPO_CLIENT_SECRET` | | — | OAuth client secret; **omit for a public (PKCE) client** |
-| `ANVIL_LAPO_BASE_URL` | | `https://app.heylapo.com` | lapo origin (discovery + entry API hang off it) |
-| `ANVIL_LAPO_ENTRY_PATH` | | `/v1/journal/append` | fallback create-entry route if OpenAPI discovery fails (see below) |
-| `ANVIL_LAPO_WHOAMI_PATH` | | `/me` | identity endpoint (only used to label the account) |
-| `ANVIL_LAPO_SCOPE` | | `journal.append documents.write` | OAuth scopes requested (both advertised scopes) |
-| `ANVIL_LAPO_COLLECTION` | | — | optional collection/space id every entry is filed under |
-| `ANVIL_LAPO_AUTHORIZE_PATH` | | `/oauth/authorize` | authorize endpoint — **discovery fallback only** |
-| `ANVIL_LAPO_TOKEN_PATH` | | `/oauth/token` | token endpoint — **discovery fallback only** |
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `ANVIL_LAPO_DISABLE` | — | set `1` to hide the integration entirely |
+| `ANVIL_LAPO_CLIENT_ID` | — | pin a pre-registered client id (skips dynamic registration) |
+| `ANVIL_LAPO_CLIENT_SECRET` | — | client secret for a pinned confidential client |
+| `ANVIL_LAPO_BASE_URL` | `https://app.heylapo.com` | lapo origin (discovery + entry API hang off it) |
+| `ANVIL_BASE_URL` | (self-discovered) | the daemon's own URL, used for the OAuth redirect + deep links |
+| `ANVIL_LAPO_ENTRY_PATH` | `/v1/journal/append` | fallback create-entry route if OpenAPI discovery fails |
+| `ANVIL_LAPO_SCOPE` | `journal.append documents.write` | OAuth scopes requested |
+| `ANVIL_LAPO_COLLECTION` | — | optional collection/space id every entry is filed under |
+| `ANVIL_LAPO_AUTHORIZE_PATH` / `_TOKEN_PATH` / `_WHOAMI_PATH` | `/oauth/authorize`, `/oauth/token`, `/me` | discovery fallbacks |
 
-On lapo's side, register this redirect URI as allowed (the daemon origin the web client is served from):
+## The OAuth redirect (self-discovered)
 
-```
-<daemon-origin>/api/integrations/lapo/callback
-```
+The redirect Anvil uses is **its own daemon URL**, self-discovered from `tailscale status`
+(`https://<magicdns>.ts.net/api/integrations/lapo/callback`) — **not** the client page's origin, which
+inside the native shells is a local asset host (`appassets.androidplatform.net` / `anvil-app://`) that
+lapo can't reach. It's shown in the Lapo card and registered with lapo automatically as part of dynamic
+registration, so there's no manual redirect-allowlist step. Override with `ANVIL_BASE_URL` if needed.
 
 ## Connecting
 
-Settings → **Lapo** → **Connect Lapo** opens a popup to lapo's authorize page. On approval, lapo
-redirects back to the daemon callback, which exchanges the code for tokens (validated + stored, mode
-0600) and broadcasts the connected status. The token is refreshed automatically before it expires.
+Settings → Integrations → **Lapo** → **Connect Lapo**. The daemon registers a client (if needed),
+opens lapo's authorize page, and you approve — authorizing against **your** lapo user. Lapo redirects to
+the daemon callback, which exchanges the code for tokens (stored mode 0600) and broadcasts the connected
+status. The token is refreshed automatically before it expires; the registered client is reused on
+reconnect. Disconnect clears the token but keeps the registration.
 
 ## The report
 

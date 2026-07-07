@@ -25,6 +25,9 @@ export interface LapoState {
   /** In-flight OAuth handshake, cleared once the callback consumes it. Carries the discovered token
    *  endpoint + PKCE verifier so the code exchange uses exactly what the authorize step used. */
   pending?: { state: string; redirectUri: string; startedAt: number; codeVerifier?: string; tokenEndpoint?: string };
+  /** A dynamically-registered OAuth client (RFC 7591), reused across connects. Tied to the redirect_uri
+   *  it was registered with — re-registered if that (the daemon's URL) changes. */
+  registration?: { clientId: string; clientSecret?: string; redirectUri: string };
 }
 
 /** A pending OAuth handshake is only valid for a few minutes — a stale one is treated as absent. */
@@ -148,16 +151,30 @@ export class IntegrationStore {
     };
   }
 
+  /** The dynamically-registered OAuth client, if any. */
+  lapoRegistration(): { clientId: string; clientSecret?: string; redirectUri: string } | undefined {
+    return this.lapoState?.registration ? { ...this.lapoState.registration } : undefined;
+  }
+
+  /** Persist a dynamically-registered OAuth client so it's reused across connects. */
+  setLapoRegistration(reg: { clientId: string; clientSecret?: string; redirectUri: string }): void {
+    this.lapoState = { ...(this.lapoState ?? {}), registration: reg };
+    this.saveLapo();
+  }
+
+  /** Clear the stored tokens but KEEP the registered client (so reconnect doesn't re-register). */
   disconnectLapo(): void {
-    this.lapoState = undefined;
-    if (existsSync(this.lapoFile)) writeFileSync(this.lapoFile, "{}", { mode: 0o600 });
+    const registration = this.lapoState?.registration;
+    this.lapoState = registration ? { registration } : undefined;
+    if (this.lapoState) this.saveLapo();
+    else if (existsSync(this.lapoFile)) writeFileSync(this.lapoFile, "{}", { mode: 0o600 });
   }
 
   private loadLapo(): LapoState | undefined {
     if (!existsSync(this.lapoFile)) return undefined;
     try {
       const parsed = JSON.parse(readFileSync(this.lapoFile, "utf8")) as LapoState;
-      return parsed.accessToken || parsed.pending ? parsed : undefined;
+      return parsed.accessToken || parsed.pending || parsed.registration ? parsed : undefined;
     } catch {
       return undefined;
     }

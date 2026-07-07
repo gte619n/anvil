@@ -68,17 +68,17 @@ export function tailnetIPv4(): string | undefined {
 }
 
 /**
- * Resolve the lapo integration's OAuth + entry-API surface from ANVIL_LAPO_* env, or `undefined` when
- * it isn't configured. The base URL defaults to `https://app.heylapo.com` and the OAuth endpoints are
- * DISCOVERED from its well-known metadata at runtime (RFC 8414), so the only required var is the client
- * id; the client secret is optional (omit it for a public / PKCE client). Read LIVE at the point of use
- * (not cached at startup) so setting these in the launcher env + restarting is enough — mirrors how the
- * OpenRouter key is read live. The *Path fallbacks apply only if discovery is unreachable.
+ * Resolve the lapo integration's OAuth + entry-API surface from ANVIL_LAPO_* env. Returns `undefined`
+ * ONLY when explicitly disabled (`ANVIL_LAPO_DISABLE=1`) — otherwise it's always available with sensible
+ * defaults: the base URL defaults to `https://app.heylapo.com`, the OAuth endpoints are DISCOVERED at
+ * runtime (RFC 8414), and the client id is OPTIONAL — when absent the daemon dynamically registers one
+ * (RFC 7591) on connect, so no manual provisioning is needed. Read LIVE at the point of use (not cached
+ * at startup). The *Path fallbacks apply only if discovery is unreachable.
  */
 export function resolveLapoConfig(env: Record<string, string | undefined> = process.env): LapoConfig | undefined {
+  if (env.ANVIL_LAPO_DISABLE === "1" || env.ANVIL_LAPO_DISABLE === "true") return undefined;
   const baseUrl = (env.ANVIL_LAPO_BASE_URL?.trim() || DEFAULT_LAPO_BASE_URL).replace(/\/+$/, "");
   const clientId = env.ANVIL_LAPO_CLIENT_ID?.trim();
-  if (!clientId) return undefined;
   const clientSecret = env.ANVIL_LAPO_CLIENT_SECRET?.trim();
   const path = (raw: string | undefined, fallback: string): string => {
     const p = raw?.trim() || fallback;
@@ -86,7 +86,7 @@ export function resolveLapoConfig(env: Record<string, string | undefined> = proc
   };
   return {
     baseUrl,
-    clientId,
+    ...(clientId ? { clientId } : {}),
     ...(clientSecret ? { clientSecret } : {}),
     authorizePath: path(env.ANVIL_LAPO_AUTHORIZE_PATH, "/oauth/authorize"),
     tokenPath: path(env.ANVIL_LAPO_TOKEN_PATH, "/oauth/token"),

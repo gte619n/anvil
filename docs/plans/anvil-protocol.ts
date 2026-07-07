@@ -407,6 +407,9 @@ export interface LapoStatusEvent extends Envelope {
   connected: boolean;
   configured: boolean;
   account?: string; // email/name of the authorized account
+  // The OAuth redirect the daemon will use (its own self-discovered tailnet URL + callback path), shown
+  // in the UI. Undefined when the daemon can't determine its own URL. NOT the client's page origin.
+  callbackUrl?: string;
 }
 /** Reply to `lapo.connect`: the authorize URL the client should open to complete the OAuth handshake. */
 export interface LapoAuthorizeEvent extends Envelope {
