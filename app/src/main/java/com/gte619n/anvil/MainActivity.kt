@@ -166,8 +166,25 @@ class MainActivity : ComponentActivity() {
             web.restoreState(savedInstanceState)
         } else {
             val sessionId = intent?.getStringExtra("sessionId") // notification-tap deep link
-            if (sessionId != null) openSession(sessionId) else web.loadUrl(APP_URL)
+            val hash = deepLinkHash(intent) // external anvil:// / *.ts.net link
+            when {
+                sessionId != null -> openSession(sessionId)
+                hash != null -> web.loadUrl("$APP_URL#$hash")
+                else -> web.loadUrl(APP_URL)
+            }
         }
+    }
+
+    /** Map an incoming VIEW intent to a web hash fragment (no leading '#'), or null if not a deep link.
+     *  Custom scheme: `anvil://autopilot`, `anvil://p/<id>`, `anvil://s/<id>`. An https `*.ts.net` link
+     *  carries the target in its fragment (`https://host/#autopilot`). */
+    private fun deepLinkHash(intent: Intent?): String? {
+        val data = intent?.data ?: return null
+        if (data.scheme == "anvil") {
+            val host = data.host ?: return null
+            return host + (data.path ?: "") // "autopilot", "p/<id>", "s/<id>"
+        }
+        return data.fragment?.takeIf { it.isNotEmpty() }
     }
 
     private fun isDark(): Boolean =
@@ -179,7 +196,8 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        intent.getStringExtra("sessionId")?.let { openSession(it) }
+        intent.getStringExtra("sessionId")?.let { openSession(it); return }
+        deepLinkHash(intent)?.let { web.loadUrl("$APP_URL#$it") }
     }
 
     /** Open a session from a notification tap and clear that session's reminder — entering the

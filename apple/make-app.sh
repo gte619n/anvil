@@ -137,6 +137,13 @@ $SPARKLE_KEYS
     <key>LSApplicationCategoryType</key>       <string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key>         <true/>
     <key>NSPrincipalClass</key>                <string>NSApplication</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleURLName</key>             <string>$BUNDLE_ID</string>
+        <key>CFBundleURLSchemes</key>          <array><string>anvil</string></array>
+      </dict>
+    </array>
 </dict>
 </plist>
 PLIST

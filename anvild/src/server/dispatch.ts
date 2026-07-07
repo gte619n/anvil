@@ -273,6 +273,23 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      case "lapo.status":
+        send(deps.supervisor.lapoStatusEvent(cid));
+        return;
+
+      case "lapo.connect":
+        // Begin the OAuth handshake: discovers endpoints, then returns the authorize URL for the client
+        // to open. The exchange itself lands on the daemon's HTTP callback (http.ts) → broadcasts status.
+        deps.supervisor
+          .beginLapoAuth(cmd.redirectBase, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "lapo.disconnect":
+        send(deps.supervisor.disconnectLapo(cid));
+        return;
+
       case "auth.status":
         send(deps.supervisor.authStatus(cmd.provider ?? "claude", cid));
         return;

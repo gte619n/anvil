@@ -17,6 +17,8 @@ import {
   type TodoistStatusEvent,
   type TodoistProjectsResultEvent,
   type TodoistProjectInfo,
+  type LapoStatusEvent,
+  type LapoAuthorizeEvent,
   type AutopilotPlanInfo,
   type AutopilotPipelineMetricsEvent,
   type AutopilotPlansEvent,
@@ -42,6 +44,7 @@ import {
 import { now } from "../util/envelope";
 import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
+import { discoverSelfBaseUrl } from "../server/fleet";
 import { Session } from "./session";
 import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
@@ -61,6 +64,9 @@ import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
+import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint } from "../integrations/lapo";
+import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
+import { resolveLapoConfig } from "../config";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
@@ -110,6 +116,8 @@ const SCHEDULE_RUN_WINDOW_MS = 10 * 60_000;
 
 export interface SupervisorConfig {
   stateDir: string;
+  /** The tailnet-facing port (== ANVIL_PORT). Used to build this daemon's self-URL for deep links. */
+  port?: number;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
   clonesDir?: string;
   warnFraction?: number;
@@ -189,9 +197,13 @@ export class Supervisor {
   /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
   private readonly devPipelineMetrics: AdversaryMetrics;
   private readonly stateDir: string;
+  private readonly selfPort: number;
+  /** Cached self base URL (deep-link target) — discovery shells out to `tailscale`, so cache it. */
+  private selfBaseUrlCache?: { url: string | undefined; at: number };
 
   constructor(cfg: SupervisorConfig, private readonly registry: ConnectionRegistry) {
     this.renderer = cfg.renderer ?? new PassthroughRenderer();
+    this.selfPort = cfg.port ?? 7701;
     this.clonesDir = cfg.clonesDir ?? join(cfg.stateDir, "repos");
     this.adversarial = {
       models: cfg.adversarialModels ?? [],
@@ -410,6 +422,180 @@ export class Supervisor {
     this.integrations.disconnectTodoist();
     this.registry.toAll(this.todoistStatusEvent());
     return this.todoistStatusEvent(cid);
+  }
+
+  // ── lapo integration (OAuth2 information-entry reports) ────────────────────
+  /** Current lapo connection state. `configured` is false when ANVIL_LAPO_* isn't set, so the UI can
+   *  show setup guidance instead of a dead Connect button. */
+  lapoStatusEvent(cid?: string): LapoStatusEvent {
+    const state = this.integrations.lapo();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "lapo.status",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      connected: !!state?.accessToken,
+      configured: !!resolveLapoConfig(),
+      ...(state?.account ? { account: state.account } : {}),
+    };
+  }
+
+  /** Begin the OAuth authorization-code handshake: discover lapo's endpoints (RFC 8414), pick PKCE when
+   *  the server advertises it (or we have no client secret), stash a CSRF `state` + redirect_uri (+ the
+   *  discovered token endpoint / PKCE verifier), and return the authorize URL for the client to open.
+   *  The browser lands back on the daemon's callback (http.ts). */
+  async beginLapoAuth(redirectBase: string, cid?: string): Promise<LapoAuthorizeEvent> {
+    const cfg = resolveLapoConfig();
+    if (!cfg) throw new BadCommand("lapo isn't configured on this server — set ANVIL_LAPO_CLIENT_ID (and, for a confidential client, ANVIL_LAPO_CLIENT_SECRET) and restart.");
+    const base = redirectBase.trim().replace(/\/+$/, "");
+    if (!/^https?:\/\//.test(base)) throw new BadCommand("a valid redirect origin is required to connect lapo");
+    const redirectUri = `${base}${LapoClient.callbackPath()}`;
+    const state = newId("lapoauth");
+    const client = new LapoClient(cfg);
+    const meta = await client.discover();
+    // Use PKCE when the server advertises S256, or whenever there's no client secret (a public client
+    // MUST PKCE). Harmless when the server ignores it.
+    const usePkce = (meta?.codeChallengeMethodsSupported?.includes("S256") ?? false) || !cfg.clientSecret;
+    const pkce = usePkce ? LapoClient.generatePkce() : undefined;
+    this.integrations.setLapoPendingAuth(state, redirectUri, {
+      ...(pkce ? { codeVerifier: pkce.verifier } : {}),
+      ...(meta?.tokenEndpoint ? { tokenEndpoint: meta.tokenEndpoint } : {}),
+    });
+    const url = client.authorizeUrl({
+      redirectUri,
+      state,
+      ...(meta?.authorizationEndpoint ? { authorizationEndpoint: meta.authorizationEndpoint } : {}),
+      ...(pkce ? { codeChallenge: pkce.challenge } : {}),
+    });
+    return { v: PROTOCOL_VERSION, type: "lapo.authorize", ts: now(), ...(cid ? { cid } : {}), url };
+  }
+
+  /** Complete the handshake from the OAuth callback: validate `state`, exchange the code (reusing the
+   *  discovered token endpoint + PKCE verifier the authorize step used), persist the tokens, and
+   *  broadcast the connected status. Throws BadCommand on a bad/expired handshake or a rejected
+   *  exchange. Returns the account label for the callback page. */
+  async completeLapoAuth(code: string, state: string): Promise<{ account?: string }> {
+    const cfg = resolveLapoConfig();
+    if (!cfg) throw new BadCommand("lapo isn't configured on this server");
+    const pending = this.integrations.consumeLapoPendingAuth(state);
+    if (!pending) throw new BadCommand("this lapo authorization link has expired or didn't match — start again from Settings → Integrations.");
+    const client = new LapoClient(cfg);
+    let tokens: LapoTokens;
+    try {
+      tokens = await client.exchangeCode({
+        code,
+        redirectUri: pending.redirectUri,
+        ...(pending.tokenEndpoint ? { tokenEndpoint: pending.tokenEndpoint } : {}),
+        ...(pending.codeVerifier ? { codeVerifier: pending.codeVerifier } : {}),
+      });
+    } catch (e) {
+      throw new BadCommand(`lapo rejected the authorization: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const [{ account }, entry] = await Promise.all([client.whoami(tokens.accessToken), client.discoverResource()]);
+    this.integrations.setLapoTokens(tokens, account, pending.tokenEndpoint, entry);
+    this.registry.toAll(this.lapoStatusEvent());
+    return account ? { account } : {};
+  }
+
+  /** Clear the stored lapo tokens and broadcast the disconnected status. */
+  disconnectLapo(cid?: string): LapoStatusEvent {
+    this.integrations.disconnectLapo();
+    this.registry.toAll(this.lapoStatusEvent());
+    return this.lapoStatusEvent(cid);
+  }
+
+  /** A valid access token, refreshing (and persisting) proactively when it's within the expiry skew. */
+  private async lapoAccessToken(client: LapoClient): Promise<string> {
+    const state = this.integrations.lapo();
+    if (!state?.accessToken) throw new BadCommand("lapo is not connected");
+    if (!tokenNeedsRefresh({ accessToken: state.accessToken, expiresAt: state.expiresAt }, Date.now()) || !state.refreshToken) return state.accessToken;
+    const next = await client.refresh(state.refreshToken, { tokenEndpoint: state.tokenEndpoint });
+    this.integrations.patchLapoTokens(next);
+    return next.accessToken;
+  }
+
+  /** This daemon's externally-reachable base URL, for deep links in outbound reports. Discovery shells
+   *  out to `tailscale`, so cache it (~1h). `ANVIL_BASE_URL` overrides and is read live. */
+  async selfBaseUrl(): Promise<string | undefined> {
+    const override = process.env.ANVIL_BASE_URL?.trim();
+    if (override) return override.replace(/\/+$/, "");
+    const now = Date.now();
+    if (this.selfBaseUrlCache && now - this.selfBaseUrlCache.at < 3_600_000) return this.selfBaseUrlCache.url;
+    const url = await discoverSelfBaseUrl({ port: this.selfPort });
+    this.selfBaseUrlCache = { url, at: now };
+    return url;
+  }
+
+  /**
+   * Post an autopilot run report to lapo as a markdown information entry (what was done, what's held
+   * for clarification, what was skipped). Best-effort and fully defensive: a lapo hiccup must never
+   * fail — or surface into — the autopilot run, so it's fire-and-forget and swallows every error. On a
+   * 401 it refreshes once and retries. No-op when lapo isn't configured/connected.
+   */
+  async postAutopilotReport(input: {
+    units: WorkUnit[];
+    skipped: number;
+    started: number;
+    startedIds: Set<string>;
+    trigger: "scheduled" | "manual";
+  }): Promise<void> {
+    const cfg = resolveLapoConfig();
+    if (!cfg || !this.integrations.isLapoConnected()) return;
+    const client = new LapoClient(cfg);
+    const appBaseUrl = await this.selfBaseUrl(); // deep-link target back into this daemon's Autopilot view
+    const environments = [...new Set(input.units.map((u) => this.envStore.get(u.environmentId)?.name ?? u.environmentId))];
+    const units: ReportUnit[] = input.units.map((u) => ({
+      id: u.id,
+      title: u.title,
+      status: u.status,
+      ...(u.summary ? { summary: u.summary } : {}),
+      ...(u.effort ? { effort: u.effort } : {}),
+      taskCount: u.taskIds.length,
+      ...(u.source ? { source: u.source } : {}),
+      started: input.startedIds.has(u.id),
+      ...(u.prUrl ? { prUrl: u.prUrl } : {}),
+      ...(u.status === "needs-clarification" ? { questions: extractOpenQuestions(u.plan) } : {}),
+    }));
+    const reportInput = {
+      runAt: new Date().toISOString(),
+      trigger: input.trigger,
+      environments,
+      units,
+      skipped: input.skipped,
+      started: input.started,
+      ...(appBaseUrl ? { appBaseUrl } : {}), // deep link into the Autopilot view (undefined → no link)
+    };
+    try {
+      // Prefer the entry endpoint discovered at connect; if it wasn't captured (older connection),
+      // discover it now. Undefined → createEntry falls back to the configured entryPath + fields.
+      let entry: LapoEntryEndpoint | undefined = this.integrations.lapo()?.entry;
+      if (!entry) {
+        entry = await client.discoverResource();
+        if (entry) this.integrations.patchLapoEntry(entry);
+      }
+      const token = await this.lapoAccessToken(client);
+      // A journal endpoint (no title field) renders as a Logseq outline folded under one collapsed
+      // node — so a run adds a single tidy bullet to the day's journal. A document endpoint gets the
+      // titled markdown report instead.
+      const doc = entry && entry.titleField
+        ? buildAutopilotReport(reportInput)
+        : { title: "", markdown: renderJournalOutline(reportInput) };
+      try {
+        const res = await client.createEntry(token, doc, entry);
+        console.log(`[lapo] posted autopilot report${res.url ? ` → ${res.url}` : ""}`);
+      } catch (e) {
+        // Token may have lapsed between the refresh check and the write — refresh once and retry.
+        const stored = this.integrations.lapo();
+        if (e instanceof Error && /→ 401\b/.test(e.message) && stored?.refreshToken) {
+          const next = await client.refresh(stored.refreshToken, { tokenEndpoint: stored.tokenEndpoint });
+          this.integrations.patchLapoTokens(next);
+          const res = await client.createEntry(next.accessToken, doc, entry);
+          console.log(`[lapo] posted autopilot report (after refresh)${res.url ? ` → ${res.url}` : ""}`);
+        } else throw e;
+      }
+    } catch (e) {
+      console.warn(`[lapo] couldn't post the autopilot report: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // ── Model-provider auth (Settings → Models) ──────────
@@ -791,6 +977,7 @@ export class Supervisor {
     }, AUTOPILOT_RUN_TIMEOUT_MS);
     watchdog.unref?.(); // a pending watchdog must never keep the daemon alive on its own
     const createdUnits: WorkUnit[] = [];
+    const startedUnitIds = new Set<string>(); // units this run auto-started — feeds the lapo report
     let skipped = 0;
     let started = 0;
     try {
@@ -868,6 +1055,7 @@ export class Supervisor {
                 emit(`🚀 Started “${u.title}”.`);
               }
               started++;
+              startedUnitIds.add(u.id);
             } catch (e) {
               emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
             }
@@ -884,6 +1072,19 @@ export class Supervisor {
     }
     const created = createdUnits.length;
     this.broadcastAutopilotPlans();
+    // Post a run report to lapo (best-effort, fire-and-forget) — what was done, what's held for
+    // clarification, and what was skipped. Only when something actually happened this run (empty runs
+    // are skipped by the operator's choice). `notify` is true only for the scheduled run, so it also
+    // distinguishes the nightly run from a manual "Run autopilot" in the report header.
+    if (created > 0 || started > 0) {
+      void this.postAutopilotReport({
+        units: createdUnits,
+        skipped,
+        started,
+        startedIds: startedUnitIds,
+        trigger: opts.notify ? "scheduled" : "manual",
+      });
+    }
     if (opts.notify && created > 0) {
       const body = started
         ? `${created} new plan${created === 1 ? "" : "s"} · ${started} started`

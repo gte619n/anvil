@@ -22,6 +22,9 @@ export const planFromHash = (): string | null => {
   const m = location.hash.match(/^#p\/(.+)$/);
   return m ? decodeURIComponent(m[1]!) : null;
 };
+// `#autopilot` opens the Autopilot grid directly (the deep link the lapo run report posts). Handled on
+// cold load and on warm hashchange, like #p/ and #s/.
+export const autopilotFromHash = (): boolean => location.hash === "#autopilot";
 
 type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader" | "menu";
 interface Overlay {

@@ -398,6 +398,22 @@ export interface TodoistProjectsResultEvent extends Envelope {
   cid?: Cid;
   projects: TodoistProjectInfo[];
 }
+/** lapo (OAuth2) connection state — broadcast on connect/disconnect and whenever it changes.
+ *  `configured` reflects whether the daemon has ANVIL_LAPO_* env set (so the UI shows setup guidance
+ *  rather than a dead Connect button when it doesn't). */
+export interface LapoStatusEvent extends Envelope {
+  type: "lapo.status";
+  cid?: Cid;
+  connected: boolean;
+  configured: boolean;
+  account?: string; // email/name of the authorized account
+}
+/** Reply to `lapo.connect`: the authorize URL the client should open to complete the OAuth handshake. */
+export interface LapoAuthorizeEvent extends Envelope {
+  type: "lapo.authorize";
+  cid?: Cid;
+  url: string;
+}
 
 /** Model-provider auth. Only "claude" is functional today (the Agent SDK is Claude-only); the field
  *  exists so the Settings → Models UI and the daemon can grow Gemini/ChatGPT entries without a
@@ -737,6 +753,8 @@ export type ServerEvent =
   | PromptsEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
+  | LapoStatusEvent
+  | LapoAuthorizeEvent
   | AuthStatusEvent
   | AutopilotPlansEvent
   | AutopilotPlanResultEvent
@@ -985,6 +1003,21 @@ export interface TodoistProjectsListCmd extends Envelope, Correlated {
   type: "todoist.projects.list"; // fetch the account's projects (live from the API)
 }
 
+// lapo integration (OAuth2 authorization-code). Anvil authorizes against a lapo instance and posts a
+// well-formatted markdown "information entry" when an autopilot run finishes. Hub-scoped, like Todoist.
+export interface LapoStatusCmd extends Envelope, Correlated {
+  type: "lapo.status"; // request the current connection + configured state
+}
+export interface LapoConnectCmd extends Envelope, Correlated {
+  type: "lapo.connect"; // begin the OAuth handshake → replies with a lapo.authorize URL to open
+  // The web origin the browser will be redirected back to (window.location.origin); the daemon's
+  // OAuth callback hangs off it, so lapo redirects land back on the same daemon that started the flow.
+  redirectBase: string;
+}
+export interface LapoDisconnectCmd extends Envelope, Correlated {
+  type: "lapo.disconnect"; // clear the stored tokens
+}
+
 // Model-provider auth (Settings → Models). Set/reset the daemon's Claude subscription OAuth token from
 // the UI without SSHing in to edit the launcher env. The token is persisted to the launcher's env file
 // (survives a service restart) and applied live to the next agent run. `provider` defaults to "claude".
@@ -1152,6 +1185,9 @@ export type ClientCommand =
   | TodoistDisconnectCmd
   | TodoistPropagateCmd
   | TodoistProjectsListCmd
+  | LapoStatusCmd
+  | LapoConnectCmd
+  | LapoDisconnectCmd
   | AuthStatusCmd
   | AuthSetCmd
   | AuthClearCmd

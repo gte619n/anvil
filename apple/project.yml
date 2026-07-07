@@ -43,6 +43,9 @@ targets:
         # Local, unsigned build (no Apple Developer account needed) — ad-hoc sign.
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Automatic
+        # NB: the `anvil://` deep-link scheme is registered for the SHIPPED macOS app in make-app.sh's
+        # Info.plist heredoc (this Xcode-dev target uses a generated plist; CFBundleURLTypes is an array,
+        # so it can't be injected via an INFOPLIST_KEY_ build setting here).
     entitlements:
       path: Resources/Anvil.entitlements
       properties:
@@ -66,6 +69,12 @@ targets:
       path: Resources/Info-iOS.plist
       properties:
         CFBundleDisplayName: Anvil
+        # Custom URL scheme so external deep links (e.g. the lapo autopilot report's `anvil://autopilot`)
+        # open the app. A private tailnet host can't verify Universal Links, so a scheme is the reliable
+        # native path; the web client's hash router (#autopilot / #p/<id>) does the actual navigation.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.gte619n.anvil
+            CFBundleURLSchemes: [anvil]
         # Anvil uses only standard/exempt encryption (HTTPS/TLS). Declaring this up front means the
         # automated App Store submission (submit-appstore.ts) isn't held waiting for a manual export
         # compliance answer. Flip to true (and file the right docs) if you ever add custom crypto.

@@ -15,5 +15,10 @@ struct ContentView: View {
     var body: some View {
         WebView(daemonURL: AppConfig.baseURL)
             .ignoresSafeArea()
+            // External deep link (an `anvil://autopilot` / `anvil://p/<id>` link tapped elsewhere, e.g.
+            // the lapo autopilot report). Route it into the hosted web client's hash router.
+            .onOpenURL { url in
+                if let hash = DeepLink.hash(from: url) { DeepLink.open(hash: hash) }
+            }
     }
 }
