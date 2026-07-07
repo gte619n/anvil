@@ -1,27 +1,39 @@
 /**
- * Daemon self-update (arch §5). The daemon runs from TS source under a launchd service that
- * serves the *built* web bundle from web/dist. A deploy is therefore: pull the daemon's own
- * source repo, rebuild web/dist, then restart so the new source is re-read. This module does all
- * three so it can be triggered from any client instead of shelling into the host (see service.sh,
- * which does the same steps by hand).
+ * Daemon self-update (arch §5). The daemon runs from TS source under a service manager (launchd on
+ * macOS, systemd --user on Linux) that serves the *built* web bundle from web/dist. A deploy is
+ * therefore: pull the daemon's own source repo, rebuild web/dist, then restart so the new source is
+ * re-read. This module does all three so it can be triggered from any client instead of shelling
+ * into the host (see service.sh, which does the same steps by hand).
  *
  * All steps shell out asynchronously (Bun.spawn) so a slow build never blocks the event loop /
- * other sessions. Restart is done with `launchctl kickstart -k` (the same path service.sh uses):
- * launchd's KeepAlive does NOT respawn after a clean SIGTERM exit (verified empirically), so a bare
- * self-SIGTERM would shut the daemon down for good — kickstart -k deterministically kills + respawns.
+ * other sessions. Restart uses the same mechanism service.sh does for the host's service manager:
+ *   • launchd  — `launchctl kickstart -k`: KeepAlive does NOT respawn after a clean SIGTERM exit
+ *     (verified empirically), so a bare self-SIGTERM would shut the daemon down for good; kickstart
+ *     -k deterministically kills + respawns.
+ *   • systemd  — `systemctl --user restart`: deterministic kill + respawn (Restart=always would
+ *     also respawn a clean exit, but the explicit restart matches launchd's semantics).
  */
 import { join } from "node:path";
 
-/** launchd service label (must match LABEL in scripts/service.sh). */
+/** Service label — must match LABEL in scripts/service.sh (launchd) / the systemd unit name. */
 const SERVICE_LABEL = "com.anvil.anvild";
 
 /** The anvild package dir (where package.json + build:web live): .../anvild */
 const anvildDir = join(import.meta.dir, "..", "..");
 
-/** True when we were started by the launchd launcher (service.sh sets ANVIL_MANAGED). Only then
- *  is exiting safe — launchd respawns us. Run via `bun dev` it would just die, so we don't. */
+/** Service manager that launched us, as reported by the launcher's ANVIL_MANAGED (set in
+ *  service.sh). null when unmanaged (e.g. `bun dev`), where exiting/restarting would just die. */
+export type ServiceManager = "launchd" | "systemd";
+
+export function serviceManager(): ServiceManager | null {
+  const m = process.env.ANVIL_MANAGED;
+  return m === "launchd" || m === "systemd" ? m : null;
+}
+
+/** True when a service manager started us and will respawn us. Only then is restarting safe —
+ *  run via `bun dev` a restart would just kill the daemon, so we don't. */
 export function isManaged(): boolean {
-  return process.env.ANVIL_MANAGED === "launchd";
+  return serviceManager() !== null;
 }
 
 /** Runs a command and returns its exit code + combined output. Injectable so the update FLOW can be
@@ -42,8 +54,8 @@ async function repoRoot(run: CommandRunner): Promise<string> {
   const r = await run(["git", "rev-parse", "--show-toplevel"], anvildDir);
   if (r.code !== 0) {
     throw new Error(
-      `This Mac's Anvil isn't a git checkout (${anvildDir}), so it can't self-update. ` +
-        `Re-install it from a git clone (run scripts/service.sh from a cloned repo on this Mac), then Update Anvil will work here.`,
+      `This host's Anvil isn't a git checkout (${anvildDir}), so it can't self-update. ` +
+        `Re-install it from a git clone (run scripts/service.sh from a cloned repo on this host), then Update Anvil will work here.`,
     );
   }
   return r.out.trim();
@@ -117,22 +129,28 @@ export async function applyUpdate(run: CommandRunner = runDefault): Promise<{ ou
   return { output: log.join("\n\n") };
 }
 
-/** Restart via `launchctl kickstart -k` after a short delay (so the result event flushes first).
- *  KeepAlive does NOT respawn a clean SIGTERM exit, so the daemon must ask launchd to relaunch it:
- *  kickstart -k SIGKILLs the current instance (after its SIGTERM graceful flush) and starts a fresh
- *  one that re-reads the updated source + serves the new bundle. The launchctl child is detached so
- *  it isn't torn down with us — by the time the kill lands, launchd has already queued the relaunch. */
+/** Restart via the host's service manager after a short delay (so the result event flushes first).
+ *  The relaunch child is detached so it isn't torn down with us — by the time the kill lands, the
+ *  manager has already queued the relaunch of a fresh instance that re-reads the updated source +
+ *  serves the new bundle.
+ *    • launchd  — `launchctl kickstart -k gui/<uid>/<label>`: KeepAlive does NOT respawn a clean
+ *      SIGTERM exit, so we must ask launchd to relaunch; kickstart -k SIGKILLs (after the SIGTERM
+ *      graceful flush) and starts fresh.
+ *    • systemd  — `systemctl --user restart <label>.service`: deterministic stop + start.
+ *  Falls back to a clean SIGTERM if the spawn throws (under systemd's Restart=always that alone
+ *  respawns; under launchd it just stops — but the spawn only fails if the CLI is missing). */
 export function scheduleRestart(): void {
+  const mgr = serviceManager();
   const uid = process.getuid?.() ?? 0;
+  const cmd =
+    mgr === "systemd"
+      ? ["systemctl", "--user", "restart", `${SERVICE_LABEL}.service`]
+      : ["launchctl", "kickstart", "-k", `gui/${uid}/${SERVICE_LABEL}`];
   setTimeout(() => {
     try {
-      Bun.spawn(["launchctl", "kickstart", "-k", `gui/${uid}/${SERVICE_LABEL}`], {
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-      });
+      Bun.spawn(cmd, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
     } catch {
-      // Fallback: at least stop cleanly. (Should never happen — launchctl always exists on macOS.)
+      // Fallback: at least stop cleanly. (Should never happen — the manager's CLI is on PATH.)
       process.kill(process.pid, "SIGTERM");
     }
   }, 1000).unref?.();

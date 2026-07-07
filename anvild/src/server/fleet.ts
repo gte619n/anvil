@@ -64,11 +64,14 @@ export function parseTailscalePeers(statusJson: string): TailscalePeer[] {
   return out;
 }
 
+// PATH first (works on any OS where `tailscale` is installed), then the common Linux/Homebrew
+// install locations, then the macOS App bundle path last as a fallback for the GUI-only install.
 const TAILSCALE_BINS = [
   "tailscale",
-  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-  "/opt/homebrew/bin/tailscale",
+  "/usr/bin/tailscale",
   "/usr/local/bin/tailscale",
+  "/opt/homebrew/bin/tailscale",
+  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
 ];
 
 async function defaultRunTailscale(): Promise<string | null> {
