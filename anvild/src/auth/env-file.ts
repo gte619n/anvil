@@ -3,14 +3,15 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 /**
- * Shared primitives for reading/writing the launcher's env file — the single file the launchd launcher
- * sources on every start (`set -a; . "$HOME/.config/anvil/env"`, see scripts/service.sh). Both the
- * Claude subscription token (auth/store.ts) and the OpenRouter key (auth/openrouter.ts) live here so a
- * value set from the UI survives a service restart. Keep this in lockstep with service.sh — do NOT swap
- * in XDG_CONFIG_HOME, or the daemon would write a file the launcher never reads.
+ * Shared primitives for reading/writing the launcher's env file — the single file the launcher sources
+ * on every start (`set -a; . "$HOME/.config/anvil/env"`, see scripts/service.sh; the launcher is the
+ * same on macOS/launchd and Linux/systemd). Both the Claude subscription token (auth/store.ts) and the
+ * OpenRouter key (auth/openrouter.ts) live here so a value set from the UI survives a service restart.
+ * Keep this in lockstep with service.sh — do NOT swap in XDG_CONFIG_HOME, or the daemon would write a
+ * file the launcher never reads (the launcher hardcodes ~/.config/anvil/env on both platforms).
  */
 
-/** The env file the launchd launcher sources. */
+/** The env file the launcher sources. */
 export function envFile(home: string = homedir()): string {
   return join(home, ".config", "anvil", "env");
 }

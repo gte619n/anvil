@@ -83,7 +83,7 @@ export function buildFileOffer(sessionId: string, cwd: string, rawPath: string):
 export async function maybeTaildrop(absPath: string): Promise<boolean> {
   const target = process.env.ANVIL_TAILDROP_TARGET?.trim();
   if (!target) return false;
-  for (const tailscale of ["tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]) {
+  for (const tailscale of ["tailscale", "/usr/bin/tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]) {
     try {
       const proc = Bun.spawn([tailscale, "file", "cp", absPath, `${target}:`], { stdout: "pipe", stderr: "pipe" });
       const code = await proc.exited;

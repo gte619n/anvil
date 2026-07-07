@@ -106,6 +106,10 @@ const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
 /** Per-unit budget for a background dev-pipeline run auto-started by the scheduler. Generous: a full
  *  7-gate run with both live models + real checks + loop-backs can legitimately take a while. */
 const PIPELINE_RUN_BUDGET_MS = 45 * 60_000;
+/** Budget for an interactive plan-refine query. Unlike a scheduled run there is no watchdog around it,
+ *  so bound it here — a stuck query then aborts with a clean error instead of spinning the refine
+ *  window forever. Kept under the client's 600s await so the user sees the failure, not a dead timeout. */
+const REFINE_RUN_BUDGET_MS = 9 * 60_000;
 
 /** How often the scheduler checks whether the scheduled time has arrived. */
 const SCHEDULE_TICK_MS = 5 * 60_000;
@@ -687,7 +691,7 @@ export class Supervisor {
     if (!feedback.trim()) throw new BadCommand("feedback is required");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
-    const revised = await refinePlanQuery({ title: u.title, currentPlan: u.plan ?? "", feedback, repoRoot: env.repoRoot });
+    const revised = await refinePlanQuery({ title: u.title, currentPlan: u.plan ?? "", feedback, repoRoot: env.repoRoot, signal: AbortSignal.timeout(REFINE_RUN_BUDGET_MS) });
     const updated = this.workUnits.update(u.id, {
       plan: revised.plan,
       ...(revised.summary ? { summary: revised.summary } : {}),
