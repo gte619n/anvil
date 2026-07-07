@@ -1,6 +1,8 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
+import { makePipelineGuardHook } from "../agent/pipeline-guard";
+import type { QueryLike } from "../agent/query";
 import type { TodoistClient, TodoistTask, TodoistSection } from "./todoist";
 import { readStatus, withStatus, type AnvilStatus } from "./status";
 import { extractPlanMeta, PLAN_META_INSTRUCTION, type PlanClarification } from "./plan-meta";
@@ -62,7 +64,7 @@ State the expected passing outcome for each check so success is unambiguous. Gro
  */
 async function runQuery(
   prompt: string,
-  opts: { model: Model; cwd?: string; readonly?: boolean; signal?: AbortSignal },
+  opts: { model: Model; cwd?: string; readonly?: boolean; signal?: AbortSignal; queryFn?: QueryLike },
 ): Promise<{ text: string; plan?: string }> {
   // Bridge the run-level signal to the SDK's AbortController so a cancelled/timed-out run tears down the
   // planning subprocess instead of leaving it spinning (and the run — and its spinner — pinned open).
@@ -71,7 +73,9 @@ async function runQuery(
     if (opts.signal.aborted) ac.abort();
     else opts.signal.addEventListener("abort", () => ac.abort(), { once: true });
   }
-  const q = query({
+  // Default to the real SDK query; tests inject a fake so no subprocess spawns (mirrors agent/query.ts).
+  const run = opts.queryFn ?? (query as unknown as QueryLike);
+  const q = run({
     prompt,
     options: {
       model: opts.model,
@@ -79,6 +83,16 @@ async function runQuery(
       // plan mode = reads/greps allowed, edits/writes blocked → safe headless inspection.
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
+      // A headless run has no human to answer a permission "ask", and in plan mode the model
+      // delivers its plan through an `ExitPlanMode` tool call — an approval-gated op. With no
+      // PreToolUse hook (and no canUseTool), that ask has no responder and the query never reaches
+      // a terminal result: the `for await` below blocks forever. That is exactly what pinned the
+      // Autopilot "refine" spinner open (refinePlanQuery runs plan-mode with no watchdog to abort
+      // the stall). Give every tool an allow/deny decision — the same SEC-H4 danger backstop the
+      // dev pipeline uses (agent/query.ts) — so ExitPlanMode is allowed and the run completes.
+      hooks: {
+        PreToolUse: [{ hooks: [makePipelineGuardHook(opts.cwd)], timeout: 3600 }],
+      },
       executable: "bun",
       abortController: ac,
       // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
@@ -88,17 +102,18 @@ async function runQuery(
   });
   let text = "";
   let plan: string | undefined;
-  for await (const msg of q) {
-    if (msg.type === "assistant") {
+  for await (const raw of q) {
+    const msg = raw as { type?: string; message?: { content?: unknown[] }; result?: unknown };
+    if (msg.type === "assistant" && Array.isArray(msg.message?.content)) {
       // The plan rides in the ExitPlanMode tool call's `input.plan`, not the final result text.
-      for (const block of msg.message.content) {
+      for (const block of msg.message.content as { type?: string; name?: string; input?: { plan?: unknown } }[]) {
         if (block.type === "tool_use" && block.name === "ExitPlanMode") {
-          const p = (block.input as { plan?: unknown }).plan;
+          const p = block.input?.plan;
           if (typeof p === "string" && p.trim()) plan = p.trim();
         }
       }
     }
-    if (msg.type === "result" && "result" in msg && typeof msg.result === "string") text = msg.result;
+    if (msg.type === "result" && typeof msg.result === "string") text = msg.result;
   }
   return { text: text.trim(), ...(plan ? { plan } : {}) };
 }
@@ -367,6 +382,8 @@ export async function refinePlanQuery(opts: {
   feedback: string;
   repoRoot: string;
   model?: Model;
+  signal?: AbortSignal; // bounds the run so a stuck query can't pin the refine spinner open forever
+  queryFn?: QueryLike; // test seam: inject a fake SDK query so no subprocess spawns
 }): Promise<{ plan: string; summary?: string; effort?: AutopilotEffort }> {
   const prompt = `You are revising an implementation plan for the unit of work "${opts.title}" in this repository, based on reviewer feedback. Inspect the codebase (read-only) as needed, then produce the FULL revised plan in markdown — the complete updated plan, not a diff.
 
@@ -382,7 +399,7 @@ ${VALIDATION_INSTRUCTION}
 
 ${PLAN_META_INSTRUCTION}`;
 
-  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true });
+  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true, signal: opts.signal, ...(opts.queryFn ? { queryFn: opts.queryFn } : {}) });
   return resolvePlan(out);
 }
 

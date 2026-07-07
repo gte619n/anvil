@@ -3090,10 +3090,11 @@ function openPlan(id: string): void {
   document.querySelector(".plan-reader-body")?.scrollTo(0, 0);
 }
 
-/** The server that owns a plan (refine/dismiss/start route there), or undefined if offline/unknown. */
+/** The server that owns a plan (refine/dismiss/start route there), or undefined if offline/unknown.
+ *  Uses {@link serverByUrl} (not a raw `servers.get`) so a plan tagged to a member whose url has drifted
+ *  scheme/slash still routes to the connected owner instead of falsely reporting "server offline". */
 function planSock(id: string): Server | undefined {
-  const url = planServer.get(id);
-  return url ? servers.get(url) : undefined;
+  return serverByUrl(planServer.get(id));
 }
 
 async function refinePlan(id: string): Promise<void> {
