@@ -1,4 +1,5 @@
 import { networkInterfaces } from "node:os";
+import { DEFAULT_LAPO_BASE_URL, DEFAULT_LAPO_SCOPE, type LapoConfig } from "./integrations/lapo";
 
 /** Runtime configuration, resolved from the environment. */
 export interface Config {
@@ -64,6 +65,36 @@ export function tailnetIPv4(): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * Resolve the lapo integration's OAuth + entry-API surface from ANVIL_LAPO_* env, or `undefined` when
+ * it isn't configured. The base URL defaults to `https://app.heylapo.com` and the OAuth endpoints are
+ * DISCOVERED from its well-known metadata at runtime (RFC 8414), so the only required var is the client
+ * id; the client secret is optional (omit it for a public / PKCE client). Read LIVE at the point of use
+ * (not cached at startup) so setting these in the launcher env + restarting is enough — mirrors how the
+ * OpenRouter key is read live. The *Path fallbacks apply only if discovery is unreachable.
+ */
+export function resolveLapoConfig(env: Record<string, string | undefined> = process.env): LapoConfig | undefined {
+  const baseUrl = (env.ANVIL_LAPO_BASE_URL?.trim() || DEFAULT_LAPO_BASE_URL).replace(/\/+$/, "");
+  const clientId = env.ANVIL_LAPO_CLIENT_ID?.trim();
+  if (!clientId) return undefined;
+  const clientSecret = env.ANVIL_LAPO_CLIENT_SECRET?.trim();
+  const path = (raw: string | undefined, fallback: string): string => {
+    const p = raw?.trim() || fallback;
+    return p.startsWith("/") ? p : `/${p}`;
+  };
+  return {
+    baseUrl,
+    clientId,
+    ...(clientSecret ? { clientSecret } : {}),
+    authorizePath: path(env.ANVIL_LAPO_AUTHORIZE_PATH, "/oauth/authorize"),
+    tokenPath: path(env.ANVIL_LAPO_TOKEN_PATH, "/oauth/token"),
+    entryPath: path(env.ANVIL_LAPO_ENTRY_PATH, "/v1/journal/append"),
+    whoamiPath: path(env.ANVIL_LAPO_WHOAMI_PATH, "/me"),
+    scope: env.ANVIL_LAPO_SCOPE?.trim() || DEFAULT_LAPO_SCOPE,
+    ...(env.ANVIL_LAPO_COLLECTION?.trim() ? { collection: env.ANVIL_LAPO_COLLECTION.trim() } : {}),
+  };
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {

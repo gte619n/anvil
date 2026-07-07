@@ -58,8 +58,10 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  *    autopilot.clear) — the Todoist-settings maintenance buttons.
  *  - "auth": model-provider token management (auth.status/set/clear) — the Settings → Models card.
  *  - "prompts": the saved-prompt library (prompt.list/save/remove) — Settings → Prompts + sidebar.
+ *  - "lapo": the lapo OAuth information-entry integration (lapo.status/connect/disconnect) — the
+ *    Settings → Lapo card + the autopilot run report.
  */
-export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts"];
+export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts", "lapo"];
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
 export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {

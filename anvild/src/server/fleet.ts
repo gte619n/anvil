@@ -1,4 +1,5 @@
 import type { rest } from "@protocol";
+import { tailnetIPv4 } from "../config";
 
 /**
  * Fleet discovery (anvil-multi-server.md §4.1). The tailnet already knows every device, so we
@@ -122,6 +123,43 @@ async function defaultProbe(baseUrl: string): Promise<ProbeResult | null> {
     /* unreachable, timed out, or not an Anvil daemon */
   }
   return null;
+}
+
+export interface SelfBaseUrlOpts {
+  /** The tailnet-facing port (== ANVIL_PORT). */
+  port: number;
+  /** ANVIL_BASE_URL override — when set, used verbatim (trailing slashes trimmed). */
+  override?: string;
+  runTailscale?: RunTailscale;
+  probe?: Probe;
+  ipv4?: () => string | undefined; // injectable for tests
+}
+
+/**
+ * Discover THIS daemon's own externally-reachable base URL, for deep links embedded in outbound
+ * reports (e.g. the lapo autopilot report's "Open in Anvil" link). It self-configures per device/user:
+ *   1. `ANVIL_BASE_URL` if set (explicit override);
+ *   2. the MagicDNS name from `tailscale status`, probing `https://<name>` (behind `tailscale serve`),
+ *      then `https://<name>:<port>`, then `http://<name>:<port>` — whichever `/api/health` answers;
+ *   3. the raw tailnet IPv4 `http://<ip>:<port>` (direct-bind hosts with no serve/MagicDNS).
+ * Returns undefined only when there's no tailnet at all. The MagicDNS name changes per device/tailnet,
+ * so this is re-derived (and cached by the caller), never hardcoded.
+ */
+export async function discoverSelfBaseUrl(opts: SelfBaseUrlOpts): Promise<string | undefined> {
+  const override = opts.override?.trim();
+  if (override) return override.replace(/\/+$/, "");
+  const runTailscale = opts.runTailscale ?? defaultRunTailscale;
+  const probe = opts.probe ?? defaultProbe;
+  const json = await runTailscale();
+  const dnsName = json ? parseTailscalePeers(json).find((p) => p.isSelf)?.dnsName : undefined;
+  if (dnsName) {
+    for (const base of [`https://${dnsName}`, `https://${dnsName}:${opts.port}`, `http://${dnsName}:${opts.port}`]) {
+      if (await probe(base)) return base;
+    }
+  }
+  const ip = (opts.ipv4 ?? tailnetIPv4)();
+  if (ip) return `http://${ip}:${opts.port}`;
+  return dnsName ? `http://${dnsName}:${opts.port}` : undefined;
 }
 
 export interface DiscoverOpts {

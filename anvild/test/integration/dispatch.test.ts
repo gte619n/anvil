@@ -27,6 +27,7 @@ const CONNECT_FRAMES = new Set([
   "environments",
   "prompts",
   "todoist.status",
+  "lapo.status",
   "autopilot.schedule",
   "autopilot.run.snapshot",
 ]);

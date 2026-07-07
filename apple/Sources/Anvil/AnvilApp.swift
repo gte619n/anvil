@@ -47,6 +47,7 @@ struct AnvilApp: App {
 extension Notification.Name {
     /// Ask the hosted WebView to reload (⌘R on macOS).
     static let anvilReload = Notification.Name("anvilReload")
-    /// Ask the hosted WebView to deep-link to a session (notification tap). userInfo: ["sessionId": String].
-    static let anvilOpenSession = Notification.Name("anvilOpenSession")
+    /// Ask the hosted WebView to deep-link to a web hash (notification tap or external `anvil://` link).
+    /// userInfo: ["hash": String] — e.g. "s/<id>", "autopilot", "p/<id>".
+    static let anvilOpenDeepLink = Notification.Name("anvilOpenDeepLink")
 }

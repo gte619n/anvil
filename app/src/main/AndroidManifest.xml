@@ -25,6 +25,22 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Deep links. Custom scheme (anvil://autopilot, anvil://p/<id>) is the reliable path on a
+                 private tailnet; the https filter lets an Anvil *.ts.net link offer to open the app too
+                 (not autoVerified — a private host can't serve a publicly-fetchable assetlinks.json). The
+                 web client's hash router (#autopilot / #p/<id>) does the actual navigation. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="anvil" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="*.ts.net" />
+            </intent-filter>
         </activity>
 
         <service

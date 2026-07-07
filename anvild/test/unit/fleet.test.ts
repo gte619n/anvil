@@ -1,5 +1,34 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, discoverFleet, tailnetPeers, resolveMember, propagateTodoist, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, type ProbeResult } from "../../src/server/fleet";
+
+const SELF_STATUS = JSON.stringify({ Self: { DNSName: "mymac.tail-scale.ts.net." } });
+
+test("discoverSelfBaseUrl: ANVIL_BASE_URL override wins (trailing slash trimmed)", async () => {
+  expect(await discoverSelfBaseUrl({ port: 7701, override: "https://anvil.example.com/" })).toBe("https://anvil.example.com");
+});
+
+test("discoverSelfBaseUrl: prefers the MagicDNS https URL that answers /api/health", async () => {
+  const url = await discoverSelfBaseUrl({
+    port: 7701,
+    runTailscale: async () => SELF_STATUS,
+    probe: async (base) => (base === "https://mymac.tail-scale.ts.net" ? { serverId: "srv_self", serverName: "MyMac", version: "1" } : null),
+  });
+  expect(url).toBe("https://mymac.tail-scale.ts.net");
+});
+
+test("discoverSelfBaseUrl: falls back to http://<tailnet-ip>:<port> when no probe answers", async () => {
+  const url = await discoverSelfBaseUrl({
+    port: 7701,
+    runTailscale: async () => SELF_STATUS,
+    probe: async () => null,
+    ipv4: () => "100.101.102.103",
+  });
+  expect(url).toBe("http://100.101.102.103:7701");
+});
+
+test("discoverSelfBaseUrl: no tailscale + no tailnet IP → undefined", async () => {
+  expect(await discoverSelfBaseUrl({ port: 7701, runTailscale: async () => null, ipv4: () => undefined })).toBeUndefined();
+});
 
 /** A fake `fetch` whose handler maps a URL → {status, body}; records every URL it was called with. */
 function fakeFetch(handler: (url: string) => { status?: number; body?: unknown } | "throw") {

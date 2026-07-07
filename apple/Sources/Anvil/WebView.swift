@@ -42,10 +42,11 @@ struct WebView {
         NotificationCenter.default.addObserver(forName: .anvilReload, object: nil, queue: .main) { [weak webView] _ in
             webView?.reload()
         }
-        // A notification tap (warm app) asks us to deep-link to a session; cold launches are handled
-        // in the Coordinator's didFinish (DeepLink.pending) once the page is ready.
-        NotificationCenter.default.addObserver(forName: .anvilOpenSession, object: nil, queue: .main) { [weak coordinator] note in
-            if let id = note.userInfo?["sessionId"] as? String { coordinator?.openSession(id) }
+        // A notification tap or an external deep link (warm app) asks us to route to a hash (a session,
+        // the autopilot grid, a plan). Cold launches are handled in the Coordinator's didFinish
+        // (DeepLink.consume) once the page is ready.
+        NotificationCenter.default.addObserver(forName: .anvilOpenDeepLink, object: nil, queue: .main) { [weak coordinator] note in
+            if let hash = note.userInfo?["hash"] as? String { coordinator?.openHash(hash) }
         }
         return webView
     }
@@ -69,16 +70,19 @@ struct WebView {
         private var popoutWindows: [WKWebView: NSWindow] = [:]
         #endif
 
-        /// Route the web client to a session by its id (notification deep-link). The web app's hash
-        /// router opens `#s/<id>`; if it's already there, re-fire hashchange so it re-focuses.
-        func openSession(_ id: String) {
+        /// Route the web client to a hash fragment (without the leading '#') — a session (`s/<id>`), the
+        /// autopilot grid (`autopilot`), or a plan (`p/<id>`). If already there, re-fire hashchange so the
+        /// web app re-focuses. Used by notification taps and external deep links.
+        func openHash(_ hash: String) {
             guard let webView else { return }
-            let safe = id.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+            let safe = hash.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
             let js = """
-            (function(id){var h='s/'+id;if(location.hash.slice(1)===h){window.dispatchEvent(new HashChangeEvent('hashchange'));}else{location.hash=h;}})('\(safe)')
+            (function(h){if(location.hash.slice(1)===h){window.dispatchEvent(new HashChangeEvent('hashchange'));}else{location.hash=h;}})('\(safe)')
             """
             webView.evaluateJavaScript(js)
         }
+        /// Convenience for the push path: route to a session by id.
+        func openSession(_ id: String) { openHash("s/\(id)") }
 
         // Keep our bundled UI in the app; open external/daemon links in the default browser.
         func webView(
@@ -111,7 +115,7 @@ struct WebView {
                 window.title = t
             }
             #endif
-            if let pending = DeepLink.consume() { openSession(pending) }
+            if let pending = DeepLink.consume() { openHash(pending) }
         }
 
         // window.open(…): the web client uses this to pop the reader into its own window.
@@ -163,19 +167,36 @@ struct WebView {
     }
 }
 
-/// Cross-platform deep-link hand-off from a push notification tap to the WebView. The push handler
-/// sets `pending` (and posts `.anvilOpenSession` for the warm-app case); the WebView consumes
-/// `pending` on its next `didFinish` for the cold-launch case.
+/// Cross-platform deep-link hand-off (push notification tap OR an external `anvil://` / universal link)
+/// to the WebView. The source sets `pending` (and posts `.anvilOpenDeepLink` for the warm-app case);
+/// the WebView consumes `pending` on its next `didFinish` for the cold-launch case. The payload is a web
+/// hash fragment without the leading '#': `s/<id>`, `autopilot`, or `p/<id>`.
 enum DeepLink {
-    private static var pendingSessionId: String?
+    private static var pendingHash: String?
 
-    static func open(sessionId: String) {
-        pendingSessionId = sessionId
-        NotificationCenter.default.post(name: .anvilOpenSession, object: nil, userInfo: ["sessionId": sessionId])
+    /// Route to an arbitrary hash (autopilot grid, plan, session).
+    static func open(hash: String) {
+        pendingHash = hash
+        NotificationCenter.default.post(name: .anvilOpenDeepLink, object: nil, userInfo: ["hash": hash])
     }
+    /// Convenience for the push path.
+    static func open(sessionId: String) { open(hash: "s/\(sessionId)") }
     static func consume() -> String? {
-        defer { pendingSessionId = nil }
-        return pendingSessionId
+        defer { pendingHash = nil }
+        return pendingHash
+    }
+
+    /// Map an incoming URL to a web hash fragment (no leading '#'), or nil if unrecognized.
+    ///  - Custom scheme: `anvil://autopilot`, `anvil://p/<id>`, `anvil://s/<id>`.
+    ///  - Universal/browser link: the target lives in the URL fragment (`https://host/#autopilot`).
+    static func hash(from url: URL) -> String? {
+        if url.scheme == "anvil" {
+            guard let host = url.host, !host.isEmpty else { return nil }
+            let path = (url.path == "/" ? "" : url.path)
+            return host + path
+        }
+        if let fragment = url.fragment, !fragment.isEmpty { return fragment }
+        return nil
     }
 }
 

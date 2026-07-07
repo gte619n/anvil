@@ -11,6 +11,7 @@ import { ui } from "./state";
 import {
   dismissOverlay,
   dismissTopOverlay,
+  autopilotFromHash,
   openOverlay,
   overlayOpen,
   overlays,
@@ -342,6 +343,8 @@ const deepLinkedSession = sessionFromHash() || new URLSearchParams(location.sear
 // Captured before setSessionHash() below rewrites the URL and discards a #p/<id> fragment. Acted on
 // once the app has booted (the plan may not have synced yet — openPlanDeepLink waits for it).
 const deepLinkedPlan = planFromHash();
+// Likewise captured before canonicalization: a bare `#autopilot` deep link opens the grid on boot.
+const deepLinkedAutopilot = autopilotFromHash();
 let activeId: string | null = deepLinkedSession || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
 // The cid of a session.create we kicked off from the new-session dialog. The matching
@@ -378,6 +381,10 @@ window.addEventListener("hashchange", () => {
   const planId = planFromHash();
   if (planId) {
     openPlanDeepLink(planId); // notification tap / shared link into a specific plan
+    return;
+  }
+  if (autopilotFromHash()) {
+    if (!overlayOpen("autopilot")) openAutopilot(); // external #autopilot deep link → open the grid
     return;
   }
   const id = sessionFromHash();
@@ -639,6 +646,7 @@ void loadFleetMembers();
 // Cold deep link into a plan (Todoist "Review in Anvil" link): open the Autopilot view now; the
 // reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
 if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
+else if (deepLinkedAutopilot) openAutopilot(); // bare #autopilot deep link → open the grid
 
 // The native shell bridge (nativeBridge/isAndroidApp) and Web Push live in push.ts.
 void initPush();
@@ -830,6 +838,13 @@ function onEvent(url: string, e: ServerEvent): void {
       return;
     case "todoist.projects.result":
       return; // resolved via cidWaiter (loadTodoistProjects)
+    case "lapo.status":
+      // Lapo is hub-scoped (tokens live on the hub daemon; the card routes to hub()). Ignore a fleet
+      // member's own status so a member that isn't configured can't clobber the hub's "connected".
+      if (url === HUB_URL) onLapoStatus(e.connected, e.configured, e.account);
+      return;
+    case "lapo.authorize":
+      return; // resolved via cidWaiter (connectLapo)
     case "auth.status":
       // Model-provider auth is hub-scoped (the token lives on the hub daemon; the Models card routes
       // to hub()). Ignore a fleet member's own status so it can't clobber the hub's.
@@ -2088,7 +2103,7 @@ function showEditPrompt(id?: string): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "todoist" | "models" | "appearance" | "prompts";
+type SettingsTab = "servers" | "environments" | "integrations" | "models" | "appearance" | "prompts";
 let settingsTab: SettingsTab = "environments";
 function openSettings(): void {
   const root = $("#settings-root");
@@ -2100,7 +2115,7 @@ function openSettings(): void {
     <div class="settings-tabs" role="tablist">
       <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
       <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
-      <button class="stab" data-tab="todoist">${icon("checklist")} Todoist</button>
+      <button class="stab" data-tab="integrations">${icon("extension")} Integrations</button>
       <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
       <button class="stab" data-tab="prompts">${icon("bookmark")} Prompts</button>
       <button class="stab" data-tab="appearance">${icon("palette")} Appearance</button>
@@ -2114,8 +2129,11 @@ function openSettings(): void {
       <section class="settings-panel" data-tab="servers">
         <div id="server-cards"><p class="small muted">Loading…</p></div>
       </section>
-      <section class="settings-panel" data-tab="todoist">
-        <div class="section-head"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
+      <section class="settings-panel" data-tab="integrations">
+        <div class="section-head"><h3>Lapo</h3></div>
+        <p class="small muted">Authorize Anvil against your Lapo instance. When an autopilot run finishes, Anvil posts a markdown report — what was done, what's held for clarification, and what was skipped — as a Lapo information entry.</p>
+        <div id="lapo-panel"><p class="small muted">Loading…</p></div>
+        <div class="section-head" style="margin-top:1.75rem"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
         <p class="small muted">Link a Todoist project to an environment, then the nightly autopilot plans &amp; builds its tasks. Set the token with <code>bun run scripts/todoist.ts set</code>.</p>
         <div id="todoist-panel"><p class="small muted">Loading…</p></div>
       </section>
@@ -2160,7 +2178,10 @@ function selectSettingsTab(tab: SettingsTab): void {
   settingsTab = tab;
   document.querySelectorAll<HTMLElement>(".settings-view .stab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
   document.querySelectorAll<HTMLElement>(".settings-view .settings-panel").forEach((p) => (p.hidden = p.dataset.tab !== tab));
-  if (tab === "todoist") {
+  if (tab === "integrations") {
+    // Lapo (top) then Todoist (below) share the one Integrations tab.
+    hub().sock.send({ type: "lapo.status", cid: newCid() }); // pull fresh connected/configured state
+    renderLapoPanel();
     renderTodoistPanel();
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
   }
@@ -2173,6 +2194,89 @@ function selectSettingsTab(tab: SettingsTab): void {
       hub().sock.send({ type: "autopilot.pipeline.metrics" }); // §6.3 calibration card
     }
   }
+}
+
+// ── Lapo integration (OAuth2 information-entry reports) ────────────────────────────
+let lapoConnected = false;
+let lapoConfigured = false;
+let lapoStatusKnown = false; // avoid a "not configured" flash before the first status arrives
+let lapoAccount: string | undefined;
+
+function onLapoStatus(connected: boolean, configured: boolean, account?: string): void {
+  lapoConnected = connected;
+  lapoConfigured = configured;
+  lapoAccount = account;
+  lapoStatusKnown = true;
+  if (document.getElementById("lapo-panel")) renderLapoPanel();
+}
+
+/** Kick off the OAuth handshake. Opens a popup synchronously (so the click gesture isn't lost to the
+ *  async round-trip and blocked), asks the daemon for the authorize URL, then points the popup at it.
+ *  The daemon's callback finishes the exchange and broadcasts lapo.status, which updates this card. */
+async function connectLapo(btn?: HTMLButtonElement): Promise<void> {
+  const popup = window.open("about:blank", "lapo-oauth", "width=560,height=720");
+  const label = btn?.textContent ?? "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Connecting…";
+  }
+  try {
+    const res = await sendAwait(hub(), { type: "lapo.connect", redirectBase: window.location.origin, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      popup?.close();
+      toast(res.message);
+      return;
+    }
+    if (res.type !== "lapo.authorize") {
+      popup?.close();
+      return;
+    }
+    if (popup) popup.location.href = res.url;
+    else window.location.href = res.url; // popup blocked → fall back to a full-page redirect
+  } catch (err) {
+    popup?.close();
+    toast(`Couldn't start Lapo authorization: ${err instanceof Error ? err.message : err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
+function renderLapoPanel(): void {
+  const host = document.getElementById("lapo-panel");
+  if (!host) return;
+  if (!serverSupports(hub(), "lapo")) {
+    host.innerHTML = `<div class="card"><p class="small muted">This server is too old to support the Lapo integration — update the daemon to use it.</p></div>`;
+    return;
+  }
+  if (!lapoStatusKnown) {
+    host.innerHTML = `<p class="small muted">Loading…</p>`;
+    return;
+  }
+  if (!lapoConfigured) {
+    host.innerHTML = `<div class="card"><b>Not configured.</b>
+      <p class="small muted">Set the Lapo OAuth client on the hub daemon (in its launcher env), then restart it. Only the client id is required — the base URL defaults to <code>app.heylapo.com</code> and the OAuth endpoints are discovered automatically. Omit the secret for a public (PKCE) client:</p>
+      <pre class="small" style="white-space:pre-wrap;user-select:all">ANVIL_LAPO_CLIENT_ID=…
+ANVIL_LAPO_CLIENT_SECRET=…   # optional (confidential client)</pre>
+      <p class="small muted">Optional overrides: <code>ANVIL_LAPO_BASE_URL</code>, <code>ANVIL_LAPO_ENTRY_PATH</code>, <code>ANVIL_LAPO_SCOPE</code>, <code>ANVIL_LAPO_COLLECTION</code> (and <code>ANVIL_LAPO_AUTHORIZE_PATH</code>/<code>_TOKEN_PATH</code> as discovery fallbacks). Register <code>${esc(window.location.origin)}/api/integrations/lapo/callback</code> as an allowed redirect in Lapo.</p></div>`;
+    return;
+  }
+  if (!lapoConnected) {
+    host.innerHTML = `<div class="card"><b>Not connected.</b>
+      <p class="small muted">Authorize Anvil to post information entries to your Lapo instance.</p>
+      <div class="lapo-connect"><button id="lapo-connect" class="primary">Connect Lapo</button></div>
+      <p class="small muted" style="margin-top:8px">Opens Lapo's authorization page in a popup. Tokens are stored on the hub daemon (mode 0600).</p></div>`;
+    $<HTMLButtonElement>("#lapo-connect").addEventListener("click", (ev) => void connectLapo(ev.currentTarget as HTMLButtonElement));
+    return;
+  }
+  host.innerHTML = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span><span>Connected${lapoAccount ? ` as <b>${esc(lapoAccount)}</b>` : ""}.</span>
+      <button id="lapo-disconnect" class="mini" style="margin-left:auto">Disconnect</button></div></div>
+    <p class="small muted">A report is posted to Lapo after each autopilot run that produced results.</p>`;
+  $<HTMLButtonElement>("#lapo-disconnect").addEventListener("click", () => {
+    hub().sock.send({ type: "lapo.disconnect", cid: newCid() });
+  });
 }
 
 // ── Todoist integration ──────────────────────────────────────────────────────────

@@ -95,6 +95,23 @@ export function webCacheControl(rel: string): string {
   return "no-cache"; // revalidate every load — never serve a stale app shell
 }
 
+/** The self-closing HTML page shown after a lapo OAuth redirect. Kept dependency-free (no bundle, no
+ *  CSP concerns) — just a status line and a best-effort auto-close, since the app updates off the
+ *  broadcast lapo.status regardless of what this popup does. */
+function lapoCallbackPage(ok: boolean, message: string): Response {
+  const safe = message.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c] ?? c);
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>lapo — ${ok ? "connected" : "error"}</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;display:grid;place-items:center;height:100vh;background:#0b0d12;color:#e6e8ee}
+.card{max-width:22rem;padding:1.5rem 1.75rem;border-radius:12px;background:#151824;text-align:center}
+.mark{font-size:2rem}.msg{margin:.5rem 0 0;color:#aab}.hint{margin-top:1rem;font-size:.85rem;color:#788}</style></head>
+<body><div class="card"><div class="mark">${ok ? "✅" : "⚠️"}</div>
+<h2 style="margin:.5rem 0 0">lapo ${ok ? "connected" : "couldn't connect"}</h2>
+<p class="msg">${safe}</p>
+<p class="hint">You can close this window and return to Anvil.</p></div>
+<script>setTimeout(function(){try{window.close()}catch(e){}},${ok ? 1500 : 6000})</script></body></html>`;
+  return new Response(html, { status: ok ? 200 : 400, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
 /** Serve a file from the built web client; `/` → index.html. Returns null if not found. */
 async function serveWeb(pathname: string): Promise<Response | null> {
   const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
@@ -142,6 +159,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const supervisor = new Supervisor(
     {
       stateDir: opts.stateDir,
+      port: opts.port,
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
@@ -233,6 +251,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
+      ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
       const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state
       ws.send(JSON.stringify(sched));
       if (sched.running) ws.send(JSON.stringify(supervisor.autopilotRunSnapshotEvent())); // replay the in-flight run's log
@@ -331,6 +350,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
           return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 400 });
         }
       }
+      // lapo OAuth2 authorization-code callback: lapo redirects the user's browser here with ?code&state
+      // after they authorize. Exchange the code for tokens (validated + stored by the supervisor) and
+      // return a tiny HTML page that reports the outcome and closes itself. The main app updates live off
+      // the broadcast lapo.status, so this window closing (or not) doesn't matter to the connection.
+      if (url.pathname === "/api/integrations/lapo/callback" && req.method === "GET") {
+        const err = url.searchParams.get("error");
+        const code = url.searchParams.get("code") ?? "";
+        const state = url.searchParams.get("state") ?? "";
+        if (err) return lapoCallbackPage(false, `lapo denied the authorization: ${err}`);
+        if (!code || !state) return lapoCallbackPage(false, "The authorization response was missing its code or state.");
+        try {
+          const { account } = await supervisor.completeLapoAuth(code, state);
+          return lapoCallbackPage(true, account ? `Connected as ${account}.` : "Connected.");
+        } catch (e) {
+          return lapoCallbackPage(false, e instanceof Error ? e.message : String(e));
+        }
+      }
+
       if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
         const results = await rotateToken({ members: fleet.list(), token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
         return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
