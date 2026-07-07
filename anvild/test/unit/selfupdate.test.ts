@@ -56,4 +56,32 @@ test("checkForUpdate reports how many commits behind upstream", async () => {
   const r = await checkForUpdate(run);
   expect(r.behind).toBe(3);
   expect(r.output).toContain("origin/main");
+  expect(r.needsRestart).toBe(false); // a real update (pull) is needed, not just a restart
+});
+
+test("checkForUpdate flags a stale running process when disk HEAD is ahead of the live process", async () => {
+  // Up to date with the remote (behind 0), but on-disk HEAD differs from the running process's SHA —
+  // a prior pull whose restart never landed. Must surface as needsRestart, not a no-op "up to date".
+  const { run } = fakeRunner({
+    "abbrev-ref": { code: 0, out: "origin/main" },
+    "rev-list --count": { code: 0, out: "0" },
+    "log -1": { code: 0, out: "beefca7" }, // disk HEAD ≠ the running short SHA
+  });
+  const r = await checkForUpdate(run);
+  expect(r.behind).toBe(0);
+  expect(r.needsRestart).toBe(true);
+  expect(r.output).toMatch(/restart to apply/i);
+});
+
+test("checkForUpdate is plainly up-to-date when the running process matches disk HEAD", async () => {
+  const { VERSION } = await import("../../src/version");
+  const runningSha = VERSION.includes("+") ? VERSION.split("+")[1]! : "";
+  const { run } = fakeRunner({
+    "abbrev-ref": { code: 0, out: "origin/main" },
+    "rev-list --count": { code: 0, out: "0" },
+    "log -1": { code: 0, out: runningSha || "0000000" }, // disk HEAD == running process SHA
+  });
+  const r = await checkForUpdate(run);
+  expect(r.needsRestart).toBe(false);
+  expect(r.output).toContain("Up to date");
 });
