@@ -529,6 +529,11 @@ const outboxQueue = new OutboxQueue();
 function enqueue(item: OutboxItem): void {
   outboxQueue.enqueue(item);
   updateOutboxBadge();
+  // A write can be queued while a socket is already open — e.g. the active session is `pending`, or
+  // its owning server is offline while the hub is up. `flushOutbox` otherwise only runs on a
+  // disconnected→connected transition, so without this kick the item sits forever behind a
+  // "Syncing…" banner that never drains. Try now if we're online (no-op if nothing can route yet).
+  if (anyOpen()) void flushOutbox();
 }
 const cidWaiters = new Map<string, (e: ServerEvent) => void>();
 function sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs = 20_000): Promise<ServerEvent> {
@@ -629,11 +634,19 @@ function updateOutboxBadge(): void {
   const queued = outboxQueue.size;
   const online = anyOpen();
   el.hidden = online && queued === 0;
+  // A "Syncing…" banner needs a Retry too: a queued write whose owning server is unreachable (while
+  // another server is up) can't drain on its own and would otherwise hang here with no way out.
   el.innerHTML = online
-    ? `${icon("sync")} Syncing ${queued} queued change${queued === 1 ? "" : "s"}…`
+    ? `${icon("sync")} Syncing ${queued} queued change${queued === 1 ? "" : "s"}… <button id="offline-retry" class="mini">${icon("refresh")} Retry</button>`
     : `${icon("cloud_off")} Offline${queued ? ` · ${queued} change${queued === 1 ? "" : "s"} queued` : ""} <button id="offline-retry" class="mini">${icon("refresh")} Retry</button>`;
   const retry = document.getElementById("offline-retry");
-  if (retry) retry.onclick = () => { for (const s of servers.values()) s.sock.connectNow(); };
+  // Reconnect only the sockets that are actually down (connectNow no-ops on an open one), then drain
+  // the outbox directly — otherwise Retry does nothing when the queue is stuck behind a socket that's
+  // already open (the item's owning server is unreachable but another server, e.g. the hub, is up).
+  if (retry) retry.onclick = () => {
+    for (const s of servers.values()) if (!s.sock.isOpen()) s.sock.connectNow();
+    void flushOutbox();
+  };
 }
 // Start connecting now that the outbox state onStatus reads is initialized: the hub always, plus
 // every server in the registry (fleet — they merge into one view).
