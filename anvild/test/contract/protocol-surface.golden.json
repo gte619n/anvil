@@ -63,6 +63,8 @@
     "permission.request",
     "permission.resolved",
     "permission.respond",
+    "ping",
+    "pong",
     "prompt.list",
     "prompt.remove",
     "prompt.save",

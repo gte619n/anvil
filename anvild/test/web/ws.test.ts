@@ -49,6 +49,8 @@ class FakeWS {
 
 // captured timers so backoff is deterministic
 let timers: Array<{ id: number; fn: () => void; delay: number }> = [];
+// heartbeat runs on setInterval — captured separately so a test can fire "the next ping" on demand.
+let intervals: Array<{ id: number; fn: () => void; delay: number }> = [];
 let nextId = 1;
 const lastDelay = () => timers.at(-1)?.delay;
 const fireTimers = () => {
@@ -56,9 +58,13 @@ const fireTimers = () => {
   timers = [];
   for (const t of due) t.fn();
 };
+const fireIntervals = () => {
+  for (const t of intervals) t.fn(); // intervals persist — mimic one tick each
+};
 
 let AnvilSocket: typeof import("../../web/src/ws").AnvilSocket;
 let origClearTimeout: unknown;
+let origClearInterval: unknown;
 let origWebSocket: unknown;
 
 beforeAll(async () => {
@@ -66,11 +72,13 @@ beforeAll(async () => {
   // Save the real globals we stub per-test so the rest of the suite (which shares globalThis in this
   // process) isn't left with a fake clearTimeout/WebSocket — that leaks real timers and breaks others.
   origClearTimeout = globalThis.clearTimeout;
+  origClearInterval = globalThis.clearInterval;
   origWebSocket = (globalThis as Record<string, unknown>).WebSocket;
   AnvilSocket = (await import("../../web/src/ws")).AnvilSocket;
 });
 afterAll(() => {
   (globalThis as Record<string, unknown>).clearTimeout = origClearTimeout;
+  (globalThis as Record<string, unknown>).clearInterval = origClearInterval;
   (globalThis as Record<string, unknown>).WebSocket = origWebSocket;
   uninstallDom();
 });
@@ -79,6 +87,7 @@ beforeEach(() => {
   FakeWS.instances = [];
   FakeWS.throwOnce = false;
   timers = [];
+  intervals = [];
   nextId = 1;
   const g = globalThis as Record<string, unknown>;
   g.WebSocket = FakeWS as unknown;
@@ -89,6 +98,14 @@ beforeEach(() => {
   };
   (globalThis as any).clearTimeout = (id: number) => {
     timers = timers.filter((t) => t.id !== id);
+  };
+  (globalThis as any).window.setInterval = (fn: () => void, delay: number) => {
+    const id = nextId++;
+    intervals.push({ id, fn, delay });
+    return id;
+  };
+  (globalThis as any).clearInterval = (id: number) => {
+    intervals = intervals.filter((t) => t.id !== id);
   };
 });
 
@@ -164,4 +181,62 @@ test("incoming frames are JSON-parsed to onEvent; malformed frames are ignored",
   ws.message(JSON.stringify({ type: "budget" }));
   ws.message("{not json");
   expect(events).toEqual([{ type: "budget" }]);
+});
+
+test("heartbeat: an open socket pings on the interval and swallows the pong", () => {
+  const { sock, events } = mk();
+  sock.connect();
+  const ws = FakeWS.instances[0]!;
+  ws.open();
+  fireIntervals(); // one heartbeat tick
+  const framed = JSON.parse(ws.sent.at(-1)!);
+  expect(framed.type).toBe("ping");
+  ws.message(JSON.stringify({ type: "pong" })); // reply must not surface as an app event
+  expect(events).toEqual([]);
+});
+
+test("heartbeat: an unanswered ping force-reconnects the half-open socket", () => {
+  const { sock, status } = mk();
+  sock.connect();
+  const ws = FakeWS.instances[0]!;
+  ws.open();
+  // Socket goes half-open: readyState stays OPEN but nothing ever comes back. The ping arms the pong
+  // deadline; firing it with no intervening frame must tear the socket down and reconnect.
+  fireIntervals(); // ping → arms the pong deadline (a setTimeout)
+  expect(FakeWS.instances.length).toBe(1);
+  fireTimers(); // the pong deadline elapses
+  expect(status).toEqual(["connecting", "connected", "disconnected", "connecting"]);
+  expect(FakeWS.instances.length).toBe(2); // reconnected immediately, not after a backoff wait
+});
+
+test("heartbeat: any inbound frame disarms the pong deadline (a busy socket never trips)", () => {
+  const { sock, status } = mk();
+  sock.connect();
+  const ws = FakeWS.instances[0]!;
+  ws.open();
+  fireIntervals(); // ping → arms the deadline
+  ws.message(JSON.stringify({ type: "budget" })); // unrelated traffic proves liveness
+  fireTimers(); // deadline was cleared — firing does nothing
+  expect(status).toEqual(["connecting", "connected"]);
+  expect(FakeWS.instances.length).toBe(1);
+});
+
+test("connectNow on an apparently-open socket sends a liveness ping instead of no-op'ing", () => {
+  const { sock } = mk();
+  sock.connect();
+  const ws = FakeWS.instances[0]!;
+  ws.open();
+  sock.connectNow(); // e.g. tab refocus / network returned — verify the socket isn't half-open
+  expect(JSON.parse(ws.sent.at(-1)!).type).toBe("ping");
+});
+
+test("close() stops the heartbeat (no ping after close)", () => {
+  const { sock } = mk();
+  sock.connect();
+  const ws = FakeWS.instances[0]!;
+  ws.open();
+  sock.close();
+  ws.sent = [];
+  fireIntervals(); // the interval was cleared — nothing should fire
+  expect(ws.sent).toEqual([]);
 });

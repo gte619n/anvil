@@ -67,6 +67,12 @@ test("unknown command type → command.error, cid echoed", async () => {
   expect(r.message).toContain("unknown command type");
 });
 
+test("ping → pong (heartbeat, §6.4), no cid required", async () => {
+  const r = await rpc({ ...base, type: "ping" });
+  expect(r.type).toBe("pong");
+  expect(r.v).toBe(PROTOCOL_VERSION);
+});
+
 test("terminal.open on an unknown session → command.error", async () => {
   const r = await rpc({ ...base, type: "terminal.open", cid: "c2", sessionId: "x", cols: 80, rows: 24 });
   expect(r.type).toBe("command.error");
