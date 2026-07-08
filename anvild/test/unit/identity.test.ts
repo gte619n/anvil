@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
-import { loadServerIdentity, sanitizeHostname, serverHelloEvent } from "../../src/server/identity";
+import { hostLabel, loadServerIdentity, sanitizeHostname, serverHelloEvent } from "../../src/server/identity";
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), "anvil-id-"));
@@ -20,15 +20,24 @@ test("serverId is generated once and stays stable across reloads (daemon restart
   }
 });
 
-test("serverName is ANVIL_SERVER_NAME when set, else the hostname", () => {
+test("serverName is ANVIL_SERVER_NAME when set, else the short host label", () => {
   const dir = tmp();
   try {
     expect(loadServerIdentity(dir, { ANVIL_SERVER_NAME: "build-box" }).serverName).toBe("build-box");
-    expect(loadServerIdentity(dir, { ANVIL_SERVER_NAME: "  " }).serverName).toBe(hostname()); // blank → hostname
-    expect(loadServerIdentity(dir, {}).serverName).toBe(hostname());
+    // Blank/absent override → the hostname's short label (any DNS domain dropped, e.g. `.oxos.lan`/`.local`).
+    expect(loadServerIdentity(dir, { ANVIL_SERVER_NAME: "  " }).serverName).toBe(hostLabel(hostname()));
+    expect(loadServerIdentity(dir, {}).serverName).toBe(hostLabel(hostname()));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("hostLabel drops the DNS domain (DHCP search domain / Bonjour) but keeps the short name", () => {
+  expect(hostLabel("Mac-Mini-M4.oxos.lan")).toBe("Mac-Mini-M4"); // office search-domain noise stripped
+  expect(hostLabel("Mac-Mini-M1.local")).toBe("Mac-Mini-M1"); // Bonjour suffix stripped
+  expect(hostLabel("mac-mini-m4")).toBe("mac-mini-m4"); // already a short name → untouched
+  expect(hostLabel("  build-box.corp.example.com  ")).toBe("build-box"); // trimmed + first label only
+  expect(hostLabel("à®ÌU")).toBe("anvil-server"); // unsalvageable mojibake still falls back to the generic label
 });
 
 test("sanitizeHostname passes clean hostnames through and rescues mojibake", () => {

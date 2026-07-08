@@ -183,17 +183,32 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // Replicate this hub's Todoist token to member daemons so autopilot can run where each repo lives
   // (anvil-multi-server.md). `targets` = member serverIds; omit for all. No-op on a leaf member (its
   // fleet is empty) or before a token is set. Fire-and-forget + idempotent — members heal on reconnect.
+  // Remember the token last *successfully* pushed to each member (by serverId), so a repeated trigger
+  // doesn't re-POST an unchanged token to the whole fleet. The client re-sends `todoist.connect` on every
+  // socket open, and a hub restart storm makes that fire on every reconnect — which otherwise produced
+  // hundreds of identical "[todoist] replicated token" lines and a burst of outbound HTTPS per restart. A
+  // member is only pushed when its token actually changes or it was never reached; a failed push isn't
+  // recorded, so an offline member still heals on its next reconnect.
+  const lastPropagated = new Map<string, string>(); // serverId → token last confirmed on that member
   function pushTodoist(targets?: string[]): void {
     const token = supervisor.todoistTokenForFleet();
     if (!token) return;
-    const members = fleet.list().filter((m) => !targets || targets.includes(m.serverId));
+    const members = fleet
+      .list()
+      .filter((m) => (!targets || targets.includes(m.serverId)) && lastPropagated.get(m.serverId) !== token);
     if (members.length === 0) return;
+    const serverIdByUrl = new Map(members.map((m) => [m.url, m.serverId]));
     void propagateTodoist({ members, token }).then((results) => {
       for (const r of results) {
         if (!r.ok) {
           console.warn(`[todoist] replication to ${r.url} failed: ${r.error ?? "unknown"}`);
           continue;
         }
+        // Record success under the member's *real* serverId (the member self-reports it; the stored
+        // record may still hold a legacy bare-host id until the heal below runs) so the dedup filter
+        // above matches on the next trigger.
+        const sid = r.serverId ?? serverIdByUrl.get(r.url);
+        if (sid) lastPropagated.set(sid, token);
         console.log(`[todoist] replicated token → ${r.resolvedUrl ?? r.url}${r.account ? ` (${r.account})` : ""}`);
         // Heal the stored fleet record from what actually answered: the working transport (e.g.
         // http→https once the member enabled `tailscale serve`) and the member's real serverId (legacy
@@ -270,19 +285,38 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
   };
 
-  const server = Bun.serve<ConnState>({
-    hostname: opts.host ?? "127.0.0.1",
-    port: opts.port,
-    async fetch(req, srv) {
-      const url = new URL(req.url);
-      const isApi = url.pathname.startsWith("/api/");
-      if (isApi && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-      const res = await handle(req, srv, url);
-      if (isApi && res) for (const [k, v] of Object.entries(CORS)) res.headers.set(k, v);
-      return res;
-    },
-    websocket: WS,
-  });
+  // Bind with a brief EADDRINUSE retry. A `launchctl kickstart -k` restart (arch §5 / self-update) can
+  // launch the fresh daemon while the outgoing one is still inside its ~4s graceful-flush window and
+  // hasn't released the port yet — and on the dev/hub box a stray worktree daemon can hold it too. A bare
+  // `Bun.serve` throws synchronously there; the process exits and launchd's KeepAlive respawns it into
+  // the same race, turning a clean restart into a multi-second crash loop that drops every client socket
+  // (observed as repeated EADDRINUSE + "shutdown watchdog fired" in the error log). Spin on the bind for a
+  // few seconds so the new instance simply waits the old one out. `Bun.sleepSync` is safe here — nothing
+  // else runs until we're listening — and `port: 0` (tests) never collides, so this is a no-op there.
+  const server = ((): ReturnType<typeof Bun.serve<ConnState>> => {
+    const bindDeadline = Date.now() + 6000;
+    for (;;) {
+      try {
+        return Bun.serve<ConnState>({
+          hostname: opts.host ?? "127.0.0.1",
+          port: opts.port,
+          async fetch(req, srv) {
+            const url = new URL(req.url);
+            const isApi = url.pathname.startsWith("/api/");
+            if (isApi && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+            const res = await handle(req, srv, url);
+            if (isApi && res) for (const [k, v] of Object.entries(CORS)) res.headers.set(k, v);
+            return res;
+          },
+          websocket: WS,
+        });
+      } catch (e) {
+        if ((e as { code?: string } | null)?.code !== "EADDRINUSE" || Date.now() >= bindDeadline) throw e;
+        console.warn(`[anvild] port ${opts.port} busy (EADDRINUSE) — a prior instance is still exiting; retrying…`);
+        Bun.sleepSync(250);
+      }
+    }
+  })();
 
   async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
       if (req.method === "GET" && url.pathname === "/api/health") {
