@@ -5471,14 +5471,20 @@ function showQuestion(requestId: string, questions: Question[]): void {
       };
       opts.appendChild(btn);
     }
-    // "Other" free-text affordance — Enter submits it when this is the one-tap case.
-    const other = document.createElement("input");
-    other.type = "text";
+    // "Other" free-text affordance — wraps and grows with the text instead of scrolling sideways.
+    const other = document.createElement("textarea");
     other.className = "q-other";
+    other.rows = 1;
     other.placeholder = "Other… (type a custom answer)";
+    const growOther = (): void => {
+      other.style.height = "auto";
+      other.style.height = `${Math.min(other.scrollHeight, 200)}px`;
+    };
+    other.addEventListener("input", growOther);
     if (oneTap) {
+      // Enter submits the one-tap case; Shift+Enter inserts a newline.
       other.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") {
+        if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           if (other.value.trim()) send();
         }
@@ -5525,7 +5531,7 @@ function gatherAnswers(card: HTMLElement, questions: Question[], chosen: string[
   const blocks = card.querySelectorAll<HTMLElement>(".q-block");
   for (const [qi, q] of questions.entries()) {
     const labels = [...(chosen[qi] ?? [])];
-    const notes = blocks[qi]?.querySelector<HTMLInputElement>(".q-other")?.value.trim() || undefined;
+    const notes = blocks[qi]?.querySelector<HTMLTextAreaElement>(".q-other")?.value.trim() || undefined;
     if (notes) labels.push(notes); // a typed "Other" answer counts as a chosen label
     if (labels.length === 0) return null; // unanswered
     answers.push({ question: q.question, labels, ...(notes ? { notes } : {}) });

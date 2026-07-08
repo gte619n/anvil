@@ -431,7 +431,7 @@ details.tool-result.error > summary { color: var(--danger); }
 .q-option.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .q-opt-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .q-opt-desc { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
-.q-other { margin-top: 8px; width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+.q-other { display: block; box-sizing: border-box; margin-top: 8px; width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; line-height: 1.45; resize: none; overflow-y: auto; max-height: 200px; }
 .q-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .q-btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; font-weight: 600; }
 .q-btn:hover { background: var(--panel); }
