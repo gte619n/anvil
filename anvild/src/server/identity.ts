@@ -33,6 +33,20 @@ export function sanitizeHostname(raw: string): string {
   return /[A-Za-z0-9]{2}/.test(salvaged) ? salvaged : "anvil-server";
 }
 
+/**
+ * Display label from the OS hostname: the machine's SHORT name, with any DNS domain dropped. A Mac
+ * that joins a network handing out a DHCP search domain has `os.hostname()` composed as
+ * `<name>.<domain>` (e.g. `Mac-Mini-M4.oxos.lan`), and a Bonjour host reports `<name>.local` — both
+ * are noise on a fleet card. Taking the first DNS label (as `tailnetPeers` already does for its
+ * picker) shows `Mac-Mini-M4` either way. `ANVIL_SERVER_NAME` overrides this entirely and is trusted
+ * as-is — set it if you deliberately want a dotted/FQDN label.
+ */
+export function hostLabel(raw: string): string {
+  const clean = sanitizeHostname(raw);
+  const dot = clean.indexOf(".");
+  return dot > 0 ? clean.slice(0, dot) : clean;
+}
+
 export function loadServerIdentity(stateDir: string, env: Record<string, string | undefined> = process.env): ServerIdentity {
   mkdirSync(stateDir, { recursive: true });
   const file = join(stateDir, "server-id");
@@ -42,7 +56,7 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
     serverId = newId("srv");
     writeFileSync(file, `${serverId}\n`);
   }
-  const serverName = (env.ANVIL_SERVER_NAME ?? "").trim() || sanitizeHostname(hostname());
+  const serverName = (env.ANVIL_SERVER_NAME ?? "").trim() || hostLabel(hostname());
   return { serverId, serverName };
 }
 
