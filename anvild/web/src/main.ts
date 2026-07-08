@@ -4580,6 +4580,25 @@ quoteBtn.addEventListener("mousedown", (e) => {
   window.getSelection()?.removeAllRanges();
 });
 
+// ── Strip select-to-cite anchors from copied markdown ──────────────────────────────
+// Every rendered block carries a `data-line="start,end"` attribute — the select-to-cite hook,
+// read from the *live* DOM by the native clients. It must never ride along on the clipboard:
+// the browser's text/html flavor otherwise leaks a stray id on each block/line into paste
+// targets. When a copy originates in a markdown surface, rewrite the clipboard from a cleaned
+// clone (plain text is already anchor-free; we set it too so both flavors stay in sync).
+document.addEventListener("copy", (e) => {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !selectionEl()) return;
+  const cd = (e as ClipboardEvent).clipboardData;
+  if (!cd) return;
+  const wrap = document.createElement("div");
+  wrap.appendChild(sel.getRangeAt(0).cloneContents());
+  wrap.querySelectorAll("[data-line]").forEach((n) => n.removeAttribute("data-line"));
+  cd.setData("text/plain", sel.toString());
+  cd.setData("text/html", wrap.innerHTML);
+  e.preventDefault();
+});
+
 // ── Side panel: files + reader (terminal lands next) ──────────────────────────────
 const panel = $("#side-panel");
 const panelContent = $("#panel-content");
