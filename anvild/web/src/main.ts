@@ -1730,6 +1730,262 @@ function addCopyButtons(root: HTMLElement): void {
   }
 }
 
+// ── Link & attachment actions (copy / download) ───────────────────────────────────
+// Every URL link and file attachment in a message gets copy + download affordances.
+//   • Desktop / web: a small icon-only bar floats over the target's top-right on hover.
+//   • Android: a long-press opens a menu with the same actions (native callout suppressed).
+// "Copy" adapts to the target — an image copies its bits, everything else copies the URL.
+type ActionTarget = { host: HTMLElement; url: string; name: string; isImage: boolean };
+
+/** Best-effort filename from a URL path (falls back to a generic name). */
+function fileNameFromUrl(url: string, fallback: string): string {
+  try {
+    const last = new URL(url).pathname.split("/").filter(Boolean).pop();
+    if (last && /\.[a-z0-9]{1,8}$/i.test(last)) return decodeURIComponent(last);
+  } catch {
+    /* not a parseable URL — use the fallback */
+  }
+  return fallback;
+}
+
+/** Resolve the copy/download target for an event target, walking up to a link or attachment. */
+function actionTargetFor(el: EventTarget | null): ActionTarget | null {
+  const start = el instanceof HTMLElement ? el : null;
+  if (!start) return null;
+  const img = start.closest<HTMLImageElement>("#conversation .att-img");
+  if (img) return { host: img, url: img.src, name: fileNameFromUrl(img.src, "image.png"), isImage: true };
+  const chip = start.closest<HTMLAnchorElement>("#conversation a.att-file");
+  if (chip) {
+    const name = chip.querySelector(".att-name")?.textContent?.trim() || fileNameFromUrl(chip.href, "file");
+    return { host: chip, url: chip.href, name, isImage: false };
+  }
+  // A plain URL link in message prose (skip in-app file links, which open the reader, not a URL).
+  const a = start.closest<HTMLAnchorElement>("#conversation .md a[href]");
+  if (a && !a.classList.contains("file-link") && /^https?:/i.test(a.href)) {
+    return { host: a, url: a.href, name: fileNameFromUrl(a.href, "download"), isImage: false };
+  }
+  return null;
+}
+
+/** Re-encode any image blob to PNG (the format the async clipboard reliably accepts) via a canvas. */
+function blobToPng(blob: Blob): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const obj = URL.createObjectURL(blob);
+    const im = new Image();
+    im.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = im.naturalWidth;
+      c.height = im.naturalHeight;
+      const ctx = c.getContext("2d");
+      if (!ctx) return (URL.revokeObjectURL(obj), reject(new Error("no 2d context")));
+      ctx.drawImage(im, 0, 0);
+      c.toBlob((b) => {
+        URL.revokeObjectURL(obj);
+        b ? resolve(b) : reject(new Error("toBlob failed"));
+      }, "image/png");
+    };
+    im.onerror = () => (URL.revokeObjectURL(obj), reject(new Error("image decode failed")));
+    im.src = obj;
+  });
+}
+
+/** Copy an image's actual bits to the clipboard (PNG). Returns false if the platform can't. */
+async function copyImageFromUrl(url: string): Promise<boolean> {
+  try {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") return false;
+    const blob = await (await fetch(url)).blob();
+    const png = blob.type === "image/png" ? blob : await blobToPng(blob);
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The "copy" action: image → its bits (falling back to the URL); anything else → the URL. */
+async function copyTarget(t: ActionTarget): Promise<boolean> {
+  if (t.isImage && (await copyImageFromUrl(t.url))) return true;
+  return copyText(t.url);
+}
+
+/** Save a URL to a file. Fetch→blob keeps same-origin attachments as true downloads; on a
+ *  cross-origin failure, fall back to opening it (the browser may still offer to save). */
+async function downloadTarget(t: ActionTarget): Promise<boolean> {
+  try {
+    const res = await fetch(t.url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const obj = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = obj;
+    a.download = t.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(obj), 4000);
+    return true;
+  } catch {
+    window.open(t.url, "_blank", "noopener");
+    return false;
+  }
+}
+
+// Flag the platform on <html> so CSS can suppress the native long-press callout on links/attachments.
+document.documentElement.classList.toggle("is-android", isAndroidApp);
+
+// ── Desktop / web: floating icon bar on hover ──
+const linkActions = document.createElement("div");
+linkActions.id = "link-actions";
+linkActions.hidden = true;
+linkActions.innerHTML =
+  `<button type="button" class="la-btn" data-act="copy">${icon("content_copy")}</button>` +
+  `<button type="button" class="la-btn" data-act="download" title="Download">${icon("download")}</button>`;
+document.body.appendChild(linkActions);
+let laTarget: ActionTarget | null = null;
+let laHideTimer = 0;
+
+function positionLinkActions(t: ActionTarget): void {
+  const r = t.host.getBoundingClientRect();
+  linkActions.hidden = false;
+  const w = linkActions.offsetWidth;
+  linkActions.style.top = `${Math.max(4, r.top + 4)}px`;
+  linkActions.style.left = `${Math.min(window.innerWidth - w - 4, Math.max(4, r.right - w - 4))}px`;
+  (linkActions.querySelector('.la-btn[data-act="copy"]') as HTMLElement).title = t.isImage ? "Copy image" : "Copy link";
+}
+function showLinkActions(t: ActionTarget): void {
+  clearTimeout(laHideTimer);
+  if (laTarget?.host === t.host && !linkActions.hidden) return; // already up for this target
+  laTarget = t;
+  positionLinkActions(t);
+}
+function hideLinkActions(): void {
+  linkActions.hidden = true;
+  laTarget = null;
+}
+function scheduleHideLinkActions(): void {
+  clearTimeout(laHideTimer);
+  laHideTimer = window.setTimeout(hideLinkActions, 160);
+}
+
+function flashActionBtn(btn: HTMLElement, done: Promise<boolean>, restore: string): void {
+  void done.then((ok) => {
+    btn.innerHTML = icon(ok ? "check" : "error");
+    btn.classList.toggle("done", ok);
+    setTimeout(() => {
+      btn.innerHTML = icon(restore);
+      btn.classList.remove("done");
+    }, 1400);
+  });
+}
+
+conversation.addEventListener("mouseover", (e) => {
+  if (isAndroidApp) return; // Android uses long-press, not hover
+  const t = actionTargetFor(e.target);
+  if (t) showLinkActions(t);
+});
+conversation.addEventListener("mouseout", (e) => {
+  if (isAndroidApp) return;
+  const to = e.relatedTarget;
+  if (to instanceof HTMLElement && (to.closest("#link-actions") || actionTargetFor(to)?.host === laTarget?.host)) return;
+  scheduleHideLinkActions();
+});
+linkActions.addEventListener("mouseenter", () => clearTimeout(laHideTimer));
+linkActions.addEventListener("mouseleave", scheduleHideLinkActions);
+linkActions.addEventListener("click", (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>(".la-btn");
+  if (!btn || !laTarget) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const t = laTarget;
+  if (btn.dataset.act === "download") flashActionBtn(btn, downloadTarget(t), "download");
+  else flashActionBtn(btn, copyTarget(t), "content_copy");
+});
+
+// ── Android: long-press action menu ──
+const linkMenu = document.createElement("div");
+linkMenu.id = "link-menu";
+linkMenu.hidden = true;
+document.body.appendChild(linkMenu);
+let menuTarget: ActionTarget | null = null;
+
+function hideLinkMenu(): void {
+  linkMenu.hidden = true;
+  menuTarget = null;
+}
+function openLinkMenu(t: ActionTarget, x: number, y: number): void {
+  menuTarget = t;
+  linkMenu.innerHTML =
+    `<button type="button" class="lm-item" data-act="copy">${icon("content_copy")}<span>${t.isImage ? "Copy image" : "Copy link"}</span></button>` +
+    `<button type="button" class="lm-item" data-act="download">${icon("download")}<span>Download</span></button>`;
+  linkMenu.hidden = false;
+  const w = linkMenu.offsetWidth;
+  const h = linkMenu.offsetHeight;
+  linkMenu.style.left = `${Math.min(Math.max(8, x), window.innerWidth - w - 8)}px`;
+  linkMenu.style.top = `${Math.min(Math.max(8, y), window.innerHeight - h - 8)}px`;
+}
+linkMenu.addEventListener("click", (e) => {
+  const item = (e.target as HTMLElement).closest<HTMLElement>(".lm-item");
+  if (!item || !menuTarget) return;
+  const t = menuTarget;
+  const act = item.dataset.act;
+  hideLinkMenu();
+  if (act === "download") void downloadTarget(t).then((ok) => toast(ok ? "Downloading…" : "Opened in a new tab"));
+  else void copyTarget(t).then((ok) => toast(ok ? (t.isImage ? "Image copied" : "Link copied") : "Couldn't copy"));
+});
+
+let pressTimer = 0;
+let pressTarget: ActionTarget | null = null;
+let pressX = 0;
+let pressY = 0;
+conversation.addEventListener(
+  "touchstart",
+  (e) => {
+    const touch = e.touches[0];
+    if (!isAndroidApp || e.touches.length !== 1 || !touch) return;
+    const t = actionTargetFor(e.target);
+    if (!t) return;
+    pressTarget = t;
+    pressX = touch.clientX;
+    pressY = touch.clientY;
+    clearTimeout(pressTimer);
+    pressTimer = window.setTimeout(() => {
+      if (pressTarget) openLinkMenu(pressTarget, pressX, pressY);
+    }, 500);
+  },
+  { passive: true },
+);
+conversation.addEventListener(
+  "touchmove",
+  (e) => {
+    const touch = e.touches[0];
+    if (!pressTarget || !touch) return;
+    if (Math.abs(touch.clientX - pressX) > 10 || Math.abs(touch.clientY - pressY) > 10) {
+      clearTimeout(pressTimer);
+      pressTarget = null;
+    }
+  },
+  { passive: true },
+);
+conversation.addEventListener("touchend", () => {
+  clearTimeout(pressTimer);
+  pressTarget = null;
+});
+// A long-press we've claimed shouldn't also raise the WebView's native link/image menu.
+conversation.addEventListener("contextmenu", (e) => {
+  if (isAndroidApp && actionTargetFor(e.target)) e.preventDefault();
+});
+// Tap elsewhere dismisses the menu; scrolling dismisses both floating layers.
+document.addEventListener(
+  "touchstart",
+  (e) => {
+    if (!linkMenu.hidden && !(e.target as HTMLElement).closest("#link-menu")) hideLinkMenu();
+  },
+  { capture: true },
+);
+conversation.addEventListener("scroll", () => {
+  hideLinkActions();
+  hideLinkMenu();
+});
+
 // ── Mermaid (lazy) ──────────────────────────────────────────────────────────────
 let mermaidReady: Promise<any> | null = null;
 async function runMermaid(container: HTMLElement): Promise<void> {
