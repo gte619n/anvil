@@ -338,6 +338,17 @@ reconciles to exactly where the Mac left off. **No shared viewport means switchi
 devices mid-conversation needs no "disconnect the other one" dance** — the bug you hit
 with Zellij simply cannot occur, because nothing is bound to a single client's dimensions.
 
+**Liveness (application heartbeat).** Reconnect only recovers once the socket is *known*
+to be down — and a browser leaves `readyState === OPEN` on a half-open socket when the
+transport dies silently (a Tailscale tunnel bounce, a laptop sleeping, a NAT dropping the
+flow). Nothing fires `onclose`, so a queued write hangs on "Syncing…" forever. Browsers
+can't send native WS ping frames, so the client sends an application-level `ping` on a
+~15s cadence and the server echoes `pong`. Any inbound frame (not just the pong) proves
+the socket is alive; if a ping goes unanswered within a grace window the client tears the
+socket down itself and reconnects, which re-runs the resume path above and drains the
+outbox. The socket also pings proactively when the tab refocuses or the network returns,
+instead of trusting `readyState`.
+
 ### 6.5 Attachments (paste / drag-drop images & files)
 
 1. Client uploads bytes via REST: `POST /api/sessions/{id}/attachments` (multipart) →

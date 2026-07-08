@@ -434,6 +434,12 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid)); // PTY persists (arch §7); the client just stops rendering
         return;
 
+      case "ping":
+        // Heartbeat (§6.4): echo pong so the client can prove the socket is still alive and
+        // detect a half-open connection. Deliberately not correlated — no cid, no ack.
+        send({ v: PROTOCOL_VERSION, type: "pong", ts: now() });
+        return;
+
       default:
         send(cmdError(`unknown command type: '${(cmd as { type: string }).type}'`, cid));
     }

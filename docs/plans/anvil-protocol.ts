@@ -613,6 +613,16 @@ export interface AckEvent extends Envelope {
   type: "ack";
   cid: Cid;
 }
+/**
+ * Heartbeat reply to a client `ping` (§6.4 liveness). A browser can't send native WS ping frames, so the
+ * client sends an application-level `ping` and the server echoes `pong`. The client uses the arrival
+ * of any frame (this one included) as proof the socket is still alive; if a ping goes unanswered it
+ * force-reconnects — otherwise a half-open socket (readyState still OPEN after the transport silently
+ * dropped, e.g. a Tailscale tunnel bounce) would strand the outbox on "Syncing…" forever.
+ */
+export interface PongEvent extends Envelope {
+  type: "pong";
+}
 /** A command failed (validation, unknown session, etc.). */
 export interface CommandErrorEvent extends Envelope {
   type: "command.error";
@@ -780,6 +790,7 @@ export type ServerEvent =
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent
+  | PongEvent
   | CommandErrorEvent
   // conversation
   | ConversationSnapshotEvent
@@ -1163,6 +1174,13 @@ export interface PushUnregisterCmd extends Envelope, Correlated {
   token: string; // stop pushing to this device (logout / disable)
 }
 
+// 5g. Liveness (§6.4)
+
+/** Application-level heartbeat; the server replies `pong`. See PongEvent for the why. */
+export interface PingCmd extends Envelope {
+  type: "ping";
+}
+
 /** The full set of messages a client may send. */
 export type ClientCommand =
   // session
@@ -1231,7 +1249,9 @@ export type ClientCommand =
   | TerminalCloseCmd
   // notifications
   | PushRegisterCmd
-  | PushUnregisterCmd;
+  | PushUnregisterCmd
+  // liveness
+  | PingCmd;
 
 // Convenience maps for exhaustive switch handlers.
 export type ServerEventType = ServerEvent["type"];
