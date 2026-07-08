@@ -671,6 +671,26 @@ input:focus, select:focus, textarea:not(#input):focus {
 .copy-btn .msym { font-size: 15px; }
 .copy-btn.copied { color: var(--accent); border-color: var(--accent); opacity: 1; }
 
+/* Copy / download affordances on links & attachments.
+ * Desktop/web: an icon-only bar floats over the target's top-right on hover (positioned in JS). */
+#link-actions { position: fixed; z-index: 40; display: flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2); }
+#link-actions[hidden] { display: none; }
+.la-btn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: none; border-radius: 6px; background: none; color: var(--muted); cursor: pointer; transition: color 0.12s, background 0.12s; }
+.la-btn:hover { background: var(--panel); color: var(--accent); }
+.la-btn.done { color: var(--accent); }
+.la-btn .msym { font-size: 16px; }
+/* Android: the long-press action menu. */
+#link-menu { position: fixed; z-index: 60; display: flex; flex-direction: column; min-width: 176px; padding: 6px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); box-shadow: 0 6px 26px rgba(0, 0, 0, 0.3); }
+#link-menu[hidden] { display: none; }
+.lm-item { display: flex; align-items: center; gap: 12px; padding: 11px 12px; border: none; border-radius: 8px; background: none; color: var(--text); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+.lm-item:active { background: var(--panel); }
+.lm-item .msym { font-size: 20px; color: var(--muted); }
+/* On Android, links & attachments answer to our long-press menu — suppress the native callout
+ * and text-selection that would otherwise hijack the gesture. */
+html.is-android #conversation .md a,
+html.is-android #conversation a.att-file,
+html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+
 /* Consolidated activity block — the turn's tool/thinking churn, collapsed to a preview */
 .activity { align-self: stretch; max-width: 100%; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); font-size: 12px; color: var(--muted); }
 .activity > summary { cursor: pointer; list-style: none; padding: 8px 11px; }
