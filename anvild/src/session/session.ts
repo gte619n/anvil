@@ -49,6 +49,11 @@ export class Session {
   /** The most recent assistant prose (plain text, trimmed) — used to give the "your turn"
    *  notification real context ("…here's the summary") instead of a generic "Finished". Transient. */
   lastAssistantText: string | undefined;
+  /** The session's opening user prompt (plain text, trimmed) — the raw brief that reveals the goal,
+   *  fed to the branch-kind classifier to prefix the remote branch (arch §8). Captured once, in
+   *  memory only; a restart drops it, which is fine (the remote branch is classified & persisted by
+   *  the first turn's end). */
+  openingPrompt: string | undefined;
   /** Once disposed (killed/archived/shutdown) `emit` is a no-op — a late-draining agent turn must
    *  not write into a dead session (would target a removed dir/connection and crash the daemon). */
   private disposed = false;
