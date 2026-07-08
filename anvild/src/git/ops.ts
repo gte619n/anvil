@@ -114,9 +114,29 @@ export function commit(cwd: string, message: string): { ok: boolean; output: str
   return { ok: r.code === 0, output: r.out || (r.code === 0 ? "committed" : "nothing to commit") };
 }
 
-export function push(cwd: string, branch: string): { ok: boolean; output: string } {
-  const r = run(["git", "push", "-u", "origin", branch], cwd);
+/**
+ * Push the local worktree branch, setting upstream tracking. When `remoteBranch` differs from the
+ * local `branch` (the usual case — the local slug maps to a `feature/…`/`bugfix/…`/`hotfix/…` remote,
+ * arch §8), push a `branch:remoteBranch` refspec so the remote reads as intent while the checkout
+ * keeps its bare name. `-u` then tracks `origin/remoteBranch`, so later plain `git push` in this
+ * worktree keeps hitting the same remote branch.
+ */
+export function push(cwd: string, branch: string, remoteBranch?: string): { ok: boolean; output: string } {
+  const refspec = remoteBranch && remoteBranch !== branch ? `${branch}:${remoteBranch}` : branch;
+  const r = run(["git", "push", "-u", "origin", refspec], cwd);
   return { ok: r.code === 0, output: r.out || "pushed" };
+}
+
+/**
+ * The remote branch this worktree already tracks (upstream `origin/<name>` → `<name>`), or
+ * undefined if no upstream is set yet. Used to avoid re-prefixing — and thereby orphaning the old
+ * remote — a branch that was already pushed (e.g. a session created before remote-branch prefixing).
+ */
+export function upstreamRemoteBranch(cwd: string): string | undefined {
+  const r = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
+  if (r.code !== 0) return undefined;
+  const name = r.out.trim();
+  return name.startsWith("origin/") ? name.slice("origin/".length) : name || undefined;
 }
 
 export function createPr(cwd: string, title: string, body: string): { ok: boolean; output: string; url?: string } {
@@ -141,6 +161,7 @@ export function mergePr(
   cwd: string,
   method: "merge" | "squash" | "rebase",
   branch?: string,
+  remoteBranch?: string,
 ): { ok: boolean; output: string; newBranch?: string } {
   const flag = method === "squash" ? "--squash" : method === "rebase" ? "--rebase" : "--merge";
   const r = run(["gh", "pr", "merge", flag], cwd);
@@ -153,8 +174,10 @@ export function mergePr(
   // Delete the remote branch ourselves — what `--delete-branch` would have done, but as a plain push
   // so it never tries to move the local checkout and can't abort the rest of the cleanup. Best-effort:
   // the remote may already be gone (e.g. branch-protection auto-delete) and that's not a failure.
-  const remoteDeleted = run(["git", "push", "origin", "--delete", branch], cwd).code === 0;
-  const remoteNote = remoteDeleted ? `; deleted remote ${branch}` : "";
+  // The remote branch carries the intent prefix (`feature/…`), which differs from the local slug.
+  const remote = remoteBranch ?? branch;
+  const remoteDeleted = run(["git", "push", "origin", "--delete", remote], cwd).code === 0;
+  const remoteNote = remoteDeleted ? `; deleted remote ${remote}` : "";
 
   const def = defaultBranch(cwd);
   const start = def ? `origin/${def}` : "HEAD";

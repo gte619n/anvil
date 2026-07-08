@@ -89,6 +89,7 @@ import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
 import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
+import { classifyBranchKind, heuristicKind } from "../agent/branch-kind";
 import { WebPush, type PushPayload } from "../push/webpush";
 import { Fcm } from "../push/fcm";
 import { Apns } from "../push/apns";
@@ -1434,6 +1435,47 @@ export class Supervisor {
     }
   }
 
+  /**
+   * Classify the worktree's REMOTE branch prefix from the opening brief and persist it (arch §8) —
+   * the local branch keeps its bare slug; the remote reads as intent (`feature/…`/`bugfix/…`/
+   * `hotfix/…`). Called eagerly once the first turn ends (the goal is now on the record). Idempotent
+   * and safe to skip: no-op for non-worktree sessions, once a prefix is set, or on a branch already
+   * pushed under some other name (adopting that upstream instead, so we never orphan a live remote).
+   */
+  private async ensureRemoteBranch(s: Session): Promise<void> {
+    const wt = s.data.worktree;
+    if (!wt || wt.remoteBranch) return;
+    const existing = git.upstreamRemoteBranch(s.data.cwd);
+    if (existing) {
+      wt.remoteBranch = existing; // already pushed — keep its remote; re-prefixing would orphan it
+      this.persist();
+      return;
+    }
+    const kind = await classifyBranchKind(s.openingPrompt ?? s.data.title ?? "", this.agentEnv());
+    // Re-read: the session may have been killed, or a concurrent push may have set the prefix first.
+    if (!this.sessions.has(s.data.id) || !s.data.worktree || s.data.worktree.remoteBranch) return;
+    s.data.worktree.remoteBranch = `${kind}/${s.data.worktree.branch}`;
+    this.persist();
+    this.broadcastUpdated(s.data);
+  }
+
+  /**
+   * The remote branch to push to right now (synchronous). Normally the prefix was already classified
+   * by the first turn (`ensureRemoteBranch`); but if a push races ahead of that LLM call, derive a
+   * prefix from the keyword heuristic on the spot so we never push a bare, unprefixed remote. The
+   * result is persisted so it stays stable. Returns undefined for non-worktree sessions.
+   */
+  private resolveRemoteBranch(s: Session): string | undefined {
+    const wt = s.data.worktree;
+    if (!wt) return undefined;
+    if (wt.remoteBranch) return wt.remoteBranch;
+    const existing = git.upstreamRemoteBranch(s.data.cwd);
+    wt.remoteBranch = existing ?? `${heuristicKind(s.openingPrompt ?? s.data.title ?? "")}/${wt.branch}`;
+    this.persist();
+    this.broadcastUpdated(s.data);
+    return wt.remoteBranch;
+  }
+
   // File browser & reader (arch §8.1/§8.2), scoped to the session worktree. Change-watching is
   // extracted to FileWatchManager (unit-tested); the Supervisor injects locate/read/session access.
   private readonly fileWatchMgr = new FileWatchManager(
@@ -1511,7 +1553,7 @@ export class Supervisor {
         break;
       }
       case "push": {
-        const r = git.push(cwd, branch);
+        const r = git.push(cwd, branch, this.resolveRemoteBranch(s));
         ok = r.ok;
         output = r.output;
         this.refreshGit(s);
@@ -1525,7 +1567,7 @@ export class Supervisor {
         break;
       }
       case "merge-pr": {
-        const r = git.mergePr(cwd, cmd.method ?? "squash", s.data.worktree?.branch);
+        const r = git.mergePr(cwd, cmd.method ?? "squash", s.data.worktree?.branch, s.data.worktree?.remoteBranch);
         ok = r.ok;
         output = r.output;
         if (r.ok) {
@@ -1688,6 +1730,10 @@ export class Supervisor {
     const inline = attachmentIds
       .map((aid) => this.attachStore.loadForAgent(id, aid))
       .filter((x): x is { mediaType: string; name: string; data: string } => x !== undefined);
+
+    // Remember the opening brief (once) so the first turn can classify the remote branch prefix
+    // from what the user actually asked for (arch §8) — the local slug alone is too terse.
+    if (!s.data.worktree?.remoteBranch && text.trim()) s.openingPrompt ??= text.trim();
 
     // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4)
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
@@ -2063,6 +2109,9 @@ export class Supervisor {
     // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
     const s = this.sessions.get(sessionId);
     if (s) this.refreshGit(s);
+    // The goal is now on the record — classify the remote branch prefix from the opening brief once
+    // (arch §8). Fire-and-forget: a slow/failed LLM call must never hold up the turn's completion.
+    if (s?.data.worktree && !s.data.worktree.remoteBranch) void this.ensureRemoteBranch(s);
     const { budget, crossedSoftStop } = this.rateLimits.update(usage.rateLimits, usage.subscriptionType);
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "budget", ts: now(), budget });
     if (crossedSoftStop) {

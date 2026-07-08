@@ -99,8 +99,13 @@ export type SessionStatus =
 
 export interface Worktree {
   repoRoot: string;
-  branch: string;
+  branch: string; // the LOCAL worktree branch — the bare session slug (arch §8)
   base: string; // branch/commit it was created from
+  /** The REMOTE branch this pushes to — the local slug under a `feature/`/`bugfix/`/`hotfix/`
+   *  prefix, classified from the session's opening prompts once the goal is clear. Absent until
+   *  classified (or on pre-existing sessions already pushed under the bare name); pushes then use a
+   *  `branch:remoteBranch` refspec so the remote reads as intent. */
+  remoteBranch?: string;
 }
 
 /**
