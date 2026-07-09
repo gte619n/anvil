@@ -1057,11 +1057,48 @@ function renderSnapshotEvents(events: ConversationEvent[]): void {
 // ── Conversation rendering ─────────────────────────────────────────────────────
 function bubble(role: string): HTMLElement {
   dropSessionHero(); // real content arriving — retire the blank-session title card
+  removeTailSpacer(); // fresh content fills the pane; drop any "new topic" blank space below
   const el = document.createElement("div");
   el.className = `bubble ${role}`;
   conversation.appendChild(el);
   scrollDown();
   return el;
+}
+
+// A "new topic" divider (§0.6) acts like a header: it scrolls to the top of the pane with a viewport
+// of blank space below, so the earlier conversation slides up out of view (it stays — scroll up).
+// The spacer is temporary; the next message removes it via bubble().
+let tailSpacer: HTMLElement | null = null;
+function removeTailSpacer(): void {
+  tailSpacer?.remove();
+  tailSpacer = null;
+}
+function appendTopicDivider(label: string, note?: string): void {
+  dropSessionHero();
+  const el = document.createElement("div");
+  el.className = "topic-divider";
+  el.innerHTML = `<div class="topic-rule"><span class="topic-chip">${icon("restart_alt")}<span>${esc(label)}</span></span></div>`;
+  if (note) {
+    const n = document.createElement("div");
+    n.className = "topic-note";
+    n.textContent = note;
+    el.appendChild(n);
+  }
+  conversation.appendChild(el);
+  if (!replayingSnapshot) pushDividerToTop(el); // a fresh clear pushes to top; replay keeps normal flow
+}
+function pushDividerToTop(el: HTMLElement): void {
+  removeTailSpacer();
+  const spacer = document.createElement("div");
+  spacer.className = "convo-tail-spacer";
+  spacer.style.height = `${conversation.clientHeight}px`; // a full viewport so the divider can reach the top
+  conversation.appendChild(spacer);
+  tailSpacer = spacer;
+  stickToBottom = false; // we're deliberately parked at the divider, not following the bottom
+  requestAnimationFrame(() => {
+    const top = el.getBoundingClientRect().top - conversation.getBoundingClientRect().top + conversation.scrollTop;
+    conversation.scrollTop = Math.max(0, top - 16);
+  });
 }
 // ── Timestamps ─────────────────────────────────────────────────────────────────
 /** A small, muted time label for a message (short text; full date/time on hover). */
@@ -1187,6 +1224,10 @@ function commitAssistant(blocks: ContentBlock[], ts?: string): void {
   }
   const mdBlocks = blocks.filter((b): b is Extract<ContentBlock, { kind: "markdown" }> => b.kind === "markdown");
   const toolBlocks = blocks.filter((b): b is Extract<ContentBlock, { kind: "tool_use" }> => b.kind === "tool_use");
+  const dividerBlocks = blocks.filter((b): b is Extract<ContentBlock, { kind: "divider" }> => b.kind === "divider");
+
+  // Topic dividers are full-width boundaries, not prose bubbles — render (and push-to-top) first.
+  for (const d of dividerBlocks) appendTopicDivider(d.label, d.note);
 
   if (mdBlocks.length) {
     // The model's prose answer is its own clean bubble (separate from the tool churn below).
@@ -1490,6 +1531,7 @@ function appendFileOffer(file: FileOffer): void {
 function clearConversation(): void {
   conversation.innerHTML = "";
   streaming = null;
+  tailSpacer = null; // detached by the innerHTML reset
   thinkingEl = null; // detached by the innerHTML reset
   turnCanceled = false;
   resetActivity(); // detached by the reset

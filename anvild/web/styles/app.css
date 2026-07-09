@@ -382,6 +382,18 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .bubble .md { line-height: 1.55; }
 .bubble .md :first-child { margin-top: 0; }
 .bubble .md :last-child { margin-bottom: 0; }
+
+/* "New topic" boundary (§0.6): a labelled, full-width rule marking where context was cleared. */
+.topic-divider { align-self: stretch; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 7px; margin: 14px 0; scroll-margin-top: 16px; }
+.topic-rule { display: flex; align-items: center; gap: 14px; width: 100%; }
+.topic-rule::before, .topic-rule::after { content: ""; flex: 1 1 auto; height: 1px; }
+.topic-rule::before { background: linear-gradient(to right, transparent, var(--border)); }
+.topic-rule::after { background: linear-gradient(to left, transparent, var(--border)); }
+.topic-chip { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 3px 13px 3px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel); }
+.topic-chip .msym { font-size: 15px; }
+.topic-note { text-align: center; font-size: 12px; color: var(--muted); max-width: 640px; line-height: 1.4; padding: 0 16px; }
+/* Blank filler below a fresh divider so it can scroll to the top of the pane; removed on next message. */
+.convo-tail-spacer { flex: 0 0 auto; pointer-events: none; }
 #quote-btn { position: absolute; z-index: 30; padding: 4px 10px; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-size: 12px; cursor: pointer; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
 .tool { font-size: 13px; color: var(--muted); margin: 6px 0; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .tool .msym { font-size: 16px; flex-shrink: 0; }
