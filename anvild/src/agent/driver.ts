@@ -1,7 +1,8 @@
 import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliOptions } from "./cli";
-import type { Model } from "@protocol";
+import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
+import type { CommandInfo, Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
@@ -56,6 +57,12 @@ export class AgentDriver {
     private readonly onPlanProposed?: PlanProposedHook,
     /** The SDK query entrypoint; overridable in tests. Defaults to the real `query`. */
     private readonly queryFn: QueryFn = query,
+    /** Skills-only plugin dirs (user + project `.claude/skills`) exposed to this session's `/` menu.
+     *  Undefined/empty leaves the session with just the built-in commands. (§skills) */
+    private readonly plugins?: LocalPlugin[],
+    /** Called once the SDK's `init` message reports the session's slash-commands, so the supervisor
+     *  can publish them for the composer's `/` autocomplete. (§skills) */
+    private readonly onCommands?: (commands: CommandInfo[]) => void,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -152,6 +159,11 @@ export class AgentDriver {
         // allow-rules — is the permission authority (arch §6.6). (Trade-off: the repo's
         // CLAUDE.md isn't auto-loaded; project context can be injected later.)
         settingSources: [],
+        // Custom skills WITHOUT reopening settings: `plugins` loads the user's + project's
+        // `.claude/skills` via skills-only wrappers, and never reads on-disk permission allow-rules,
+        // so `settingSources: []` above still holds and the PreToolUse hook stays authoritative
+        // (§skills). `skills: "all"` enables every discovered skill + the Skill tool.
+        ...(this.plugins && this.plugins.length ? { plugins: this.plugins, skills: "all" as const } : {}),
         // PreToolUse fires on EVERY tool → the autonomy policy + danger list govern all
         // tools, and a blocked prompt parks here (timeout high enough to answer from a
         // phone). This is the authoritative gate (M7); canUseTool alone only sees ops the
@@ -195,6 +207,13 @@ export class AgentDriver {
       for await (const m of this.q) {
         const sid = extractSessionId(m);
         if (sid) this.session.data.claudeSessionId = sid;
+
+        // The SDK's session-init message reports the resolved slash-commands/skills (built-in + the
+        // plugins we loaded). Publish them once so the composer's `/` autocomplete can list them. (§skills)
+        if (this.onCommands && m.type === "system" && (m as any).subtype === "init") {
+          const slash = (m as any).slash_commands;
+          if (Array.isArray(slash)) this.onCommands(buildCommandInfo(slash, this.session.data.cwd));
+        }
 
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
         // Stash the assistant's prose so a "your turn" push can quote it (real context, not a

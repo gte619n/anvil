@@ -30,6 +30,7 @@ import {
   type AutopilotMaintenanceResultEvent,
   type AuthProvider,
   type AuthStatusEvent,
+  type CommandInfo,
   type GitCmd,
   type GitResultEvent,
   isModel,
@@ -52,6 +53,7 @@ import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
 import { applyPrBadge, carryPrBadge, createWorktree, gitStatus, isPrSweepEligible, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
+import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildAgentEnv } from "../agent/env";
@@ -1422,6 +1424,16 @@ export class Supervisor {
     return { id: session.id, title: session.data.title, cwd: session.data.cwd };
   }
 
+  /** The driver reported the session's slash-commands/skills (from the SDK `init` message). Store them
+   *  on the session and push via session.updated so every device's composer `/` menu can list them. */
+  private onSessionCommands(id: string, commands: CommandInfo[]): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    s.data.commands = commands;
+    this.persist();
+    this.broadcastUpdated(s.data);
+  }
+
   /** Fire-and-forget: ask Sonnet for a fitting icon, then push it via session.updated. */
   private async assignIcon(s: Session): Promise<void> {
     try {
@@ -1754,6 +1766,9 @@ export class Supervisor {
         isDefault ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer } : undefined,
         isDefault ? DEFAULT_TOOL_IDS : undefined,
         this.planReviewer(s),
+        undefined, // queryFn — keep the SDK default
+        skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
+        (commands) => this.onSessionCommands(id, commands),
       );
       this.drivers.set(id, driver);
     }
