@@ -44,6 +44,7 @@ import type {
   AutopilotSchedule,
   AutonomyPolicy,
   Budget,
+  CommandInfo,
   ContentBlock,
   ConversationEvent,
   DirEntry,
@@ -4343,6 +4344,15 @@ const input = $<HTMLTextAreaElement>("#input");
 const pendingAttachments: { id: string; name: string; kind: "image" | "file"; dataUrl?: string }[] = [];
 const attachRow = $("#attach-row");
 
+// `/` autocomplete state — declared here (before the first `restoreDraft` runs) so the hoisted menu
+// functions below have their backing element/state initialized. Logic lives further down.
+const slashMenu = document.createElement("div");
+slashMenu.id = "slash-menu";
+slashMenu.hidden = true;
+$("#input-box").appendChild(slashMenu);
+let slashItems: CommandInfo[] = [];
+let slashIdx = 0;
+
 // ── Per-session composer drafts ──────────────────────────────────────────────────
 // Unsent text belongs to the session it was typed in, not the box. Switching sessions stashes the
 // current draft under the outgoing session and restores the incoming one's (usually blank), so a
@@ -4400,6 +4410,7 @@ let historyStash = "";
 function restoreDraft(id: string | null): void {
   input.value = loadDraft(id);
   historyIdx = -1; // a fresh composer context — start recall from the top again
+  closeSlashMenu(); // don't carry one session's open `/` menu into another
   autoGrow();
   updateSendState();
 }
@@ -4452,6 +4463,29 @@ function applyRecall(text: string): void {
   updateSendState();
 }
 input.addEventListener("keydown", (e) => {
+  // While the `/` menu is open it owns the navigation keys — intercept before send/history below.
+  if (slashOpen()) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveSlash(1);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveSlash(-1);
+      return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      acceptSlash(slashIdx);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeSlashMenu();
+      return;
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     $<HTMLFormElement>("#composer").requestSubmit();
@@ -4482,13 +4516,106 @@ input.addEventListener("input", () => {
   historyIdx = -1; // a manual edit leaves history navigation — next ArrowUp starts fresh
   autoGrow();
   updateSendState();
+  updateSlashMenu();
 });
+// Close the menu when focus leaves the box (deferred so a row's mousedown still lands first).
+input.addEventListener("blur", () => setTimeout(closeSlashMenu, 100));
 function autoGrow(): void {
   input.style.height = "auto";
   input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
 }
 function updateSendState(): void {
   $<HTMLButtonElement>("#send").disabled = !input.value.trim() && pendingAttachments.length === 0;
+}
+
+// ── `/` slash-command autocomplete ────────────────────────────────────────────────
+// Typing "/" at the very start of the composer pops a menu of the active session's skills/commands
+// (built-in + the user's & project's `.claude/skills`, reported by the daemon on `session.commands`).
+// Picking one drops the invocable "/name " into the box; sending it triggers the skill. The menu only
+// arms while the text is a single "/token" (no space yet) — once you type an argument it gets out of
+// the way, and Enter/Arrows fall back to their normal send/history behaviour.
+// (The menu element + `slashItems`/`slashIdx` state are declared up in the composer setup so the
+// first `restoreDraft` at load already has them ready.)
+const slashOpen = (): boolean => !slashMenu.hidden;
+
+/** The commands published for the active session, or [] before its first turn. */
+function activeCommands(): CommandInfo[] {
+  return (activeId && sessions.get(activeId)?.commands) || [];
+}
+
+/** The "/token" the user is typing, or null when the menu shouldn't be armed (no leading "/", or a
+ *  space has been typed so we're now into arguments). */
+function slashToken(): string | null {
+  const v = input.value;
+  if (!v.startsWith("/")) return null;
+  const rest = v.slice(1);
+  return /\s/.test(rest) ? null : rest;
+}
+
+function closeSlashMenu(): void {
+  slashMenu.hidden = true;
+  slashMenu.replaceChildren();
+}
+
+/** Recompute the menu from the current composer text (called on every input). */
+function updateSlashMenu(): void {
+  const token = slashToken();
+  if (token === null) {
+    closeSlashMenu();
+    return;
+  }
+  const q = token.toLowerCase();
+  const all = activeCommands();
+  // Prefix matches first (what you'd expect while typing), then any substring hit.
+  slashItems = [
+    ...all.filter((c) => c.name.toLowerCase().startsWith(q)),
+    ...all.filter((c) => !c.name.toLowerCase().startsWith(q) && c.name.toLowerCase().includes(q)),
+  ].slice(0, 50);
+  if (!slashItems.length) {
+    closeSlashMenu();
+    return;
+  }
+  slashIdx = Math.min(slashIdx, slashItems.length - 1);
+  renderSlashMenu();
+}
+
+function renderSlashMenu(): void {
+  slashMenu.replaceChildren();
+  slashItems.forEach((c, i) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "slash-item" + (i === slashIdx ? " sel" : "");
+    row.innerHTML =
+      `<span class="slash-name">/${esc(c.name)}</span>` +
+      (c.source !== "builtin" ? `<span class="slash-src">${esc(c.source)}</span>` : "") +
+      (c.description ? `<span class="slash-desc">${esc(c.description)}</span>` : "");
+    // mousedown (not click) so the textarea never loses focus / selection before we act.
+    row.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      acceptSlash(i);
+    });
+    slashMenu.appendChild(row);
+  });
+  slashMenu.hidden = false;
+  slashMenu.querySelector(".slash-item.sel")?.scrollIntoView({ block: "nearest" });
+}
+
+function moveSlash(delta: number): void {
+  slashIdx = (slashIdx + delta + slashItems.length) % slashItems.length;
+  renderSlashMenu();
+}
+
+/** Insert the chosen command as "/name " and close the menu. */
+function acceptSlash(i: number): void {
+  const c = slashItems[i];
+  if (!c) return;
+  input.value = `/${c.name} `;
+  closeSlashMenu();
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  saveDraft(activeId, input.value);
+  autoGrow();
+  updateSendState();
 }
 
 // attach button → file picker

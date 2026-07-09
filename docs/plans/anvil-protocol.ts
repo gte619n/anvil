@@ -204,6 +204,19 @@ export interface Session {
   createdAt: Iso8601;
   lastActivityAt: Iso8601;
   usage: Usage;
+  // The slash-commands/skills this session can invoke, reported by the SDK's `init` message and
+  // enriched with SKILL.md descriptions — drives the composer's `/` autocomplete. Populated once the
+  // driver starts (absent until the first turn); rides session.updated/session.list. (§skills)
+  commands?: CommandInfo[];
+}
+
+/** One entry in a session's `/` autocomplete: an invocable slash-command or skill. `name` is the exact
+ *  invocable string (built-ins bare, e.g. "compact"; plugin skills namespaced, e.g. "user:deep-research")
+ *  — the composer sends "/" + name verbatim. (§skills) */
+export interface CommandInfo {
+  name: string;
+  description?: string; // one-line SKILL.md summary; absent for built-ins we don't have a blurb for
+  source: "builtin" | "user" | "project";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
