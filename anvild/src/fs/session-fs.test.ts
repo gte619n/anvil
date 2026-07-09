@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileNotFound, locateInside } from "./session-fs";
+import { FileExists, FileNotFound, listDir, locateInside, writeFile } from "./session-fs";
 
 // locateInside is the forgiving resolver behind fs.read: Claude names a markdown file by basename in
 // prose (`design.md`) while it lives in a subdir (`docs/plans/design.md`). A click sends the bare
@@ -46,5 +46,37 @@ describe("locateInside", () => {
 
   test("throws FileNotFound for a name that isn't anywhere in the tree", () => {
     expect(() => locateInside(root, "does-not-exist.md")).toThrow(FileNotFound);
+  });
+});
+
+// writeFile backs the file browser's drag-drop upload. It must confine writes to the worktree
+// (same boundary as reads/downloads) and refuse to clobber an existing path (arch §8.1).
+describe("writeFile", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "anvil-up-")));
+    mkdirSync(join(root, "sub"), { recursive: true });
+    writeFileSync(join(root, "existing.txt"), "old\n");
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  test("writes a new file into the worktree and reports its size", () => {
+    const bytes = new TextEncoder().encode("hello upload");
+    const res = writeFile(root, "sub/new.txt", bytes);
+    expect(res).toEqual({ path: "sub/new.txt", size: bytes.byteLength });
+    expect(readFileSync(join(root, "sub", "new.txt"), "utf8")).toBe("hello upload");
+    // the new file shows up in a listing with a size + mtime detail
+    const entry = listDir(root, "sub").entries.find((e) => e.name === "new.txt");
+    expect(entry?.size).toBe(bytes.byteLength);
+    expect(typeof entry?.mtime).toBe("number");
+  });
+
+  test("refuses to overwrite an existing path", () => {
+    expect(() => writeFile(root, "existing.txt", new Uint8Array([1]))).toThrow(FileExists);
+    expect(readFileSync(join(root, "existing.txt"), "utf8")).toBe("old\n"); // untouched
+  });
+
+  test("refuses a path that escapes the worktree", () => {
+    expect(() => writeFile(root, "../escape.txt", new Uint8Array([1]))).toThrow(/escapes/);
   });
 });

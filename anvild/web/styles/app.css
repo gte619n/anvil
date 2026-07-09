@@ -258,10 +258,19 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .ptab-spacer { flex: 1; }
 #panel-close { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; }
 #panel-content { flex: 1; overflow: auto; padding: 12px; }
+.file-browser { position: relative; min-height: 100%; }
+.file-browser.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; border-radius: 8px; }
+.file-browser.drag-over .fb-drop-hint { opacity: 1; }
+.fb-drop-hint { margin: 10px 4px 0; text-align: center; opacity: 0.5; }
 .file-list { list-style: none; margin: 0; padding: 0; }
-.file-list li { padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.file-list li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .file-list li:hover { background: var(--panel); }
 .file-list .dir { font-weight: 600; }
+.fb-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-detail { color: var(--muted); font-size: 11px; font-weight: 400; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.fb-dl { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; padding: 0; flex-shrink: 0; opacity: 0; }
+.file-list li:hover .fb-dl { opacity: 1; }
+.fb-dl:hover { color: var(--accent); }
 .reader-head { font-size: 12px; color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .reader-head a { color: var(--accent); }
 .reader-head-actions { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; }
@@ -495,6 +504,11 @@ details.tool-result.error > summary { color: var(--danger); }
 #composer-controls .spacer { flex: 1; }
 #btn-attach { background: none; border: none; cursor: pointer; font-size: 17px; padding: 4px 6px; border-radius: 8px; color: var(--muted); }
 #btn-attach:hover { background: var(--panel); }
+.composer-model { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 1; min-width: 0; max-width: 42vw; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: none; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; }
+.composer-model[hidden] { display: none; }
+.composer-model:hover, .composer-model.active { border-color: var(--accent); color: var(--text); background: var(--panel); }
+.composer-model .msym { font-size: 16px; color: var(--accent); }
+.composer-model .cm-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 #send { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--accent); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(59, 110, 245, 0.4); transition: transform 0.1s, background 0.15s; }
 #send:not(:disabled):hover { transform: scale(1.06); }
 #send:not(:disabled):active { transform: scale(0.95); }

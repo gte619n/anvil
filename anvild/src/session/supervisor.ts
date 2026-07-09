@@ -33,6 +33,7 @@ import {
   type CommandInfo,
   type GitCmd,
   type GitResultEvent,
+  isModel,
   type Model,
   type PermissionDecision,
   type QuestionAnswer,
@@ -86,7 +87,7 @@ import type { PhaseDeps } from "../pipeline/phases";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { AutopilotScheduleStore, scheduledFireDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
-import { FileNotFound, listDir, locateInside, readFile, resolveInside } from "../fs/session-fs";
+import { FileNotFound, listDir, locateInside, readFile, resolveInside, writeFile } from "../fs/session-fs";
 import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
 import { VERSION } from "../version";
@@ -1518,6 +1519,9 @@ export class Supervisor {
   fsResolve(sessionId: string, path: string): string {
     return resolveInside(this.require(sessionId).data.cwd, path);
   }
+  fsWrite(sessionId: string, path: string, data: Uint8Array): { path: string; size: number } {
+    return writeFile(this.require(sessionId).data.cwd, path, data);
+  }
   fsWatch(sessionId: string, path: string): void {
     this.fileWatchMgr.add(sessionId, path);
   }
@@ -1827,6 +1831,7 @@ export class Supervisor {
   }
 
   setModel(id: string, model: Model): void {
+    if (!isModel(model)) return; // ignore an unknown model rather than pass junk to the SDK
     const s = this.require(id);
     s.data.model = model;
     s.data.lastActivityAt = now();
