@@ -32,6 +32,7 @@ import {
   type AuthStatusEvent,
   type GitCmd,
   type GitResultEvent,
+  isModel,
   type Model,
   type PermissionDecision,
   type QuestionAnswer,
@@ -1812,6 +1813,7 @@ export class Supervisor {
   }
 
   setModel(id: string, model: Model): void {
+    if (!isModel(model)) return; // ignore an unknown model rather than pass junk to the SDK
     const s = this.require(id);
     s.data.model = model;
     s.data.lastActivityAt = now();

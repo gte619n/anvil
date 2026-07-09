@@ -77,7 +77,20 @@ export interface SessionScoped {
 // 1. Domain types (§5)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type Model = "opus" | "sonnet";
+export type Model = "opus" | "sonnet" | "haiku" | "fable";
+
+/** The models a session can run on, in picker order. `label` is the human name shown in the UI;
+ *  the daemon maps each `id` to the string the Agent SDK expects (see agent/models.ts). */
+export const MODELS: readonly { id: Model; label: string }[] = [
+  { id: "opus", label: "Opus 4.8" },
+  { id: "sonnet", label: "Sonnet 4.6" },
+  { id: "haiku", label: "Haiku 4.5" },
+  { id: "fable", label: "Fable 5" },
+];
+/** Human label for a session's model (falls back to the raw id for forward-compat). */
+export const modelLabel = (m: Model): string => MODELS.find((x) => x.id === m)?.label ?? m;
+/** Whether a value is one of the models a session may switch to. */
+export const isModel = (m: unknown): m is Model => MODELS.some((x) => x.id === m);
 
 export type AutonomyPolicy =
   | "mostly-autonomous" // default: auto-allow; prompt only on the danger list (§6.6)

@@ -1,6 +1,7 @@
 import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliOptions } from "./cli";
 import type { Model } from "@protocol";
+import { sdkModelId } from "./models";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
@@ -71,9 +72,9 @@ export class AgentDriver {
     }
   }
 
-  async setModel(model: string): Promise<void> {
+  async setModel(model: Model): Promise<void> {
     try {
-      await this.q?.setModel(model);
+      await this.q?.setModel(sdkModelId(model));
     } catch {
       /* not started yet — picked up at next start */
     }
@@ -141,7 +142,7 @@ export class AgentDriver {
     this.q = this.queryFn({
       prompt: this.input,
       options: {
-        model: s.data.model, // "opus" | "sonnet" — Claude Code accepts the aliases
+        model: sdkModelId(s.data.model), // alias for opus/sonnet/haiku; full id for fable
         cwd: s.data.cwd,
         systemPrompt: this.systemPrompt(),
         resume: s.data.claudeSessionId,

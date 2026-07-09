@@ -35,6 +35,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
   for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
   return a;
 };
+import { MODELS, modelLabel } from "../../protocol";
 import type {
   AttachmentRef,
   AuthStatusEvent,
@@ -793,6 +794,7 @@ function onEvent(url: string, e: ServerEvent): void {
       if (e.session.id === activeId) {
         updateGitPanelMeta();
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
+        updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
       }
       return;
     case "session.deleted":
@@ -2199,6 +2201,7 @@ function setHeaderTitle(s: Session | undefined): void {
   document.title = s ? `Anvil: ${s.title}` : "Anvil";
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   updateHeaderBranch(s);
+  updateHeaderModel(s);
   void setFavicon(s);
 }
 /** Show the active session's git branch as a chip in the header; tap it to open the Git panel. */
@@ -2216,6 +2219,38 @@ function updateHeaderBranch(s: Session | undefined): void {
   }
 }
 $("#header-branch").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
+
+/** Show the active session's model as a pill in the composer (next to Attach); tap it to switch. */
+function updateHeaderModel(s: Session | undefined): void {
+  const el = document.getElementById("btn-model");
+  if (!el) return;
+  if (s) {
+    el.innerHTML = `${icon("smart_toy")}<span class="cm-name">${esc(modelLabel(s.model))}</span>`;
+    el.title = "Switch model";
+    el.hidden = false;
+  } else {
+    el.innerHTML = "";
+    el.hidden = true;
+  }
+}
+// Tapping the model pill opens a menu of the available models; picking one switches this session
+// live (session.set_model takes effect on the next message — no restart). A ✓ marks the current one.
+$("#btn-model").addEventListener("click", () => {
+  const s = activeId ? sessions.get(activeId) : undefined;
+  if (!s) return;
+  toggleHeaderMenu(
+    $("#btn-model"),
+    MODELS.map((m) => ({
+      icon: m.id === s.model ? "check" : "smart_toy",
+      label: m.label,
+      title: m.id === s.model ? `${m.label} (current)` : `Switch to ${m.label}`,
+      run: () => {
+        if (m.id === s.model) return;
+        sendTo(activeId, { type: "session.set_model", sessionId: activeId, model: m.id });
+      },
+    })),
+  );
+});
 
 // ── Favicon: mirror the active session's Material Symbol; fall back to the brand mark ────────────
 const DEFAULT_FAVICON = "/anvil.svg";
@@ -5171,10 +5206,16 @@ function toggleHeaderMenu(anchor: HTMLElement, items: HeaderMenuItem[]): void {
     menu.appendChild(row);
   }
   $("#menu-root").appendChild(menu);
-  // Anchor under the button with right edges aligned; clamp the right offset into the viewport.
+  // Align right edges and clamp the offset into the viewport. Open downward from a header button,
+  // but flip upward for a low anchor (e.g. the composer at the bottom) so the menu stays on-screen.
   const r = anchor.getBoundingClientRect();
-  menu.style.top = `${Math.round(r.bottom + 6)}px`;
   menu.style.right = `${Math.round(Math.max(8, window.innerWidth - r.right))}px`;
+  const spaceBelow = window.innerHeight - r.bottom;
+  if (spaceBelow < menu.offsetHeight + 12 && r.top > spaceBelow) {
+    menu.style.bottom = `${Math.round(window.innerHeight - r.top + 6)}px`; // open upward
+  } else {
+    menu.style.top = `${Math.round(r.bottom + 6)}px`; // open downward
+  }
   anchor.classList.add("active");
   menuAnchor = anchor;
   openOverlay("menu", closeHeaderMenuDom); // Back/Escape close it
@@ -5242,8 +5283,8 @@ function closeModalDom(): void {
   $("#modal-root").innerHTML = "";
 }
 const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
-// Model is fixed to Opus (no picker). New sessions default to "bypass" (skip all permission
-// prompts); the autonomy picker lets the user dial that back per session.
+// New sessions start on Opus; the header model chip switches models mid-session (session.set_model).
+// New sessions default to "bypass" (skip all permission prompts); the autonomy picker dials that back.
 const DEFAULT_MODEL = "opus";
 const DEFAULT_AUTONOMY: AutonomyPolicy = "bypass";
 const AUTONOMY_PICKER = `<label>Autonomy<select id="ns-auto">
