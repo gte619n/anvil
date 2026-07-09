@@ -487,6 +487,11 @@ details.tool-result.error > summary { color: var(--danger); }
 #composer-controls .spacer { flex: 1; }
 #btn-attach { background: none; border: none; cursor: pointer; font-size: 17px; padding: 4px 6px; border-radius: 8px; color: var(--muted); }
 #btn-attach:hover { background: var(--panel); }
+.composer-model { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 1; min-width: 0; max-width: 42vw; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: none; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; }
+.composer-model[hidden] { display: none; }
+.composer-model:hover, .composer-model.active { border-color: var(--accent); color: var(--text); background: var(--panel); }
+.composer-model .msym { font-size: 16px; color: var(--accent); }
+.composer-model .cm-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 #send { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--accent); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(59, 110, 245, 0.4); transition: transform 0.1s, background 0.15s; }
 #send:not(:disabled):hover { transform: scale(1.06); }
 #send:not(:disabled):active { transform: scale(0.95); }
