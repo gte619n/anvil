@@ -26,6 +26,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so the version step below can `git describe` the nearest release-* tag.
+          fetch-depth: 0
+
+      # Label the TestFlight build with the public release version instead of the VERSION file's
+      # MAJOR.MINOR. make-ios.sh normally derives MARKETING_VERSION from VERSION (2.2 → 2.2.<build>);
+      # that drifts from the release-* tags the rest of the fleet ships (release-2.2.0 → 2.2.0). Here
+      # we resolve the nearest release-* tag reachable from the checked-out commit and, when present,
+      # pass its exact version as ANVIL_MARKETING_VERSION so iOS matches release.yml (macOS) / Android.
+      # No reachable tag (e.g. a feature-branch dispatch) → unset, and make-ios.sh falls back to VERSION.
+      - name: Derive marketing version from release tag
+        run: |
+          set -euo pipefail
+          tag="$(git describe --tags --abbrev=0 --match 'release-*' 2>/dev/null || true)"
+          ver="${tag#release-}"
+          if [ -n "$ver" ]; then
+            echo "ANVIL_MARKETING_VERSION=$ver" >> "$GITHUB_ENV"
+            echo "iOS marketing version: $ver (from tag $tag)"
+          else
+            echo "no release-* tag reachable — make-ios.sh will use the VERSION file"
+          fi
 
       # Runners default xcode-select at the CLT; point it at the newest full Xcode (with the iOS SDK).
       - name: Select Xcode
