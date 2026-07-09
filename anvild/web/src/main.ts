@@ -1506,6 +1506,18 @@ function humanSize(bytes: number): string {
   }
   return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
+/** Compact "modified N ago" for the file browser detail column. */
+function relTime(ms: number): string {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  const m = s / 60;
+  if (m < 60) return `${Math.round(m)}m ago`;
+  const h = m / 60;
+  if (h < 24) return `${Math.round(h)}h ago`;
+  const d = h / 24;
+  if (d < 7) return `${Math.round(d)}d ago`;
+  return new Date(ms).toLocaleDateString();
+}
 function fileOfferIcon(mime: string): string {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "movie";
@@ -4763,24 +4775,100 @@ function requestFiles(path: string): void {
 function renderFiles(entries: DirEntry[]): void {
   panelView = "files";
   setPanelTabs();
+  const wrap = document.createElement("div");
+  wrap.className = "file-browser";
   const ul = document.createElement("ul");
   ul.className = "file-list";
   if (filesPath) {
     const up = document.createElement("li");
     up.className = "dir";
-    up.innerHTML = "📁 ..";
+    up.innerHTML = `<span class="fb-name">📁 ..</span>`;
     up.onclick = () => requestFiles(filesPath.split("/").slice(0, -1).join("/"));
     ul.appendChild(up);
   }
   for (const e of entries) {
     const li = document.createElement("li");
     li.className = e.isDir ? "dir" : "";
-    li.innerHTML = `${e.isDir ? "📁" : "📄"} ${esc(e.name)}`;
+    const detail = [e.size !== undefined ? humanSize(e.size) : "", e.mtime !== undefined ? relTime(e.mtime) : ""].filter(Boolean).join(" · ");
+    li.innerHTML =
+      `<span class="fb-name">${e.isDir ? "📁" : "📄"} ${esc(e.name)}</span>` +
+      `<span class="fb-detail">${esc(detail)}</span>` +
+      (e.isDir ? "" : `<button type="button" class="fb-dl" title="Download">${icon("download")}</button>`);
     li.onclick = () => (e.isDir ? requestFiles(e.path) : openFile(e.path));
+    const dl = li.querySelector<HTMLButtonElement>(".fb-dl");
+    if (dl)
+      dl.onclick = (ev) => {
+        ev.stopPropagation(); // don't also open the file in the reader
+        downloadFile(e.path, e.name);
+      };
     ul.appendChild(li);
   }
+  wrap.appendChild(ul);
+  const hint = document.createElement("p");
+  hint.className = "fb-drop-hint muted small";
+  hint.textContent = "Drop files here to upload";
+  wrap.appendChild(hint);
+  wireBrowserDrop(wrap);
   panelContent.innerHTML = "";
-  panelContent.appendChild(ul);
+  panelContent.appendChild(wrap);
+}
+/** Stream a worktree file to the client via the daemon's download endpoint (Content-Disposition
+ *  forces a save-as). Routed to the active session's server so it works across a federated fleet. */
+function downloadFile(path: string, name: string): void {
+  if (!activeId) return;
+  const url = serverApiUrl(activeServer().url, `/api/sessions/${activeId}/files?path=${encodeURIComponent(path)}&download=1`);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+/** Drag-and-drop upload into the currently-browsed worktree directory (`filesPath`). Uploads the
+ *  raw bytes via PUT; the daemon refuses to overwrite an existing name (409 → "already exists"). */
+function wireBrowserDrop(wrap: HTMLElement): void {
+  wrap.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    wrap.classList.add("drag-over");
+  });
+  wrap.addEventListener("dragleave", (e) => {
+    if (e.target === wrap) wrap.classList.remove("drag-over");
+  });
+  wrap.addEventListener("drop", (e) => {
+    e.preventDefault();
+    wrap.classList.remove("drag-over");
+    void uploadToBrowser(Array.from((e as DragEvent).dataTransfer?.files ?? []), filesPath);
+  });
+}
+async function uploadToBrowser(files: File[], dir: string): Promise<void> {
+  if (!activeId || files.length === 0) return;
+  let ok = 0;
+  for (const file of files) {
+    const rel = (dir ? `${dir}/` : "") + file.name;
+    try {
+      const res = await serverFetch(activeServer().url, `/api/sessions/${activeId}/files?path=${encodeURIComponent(rel)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: await file.arrayBuffer(),
+      });
+      if (res.status === 409) {
+        toast(`"${file.name}" already exists — rename it or remove the old one first`);
+        continue;
+      }
+      if (!res.ok) {
+        toast(`Upload of "${file.name}" failed`);
+        continue;
+      }
+      ok++;
+    } catch {
+      toast(`Upload of "${file.name}" failed`);
+    }
+  }
+  if (ok > 0) {
+    toast(ok === 1 ? "Uploaded 1 file" : `Uploaded ${ok} files`);
+    if (panelView === "files" && filesPath === dir) requestFiles(dir); // refresh to show the new files
+  }
 }
 function openFile(path: string): void {
   if (!activeId) return;

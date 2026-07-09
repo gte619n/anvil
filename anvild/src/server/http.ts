@@ -10,6 +10,7 @@ import { discoverFleet, inviteMac, propagateTodoist, resolveMember, rotateToken,
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
+import { FileExists } from "../fs/session-fs";
 import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
@@ -175,7 +176,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // used, so `*` is safe.) The PWA is same-origin and unaffected.
   const CORS: Record<string, string> = {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Max-Age": "86400",
   };
@@ -580,6 +581,20 @@ export function createServer(opts: ServerOptions): ServerHandle {
           return new Response(file, { headers });
         } catch {
           return new Response("forbidden", { status: 403 });
+        }
+      }
+      // Upload a dropped file into the worktree at `path` (streamed raw body, not base64). Refuses
+      // to overwrite an existing path → 409, so a drag-drop can't silently clobber (arch §8.1).
+      if (fileMatch && req.method === "PUT") {
+        const sessionId = fileMatch[1]!;
+        const path = url.searchParams.get("path") ?? "";
+        try {
+          const data = new Uint8Array(await req.arrayBuffer());
+          const written = supervisor.fsWrite(sessionId, path, data);
+          return Response.json(written);
+        } catch (e) {
+          if (e instanceof FileExists) return new Response("a file with that name already exists", { status: 409 });
+          return new Response(e instanceof Error ? e.message : "upload failed", { status: 403 });
         }
       }
 

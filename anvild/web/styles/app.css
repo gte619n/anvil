@@ -258,10 +258,19 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .ptab-spacer { flex: 1; }
 #panel-close { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; }
 #panel-content { flex: 1; overflow: auto; padding: 12px; }
+.file-browser { position: relative; min-height: 100%; }
+.file-browser.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; border-radius: 8px; }
+.file-browser.drag-over .fb-drop-hint { opacity: 1; }
+.fb-drop-hint { margin: 10px 4px 0; text-align: center; opacity: 0.5; }
 .file-list { list-style: none; margin: 0; padding: 0; }
-.file-list li { padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.file-list li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
 .file-list li:hover { background: var(--panel); }
 .file-list .dir { font-weight: 600; }
+.fb-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-detail { color: var(--muted); font-size: 11px; font-weight: 400; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.fb-dl { background: none; border: none; cursor: pointer; color: var(--muted); display: inline-flex; padding: 0; flex-shrink: 0; opacity: 0; }
+.file-list li:hover .fb-dl { opacity: 1; }
+.fb-dl:hover { color: var(--accent); }
 .reader-head { font-size: 12px; color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .reader-head a { color: var(--accent); }
 .reader-head-actions { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; }
