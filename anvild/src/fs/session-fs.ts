@@ -1,11 +1,14 @@
-import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { basename, join, resolve, sep } from "node:path";
+import { type Dirent, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type { DirEntry, FileContent } from "@protocol";
 import type { MarkdownRenderer } from "../render/markdown";
 
 /** Thrown when a requested path can't be located in the worktree — translated to a clean
  *  client error (not "internal error") by the supervisor. */
 export class FileNotFound extends Error {}
+
+/** Thrown when an upload targets a path that already exists — the browser refuses to clobber. */
+export class FileExists extends Error {}
 
 /**
  * Confine `userPath` to the session worktree `root` (arch §8.1). Resolves symlinks so a
@@ -106,17 +109,28 @@ export function listDir(root: string, userPath: string): { path: string; entries
     if (SKIP.has(d.name)) continue;
     const rel = join(userPath, d.name).replace(/^\/+/, "");
     let size: number | undefined;
-    if (!d.isDirectory()) {
-      try {
-        size = statSync(join(dir, d.name)).size;
-      } catch {
-        /* ignore */
-      }
+    let mtime: number | undefined;
+    try {
+      const st = statSync(join(dir, d.name));
+      mtime = st.mtimeMs;
+      if (!d.isDirectory()) size = st.size;
+    } catch {
+      /* ignore — a broken symlink or a race with a delete just yields no detail */
     }
-    entries.push({ name: d.name, path: rel, isDir: d.isDirectory(), size });
+    entries.push({ name: d.name, path: rel, isDir: d.isDirectory(), size, mtime });
   }
   entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1));
   return { path: userPath, entries };
+}
+
+/** Write an uploaded file into the worktree at `userPath` (arch §8.1). Refuses to overwrite an
+ *  existing path (the browser's drag-drop is "refuse & warn on conflict"). Returns the stored size. */
+export function writeFile(root: string, userPath: string, data: Uint8Array): { path: string; size: number } {
+  const abs = resolveInside(root, userPath); // symlink-safe boundary — same guard as reads/downloads
+  if (existsSync(abs)) throw new FileExists(userPath);
+  mkdirSync(dirname(abs), { recursive: true }); // the drop target dir already exists; harmless if so
+  writeFileSync(abs, data);
+  return { path: userPath.replace(/^\/+/, ""), size: data.byteLength };
 }
 
 /** Read a file as FileContent: markdown rendered, text inline (capped), binaries as a URL. */

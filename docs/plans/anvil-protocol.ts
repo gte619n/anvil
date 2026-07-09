@@ -285,6 +285,7 @@ export interface DirEntry {
   path: string;
   isDir: boolean;
   size?: number;
+  mtime?: number; // last-modified epoch ms (files + dirs), for the browser's detail column
   isRepo?: boolean; // dir contains a .git (useful for the session-create picker)
 }
 
