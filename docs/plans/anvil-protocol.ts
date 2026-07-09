@@ -223,7 +223,10 @@ export interface RenderedMarkdown {
 /** A finalized assistant turn is an ordered list of these (§6.2). */
 export type ContentBlock =
   | { kind: "markdown"; rendered: RenderedMarkdown }
-  | { kind: "tool_use"; toolUseId: ToolUseId; name: string; input: unknown };
+  | { kind: "tool_use"; toolUseId: ToolUseId; name: string; input: unknown }
+  // A full-width topic boundary (§0.6, "new topic"): a labelled rule that visually clears the pane
+  // without deleting scrollback. `note` is an optional muted sub-line under the label.
+  | { kind: "divider"; label: string; note?: string };
 
 /** One conversation log entry — what `conversation.snapshot` replays (§6.4).
  *  `ts` is the wall-clock time the entry was first emitted, carried through so a replayed

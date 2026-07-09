@@ -2023,10 +2023,9 @@ export class Supervisor {
       type: "assistant.message",
       blocks: [
         {
-          kind: "markdown",
-          rendered: this.renderer.render(
-            "───────────\n**New topic** — the earlier conversation is above for reference; Claude no longer has it in context.",
-          ),
+          kind: "divider",
+          label: "New topic",
+          note: "The earlier conversation is above for reference; Claude no longer has it in context.",
         },
       ],
     });
