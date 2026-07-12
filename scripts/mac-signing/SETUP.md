@@ -175,8 +175,9 @@ API key), so you only store the cert + Team ID — no profile to manage.
    ```
 6. **Build locally** (full Xcode required): `source ~/.config/oxos-signing/env.sh`
    then `cd apple && ./make-ios.sh`.
-7. **CI** (`.github/workflows/ios-release.yml`): mirror the secrets into GitHub
-   once with `./sync-github-secrets.sh`, then `gh workflow run ios-release.yml`.
+7. **CI** (the `ios` job in `.github/workflows/release.yml`): mirror the secrets into GitHub
+   once with `./sync-github-secrets.sh`; the full release then runs on merge to `main` (or
+   `gh workflow run release.yml`).
 
 | iOS secret name | Contents |
 |---|---|

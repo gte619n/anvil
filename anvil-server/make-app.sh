@@ -4,7 +4,7 @@
 #   open "Anvil Server.app"
 #
 # Local default is an ad-hoc signature (SIGN_ID unset). For a distributable, Gatekeeper-clean,
-# auto-updating build (the release-* workflow), set:
+# auto-updating build (the full-release workflow), set:
 #   SIGN_ID="Developer ID Application: … (TEAMID)"   real Developer ID identity
 #   APPLE_API_KEY_PATH / APPLE_API_KEY / APPLE_API_ISSUER   App Store Connect key → notarize + staple
 #   SPARKLE_PUBLIC_ED_KEY                            embeds the appcast feed keys for auto-update
@@ -18,7 +18,7 @@ APP="Anvil Server.app"
 BIN_NAME="AnvilServer"
 
 # Version: MAJOR.MINOR from the repo-root VERSION file (single source of truth shared with the
-# client + Android) → MAJOR.MINOR.<build>, so every CI build revs. A release-* tag overrides the
+# client + Android) → MAJOR.MINOR.<build>, so every CI build revs. The full-release workflow sets the
 # marketing string via ANVIL_MARKETING_VERSION. CFBundleVersion (BUILD) is what Sparkle compares to
 # decide "newer", so it must increase per release (the workflow run number provides that).
 MAJOR_MINOR="$(tr -d '[:space:]' < "../VERSION" 2>/dev/null || true)"

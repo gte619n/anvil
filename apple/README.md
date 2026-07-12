@@ -85,8 +85,9 @@ source ~/.config/oxos-signing/env.sh   # APPLE_TEAM_ID + APPLE_API_* (after ./pr
 cd apple && ./make-ios.sh              # rebundle web → archive → export → upload
 ```
 
-CI does the same on a macOS runner via `.github/workflows/ios-release.yml` (manual trigger). All
-certs/keys live in Google Secret Manager; see `scripts/mac-signing/SETUP.md` §5.
+CI does the same on a macOS runner via the `ios` job in `.github/workflows/release.yml` (the "full
+release" — runs on every merge to `main`, or manual dispatch). All certs/keys live in Google Secret
+Manager; see `scripts/mac-signing/SETUP.md` §5.
 
 ## Roadmap
 

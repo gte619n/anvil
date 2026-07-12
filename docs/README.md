@@ -3,6 +3,7 @@
 Start with the [root README](../README.md) for the overview, then:
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the approachable tour, with diagrams. Read this first.
+- **[CI-CD.md](CI-CD.md)** — the build & deployment pipeline: every target, what to push to ship it (dev + prod), and where builds run. The authoritative reference for releases.
 
 ## Design & implementation plans (`plans/`)
 

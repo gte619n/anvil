@@ -3,8 +3,8 @@ plugins {
     id 'org.jetbrains.kotlin.android'
     id 'com.google.gms.google-services'
     id 'com.google.firebase.appdistribution'
-    // Publishes a signed AAB to the Play Store production track (release-* tag). The publish
-    // tasks only run when the release workflow invokes them; configuration is inert otherwise.
+    // Play Store production publish — configured but DORMANT: no workflow invokes publishReleaseBundle
+    // (the full release ships Android via Firebase). Inert until a publish task is actually run.
     id 'com.github.triplet.play'
 }
 
@@ -24,8 +24,8 @@ def majorMinor = versionFile.exists() ? versionFile.text.trim() : "2.1"
 
 // CI (GitHub Actions) sets ANVIL_BUILD_NUMBER to the workflow run number; it becomes both the
 // version's patch component and a monotonic versionCode (offset past the last hand-bumped code).
-// A `release-*` tag exports ANVIL_MARKETING_VERSION (the exact public number, e.g. 2.1.0) which
-// takes precedence so store releases get the clean number you tagged. Local builds → MAJOR.MINOR.0.
+// The full-release workflow exports ANVIL_MARKETING_VERSION (VERSION + run number, e.g. 2.2.47),
+// which takes precedence so every artifact reports the same number. Local builds → MAJOR.MINOR.0.
 def ciBuildNumber = System.getenv("ANVIL_BUILD_NUMBER")
 def buildNumber = ciBuildNumber ?: "0"
 def appVersionName = System.getenv("ANVIL_MARKETING_VERSION") ?: "${majorMinor}.${buildNumber}"

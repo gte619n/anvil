@@ -297,7 +297,7 @@ anvil/
 │   ├── assets/          #    brand assets (logo, banners)
 │   └── plans/           #    deep design + implementation specs
 ├── scripts/             #    build/release utilities (CI release notes, Apple signing)
-└── .github/workflows/   #    Android release → Firebase App Distribution
+└── .github/workflows/   #    CI gate + "full release" (Firebase, TestFlight, Sparkle) on merge to main
 ```
 
 ---
