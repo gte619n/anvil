@@ -17,10 +17,11 @@ rmSync(next, { recursive: true, force: true });
 mkdirSync(next, { recursive: true });
 
 // Version shown next to the brand. The native build passes APP_VERSION (the APK's versionName),
-// so bumping the app version surfaces the same number in the UI; the PWA falls back to the
-// daemon package.json version.
-const pkgVersion = (JSON.parse(readFileSync(join(root, "../package.json"), "utf8")) as { version: string }).version;
-const appVersion = process.env.APP_VERSION || pkgVersion;
+// so bumping the app version surfaces the same number in the UI. The daemon-served PWA has no
+// APP_VERSION, so it falls back to the repo-root VERSION file (MAJOR.MINOR) — the ONE source of
+// truth every other artifact (Android/iOS/macOS/server) already derives from — as MAJOR.MINOR.0.
+const majorMinor = readFileSync(join(root, "../../VERSION"), "utf8").trim();
+const appVersion = process.env.APP_VERSION || `${majorMinor}.0`;
 
 const result = await Bun.build({
   entrypoints: [join(root, "src/main.ts")],
