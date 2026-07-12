@@ -1,56 +1,59 @@
 # Releasing Anvil
 
-Anvil has two distribution tiers:
+> **See [`docs/CI-CD.md`](docs/CI-CD.md) for the authoritative pipeline** — every target, every
+> trigger, and how to ship. **This file is the signing / secrets / one-time-setup companion.**
 
-| Tier | Trigger | Android | iOS | macOS client | macOS server |
-|------|---------|---------|-----|--------------|--------------|
-| **Beta** | push to `main` (Android) / manual (iOS) | Firebase App Distribution (debug APK) | TestFlight (`gh workflow run ios-release.yml`) | — | — |
-| **Production** | push a `release-*` tag | Play Store (production, completed rollout) | App Store (auto-submit + auto-release) | Developer-ID notarized + Sparkle | Developer-ID notarized + Sparkle |
+## The model: one "full release" per merge to `main`
 
-Beta is unchanged by this setup. Production is driven entirely by **`.github/workflows/release.yml`**.
+Anvil ships a **full release** on **every merge/push to `main`** (or a manual run of the workflow):
+one version fanned out to all client surfaces at once via
+**[`.github/workflows/release.yml`](.github/workflows/release.yml)**.
+
+| Surface | How it ships |
+|---------|--------------|
+| **Android** | Firebase App Distribution (signed debug APK) |
+| **iOS** | TestFlight |
+| **macOS client** | Developer-ID notarized + Sparkle |
+| **macOS server** | Developer-ID notarized + Sparkle |
+| **web** | bundled into every shell above (and served by the daemon) — not a separate job |
+
+**Public app stores (Play production / App Store review) are deliberately NOT wired.** We ship to the
+test / auto-update channels only. The store setup below (§1 Play/App Store secrets, §3 listings)
+stays documented so a public launch is a config change away, but no workflow invokes it today.
 
 ## Versioning (single source of truth)
 
-`MAJOR.MINOR` lives in **one** place — the repo-root **`VERSION`** file (currently `2.1`) — and is read
-by all four build paths (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`,
-`anvil-server/make-app.sh`), so every artifact reports the same number.
+`MAJOR.MINOR` lives in **one** place — the repo-root **`VERSION`** file (currently `2.2`) — read by
+all four build paths (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`,
+`anvil-server/make-app.sh`), so every artifact reports the same number. The full version is
+**`MAJOR.MINOR.<run_number>`** (e.g. `2.2.47`); every job in a run shares the run number, so all four
+apps match.
 
-- **Beta / local builds** → `MAJOR.MINOR.<build>` where `<build>` is the workflow run number
-  (e.g. `2.1.47`). The visible version revs on **every** CI build, no hand-editing.
-- **Production (`release-*` tag)** → the workflow exports `ANVIL_MARKETING_VERSION` = the exact tag
-  number (e.g. `release-2.1.0` → `2.1.0`), which **overrides** the auto scheme so the store version is
-  the clean number you tagged. In a single release run all four jobs share one run number, so the
-  build numbers match too.
-
-**To start a new line, edit `VERSION`** (e.g. `2.1` → `2.2`); betas immediately become `2.2.<build>`.
-Keep `VERSION` at or ahead of your most recent release so betas (previews of the next version) never
-sort below a shipped release. The static `MARKETING_VERSION` in `apple/project.yml` is only for raw
-Xcode dev builds — keep its MAJOR.MINOR in sync by hand.
+**To start a new line, edit `VERSION`** (e.g. `2.2` → `2.3`) and merge — the next full release is
+`2.3.<run_number>`. The static `MARKETING_VERSION` in `apple/project.yml` is only for raw Xcode dev
+builds — keep its MAJOR.MINOR in sync by hand.
 
 ## The release ritual
 
-```bash
-git tag release-2.1.0
-git push origin release-2.1.0
-```
+**Merge to `main`.** That's it — no tag to push. Watch the run in the repo's **Actions** tab
+(workflow **"Full release"**). After `meta` (mint the version + a `v<version>` GitHub Release to host
+the macOS zips) and `verify` (the merge gate), the four ship jobs run in parallel, then `pages`:
 
-The tag's version (`release-2.1.0` → `2.1.0`) becomes the marketing version everywhere; the workflow
-run number becomes the build number. Watch the run in the repo's **Actions** tab. Five jobs run:
+- **android** — builds the debug APK and distributes it to **Firebase App Distribution**.
+- **ios** — archives and uploads to **TestFlight** (`make-ios.sh`).
+- **mac-client** / **mac-server** — build, Developer-ID-sign, notarize, staple, attach the `.zip` to
+  the build's GitHub Release, and sign the update with the Sparkle key.
+- **pages** — updates the two Sparkle appcasts and deploys them to GitHub Pages so installed macOS
+  apps auto-update.
 
-- **android** — builds a signed AAB and publishes it to the Play **production** track (full rollout).
-- **ios** — uploads the build to App Store Connect (also lands in TestFlight), then `submit-appstore.ts`
-  creates the App Store version, attaches the build, enables phased release, and submits for review with
-  **auto-release after approval**.
-- **mac-client** / **mac-server** — build, Developer-ID-sign, notarize, staple, attach the `.zip` to the
-  GitHub Release, and sign the update with the Sparkle key.
-- **pages** — updates the two Sparkle appcasts and deploys them to GitHub Pages so installed apps update.
+To re-fire without a new commit, use **Actions → Full release → Run workflow** (`workflow_dispatch`).
 
-> **"Fully automatic" is bounded by store review.** CI submits and arms auto-release, but the public
-> release happens by itself only *after* Apple/Google approve the build (hours to days). The macOS
-> Sparkle releases are live as soon as the `pages` job finishes.
+> **Heads up on cadence.** Every merge notarizes both macOS apps and uploads to TestFlight (three
+> `macos-15` jobs). That's real runner time and a TestFlight build number per merge — see the cost
+> note in `docs/CI-CD.md` if merges get frequent.
 
-The dev **"Update Anvil" / "Restart daemon"** affordances (git-pull the daemon) are unchanged — they
-update the *daemon*, independent of the store/Sparkle updates that refresh the *app shells*.
+The dev **"Update Anvil" / "Restart daemon"** affordances git-pull the *daemon* — independent of the
+Firebase/TestFlight/Sparkle updates that refresh the *app shells*.
 
 ---
 
@@ -103,17 +106,18 @@ Repo **Settings → Pages → Build and deployment → Source = GitHub Actions**
 These URLs are hard-coded in `apple/make-app.sh` and `anvil-server/make-app.sh` (override with
 `SPARKLE_FEED_URL` if the repo/owner changes).
 
-### 3. App Store & Play Console listings
+### 3. App Store & Play Console listings *(only for a future public-store launch — not used today)*
 
-Stores reject automated submissions for an app that has no listing yet — do these once:
+Stores reject automated submissions for an app that has no listing yet — do these once **if/when you
+wire the dormant store path**:
 
 - **App Store Connect:** create the app for bundle id `com.gte619n.anvil`, fill metadata (description,
   screenshots, privacy, category). Export compliance is pre-answered via `ITSAppUsesNonExemptEncryption=false`
   in `apple/project.yml`, so submissions aren't held on it.
 - **Play Console:** create the app, upload a first AAB manually (or to an internal track) to establish it,
   enrol in **Play App Signing**, complete the store listing + content rating, and grant the service
-  account the **Release manager** role. To de-risk the first automated run, temporarily set
-  `track.set("production")` → `"internal"` in `app/build.gradle`, push a tag, confirm, then switch back.
+  account the **Release manager** role. (De-risk a first automated run by temporarily setting
+  `track.set("production")` → `"internal"` in `app/build.gradle`.)
 
 ### 4. Sparkle signing keys
 
@@ -136,9 +140,12 @@ update in CI (`sign_update`). Keep the private key safe — losing it breaks aut
   apple/make-app.sh` and `… anvil-server/make-app.sh` produce ad-hoc bundles; check
   `codesign --verify --deep --strict` and `spctl -a -vv`. With `SIGN_ID` + `APPLE_API_KEY_PATH` +
   `SPARKLE_PUBLIC_ED_KEY` set, they notarize and embed the feed.
-- **Android:** `ANVIL_RELEASE_STORE_FILE=… ./gradlew :app:bundleRelease` signs with the upload key.
-  Publish to the **internal** track first (step 3) before flipping to production.
-- **iOS:** run `ios-release.yml` (TestFlight) first to confirm the upload path, then push a `release-*`
-  tag — the App Store version shows "Pending Developer Release" → auto-releases after approval.
-- **Sparkle end-to-end:** install build N, push `release-` for N+1, wait for the `pages` job, then
+- **Android (Firebase):** `./gradlew :app:assembleDebug` builds the APK that CI distributes; the
+  debug keystore is committed, so no secret is needed to reproduce the build locally.
+- **iOS (TestFlight):** the `ios` job in the full release drives `make-ios.sh`. To rehearse the whole
+  pipeline against `main`, use **Actions → Full release → Run workflow** rather than merging.
+- **Sparkle end-to-end:** install build N, merge a change (build N+1), wait for the `pages` job, then
   "Check for Updates…" in the app should offer the update and verify its EdDSA signature.
+
+> The **Android upload-key / Play** and **App Store submission** steps below are only for a future
+> public-store launch — the full release doesn't use them.

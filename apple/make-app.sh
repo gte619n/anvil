@@ -32,8 +32,8 @@ done
 
 # Version: MAJOR.MINOR comes from the repo-root VERSION file (single source of truth shared by
 # Android, iOS, and the server). The full marketing version is MAJOR.MINOR.<build> so every CI
-# build revs automatically; CFBundleVersion is the same <build>. A release-* tag overrides the whole
-# marketing string via ANVIL_MARKETING_VERSION so the bundled version matches the appcast entry.
+# build revs automatically; CFBundleVersion is the same <build>. The full-release workflow sets the
+# whole marketing string via ANVIL_MARKETING_VERSION so the bundled version matches the appcast entry.
 MAJOR_MINOR="$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || true)"
 BUILD="${ANVIL_BUILD_NUMBER:-0}"
 VERSION="${ANVIL_MARKETING_VERSION:-${MAJOR_MINOR:-0.0}.$BUILD}"

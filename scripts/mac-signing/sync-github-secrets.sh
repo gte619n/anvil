@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mirror the signing/publishing secrets from Google Secret Manager into the GitHub repo's Actions
-# secrets, so the iOS (ios-release.yml) and tag-driven release (release.yml) workflows can build,
-# sign, notarize, and publish without GCP auth in CI.
+# secrets, so the full-release workflow (release.yml) can build, sign, notarize, and publish without
+# GCP auth in CI.
 #
 # Secret Manager is the source of truth (used by local builds via provision.sh); this just copies
 # the subset the CI workflow needs. Re-run after rotating any secret.
@@ -33,7 +33,7 @@ echo "▸ mirroring Secret Manager → GitHub Actions secrets…"
 
 # The cert + APNs .p8 are stored base64 in Secret Manager; the workflow base64-decodes them, so
 # pass the base64 text straight through as the GitHub secret body.
-# iOS (TestFlight + App Store) — required by ios-release.yml and release.yml's ios job.
+# iOS (TestFlight) — required by release.yml's `ios` job.
 set_secret IOS_DIST_P12_BASE64   "$(secret_get "$SECRET_IOS_P12")"
 set_secret IOS_DIST_P12_PASSWORD "$(secret_get "$SECRET_IOS_P12_PASS")"
 set_secret IOS_PROVISIONING_PROFILE_BASE64 "$(secret_get "$SECRET_IOS_PROFILE")"
@@ -58,5 +58,4 @@ set_secret_opt ANDROID_UPLOAD_KEY_PASSWORD      "$SECRET_ANDROID_KEY_PASS"
 set_secret_opt PLAY_SERVICE_ACCOUNT_JSON        "$SECRET_PLAY_SA"
 
 echo "✓ GitHub Actions secrets updated."
-echo "  Beta (iOS TestFlight):   gh workflow run ios-release.yml"
-echo "  Production (all stores):  git tag release-X.Y.Z && git push origin release-X.Y.Z"
+echo "  Full release (all platforms): merge to main, or 'gh workflow run release.yml'"

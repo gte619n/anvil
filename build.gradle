@@ -3,7 +3,8 @@ plugins {
     id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
     id 'com.google.gms.google-services' version '4.4.2' apply false
     id 'com.google.firebase.appdistribution' version '5.0.0' apply false
-    // Gradle Play Publisher: publishes a signed AAB to the Play Store production track
-    // (release-* tag → .github/workflows/release.yml). Beta stays on Firebase above.
+    // Gradle Play Publisher: can publish a signed AAB to the Play Store production track. Kept
+    // configured but DORMANT — no workflow invokes it (the full release ships Android via Firebase).
+    // Wire it into release.yml only for a public Play launch. See docs/CI-CD.md.
     id 'com.github.triplet.play' version '3.12.1' apply false
 }

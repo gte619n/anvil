@@ -32,7 +32,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.gte619n.anvil
         PRODUCT_NAME: Anvil
         # Dev-only default for raw Xcode builds; make-app.sh / make-ios.sh override this from the
-        # repo-root VERSION file (MAJOR.MINOR.<build>) and from release-* tags. Keep MAJOR.MINOR in sync.
+        # repo-root VERSION file (MAJOR.MINOR.<build>) in CI. Keep MAJOR.MINOR in sync.
         MARKETING_VERSION: "2.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
@@ -97,7 +97,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.gte619n.anvil
         PRODUCT_NAME: Anvil
         # Dev-only default for raw Xcode builds; make-app.sh / make-ios.sh override this from the
-        # repo-root VERSION file (MAJOR.MINOR.<build>) and from release-* tags. Keep MAJOR.MINOR in sync.
+        # repo-root VERSION file (MAJOR.MINOR.<build>) in CI. Keep MAJOR.MINOR in sync.
         MARKETING_VERSION: "2.1.0"
         CURRENT_PROJECT_VERSION: "1"
         # 1 = iPhone, 2 = iPad → one universal binary covers iPhone, iPad, and iPad Mini.

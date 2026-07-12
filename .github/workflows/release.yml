@@ -1,50 +1,74 @@
-name: Release (macOS + Sparkle)
+name: Full release
 
-# Tag-driven macOS release. Push a tag like `release-2.1.0` and this:
+# THE release pipeline. Every merge/push to `main` cuts a coordinated "full release" of every client
+# surface at ONE shared version (MAJOR.MINOR from the repo-root VERSION file + the run number, e.g.
+# 2.2.47):
+#   • android     → Firebase App Distribution (signed debug APK to the testers)
+#   • ios         → TestFlight (App Store Connect)
 #   • mac-client  → Developer-ID-notarized Anvil.app on a GitHub Release + Sparkle appcast
 #   • mac-server  → Developer-ID-notarized "Anvil Server.app" on a GitHub Release + Sparkle appcast
 #   • pages       → publishes the two Sparkle appcasts to GitHub Pages so installed apps auto-update
 #
-# macOS has no beta channel, so the tag is the only way it ships. The mobile apps ship on their own
-# workflows and are intentionally NOT here: android-release.yml (Firebase App Distribution, push→main)
-# and ios-release.yml (TestFlight, manual). Public store submission (Play production / App Store
-# review) is deliberately out of scope — add it back only when a public launch is actually wanted.
+# The web client is NOT a separate target: `build:web` runs inside every job, so the current UI is
+# bundled into each native shell. The browser-facing web is served by the daemon and updates on a
+# daemon deploy (git-pull / self-update) — a separate channel. See docs/CI-CD.md.
 #
-# The marketing version is parsed from the tag (release-2.1.0 → 2.1.0); the build number is the run
-# number. One-time setup + the full secret list live in RELEASING.md.
+# Public store submission (Play production / App Store review) is deliberately NOT wired — we ship to
+# the test/update channels only. The store signing + listing setup still lives in RELEASING.md if a
+# public launch is ever wanted.
+#
+# Versioning: MAJOR.MINOR from VERSION, patch = github.run_number, shared by every job. Bump VERSION
+# to start a new line. macOS has no separate beta channel — this IS its channel. Full model: docs/CI-CD.md.
 on:
   push:
-    tags: ['release-*']
+    branches: [main]
+  workflow_dispatch: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialize full releases on main so builds never upload out of order (each still gets a unique
+  # run number). We do NOT cancel in-flight runs — a half-finished notarization/TestFlight upload is
+  # messier than just letting it finish.
+  group: full-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write   # create the GitHub Release + upload the macOS zips
+  contents: write   # create the per-build GitHub Release + upload the macOS zips
   pages: write      # deploy the appcasts to GitHub Pages
   id-token: write   # OIDC for the Pages deployment
 
 jobs:
-  # ── parse the tag once, and create the GitHub Release the macOS jobs upload into ──────────────
+  # ── compute the shared version + create the GitHub Release the macOS jobs upload their zips into ─
+  # No release-* tag drives this workflow (it's push→main), so we mint a per-build tag `v<version>`
+  # and Release here. That Release is the stable, public download URL the Sparkle appcast enclosures
+  # point at; the mobile jobs don't need it.
   meta:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v4
       - id: v
-        run: echo "version=${GITHUB_REF_NAME#release-}" >> "$GITHUB_OUTPUT"
-      - name: Ensure the GitHub Release exists
         run: |
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-                 --title "$GITHUB_REF_NAME" --notes "Automated release $GITHUB_REF_NAME." --verify-tag
+          set -euo pipefail
+          mm="$(tr -d '[:space:]' < VERSION)"
+          version="${mm:-0.0}.${GITHUB_RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version"    >> "$GITHUB_OUTPUT"
+          echo "full release version: $version"
+      - name: Create the build's GitHub Release (hosts the macOS Sparkle zips)
+        run: |
+          set -euo pipefail
+          tag="${{ steps.v.outputs.tag }}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+                 --title "$tag" --notes "Automated full release $tag."
 
   # ── merge gate, re-run at release time so no untested artifact ever ships ─────────────────────
-  # Mirrors ci.yml. Every ship job below `needs:` this, so a tag that fails typecheck/build/test
-  # halts the whole release instead of publishing a notarized app + appcast.
+  # Mirrors ci.yml. Every ship job below `needs:` this, so a red typecheck/build/test halts the whole
+  # release instead of distributing an APK / TestFlight build / notarized app + appcast.
   verify:
     runs-on: ubuntu-latest
     defaults:
@@ -59,6 +83,161 @@ jobs:
       - run: bun run typecheck:web
       - run: bun run build:web
       - run: bun test
+
+  # ── Android → Firebase App Distribution (signed debug APK to the testers) ─────────────────────
+  android:
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      # gradle bundleWebAssets runs `bun` via a login shell (`bash -lc`) whose PATH may miss Bun's
+      # install dir; symlink it onto a dir that's always on PATH.
+      - name: Make Bun available to login shells
+        run: sudo ln -sf "$(which bun)" /usr/local/bin/bun
+
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Write Firebase service account
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "::error::FIREBASE_SERVICE_ACCOUNT secret is not set — add it in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" > "$RUNNER_TEMP/fcm-service-account.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/fcm-service-account.json" >> "$GITHUB_ENV"
+
+      # Grouped, de-noised notes from the Conventional-Commit history in this push (workflow_dispatch
+      # has no `before` → gen-release-notes.ts falls back to the last 30 commits). The gradle
+      # firebaseAppDistribution block uploads app/release-notes.txt when present.
+      - name: Generate release notes from merged commits
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bun scripts/gen-release-notes.ts > app/release-notes.txt
+          echo "----- release notes -----"; cat app/release-notes.txt
+
+      - name: Build APK & distribute to Firebase
+        env:
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+        run: ./gradlew :app:assembleDebug :app:appDistributionUploadDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  # ── iOS → TestFlight (App Store Connect) ──────────────────────────────────────────────────────
+  # macos-15 ships Xcode 16.x; xcodegen (latest) emits the Xcode-16 project format older Xcode can't
+  # open, so the runner must match. make-ios.sh archives + uploads; TestFlight processes it async.
+  ios:
+    needs: [meta, verify]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
+          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
+          xcodebuild -version
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      # Import the distribution cert into an ephemeral keychain so xcodebuild can sign with it.
+      # Automatic signing (-allowProvisioningUpdates, via the API key) handles the profile itself.
+      - name: Set up signing keychain
+        env:
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$IOS_DIST_P12_BASE64" ] || { echo "::error::IOS_DIST_P12_BASE64 secret not set"; exit 1; }
+          KC="$RUNNER_TEMP/anvil-signing.keychain-db"
+          KC_PASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          echo "$IOS_DIST_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -k "$KC" -P "$IOS_DIST_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/xcodebuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          rm -f "$RUNNER_TEMP/dist.p12"
+          echo "SIGNING_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Write App Store Connect API key
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$APPLE_API_KEY_BASE64" ] || { echo "::error::APPLE_API_KEY_BASE64 secret not set"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/private_keys/AuthKey.p8"
+
+      - name: Install provisioning profile
+        env:
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$IOS_PROVISIONING_PROFILE_BASE64" ] || { echo "::error::IOS_PROVISIONING_PROFILE_BASE64 secret not set"; exit 1; }
+          dir="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$dir"
+          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$dir/anvil_appstore.mobileprovision"
+
+      - name: Build & upload to TestFlight
+        working-directory: apple
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey.p8
+          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
+          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
+        run: ./make-ios.sh
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/private_keys"
 
   # ── macOS client → Developer-ID-notarized Anvil.app + Sparkle ─────────────────────────────────
   mac-client:
@@ -138,7 +317,7 @@ jobs:
           echo "sign_update: $OUT"
           echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
           echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
-          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/Anvil.zip" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "${{ needs.meta.outputs.tag }}" "$RUNNER_TEMP/Anvil.zip" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Clean up keychain
         if: always()
@@ -227,7 +406,7 @@ jobs:
           echo "sign_update: $OUT"
           echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
           echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
-          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/Anvil-Server.zip" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "${{ needs.meta.outputs.tag }}" "$RUNNER_TEMP/Anvil-Server.zip" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Clean up keychain
         if: always()
@@ -235,7 +414,7 @@ jobs:
           security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
           rm -rf "$RUNNER_TEMP/private_keys"
 
-  # ── publish both Sparkle appcasts to GitHub Pages (so installed apps auto-update) ─────────────
+  # ── publish both Sparkle appcasts to GitHub Pages (so installed macOS apps auto-update) ───────
   pages:
     needs: [meta, mac-client, mac-server]
     runs-on: ubuntu-latest
@@ -262,11 +441,11 @@ jobs:
           APP_TITLE: Anvil
           SHORT_VERSION: ${{ needs.meta.outputs.version }}
           BUILD_VERSION: ${{ github.run_number }}
-          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/Anvil.zip
+          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.meta.outputs.tag }}/Anvil.zip
           ED_SIGNATURE: ${{ needs.mac-client.outputs.ed_signature }}
           LENGTH: ${{ needs.mac-client.outputs.length }}
           MIN_SYSTEM: '13.0'
-          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.meta.outputs.tag }}
         run: bun scripts/mac-signing/update-appcast.ts
 
       - name: Update server appcast
@@ -275,11 +454,11 @@ jobs:
           APP_TITLE: Anvil Server
           SHORT_VERSION: ${{ needs.meta.outputs.version }}
           BUILD_VERSION: ${{ github.run_number }}
-          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/Anvil-Server.zip
+          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.meta.outputs.tag }}/Anvil-Server.zip
           ED_SIGNATURE: ${{ needs.mac-server.outputs.ed_signature }}
           LENGTH: ${{ needs.mac-server.outputs.length }}
           MIN_SYSTEM: '14.0'
-          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.meta.outputs.tag }}
         run: bun scripts/mac-signing/update-appcast.ts
 
       - name: Upload Pages artifact

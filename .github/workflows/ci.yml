@@ -2,9 +2,9 @@ name: CI
 
 # The merge gate. Runs on every pull request and every push to `main`, and is the ONLY thing that
 # proves a change typechecks, builds its web bundle, and passes the test suite before it can land.
-# The release workflows (release.yml, android-release.yml, ios-release.yml) all ship AFTER merge, so
-# without this gate a broken build would auto-ship to Play/TestFlight/Firebase. Keep this job fast
-# and green; the production release jobs `needs:` an equivalent verify step so nothing untested ships.
+# The full-release workflow (release.yml) ships every client surface AFTER merge to `main`, so without
+# this gate a broken build would auto-ship to Firebase/TestFlight/Sparkle. Keep this job fast and
+# green; release.yml `needs:` an equivalent `verify` step so nothing untested ships.
 on:
   pull_request:
   push:
