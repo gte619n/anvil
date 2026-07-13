@@ -59,6 +59,48 @@ test("checkForUpdate reports how many commits behind upstream", async () => {
   expect(r.needsRestart).toBe(false); // a real update (pull) is needed, not just a restart
 });
 
+test("checkForUpdate falls back to origin's default branch when no upstream is configured", async () => {
+  // Dev-box symptom (#update-failed): the daemon's checkout is detached / on a local-only branch, so
+  // @{u} fails. It must fall back to origin/HEAD instead of aborting the whole update.
+  const { run, calls } = fakeRunner({
+    "symbolic-full-name @{u}": { code: 128, out: "fatal: no upstream configured for branch" },
+    "symbolic-ref --short refs/remotes/origin/HEAD": { code: 0, out: "origin/main" },
+    "rev-list --count": { code: 0, out: "2" },
+  });
+  const r = await checkForUpdate(run);
+  expect(r.behind).toBe(2);
+  expect(r.output).toContain("origin/main");
+  expect(ran(calls, "HEAD..origin/main")).toBe(true); // counted against the fallback ref, not @{u}
+});
+
+test("checkForUpdate records origin/HEAD via set-head when it isn't set locally", async () => {
+  const { run, calls } = fakeRunner({
+    "symbolic-full-name @{u}": { code: 128, out: "no upstream" },
+    "symbolic-ref --short refs/remotes/origin/HEAD": { code: 1, out: "" }, // not recorded locally
+  });
+  // origin/HEAD unresolved → the fallback must attempt `git remote set-head origin --auto` to record it
+  // before giving up (here the stubbed symbolic-ref keeps failing, so it ultimately throws).
+  await expect(checkForUpdate(run)).rejects.toThrow(/can't check for updates/);
+  expect(ran(calls, "remote set-head origin --auto")).toBe(true);
+});
+
+test("checkForUpdate errors clearly when neither upstream nor origin's default branch resolves", async () => {
+  const { run } = fakeRunner({
+    "symbolic-full-name @{u}": { code: 128, out: "no upstream" },
+    "symbolic-ref --short refs/remotes/origin/HEAD": { code: 128, out: "no origin/HEAD" },
+  });
+  await expect(checkForUpdate(run)).rejects.toThrow(/can't check for updates/);
+});
+
+test("applyUpdate pulls the resolved ref by name (works without branch tracking)", async () => {
+  const { run, calls } = fakeRunner({
+    "symbolic-full-name @{u}": { code: 128, out: "no upstream" },
+    "symbolic-ref --short refs/remotes/origin/HEAD": { code: 0, out: "origin/main" },
+  });
+  await applyUpdate(run);
+  expect(ran(calls, "git pull --ff-only origin main")).toBe(true);
+});
+
 test("checkForUpdate flags a stale running process when disk HEAD is ahead of the live process", async () => {
   // Up to date with the remote (behind 0), but on-disk HEAD differs from the running process's SHA —
   // a prior pull whose restart never landed. Must surface as needsRestart, not a no-op "up to date".

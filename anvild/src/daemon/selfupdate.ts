@@ -74,6 +74,31 @@ async function repoRoot(run: CommandRunner): Promise<string> {
   return r.out.trim();
 }
 
+/** The remote-tracking ref the daemon should update toward, e.g. "origin/main". Prefers the checkout's
+ *  configured upstream (@{u}); when none is set — a detached HEAD or a local-only branch, common on a
+ *  dev-box checkout that's been moved between branches/worktrees — falls back to the remote's default
+ *  branch, which is the release track the daemon should follow regardless of what the local checkout is
+ *  pointed at. Throws a human-actionable message (surfaced verbatim in the client's "Update failed:"
+ *  line) only when neither can be resolved. */
+async function resolveUpdateRef(run: CommandRunner, root: string): Promise<string> {
+  const upstream = await run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], root);
+  if (upstream.code === 0 && upstream.out.trim()) return upstream.out.trim();
+  // No tracking branch — resolve the remote's default branch (origin/HEAD → e.g. "origin/main").
+  let head = await run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], root);
+  if (head.code !== 0 || !head.out.trim()) {
+    // origin/HEAD isn't recorded locally (a fresh `git clone` records it, but re-inits / partial setups
+    // may not) — ask the remote to record it and retry once.
+    await run(["git", "remote", "set-head", "origin", "--auto"], root);
+    head = await run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], root);
+  }
+  if (head.code === 0 && head.out.trim()) return head.out.trim();
+  throw new Error(
+    "no upstream branch configured for the daemon's checkout, and origin's default branch couldn't be resolved — " +
+      "can't check for updates. On the host, run `git remote set-head origin --auto` (or " +
+      "`git branch --set-upstream-to=origin/main`) in the daemon's checkout.",
+  );
+}
+
 /**
  * Fetch and report update state: how many commits behind upstream the checkout is, AND whether the
  * running process is stale relative to the on-disk checkout. The latter catches the case where a prior
@@ -85,14 +110,10 @@ export async function checkForUpdate(run: CommandRunner = runDefault): Promise<{
   const root = await repoRoot(run);
   const fetch = await run(["git", "fetch", "--quiet"], root);
   if (fetch.code !== 0) throw new Error(`git fetch failed: ${fetch.out || `exit ${fetch.code}`}`);
-  const upstream = await run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], root);
-  if (upstream.code !== 0) {
-    throw new Error("no upstream branch configured for the daemon's checkout — can't check for updates");
-  }
-  const counted = await run(["git", "rev-list", "--count", "HEAD..@{u}"], root);
+  const ref = await resolveUpdateRef(run, root);
+  const counted = await run(["git", "rev-list", "--count", `HEAD..${ref}`], root);
   if (counted.code !== 0) throw new Error(`git rev-list failed: ${counted.out || `exit ${counted.code}`}`);
   const behind = Number.parseInt(counted.out.trim(), 10) || 0;
-  const ref = upstream.out.trim();
   // Running process vs on-disk HEAD (same `git log -1 --format=%h` version.ts used at startup).
   const head = (await run(["git", "log", "-1", "--format=%h"], root)).out.trim();
   const running = runningSha();
@@ -112,9 +133,16 @@ export async function applyUpdate(run: CommandRunner = runDefault): Promise<{ ou
   const root = await repoRoot(run);
   const log: string[] = [];
 
+  // Pull the resolved ref by name (remote + branch) rather than relying on branch tracking — the
+  // checkout may be in detached HEAD or on a local-only branch (see resolveUpdateRef). --ff-only still
+  // refuses anything that isn't a clean fast-forward, so local commits fail loudly, never clobbered.
+  const ref = await resolveUpdateRef(run, root);
+  const slash = ref.indexOf("/");
+  const [remote, branch] = slash > 0 ? [ref.slice(0, slash), ref.slice(slash + 1)] : ["origin", ref];
+
   const before = (await run(["git", "rev-parse", "HEAD"], root)).out.trim();
-  const pull = await run(["git", "pull", "--ff-only"], root);
-  log.push(`$ git pull --ff-only\n${pull.out}`);
+  const pull = await run(["git", "pull", "--ff-only", remote, branch], root);
+  log.push(`$ git pull --ff-only ${remote} ${branch}\n${pull.out}`);
   if (pull.code !== 0) throw new Error(`git pull failed (local changes / not fast-forward?):\n${pull.out}`);
 
   // Only reinstall when the pull actually touched dependencies — running `bun install` against the
