@@ -4,11 +4,16 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { CLONE_TIMEOUT_MS, GIT_ENV, gitSpawn, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "./spawn";
 
-function run(cmd: string[], cwd: string): { code: number; out: string } {
-  const r = Bun.spawnSync(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
-  const out = `${r.stdout.toString()}${r.stderr.toString()}`.trim();
-  return { code: r.exitCode, out };
+/** Run a git/gh command in `cwd`, returning its exit code + combined stdout/stderr. Hardened against
+ *  network hangs via the shared `gitSpawn` (SSH keepalive + hard timeout). Local ops use the generous
+ *  default; ops that touch the network (clone/fetch/push/pr) pass a network timeout so a stalled
+ *  connection can never wedge the single-threaded daemon. */
+function run(cmd: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): { code: number; out: string } {
+  const r = gitSpawn(cmd, cwd, timeoutMs);
+  const out = `${r.stdout}${r.stderr}`.trim();
+  return { code: r.code, out };
 }
 
 /**
@@ -59,7 +64,7 @@ export function cloneRepo(url: string, parent: string): { dest: string; output: 
   mkdirSync(parent, { recursive: true });
   // `-c protocol.ext.allow=never` neutralizes the ext remote helper even if the allowlist is ever
   // loosened; `--` stops any dash-leading value from being read as an option.
-  const r = run(["git", "-c", "protocol.ext.allow=never", "clone", "--", trimmed, dest], parent);
+  const r = run(["git", "-c", "protocol.ext.allow=never", "clone", "--", trimmed, dest], parent, CLONE_TIMEOUT_MS);
   if (r.code !== 0) {
     throw new Error(`git clone failed: ${r.out || `exit ${r.code}`}`);
   }
@@ -90,7 +95,7 @@ export function ensureInitialCommit(dest: string): { initialized: boolean; outpu
   if (commit.code !== 0) {
     return { initialized: false, output: `could not auto-create an initial commit: ${commit.out}` };
   }
-  const pushed = run(["git", "push", "-u", "origin", branch], dest);
+  const pushed = run(["git", "push", "-u", "origin", branch], dest, NET_TIMEOUT_MS);
   return {
     initialized: true,
     output:
@@ -123,7 +128,7 @@ export function commit(cwd: string, message: string): { ok: boolean; output: str
  */
 export function push(cwd: string, branch: string, remoteBranch?: string): { ok: boolean; output: string } {
   const refspec = remoteBranch && remoteBranch !== branch ? `${branch}:${remoteBranch}` : branch;
-  const r = run(["git", "push", "-u", "origin", refspec], cwd);
+  const r = run(["git", "push", "-u", "origin", refspec], cwd, NET_TIMEOUT_MS);
   return { ok: r.code === 0, output: r.out || "pushed" };
 }
 
@@ -140,7 +145,7 @@ export function upstreamRemoteBranch(cwd: string): string | undefined {
 }
 
 export function createPr(cwd: string, title: string, body: string): { ok: boolean; output: string; url?: string } {
-  const r = run(["gh", "pr", "create", "--title", title, "--body", body], cwd);
+  const r = run(["gh", "pr", "create", "--title", title, "--body", body], cwd, NET_TIMEOUT_MS);
   const url = r.out.match(/https?:\/\/\S+/)?.[0];
   return { ok: r.code === 0, output: r.out, url };
 }
@@ -164,19 +169,19 @@ export function mergePr(
   remoteBranch?: string,
 ): { ok: boolean; output: string; newBranch?: string } {
   const flag = method === "squash" ? "--squash" : method === "rebase" ? "--rebase" : "--merge";
-  const r = run(["gh", "pr", "merge", flag], cwd);
+  const r = run(["gh", "pr", "merge", flag], cwd, NET_TIMEOUT_MS);
   if (r.code !== 0 || !branch) return { ok: r.code === 0, output: r.out || "merged" };
 
   // Pull the merged state down so the follow-up branch starts from the new default-branch tip
   // (after a squash/rebase merge the local merged-branch tip has diverged from it).
-  run(["git", "fetch", "origin"], cwd);
+  run(["git", "fetch", "origin"], cwd, NET_TIMEOUT_MS);
 
   // Delete the remote branch ourselves — what `--delete-branch` would have done, but as a plain push
   // so it never tries to move the local checkout and can't abort the rest of the cleanup. Best-effort:
   // the remote may already be gone (e.g. branch-protection auto-delete) and that's not a failure.
   // The remote branch carries the intent prefix (`feature/…`), which differs from the local slug.
   const remote = remoteBranch ?? branch;
-  const remoteDeleted = run(["git", "push", "origin", "--delete", remote], cwd).code === 0;
+  const remoteDeleted = run(["git", "push", "origin", "--delete", remote], cwd, NET_TIMEOUT_MS).code === 0;
   const remoteNote = remoteDeleted ? `; deleted remote ${remote}` : "";
 
   const def = defaultBranch(cwd);
@@ -252,7 +257,7 @@ export function pruneUnusedFollowupBranches(repoRoot: string): { deleted: string
 
 /** PR state for the current branch via `gh` (network); undefined if there's no PR. */
 export function prStatus(cwd: string): { state?: "open" | "merged" | "closed"; url?: string } {
-  const r = run(["gh", "pr", "view", "--json", "state,url"], cwd);
+  const r = run(["gh", "pr", "view", "--json", "state,url"], cwd, NET_TIMEOUT_MS);
   if (r.code !== 0) return {};
   try {
     const j = JSON.parse(r.out) as { state?: string; url?: string };
@@ -267,7 +272,16 @@ export function prStatus(cwd: string): { state?: "open" | "merged" | "closed"; u
  *  stalls the single-threaded daemon. Same shape/semantics as prStatus(). */
 export async function prStatusAsync(cwd: string): Promise<{ state?: "open" | "merged" | "closed"; url?: string }> {
   try {
-    const proc = Bun.spawn(["gh", "pr", "view", "--json", "state,url"], { cwd, stdout: "pipe", stderr: "ignore" });
+    // Same network-safety env + hard timeout as the sync path: a hung `gh` here wouldn't freeze the
+    // event loop, but it would leak a process and never resolve the badge refresh.
+    const proc = Bun.spawn(["gh", "pr", "view", "--json", "state,url"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "ignore",
+      env: GIT_ENV,
+      timeout: NET_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
     const out = await new Response(proc.stdout).text();
     if ((await proc.exited) !== 0) return {};
     const j = JSON.parse(out) as { state?: string; url?: string };
@@ -280,5 +294,5 @@ export async function prStatusAsync(cwd: string): Promise<{ state?: "open" | "me
 
 /** Best-effort delete of the remote branch (for abandon/cleanup). */
 export function deleteRemoteBranch(cwd: string, branch: string): void {
-  run(["git", "push", "origin", "--delete", branch], cwd);
+  run(["git", "push", "origin", "--delete", branch], cwd, NET_TIMEOUT_MS);
 }
