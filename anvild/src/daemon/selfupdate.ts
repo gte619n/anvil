@@ -14,6 +14,7 @@
  *     also respawn a clean exit, but the explicit restart matches launchd's semantics).
  */
 import { join } from "node:path";
+import { GIT_ENV } from "../git/spawn";
 import { VERSION } from "../version";
 
 /** Service label — must match LABEL in scripts/service.sh (launchd) / the systemd unit name. */
@@ -54,7 +55,11 @@ export function isManaged(): boolean {
 export type CommandRunner = (cmd: string[], cwd: string) => Promise<{ code: number; out: string }>;
 
 const runDefault: CommandRunner = async (cmd, cwd) => {
-  const p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  // GIT_ENV adds SSH keepalives + no-prompt so a self-update `git fetch`/`git pull` over a dead
+  // connection fails fast instead of stalling the update flow forever. (These steps are async, so a
+  // hang wouldn't freeze the event loop — but it would leave the update wedged with no signal.) The
+  // env is harmless for the non-git steps (bun install / build:web) this runner also drives.
+  const p = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", env: GIT_ENV });
   const [stdout, stderr] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
   const code = await p.exited;
   return { code, out: `${stdout}${stderr}`.trim() };

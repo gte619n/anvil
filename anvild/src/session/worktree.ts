@@ -1,11 +1,12 @@
 import { existsSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { GitStatus, Worktree } from "@protocol";
+import { gitSpawn, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "../git/spawn";
 
-/** Run git in `cwd`, capturing output. */
-function git(args: string[], cwd: string): { code: number; stdout: string; stderr: string } {
-  const r = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  return { code: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+/** Run git in `cwd`, capturing output. Hardened against network hangs via the shared `gitSpawn`
+ *  (SSH keepalive + hard timeout); pass `NET_TIMEOUT_MS` for ops that touch the network (fetch). */
+function git(args: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): { code: number; stdout: string; stderr: string } {
+  return gitSpawn(["git", ...args], cwd, timeoutMs);
 }
 
 /**
@@ -125,7 +126,7 @@ function syncedBase(repoRoot: string, base: string): string {
   const slash = tracking.indexOf("/"); // split "origin/feature/x" → remote "origin", branch "feature/x"
   const remote = tracking.slice(0, slash);
   const remoteBranch = tracking.slice(slash + 1);
-  const fetched = git(["fetch", remote, remoteBranch], repoRoot); // updates refs/remotes/<tracking>
+  const fetched = git(["fetch", remote, remoteBranch], repoRoot, NET_TIMEOUT_MS); // network; updates refs/remotes/<tracking>
   if (fetched.code !== 0) return base;
   fastForwardLocal(repoRoot, branch, tracking);
   return tracking;
