@@ -167,8 +167,9 @@ export function buildAutopilotReport(input: AutopilotReportInput): AutopilotRepo
  * nest). The whole report hangs off a single top node folded with a `collapsed:: true` property, so a
  * run adds exactly ONE collapsible bullet to the day's journal rather than a wall of headings.
  *
- *   - Autopilot run — <repos> — <date>
+ *   - # ✈️ Anvil Autopilot Report
  *   \tcollapsed:: true
+ *   \t- _<trigger> run · <repos> · <date>_
  *   \t- <counts>
  *   \t- ✅ Started
  *   \t\t- <unit>
@@ -187,7 +188,7 @@ export function renderJournalOutline(input: AutopilotReportInput): string {
 
   node(0, `# ${REPORT_TITLE}`); // H1 heading node (Logseq renders `# …` in a block as a title)
   prop(1, "collapsed:: true"); // fold the whole report under the top node
-  prop(1, `_${input.trigger} run · ${reportContext(input)}_`);
+  node(1, `_${input.trigger} run · ${reportContext(input)}_`); // a real child bullet, not a bare line glued onto the title
   if (input.appBaseUrl) node(1, openInAnvil(input.appBaseUrl));
   node(1, reportCounts(input).join(" · ") + ".");
 

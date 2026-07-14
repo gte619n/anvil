@@ -125,6 +125,9 @@ test("renderJournalOutline folds the report under one collapsed, TAB-nested node
   // Top node is a bullet at depth 0; the fold property + everything else are TAB-indented beneath it.
   expect(lines[0]).toBe("- # ✈️ Anvil Autopilot Report");
   expect(lines[1]).toBe("\tcollapsed:: true");
+  // The run/timestamp line must be a real child BULLET at depth 1 (a bare `\t…` line glues onto the
+  // title block and shows at the first level instead of nesting under it).
+  expect(lines[2]).toBe("\t- _scheduled run · anvil · 2026-07-07_");
   expect(md).toContain("\t- ✅ Started");
   expect(md).toContain("\t\t- **Wire push retries** — add backoff");
   expect(md).toContain("\t- ❓ Needs more information");
