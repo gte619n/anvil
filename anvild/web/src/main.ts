@@ -3320,6 +3320,13 @@ function closeAutopilot(): void {
   $("#autopilot-root").innerHTML = "";
 }
 
+/** Millis of a plan's last action (updatedAt, falling back to createdAt), for recency sort + label.
+ *  Returns 0 when neither timestamp parses, so undated plans sort last / show no date. */
+function planUpdatedMs(p: AutopilotPlanInfo): number {
+  const t = Date.parse(p.updatedAt ?? p.createdAt ?? "");
+  return Number.isFinite(t) ? t : 0;
+}
+
 function planCardHtml(p: AutopilotPlanInfo): string {
   const localEnv = p.environmentId ? environments.get(p.environmentId) : undefined;
   // Tint each card with its environment's colour (same hue the sidebar/session rows use), so a plan is
@@ -3330,6 +3337,12 @@ function planCardHtml(p: AutopilotPlanInfo): string {
   const eff = p.effort
     ? `<span class="ap-chip eff-${p.effort.size}">${SIZE_LABEL[p.effort.size] ?? p.effort.size}${p.effort.filesTouched != null ? ` · ${p.effort.filesTouched} file${p.effort.filesTouched === 1 ? "" : "s"}` : ""}</span>`
     : "";
+  // When the plan's last action happened — the same recency the grid now sorts by. Relative for glance
+  // value ("3d ago"), full date on hover.
+  const ms = planUpdatedMs(p);
+  const when = ms
+    ? `<span class="ap-chip ap-chip-when" title="Last action ${esc(new Date(ms).toLocaleString())}">${icon("history")}${esc(relTime(ms))}</span>`
+    : "";
   return `<button class="plan-card" data-id="${esc(p.id)}" style="--plan-stripe:${stripe}">
     <span class="plan-title">${esc(p.title)}</span>
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
@@ -3338,6 +3351,7 @@ function planCardHtml(p: AutopilotPlanInfo): string {
       ${eff}
       ${p.source === "label" ? `<span class="ap-chip ap-chip-label">${icon("label")}via label</span>` : ""}
       <span class="ap-chip status-${esc(p.status)}">${esc(p.status)}</span>
+      ${when}
     </span>
   </button>`;
 }
@@ -3345,8 +3359,8 @@ function planCardHtml(p: AutopilotPlanInfo): string {
 function planEnvName(p: AutopilotPlanInfo): string {
   return p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "Unlinked";
 }
-/** Group a server's plans by environment, ordered by environment name then title, so a repo's plans
- *  sit together under one separator. */
+/** Group a server's plans by environment, environments ordered by name and each env's plans ordered
+ *  most-recent-first (by last action), so a repo's plans sit together with the freshest on top. */
 function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: string; plans: AutopilotPlanInfo[] }[] {
   const groups = new Map<string, { envId?: string; name: string; plans: AutopilotPlanInfo[] }>();
   for (const p of list) {
@@ -3357,7 +3371,8 @@ function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: 
     g.plans.push(p);
   }
   const out = [...groups.values()];
-  for (const g of out) g.plans.sort((a, b) => a.title.localeCompare(b.title));
+  // Most recent action first; ties (or undated plans) fall back to title for a stable order.
+  for (const g of out) g.plans.sort((a, b) => planUpdatedMs(b) - planUpdatedMs(a) || a.title.localeCompare(b.title));
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 /** The flowing card grid, grouped by server when the fleet has more than one. */
