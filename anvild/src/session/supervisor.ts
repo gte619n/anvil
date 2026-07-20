@@ -1740,6 +1740,25 @@ export class Supervisor {
       s.data.archived = false; // prompting reactivates an archived session
       this.broadcastUpdated(s.data);
     }
+
+    // Built-in context controls are handled by the daemon, not passed through as prose (§context). They
+    // must be the WHOLE message (matching Claude Code's slash-command rule) and carry no attachments.
+    const trimmed = text.trim();
+    if (trimmed === "/clear") {
+      // Same effect as the "New topic" action: null the resume id, reset the context meter, drop a
+      // divider. SDK-native /clear would do none of that (the daemon would still resume the old topic
+      // on restart), so we route to newTopic instead of forwarding the command.
+      void this.newTopic(id);
+      return;
+    }
+    if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
+      // Forward to the SDK so it actually summarizes the context. We suppress the user-echo (the
+      // compact_boundary divider the driver emits is the visible marker) and let the refreshed context
+      // meter ride the turn's result. Any `/compact <instructions>` guidance passes through verbatim.
+      this.ensureDriver(id).prompt(text);
+      return;
+    }
+
     const attachments = attachmentIds
       .map((aid) => this.attachStore.ref(id, aid))
       .filter((r): r is AttachmentRef => r !== undefined);
@@ -1753,8 +1772,14 @@ export class Supervisor {
 
     // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4)
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
+    this.ensureDriver(id).prompt(text, inline);
+  }
+
+  /** Get the session's live driver, creating it lazily on first use (arch §6.2). */
+  private ensureDriver(id: string): AgentDriver {
     let driver = this.drivers.get(id);
     if (!driver) {
+      const s = this.require(id);
       const isDefault = s.data.isDefault === true;
       driver = new AgentDriver(
         s,
@@ -1772,7 +1797,7 @@ export class Supervisor {
       );
       this.drivers.set(id, driver);
     }
-    driver.prompt(text, inline);
+    return driver;
   }
 
   interrupt(id: string): void {
@@ -2037,6 +2062,7 @@ export class Supervisor {
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
     s.data.claudeSessionId = undefined; // the key line: forget the prior topic (no resume next turn)
+    s.data.context = undefined; // the fresh topic starts with an empty window; the next turn repopulates the meter
     s.data.status = "idle";
     s.data.lastActivityAt = now();
     s.emit({
@@ -2128,6 +2154,12 @@ export class Supervisor {
     // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
     const s = this.sessions.get(sessionId);
     if (s) this.refreshGit(s);
+    // Refresh the live context-window meter from this turn's reading (§context). Broadcast so every
+    // device's composer gauge updates; skip the push when the SDK didn't report (keep the last value).
+    if (s && usage.contextUsage) {
+      s.data.context = usage.contextUsage;
+      this.broadcastUpdated(s.data);
+    }
     // The goal is now on the record — classify the remote branch prefix from the opening brief once
     // (arch §8). Fire-and-forget: a slow/failed LLM call must never hold up the turn's completion.
     if (s?.data.worktree && !s.data.worktree.remoteBranch) void this.ensureRemoteBranch(s);

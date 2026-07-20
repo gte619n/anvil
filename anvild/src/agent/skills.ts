@@ -130,22 +130,40 @@ function skillDescription(skillsDir: string, skill: string): string | undefined 
 }
 
 /**
+ * Blurbs for the built-in commands anvil cares to explain in the `/` menu. The two context controls are
+ * daemon-handled (§context): `/clear` routes to a fresh topic; `/compact` is forwarded to the SDK to
+ * summarize the window. We inject them if the SDK didn't already list them, so the menu always offers
+ * them. Other built-ins stay description-less (the SDK doesn't hand us blurbs for them).
+ */
+const BUILTIN_DESCRIPTIONS: Record<string, string> = {
+  clear: "Start a fresh topic — Claude forgets the conversation above; your visible history stays",
+  compact: "Summarize the conversation so far to free up the context window, then continue",
+};
+
+/**
  * Map the SDK `init` message's `slash_commands` to the composer's `CommandInfo[]`. Plugin skills come
  * namespaced (`user:foo` / `project:bar`) — we split the namespace to tag the source and look up the
- * SKILL.md description; everything else (built-in commands + skills) is reported bare as "builtin".
+ * SKILL.md description; everything else (built-in commands + skills) is reported bare as "builtin",
+ * enriched with a blurb when we have one. The context controls are guaranteed present (§context).
  */
 export function buildCommandInfo(slashCommands: readonly string[], cwd: string): CommandInfo[] {
   const dirs: Record<SkillSourceName, string | undefined> = {
     user: existsSync(userSkillsDir()) ? userSkillsDir() : undefined,
     project: projectSkillsDir(cwd),
   };
-  return slashCommands.map((name) => {
+  const out: CommandInfo[] = slashCommands.map((name) => {
     const colon = name.indexOf(":");
     const ns = colon > 0 ? name.slice(0, colon) : "";
     if ((ns === "user" || ns === "project") && dirs[ns]) {
       const description = skillDescription(dirs[ns]!, name.slice(colon + 1));
       return description ? { name, description, source: ns } : { name, source: ns };
     }
-    return { name, source: "builtin" as const };
+    const description = BUILTIN_DESCRIPTIONS[name];
+    return description ? { name, description, source: "builtin" as const } : { name, source: "builtin" as const };
   });
+  const have = new Set(out.map((c) => c.name));
+  for (const name of ["clear", "compact"]) {
+    if (!have.has(name)) out.unshift({ name, description: BUILTIN_DESCRIPTIONS[name], source: "builtin" });
+  }
+  return out;
 }
