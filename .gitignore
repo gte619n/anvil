@@ -29,3 +29,6 @@ __pycache__/
 
 # OMC
 .omc/
+
+# Firebase Hosting deploy cache (marketing site — website/)
+.firebase/

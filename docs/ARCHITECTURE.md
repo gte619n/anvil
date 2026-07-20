@@ -44,6 +44,7 @@ flowchart TB
             gitm["Git / worktree ops"]
             bud["Budget tracker"]
             pushm["Push registry"]
+            intm["Integrations + autopilot<br/>Todoist · lapo · OpenRouter<br/>schedule · dev pipeline"]
         end
         ccode["Claude Code"]
         drv <--> ccode
@@ -66,14 +67,15 @@ flowchart TB
     classDef daemon fill:#D39450,stroke:#2F2739,color:#2F2739;
     classDef box fill:#635F6A,stroke:#2F2739,color:#F0F6FC;
     classDef edge fill:#3D3645,stroke:#2F2739,color:#F0F6FC;
-    class sup,drv,ren,perm,log,gitm,bud,pushm,ccode box;
+    class sup,drv,ren,perm,log,gitm,bud,pushm,intm,ccode box;
     class ws edge;
     class web,android,apple,server box;
 ```
 
 - **`anvild`** — the keystone. One daemon per Mac. It supervises sessions, drives Claude
   Code through the Agent SDK, renders markdown, enforces permissions, tracks the budget,
-  persists an event log, owns the git worktrees, and serves both the web client and the
+  persists an event log, owns the git worktrees, runs the autopilot + adversarial pipeline
+  and the Todoist/lapo/OpenRouter integrations, and serves both the web client and the
   protocol. Lives in [`anvild/src/`](../anvild/src/).
 - **Web client** — vanilla TypeScript served by the daemon at `/`. It is both the daily
   driver in a browser *and* the shared render surface bundled into the native shells.
@@ -94,9 +96,9 @@ owns the lifecycle explicitly — there are no Zellij sockets or husks to reason
 | Field | Meaning |
 |---|---|
 | `source` | `existing-dir` (attach to a directory as-is) or `fresh-worktree` (spin up a git worktree off a base branch) |
-| `model` | `opus` (default) or `sonnet`, per-session override |
-| `autonomy` | `mostly-autonomous` (default), `allowlist`, or `prompt-all` |
-| `status` | `idle` · `thinking` · `running_tool` · `awaiting_permission` · `error` · `exited` |
+| `model` | `opus` (default) · `sonnet` · `haiku` · `fable`, per-session override, switchable mid-conversation |
+| `autonomy` | `mostly-autonomous` (default), `bypass`, `allowlist`, or `prompt-all` |
+| `status` | `idle` · `thinking` · `running_tool` · `awaiting_permission` · `awaiting_question` · `error` · `exited` |
 | `claudeSessionId` | Claude Code's own `--resume` id, captured for resume |
 
 ```mermaid
@@ -152,14 +154,20 @@ raw terminal channel, where the most-recently-attached client owns the PTY size.
 
 | Direction | Message | Purpose |
 |---|---|---|
-| C→S | `prompt.send` | send a user turn (with optional attachment ids) |
-| C→S | `permission.respond` | answer a permission request (`allow` / `deny` / `allow_always`) |
+| C→S | `prompt.send` | send a user turn (with optional attachment ids + citations) |
+| C→S | `permission.respond` / `question.respond` | answer a permission request (`allow` / `deny` / `allow_always`) or a multiple-choice question |
 | C→S | `session.attach` / `interrupt` / `session.kill` | resume · stop a turn · end a session |
+| C→S | `autopilot.*` / `prompt.*` / `todoist.*` / `lapo.*` | drive autopilot & the dev pipeline, the prompt library, and the integrations |
+| S→C | `server.hello` | first frame on every connection — `serverId`, version, and the capability list |
 | S→C | `assistant.delta` / `assistant.message` | streaming text, then the finalized turn |
-| S→C | `tool.use` / `tool.result` | a tool ran |
-| S→C | `permission.request` | the daemon is blocked awaiting your decision |
+| S→C | `tool.use` / `tool.result` / `file.offer` | a tool ran · a deliverable file is ready to download |
+| S→C | `permission.request` / `question.request` | the daemon is blocked awaiting your decision or an answer |
 | S→C | `budget` | shared Max-pool usage, pushed on change |
 | S→C | `fs.changed` | a watched file changed (live markdown reader) |
+
+The daemon advertises what it supports in `server.hello.capabilities` (e.g. `autopilot`,
+`prompts`, `auth`, `lapo`), so a newer client degrades gracefully against an older daemon
+instead of sending commands it can't answer.
 
 ---
 
@@ -215,6 +223,74 @@ detail: [`anvil-native-architecture.md` §3](plans/anvil-native-architecture.md)
 
 ---
 
+## Environments and the concierge
+
+An **environment** is a registered git repo (name, default base branch, colour/icon, optional
+Todoist project + validation commands). New sessions are created *into* an environment, which
+is where the worktree branches from. Environments are managed from the client (`env.add` /
+`env.clone` / `env.update` / `env.remove`) and broadcast to every device.
+
+The daemon also keeps one persistent **concierge** session — a pinned, whole-fleet chat that
+never dies. It has a small in-process tool surface (`list_sessions`, `get_session`,
+`list_environments`, `create_session`) so you can ask it about work in flight anywhere and
+have it hand off a fresh worktree session. `session.new_topic` gives it a clean Claude context
+while keeping the visible scrollback.
+
+---
+
+## Autopilot: from a task list to a plan (and maybe a PR)
+
+Autopilot turns a **Todoist** project into reviewable work. On demand or on a nightly
+schedule, the daemon reads the project's tasks, bundles related ones into **units of work**,
+and writes an implementation plan for each. Two gates keep it from building the wrong thing
+unattended: an **intake** classifier parks underspecified tasks as *needs-clarification*
+(with the open questions), and an optional **adversarial panel** of independent
+[OpenRouter](https://openrouter.ai) models critiques each plan — reading the actual repo via a
+read-only tool surface — and scores it. Only well-specified, high-consensus units auto-start;
+everything else waits for a human on the plan-review grid.
+
+```mermaid
+flowchart LR
+    todoist["Todoist project"] --> bundle["bundle → units of work"]
+    bundle --> plan["plan each unit<br/>(Claude)"]
+    plan --> intake{"specified<br/>enough?"}
+    intake -->|no| hold["⏸️ needs-clarification<br/>(open questions)"]
+    intake -->|yes| panel["adversarial panel<br/>(OpenRouter models, optional)"]
+    panel --> score{"consensus<br/>≥ threshold?"}
+    score -->|no| review["🧑 manual review"]
+    score -->|yes| start["auto-start"]
+    start --> build["build session"]
+    start --> pipe["dev pipeline"]
+    classDef n fill:#635F6A,stroke:#2F2739,color:#F0F6FC;
+    classDef stop fill:#D39450,stroke:#2F2739,color:#2F2739;
+    class todoist,bundle,plan,panel,build,pipe n;
+    class hold,review,start stop;
+```
+
+Each task carries exactly one `anvil:*` status label (planned · needs-clarification · building
+· review · blocked · dismissed · completed · expired), so the grid and the gates stay in sync
+without a separate database. After a run the daemon can file a report to a **lapo**/Logseq
+journal — what it started, what's held, what it skipped (see
+[`lapo-integration.md`](lapo-integration.md)). Scheduling is hub-only. Full design:
+[`plans/anvil-autopilot-ui.md`](plans/anvil-autopilot-ui.md) ·
+[`plans/anvil-todoist-integration.md`](plans/anvil-todoist-integration.md).
+
+### The adversarial dev pipeline
+
+Auto-start can either open an ordinary build session or run the **unattended dev pipeline** —
+a cross-model gauntlet built on the rule that the author and the reviewer of any artifact must
+be *different* models. Two decorrelated peers play the roles: **Claude Opus** (design and
+judgment, on the Max subscription) and **GLM** (cheap agentic work, via OpenRouter, driven
+through the Agent SDK's Anthropic-compatible endpoint). A task flows through six gates —
+intake → requirements → design → implementation → verification → validation — with bounded
+loopbacks and human escalation on critical findings, and ships by opening a PR whose body is a
+**Design History File** tracing every decision from the original task to the diff. A guard
+hard-denies dangerous tools since no human is in the loop, and a "decorative adversary" metric
+watches for reviewers that rubber-stamp. Design:
+[`plans/anvil-adversarial-pipeline.md`](plans/anvil-adversarial-pipeline.md).
+
+---
+
 ## The fleet (optional)
 
 One client can manage `anvild` on several Macs over the same tailnet, all on one Max plan —
@@ -253,3 +329,6 @@ Design: [`plans/anvil-multi-server.md`](plans/anvil-multi-server.md) and
 - **The full design:** [`plans/anvil-native-architecture.md`](plans/anvil-native-architecture.md)
 - **The wire protocol:** [`plans/anvil-protocol.ts`](plans/anvil-protocol.ts)
 - **Per-component plans:** [`plans/anvil-impl-INDEX.md`](plans/anvil-impl-INDEX.md)
+- **Autopilot & the dev pipeline:** [`plans/anvil-autopilot-ui.md`](plans/anvil-autopilot-ui.md) · [`plans/anvil-adversarial-pipeline.md`](plans/anvil-adversarial-pipeline.md)
+- **Integrations:** [`plans/anvil-todoist-integration.md`](plans/anvil-todoist-integration.md) · [`lapo-integration.md`](lapo-integration.md)
+- **Build & release:** [`CI-CD.md`](CI-CD.md)

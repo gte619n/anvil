@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Anvil — Drive Claude Code from anywhere</title>
+  <meta name="description" content="Anvil is a native, multi-device client for Claude Code. Kick off a task on your Mac, drive it from your phone, and get pulled back when it needs you — private over Tailscale, on your Claude Max plan." />
+  <meta name="theme-color" content="#2F2739" />
+  <link rel="icon" href="assets/anvil-mark.svg" type="image/svg+xml" />
+  <link rel="canonical" href="https://anvild.sh/" />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://anvild.sh/" />
+  <meta property="og:title" content="Anvil — Drive Claude Code from anywhere" />
+  <meta property="og:description" content="A native, multi-device client for Claude Code. Autopilot your backlog overnight, review from your phone, ship a PR — private over Tailscale." />
+  <meta property="og:image" content="assets/anvil-banner-dark.svg" />
+  <meta name="twitter:card" content="summary_large_image" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- ============================ NAV ============================ -->
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top"><img src="assets/anvil-mark.svg" alt="Anvil" /> Anvil</a>
+    <nav class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#autopilot">Autopilot</a>
+      <a href="#pipeline">Pipeline</a>
+      <a href="#how">How it works</a>
+      <a href="#platforms">Platforms</a>
+    </nav>
+    <span class="nav-spacer"></span>
+    <div class="nav-cta">
+      <a class="btn btn-ghost" href="https://github.com/gte619n/anvil" target="_blank" rel="noopener">
+        <span class="material-symbols-rounded">star</span> GitHub
+      </a>
+      <a class="btn btn-primary" href="#start">Get started</a>
+    </div>
+    <button class="btn btn-ghost nav-toggle" id="navToggle" aria-label="Menu"><span class="material-symbols-rounded">menu</span></button>
+  </div>
+</header>
+
+<a id="top"></a>
+
+<!-- ============================ HERO ============================ -->
+<section class="hero wrap">
+  <div class="hero-grid">
+    <div class="hero-copy reveal">
+      <span class="eyebrow"><span class="material-symbols-rounded">bolt</span> Native client for Claude Code</span>
+      <h1>Drive Claude Code <span class="accent">from anywhere.</span></h1>
+      <p class="hero-sub">
+        Run the agent on your dev machine and steer it from your phone, tablet, or laptop.
+        Kick off a task, pocket your phone, and get pulled back by a push when it finishes —
+        or needs your call on something risky.
+      </p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="#start"><span class="material-symbols-rounded">rocket_launch</span> Get started</a>
+        <a class="btn btn-ghost" href="#features"><span class="material-symbols-rounded">explore</span> See the features</a>
+      </div>
+      <div class="hero-meta">
+        <span><span class="material-symbols-rounded">shield_lock</span> Private over Tailscale</span>
+        <span><span class="material-symbols-rounded">workspace_premium</span> On your Claude Max plan</span>
+        <span><span class="material-symbols-rounded">code</span> Open source · MIT</span>
+      </div>
+    </div>
+
+    <!-- HERO VISUAL: laptop app mock + floating phone mock (multi-device story) -->
+    <div class="hero-visual reveal">
+      <div class="browser">
+        <div class="browser-bar">
+          <div class="lights"><i></i><i></i><i></i></div>
+          <div class="url"><span class="material-symbols-rounded">lock</span> mac-mini.tailnet.ts.net</div>
+        </div>
+        <div class="app">
+          <!-- sidebar -->
+          <aside class="app-side">
+            <div class="app-brand"><img src="assets/anvil-mark.svg" alt="" /> Anvil <small>v2.2</small></div>
+            <div class="s-item"><span class="material-symbols-rounded">forum</span><span class="s-txt">Concierge</span></div>
+            <div class="s-item active"><span class="dot" style="background:#3fb950"></span><span class="s-txt">Wire push retries<small>feature/push-backoff</small></span></div>
+            <div class="s-item"><span class="dot" style="background:#6b9bff"></span><span class="s-txt">Refactor auth guard<small>bugfix/auth</small></span></div>
+            <div class="s-item"><span class="dot" style="background:#d39450"></span><span class="s-txt">Export as CSV<small>feature/export</small></span></div>
+            <div class="s-sep"></div>
+            <div class="app-foot"><span class="material-symbols-rounded">bolt</span><span>Autopilot</span></div>
+            <div class="app-foot"><span class="material-symbols-rounded">tune</span><span>Settings &amp; Servers</span></div>
+          </aside>
+          <!-- main -->
+          <div class="app-main">
+            <div class="app-head">
+              <span class="conn"></span>
+              <span class="title">Wire push retries</span>
+              <span class="chip"><span class="material-symbols-rounded">account_tree</span> feature/push-backoff · +2 −0</span>
+              <span class="grow"></span>
+              <span class="hicon"><span class="material-symbols-rounded">terminal</span></span>
+              <span class="hicon"><span class="material-symbols-rounded">description</span></span>
+            </div>
+            <div class="app-conv">
+              <div class="bubble user">Add exponential backoff to the FCM push sender and cap retries at 5.</div>
+              <div class="bubble asst">
+                <p>I'll add a retry loop with jittered backoff around <code>sendFcm()</code> and cap it at 5 attempts.</p>
+              </div>
+              <div class="toolcard"><span class="material-symbols-rounded">edit</span><code>Edit&nbsp;&nbsp;src/push/fcm.ts</code><span class="material-symbols-rounded ok">check_circle</span></div>
+              <div class="permcard">
+                <div class="ph"><span class="material-symbols-rounded">gpp_maybe</span> Permission needed</div>
+                <div class="pd">git push origin feature/push-backoff</div>
+                <div class="pb"><span class="pbtn allow">Allow</span><span class="pbtn deny">Deny</span><span class="pbtn">Always allow</span></div>
+              </div>
+            </div>
+            <div class="app-composer">
+              <span class="pill"><span class="material-symbols-rounded" style="font-size:13px">neurology</span> Opus</span>
+              <div class="field">Message Anvil… &nbsp; ⇧⏎ for newline</div>
+              <div class="send"><span class="material-symbols-rounded">arrow_upward</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- floating phone: same session, reconciled -->
+      <div class="phone">
+        <div class="notch"></div>
+        <div class="phone-screen">
+          <div class="phone-head"><span class="material-symbols-rounded">arrow_back</span> Wire push retries</div>
+          <div class="phone-body">
+            <div class="bubble asst" style="max-width:100%"><p style="font-size:12px">Pushed. Opening a PR now…</p></div>
+            <div class="toolcard" style="font-size:11px"><span class="material-symbols-rounded">merge</span><code>gh pr create</code><span class="material-symbols-rounded ok">check_circle</span></div>
+            <div class="permcard" style="padding:9px 10px">
+              <div class="ph" style="font-size:11px"><span class="material-symbols-rounded">notifications_active</span> Turn complete</div>
+              <div class="pd" style="margin:5px 0 0; font-family:var(--font)">PR #148 opened — ready for review.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ TRUST ============================ -->
+<div class="trust">
+  <div class="wrap trust-inner reveal">
+    <span class="trust-item"><span class="material-symbols-rounded">hub</span> Built on the <b>Claude Agent SDK</b></span>
+    <span class="trust-item"><span class="material-symbols-rounded">devices</span> <b>Web · Android · macOS · iOS</b></span>
+    <span class="trust-item"><span class="material-symbols-rounded">vpn_lock</span> Nothing public — <b>your tailnet</b></span>
+    <span class="trust-item"><span class="material-symbols-rounded">savings</span> <b>Subscription</b> billing, never metered</span>
+  </div>
+</div>
+
+<!-- ============================ REFRAME ============================ -->
+<section class="wrap">
+  <div class="section-head center reveal">
+    <span class="eyebrow"><span class="material-symbols-rounded">psychology</span> The idea</span>
+    <h2>A Claude client that occasionally needs a terminal — not a terminal that occasionally talks to Claude.</h2>
+    <p>Claude Code can be driven through the Agent SDK, which streams typed events: text, tool calls, diffs, permission requests, usage. So Anvil never scrapes a terminal grid. A daemon renders those events once and every device shows the same clean conversation.</p>
+  </div>
+  <div class="feature-grid reveal">
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">article</span></div>
+      <h3>Conversation, not a grid</h3>
+      <p>Reflowable markdown, syntax-highlighted code, tables, math, and live mermaid diagrams — rendered once on the daemon, identical on every device. Real text inputs; ⇧⏎ is a newline.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">sync_alt</span></div>
+      <h3>Multi-device, no shared viewport</h3>
+      <p>Pick up your phone mid-conversation and it reconciles to exactly where your laptop left off. No "disconnect the other client" dance — nothing is bound to one screen size.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">account_tree</span></div>
+      <h3>Worktree-per-session</h3>
+      <p>Each task spins up its own git worktree off a base branch. Branch, diffstat, and the full lifecycle — commit, push, PR, merge — are first-class buttons, not shell incantations.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ FEATURES ============================ -->
+<section id="features" class="wrap">
+  <div class="section-head reveal">
+    <span class="eyebrow"><span class="material-symbols-rounded">grid_view</span> Everything in the box</span>
+    <h2>Built for real, unattended work — with a human in the loop when it counts.</h2>
+    <p>The daemon owns the session lifecycle end-to-end, so sessions are legible, killable, and resumable from any device.</p>
+  </div>
+  <div class="feature-grid reveal">
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">shield</span></div>
+      <h3>Mostly-autonomous, with a backstop</h3>
+      <p>Auto-allows ordinary tool use and prompts only on genuinely risky ops — <code>rm&nbsp;-rf</code>, force-push, secret access. Tune autonomy per session from <em>bypass</em> to <em>prompt-all</em>.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">notifications_active</span></div>
+      <h3>Push when it matters</h3>
+      <p>A notification when a session needs a decision or a turn completes — with Allow / Deny right on the notification. Web Push today; FCM and APNs in the native shells.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">terminal</span></div>
+      <h3>A real terminal, when you need one</h3>
+      <p>A persistent, server-side PTY per session with durable scrollback that survives device switches — for the moments a conversation isn't the right tool.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">description</span></div>
+      <h3>Live markdown reader</h3>
+      <p>Open a doc and chat about it side-by-side. It re-renders in place as Claude edits it, with select-to-cite straight back into the conversation.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">attach_file</span></div>
+      <h3>Attachments &amp; deliverables</h3>
+      <p>Drop images, PDFs, and files into a turn. Generated reports, archives, and media come back as download cards — with best-effort Tailscale Taildrop to your device.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">bookmark</span></div>
+      <h3>Prompts &amp; skills</h3>
+      <p>A device-synced prompt library in the composer, plus <code>/</code>-autocomplete for your Claude Code user and project skills — your shortcuts follow you everywhere.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">quiz</span></div>
+      <h3>Structured questions</h3>
+      <p>When Claude needs a decision, its multiple-choice questions become native cards you can answer from any device — no half-finished turns waiting on a keystroke.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">dns</span></div>
+      <h3>Fleet-ready</h3>
+      <p>One client manages <code>anvild</code> across several Macs on a single Max plan, with a persistent <strong>concierge</strong> session that sees — and spins up — work across the fleet.</p>
+    </div>
+    <div class="fcard">
+      <div class="fic"><span class="material-symbols-rounded">dark_mode</span></div>
+      <h3>Fast, offline-tolerant PWA</h3>
+      <p>Installable app shell, light/dark themes, and an outbox that queues your actions while offline and flushes them on reconnect. It just keeps up.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ AUTOPILOT ============================ -->
+<section id="autopilot">
+  <div class="wrap">
+    <div class="split reverse">
+      <div class="split-media reveal">
+        <div class="ap-frame">
+          <div class="ap-frame-head">
+            <span class="material-symbols-rounded">bolt</span> Autopilot · tonight's plan
+            <span class="material-symbols-rounded spin">progress_activity</span>
+          </div>
+          <div class="ap-grid">
+            <div class="ap-card">
+              <div class="apt">Wire push retries</div>
+              <div class="aps">Exponential backoff on the FCM sender, capped at 5 attempts.</div>
+              <div class="apm"><span class="ap-badge planned">Planned</span><span class="apx">2 tasks · S</span></div>
+            </div>
+            <div class="ap-card c2">
+              <div class="apt">Add CSV export</div>
+              <div class="aps">Held — which columns, and CSV or XLSX?</div>
+              <div class="apm"><span class="ap-badge clarify">Needs info</span><span class="apx">1 task</span></div>
+            </div>
+            <div class="ap-card c4">
+              <div class="apt">Harden origin gate</div>
+              <div class="aps">Reviewed by 3 models · consensus 8/10.</div>
+              <div class="apm"><span class="ap-badge review">In review</span><span class="apx">3 tasks · M</span></div>
+            </div>
+            <div class="ap-card c3">
+              <div class="apt">Fix outbox flush</div>
+              <div class="aps">Building in a worktree → opening PR.</div>
+              <div class="apm"><span class="ap-badge build">Building</span><span class="apx">1 task · S</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="split-body reveal">
+        <span class="eyebrow"><span class="material-symbols-rounded">bolt</span> Autopilot</span>
+        <h2>Point it at your backlog. Wake up to reviewable work.</h2>
+        <p>Connect a Todoist project and Anvil bundles related tasks into units of work, writes an implementation plan for each, and — on a nightly schedule — kicks off the builds. You review, not babysit.</p>
+        <ul class="checks">
+          <li><span class="material-symbols-rounded">check_circle</span><span><b>It asks before it guesses.</b> An intake gate parks underspecified tasks as <em>needs-clarification</em> with the open questions, instead of building the wrong thing.</span></li>
+          <li><span class="material-symbols-rounded">check_circle</span><span><b>Plans get red-teamed.</b> An optional panel of independent models reads the actual repo, critiques each plan, and scores it — only high-consensus units auto-start.</span></li>
+          <li><span class="material-symbols-rounded">check_circle</span><span><b>Every task stays labeled.</b> One <code>anvil:*</code> status per task (planned → building → review → done) keeps the grid and your Todoist in sync.</span></li>
+          <li><span class="material-symbols-rounded">check_circle</span><span><b>You get a morning report.</b> Each run files a tidy summary to your journal — what it started, what's held, what it skipped.</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ PIPELINE ============================ -->
+<section id="pipeline" class="wrap">
+  <div class="section-head reveal">
+    <span class="eyebrow"><span class="material-symbols-rounded">swords</span> The adversarial dev pipeline</span>
+    <h2>Two models that check each other's work — all the way to a pull request.</h2>
+    <p>Opt a unit into the fully unattended pipeline and it runs a cross-model gauntlet built on one rule: the author and the reviewer of any artifact must be <em>different</em> models. It ships by opening a PR whose body is a Design History File tracing every decision.</p>
+  </div>
+
+  <div class="pipe reveal">
+    <div class="pipe-rail">
+      <div class="pipe-step"><div class="n">P1</div><h4>Requirements</h4><small>Draft acceptance criteria, then audit them.</small><span class="who glm">GLM drafts</span></div>
+      <div class="pipe-step"><div class="n">P2</div><h4>Design</h4><small>Plan the change; red-team the plan.</small><span class="who claude">Claude designs</span></div>
+      <div class="pipe-step"><div class="n">P3</div><h4>Implement</h4><small>Write the code in an isolated worktree.</small><span class="who glm">GLM builds</span></div>
+      <div class="pipe-step"><div class="n">P4</div><h4>Verify</h4><small>Adversarial tests + deterministic checks.</small><span class="who glm">GLM tests</span></div>
+      <div class="pipe-step"><div class="n">P5</div><h4>Validate</h4><small>Blind-check: built vs. what was asked.</small><span class="who claude">Claude judges</span></div>
+      <div class="pipe-step"><div class="n">P6</div><h4>Ship</h4><small>Open a PR with the Design History File.</small><span class="who claude">→ PR</span></div>
+    </div>
+
+    <div class="roles">
+      <div class="role claude">
+        <h4><span class="material-symbols-rounded" style="color:var(--copper-2)">neurology</span> Claude Opus <span class="tag">design · judgment</span></h4>
+        <p>On your Max subscription. Strongest at planning and judgment, so it owns design and the final blind validation — and audits GLM's requirements.</p>
+      </div>
+      <div class="role glm">
+        <h4><span class="material-symbols-rounded" style="color:var(--a-accent)">bolt</span> GLM <span class="tag">agentic work</span></h4>
+        <p>Cheap, capable agentic work via OpenRouter, driven through the SDK. Does the coding and test-writing — and red-teams Claude's design. Decorrelated by construction.</p>
+      </div>
+    </div>
+
+    <div class="callout reveal" style="margin-top:26px">
+      <span class="material-symbols-rounded">policy</span>
+      <div>
+        <h3>Guardrails, because nobody's watching</h3>
+        <p>Bounded loopbacks keep the two models from ping-ponging forever; critical findings escalate to a human; a hard guard denies dangerous tools since there's no one to ask; and a "decorative adversary" metric flags any reviewer that starts rubber-stamping. Autonomy you can actually leave running.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ HOW IT WORKS ============================ -->
+<section id="how" class="wrap">
+  <div class="section-head center reveal">
+    <span class="eyebrow"><span class="material-symbols-rounded">schema</span> How it works</span>
+    <h2>One daemon on your Mac. Thin clients everywhere else. Your private tailnet between them.</h2>
+    <p><code>anvild</code> hosts Claude Code, renders every event once, owns the git worktrees, and serves the clients over Tailscale. Nothing is exposed to the public internet.</p>
+  </div>
+
+  <div class="arch reveal">
+    <svg viewBox="0 0 960 430" role="img" aria-label="Architecture: the anvild daemon on your dev machine drives Claude Code and serves web, Android, and Apple clients over Tailscale, with optional push.">
+      <defs>
+        <style>
+          .lbl { font: 600 15px Inter, sans-serif; fill: #f0f6fc; }
+          .sub { font: 500 11.5px Inter, sans-serif; fill: #b3adbd; }
+          .tiny{ font: 500 10.5px Inter, sans-serif; fill: #8b8494; }
+          .edge{ stroke: #635f6a; stroke-width: 1.6; fill: none; }
+          .edge-d{ stroke: #635f6a; stroke-width: 1.4; fill: none; stroke-dasharray: 5 5; }
+        </style>
+        <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#635f6a"/></marker>
+      </defs>
+
+      <!-- dev machine -->
+      <rect x="24" y="46" width="380" height="338" rx="18" fill="rgba(240,246,252,.03)" stroke="rgba(240,246,252,.12)"/>
+      <text x="46" y="78" class="sub">🖥️  Your dev machine</text>
+
+      <!-- daemon -->
+      <rect x="46" y="96" width="336" height="150" rx="14" fill="#d39450"/>
+      <text x="64" y="128" style="font:700 17px Inter,sans-serif; fill:#241a0d">anvild — the daemon</text>
+      <text x="64" y="152" style="font:600 11.5px Inter,sans-serif; fill:#3a2a13">session supervisor · Agent SDK stream</text>
+      <text x="64" y="170" style="font:600 11.5px Inter,sans-serif; fill:#3a2a13">render pipeline · git / worktrees · event log</text>
+      <text x="64" y="188" style="font:600 11.5px Inter,sans-serif; fill:#3a2a13">permissions · budget · push</text>
+      <text x="64" y="212" style="font:600 11.5px Inter,sans-serif; fill:#3a2a13">autopilot · adversarial pipeline</text>
+      <text x="64" y="230" style="font:600 11.5px Inter,sans-serif; fill:#3a2a13">Todoist · lapo · OpenRouter</text>
+
+      <!-- claude code + worktrees -->
+      <rect x="46" y="266" width="160" height="96" rx="12" fill="#635f6a"/>
+      <text x="66" y="300" class="lbl" style="font-size:13px">Claude Code</text>
+      <text x="66" y="320" class="tiny">(Agent SDK)</text>
+      <text x="66" y="342" class="tiny">drives the loop</text>
+      <rect x="222" y="266" width="160" height="96" rx="12" fill="#635f6a"/>
+      <text x="242" y="300" class="lbl" style="font-size:13px">git worktrees</text>
+      <text x="242" y="320" class="tiny">one per session</text>
+      <text x="242" y="342" class="tiny">isolated task trees</text>
+      <path class="edge" d="M126,246 L126,266" marker-end="url(#arrow)"/>
+      <path class="edge" d="M126,246 L126,258 L302,258 L302,266" marker-end="url(#arrow)"/>
+
+      <!-- tailscale channel -->
+      <rect x="446" y="150" width="120" height="130" rx="12" fill="rgba(211,148,80,.12)" stroke="rgba(211,148,80,.4)"/>
+      <text x="506" y="200" text-anchor="middle" class="sub" style="fill:#e6a862">Tailscale</text>
+      <text x="506" y="218" text-anchor="middle" class="tiny">WebSocket</text>
+      <text x="506" y="234" text-anchor="middle" class="tiny">+ REST</text>
+      <text x="506" y="256" text-anchor="middle" class="tiny">MagicDNS · ACLs</text>
+      <path class="edge" d="M382,180 C 410,180 420,200 446,205" marker-end="url(#arrow)"/>
+      <path class="edge" d="M446,225 C 420,230 410,250 382,250"/>
+
+      <!-- clients -->
+      <rect x="620" y="70" width="316" height="96" rx="12" fill="rgba(240,246,252,.04)" stroke="rgba(240,246,252,.12)"/>
+      <text x="640" y="104" class="lbl">Web client</text>
+      <text x="640" y="126" class="sub">browser · the daily driver + render surface</text>
+      <text x="640" y="146" class="tiny">served by the daemon at /</text>
+
+      <rect x="620" y="182" width="152" height="96" rx="12" fill="rgba(240,246,252,.04)" stroke="rgba(240,246,252,.12)"/>
+      <text x="640" y="214" class="lbl">Android</text>
+      <text x="640" y="236" class="sub">WebView + FCM</text>
+      <text x="640" y="256" class="tiny">com.gte619n.anvil</text>
+
+      <rect x="784" y="182" width="152" height="96" rx="12" fill="rgba(240,246,252,.04)" stroke="rgba(240,246,252,.12)"/>
+      <text x="804" y="214" class="lbl">Apple</text>
+      <text x="804" y="236" class="sub">SwiftUI + APNs</text>
+      <text x="804" y="256" class="tiny">macOS · iOS · iPad</text>
+
+      <path class="edge" d="M566,200 C 600,180 600,120 620,116" marker-end="url(#arrow)"/>
+      <path class="edge" d="M566,215 L620,220" marker-end="url(#arrow)"/>
+      <path class="edge" d="M566,230 C 600,250 760,250 820,232 L850,232" marker-end="url(#arrow)"/>
+
+      <!-- push -->
+      <rect x="620" y="300" width="316" height="72" rx="12" fill="rgba(99,95,106,.14)" stroke="rgba(240,246,252,.1)"/>
+      <text x="640" y="330" class="lbl" style="font-size:13px">☁️  Push — optional</text>
+      <text x="640" y="352" class="sub">FCM · APNs · Web Push — wake a device when a decision is needed</text>
+      <path class="edge-d" d="M214,246 C 214,336 560,392 620,344" marker-end="url(#arrow)"/>
+    </svg>
+  </div>
+</section>
+
+<!-- ============================ SECURITY ============================ -->
+<section class="wrap">
+  <div class="section-head reveal">
+    <span class="eyebrow"><span class="material-symbols-rounded">verified_user</span> Private &amp; predictable</span>
+    <h2>Powerful autonomy, on rails you control.</h2>
+  </div>
+  <div class="mini-grid reveal">
+    <div class="mini">
+      <div class="fic"><span class="material-symbols-rounded">vpn_lock</span></div>
+      <h3>Your tailnet is the boundary</h3>
+      <p>The daemon isn't on the public internet. Your Mac and your devices talk directly over an encrypted Tailscale network — MagicDNS and ACLs, no ports to forward, no login server to trust.</p>
+    </div>
+    <div class="mini">
+      <div class="fic"><span class="material-symbols-rounded">savings</span></div>
+      <h3>Subscription, not metered</h3>
+      <p>Anvil only ever drives Claude through the Agent SDK on your Max subscription. It <em>refuses to start</em> if an API key is present — so a stray key can't quietly switch you to pay-per-token billing.</p>
+    </div>
+    <div class="mini">
+      <div class="fic"><span class="material-symbols-rounded">gpp_good</span></div>
+      <h3>An auditable danger list</h3>
+      <p>One conservative, reviewable table stands between "mostly autonomous" and an unattended <code>rm&nbsp;-rf</code>, force-push, or secret read. Anything on it blocks the session and asks you — from any device.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ PLATFORMS ============================ -->
+<section id="platforms" class="wrap">
+  <div class="section-head center reveal">
+    <span class="eyebrow"><span class="material-symbols-rounded">devices</span> Everywhere you are</span>
+    <h2>One render surface. Four native shells.</h2>
+    <p>The web client is the daily driver <em>and</em> the shared render surface bundled into each native app — so mermaid, math, and select-to-cite work identically everywhere.</p>
+  </div>
+  <div class="plat-grid reveal">
+    <div class="plat">
+      <span class="material-symbols-rounded">language</span>
+      <h3>Web</h3>
+      <p>Served by the daemon at <code>/</code>. Installable PWA, offline-tolerant.</p>
+    </div>
+    <div class="plat">
+      <span class="material-symbols-rounded">android</span>
+      <h3>Android</h3>
+      <p>Kotlin WebView shell with native FCM push and ADB-over-Tailscale.</p>
+    </div>
+    <div class="plat">
+      <span class="material-symbols-rounded">desktop_mac</span>
+      <h3>macOS &amp; iOS</h3>
+      <p>SwiftUI shell across Mac, iPhone, and iPad, with APNs push.</p>
+    </div>
+    <div class="plat">
+      <span class="material-symbols-rounded">settings_applications</span>
+      <h3>Server app</h3>
+      <p>Menu-bar control panel — stand up the daemon and join a fleet, no terminal.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ GET STARTED ============================ -->
+<section id="start" class="wrap">
+  <div class="start-grid">
+    <div class="reveal">
+      <div class="term">
+        <div class="term-bar"><div class="lights"><i></i><i></i><i></i></div><span>anvild — zsh</span></div>
+<pre><span class="c"># 1 · install deps (Bun ≥ 1.3.14)</span>
+<span class="p">cd</span> <span class="cmd">anvild &amp;&amp;</span> <span class="p">bun</span> <span class="cmd">install</span>
+
+<span class="c"># 2 · authenticate with your Max subscription (one-time)</span>
+<span class="p">export</span> <span class="cmd">CLAUDE_CODE_OAUTH_TOKEN=</span><span class="g">"$(claude setup-token)"</span>
+
+<span class="c"># 3 · run the daemon — serves the web client on :7701</span>
+<span class="p">bun</span> <span class="cmd">run start</span>
+<span class="g">  → open http://localhost:7701</span>
+
+<span class="c"># 4 · reach it from your phone over Tailscale</span>
+<span class="p">tailscale</span> <span class="cmd">serve --bg --https=443 http://localhost:7701</span>
+<span class="g">  → https://&lt;your-magicdns-host&gt;/</span>
+</pre>
+      </div>
+    </div>
+    <div class="reveal">
+      <span class="eyebrow"><span class="material-symbols-rounded">rocket_launch</span> Get started</span>
+      <h2>Running in four commands.</h2>
+      <ol class="steps">
+        <li><div><b>Bring a Mac, Bun, and Tailscale.</b><span>Plus a Claude Max subscription — Anvil rides your subscription pool, not a metered API key.</span></div></li>
+        <li><div><b>Capture your subscription token once.</b><span><code>claude setup-token</code> authenticates the Agent SDK. No API keys in the environment.</span></div></li>
+        <li><div><b>Start the daemon.</b><span>It serves the web client and the protocol on <code>:7701</code>. Open it in any browser on the machine.</span></div></li>
+        <li><div><b>Share it over your tailnet.</b><span>One <code>tailscale serve</code> and every device you own can drive it. For an always-on, terminal-free setup, use the menu-bar Server app.</span></div></li>
+      </ol>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="https://github.com/gte619n/anvil" target="_blank" rel="noopener"><span class="material-symbols-rounded">code</span> Read the docs</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ FINAL CTA ============================ -->
+<section class="wrap">
+  <div class="final-card reveal final">
+    <h2>Put your agent in your pocket.</h2>
+    <p>Kick off the work on your workstation, walk away, and come back when Anvil taps you on the shoulder. Open source, private, and yours to run.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#start"><span class="material-symbols-rounded">rocket_launch</span> Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/gte619n/anvil" target="_blank" rel="noopener"><span class="material-symbols-rounded">star</span> Star on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ FOOTER ============================ -->
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="#top"><img src="assets/anvil-mark.svg" alt="Anvil" /> Anvil</a>
+        <p>A native, multi-device client for Claude Code. Drive your agent from anywhere, over your own private network.</p>
+      </div>
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#autopilot">Autopilot</a></li>
+          <li><a href="#pipeline">Dev pipeline</a></li>
+          <li><a href="#platforms">Platforms</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Docs</h5>
+        <ul>
+          <li><a href="https://github.com/gte619n/anvil/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
+          <li><a href="https://github.com/gte619n/anvil/blob/main/anvild/README.md">Run the daemon</a></li>
+          <li><a href="https://github.com/gte619n/anvil/blob/main/docs/CI-CD.md">Build &amp; release</a></li>
+          <li><a href="https://github.com/gte619n/anvil/blob/main/SECURITY.md">Security</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/gte619n/anvil">GitHub</a></li>
+          <li><a href="https://github.com/gte619n/anvil/issues">Issues</a></li>
+          <li><a href="https://www.claude.com/product/claude-code">Claude Code</a></li>
+          <li><a href="https://tailscale.com">Tailscale</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-base">
+      <span>© 2026 Anvil · MIT Licensed</span>
+      <span>Built on the Claude Agent SDK · Private over Tailscale</span>
+    </div>
+  </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

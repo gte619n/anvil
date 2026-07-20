@@ -102,16 +102,19 @@ For a terminal-free install + multi-Mac fleet setup, use the menu-bar
 
 | Area | Path | Responsibility |
 |---|---|---|
-| Server | [`src/server/`](src/server/) | HTTP + WebSocket, envelope dispatch, connection registry, fleet endpoints |
-| Session | [`src/session/`](src/session/) | supervisor, process groups, worktree create/kill/reap, persistence |
-| Agent | [`src/agent/`](src/agent/) | Agent SDK driver, permissions, input queue, default tools, danger list |
+| Server | [`src/server/`](src/server/) | HTTP + WebSocket, envelope dispatch, connection registry, capabilities/identity, fleet endpoints |
+| Session | [`src/session/`](src/session/) | supervisor, process groups, worktree create/kill/reap, terminal PTYs, file watching, persistence |
+| Agent | [`src/agent/`](src/agent/) | Agent SDK driver + message map, permissions & danger list, questions (AskUserQuestion), model roster, skills, file offers, input queue, default (concierge) tools |
 | Render | [`src/render/`](src/render/) | markdown-it → Shiki → KaTeX → DOMPurify pipeline (mermaid stays client-side) |
 | Git | [`src/git/`](src/git/) | branch/diffstat metadata, commit/push/PR/merge ops |
 | Event log | [`src/eventlog/`](src/eventlog/) | append-only `events.ndjson` — the source of truth for resume |
 | Budget | [`src/budget/`](src/budget/) | rolling 7-day usage → Opus/Sonnet hours, warn + soft-stop |
 | Push | [`src/push/`](src/push/) | Web Push / FCM / APNs registries |
 | Fleet | [`src/fleet/`](src/fleet/) | multi-server discovery, token push/rotation |
-| Integrations | [`src/integrations/`](src/integrations/) | Todoist autopilot, scheduling, work units |
+| Integrations | [`src/integrations/`](src/integrations/) | autopilot planner, Todoist client, lapo/OpenRouter clients, adversarial plan panel, nightly scheduler, work-unit store |
+| Pipeline | [`src/pipeline/`](src/pipeline/) | the unattended cross-model dev pipeline (phases, orchestrator, adversary metrics, Design History File) |
+| Prompts | [`src/prompts/`](src/prompts/) | the device-synced prompt library |
+| Attach / Env / Auth | [`src/attach/`](src/attach/) · [`src/env/`](src/env/) · [`src/auth/`](src/auth/) | attachment store, environment registry, provider-token store + the startup billing guard |
 | Web client | [`web/`](web/) | the browser UI + shared render surface |
 
 ---

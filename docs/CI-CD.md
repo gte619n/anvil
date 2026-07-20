@@ -154,6 +154,31 @@ running daemon. (Scheduled/nightly autopilot deploys are hub-only.)
 
 ---
 
+## The marketing site ([`website/`](../website/))
+
+The public marketing site is a static page hosted on **Firebase Hosting** at
+**[anvild.sh](https://anvild.sh)** (default URL `anvild.web.app`), in the **`gte619n-anvil`** GCP
+project — separate from the app-release channels above.
+
+| Piece | Where |
+|-------|-------|
+| Source | [`website/`](../website/) (plain HTML/CSS/JS, no build) + [`firebase.json`](../firebase.json) / [`.firebaserc`](../.firebaserc) |
+| Host | Firebase Hosting site `anvild` (project `gte619n-anvil`) |
+| Domain | `anvild.sh`, registered at **Porkbun**, DNS delegated to **Cloud DNS** zone `anvild-sh` (same project) |
+| DNS records | apex `A → 199.36.158.100` + `TXT hosting-site=anvild` (the records Firebase Hosting requires) |
+
+Deploy (manual for now — the site changes rarely and is not yet wired into CI):
+
+```bash
+firebase deploy --only hosting:anvild --project gte619n-anvil
+```
+
+> **Not on GitHub Pages.** GitHub Pages (`gte619n.github.io/anvil`) serves **only** the Sparkle
+> appcasts; the marketing site lives on Firebase so a custom domain never redirects the app
+> auto-update URLs. Nameservers for `anvild.sh` point at Cloud DNS, set once at Porkbun.
+
+---
+
 ## Secrets & one-time setup
 
 All secrets live in **Google Secret Manager** (project `gte619n-anvil`) and are mirrored into GitHub
