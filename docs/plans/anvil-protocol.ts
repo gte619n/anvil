@@ -169,6 +169,17 @@ export interface Usage {
 }
 
 /**
+ * Live context-window occupancy for the current topic, read from the Agent SDK's `getContextUsage()`
+ * (the same numbers Claude Code's own context bar shows) — NOT cumulative billing. `used` is the tokens
+ * currently in the window (system prompt + tools + messages); `max` is the model's usable window. Absent
+ * until the first turn reports, and reset when the topic is cleared or the context is compacted. (§context)
+ */
+export interface ContextUsage {
+  used: number;
+  max: number;
+}
+
+/**
  * One rate-limit window's utilization, read from the Agent SDK's usage endpoint (§3) — the same
  * windows shown in claude.ai → Settings → Usage. `utilization` is a percentage, 0–100.
  */
@@ -217,6 +228,10 @@ export interface Session {
   createdAt: Iso8601;
   lastActivityAt: Iso8601;
   usage: Usage;
+  // Live context-window occupancy for the current topic (§context). Refreshed each turn from the SDK's
+  // `getContextUsage()`; drives the composer's context meter. Absent until the first turn; cleared by
+  // `session.new_topic` (/clear) and repopulated after a /compact.
+  context?: ContextUsage;
   // The slash-commands/skills this session can invoke, reported by the SDK's `init` message and
   // enriched with SKILL.md descriptions — drives the composer's `/` autocomplete. Populated once the
   // driver starts (absent until the first turn); rides session.updated/session.list. (§skills)

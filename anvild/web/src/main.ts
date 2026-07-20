@@ -796,6 +796,7 @@ function onEvent(url: string, e: ServerEvent): void {
         updateGitPanelMeta();
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
+        updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
       }
       return;
     case "session.deleted":
@@ -2215,6 +2216,7 @@ function setHeaderTitle(s: Session | undefined): void {
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   updateHeaderBranch(s);
   updateHeaderModel(s);
+  updateContextMeter(s);
   void setFavicon(s);
 }
 /** Show the active session's git branch as a chip in the header; tap it to open the Git panel. */
@@ -2245,6 +2247,31 @@ function updateHeaderModel(s: Session | undefined): void {
     el.innerHTML = "";
     el.hidden = true;
   }
+}
+/** Compact a token count for the meter tooltip: 187000 → "187k", 940 → "940". */
+function fmtK(n: number): string {
+  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
+}
+/**
+ * Context-window meter (§context): a small pill next to the model showing how full the current topic's
+ * context is. Hidden until the first turn reports; goes amber past 75% and red past 90% to cue a
+ * `/compact`. Fed by `session.context` (the daemon's read of the SDK's own context bar).
+ */
+function updateContextMeter(s: Session | undefined): void {
+  const el = document.getElementById("ctx-meter");
+  if (!el) return;
+  const ctx = s?.context;
+  if (!ctx || !ctx.max) {
+    el.hidden = true;
+    el.className = "ctx-meter";
+    el.replaceChildren();
+    return;
+  }
+  const pct = Math.min(100, Math.round((ctx.used / ctx.max) * 100));
+  el.hidden = false;
+  el.className = "ctx-meter" + (pct >= 90 ? " hot" : pct >= 75 ? " warm" : "");
+  el.innerHTML = `${icon("data_usage")}<span class="ctx-pct">${pct}%</span>`;
+  el.title = `Context window: ${fmtK(ctx.used)} / ${fmtK(ctx.max)} tokens (${pct}%). Send /compact to free space, or /clear to start fresh.`;
 }
 // Tapping the model pill opens a menu of the available models; picking one switches this session
 // live (session.set_model takes effect on the next message — no restart). A ✓ marks the current one.

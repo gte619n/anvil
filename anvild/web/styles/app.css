@@ -509,6 +509,14 @@ details.tool-result.error > summary { color: var(--danger); }
 .composer-model:hover, .composer-model.active { border-color: var(--accent); color: var(--text); background: var(--panel); }
 .composer-model .msym { font-size: 16px; color: var(--accent); }
 .composer-model .cm-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* Context-window meter (§context): a compact, read-only pill that mirrors the model pill's look. */
+.ctx-meter { display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; cursor: default; }
+.ctx-meter[hidden] { display: none; }
+.ctx-meter .msym { font-size: 15px; color: var(--muted); }
+.ctx-meter.warm { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.ctx-meter.warm .msym { color: var(--warn); }
+.ctx-meter.hot { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.ctx-meter.hot .msym { color: var(--danger); }
 #send { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--accent); color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(59, 110, 245, 0.4); transition: transform 0.1s, background 0.15s; }
 #send:not(:disabled):hover { transform: scale(1.06); }
 #send:not(:disabled):active { transform: scale(0.95); }

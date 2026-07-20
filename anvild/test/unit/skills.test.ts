@@ -18,7 +18,21 @@ test("buildCommandInfo tags built-ins and enriches project skills with descripti
 
   const cmds = buildCommandInfo(["compact", "context", "project:deploy-thing"], repo);
 
-  expect(cmds).toContainEqual({ name: "compact", source: "builtin" });
+  // Built-in context controls carry a blurb; other built-ins (e.g. "context") stay bare.
+  expect(cmds).toContainEqual({
+    name: "compact",
+    source: "builtin",
+    description: "Summarize the conversation so far to free up the context window, then continue",
+  });
+  expect(cmds).toContainEqual({ name: "context", source: "builtin" });
+  // /clear is guaranteed present and blurbed even though the SDK didn't list it here.
+  expect(cmds).toContainEqual({
+    name: "clear",
+    source: "builtin",
+    description: "Start a fresh topic — Claude forgets the conversation above; your visible history stays",
+  });
+  // A listed built-in is not duplicated by the guarantee pass.
+  expect(cmds.filter((c) => c.name === "compact")).toHaveLength(1);
   expect(cmds).toContainEqual({
     name: "project:deploy-thing",
     source: "project",
@@ -32,7 +46,10 @@ test("buildCommandInfo keeps a namespaced skill even when its SKILL.md is missin
   mkdirSync(join(repo, ".claude", "skills"), { recursive: true }); // dir exists, skill does not
 
   const cmds = buildCommandInfo(["project:ghost"], repo);
-  expect(cmds).toEqual([{ name: "project:ghost", source: "project" }]);
+  expect(cmds).toContainEqual({ name: "project:ghost", source: "project" });
+  // The daemon-handled context controls are always offered, even when the SDK lists nothing else.
+  expect(cmds).toContainEqual({ name: "clear", source: "builtin", description: expect.any(String) });
+  expect(cmds).toContainEqual({ name: "compact", source: "builtin", description: expect.any(String) });
 });
 
 test("skillPlugins synthesizes a skills-only plugin dir pointing at the project skills", () => {

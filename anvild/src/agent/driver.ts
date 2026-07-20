@@ -2,7 +2,7 @@ import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthrop
 import { claudeCliOptions } from "./cli";
 import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
-import type { CommandInfo, Model } from "@protocol";
+import type { CommandInfo, ContextUsage, Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
@@ -18,12 +18,19 @@ export interface TurnUsage {
   /** The SDK's `rate_limits` payload (opaque here), or null when unavailable this turn. */
   rateLimits: unknown;
   subscriptionType: string | null; // "max" | "pro" | … | null (API-key / 3P session)
+  /** Live context-window occupancy after this turn (§context), or null if the SDK didn't report it. */
+  contextUsage: ContextUsage | null;
 }
 /** Called once per completed turn so the supervisor can refresh the shared rate-limit gauge. */
 export type ResultRecorder = (usage: TurnUsage) => void;
 
 /** The SDK `query` entrypoint — injectable so tests can drive `consume()` without a subprocess. */
 export type QueryFn = typeof query;
+
+/** Compact a token count for a human-facing divider: 1234 → "1.2k", 987 → "987". */
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
 
 /**
  * Drives one Claude Code session via the Agent SDK in streaming-input mode (arch §2).
@@ -215,6 +222,27 @@ export class AgentDriver {
           if (Array.isArray(slash)) this.onCommands(buildCommandInfo(slash, this.session.data.cwd));
         }
 
+        // The SDK compacted the context — either a manual `/compact` or an automatic compaction at the
+        // window limit. Drop a persisted divider so the boundary is visible on every device (and the
+        // freed headroom on the context meter has a cause). The refreshed gauge rides the next result.
+        if (m.type === "system" && (m as any).subtype === "compact_boundary") {
+          const meta = (m as any).compact_metadata ?? {};
+          const auto = meta.trigger === "auto";
+          const pre = typeof meta.pre_tokens === "number" ? meta.pre_tokens : undefined;
+          const post = typeof meta.post_tokens === "number" ? meta.post_tokens : undefined;
+          const shrink = pre !== undefined && post !== undefined ? ` — ${fmtTokens(pre)} → ${fmtTokens(post)} tokens` : "";
+          this.session.emit({
+            type: "assistant.message",
+            blocks: [
+              {
+                kind: "divider",
+                label: auto ? "Context auto-compacted" : "Context compacted",
+                note: `Older turns were summarized to free up the context window${shrink}. Claude keeps the summary; full history stays above for reference.`,
+              },
+            ],
+          });
+        }
+
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
         // Stash the assistant's prose so a "your turn" push can quote it (real context, not a
         // generic "Finished"). Cheap: read text blocks straight off the SDK message.
@@ -270,7 +298,18 @@ export class AgentDriver {
           } catch {
             /* experimental usage endpoint unavailable — keep the last-known gauge */
           }
-          this.onResult({ model: this.session.data.model, costUsd, rateLimits, subscriptionType });
+          // Read the live context-window occupancy (the same breakdown Claude Code's context bar shows).
+          // Best-effort like the usage endpoint: absent/throwing leaves the last-known meter in place.
+          let contextUsage: ContextUsage | null = null;
+          try {
+            const c = await this.q?.getContextUsage();
+            if (c && typeof c.totalTokens === "number" && typeof c.maxTokens === "number" && c.maxTokens > 0) {
+              contextUsage = { used: c.totalTokens, max: c.maxTokens };
+            }
+          } catch {
+            /* context-usage endpoint unavailable — keep the last-known meter */
+          }
+          this.onResult({ model: this.session.data.model, costUsd, rateLimits, subscriptionType, contextUsage });
           this.session.setStatus("idle");
         }
       }
