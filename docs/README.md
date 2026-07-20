@@ -4,6 +4,7 @@ Start with the [root README](../README.md) for the overview, then:
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the approachable tour, with diagrams. Read this first.
 - **[CI-CD.md](CI-CD.md)** — the build & deployment pipeline: every target, what to push to ship it (dev + prod), and where builds run. The authoritative reference for releases.
+- **[lapo-integration.md](lapo-integration.md)** — the lapo/Logseq OAuth2 integration that posts autopilot run reports to your journal.
 
 ## Design & implementation plans (`plans/`)
 
@@ -32,6 +33,7 @@ Brand assets — the logo and the README banners. See [assets/README.md](assets/
 Each component keeps its own build/run notes:
 
 - [anvild/README.md](../anvild/README.md) — the daemon + web client
+- [app/README.md](../app/README.md) — Android (Kotlin WebView + FCM) shell
 - [apple/README.md](../apple/README.md) — Apple (macOS-first) shell
 - [anvil-server/README.md](../anvil-server/README.md) — the menu-bar control panel
 - [scripts/README.md](../scripts/README.md) — build/release utilities (CI release notes, Apple signing)

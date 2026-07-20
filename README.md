@@ -48,15 +48,30 @@ finishes — or needs your permission for something risky.
 - 🌳 **Worktree-per-session** — each task can spin up its own git worktree off a base branch.
   Branch, diffstat, and git lifecycle (commit / push / PR / merge) are first-class.
 - 🛡️ **Mostly-autonomous with a danger-list backstop** — auto-allows ordinary tool use,
-  prompts only on genuinely risky ops (`rm -rf`, force-push, secret access). Permission
-  prompts become native dialogs answerable from any device.
+  prompts only on genuinely risky ops (`rm -rf`, force-push, secret access). Per-session
+  autonomy runs from `bypass` through `mostly-autonomous`, `allowlist`, to `prompt-all`;
+  pick a model per session (`opus` · `sonnet` · `haiku` · `fable`). Permission prompts and
+  Claude's own multiple-choice **questions** become native dialogs answerable from any device.
+- 🤖 **Autopilot** — connect a Todoist project and Anvil bundles your tasks into units of
+  work, writes an implementation plan for each (optionally red-teamed by a panel of
+  independent models), and can run **overnight on a schedule** — kicking off build sessions
+  and filing a run report back to your journal ([lapo](docs/lapo-integration.md) / Logseq).
+- ⚔️ **Adversarial dev pipeline** — an opt-in, fully unattended path where two decorrelated
+  models (Claude for design/judgment, GLM for agentic work) take a task through a
+  requirements → design → implement → verify → validate gauntlet and open a PR, with a
+  Design History File as the PR body.
 - 🔔 **Push when it matters** — a notification when a session needs a decision or a turn
   completes. Web Push today; FCM (Android) / APNs (Apple) for native shells.
 - 🖥️ **A real terminal when you need one** — a persistent, server-side PTY per session,
   with durable scrollback across device switches.
 - 📄 **Live markdown reader** — open a doc and chat about it side-by-side; it re-renders in
   place as Claude edits it, with select-to-cite back into the conversation.
-- 🔗 **Fleet-ready** — one client can manage `anvild` across several Macs on one Max plan.
+- 📎 **Attachments & deliverables** — drop images, PDFs, and files into a turn; generated
+  reports/archives/media come back as download cards (with best-effort Tailscale Taildrop).
+- 🧩 **Reusable prompts & skills** — a device-synced prompt library in the composer, plus
+  `/`-autocomplete for your Claude Code user/project skills.
+- 🔗 **Fleet-ready** — one client can manage `anvild` across several Macs on one Max plan,
+  with a persistent **concierge** session that can see and spin up work across the fleet.
 
 ---
 
@@ -227,7 +242,7 @@ Full reasoning in [`anvil-native-architecture.md` §8.3](docs/plans/anvil-native
 
 | Component | Path | Stack | What it is |
 |---|---|---|---|
-| **Daemon** | [`anvild/`](anvild/) | TypeScript · Bun | Session supervisor, Agent SDK streaming, event log, git/worktree ops, permissions, budget, render pipeline, push. The keystone. |
+| **Daemon** | [`anvild/`](anvild/) | TypeScript · Bun | Session supervisor, Agent SDK streaming, event log, git/worktree ops, permissions, budget, render pipeline, push, autopilot + adversarial pipeline, and the Todoist/lapo/OpenRouter integrations. The keystone. |
 | **Web client** | [`anvild/web/`](anvild/web/) | Vanilla TS | The daily-driver UI and the reusable render surface, served by the daemon at `/`. Also bundled into the native shells. |
 | **Android app** | [`app/`](app/) | Kotlin | A WebView shell hosting the web client over Tailscale + native FCM push, ADB-over-Tailscale, offline app-shell. `com.gte619n.anvil`. |
 | **Apple app** | [`apple/`](apple/) | SwiftUI · WKWebView | macOS-first hybrid shell (same model as Android); iOS + APNs gated on an Apple Developer account. |
@@ -286,6 +301,7 @@ auth/billing constraint and the protocol — lives in
 anvil/
 ├── anvild/              # 🔨 the daemon (TS/Bun) — the keystone
 │   ├── src/             #    server · session · agent · render · git · push · fleet …
+│   │                    #    integrations (autopilot · Todoist · lapo · schedule) · pipeline · prompts
 │   ├── web/             #    the web client + render surface (served at /)
 │   ├── protocol.ts      #    → symlink to docs/plans/anvil-protocol.ts
 │   └── scripts/         #    service.sh (LaunchAgent), merge-session.sh
@@ -312,8 +328,12 @@ anvil/
 | [`docs/plans/anvil-impl-INDEX.md`](docs/plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans. |
 | [`docs/plans/anvil-multi-server.md`](docs/plans/anvil-multi-server.md) | Multi-server fleet design (one client, many Macs, one Max plan). |
 | [`docs/plans/anvil-server-app.md`](docs/plans/anvil-server-app.md) | The menu-bar control panel design. |
+| [`docs/plans/anvil-autopilot-ui.md`](docs/plans/anvil-autopilot-ui.md) · [`anvil-todoist-integration.md`](docs/plans/anvil-todoist-integration.md) | Todoist autopilot + the plan-review UI. |
+| [`docs/plans/anvil-adversarial-pipeline.md`](docs/plans/anvil-adversarial-pipeline.md) | The OpenRouter/GLM adversarial planning panel + the unattended dev pipeline. |
+| [`docs/lapo-integration.md`](docs/lapo-integration.md) | Posting autopilot run reports to a lapo/Logseq journal over OAuth2. |
+| [`docs/CI-CD.md`](docs/CI-CD.md) | The build & release pipeline — every target, what to push to ship it. |
 | [`anvild/README.md`](anvild/README.md) | Running, building, and developing the daemon + web client. |
-| [`apple/README.md`](apple/README.md) · [`anvil-server/README.md`](anvil-server/README.md) | Apple client + control-panel build notes. |
+| [`app/README.md`](app/README.md) · [`apple/README.md`](apple/README.md) · [`anvil-server/README.md`](anvil-server/README.md) | Android + Apple clients and the control-panel build notes. |
 
 ---
 
