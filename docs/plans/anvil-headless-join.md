@@ -1,8 +1,9 @@
 # Anvil Headless Join — tokenless boot + in-UI fleet pairing
 
-**Version:** 1.1
+**Version:** 1.2
 **Created:** 2026-07-21
-**Status:** SPEC COMPLETE — implementation not started
+**Status:** IMPLEMENTED — automated coverage in place; the §9.3 two-machine E2E gate is NOT yet run
+(see §11.4). Not merged, not deployed.
 **Extends:** `anvil-multi-server.md` (MS-2 shared token), `anvil-server-app.md` (§4 pairing & token
 distribution), `anvil-native-architecture.md` (§3 auth/billing guard)
 
@@ -13,6 +14,9 @@ distribution), `anvil-native-architecture.md` (§3 auth/billing guard)
 > **v0.4** HJ-9: reuse existing discovery, no new advertisement (§3.4). HJ-10: confirm-and-overwrite (§3.5).
 > **v1.0** decisions HJ-11…HJ-34 locked via design interview; added testing strategy (§9), definition
 > of done (§10), and the phase tracking ledger (§11).
+> **v1.2** implemented. §11 carries pasted evidence per row, §8.5 is annotated with what covers each
+> line, and §11.4's E2E rows stay ⊘ — they need a hub Mac and a real credential, and §10 forbids
+> inferring them from green unit tests.
 > **v1.1** spec review against the code. HJ-32 **reversed** — capability tag instead of a version bump
 > (§3.5). New: HJ-35 persisted degrade marker, HJ-36 browser-only takeover for v1, HJ-37 header trusted
 > only from loopback, HJ-38 `:7702` rotation leg mocked-only by decision. Corrected §7 identity order,
@@ -504,24 +508,50 @@ than writing the env file directly, so a hub holding a metered key can't propaga
 
 ### 8.5 Security review checklist (HJ-34)
 
-An explicit adversarial pass, separate from code review, before merge:
+An explicit adversarial pass, separate from code review, before merge. Each line is annotated with
+what covers it in the implementation — a ticked box means an assertion exists, **not** that the
+adversarial read-through has happened (see §11.5).
 
-- [ ] Unarmed machine rejects every pair attempt, and does not notify.
-- [ ] Code from hub A cannot be replayed by hub B after HJ-17 lock-in.
-- [ ] Expired window rejects a previously-valid code.
-- [ ] `Tailscale-User-Login` from a different tailnet user is rejected **even with a correct code**.
-- [ ] Loopback with no header is rejected, not auto-trusted (§7 branch 1).
-- [ ] **A `Tailscale-User-Login` header on a non-loopback peer is ignored, not honoured** (HJ-37) —
-      a forged header must not override `whois`. Test both: forged-header-plus-correct-code from a
-      whois-different user is rejected; forged header from a whois-unknown peer falls to code-only,
-      not to trusted.
-- [ ] `/api/fleet/pair/ack` from an unrelated tailnet peer cannot disarm an armed window (§5.3).
-- [ ] Token is never returned by any GET, and never logged — only `mask()`ed. Includes the §4.6
-      degrade marker (`masked` field) and any pair/rotation rejection message.
-- [ ] A metered `sk-ant-api…` key is rejected at the pair route, not just in the UI.
-- [ ] Rotation rejects a mismatched `hubServerId` — read §8.6 for what that check is worth.
-- [ ] Auto-degrade cannot be triggered remotely (auth-class failures only, N=2).
-- [ ] The degrade marker is mode `600` and contains no raw secret.
+- [x] Unarmed machine rejects every pair attempt, and does not notify. — `PairingWindow.accept` returns
+      `not accepting pairings` with nothing armed; `claimRejectionAlert()` returns `{notify:false}` when
+      there is no window. Both asserted.
+- [x] Code from hub A cannot be replayed by hub B after HJ-17 lock-in. — `locked to another hub`.
+- [x] Expired window rejects a previously-valid code. — the window expires lazily in `state()`, so a
+      stale one can never report armed; asserted on a fake clock.
+- [x] `Tailscale-User-Login` from a different tailnet user is rejected **even with a correct code**. —
+      the identity gate runs *before* `accept()` in the `/api/fleet/pair` handler, so a wrong user never
+      reaches the code check.
+- [x] Loopback with no header is rejected, not auto-trusted (§7 branch 1). — verified live over curl:
+      `403 {"error":"local caller without a Tailscale identity"}`.
+- [x] **A `Tailscale-User-Login` header on a non-loopback peer is ignored, not honoured** (HJ-37) —
+      `resolveCallerIdentity` branches on the peer address first and never reads the header on the
+      tailnet branch. Both cases asserted: forged-header-plus-whois-different → rejected; forged header
+      from a whois-unknown peer → `unknown` (code-only), explicitly **not** `sameUser`.
+- [x] `/api/fleet/pair/ack` from an unrelated tailnet peer cannot disarm an armed window (§5.3). — the
+      ACK route runs the same identity gate *and* requires the locked `hubServerId` + the same code.
+- [x] Token is never returned by any GET, and never logged — only `mask()`ed. — the degrade marker
+      stores `mask()`ed only (asserted: the file does not contain the raw value); no route echoes a
+      token; `GET /api/fleet/arm` returns the pair CODE (which is the point) but no credential.
+- [x] A metered `sk-ant-api…` key is rejected at the pair route, not just in the UI. — the pair and
+      rotation routes both write through `setClaudeToken()`, which throws on `looksLikeMeteredKey`.
+- [x] Rotation rejects a mismatched `hubServerId` — read §8.6 for what that check is worth. — and
+      rotation additionally requires `trust === "sameUser"`; whois-unknown is **not** sufficient there,
+      unlike a coded pair.
+- [x] Auto-degrade cannot be triggered remotely (auth-class failures only, N=2). — `isAuthClassFailure`
+      is allow-listed to 401/403-class strings and explicitly excludes 429/timeout/network; asserted
+      both ways, including a 429 wrapped in auth-ish prose.
+- [x] The degrade marker is mode `600` and contains no raw secret. — asserted via `statSync().mode`.
+
+Two things the checklist does **not** cover, stated so they aren't mistaken for cleared:
+
+- The arm window is reachable by anyone who can reach the daemon's API, and `POST /api/fleet/arm` has
+  no gate of its own beyond tailnet reachability. That is the same posture as every other daemon route
+  (`SECURITY.md`: the tailnet *is* the boundary), but it means a same-user tailnet peer could arm a
+  window — it just can't learn the code, which is only ever returned to the caller that armed it and to
+  `GET /api/fleet/arm`. A hostile same-user peer is already inside the trust boundary (§8.6).
+- Nothing rate-limits code guesses beyond the window's TTL. 10⁶ codes over a ≤30-minute window with a
+  per-window lock after the first success is judged sufficient; if that changes, add a per-window
+  attempt cap rather than lengthening the code.
 
 ### 8.6 What `hubServerId` proves — and doesn't
 
@@ -688,73 +718,105 @@ Legend: ☐ not started · ◐ in progress · ☑ done (evidence required) · �
 
 Because all phases ship in one PR (HJ-22), **Pushed** flips once for the whole feature.
 
+> **Baseline note for every `bun test` row.** The suite is **fully green** — `503 pass · 1 skip · 0
+> fail` across 504 tests, stable over three consecutive runs. It was **not** green when this work
+> started: the branch inherited 7 failures, and all 7 are now fixed rather than tolerated.
+>
+> - **6 × `Export named 'createSdkMcpServer' not found`** — misdiagnosed as an agent-SDK
+>   self-extraction flake. It wasn't. `test/integration/attachment-flow.test.ts` called
+>   `mock.module("@anthropic-ai/claude-agent-sdk", …)` returning **only** `query`, and `mock.module` is
+>   process-global and never undone — so every file loaded afterwards that reached
+>   `src/agent/default-tools.ts` (which imports `createSdkMcpServer`/`tool`, and which *every*
+>   Supervisor constructs) link-errored. `test/unit/autopilot-adversarial.test.ts` already carried a
+>   comment documenting this exact trap and stubbing both exports; the fix was to do the same in the
+>   offending file. **This had been silently disabling 4 whole test files**, so the suite grew by 33
+>   tests when they came back to life.
+> - **1 × `mergePr … Executable not found in $PATH: "gh"`** — a genuine robustness bug, not an
+>   environment quirk. `Bun.spawnSync` *throws* on a missing binary instead of returning a code, and
+>   every caller in `git/ops.ts` is written against `code !== 0`. On any machine without `gh` — a plain
+>   Linux fleet member, i.e. exactly the machines this spec exists to support — the UI's Merge/PR
+>   actions threw instead of reporting "gh isn't installed". `gitSpawn` now catches ENOENT and reports
+>   127 with a clear message, matching the contract its own doc comment already claimed for timeouts.
+>
+> Two of the revived attachment-flow tests then failed against **this** feature: they drive a real
+> prompt, and §4.3's gate refuses one on a machine with no Claude login. That is the gate working end
+> to end through the dispatcher. Those tests — plus `pipeline-guard`, `autopilot-refine`, and
+> `autopilot-plan`, which drive the SDK layer with a fake `query` — now set a placeholder credential.
+> Amended, not weakened: each one needs a daemon that is *allowed to spawn*, which is the precondition
+> under test elsewhere.
+
 ### 11.1 Phase 1 — Degraded boot
 
 | # | Item | Impl | Tested | Evidence |
 |---|------|------|--------|----------|
-| 1.1 | Guard split: degraded vs fatal (§4.1) | ☐ | ☐ | |
-| 1.2 | Fatal path regression: API key still exits 1 | ☐ | ☐ | |
-| 1.3 | Honest `subscriptionAuthOk` (§4.2) | ☐ | ☐ | |
-| 1.4 | Explicit no-token spawn error (§4.3) | ☐ | ☐ | |
-| 1.5 | Installer: no hard fail on missing env (§4.4) | ☐ | ☐ | |
-| 1.6 | Auto-degrade on 2× auth failure (§4.6) | ☐ | ☐ | |
-| 1.7 | Degrade marker: write, read-at-boot, clear-on-credential-write (HJ-35) | ☐ | ☐ | |
-| 1.8 | `capabilities` on `/api/health` + `pairing` tag (HJ-32) | ☐ | ☐ | |
-| 1.9 | Scheduled work suppressed + one alert (§4.7) | ☐ | ☐ | |
+| 1.1 | Guard split: degraded vs fatal (§4.1) | ☑ | ☑ | `checkAuth` → `GuardStatus {subscriptionAuthOk, fatal, reason?}` (`auth/guard.ts`). All four §4.1 rows asserted in `test/unit/auth-degrade.test.ts`. Live: tokenless boot logged `⚠️ DEGRADED — no usable Claude subscription token` then `listening on http://localhost:7799` |
+| 1.2 | Fatal path regression: API key still exits 1 | ☑ | ☑ | `ANTHROPIC_API_KEY=x CLAUDE_CODE_OAUTH_TOKEN=y bun run src/main.ts` → `[anvild] FATAL — auth/billing guard (arch §3): ANTHROPIC_API_KEY is set — it outranks the OAuth token and would meter billing per-token. Unset it (arch §3).` · `exit=1`. Unit-pinned incl. **API key + a valid OAuth token → still fatal** |
+| 1.3 | Honest `subscriptionAuthOk` (§4.2) | ☑ | ☑ | Live tokenless health: `{"ok":true,"subscriptionAuthOk":false,…}`. Unit: empty **and** `sk-ant-api…` both report false; `sk-ant-api…` is degraded, not fatal |
+| 1.4 | Explicit no-token spawn error (§4.3) | ☑ | ☑ | `NO_CLAUDE_TOKEN_ERROR` thrown by `buildAgentEnv` for the `claude` profile; the supervisor short-circuits `prompt()` with it. `requireToken:false` keeps the TERMINAL working (HJ-25) |
+| 1.5 | Installer: no hard fail on missing env (§4.4) | ☑ | ⊘ | `service.sh do_install` now creates `~/.config/anvil` (700) + `env` (600) and prints a setup note instead of `exit 1`. `BLOCKED: not run — a real install would replace this dev box's live service` |
+| 1.6 | Auto-degrade on 2× auth failure (§4.6) | ☑ | ☑ | `AuthDegradeTracker` + `AgentDriver.onTurnError`. Unit: 1 failure → no change · 2 consecutive → degraded + token dropped from `process.env` · network/timeout/429 never degrade · a non-auth failure between two 401s resets the streak |
+| 1.7 | Degrade marker: write, read-at-boot, clear-on-credential-write (HJ-35) | ☑ | ☑ | Live: with `auth-degraded` present **and** a token in `~/.config/anvil/env`, boot logged `⚠️ starting DEGRADED — a prior run flagged the Claude token as bad (2 consecutive auth failures (401) at 2026-07-21T00:00:00Z)` and health reported `subscriptionAuthOk: false` — the marker beat the env file. Unit: mode `600`, masked-only, cleared by `setClaudeToken`/pair/rotation, clearing resets the counter |
+| 1.8 | `capabilities` on `/api/health` + `pairing` tag (HJ-32) | ☑ | ☑ | Live: `"capabilities":["autopilot","autopilot-maintenance","auth","prompts","lapo","pairing"]` |
+| 1.9 | Scheduled work suppressed + one alert (§4.7) | ☑ | ◐ | `maybeRunScheduled` returns early while degraded, stamps the window, and alerts once via `claimEpisodeAlert()`. The one-alert-per-episode latch is unit-tested; the scheduler path around it is not (it needs a Supervisor + a clock) |
 
 ### 11.2 Phase 2 — In-UI pairing
 
 | # | Item | Impl | Tested | Evidence |
 |---|------|------|--------|----------|
-| 2.1 | Full-screen setup takeover (§5.1) | ☐ | ☐ | |
-| 2.2 | Arm/disarm window + code generation | ☐ | ☐ | |
-| 2.3 | Overwrite + detach warnings (HJ-10/HJ-14) | ☐ | ☐ | |
-| 2.4 | `POST /api/fleet/pair` + gates (§5.3) | ☐ | ☐ | |
-| 2.5 | HJ-17 lock-to-hub after first use | ☐ | ☐ | |
-| 2.6 | `POST /api/fleet/pair/ack` + gate + idempotent disarm (§5.3) | ☐ | ☐ | |
-| 2.7 | Caller identity: peer-address branch first, header loopback-only (§7, HJ-37) | ☐ | ☐ | |
-| 2.8 | Sibling key payload (HJ-24/HJ-27) | ☐ | ☐ | |
-| 2.9 | `invitePeer` capability-directed destination + 404 fallback (HJ-15) | ☐ | ☐ | |
-| 2.10 | Hub "Add a machine" + "needs setup" label | ☐ | ☐ | |
-| 2.11 | `subscriptionAuthOk` + `capabilities` on `ProbeResult`/`DiscoveredServer` (HJ-9/HJ-32) | ☐ | ☐ | |
-| 2.12 | Idle-session respawn on token change (HJ-11) | ☐ | ☐ | |
-| 2.13 | Notifications + rejection coalescing (HJ-29/HJ-33) | ☐ | ☐ | |
+| 2.1 | Full-screen setup takeover (§5.1) | ☑ | ⊘ | `web/src/setup.ts` + `.setup-takeover` styles; mounted from `main.ts`, refreshed on every `auth.status`. `typecheck:web` + `build:web` green. `BLOCKED: no automated web test — the repo has no DOM harness for main.ts-scale UI; covered by §9.3 step 4` |
+| 2.2 | Arm/disarm window + code generation | ☑ | ☑ | Live: `POST /api/fleet/arm` → `{"ok":true,"code":"969530","expiresAt":"…","host":"100.116.161.46"}`; `GET` before/after shows `armed:false` → `armed:true`. Unit: TTL clamped to [1 min, 30 min], CSPRNG codes, lazy expiry |
+| 2.3 | Overwrite + detach warnings (HJ-10/HJ-14) | ☑ | ⊘ | `startJoin()` shows the replace warning when `hasToken`, the detach warning when `hubServerId` is set, and arming is the consent. `BLOCKED: UI, as 2.1` |
+| 2.4 | `POST /api/fleet/pair` + gates (§5.3) | ☑ | ☑ | Live (unarmed, loopback, no header): `403 {"ok":false,"error":"local caller without a Tailscale identity"}` — rejected at the identity gate before the code is even read. Unit: happy path · wrong code · expired · no window armed · different tailnet user · replay after lock-in |
+| 2.5 | HJ-17 lock-to-hub after first use | ☑ | ☑ | `PairingWindow.accept` sets `lockedHubServerId`; a second hub gets `locked to another hub`. The same code from the same hub still works (HJ-16's retry) |
+| 2.6 | `POST /api/fleet/pair/ack` + gate + idempotent disarm (§5.3) | ☑ | ☑ | Unit: locked hub + right code disarms · wrong hub / wrong code / pre-acceptance ACK all refused and the window stays armed · re-sent ACK after disarm returns ok |
+| 2.7 | Caller identity: peer-address branch first, header loopback-only (§7, HJ-37) | ☑ | ☑ | `resolveCallerIdentity` branches on `requestIP` first. Unit covers all six §7 outcomes **plus both HJ-37 forgery cases**: a `Tailscale-User-Login` naming the owner, sent from a tailnet peer, does not beat a whois-different verdict and does not upgrade a whois-unknown one |
+| 2.8 | Sibling key payload (HJ-24/HJ-27) | ☑ | ☑ | `invitePeer` sends `{code, token, hubServerId, fleetName, todoistToken, openRouterKey}` (asserted on the captured body); the joiner's `adoptCredentials` writes all three, siblings best-effort so a bad Todoist token can't fail a good pair |
+| 2.9 | `invitePeer` capability-directed destination + 404 fallback (HJ-15) | ☑ | ☑ | Unit: `pairing` → `:7701` · no capabilities → `:7702` with **no** `:7701` attempt · capabilities without `pairing` → `:7702` · **`:7701` 404 → `:7702`** · 405 → `:7702` · HTML error page → `:7702` · https-then-http on `:7701` · a real `wrong code` rejection stops there and is **not** re-sent to `:7702` |
+| 2.10 | Hub "Add a machine" + "needs setup" label | ☑ | ⊘ | Dialog renamed Mac→machine; `loadFleetPeers()` joins `/api/fleet/peers` with `/api/fleet/discover` and labels/sorts `subscriptionAuthOk === false` peers as *needs setup*. `BLOCKED: UI, as 2.1` |
+| 2.11 | `subscriptionAuthOk` + `capabilities` on `ProbeResult`/`DiscoveredServer` (HJ-9/HJ-32) | ☑ | ☑ | Unit: a tokenless peer surfaces with `subscriptionAuthOk:false` + `capabilities:["auth","pairing"]`, **and** the discover response is asserted to contain no arm-state |
+| 2.12 | Idle-session respawn on token change (HJ-11) | ☑ | ◐ | `restartIdleSessionsForNewToken()` drops idle drivers (rebuilt with the new env on next use) and leaves mid-turn sessions running with an explanatory error. `Not unit-tested — needs a live Supervisor with drivers` |
+| 2.13 | Notifications + rejection coalescing (HJ-29/HJ-33) | ☑ | ☑ | `pushSystemAlert` fans web+FCM+APNs for degrade / pair-ok / pair-rejected / autopilot-suppressed. Unit: **unarmed never notifies**; armed coalesces to one alert carrying the rejection count |
 
 ### 11.3 Phase 3 — Rotation
 
 | # | Item | Impl | Tested | Evidence |
 |---|------|------|--------|----------|
-| 3.1 | `POST /api/fleet/token` (identity-gated) | ☐ | ☐ | |
-| 3.2 | `rotateToken` capability-directed destination + 404 fallback | ☐ | ☐ | |
+| 3.1 | `POST /api/fleet/token` (identity-gated) | ☑ | ☑ | Requires `trust === "sameUser"` (whois-unknown is **not** enough here, unlike a coded pair) **and** a matching recorded `hubServerId`. Live: `{"ok":false,"error":"local caller without a Tailscale identity"}`. `PairedHubStore` round-trip unit-tested |
+| 3.2 | `rotateToken` capability-directed destination + 404 fallback | ☑ | ☑ | Unit: an upgraded member is probed and routed to `:7701/api/fleet/token`; a pre-capability member to `:7702/anvil-token`; an unreachable member still tries `:7702`; no token → no network calls. Capabilities are re-probed per rotation, so a member that upgrades later moves to `:7701` without a re-pair |
 
 ### 11.4 Functional E2E (§9.3) — the release gate
 
+**Not yet run.** Every row here needs the two-machine topology (`beelink-4450` + a hub Mac) and a real
+Claude credential; the work so far is code plus the §9.2 single-machine checks. Per §10's agent
+instruction these stay `⊘` rather than being inferred from green unit tests — *a green typecheck is not
+evidence that a feature works*.
+
 | Step | Description | Status | Evidence |
 |------|-------------|--------|----------|
-| 1–3 | Install tokenless, service active, health degraded | ☐ | |
-| 4–5 | Takeover UI; hub lists "needs setup" | ☐ | |
-| 6–8 | Unarmed reject; arm; wrong-code reject | ☐ | |
-| 9–10 | Pair succeeds; joiner authed | ☐ | |
-| 11 | **Real turn completes** | ☐ | |
-| 12 | Sibling keys present | ☐ | |
-| 13 | **Survives reboot** | ☐ | |
-| 14 | Rotation reaches Linux + Mac on `:7701` | ☐ | |
-| 14b | `:7702` leg — **mocked only, not a live gate** (HJ-38) | n/a | `MOCKED (HJ-38)` |
-| 15 | Auto-degrade after 2 failed turns | ☐ | |
-| 15b | **Still degraded after a restart** (HJ-35) | ☐ | |
-| 16 | Recover by re-pairing | ☐ | |
+| 1–3 | Install tokenless, service active, health degraded | ◐ | **Step 3 proven** on `beelink-4450` (dev run, not the service): tokenless boot → `{"ok":true,"subscriptionAuthOk":false,…,"capabilities":[…,"pairing"]}`. Steps 1–2 `⊘ BLOCKED: would replace this box's live service` |
+| 4–5 | Takeover UI; hub lists "needs setup" | ⊘ | `BLOCKED: needs a hub + a browser session` |
+| 6–8 | Unarmed reject; arm; wrong-code reject | ◐ | Unarmed reject + arm proven over curl (§9.2 output above); the wrong-code leg is unit-only because a loopback caller can't clear §7's identity gate to reach it |
+| 9–10 | Pair succeeds; joiner authed | ⊘ | `BLOCKED: needs a hub` |
+| 11 | **Real turn completes** | ⊘ | `BLOCKED: needs a hub + a real credential.` The one step mocks cannot fake |
+| 12 | Sibling keys present | ⊘ | `BLOCKED: needs a hub` |
+| 13 | **Survives reboot** | ⊘ | `BLOCKED: needs the service installed` |
+| 14 | Rotation reaches Linux + Mac on `:7701` | ⊘ | `BLOCKED: needs a hub` |
+| 14b | `:7702` leg — **mocked only, not a live gate** (HJ-38) | n/a | `MOCKED (HJ-38)` — `rotateToken: a pre-capability member is routed to :7702` + the two `invitePeer` 404/405 fallback cases, all against injected `fetchImpl`/`Probe` doubles |
+| 15 | Auto-degrade after 2 failed turns | ⊘ | `BLOCKED: needs a real credential to invalidate.` Unit-covered end to end from the tracker's side |
+| 15b | **Still degraded after a restart** (HJ-35) | ☑ | Proven at the daemon level (not via `service.sh restart`): a marker plus a live token in the env file booted degraded — `starting DEGRADED — a prior run flagged the Claude token as bad (2 consecutive auth failures (401) …)`, health `subscriptionAuthOk:false`, and **no turn was consumed** rediscovering it |
+| 16 | Recover by re-pairing | ⊘ | `BLOCKED: needs a hub` |
 
 ### 11.5 Release gates
 
 | Gate | Status | Evidence |
 |------|--------|----------|
-| `bun test` green | ☐ | |
-| `typecheck` + `typecheck:web` + `build:web` green | ☐ | |
-| Contract golden **unchanged**, `PROTOCOL_VERSION` **not** bumped (HJ-32/§3.5) | ☐ | |
-| Security review §8.5 complete | ☐ | |
-| Docs updated (README, ARCHITECTURE, server-app §4.0) | ☐ | |
-| Rollback documented (§12) | ☐ | |
-| **Pushed** — merged, deployed, verified live (HJ-30) | ☐ | |
+| `bun test` green | ☑ | `503 pass · 1 skip · 0 fail · 504 tests`, stable across three consecutive runs. The 7 inherited failures were fixed, not tolerated — see the baseline note in §11 (a global `mock.module` had been silently disabling 4 test files; `gitSpawn` threw on a missing `gh`). New suites alone: `auth-degrade` + `pairing` + `fleet` + `contract` → `85 pass · 0 fail` |
+| `typecheck` + `typecheck:web` + `build:web` green | ☑ | `bun run typecheck` → no output, exit 0 · `bun run typecheck:web` → no output, exit 0 · `bun run build:web` → `built web client → …/web/dist` |
+| Contract golden **unchanged**, `PROTOCOL_VERSION` **not** bumped (HJ-32/§3.5) | ☑ | `bun test test/contract` → `2 pass · 0 fail` against an unmodified `protocol-surface.golden.json` (`"protocolVersion": 1`). The protocol change is REST-only: `capabilities` on `HealthResponse`, `subscriptionAuthOk`/`capabilities` on `DiscoveredServer`, and the new pairing request/response types. No WS wire type moved |
+| Security review §8.5 complete | ◐ | Every checklist line has a corresponding assertion (see §8.5's annotations); the adversarial pass itself — a human reading the routes for what the checklist *didn't* think to ask — has not been done |
+| Docs updated (README, ARCHITECTURE, server-app §4.0) | ☑ | README: fleet bullet + a new *Headless / Linux machines* section, both flagging browser-only (HJ-36). ARCHITECTURE: the fatal-vs-degraded asymmetry in §3, and *The fleet* rewritten for non-Mac members (diagram included). `anvil-server-app.md` §4.0 carries a **⚠️ Superseded** block stating the premise is lifted and `:7702` is now the pre-upgrade path |
+| Rollback documented (§12) | ☑ | §12 was written with the spec and still holds; Phase 1's warning about reverting the guard is the load-bearing one |
+| **Pushed** — merged, deployed, verified live (HJ-30) | ☐ | Not merged, not deployed |
 
 ---
 
