@@ -302,8 +302,8 @@ test("ackPair: sent only to a :7701 pairing peer — a :7702 member disarms on i
 
 test("rotateToken: probes each member and routes an UPGRADED one to :7701 (§6)", async () => {
   const probe = async (base: string): Promise<ProbeResult | null> =>
-    base.startsWith("https://linux.ts.net") ? { serverId: "srv_l", serverName: "L", version: "1", capabilities: ["auth", "pairing"] } : null;
-  const { fn, calls } = fakeFetch((u) => (u.startsWith("https://linux.ts.net:7701") ? { body: { ok: true } } : "throw"));
+    base === "https://linux.ts.net:7701" ? { serverId: "srv_l", serverName: "L", version: "1", capabilities: ["auth", "pairing"] } : null;
+  const { fn, calls } = fakeFetch((u) => (u === "https://linux.ts.net:7701/api/fleet/token" ? { body: { ok: true } } : "throw"));
   const [r] = await rotateToken({ members: [{ host: "linux.ts.net" }], token: "tok", hubServerId: "h", probe, fetchImpl: fn });
   expect(r!.ok).toBe(true);
   expect(calls).toEqual(["https://linux.ts.net:7701/api/fleet/token"]);
@@ -311,7 +311,7 @@ test("rotateToken: probes each member and routes an UPGRADED one to :7701 (§6)"
 
 test("rotateToken: a pre-capability member is routed to :7702 (MOCKED coverage only — HJ-38)", async () => {
   const probe = async (base: string): Promise<ProbeResult | null> =>
-    base.startsWith("https://oldmac.ts.net") ? { serverId: "srv_m", serverName: "M", version: "0.9" } : null; // no capabilities field
+    base === "https://oldmac.ts.net:7701" ? { serverId: "srv_m", serverName: "M", version: "0.9" } : null; // no capabilities field
   const { fn, calls } = fakeFetch(() => ({ body: { ok: true } }));
   const [r] = await rotateToken({ members: [{ host: "oldmac.ts.net" }], token: "tok", hubServerId: "h", probe, fetchImpl: fn });
   expect(r!.ok).toBe(true);

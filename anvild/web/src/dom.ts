@@ -6,7 +6,22 @@ import TomSelect from "tom-select";
 import type { Environment, Session } from "../../protocol";
 
 export const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => document.querySelector(sel) as T;
-export const esc = (s: string): string => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
+/**
+ * Escape text for interpolation into HTML — including into a **quoted attribute value**.
+ *
+ * Quotes are part of the set on purpose. This helper is used both as `>${esc(x)}<` (text) and as
+ * `value="${esc(x)}"` (attribute), and the client builds a lot of markup by template string. Escaping
+ * only `& < >` left every attribute site breakable by a value containing `"` — CodeQL's
+ * `js/incomplete-html-attribute-sanitization`, which fires on several call sites here. Escaping the
+ * quotes too closes the whole class at the leaf instead of auditing each `innerHTML` in turn.
+ *
+ * No rendering changes: a browser renders `&quot;`/`&#39;` as `"`/`'` in text content, so text sites
+ * look identical — they simply stop being able to break out of an attribute they might later be moved
+ * into. `linkifyUrls` below benefits for the same reason: a URL carrying a quote can no longer escape
+ * the `href="…"` it gets substituted into.
+ */
+const HTML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+export const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
 // [SEC-L6] Escape text, then turn bare http(s) URLs into new-tab links. `rel="noopener noreferrer"`
 // prevents the opened page from reaching back via `window.opener` (reverse tabnabbing). Text is
 // escaped first, so the URL can't inject tags.
