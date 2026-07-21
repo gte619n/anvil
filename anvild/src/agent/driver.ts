@@ -70,6 +70,10 @@ export class AgentDriver {
     /** Called once the SDK's `init` message reports the session's slash-commands, so the supervisor
      *  can publish them for the composer's `/` autocomplete. (§skills) */
     private readonly onCommands?: (commands: CommandInfo[]) => void,
+    /** Called with whatever the consume loop threw, so the supervisor can classify credential
+     *  rejections and auto-degrade after N consecutive ones (headless-join §4.6). Advisory: the error
+     *  is still surfaced in the session either way. */
+    private readonly onTurnError?: (err: unknown) => void,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -315,6 +319,7 @@ export class AgentDriver {
       }
     } catch (e) {
       this.session.emitError(e instanceof Error ? e.message : String(e), false);
+      this.onTurnError?.(e);
     } finally {
       // [BE-3] End-of-run cleanup. The consume loop only exits when the session ends (input closed
       // via stop()) or a turn throws. In both cases: unblock any prompt parked in a broker (else the

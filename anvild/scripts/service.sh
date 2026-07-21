@@ -302,12 +302,19 @@ launcher_is_serve_mode() {
 do_install() {
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
   svc_preflight
-  [ -f "$CONFIG_ENV" ] || {
-    echo "error: missing $CONFIG_ENV"
-    echo "  Run:  claude setup-token"
-    echo "  Then: mkdir -p ~/.config/anvil && umask 077 && printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' '<token>' > $CONFIG_ENV"
-    exit 1
-  }
+  # A missing env file is NO LONGER fatal (anvil-headless-join.md §4.4). The daemon boots degraded
+  # when it has no token — it serves its web UI, which is where the machine is paired with a fleet or
+  # handed a token. Hard-failing here is what made a headless box impossible to onboard: you couldn't
+  # install without a token, and you couldn't be given a token without a running daemon. Create the
+  # file (700 dir / 600 file) so the launcher's `set -a; . "$CONFIG_ENV"` has something to source.
+  if [ ! -f "$CONFIG_ENV" ]; then
+    (umask 077; mkdir -p "$(dirname "$CONFIG_ENV")" && : > "$CONFIG_ENV")
+    chmod 700 "$(dirname "$CONFIG_ENV")" 2>/dev/null || true
+    chmod 600 "$CONFIG_ENV" 2>/dev/null || true
+    echo "note: no Claude login yet ($CONFIG_ENV was empty/missing)."
+    echo "      Anvil will start in setup mode — open its web UI to join a fleet or paste a token."
+    echo "      (Or run \`claude setup-token\` and put it in $CONFIG_ENV as CLAUDE_CODE_OAUTH_TOKEN=…)"
+  fi
   mkdir -p "$BIN_DIR" "$STATE_DIR" "$UNIT_DIR"
 
   build_web

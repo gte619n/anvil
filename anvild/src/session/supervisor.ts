@@ -56,7 +56,7 @@ import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
-import { buildAgentEnv } from "../agent/env";
+import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
@@ -93,6 +93,7 @@ import * as selfupdate from "../daemon/selfupdate";
 import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
 import { classifyBranchKind, heuristicKind } from "../agent/branch-kind";
+import { AuthDegradeTracker, type DegradeMarker } from "../auth/degrade";
 import { WebPush, type PushPayload } from "../push/webpush";
 import { Fcm } from "../push/fcm";
 import { Apns } from "../push/apns";
@@ -168,6 +169,11 @@ export class Supervisor {
   private agentEnv(): Record<string, string> {
     return buildAgentEnv();
   }
+  /** Same allow-list, but tolerant of a missing Claude token — for the session TERMINAL, which must keep
+   *  working on a degraded machine (HJ-25/§8.3). Only agent turns are gated on the credential. */
+  private shellEnv(): Record<string, string> {
+    return buildAgentEnv({ requireToken: false });
+  }
   /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
    *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
   private readonly defaultToolsServer = buildDefaultToolsServer({
@@ -211,6 +217,9 @@ export class Supervisor {
   /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
   private readonly devPipelineMetrics: AdversaryMetrics;
   private readonly stateDir: string;
+  /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
+   *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
+  readonly authDegrade!: AuthDegradeTracker;
   private readonly selfPort: number;
   /** Cached self base URL (deep-link target) — discovery shells out to `tailscale`, so cache it. */
   private selfBaseUrlCache?: { url: string | undefined; at: number };
@@ -224,6 +233,11 @@ export class Supervisor {
       provider: cfg.adversarialProvider,
     };
     this.stateDir = cfg.stateDir;
+    // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
+    // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
+    (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
+      this.notifyAuthDegraded(marker),
+    );
     this.devPipelineMetrics = loadMetrics(cfg.stateDir);
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
@@ -277,6 +291,18 @@ export class Supervisor {
   private async maybeRunScheduled(): Promise<void> {
     const sched = this.autopilotSchedule.get();
     if (this.autopilotRunning || !scheduledFireDue(sched, new Date(), SCHEDULE_RUN_WINDOW_MS, sched.lastRunAt)) return;
+    // Degraded machine: every unit this run planned would fail at spawn. Suppress the run rather than
+    // manufacturing a nightly wall of auth errors — but say so ONCE per degraded episode, so it's not a
+    // silent stop either (HJ-12/HJ-29). Stamp the window as run so the 5-min ticks don't re-alert.
+    if (this.authDegrade.degraded()) {
+      this.autopilotSchedule.markRun(now());
+      this.broadcastSchedule();
+      if (this.authDegrade.claimEpisodeAlert()) {
+        console.warn("[anvild] autopilot: scheduled run suppressed — this machine has no usable Claude token.");
+        this.pushSystemAlert("Autopilot paused", "This machine has no Claude login, so the scheduled run was skipped. Pair it with your fleet to resume.", "auth-degraded");
+      }
+      return;
+    }
     // Stamp the run NOW so a slow run isn't re-triggered on the next 5-min tick, and so a hard error
     // (Todoist down, no linked envs) doesn't hammer — it waits for the next scheduled window.
     this.autopilotSchedule.markRun(now());
@@ -598,6 +624,47 @@ export class Supervisor {
     const url = await discoverSelfBaseUrl({ port: this.selfPort });
     this.selfBaseUrlCache = { url, at: now };
     return url;
+  }
+
+  /** This machine's bare MagicDNS name — what the operator picks on the hub's "Add a machine" list, so
+   *  the setup screen can show them exactly which candidate is theirs (§5.1). Derived from
+   *  {@link selfBaseUrl} so it agrees with whatever transport actually answers. */
+  async selfHost(): Promise<string | undefined> {
+    const base = await this.selfBaseUrl();
+    if (!base) return undefined;
+    try {
+      return new URL(base).hostname;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * A new Claude credential just landed (a pair, a rotation, or a paste). Sessions build their agent
+   * env per spawn, so nothing needs a restart to pick it up — but a session whose DRIVER is already
+   * running holds the old env for the life of its `query()`. Drop the drivers of IDLE sessions so the
+   * next turn rebuilds with the new token; sessions mid-turn are left alone and flagged instead, since
+   * tearing down a running turn would lose its work (HJ-11).
+   */
+  async restartIdleSessionsForNewToken(): Promise<void> {
+    const busy: string[] = [];
+    for (const [id, driver] of [...this.drivers]) {
+      const status = this.sessions.get(id)?.data.status;
+      if (status && status !== "idle") {
+        busy.push(id);
+        continue;
+      }
+      this.drivers.delete(id);
+      await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+    }
+    if (busy.length) {
+      for (const id of busy) {
+        this.sessions
+          .get(id)
+          ?.emitError("This machine's Claude login changed while this session was mid-turn. Finish or interrupt the turn — the new login applies from the next one.", false);
+      }
+      console.log(`[fleet] token changed — ${busy.length} session(s) mid-turn kept on the old login until they settle`);
+    }
   }
 
   /**
@@ -1757,7 +1824,7 @@ export class Supervisor {
       const s = this.require(sessionId);
       return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
     },
-    () => this.agentEnv(),
+    () => this.shellEnv(),
   );
 
   terminalOpen(sessionId: string, cols: number, rows: number): void {
@@ -1782,6 +1849,13 @@ export class Supervisor {
   /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
   prompt(id: string, text: string, attachmentIds: string[] = []): void {
     const s = this.require(id);
+    // Degraded machine (no usable Claude token): stop here with the explicit §4.3 message instead of
+    // letting `buildAgentEnv` throw out through the dispatcher as an opaque command error. The user's
+    // text is deliberately NOT echoed — nothing consumed it, so a bubble with no reply would be a lie.
+    if (this.authDegrade.degraded()) {
+      s.emitError(NO_CLAUDE_TOKEN_ERROR, false);
+      return;
+    }
     if (s.data.archived) {
       s.data.archived = false; // prompting reactivates an archived session
       this.broadcastUpdated(s.data);
@@ -1821,6 +1895,13 @@ export class Supervisor {
     this.ensureDriver(id).prompt(text, inline);
   }
 
+  /** A turn threw. Classify it: two consecutive 401/403-class failures mean the credential is dead, so
+   *  the daemon degrades itself back into the pairing flow rather than failing every future turn the
+   *  same opaque way (§4.6). Anything else (network, timeout, 429) resets the streak. */
+  private onTurnError(err: unknown): void {
+    this.authDegrade.recordTurnFailure(err);
+  }
+
   /** Get the session's live driver, creating it lazily on first use (arch §6.2). */
   private ensureDriver(id: string): AgentDriver {
     let driver = this.drivers.get(id);
@@ -1840,6 +1921,7 @@ export class Supervisor {
         undefined, // queryFn — keep the SDK default
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
         (commands) => this.onSessionCommands(id, commands),
+        (err) => this.onTurnError(err),
       );
       this.drivers.set(id, driver);
     }
@@ -1888,6 +1970,33 @@ export class Supervisor {
    *  "your turn" reminder on every device (the notified one and the rest). (UI refinement §1) */
   viewed(id: string): void {
     if (this.sessions.has(id)) this.clearNotifications(id);
+  }
+
+  /** Fan a session-less operational alert out to every registered device (web + native). Used for the
+   *  fleet-pairing lifecycle: auto-degrade fired, pair succeeded/rejected, scheduled work suppressed
+   *  (HJ-29). `tag` coalesces repeats so the shade never stacks duplicates. */
+  pushSystemAlert(title: string, body: string, tag: string): void {
+    const payload: PushPayload = { title, body, tag };
+    void this.webpush.notify(payload);
+    void this.fcm.notify(payload);
+    void this.apns.notify(payload);
+  }
+
+  /** The auto-degrade notification (HJ-29). Also broadcast on the wire so an OPEN client flips to the
+   *  setup takeover immediately, rather than only on its next reload. */
+  private notifyAuthDegraded(marker: DegradeMarker): void {
+    this.broadcastAuthState();
+    this.pushSystemAlert(
+      "Anvil can't reach Claude",
+      `This machine's Claude login stopped working (${marker.reason}). Turns are paused until it's re-paired.`,
+      "auth-degraded",
+    );
+  }
+
+  /** Tell every connected client this machine's auth/pairing state changed, so the setup takeover can
+   *  appear (degraded) or disappear (paired) live. */
+  broadcastAuthState(): void {
+    this.registry.toAll(this.authStatusEvent("claude"));
   }
 
   /** Send a "clear" push (web + native) that dismisses the session's outstanding reminder on every
@@ -2195,6 +2304,9 @@ export class Supervisor {
   /** Per-turn: refresh the shared rate-limit gauge from the real plan windows, broadcast it, and
    *  advise once when the weekly window nears the cap. */
   private onAgentResult(sessionId: string, usage: TurnUsage): void {
+    // A turn that produced a result reached Anthropic with a working credential — break any
+    // consecutive-auth-failure streak so a 401 hours ago can't pair up with one now (§4.6).
+    this.authDegrade.recordTurnSuccess();
     // The agent may have committed, switched/created a branch, or left new changes this turn —
     // refresh git so the worktree panel and session-list badge stay current without a manual
     // "status" press. Local-only and a no-op (no broadcast) when nothing changed.

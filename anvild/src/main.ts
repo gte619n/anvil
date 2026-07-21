@@ -1,5 +1,6 @@
 import { loadConfig } from "./config";
 import { assertSubscriptionAuth } from "./auth/guard";
+import { applyDegradeMarkerAtBoot } from "./auth/degrade";
 import { loadPersistedClaudeToken } from "./auth/store";
 import { loadPersistedOpenRouterKey } from "./auth/openrouter";
 import { createServer, VERSION } from "./server/http";
@@ -17,10 +18,27 @@ loadPersistedClaudeToken();
 // the panel is enabled on startup when a key was set from the UI. It's a different provider than
 // Anthropic, so it's irrelevant to the §3 guard below.
 loadPersistedOpenRouterKey();
-// arch §3: refuse to start unless the subscription-auth invariant holds.
+
+// Config must be resolved BEFORE the guard now: the degrade marker lives in the state dir and is
+// consulted between the token load above and the guard below (headless-join §4.6). Nothing in
+// loadConfig depends on the auth state, so hoisting it is safe.
+const config = loadConfig();
+
+// A prior run auto-degraded (2× auth failure). The launcher re-sources the env file on EVERY start and
+// loadPersistedClaudeToken() reloads that key, so without this the daemon would come back looking
+// authed and burn two more turns rediscovering the dead token — on every reboot (HJ-35).
+const degradeMarker = applyDegradeMarkerAtBoot(config.stateDir);
+if (degradeMarker) {
+  console.warn(
+    `[anvild] ⚠️  starting DEGRADED — a prior run flagged the Claude token as bad (${degradeMarker.reason}` +
+      `${degradeMarker.at ? ` at ${degradeMarker.at}` : ""}). Re-pair this machine, or set a token in Settings → Auth.`,
+  );
+}
+
+// arch §3: refuse to start on a §3 VIOLATION (a metered key). A missing/dead token warns and boots
+// degraded instead — that's what lets a fresh headless box exist long enough to be paired (§4.1).
 assertSubscriptionAuth();
 
-const config = loadConfig();
 // Log how the PRIOR run ended (deliberate restart vs crash/respawn) and stamp this run `running`, so the
 // next restart is attributable on sight (arch §5 diagnostics).
 recordStart(config.stateDir);

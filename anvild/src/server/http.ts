@@ -5,8 +5,20 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
-import { loadServerIdentity, serverHelloEvent } from "./identity";
-import { discoverFleet, inviteMac, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
+import { ackPair, discoverFleet, invitePeer, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import {
+  DEFAULT_ARM_TTL_MS,
+  PairedHubStore,
+  PairingWindow,
+  resolveCallerIdentity,
+  tailscaleSelfLogin,
+  tailscaleWhois,
+  type PeerTrust,
+} from "./pairing";
+import { bindDegradeStateDir } from "../auth/degrade";
+import { setClaudeToken } from "../auth/store";
+import { setOpenRouterKey } from "../auth/openrouter";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
@@ -155,6 +167,13 @@ export interface ServerOptions {
 export function createServer(opts: ServerOptions): ServerHandle {
   const identity = loadServerIdentity(opts.stateDir);
   const fleet = new FleetStore(opts.stateDir);
+  // Bind the degrade marker's home so a credential write from ANY path (a direct paste via
+  // `setClaudeToken`, a pair, a rotation) clears it without threading a state dir through (§4.6).
+  bindDegradeStateDir(opts.stateDir);
+  /** This machine's join window — default closed, armed only by a human in its own UI (§5.1/§8.2). */
+  const pairWindow = new PairingWindow();
+  /** The hub this machine was joined by, for rotation gating only (HJ-26). */
+  const pairedHub = new PairedHubStore(opts.stateDir);
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
   const supervisor = new Supervisor(
@@ -324,11 +343,19 @@ export function createServer(opts: ServerOptions): ServerHandle {
         const auth = checkAuth();
         const body: rest.HealthResponse = {
           ok: true,
+          // Honest now (§4.2): false for an absent token AND for an `sk-ant-api…` value. Note the daemon
+          // still answers `ok: true` — "up but unauthed" is the state this pair of fields has always
+          // modelled; headless-join is what made it reachable.
           subscriptionAuthOk: auth.subscriptionAuthOk,
           version: VERSION,
           serverId: identity.serverId,
           serverName: identity.serverName,
           budget: supervisor.budget(),
+          // Discovery is REST — a hub has no WS session with a machine it hasn't joined yet — so the
+          // capability list a client normally reads off `server.hello` is mirrored here (HJ-32/§3.5).
+          // Deliberately NOT included: this window's arm-state, which would broadcast an open
+          // credential window to the whole tailnet (HJ-9).
+          capabilities: [...SERVER_CAPABILITIES],
         };
         return Response.json(body);
       }
@@ -353,7 +380,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (url.pathname === "/api/fleet/invite" && req.method === "POST") {
         const { host, code } = (await req.json().catch(() => ({}))) as Partial<rest.FleetInviteRequest>;
         if (!host || !code) return new Response("host and code required", { status: 400 });
-        const outcome = await inviteMac({ host, code, token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
+        // Ask the joiner what it speaks BEFORE pushing, so the destination is a lookup rather than a
+        // guess (HJ-15/§3.5). A peer that answers without capabilities is a pre-capability daemon →
+        // :7702. `invitePeer` still falls back on a 404/405 from :7701, for an un-upgraded Mac that
+        // answers on the daemon port but has no such route.
+        const preflight = await resolveMember(host, opts.port);
+        const outcome = await invitePeer({
+          host,
+          code,
+          token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
+          hubServerId: identity.serverId,
+          capabilities: preflight.capabilities,
+          port: opts.port,
+          // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
+          ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
+          ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+        });
         if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
         // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
         // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
@@ -366,8 +408,151 @@ export function createServer(opts: ServerOptions): ServerHandle {
           url: resolved.url,
         };
         fleet.upsert(member);
+        // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately
+        // AFTER the upsert: the joiner staying armed through a lost reply is the failure mode this
+        // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
+        void ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
         pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
         return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
+      }
+
+      // ── Joiner side: receive credentials on this daemon's own port (headless-join §5.3) ────────
+      // These are what let a NON-Mac machine be added to a fleet at all: the macOS Server.app's :7702
+      // listener has no Linux equivalent, and until Phase 1 a tokenless machine had no running daemon
+      // to host one anyway. Default closed, code + tailnet identity gated; see §8.2 for the full list.
+
+      /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback. */
+      const callerIdentity = async (): Promise<{ trust: PeerTrust; reject?: string }> =>
+        resolveCallerIdentity({
+          peerAddress: srv.requestIP(req)?.address,
+          headerLogin: req.headers.get("Tailscale-User-Login"),
+          selfLogin: tailscaleSelfLogin,
+          whois: tailscaleWhois,
+        });
+
+      /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
+       *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
+      const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string }): string | null => {
+        try {
+          setClaudeToken(String(body.token ?? "")); // also clears the degrade marker + failure counter
+        } catch (e) {
+          return e instanceof Error ? e.message : String(e);
+        }
+        // Siblings are best-effort: a bad Todoist token must not fail a pair that already succeeded in
+        // handing over the credential that matters (HJ-24/HJ-27 — present keys overwrite).
+        if (body.openRouterKey) {
+          try {
+            setOpenRouterKey(body.openRouterKey);
+          } catch (e) {
+            console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+        if (body.todoistToken) {
+          void supervisor.connectTodoist(body.todoistToken).catch((e: unknown) => console.warn(`[fleet] pushed Todoist token rejected: ${e instanceof Error ? e.message : e}`));
+        }
+        supervisor.authDegrade.recover();
+        supervisor.broadcastAuthState();
+        void supervisor.restartIdleSessionsForNewToken();
+        return null;
+      };
+
+      // Arm a join window on THIS machine and show its code. The code lives in exactly one place —
+      // this UI (HJ-13) — so there is no log or CLI fallback to scrape.
+      if (url.pathname === "/api/fleet/arm" && req.method === "POST") {
+        const { ttlMs } = (await req.json().catch(() => ({}))) as Partial<rest.FleetArmRequest>;
+        const { code, expiresAt } = pairWindow.arm(ttlMs ?? DEFAULT_ARM_TTL_MS);
+        const host = await supervisor.selfHost();
+        console.log(`[fleet] pairing window open for ${Math.round((expiresAt - Date.now()) / 60_000)} min`);
+        return Response.json({ ok: true, code, expiresAt: new Date(expiresAt).toISOString(), ...(host ? { host } : {}) } satisfies rest.FleetArmResponse);
+      }
+      if (url.pathname === "/api/fleet/arm" && req.method === "DELETE") {
+        pairWindow.disarm();
+        return Response.json({ ok: true } satisfies rest.FleetArmResponse);
+      }
+      // This machine's own setup state, for its takeover screen. Arm-state is exposed HERE and not on
+      // /api/health precisely because health is the unauthenticated, tailnet-wide surface (HJ-9).
+      if (url.pathname === "/api/fleet/arm" && req.method === "GET") {
+        const w = pairWindow.state();
+        const host = await supervisor.selfHost();
+        const hub = pairedHub.get();
+        return Response.json({
+          armed: w !== null,
+          ...(w ? { code: w.code, expiresAt: new Date(w.expiresAt).toISOString() } : {}),
+          ...(host ? { host } : {}),
+          hasToken: (process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim().length > 0,
+          ...(hub ? { hubServerId: hub.hubServerId } : {}),
+          serverId: identity.serverId,
+          serverName: identity.serverName,
+        } satisfies rest.FleetArmStatusResponse);
+      }
+
+      // First join: code-gated + identity-gated. Mirrors /anvil-pair's semantics and its rejection
+      // vocabulary (Pairing.swift:129) so the two paths stay recognisably the same gate.
+      if (url.pathname === "/api/fleet/pair" && req.method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as Partial<rest.FleetPairRequest>;
+        const reject = (error: string, status = 403): Response => {
+          // Coalesce to at most one notification per armed window, with a count; an UNARMED machine
+          // logs but never notifies, so a tailnet scanner can't use this as a doorbell (HJ-33).
+          const alert = pairWindow.claimRejectionAlert();
+          console.warn(`[fleet] pair rejected: ${error}`);
+          if (alert.notify) supervisor.pushSystemAlert("Pairing attempt rejected", `Someone tried to pair this machine and was turned away (${error}).`, "pair-rejected");
+          return Response.json({ ok: false, error } satisfies rest.FleetPairResponse, { status });
+        };
+        if (!body.token || !body.hubServerId) return reject("bad request", 400);
+
+        const who = await callerIdentity();
+        // A caller whois says is a DIFFERENT tailnet user is rejected even with a correct code.
+        if (who.trust === "otherUser") return reject(who.reject ?? "different tailnet user");
+        // whois-unknown falls back to code-only, matching `notOtherUser` (Pairing.swift:118).
+
+        const codeError = pairWindow.accept(String(body.code ?? ""), body.hubServerId);
+        if (codeError) return reject(codeError, codeError === "not accepting pairings" ? 409 : 403);
+
+        const failure = adoptCredentials(body);
+        if (failure) return reject(failure, 400);
+        pairedHub.record(body.hubServerId, body.fleetName);
+        console.log(`[fleet] paired with hub ${body.hubServerId}${body.fleetName ? ` (${body.fleetName})` : ""}`);
+        supervisor.pushSystemAlert("Joined the fleet", `This machine now shares ${body.fleetName ? `the ${body.fleetName}` : "your"} Claude login.`, "pair-ok");
+        // Stay armed until the hub ACKs (HJ-16) — the window is now locked to this hub (HJ-17), which
+        // is what makes leaving it open a strictly smaller surface than a fresh one.
+        const self = await supervisor.selfBaseUrl();
+        return Response.json({
+          ok: true,
+          serverId: identity.serverId,
+          serverName: identity.serverName,
+          ...(self ? { url: self } : {}),
+        } satisfies rest.FleetPairResponse);
+      }
+
+      // The hub confirms the member is recorded → disarm. Gated exactly as /pair is, and the body must
+      // carry the SAME hubServerId and code the window locked to — otherwise any tailnet peer could
+      // POST this and cancel someone else's pairing window mid-flow. Idempotent by design.
+      if (url.pathname === "/api/fleet/pair/ack" && req.method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as Partial<rest.FleetPairAckRequest>;
+        const who = await callerIdentity();
+        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+        if (!body.hubServerId || !pairWindow.ack(String(body.code ?? ""), body.hubServerId)) {
+          return Response.json({ ok: false, error: "not your pairing window" }, { status: 403 });
+        }
+        return Response.json({ ok: true });
+      }
+
+      // Rotation counterpart: identity-gated, NOT code-gated — persistent rather than armed, so the hub
+      // can push a refreshed token unattended. `hubServerId` is an anti-confusion check, not a
+      // credential: read §8.6 before reading this as "rotation is authenticated". The real gate is
+      // same-user tailnet reachability, so `unknown` trust is NOT enough here (unlike a coded pair).
+      if (url.pathname === "/api/fleet/token" && req.method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as Partial<rest.FleetTokenRequest>;
+        const who = await callerIdentity();
+        if (who.trust !== "sameUser") return Response.json({ ok: false, error: who.reject ?? "untrusted tailnet user" }, { status: 403 });
+        const hub = pairedHub.get();
+        if (!hub || !body.hubServerId || body.hubServerId !== hub.hubServerId) {
+          return Response.json({ ok: false, error: "unknown hub" }, { status: 403 });
+        }
+        const failure = adoptCredentials(body);
+        if (failure) return Response.json({ ok: false, error: failure }, { status: 400 });
+        console.log(`[fleet] token rotated by hub ${hub.hubServerId}`);
+        return Response.json({ ok: true, serverId: identity.serverId, serverName: identity.serverName } satisfies rest.FleetPairResponse);
       }
 
       // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
@@ -404,7 +589,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
       }
 
       if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
-        const results = await rotateToken({ members: fleet.list(), token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "", hubServerId: identity.serverId });
+        // Capabilities are re-probed per member inside rotateToken (not read from the stored record),
+        // so a member that upgraded after joining starts receiving rotation on :7701 without a re-pair.
+        const results = await rotateToken({
+          members: fleet.list(),
+          token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
+          hubServerId: identity.serverId,
+          port: opts.port,
+        });
         return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
       }
       const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);

@@ -34,6 +34,12 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
   },
 }));
 
+// These tests drive a real prompt through the supervisor, and a degraded machine (no Claude login)
+// now refuses one with the §4.3 pair-this-machine error instead of spawning — see
+// anvil-headless-join.md. Give the daemon a placeholder credential so the attachment path under test
+// is reachable. (The SDK itself is mocked above, so the value is never used for anything.)
+process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
+
 const { createServer } = await import("../../src/server/http");
 
 // 1×1 red PNG.

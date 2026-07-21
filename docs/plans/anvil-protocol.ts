@@ -1323,12 +1323,27 @@ export namespace rest {
   /** GET /api/health → liveness + the auth/billing self-check (§3). */
   export interface HealthResponse {
     ok: boolean;
-    /** True only if CLAUDE_CODE_OAUTH_TOKEN is set AND ANTHROPIC_API_KEY is unset (§3). */
+    /**
+     * A plausible subscription token is present AND no metered key outranks it (§3). False means the
+     * daemon is UP but DEGRADED — it serves the API, the terminal, and files, but refuses agent turns
+     * until it's paired or a token is set. `ok` and this field have always been separate for exactly
+     * this state; anvil-headless-join.md is what made it reachable.
+     *
+     * This is a SHAPE check, not a validity check: a well-formed but revoked token still reports true
+     * here until a turn fails (auto-degrade then flips it — headless-join §4.2/§4.6).
+     */
     subscriptionAuthOk: boolean;
     version: string;
     serverId: string; // stable id for this server, persisted in the state dir — fleet identity (§3)
     serverName: string; // display name for this server (default: hostname) — fleet groundwork
     budget: Budget;
+    /**
+     * Coarse feature flags this build supports (`SERVER_CAPABILITIES`) — the same list `server.hello`
+     * carries, exposed on REST because discovery is REST: a hub has no WS session with a machine it
+     * hasn't joined yet, and it needs "does this peer speak :7701 pairing?" to route a credential push
+     * (headless-join §3.5). Absent ⇒ a pre-capability daemon ⇒ treat every capability as unsupported.
+     */
+    capabilities?: string[];
   }
   /** An Anvil server found on the tailnet by discovery (anvil-multi-server.md §4.1). */
   export interface DiscoveredServer {
@@ -1338,6 +1353,13 @@ export namespace rest {
     version: string; // anvild version reported by /api/health
     online: boolean;
     isSelf: boolean; // this hub's own daemon (already connected)
+    /** From that peer's /api/health. False ⇒ it's up but has no Claude login, so the Fleet UI can
+     *  label it "needs setup" and offer to pair it (headless-join HJ-9). Absent on a peer whose
+     *  health predates the field. */
+    subscriptionAuthOk?: boolean;
+    /** That peer's `SERVER_CAPABILITIES` (see HealthResponse.capabilities). Contains "pairing" when the
+     *  hub can push credentials to its :7701 API instead of the macOS :7702 listener. */
+    capabilities?: string[];
   }
   /** GET /api/fleet/discover → Anvil servers on the tailnet (anvil-multi-server.md §4.1). The hub
    *  daemon enumerates Tailscale peers and probes each for /api/health, returning the ones that
@@ -1386,6 +1408,77 @@ export namespace rest {
   export interface FleetRotateResponse {
     ok: boolean;
     results: { host: string; ok: boolean; error?: string }[];
+  }
+
+  // ── Joiner-side pairing on :7701 (anvil-headless-join.md §5.3) ───────────────────────────────
+  // The macOS Server.app's :7702 listener only exists on a Mac, so a headless Linux box had no way to
+  // be handed a fleet credential. These routes are the daemon's own equivalent, gated identically:
+  // first join is code-gated, rotation is identity-gated. Advertised via the "pairing" capability.
+
+  /** POST /api/fleet/arm → open a join window on THIS machine and show its code (HJ-13: the code lives
+   *  in exactly one place — the joiner's own UI). Default-closed: without this, /pair rejects. */
+  export interface FleetArmRequest {
+    /** Window lifetime in ms; the daemon clamps it to a sane maximum. Omit for the default. */
+    ttlMs?: number;
+  }
+  export interface FleetArmResponse {
+    ok: boolean;
+    code?: string; // 6 digits, shown to the operator
+    expiresAt?: string; // ISO8601 — drives the countdown
+    /** This machine's MagicDNS name, so the operator knows which candidate to pick on the hub. */
+    host?: string;
+    error?: string;
+  }
+  /** GET /api/fleet/arm → the joiner's own setup state, for its takeover screen. Deliberately NOT part
+   *  of /api/health: arm-state on unauthenticated health would broadcast an open credential window to
+   *  the whole tailnet (HJ-9). */
+  export interface FleetArmStatusResponse {
+    armed: boolean;
+    code?: string;
+    expiresAt?: string;
+    host?: string;
+    /** A credential is already present — pairing would REPLACE it (HJ-10, consented at the joiner). */
+    hasToken: boolean;
+    /** The hub this machine is currently joined to, if any. Re-pairing to a different hub detaches
+     *  from this one (HJ-14). */
+    hubServerId?: string;
+    serverId: string;
+    serverName: string;
+  }
+  /** POST /api/fleet/pair — the hub pushes credentials to an ARMED joiner. Code + tailnet identity are
+   *  both required (§7/§8.2). Mirrors the :7702 `/anvil-pair` body so the two paths stay recognisable. */
+  export interface FleetPairRequest {
+    code: string;
+    token: string; // the fleet's Claude subscription OAuth token
+    hubServerId: string;
+    fleetName?: string;
+    /** Sibling secrets pushed in the same payload — joining a fleet means adopting its config
+     *  (HJ-24/HJ-27). Present keys OVERWRITE; absent keys are left alone. */
+    todoistToken?: string;
+    openRouterKey?: string;
+  }
+  /** The joiner's reply — its own identity, so the hub can record a real member (not a bare host). */
+  export interface FleetPairResponse {
+    ok: boolean;
+    serverId?: string;
+    serverName?: string;
+    url?: string;
+    error?: string;
+  }
+  /** POST /api/fleet/pair/ack — the hub confirms the member is recorded and the joiner disarms (HJ-16).
+   *  Gated exactly as /pair is, and must carry the same hubServerId AND code the window locked to —
+   *  otherwise any tailnet peer could cancel someone else's pairing window mid-flow. Idempotent. */
+  export interface FleetPairAckRequest {
+    code: string;
+    hubServerId: string;
+  }
+  /** POST /api/fleet/token — rotation counterpart: identity-gated (no code), persistent rather than
+   *  armed. See headless-join §8.6 for what `hubServerId` does and does not prove. */
+  export interface FleetTokenRequest {
+    token: string;
+    hubServerId: string;
+    todoistToken?: string;
+    openRouterKey?: string;
   }
   /** GET /api/environments/:id/readme — the repo's README, rendered (arch §8). */
   export interface EnvReadmeResponse {

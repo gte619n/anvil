@@ -21,6 +21,7 @@ import {
   setSessionHash,
 } from "./overlays";
 import { initPush, isAndroidApp, nativeBridge } from "./push";
+import { initSetupTakeover, refreshSetupState } from "./setup";
 import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 
 const strToB64 = (s: string): string => {
@@ -662,6 +663,15 @@ void loadFleetMembers();
 // reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
 if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 else if (deepLinkedAutopilot) openAutopilot(); // bare #autopilot deep link → open the grid
+
+// A daemon with no Claude login can't run a single turn, so the session list would be a lie — take the
+// screen over with the pairing/setup flow instead (headless-join §5.1). No-op on a healthy daemon.
+initSetupTakeover({
+  setToken: async (token) => {
+    const res = await sendAwait(hub(), { type: "auth.set", token, cid: newCid() }, 20_000);
+    if (res.type === "command.error") throw new Error(res.message); // e.g. the metered-key rejection
+  },
+});
 
 // The native shell bridge (nativeBridge/isAndroidApp) and Web Push live in push.ts.
 void initPush();
@@ -2923,6 +2933,10 @@ function onAuthStatus(e: AuthStatusEvent): void {
   if (e.provider === "openrouter") openRouterAuth = state;
   else claudeAuth = state;
   if (document.getElementById("models-panel")) renderModelsPanel();
+  // A Claude-token change is exactly the transition the setup takeover exists for — a pair, a paste, or
+  // an auto-degrade. Re-read health so the screen appears/clears live on every open device, rather than
+  // only on the next reload (anvil-headless-join.md §5.1).
+  if (e.provider !== "openrouter") void refreshSetupState();
 }
 
 /** Persist a new/replacement Claude OAuth token on the hub daemon. */
@@ -4139,13 +4153,15 @@ async function rotateFleetToken(): Promise<void> {
   } catch { toast("Couldn't push the login — is the hub reachable?"); }
 }
 
-/** The "+ Add a Mac" dialog: invite by join code (primary), or adopt a server that's already running. */
+/** The "+ Add a machine" dialog: invite by join code (primary), or adopt a server that's already
+ *  running. Not "Add a Mac" any more — a Linux/headless daemon receives the credential on its own
+ *  :7701 API, so the joiner no longer has to be a Mac (anvil-headless-join.md). */
 function showAddMac(): void {
   const m = document.createElement("div");
   m.className = "modal";
-  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a Mac</h3>
-    <p class="small muted">On the new Mac open <b>Anvil Server → Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
-    <label>Mac<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
+  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a machine</h3>
+    <p class="small muted">On the machine you're adding, open its Anvil web UI (a Mac can also use <b>Anvil Server → Join a fleet</b>) and choose <b>Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
+    <label>Machine<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
     <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" /></label>
     <div id="fleet-status" class="small muted"></div>
     <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
@@ -4158,8 +4174,8 @@ function showAddMac(): void {
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
     const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
     const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
-    if (!host) { setStatus("Pick the Mac you're adding."); return; }
-    if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that Mac is showing."); return; }
+    if (!host) { setStatus("Pick the machine you're adding."); return; }
+    if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that machine is showing."); return; }
     setStatus(`Sending the login to ${host} over the tailnet…`);
     try {
       const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; member?: { url: string }; error?: string };
@@ -4171,7 +4187,7 @@ function showAddMac(): void {
         void loadFleetPeers();
         renderServerCards();
       } else {
-        setStatus(`Rejected: ${r.error ?? "unknown"}. Make sure that Mac's “Join a fleet” screen is still open.`);
+        setStatus(`Rejected: ${r.error ?? "unknown"}. Make sure that machine's “Join a fleet” screen is still open and showing a code.`);
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
@@ -4236,20 +4252,43 @@ async function loadFleetMembers(): Promise<void> {
     /* hub unreachable — cards still render from the locally-known servers */
   }
 }
-/** Fill the "Add a Mac" dropdown from the hub's tailnet peers — so you pick a name, not an IP. */
+/**
+ * Fill the "Add a machine" dropdown from the hub's tailnet peers — so you pick a name, not an IP.
+ *
+ * Peers come from `/api/fleet/peers` (every tailnet node), and discovery (`/api/fleet/discover`, which
+ * probes each peer's `/api/health`) tells us which of them are Anvil daemons *without a Claude login* —
+ * exactly the machines someone is here to add. Those are labelled **"needs setup"** (HJ-9). We use the
+ * honest `subscriptionAuthOk` rather than a separate "pairable" advertisement, so there is only one
+ * signal and it can't disagree with itself; arm-state is deliberately never on the wire.
+ */
 async function loadFleetPeers(): Promise<void> {
   const sel = document.getElementById("fleet-host") as HTMLSelectElement | null;
   if (!sel) return;
   try {
-    const r = (await (await apiFetch("/api/fleet/peers")).json()) as { ok: boolean; peers: { name: string; host: string; online: boolean }[]; warning?: string };
+    const [peersRes, discovered] = await Promise.all([
+      apiFetch("/api/fleet/peers").then((r) => r.json()) as Promise<{ ok: boolean; peers: { name: string; host: string; online: boolean }[]; warning?: string }>,
+      // Discovery is best-effort garnish: without it every candidate simply shows unlabelled.
+      apiFetch("/api/fleet/discover")
+        .then((r) => r.json())
+        .catch(() => ({ servers: [] })) as Promise<{ servers?: { url: string; subscriptionAuthOk?: boolean }[] }>,
+    ]);
+    const needsSetup = new Set(
+      (discovered.servers ?? []).filter((s) => s.subscriptionAuthOk === false).map((s) => hostOf(s.url)),
+    );
     const knownHosts = new Set([...servers.values()].map((s) => hostOf(s.url)));
-    const candidates = (r.peers ?? []).filter((p) => p.online && !knownHosts.has(p.host));
-    if (!r.ok) {
-      sel.innerHTML = `<option value="">${esc(r.warning ?? "Tailscale unavailable")}</option>`;
+    const candidates = (peersRes.peers ?? []).filter((p) => p.online && !knownHosts.has(p.host));
+    if (!peersRes.ok) {
+      sel.innerHTML = `<option value="">${esc(peersRes.warning ?? "Tailscale unavailable")}</option>`;
     } else if (!candidates.length) {
-      sel.innerHTML = `<option value="">No other Macs found on your tailnet</option>`;
+      sel.innerHTML = `<option value="">No other machines found on your tailnet</option>`;
     } else {
-      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}</option>`).join("");
+      // Machines waiting for a login sort first — that's who the operator came here for.
+      candidates.sort((a, b) => Number(needsSetup.has(b.host)) - Number(needsSetup.has(a.host)));
+      sel.innerHTML =
+        `<option value="">Choose a machine…</option>` +
+        candidates
+          .map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}${needsSetup.has(p.host) ? " — needs setup" : ""}</option>`)
+          .join("");
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;
