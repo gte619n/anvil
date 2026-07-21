@@ -327,6 +327,7 @@ anvil/
 | [`docs/plans/anvil-protocol.ts`](docs/plans/anvil-protocol.ts) | The wire protocol — every envelope, event, and command (the source of truth). |
 | [`docs/plans/anvil-impl-INDEX.md`](docs/plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans. |
 | [`docs/plans/anvil-multi-server.md`](docs/plans/anvil-multi-server.md) | Multi-server fleet design (one client, many Macs, one Max plan). |
+| [`docs/plans/anvil-headless-join.md`](docs/plans/anvil-headless-join.md) | Tokenless boot + joining a fleet from a headless (non-Mac) machine. |
 | [`docs/plans/anvil-server-app.md`](docs/plans/anvil-server-app.md) | The menu-bar control panel design. |
 | [`docs/plans/anvil-autopilot-ui.md`](docs/plans/anvil-autopilot-ui.md) · [`anvil-todoist-integration.md`](docs/plans/anvil-todoist-integration.md) | Todoist autopilot + the plan-review UI. |
 | [`docs/plans/anvil-adversarial-pipeline.md`](docs/plans/anvil-adversarial-pipeline.md) | The OpenRouter/GLM adversarial planning panel + the unattended dev pipeline. |
