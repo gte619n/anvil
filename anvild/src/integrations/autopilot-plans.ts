@@ -25,6 +25,40 @@ export function selectPendingPlans(units: WorkUnit[]): WorkUnit[] {
   );
 }
 
+/**
+ * Statuses a work unit can be auto-completed FROM when its source task is checked off in Todoist.
+ * These are the non-terminal, awaiting-a-human states — the ones still riding on the open Todoist
+ * task. A unit that's already completed/expired/dismissed is terminal, and one that's actively
+ * `building` is mid-flight (its live session is handled separately), so neither is reconciled here.
+ */
+export const RECONCILABLE_STATUSES: ReadonlySet<WorkUnit["status"]> = new Set([
+  "planned",
+  "needs-clarification",
+  "blocked",
+  "review",
+]);
+
+/**
+ * Inbound completion sync: which work units should flip to `completed` because the human checked off
+ * their source task(s) in Todoist. A unit qualifies when it's in a reconcilable status, has no live
+ * build session (`isLive`), and EVERY one of its member tasks is in `completedTaskIds` (the set Todoist
+ * reports closed). Requiring all tasks avoids closing a multi-task unit while some of its work is still
+ * open. Pure — the caller persists the status change + broadcasts.
+ */
+export function selectCompletedUnits(
+  units: WorkUnit[],
+  completedTaskIds: ReadonlySet<string>,
+  isLive: (u: WorkUnit) => boolean,
+): WorkUnit[] {
+  return units.filter(
+    (u) =>
+      RECONCILABLE_STATUSES.has(u.status) &&
+      !isLive(u) &&
+      u.taskIds.length > 0 &&
+      u.taskIds.every((id) => completedTaskIds.has(id)),
+  );
+}
+
 /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
 export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, renderer: Pick<MarkdownRenderer, "render">): AutopilotPlanInfo {
   return {
