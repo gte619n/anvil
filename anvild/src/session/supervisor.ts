@@ -66,7 +66,7 @@ import { EnvironmentStore } from "../env/store";
 import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
-import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
+import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint, type LapoConfig } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
@@ -123,6 +123,10 @@ const SCHEDULE_TICK_MS = 5 * 60_000;
  *  > SCHEDULE_TICK_MS so a tick always lands inside it; small enough that a restart well away from the
  *  scheduled time never trips it (see scheduledFireDue — restarts must not launch a run). */
 const SCHEDULE_RUN_WINDOW_MS = 10 * 60_000;
+/** How far back the inbound completion sync looks for tasks checked off in Todoist. Todoist caps the
+ *  completion query at ~3 months; 60 days stays well under that while covering any realistic stretch of
+ *  daemon downtime between the completion and the next reconcile tick. */
+const RECONCILE_WINDOW_DAYS = 60;
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -251,7 +255,13 @@ export class Supervisor {
    *  while the daemon is already running. SCHEDULE_TICK_MS must stay < SCHEDULE_RUN_WINDOW_MS so a tick
    *  always lands inside the window. */
   private startAutopilotScheduler(): void {
-    this.scheduleTimer = setInterval(() => void this.maybeRunScheduled(), SCHEDULE_TICK_MS);
+    this.scheduleTimer = setInterval(() => {
+      void this.maybeRunScheduled();
+      // Todoist has no webhooks, so completion is polled: on every tick, drop any pending plan whose
+      // source task the user has since checked off in Todoist. Independent of whether a scheduled run
+      // is due, so a card clears within a tick of the task being completed even with autopilot idle.
+      void this.reconcileCompletedUnits();
+    }, SCHEDULE_TICK_MS);
     this.scheduleTimer.unref?.();
   }
   /** Keep the sidebar's PR/merge badges fresh for an already-open app: a connect triggers a sweep, but
@@ -851,6 +861,39 @@ export class Supervisor {
     this.broadcastAutopilotPlans();
   }
 
+  /** Inbound completion sync (Todoist → anvil): when the human checks off a plan's source task(s) in
+   *  Todoist, mark that work unit `completed` here too, so the card leaves the grid on its own. Todoist
+   *  has no webhooks, so this polls the completion-date endpoint — driven by the schedule tick and the
+   *  top of every autopilot run. Best-effort: a Todoist hiccup just means we retry next tick; a unit with
+   *  a live build session is left alone (its session, not the checkbox, owns its lifecycle). Returns the
+   *  number of units completed. */
+  async reconcileCompletedUnits(): Promise<number> {
+    if (this.autopilotRunning) return 0; // don't race a run that's mutating the same store
+    const state = this.integrations.todoist();
+    if (!state?.accessToken) return 0;
+    const isLive = (u: WorkUnit): boolean => !!u.sessionId && this.sessions.has(u.sessionId);
+    const pending = this.workUnits
+      .list()
+      .filter((u) => RECONCILABLE_STATUSES.has(u.status) && !isLive(u) && u.taskIds.length > 0);
+    if (pending.length === 0) return 0;
+    // One completion query per distinct project the pending units draw from — this is exactly the set of
+    // boards we care about, whether project- or label-sourced (each unit stores the project its tasks live in).
+    const projectIds = new Set(pending.map((u) => u.todoistProjectId).filter((id): id is string => !!id));
+    const client = new TodoistClient(state.accessToken);
+    const completed = new Set<string>();
+    try {
+      for (const projectId of projectIds) {
+        for (const t of await client.completedTasks({ projectId, windowDays: RECONCILE_WINDOW_DAYS })) completed.add(t.id);
+      }
+    } catch {
+      return 0; // Todoist unreachable/rate-limited — leave the cards as-is and retry next tick
+    }
+    const done = selectCompletedUnits(pending, completed, isLive);
+    for (const u of done) this.workUnits.update(u.id, { status: "completed" });
+    if (done.length > 0) this.broadcastAutopilotPlans();
+    return done.length;
+  }
+
   // ── Autopilot maintenance (Todoist-settings buttons) ──────────────────────────────
   /** Remove the anvil:* status label from each given task (best-effort), keeping the user's own labels —
    *  including the "Autopilot" sourcing label — intact. Returns how many tasks actually had one removed. */
@@ -990,6 +1033,9 @@ export class Supervisor {
     if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
     const state = this.integrations.todoist();
     if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
+    // Clear any plan whose source task was checked off since the last tick before we plan afresh, so a
+    // manual "Run autopilot" reflects completions immediately. Runs before the run marks itself active.
+    await this.reconcileCompletedUnits().catch(() => 0);
     // Run-level abort: the watchdog (below) fires it on timeout so every in-flight Todoist/SDK call
     // unwinds instead of hanging the run open. Threaded into the client and the planning calls.
     const ac = new AbortController();

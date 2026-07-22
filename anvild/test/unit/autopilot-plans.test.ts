@@ -7,7 +7,7 @@
  */
 import { test, expect } from "bun:test";
 import type { WorkUnit } from "../../src/integrations/workunit";
-import { selectPendingPlans, toPlanInfo, buildAutopilotBrief } from "../../src/integrations/autopilot-plans";
+import { selectPendingPlans, selectCompletedUnits, toPlanInfo, buildAutopilotBrief } from "../../src/integrations/autopilot-plans";
 
 const wu = (o: Partial<WorkUnit>): WorkUnit =>
   ({
@@ -48,6 +48,43 @@ test("selectPendingPlans keeps pipeline-run units in review/blocked, but not pla
 
 test("selectPendingPlans excludes unrelated statuses", () => {
   expect(selectPendingPlans([wu({ status: "completed" }), wu({ status: "in-progress" as WorkUnit["status"] })])).toEqual([]);
+});
+
+// ── selectCompletedUnits: inbound Todoist → anvil completion sync ──────────────────
+const notLive = () => false;
+
+test("selectCompletedUnits completes a unit when all its source tasks are checked off in Todoist", () => {
+  const u = wu({ id: "a", status: "planned", taskIds: ["t1", "t2"] });
+  const done = selectCompletedUnits([u], new Set(["t1", "t2"]), notLive);
+  expect(done.map((x) => x.id)).toEqual(["a"]);
+});
+
+test("selectCompletedUnits leaves a multi-task unit alone when only some tasks are done", () => {
+  const u = wu({ id: "a", status: "planned", taskIds: ["t1", "t2"] });
+  expect(selectCompletedUnits([u], new Set(["t1"]), notLive)).toEqual([]);
+});
+
+test("selectCompletedUnits reconciles held/blocked/review units, not terminal or building ones", () => {
+  const ids = ["t"];
+  const completed = new Set(ids);
+  const held = wu({ id: "held", status: "needs-clarification", taskIds: ids });
+  const blocked = wu({ id: "blocked", status: "blocked", taskIds: ids });
+  const review = wu({ id: "review", status: "review", taskIds: ids });
+  const building = wu({ id: "building", status: "building", taskIds: ids });
+  const alreadyDone = wu({ id: "done", status: "completed", taskIds: ids });
+  const dismissed = wu({ id: "dismissed", status: "dismissed", taskIds: ids });
+  const picked = selectCompletedUnits([held, blocked, review, building, alreadyDone, dismissed], completed, notLive);
+  expect(picked.map((u) => u.id).sort()).toEqual(["blocked", "held", "review"]);
+});
+
+test("selectCompletedUnits never completes a unit with a live build session", () => {
+  const u = wu({ id: "a", status: "review", taskIds: ["t1"], sessionId: "sess_1" });
+  expect(selectCompletedUnits([u], new Set(["t1"]), (x) => x.id === "a")).toEqual([]);
+});
+
+test("selectCompletedUnits ignores a unit with no member tasks", () => {
+  const u = wu({ id: "a", status: "planned", taskIds: [] });
+  expect(selectCompletedUnits([u], new Set(), notLive)).toEqual([]);
 });
 
 test("toPlanInfo maps core fields, includes env name + rendered plan, omits absent optionals", () => {

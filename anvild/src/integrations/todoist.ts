@@ -174,6 +174,22 @@ export class TodoistClient {
     return this.getAll<TodoistTask>("/tasks", { label });
   }
 
+  /**
+   * Tasks checked off (completed) in the last `windowDays`, optionally scoped to a project. The active
+   * `tasks()` list omits closed tasks, so this dedicated completion-date endpoint is how anvil learns a
+   * task was finished in Todoist (inbound completion sync). Todoist caps the query window at ~3 months —
+   * `windowDays` must stay comfortably under that. Cursor-paginated like the other list endpoints.
+   */
+  completedTasks(opts: { projectId?: string; windowDays: number }): Promise<TodoistTask[]> {
+    const until = new Date();
+    const since = new Date(until.getTime() - opts.windowDays * 24 * 60 * 60 * 1000);
+    return this.getAll<TodoistTask>("/tasks/completed/by_completion_date", {
+      since: since.toISOString(),
+      until: until.toISOString(),
+      ...(opts.projectId ? { project_id: opts.projectId } : {}),
+    });
+  }
+
   getTask(taskId: string): Promise<TodoistTask> {
     return this.request<TodoistTask>("GET", `/tasks/${taskId}`);
   }
