@@ -21,7 +21,7 @@ import {
   setSessionHash,
 } from "./overlays";
 import { initPush, isAndroidApp, nativeBridge } from "./push";
-import { initSetupTakeover, refreshSetupState } from "./setup";
+import { initSetupTakeover, refreshSetupState, armJoinWindow } from "./setup";
 import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 
 const strToB64 = (s: string): string => {
@@ -4093,6 +4093,7 @@ function renderServerCards(): void {
   document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
+  void maybeRenderRepairCard(host); // this-machine "get a join code" — only when it's already in a fleet
   if (nativeBridge) {
     const bridge = nativeBridge; // local const so the non-undefined narrowing flows into the closures below
     const setOut = (t: string): void => {
@@ -4196,6 +4197,47 @@ function showAddMac(): void {
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
+}
+
+/**
+ * Append a "this machine" card offering a fresh join code — but ONLY when this machine is already in a
+ * fleet. The tokenless setup takeover (setup.ts) is the usual place to get a code, but it renders only
+ * while a machine has NO login; once it's joined (has a login) the takeover never shows, leaving no
+ * in-UI way to re-open a pairing window if the hub later loses the member. This is that missing entry
+ * point. Gated on the LOCAL daemon's arm-state carrying `hubServerId` — present only for a machine
+ * paired to a hub, so it never appears on the hub itself or on an unpaired standalone box.
+ */
+async function maybeRenderRepairCard(host: HTMLElement): Promise<void> {
+  let st: { hubServerId?: string };
+  try {
+    st = (await (await apiFetch("/api/fleet/arm")).json()) as { hubServerId?: string };
+  } catch {
+    return; // daemon unreachable — nothing to offer
+  }
+  if (!st.hubServerId) return; // not joined to a hub → no re-pair to offer (the hub, or a standalone box)
+  host.insertAdjacentHTML(
+    "beforeend",
+    `<div class="card"><div class="card-main">${icon("hub")} <b>This machine</b></div>
+      <div class="small muted">Already in a fleet. If the hub lost track of it, open a join window here and re-enter the code on the hub's <b>Add a machine</b>.</div>
+      <div class="git-row" style="margin-top:10px"><button class="mini" id="fleet-repair">${icon("vpn_key")} Get a join code</button></div>
+    </div>`,
+  );
+  document.getElementById("fleet-repair")?.addEventListener("click", () => showRepairDialog());
+}
+
+/** The "Get a join code" modal for THIS machine (Settings → Fleet). Arms the local daemon — apiFetch
+ *  targets the page's own daemon — and shows a code to enter on the hub's "Add a machine". The
+ *  standard-UI counterpart to the tokenless takeover's "Join a fleet", for an already-set-up machine. */
+function showRepairDialog(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("hub")} Re-pair this machine</h3>
+    <p class="small muted">Opens a join window on <b>this</b> machine. On the hub, open <b>Settings → Fleet → Add a machine</b>, pick this machine, and enter the code below — it re-shares the hub's Claude login with this machine.</p>
+    <div id="repair-panel"></div>
+  </div>`;
+  showModal(m);
+  const p = document.getElementById("repair-panel");
+  if (p) void armJoinWindow(p, { onCancel: () => closeModal() });
 }
 
 /** Click handler for a server card's "Remove": dim the card, eject it from the fleet (if it's a member),

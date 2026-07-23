@@ -190,26 +190,35 @@ async function startJoin(st: ArmState | null): Promise<void> {
 
 async function arm(): Promise<void> {
   const p = panel();
-  if (!p) return;
-  p.innerHTML = `<div class="setup-panel-box"><p class="small muted">${icon("progress_activity")} Opening a join window…</p></div>`;
+  if (p) await armJoinWindow(p, { onCancel: () => void renderTakeover() });
+}
+
+/**
+ * Arm THIS machine's pairing window and render its code (with a live countdown) into `container`.
+ * Shared by the tokenless setup takeover AND the standard-UI "re-pair" entry (main.ts's Fleet
+ * settings), so the arm call, the code display, the countdown, and the cancel-disarms-the-window
+ * behaviour live in exactly one place. `onCancel` runs AFTER the window is disarmed — the takeover
+ * re-renders its menu, the Settings modal closes. `apiFetch` always targets the daemon serving this
+ * page, so this always arms the *local* machine (which is the one whose code the hub must enter).
+ */
+export async function armJoinWindow(container: HTMLElement, opts: { onCancel?: () => void } = {}): Promise<void> {
+  container.innerHTML = `<div class="setup-panel-box"><p class="small muted">${icon("progress_activity")} Opening a join window…</p></div>`;
   let res: { ok?: boolean; code?: string; expiresAt?: string; host?: string; error?: string };
   try {
     res = await (await apiFetch("/api/fleet/arm", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
   } catch {
-    p.innerHTML = `<div class="setup-panel-box setup-warn"><p>Couldn't reach this machine's daemon to open a join window.</p></div>`;
+    container.innerHTML = `<div class="setup-panel-box setup-warn"><p>Couldn't reach this machine's daemon to open a join window.</p></div>`;
     return;
   }
   if (!res.ok || !res.code) {
-    p.innerHTML = `<div class="setup-panel-box setup-warn"><p>${esc(res.error ?? "Couldn't open a join window.")}</p></div>`;
+    container.innerHTML = `<div class="setup-panel-box setup-warn"><p>${esc(res.error ?? "Couldn't open a join window.")}</p></div>`;
     return;
   }
-  renderCode(res.code, res.expiresAt, res.host);
+  renderCode(container, res.code, res.expiresAt, res.host, opts);
 }
 
-function renderCode(code: string, expiresAt?: string, host?: string): void {
-  const p = panel();
-  if (!p) return;
-  p.innerHTML = `<div class="setup-panel-box setup-code-box">
+function renderCode(container: HTMLElement, code: string, expiresAt: string | undefined, host: string | undefined, opts: { onCancel?: () => void }): void {
+  container.innerHTML = `<div class="setup-panel-box setup-code-box">
     <p class="small muted">On another Anvil machine, open <b>Settings → Servers → Add a machine</b>, pick
       <b>${esc(host ?? "this machine")}</b>, and enter this code:</p>
     <div class="setup-code">${esc(code.replace(/(\d{3})(\d{3})/, "$1 $2"))}</div>
@@ -220,7 +229,7 @@ function renderCode(code: string, expiresAt?: string, host?: string): void {
   </div>`;
   document.getElementById("setup-cancel-arm")?.addEventListener("click", () => {
     void apiFetch("/api/fleet/arm", { method: "DELETE" }).catch(() => {});
-    void renderTakeover();
+    opts.onCancel?.();
   });
 
   const end = expiresAt ? new Date(expiresAt).getTime() : 0;

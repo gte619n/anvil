@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, peerBases, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
 
 const SELF_STATUS = JSON.stringify({ Self: { DNSName: "mymac.tail-scale.ts.net." } });
 
@@ -93,6 +93,62 @@ test("parseTailscalePeers: Self + peers, trailing dot stripped, online flags car
   expect(peers.find((p) => p.dnsName === "asleep.tail-scale.ts.net")?.online).toBe(false);
 });
 
+test("parseTailscalePeers: carries the CGNAT tailnet IPv4, and admits an IP-only (no-MagicDNS) peer", () => {
+  const status = JSON.stringify({
+    Self: { DNSName: "hub.ts.net.", TailscaleIPs: ["fd7a:aaaa::1", "100.100.1.1"] },
+    Peer: {
+      // MagicDNS OFF for this node: no DNSName, only a tailnet IP. Must NOT be dropped.
+      nameless: { Online: true, TailscaleIPs: ["100.64.9.9", "fd7a:bbbb::2"] },
+      // A non-CGNAT address (e.g. a subnet route) is not a tailnet IP → not picked up.
+      lan: { DNSName: "lan.ts.net.", Online: true, TailscaleIPs: ["192.168.1.5"] },
+    },
+  });
+  const peers = parseTailscalePeers(status);
+  expect(peers).toContainEqual({ dnsName: "hub.ts.net", online: true, isSelf: true, ipv4: "100.100.1.1" });
+  expect(peers).toContainEqual({ dnsName: "", online: true, isSelf: false, ipv4: "100.64.9.9" });
+  expect(peers.find((p) => p.dnsName === "lan.ts.net")).toEqual({ dnsName: "lan.ts.net", online: true, isSelf: false }); // no CGNAT ip
+});
+
+test("peerBases: name → https+http; IP → http only; both → all three in preference order", () => {
+  expect(peerBases({ dnsName: "m.ts.net" }, 7701)).toEqual(["https://m.ts.net:7701", "http://m.ts.net:7701"]);
+  expect(peerBases({ ipv4: "100.64.9.9" }, 7701)).toEqual(["http://100.64.9.9:7701"]); // no https to a bare IP (no cert)
+  expect(peerBases({ dnsName: "m.ts.net", ipv4: "100.64.9.9" }, 7701)).toEqual([
+    "https://m.ts.net:7701",
+    "http://m.ts.net:7701",
+    "http://100.64.9.9:7701",
+  ]);
+});
+
+test("discoverFleet: reaches an IP-only (no-MagicDNS) peer over http on its tailnet IP", async () => {
+  const status = JSON.stringify({
+    Self: { DNSName: "hub.ts.net.", TailscaleIPs: ["100.100.1.1"] },
+    Peer: { nameless: { Online: true, TailscaleIPs: ["100.64.9.9"] } },
+  });
+  const probed: string[] = [];
+  const probe = async (baseUrl: string): Promise<ProbeResult | null> => {
+    probed.push(baseUrl);
+    if (baseUrl === "https://hub.ts.net:7701") return { serverId: "srv_hub", serverName: "Hub", version: "1.0.0" };
+    if (baseUrl === "http://100.64.9.9:7701") return { serverId: "srv_beelink", serverName: "", version: "1.0.0" };
+    return null;
+  };
+  const res = await discoverFleet({ port: 7701, selfServerId: "srv_hub", runTailscale: async () => status, probe });
+
+  expect(probed).toContain("http://100.64.9.9:7701"); // the IP-only peer was probed on its IP
+  expect(probed).not.toContain("https://100.64.9.9:7701"); // never https to a bare IP
+  const beelink = res.servers.find((s) => s.serverId === "srv_beelink")!;
+  expect(beelink.url).toBe("http://100.64.9.9:7701");
+  expect(beelink.serverName).toBe("100.64.9.9"); // no reported name, no dnsName → IP is the label
+});
+
+test("tailnetPeers: an IP-only node is listed with the IP as both label and host", async () => {
+  const status = JSON.stringify({
+    Self: { DNSName: "hub.ts.net." },
+    Peer: { nameless: { Online: true, TailscaleIPs: ["100.64.9.9"] } },
+  });
+  const r = await tailnetPeers(async () => status);
+  expect(r.peers).toContainEqual({ name: "100.64.9.9", host: "100.64.9.9", online: true });
+});
+
 test("discoverFleet: probes https then http per peer, flags self, dedups by serverId", async () => {
   const probed: string[] = [];
   // mac-mini = this hub (serve-capable → https). laptop = an App-Store-Tailscale peer that only
@@ -173,6 +229,14 @@ test("propagateTodoist: falls back to http for a direct-bind (App Store) member"
     "https://plain.ts.net:7701/api/integrations/todoist", // tried first, threw
     "http://plain.ts.net:7701/api/integrations/todoist", // fell back
   ]);
+});
+
+test("propagateTodoist: a bare-IP member is reached over http only (no wasted https probe to a certless IP)", async () => {
+  const { fn, calls } = fakeFetch((u) => (u.startsWith("http://100.64.9.9:7701") ? { body: { ok: true } } : "throw"));
+  const [r] = await propagateTodoist({ members: [{ url: "http://100.64.9.9:7701/", host: "100.64.9.9" }], token: "tok", fetchImpl: fn });
+  expect(r!.ok).toBe(true);
+  expect(r!.resolvedUrl).toBe("http://100.64.9.9:7701/");
+  expect(calls).toEqual(["http://100.64.9.9:7701/api/integrations/todoist"]); // http only — https to a bare IP is skipped
 });
 
 test("propagateTodoist: unreachable on both schemes → ok:false, no throw", async () => {

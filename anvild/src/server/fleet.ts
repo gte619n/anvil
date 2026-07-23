@@ -13,7 +13,11 @@ import { tailnetIPv4 } from "../config";
  */
 
 export interface TailscalePeer {
-  dnsName: string; // MagicDNS name, trailing dot stripped
+  dnsName: string; // MagicDNS name, trailing dot stripped ("" when the node has none)
+  /** The node's CGNAT-range (100.64.0.0/10) tailnet IPv4, if any. This is the reachability floor:
+   *  it needs no DNS at all, so it's the ONLY address that works when MagicDNS is disabled on the
+   *  tailnet (or a node simply has no name). Reached over plain http (a bare IP has no TLS cert). */
+  ipv4?: string;
   online: boolean;
   isSelf: boolean;
 }
@@ -51,23 +55,77 @@ export async function tailnetPeers(runTailscale: RunTailscale = defaultRunTailsc
     return { ok: false, peers: [], warning: "Couldn't parse `tailscale status --json`." };
   }
   const peers = parsed
-    .filter((p) => !p.isSelf && p.dnsName)
-    .map((p) => ({ name: p.dnsName.split(".")[0]!, host: p.dnsName, online: p.online }));
+    .filter((p) => !p.isSelf && (p.dnsName || p.ipv4))
+    .map((p) => ({
+      // Prefer the friendly short name; for an IP-only node (no MagicDNS) the IP IS the label/host.
+      name: p.dnsName ? p.dnsName.split(".")[0]! : p.ipv4!,
+      host: p.dnsName || p.ipv4!,
+      online: p.online,
+    }));
   return { ok: true, peers };
 }
 
-/** Parse `tailscale status --json` into the peers we might probe (Self + every Peer). */
+/** The CGNAT-range (100.64.0.0/10) IPv4 from a Tailscale node's `TailscaleIPs`, if present. Mirrors
+ *  the interface-based {@link tailnetIPv4} in config.ts, but reads the address off the status JSON so
+ *  it works for *peers* (whose interfaces we can't see), not just self. */
+function cgnatIPv4(ips?: string[]): string | undefined {
+  for (const ip of ips ?? []) {
+    const o = ip.split(".");
+    if (o.length !== 4) continue; // skip IPv6 (fd7a:…) and anything malformed
+    const a = Number(o[0]);
+    const b = Number(o[1]);
+    if (a === 100 && b >= 64 && b <= 127) return ip;
+  }
+  return undefined;
+}
+
+/** True for a bare IPv4 literal (as opposed to a MagicDNS name). Used to skip the pointless https
+ *  probe to a raw tailnet IP — no TLS cert exists for a 100.x address, so only http reaches it. */
+function isBareIPv4(host: string): boolean {
+  const o = host.split(".");
+  return o.length === 4 && o.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+}
+
+/**
+ * Candidate `:7701` daemon base URLs for a host, most-preferred first. A MagicDNS name is tried over
+ * https (serve mode — the joiner binds loopback and only https reaches it) then http (a direct-bind
+ * host answers only http). A bare tailnet IP is http-ONLY: a 100.x literal has no TLS cert, so an
+ * https attempt to it is a guaranteed-wasted probe (and a wasted timeout). Shared by every reach path
+ * — discovery, pairing/rotation, ack, Todoist propagation — so they agree on scheme order.
+ */
+function daemonBases(host: string, port: number | string): string[] {
+  return isBareIPv4(host) ? [`http://${host}:${port}`] : [`https://${host}:${port}`, `http://${host}:${port}`];
+}
+
+/** Every base URL worth probing for a discovered peer, preferred first: its MagicDNS name (https then
+ *  http) and/or its raw tailnet IP (http only). The IP leg is what keeps an IP-only peer — MagicDNS
+ *  off, or no name — reachable instead of invisible. */
+export function peerBases(peer: { dnsName?: string; ipv4?: string }, port: number): string[] {
+  const bases: string[] = [];
+  if (peer.dnsName) bases.push(...daemonBases(peer.dnsName, port));
+  if (peer.ipv4) bases.push(`http://${peer.ipv4}:${port}`);
+  return bases;
+}
+
+/** Parse `tailscale status --json` into the peers we might probe (Self + every Peer). A node is
+ *  admitted if it's reachable by EITHER a MagicDNS name OR a raw tailnet IP — dropping IP-only nodes
+ *  (the no-MagicDNS case) made them invisible even though http://<ip>:7701 reaches them fine. */
 export function parseTailscalePeers(statusJson: string): TailscalePeer[] {
   const s = JSON.parse(statusJson) as {
-    Self?: { DNSName?: string };
-    Peer?: Record<string, { DNSName?: string; Online?: boolean }>;
+    Self?: { DNSName?: string; TailscaleIPs?: string[] };
+    Peer?: Record<string, { DNSName?: string; Online?: boolean; TailscaleIPs?: string[] }>;
   };
   const strip = (d?: string): string => (d ?? "").replace(/\.$/, "");
   const out: TailscalePeer[] = [];
-  if (s.Self?.DNSName) out.push({ dnsName: strip(s.Self.DNSName), online: true, isSelf: true });
-  for (const peer of Object.values(s.Peer ?? {})) {
-    if (peer.DNSName) out.push({ dnsName: strip(peer.DNSName), online: !!peer.Online, isSelf: false });
-  }
+  const add = (node: { DNSName?: string; TailscaleIPs?: string[] } | undefined, online: boolean, isSelf: boolean): void => {
+    if (!node) return;
+    const dnsName = strip(node.DNSName);
+    const ipv4 = cgnatIPv4(node.TailscaleIPs);
+    if (!dnsName && !ipv4) return; // no way to reach it — neither a name nor a tailnet IP
+    out.push({ dnsName, online, isSelf, ...(ipv4 ? { ipv4 } : {}) });
+  };
+  add(s.Self, true, true);
+  for (const peer of Object.values(s.Peer ?? {})) add(peer, !!peer.Online, false);
   return out;
 }
 
@@ -102,14 +160,15 @@ async function defaultRunTailscale(): Promise<string | null> {
  * serverId/serverName — important because the `:7702` pairing outcome may omit a serverId, and falling
  * back to the bare host as the serverId silently breaks *targeted* token propagation (members are
  * matched by serverId). Defaults to http with no identity if neither scheme answers (the member may
- * still be starting up) so the registry still gets a usable entry. `host` is a bare MagicDNS name.
+ * still be starting up) so the registry still gets a usable entry. `host` is a bare MagicDNS name or,
+ * when MagicDNS is off, a raw tailnet IP (http-only — see {@link daemonBases}).
  */
 export async function resolveMember(
   host: string,
   port: number,
   probe: Probe = defaultProbe,
 ): Promise<{ url: string; serverId?: string; serverName?: string; capabilities?: string[]; subscriptionAuthOk?: boolean }> {
-  for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
+  for (const base of daemonBases(host, port)) {
     const r = await probe(base);
     // `capabilities` rides along so the invite path can pick a push destination from what the joiner
     // actually advertises rather than guessing (headless-join HJ-15) — same probe, no extra round trip.
@@ -225,10 +284,10 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
   // name; App-Store-Tailscale hosts bind the tailnet IP directly and answer over plain http. So try
   // https first, then http, and record whichever URL answered (server-side fetch isn't subject to
   // the browser's ts.net HSTS, so http://<name> reaches a direct-bind peer fine).
-  const targets = peers.filter((p) => p.online && p.dnsName);
+  const targets = peers.filter((p) => p.online && (p.dnsName || p.ipv4));
   const probed = await Promise.all(
     targets.map(async (p) => {
-      for (const url of [`https://${p.dnsName}:${opts.port}`, `http://${p.dnsName}:${opts.port}`]) {
+      for (const url of peerBases(p, opts.port)) {
         const r = await probe(url);
         if (r) return { ...r, peer: p, url };
       }
@@ -241,7 +300,7 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
     if (!x || byId.has(x.serverId)) continue; // dedup by serverId (first address wins)
     byId.set(x.serverId, {
       serverId: x.serverId,
-      serverName: x.serverName || x.peer.dnsName,
+      serverName: x.serverName || x.peer.dnsName || x.peer.ipv4 || x.url,
       url: x.url,
       version: x.version,
       online: true,
@@ -360,7 +419,7 @@ async function pushCredential(opts: {
 
   if (speaksPairing(opts.capabilities)) {
     let last: PairOutcome = { ok: false, error: "no reachable transport" };
-    for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
+    for (const base of daemonBases(host, port)) {
       const r = await postPairing(`${base}${opts.daemonPath}`, opts.body, 12_000, doFetch);
       if (r.ok) return r;
       last = r;
@@ -435,7 +494,7 @@ export async function ackPair(opts: {
   const host = bareHost(opts.host);
   const port = opts.port ?? 7701;
   let last: PairOutcome = { ok: false, error: "no reachable transport" };
-  for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
+  for (const base of daemonBases(host, port)) {
     const r = await postPairing(`${base}/api/fleet/pair/ack`, { code: opts.code, hubServerId: opts.hubServerId }, 8_000, opts.fetchImpl ?? fetch);
     if (r.ok) return r;
     last = r;
@@ -444,11 +503,12 @@ export async function ackPair(opts: {
 }
 
 /**
- * Candidate daemon base URLs for a member, https first then http. We deliberately re-derive these from
- * the member's host:port and IGNORE the stored scheme: a member's transport can change after pairing
- * (e.g. `tailscale serve` HTTPS comes up only after the join), and a token POST sent to the wrong scheme
- * is hard-rejected ("Client sent an HTTP request to an HTTPS server") — silently stranding the member
- * without a token forever. Trying both schemes lets propagation self-correct a stale registry entry.
+ * Candidate daemon base URLs for a member, https first then http (http only for a bare IP host — see
+ * {@link daemonBases}). We deliberately re-derive these from the member's host:port and IGNORE the
+ * stored scheme: a member's transport can change after pairing (e.g. `tailscale serve` HTTPS comes up
+ * only after the join), and a token POST sent to the wrong scheme is hard-rejected ("Client sent an
+ * HTTP request to an HTTPS server") — silently stranding the member without a token forever. Trying
+ * both schemes lets propagation self-correct a stale registry entry.
  */
 function memberBases(m: { url: string; host?: string }): string[] {
   let host = m.host ?? "";
@@ -460,7 +520,7 @@ function memberBases(m: { url: string; host?: string }): string[] {
   } catch {
     /* malformed stored url — fall back to the bare host on the default port */
   }
-  return host ? [`https://${host}:${port}`, `http://${host}:${port}`] : [];
+  return host ? daemonBases(host, port) : [];
 }
 
 /**
