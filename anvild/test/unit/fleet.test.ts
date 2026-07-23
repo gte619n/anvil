@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, peerBases, planMemberUrlHeals, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, peerBases, peerIPv4, planMemberUrlHeals, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
 
 const SELF_STATUS = JSON.stringify({ Self: { DNSName: "mymac.tail-scale.ts.net." } });
 
@@ -109,14 +109,44 @@ test("parseTailscalePeers: carries the CGNAT tailnet IPv4, and admits an IP-only
   expect(peers.find((p) => p.dnsName === "lan.ts.net")).toEqual({ dnsName: "lan.ts.net", online: true, isSelf: false }); // no CGNAT ip
 });
 
-test("peerBases: name → https+http; IP → http only; both → all three in preference order", () => {
+test("peerBases: https-name first, then IP-before-name for http (a plain-http member resolves to its IP)", () => {
   expect(peerBases({ dnsName: "m.ts.net" }, 7701)).toEqual(["https://m.ts.net:7701", "http://m.ts.net:7701"]);
   expect(peerBases({ ipv4: "100.64.9.9" }, 7701)).toEqual(["http://100.64.9.9:7701"]); // no https to a bare IP (no cert)
+  // Both: the http IP leg is tried BEFORE the http name leg, so whichever answers records the DNS-free IP
+  // url for a plain-http daemon while a serve-mode Mac still wins on https://name.
   expect(peerBases({ dnsName: "m.ts.net", ipv4: "100.64.9.9" }, 7701)).toEqual([
     "https://m.ts.net:7701",
-    "http://m.ts.net:7701",
     "http://100.64.9.9:7701",
+    "http://m.ts.net:7701",
   ]);
+});
+
+test("resolveMember: with the tailnet IP, a plain-http member is recorded at http://<ip>, not the MagicDNS name", async () => {
+  const probed: string[] = [];
+  const probe = async (baseUrl: string): Promise<ProbeResult | null> => {
+    probed.push(baseUrl);
+    // Serve-mode https on the name fails (this is a plain-http box); both http legs would answer, but the
+    // IP leg is tried first so it's the one recorded.
+    if (baseUrl.startsWith("http://100.116.161.46:7701")) return { serverId: "srv_beelink", serverName: "beelink", version: "1.0.0" };
+    if (baseUrl.startsWith("http://beelink.ts.net:7701")) return { serverId: "srv_beelink", serverName: "beelink", version: "1.0.0" };
+    return null; // https://beelink.ts.net → no cert/serve
+  };
+  const r = await resolveMember("beelink.ts.net", 7701, probe, "100.116.161.46");
+  expect(r.url).toBe("http://100.116.161.46:7701/");
+  expect(r.serverId).toBe("srv_beelink");
+  // https://name is tried first (fails), then the IP answers and resolution stops — the http name leg is
+  // never even reached, proving the IP is strictly preferred over the name for http.
+  expect(probed).toEqual(["https://beelink.ts.net:7701", "http://100.116.161.46:7701"]);
+});
+
+test("peerIPv4: maps a MagicDNS name to its CGNAT tailnet IPv4 from status; passes a bare IP through", async () => {
+  const status = JSON.stringify({
+    Self: { DNSName: "hub.ts.net." },
+    Peer: { beelink: { DNSName: "beelink.ts.net.", Online: true, TailscaleIPs: ["fd7a::9", "100.116.161.46"] } },
+  });
+  expect(await peerIPv4("beelink.ts.net", async () => status)).toBe("100.116.161.46");
+  expect(await peerIPv4("100.116.161.46", async () => status)).toBe("100.116.161.46"); // already an IP
+  expect(await peerIPv4("unknown.ts.net", async () => status)).toBeUndefined(); // no such peer
 });
 
 test("discoverFleet: reaches an IP-only (no-MagicDNS) peer over http on its tailnet IP", async () => {

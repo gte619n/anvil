@@ -97,13 +97,22 @@ function daemonBases(host: string, port: number | string): string[] {
   return isBareIPv4(host) ? [`http://${host}:${port}`] : [`https://${host}:${port}`, `http://${host}:${port}`];
 }
 
-/** Every base URL worth probing for a discovered peer, preferred first: its MagicDNS name (https then
- *  http) and/or its raw tailnet IP (http only). The IP leg is what keeps an IP-only peer — MagicDNS
- *  off, or no name — reachable instead of invisible. */
+/**
+ * Every base URL worth probing for a discovered peer, most-preferred first:
+ *   1. `https://<name>`  — serve-mode (Mac) daemons: TLS cert is bound to the MagicDNS name, so the
+ *      name is mandatory here and can't be swapped for the IP.
+ *   2. `http://<ip>`     — plain-http (direct-bind) daemons: preferred over the name because a non-TLS
+ *      daemon gains nothing from MagicDNS (no cert to match) and the raw tailnet IP needs no DNS, so it
+ *      stays reachable when MagicDNS is down. This is what makes a plain-http member's stored url a
+ *      DNS-independent `http://100.x:7701` instead of a name that dies with the resolver.
+ *   3. `http://<name>`   — last-ditch fallback if the IP probe is somehow blocked but the name resolves.
+ * Whichever answers first becomes the recorded url, so the ORDER here decides how a member is addressed.
+ */
 export function peerBases(peer: { dnsName?: string; ipv4?: string }, port: number): string[] {
   const bases: string[] = [];
-  if (peer.dnsName) bases.push(...daemonBases(peer.dnsName, port));
+  if (peer.dnsName && !isBareIPv4(peer.dnsName)) bases.push(`https://${peer.dnsName}:${port}`);
   if (peer.ipv4) bases.push(`http://${peer.ipv4}:${port}`);
+  if (peer.dnsName) bases.push(`http://${peer.dnsName}:${port}`);
   return bases;
 }
 
@@ -167,8 +176,13 @@ export async function resolveMember(
   host: string,
   port: number,
   probe: Probe = defaultProbe,
+  ipv4?: string,
 ): Promise<{ url: string; serverId?: string; serverName?: string; capabilities?: string[]; subscriptionAuthOk?: boolean }> {
-  for (const base of daemonBases(host, port)) {
+  // With the peer's tailnet IP in hand, probe IP-before-name for http (via peerBases) so a plain-http
+  // member is recorded at its DNS-independent http://<ip> url, not a MagicDNS name. Without it, fall
+  // back to name-only ordering.
+  const bases = ipv4 ? peerBases({ dnsName: isBareIPv4(host) ? undefined : host, ipv4 }, port) : daemonBases(host, port);
+  for (const base of bases) {
     const r = await probe(base);
     // `capabilities` rides along so the invite path can pick a push destination from what the joiner
     // actually advertises rather than guessing (headless-join HJ-15) — same probe, no extra round trip.
@@ -188,6 +202,24 @@ export async function resolveMember(
 /** URL-only convenience over {@link resolveMember} (kept for callers that don't need the identity). */
 export async function resolveMemberUrl(host: string, port: number, probe: Probe = defaultProbe): Promise<string> {
   return (await resolveMember(host, port, probe)).url;
+}
+
+/**
+ * The CGNAT tailnet IPv4 for a peer host (a MagicDNS name), read from `tailscale status`. Returns the
+ * host unchanged if it's already a bare IP, or undefined when the peer has no tailnet IPv4 or status is
+ * unavailable. Feeds {@link resolveMember}'s `ipv4` so the invite path records a plain-http member at its
+ * DNS-independent http://<ip> url the moment it's paired — not a MagicDNS name that dies with the resolver.
+ */
+export async function peerIPv4(host: string, runTailscale: RunTailscale = defaultRunTailscale): Promise<string | undefined> {
+  if (isBareIPv4(host)) return host;
+  const status = await runTailscale();
+  if (!status) return undefined;
+  try {
+    const bare = host.replace(/\.$/, "");
+    return parseTailscalePeers(status).find((p) => p.dnsName === bare)?.ipv4;
+  } catch {
+    return undefined;
+  }
 }
 
 async function defaultProbe(baseUrl: string): Promise<ProbeResult | null> {

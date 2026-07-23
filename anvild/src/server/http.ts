@@ -6,7 +6,7 @@ import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
 import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
-import { ackPair, discoverFleet, invitePeer, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import { ackPair, discoverFleet, invitePeer, peerIPv4, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import {
   DEFAULT_ARM_TTL_MS,
   PairedHubStore,
@@ -409,11 +409,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (url.pathname === "/api/fleet/invite" && req.method === "POST") {
         const { host, code } = (await req.json().catch(() => ({}))) as Partial<rest.FleetInviteRequest>;
         if (!host || !code) return new Response("host and code required", { status: 400 });
+        // Resolve the joiner's tailnet IP up front so a plain-http member is recorded at its DNS-free
+        // http://<ip> url rather than a MagicDNS name (which strands the member the moment MagicDNS drops).
+        const memberIp = await peerIPv4(host);
         // Ask the joiner what it speaks BEFORE pushing, so the destination is a lookup rather than a
         // guess (HJ-15/§3.5). A peer that answers without capabilities is a pre-capability daemon →
         // :7702. `invitePeer` still falls back on a 404/405 from :7701, for an un-upgraded Mac that
         // answers on the daemon port but has no such route.
-        const preflight = await resolveMember(host, opts.port);
+        const preflight = await resolveMember(host, opts.port, undefined, memberIp);
         const outcome = await invitePeer({
           host,
           code,
@@ -429,7 +432,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
         // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
         // breaks targeted token propagation (members are matched by serverId).
-        const resolved = await resolveMember(host, opts.port);
+        const resolved = await resolveMember(host, opts.port, undefined, memberIp);
         const member: rest.FleetMember = {
           serverId: resolved.serverId || outcome.serverId || host,
           serverName: outcome.serverName || resolved.serverName || host,
