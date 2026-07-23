@@ -6132,7 +6132,9 @@ function showQuestion(requestId: string, questions: Question[]): void {
 
   questionCards.set(requestId, card);
   conversation.appendChild(card);
-  scrollDown();
+  // Bring the *top* of the question block to the top of the view (not the bottom) so a tall
+  // multi-question block starts at its first question instead of scrolling past the title.
+  card.scrollIntoView({ block: "start" });
 }
 
 /** Fire a question answer; queue it for reconnect instead of dropping it if we're momentarily offline. */
