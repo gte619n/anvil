@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, peerBases, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, peerBases, planMemberUrlHeals, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
 
 const SELF_STATUS = JSON.stringify({ Self: { DNSName: "mymac.tail-scale.ts.net." } });
 
@@ -147,6 +147,27 @@ test("tailnetPeers: an IP-only node is listed with the IP as both label and host
   });
   const r = await tailnetPeers(async () => status);
   expect(r.peers).toContainEqual({ name: "100.64.9.9", host: "100.64.9.9", online: true });
+});
+
+test("planMemberUrlHeals: heals a MagicDNS-off member from its dead name-url to the rediscovered IP-url", () => {
+  const members = [
+    { serverId: "srv_beelink", url: "https://beelink.ts.net:7701" }, // name went dark (MagicDNS off)
+    { serverId: "srv_mini", url: "https://mini.ts.net:7701" }, // still reachable at the same url
+  ];
+  const discovered = [
+    { serverId: "srv_beelink", url: "http://100.64.9.9:7701" }, // same machine, now only on its tailnet IP
+    { serverId: "srv_mini", url: "https://mini.ts.net:7701" },
+  ];
+  expect(planMemberUrlHeals(members, discovered)).toEqual([{ serverId: "srv_beelink", url: "http://100.64.9.9:7701" }]);
+});
+
+test("planMemberUrlHeals: skips legacy (non-srv_) records and members absent from discovery", () => {
+  const members = [
+    { serverId: "beelink.ts.net", url: "https://beelink.ts.net:7701" }, // legacy bare-host id → resolveMember's job
+    { serverId: "srv_offline", url: "https://offline.ts.net:7701" }, // not in discovery (offline) → leave as-is
+  ];
+  const discovered = [{ serverId: "beelink.ts.net", url: "http://100.64.9.9:7701" }];
+  expect(planMemberUrlHeals(members, discovered)).toEqual([]);
 });
 
 test("discoverFleet: probes https then http per peer, flags self, dedups by serverId", async () => {

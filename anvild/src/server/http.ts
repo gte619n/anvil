@@ -6,7 +6,7 @@ import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
 import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
-import { ackPair, discoverFleet, invitePeer, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import { ackPair, discoverFleet, invitePeer, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import {
   DEFAULT_ARM_TTL_MS,
   PairedHubStore,
@@ -277,6 +277,34 @@ export function createServer(opts: ServerOptions): ServerHandle {
     );
   }
 
+  // A member paired under a MagicDNS name goes dark the moment the tailnet disables MagicDNS: its stored
+  // `https://name.ts.net:7701` no longer resolves, so every client renders it disconnected and there's no
+  // name to re-probe. `healStaleFleetRecords` can't help — it dials the same dead name. This pass instead
+  // runs a full discovery (which now reaches IP-only peers over `http://<tailnet-ip>`), correlates by
+  // serverId, and rewrites any member's url to the address that actually answered — so clients reconnect
+  // and token propagation (memberBases re-derives the host from the url) targets the live IP. Throttled and
+  // fire-and-forget: discovery probes every online peer, so we never block the members GET on it.
+  let lastUrlHealAt = 0;
+  async function healFleetUrlsByDiscovery(): Promise<void> {
+    if (!fleet.list().some((m) => m.serverId.startsWith("srv_"))) return; // nothing correlatable to heal
+    const now = Date.now();
+    if (now - lastUrlHealAt < 20_000) return; // bound the probe cost across a client's polling
+    lastUrlHealAt = now;
+    let disco: rest.FleetDiscoverResponse;
+    try {
+      disco = await discoverFleet({ port: opts.port, selfServerId: identity.serverId });
+    } catch {
+      return; // tailscale unavailable — nothing to reconcile against
+    }
+    if (!disco.ok) return;
+    for (const heal of planMemberUrlHeals(fleet.list(), disco.servers)) {
+      const stored = fleet.list().find((m) => m.serverId === heal.serverId);
+      if (!stored || stored.url === heal.url) continue; // re-read: a concurrent upsert may have moved it
+      fleet.upsert({ ...stored, url: heal.url });
+      console.log(`[fleet] healed member URL ${stored.url} → ${heal.url} (via discovery)`);
+    }
+  }
+
   const WS = {
     open(ws: ServerWebSocket<ConnState>) {
       registry.add(ws);
@@ -371,6 +399,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
       if (url.pathname === "/api/fleet/members" && req.method === "GET") {
         await healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
+        void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP; healed url lands on the next poll
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
       }
       // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).

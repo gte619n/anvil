@@ -312,6 +312,30 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
   return { ok: true, servers: [...byId.values()] };
 }
 
+/**
+ * Reconcile stored fleet members against a fresh discovery pass and return the `{ serverId, url }` heals
+ * to apply: a member whose real serverId was just rediscovered at a *different, reachable* address. The
+ * canonical trigger is MagicDNS going dark — a member paired under `https://name.ts.net:7701` stops
+ * resolving and now answers only on its raw tailnet IP (`http://100.x:7701`), so its stored url is dead
+ * and every client renders it disconnected. Matching by **serverId** (not host) is what lets a name↔IP
+ * swap still correlate; a bare scheme change (http→https once `tailscale serve` comes up) heals the same
+ * way. Only `srv_…` members are considered — legacy bare-host records heal via {@link resolveMember}
+ * instead — and a member absent from discovery (merely offline) is left untouched, never blanked.
+ */
+export function planMemberUrlHeals(
+  members: readonly { serverId: string; url: string }[],
+  discovered: readonly { serverId: string; url: string }[],
+): { serverId: string; url: string }[] {
+  const urlById = new Map(discovered.map((d) => [d.serverId, d.url]));
+  const heals: { serverId: string; url: string }[] = [];
+  for (const m of members) {
+    if (!m.serverId.startsWith("srv_")) continue; // unresolved legacy record — resolveMember's job
+    const url = urlById.get(m.serverId);
+    if (url && url !== m.url) heals.push({ serverId: m.serverId, url });
+  }
+  return heals;
+}
+
 // ─── Hub-side token distribution (anvil-server-app.md §4 · anvil-headless-join.md §5.4/§6) ─────
 // The hub daemon pushes ITS subscription token to a joiner so the fleet can be managed from any
 // client — web/Android/Mac — without touching the hub's Mac app. The token is read from the daemon's

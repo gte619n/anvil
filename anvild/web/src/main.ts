@@ -160,6 +160,16 @@ const hostOf = (url: string): string => {
     return url;
   }
 };
+// Port-stripped hostname. Fleet members are stored under a bare host ("beelink.ts.net"), but a card's
+// url carries the :7701 port — matching the two (e.g. to eject a member on Remove) has to compare the
+// hostname alone, or the lookup silently misses and the eject never fires.
+const hostnameOf = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url.replace(/:\d+$/, "");
+  }
+};
 const servers = new Map<string, Server>(); // keyed by url
 const sessionServer = new Map<string, string>(); // sessionId → server url (outbound routing)
 const envServer = new Map<string, string>(); // environmentId → server url (grouping/routing)
@@ -4256,12 +4266,16 @@ async function confirmRemoveServer(srv: Server): Promise<void> {
   const btn = document.getElementById(`srv-remove-${cssId(srv.url)}`) as HTMLButtonElement | null;
   card?.classList.add("removing"); // dim + ignore further clicks until this resolves
   if (btn) { btn.disabled = true; btn.innerHTML = `${icon("progress_activity")} Removing…`; btn.querySelector(".msym")?.classList.add("spin"); }
-  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login.
-  const memberId = fleetMemberIdByHost.get(hostOf(srv.url));
+  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login. Match
+  // by port-stripped hostname; fall back to the card's own serverId when it's a known member (covers a
+  // MagicDNS-off member whose card was adopted under a raw IP that doesn't equal its stored `host`).
+  const memberId =
+    fleetMemberIdByHost.get(hostnameOf(srv.url)) ??
+    (srv.id && new Set(fleetMemberIdByHost.values()).has(srv.id) ? srv.id : undefined);
   if (memberId) {
     try {
       await apiFetch(`/api/fleet/members/${encodeURIComponent(memberId)}`, { method: "DELETE" });
-      fleetMemberIdByHost.delete(hostOf(srv.url));
+      for (const [k, v] of [...fleetMemberIdByHost]) if (v === memberId) fleetMemberIdByHost.delete(k);
     } catch {
       card?.classList.remove("removing");
       if (btn) { btn.disabled = false; btn.innerHTML = `${icon("close")} Remove`; }
@@ -4279,7 +4293,11 @@ async function loadFleetMembers(): Promise<void> {
     fleetMemberIdByHost.clear();
     let adopted = false;
     for (const m of members) {
-      fleetMemberIdByHost.set(m.host, m.serverId);
+      // Index under the bare host AND the url's hostname: with MagicDNS off the url can be healed to a
+      // raw tailnet IP while `host` stays the (now-unresolvable) name, so a card adopted under either
+      // form still maps back to the member for Remove.
+      if (m.host) fleetMemberIdByHost.set(hostnameOf(m.host), m.serverId);
+      fleetMemberIdByHost.set(hostnameOf(m.url), m.serverId);
       const url = m.url.replace(/\/+$/, "");
       if (!url || url === HUB_URL) continue;
       // The hub can heal a member's scheme (http→https once `tailscale serve` is up). If we'd adopted it
