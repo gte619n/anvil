@@ -4225,9 +4225,13 @@ async function maybeRenderRepairCard(host: HTMLElement): Promise<void> {
     return; // daemon unreachable — nothing to offer
   }
   if (!st.hubServerId) return; // not joined to a hub → no re-pair to offer (the hub, or a standalone box)
+  // Idempotent append: renderServerCards can be in flight several times at once (adoption, server.hello),
+  // and this runs AFTER its own await — so without removing a prior copy each in-flight render stacks
+  // another card. Drop any existing one before inserting so there's exactly one, no matter the render count.
+  document.getElementById("fleet-repair-card")?.remove();
   host.insertAdjacentHTML(
     "beforeend",
-    `<div class="card"><div class="card-main">${icon("hub")} <b>This machine</b></div>
+    `<div class="card" id="fleet-repair-card"><div class="card-main">${icon("hub")} <b>This machine</b></div>
       <div class="small muted">Already in a fleet. If the hub lost track of it, open a join window here and re-enter the code on the hub's <b>Add a machine</b>.</div>
       <div class="git-row" style="margin-top:10px"><button class="mini" id="fleet-repair">${icon("vpn_key")} Get a join code</button></div>
     </div>`,
