@@ -278,6 +278,13 @@ interface PairOutcome {
   /** The route answered, but with "no such route" semantics (404/405, or a non-JSON error page). The
    *  caller treats this as "try the other destination", NOT as a hard failure — see {@link pushCredential}. */
   routeMissing?: boolean;
+  /** The fetch never produced a response at all — connection refused, DNS failure, TLS-to-plain-HTTP
+   *  mismatch, or timeout. The caller retries the next scheme/port rather than surfacing it as a real
+   *  rejection (see {@link pushCredential}). Deliberately a FLAG set at the fetch boundary, not a
+   *  string match on `error`: Bun's refused-connection message ("Unable to connect…") contains none of
+   *  the keywords a regex would look for, so classifying by text silently defeated the https→http
+   *  fallback and broke pairing to every direct-bind (serve-less) joiner. */
+  transportError?: boolean;
 }
 
 async function postPairing(url: string, body: Record<string, unknown>, timeoutMs = 12_000, fetchImpl: typeof fetch = fetch): Promise<PairOutcome> {
@@ -301,7 +308,9 @@ async function postPairing(url: string, body: Record<string, unknown>, timeoutMs
     }
     return { ok: res.ok && data.ok !== false, serverId: data.serverId, serverName: data.serverName, error: data.error };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    // Threw before any response: unreachable scheme/port, DNS failure, TLS mismatch, or timeout. Flag
+    // it so the caller retries the next base instead of reading the message — see transportError.
+    return { ok: false, transportError: true, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -356,8 +365,12 @@ async function pushCredential(opts: {
       if (r.ok) return r;
       last = r;
       // A real rejection ("wrong code") is an ANSWER — stop, don't shop the credential around. Only a
-      // missing route or an unreachable scheme justifies trying elsewhere.
-      if (!r.routeMissing && r.error && !/fetch|network|refused|reset|timed|abort/i.test(r.error)) return r;
+      // transport failure (this scheme was unreachable) or a missing route justifies trying elsewhere.
+      // Gate on the transportError FLAG, not the error text: Bun's connection-refused message
+      // ("Unable to connect…") matches none of the obvious keywords, so a regex here silently treated
+      // an unreachable https scheme as a real rejection and never tried http — which is exactly the
+      // state of every direct-bind (serve-less) joiner, i.e. the whole headless case.
+      if (!r.routeMissing && !r.transportError) return r;
       if (r.routeMissing) break; // it's a daemon, but an old one — go straight to :7702
     }
     const legacy = await postPairing(legacyUrl, opts.body, 12_000, doFetch);

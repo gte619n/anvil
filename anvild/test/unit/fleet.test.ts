@@ -37,8 +37,20 @@ function fakeFetch(handler: (url: string) => { status?: number; body?: unknown }
     const url = String(input);
     calls.push(url);
     const r = handler(url);
-    if (r === "throw") throw new Error("ECONNREFUSED / wrong scheme"); // mimic an https-vs-http transport reject
-    return new Response(JSON.stringify(r.body ?? {}), { status: r.status ?? 200, headers: { "content-type": "application/json" } });
+    // Throw Bun's ACTUAL refused-connection message, verbatim. The previous mock threw
+    // "ECONNREFUSED …", whose "refused" happened to match the old string-based retry gate — so the
+    // fallback tests passed while real pairing to a serve-less joiner failed (Bun's message contains
+    // none of those keywords). The message IS the regression guard; keep it literal.
+    if (r === "throw") throw new Error("Unable to connect. Is the computer able to access the url?");
+    // A STRING body models a real non-JSON response (a proxy's HTML error page) — sent verbatim with a
+    // text/html type so postPairing's JSON.parse actually throws, exercising the routeMissing branch.
+    // JSON.stringify-ing it (the old behaviour) turned "<html>…" into valid JSON and silently skipped
+    // that path. An object body is a normal JSON response.
+    const raw = typeof r.body === "string";
+    return new Response(raw ? (r.body as string) : JSON.stringify(r.body ?? {}), {
+      status: r.status ?? 200,
+      headers: { "content-type": raw ? "text/html" : "application/json" },
+    });
   }) as unknown as typeof fetch;
   return { fn, calls };
 }
