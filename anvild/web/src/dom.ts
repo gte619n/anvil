@@ -54,7 +54,11 @@ const renderTomOption = (data: { [k: string]: unknown }, escape: (s: string) => 
 /** Upgrade a native <select> into a stylized Tom Select. `search` shows the filter box (long lists). */
 export function enhanceSelect(sel: HTMLSelectElement | null, search = false): void {
   if (!sel) return;
-  const base = { maxOptions: null, hideSelected: false, render: { option: renderTomOption, item: renderTomOption } };
+  // allowEmptyOption keeps a value="" option (our "Select a machine…" prompt) as a RENDERED item.
+  // Without it Tom Select treats the empty option as an invisible placeholder — and since we pass
+  // controlInput:null in non-search mode, inputState() early-returns and never paints that placeholder,
+  // leaving the control blank. Rendering it as a real item is what shows the prompt text.
+  const base = { maxOptions: null, hideSelected: false, allowEmptyOption: true, render: { option: renderTomOption, item: renderTomOption } };
   modalTomSelects.push(new TomSelect(sel, search ? base : { ...base, controlInput: null }));
 }
 /** Re-read options/value from the underlying <select> after it's been repopulated programmatically. */

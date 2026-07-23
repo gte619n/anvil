@@ -4079,10 +4079,10 @@ function renderServerCards(): void {
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
-    `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
-    `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
+    `<button id="fleet-rotate" class="mini" title="Push the current login to every machine in the fleet">${icon("autorenew")} Update token</button>` +
+    `<button id="fleet-add" class="mini primary">${icon("add")} Add a machine</button>` +
     `</div></div>` +
-    `<p class="small muted">Every Mac here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    `<p class="small muted">Every machine here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
     list.map(serverCardHtml).join("");
   for (const srv of list) {
     wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
@@ -4162,7 +4162,7 @@ function showAddMac(): void {
   m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a machine</h3>
     <p class="small muted">On the machine you're adding, open its Anvil web UI (a Mac can also use <b>Anvil Server → Join a fleet</b>) and choose <b>Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
     <label>Machine<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
-    <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" /></label>
+    <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="6-digit code" /></label>
     <div id="fleet-status" class="small muted"></div>
     <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
   </div>`;
@@ -4170,10 +4170,15 @@ function showAddMac(): void {
   enhanceSelect(document.getElementById("fleet-host") as HTMLSelectElement | null);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  // The joiner shows the code grouped as "123 456" for readability, so a copy-paste arrives with a
+  // space (and pasting into a maxlength=6 field used to truncate it to "123 45"). Strip everything but
+  // digits on every input and cap at 6, so a pasted grouped code Just Works.
+  const codeInput = document.getElementById("fleet-code") as HTMLInputElement | null;
+  codeInput?.addEventListener("input", () => { codeInput.value = codeInput.value.replace(/\D/g, "").slice(0, 6); });
   $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
     const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
-    const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
+    const code = ($<HTMLInputElement>("#fleet-code").value || "").replace(/\D/g, "");
     if (!host) { setStatus("Pick the machine you're adding."); return; }
     if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that machine is showing."); return; }
     setStatus(`Sending the login to ${host} over the tailnet…`);
@@ -4272,10 +4277,14 @@ async function loadFleetPeers(): Promise<void> {
         .then((r) => r.json())
         .catch(() => ({ servers: [] })) as Promise<{ servers?: { url: string; subscriptionAuthOk?: boolean }[] }>,
     ]);
+    // Compare on the bare hostname (no port). The peer list's `host` is a MagicDNS name with no port,
+    // but hostOf()/URL.host carries the :7701 — so matching on hostOf here silently never fires, and
+    // neither "needs setup" nor the already-added filter would work. Strip the port on both sides.
+    const hostname = (u: string): string => { try { return new URL(u).hostname; } catch { return hostOf(u).replace(/:\d+$/, ""); } };
     const needsSetup = new Set(
-      (discovered.servers ?? []).filter((s) => s.subscriptionAuthOk === false).map((s) => hostOf(s.url)),
+      (discovered.servers ?? []).filter((s) => s.subscriptionAuthOk === false).map((s) => hostname(s.url)),
     );
-    const knownHosts = new Set([...servers.values()].map((s) => hostOf(s.url)));
+    const knownHosts = new Set([...servers.values()].map((s) => hostname(s.url)));
     const candidates = (peersRes.peers ?? []).filter((p) => p.online && !knownHosts.has(p.host));
     if (!peersRes.ok) {
       sel.innerHTML = `<option value="">${esc(peersRes.warning ?? "Tailscale unavailable")}</option>`;
@@ -4285,7 +4294,7 @@ async function loadFleetPeers(): Promise<void> {
       // Machines waiting for a login sort first — that's who the operator came here for.
       candidates.sort((a, b) => Number(needsSetup.has(b.host)) - Number(needsSetup.has(a.host)));
       sel.innerHTML =
-        `<option value="">Choose a machine…</option>` +
+        `<option value="">Select a machine…</option>` +
         candidates
           .map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}${needsSetup.has(p.host) ? " — needs setup" : ""}</option>`)
           .join("");
