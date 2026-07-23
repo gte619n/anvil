@@ -21,6 +21,7 @@ import { esc, icon } from "./dom";
 
 let root: HTMLElement | null = null;
 let shown = false;
+let celebrating = false;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 /** Injected from main.ts — the "paste a token" path goes over the existing WS auth.set command. */
 let setTokenFn: (token: string) => Promise<void> = async () => {};
@@ -55,13 +56,45 @@ export async function refreshSetupState(): Promise<void> {
   } catch {
     return; // daemon unreachable — that's the offline banner's job, not a reason to claim "needs setup"
   }
-  if (authed) hideTakeover();
-  else void showTakeover();
+  if (authed) {
+    // Authed WHILE the takeover is up means a credential just landed — a hub pushed one (a pair
+    // completes on the daemon with no client round trip), or a token was pasted here. Show a positive
+    // "you're in" confirmation before revealing the app, instead of the screen silently vanishing.
+    // A first-boot call (authed and the takeover was never shown) just falls through to a no-op hide.
+    if (shown && !celebrating) void celebratePaired();
+    else if (!shown) hideTakeover();
+  } else void showTakeover();
+}
+
+/**
+ * The transition out of setup, made visible. The joiner otherwise got no signal that pairing worked —
+ * the takeover just disappeared. Confirm it for a beat, then reveal the app underneath (which booted
+ * normally under the overlay). Fleet-join vs standalone-paste is told apart by whether the daemon now
+ * reports a hubServerId — a pair adopts the hub's; a bare token paste does not.
+ */
+async function celebratePaired(): Promise<void> {
+  if (!root) { hideTakeover(); return; }
+  celebrating = true;
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = undefined; } // no re-entry while we confirm
+  let fleet = false;
+  try { fleet = !!(await armState())?.hubServerId; } catch { /* identity probe failed — show the generic message */ }
+  if (!root) { celebrating = false; hideTakeover(); return; } // overlay pulled while we awaited
+  root.innerHTML = `<div class="setup-box">
+    <div class="setup-brand"><img src="/anvil.svg" class="brand-logo" alt="" /> Anvil</div>
+    <h2>${icon("check_circle")} ${fleet ? "Paired — you're in" : "Claude login active"}</h2>
+    <p class="setup-lede">${
+      fleet
+        ? "This machine now shares the fleet's Claude login and can run turns. Opening your sessions…"
+        : "This machine has a Claude login and can run turns. Opening your sessions…"
+    }</p>
+  </div>`;
+  setTimeout(() => { celebrating = false; hideTakeover(); }, 2200);
 }
 
 function hideTakeover(): void {
   if (!shown) return;
   shown = false;
+  celebrating = false;
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = undefined;
   root?.remove();
