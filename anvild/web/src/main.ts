@@ -2211,49 +2211,30 @@ function renderTeamBoard(lead: Session | undefined): void {
         <span class="tmb-task">${esc(m.memberTask ?? m.title)}</span>
         <span class="tmb-meta">${esc(m.status)}${git ? ` · ${esc(git)}` : ""}</span>
         ${pr}
-        <button class="tmb-dismiss" data-id="${esc(m.id)}" title="Dismiss member (remove worktree + branch)">${icon("close")}</button>
       </div>`;
     })
     .join("");
 
-  const canIntegrate = members.length > 0 && !pending;
+  // Observational board only — integration + teardown are driven by the lead agent (via its
+  // integrate / dismiss_member tools), so there are no action buttons here. The user directs the
+  // lead conversationally ("integrate now", "dismiss the docs member").
   el.innerHTML = `${planCard}
     <div class="team-board-head">
-      <span>${icon("groups")} Team · ${members.length} member(s) · ${esc(policy)}</span>
-      <span class="tmb-head-actions">
-        ${canIntegrate ? `<button class="tmb-integrate" data-lead="${esc(lead.id)}">Integrate</button>` : ""}
-        ${members.length ? `<button class="tmb-disband" data-lead="${esc(lead.id)}">Disband</button>` : ""}
-      </span>
+      <span class="tmb-title">${icon("groups")} Team · ${members.length} member(s) · ${esc(policy)}</span>
     </div>
     <div class="tmb-rows">${rows || `<div class="tmb-empty">No members yet.</div>`}</div>`;
 
+  // Member rows deep-link to that member (its cards then route correctly as the active session).
   el.querySelectorAll<HTMLElement>(".tmb-row").forEach((row) =>
     row.addEventListener("click", () => { const id = row.dataset.id; if (id) selectSession(id); }),
   );
+  // The plan-approval card keeps its Approve/Reject (that's the gate, not a team action).
   el.querySelector(".tpc-approve")?.addEventListener("click", () => {
     if (pending) sendTo(lead.id, { type: "team.plan.approve", sessionId: lead.id, plan: pending, cid: newCid() });
   });
   el.querySelector(".tpc-reject")?.addEventListener("click", () =>
     sendTo(lead.id, { type: "team.plan.reject", sessionId: lead.id, cid: newCid() }),
   );
-  el.querySelector(".tmb-integrate")?.addEventListener("click", () =>
-    sendTo(lead.id, { type: "team.integrate", sessionId: lead.id, cid: newCid() }),
-  );
-  // Teardown: dismiss one member, or disband the whole team (members only — the lead stays).
-  el.querySelectorAll<HTMLElement>(".tmb-dismiss").forEach((b) =>
-    b.addEventListener("click", async (e) => {
-      e.stopPropagation(); // don't also select the row
-      const id = b.dataset.id;
-      if (id && (await confirmDialog({ title: "Dismiss member?", body: "Its worktree and branch will be removed. Uncommitted work is lost.", confirmLabel: "Dismiss", danger: true, icon: "close" }))) {
-        killSession(id);
-      }
-    }),
-  );
-  el.querySelector(".tmb-disband")?.addEventListener("click", async () => {
-    if (await confirmDialog({ title: "Disband team?", body: `Remove all ${members.length} member(s) — their worktrees and branches. The lead session stays.`, confirmLabel: "Disband", danger: true, icon: "group_remove" })) {
-      for (const m of members) killSession(m.id);
-    }
-  });
 }
 
 /** Map a session status to a colored status-dot class for the member board. */

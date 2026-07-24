@@ -173,15 +173,20 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   color: var(--muted); background: color-mix(in srgb, var(--accent) 12%, var(--bg));
   border: 1px solid var(--border); white-space: nowrap; vertical-align: 1px;
 }
-/* Lead member board (shown above the lead's conversation) + the plan-approval card */
-#team-board { padding: 10px 12px 4px; display: flex; flex-direction: column; gap: 8px; }
+/* Lead member board (shown above the lead's conversation) + the plan-approval card.
+   Banded background + bottom divider so it reads as its own section, distinct from the conversation. */
+#team-board {
+  padding: 10px 14px; display: flex; flex-direction: column; gap: 8px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg));
+  border-bottom: 1px solid var(--border);
+}
 .team-board-head { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--muted); font-weight: 600; }
 .team-board-head .msym { vertical-align: -3px; margin-right: 3px; }
-.tmb-integrate, .tpc-approve, .tpc-reject {
+.tpc-approve, .tpc-reject {
   padding: 4px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg);
   color: var(--text); font-weight: 600; cursor: pointer; font-size: 12px;
 }
-.tmb-integrate:hover, .tpc-approve:hover { border-color: var(--accent); color: var(--accent); }
+.tpc-approve:hover { border-color: var(--accent); color: var(--accent); }
 .tpc-reject:hover { border-color: #e0564f; color: #e0564f; }
 .tmb-rows { display: flex; flex-direction: column; gap: 3px; }
 .tmb-row {
@@ -200,13 +205,6 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .tmb-pr.merged { color: #8957e5; border-color: #8957e5; }
 .tmb-pr.open { color: #3fb950; border-color: #3fb950; }
 .tmb-empty { font-size: 12px; color: var(--muted); padding: 4px 2px; }
-.tmb-head-actions { display: flex; gap: 6px; }
-.tmb-disband { padding: 4px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); font-weight: 600; cursor: pointer; font-size: 12px; }
-.tmb-disband:hover { border-color: #e0564f; color: #e0564f; }
-.tmb-dismiss { background: none; border: none; color: var(--muted); cursor: pointer; padding: 2px 4px; display: flex; align-items: center; border-radius: 6px; opacity: 0; flex: 0 0 auto; }
-.tmb-dismiss .msym { font-size: 16px; }
-.tmb-row:hover .tmb-dismiss { opacity: 0.7; }
-.tmb-dismiss:hover { opacity: 1; color: #e0564f; background: color-mix(in srgb, #e0564f 12%, transparent); }
 .team-plan-card { border: 1px solid var(--accent); border-radius: 12px; padding: 10px 12px; background: color-mix(in srgb, var(--accent) 7%, var(--bg)); }
 .tpc-head { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
 .tpc-head .msym { vertical-align: -3px; }
