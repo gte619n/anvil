@@ -846,15 +846,26 @@ export class Supervisor {
     const room = Math.max(0, cap - this.activeMemberCount(plan.leadId));
     const toStart = plan.members.slice(0, room);
     const overflow = plan.members.slice(room);
-    for (const m of toStart) {
-      try {
-        this.teamCreateMember(plan.leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
-      } catch (e) {
-        console.error(`[teams] member spawn failed for "${m.title}":`, e instanceof Error ? e.message : e);
-      }
-    }
+    let started = 0;
+    for (const m of toStart) if (this.spawnMember(plan.leadId, m)) started++;
     if (overflow.length) this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...overflow]);
-    return toStart.length;
+    return started; // actual successes, not attempts — a failed spawn must not inflate the count
+  }
+
+  /** Spawn one planned member, surfacing a failure to the lead's conversation rather than swallowing
+   *  it (design §7: "that member is flagged and reported to the lead"). Returns true on success. A
+   *  common cause is a branch-name collision (two teams in one repo asking for the same member title →
+   *  the same branch slug → `git worktree add` fails). */
+  private spawnMember(leadId: string, m: TeamPlanMember): boolean {
+    try {
+      this.teamCreateMember(leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
+      return true;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[teams] member spawn failed for "${m.title}":`, msg);
+      this.sessions.get(leadId)?.emitError(`Team member "${m.title}" failed to spawn — not added: ${msg}`, false);
+      return false;
+    }
   }
 
   /** Start queued members up to the lead's concurrency cap, unless the budget is paused. Called when a
@@ -872,12 +883,7 @@ export class Supervisor {
     let room = Math.max(0, cap - this.activeMemberCount(leadId, justFinishedId));
     while (room > 0 && queue.length > 0) {
       const m = queue.shift()!;
-      try {
-        this.teamCreateMember(leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
-        room--;
-      } catch (e) {
-        console.error(`[teams] queued member spawn failed for "${m.title}":`, e instanceof Error ? e.message : e);
-      }
+      if (this.spawnMember(leadId, m)) room--; // a failed spawn is reported + dropped, not retried
     }
     if (queue.length === 0) this.queuedMembers.delete(leadId);
   }
