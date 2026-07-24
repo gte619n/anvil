@@ -211,6 +211,11 @@ export interface Session {
   pending?: boolean; // client-only: created offline, not yet realized on the daemon (never set by the server)
   icon?: string; // Material Symbols name chosen by Sonnet from the session title (arch §5)
   environmentId?: string; // the Environment this session was created from, if any
+  // ── Teams (see docs/plans/anvil-team-support.md) ──────────────────────────
+  parentId?: SessionId; // present on a member; points at its lead session
+  teamRole?: "lead" | "member"; // absent on a plain (non-team) session
+  memberTask?: string; // the one-line task the lead assigned this member
+  team?: TeamPolicy; // set only on a lead: this team's integration/concurrency policy
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted
   finished?: boolean; // user-parked in the sidebar's "Finished" group (done, e.g. pending deploy)
   order?: number; // explicit sidebar sort position (lower = higher); unset sorts newest-on-top
@@ -236,6 +241,12 @@ export interface Session {
   // enriched with SKILL.md descriptions — drives the composer's `/` autocomplete. Populated once the
   // driver starts (absent until the first turn); rides session.updated/session.list. (§skills)
   commands?: CommandInfo[];
+}
+
+/** A team's policy. Lives on the lead `Session`; a team is otherwise derived from `parentId`. */
+export interface TeamPolicy {
+  integration: "combined-pr" | "pr-per-member"; // default "combined-pr"
+  maxConcurrentMembers: number; // spawn/concurrency cap (default 3)
 }
 
 /** One entry in a session's `/` autocomplete: an invocable slash-command or skill. `name` is the exact
