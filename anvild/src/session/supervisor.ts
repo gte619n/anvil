@@ -63,7 +63,7 @@ import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildTeamToolsServer, TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
 import { memberBaseRef } from "../integrations/member-base";
-import { shouldAutoApprove } from "../integrations/team-gate";
+import { shouldAutoApprove, spawnPaused } from "../integrations/team-gate";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
@@ -832,9 +832,14 @@ export class Supervisor {
     lead.data.team.integration = plan.integration; // honor the plan's integration choice
     this.persist();
     this.activeTeamPlans.set(plan.leadId, plan);
+    // Budget backstop: while the subscription budget is warning, spawn nothing new — queue every
+    // member and let the drain (on member completion / budget recovery) start them later.
+    if (spawnPaused(this.budget())) {
+      this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...plan.members]);
+      return 0;
+    }
     const cap = lead.data.team.maxConcurrentMembers ?? 3;
-    const active = this.activeMemberCount(plan.leadId);
-    const room = Math.max(0, cap - active);
+    const room = Math.max(0, cap - this.activeMemberCount(plan.leadId));
     const toStart = plan.members.slice(0, room);
     const overflow = plan.members.slice(room);
     for (const m of toStart) {
@@ -846,6 +851,28 @@ export class Supervisor {
     }
     if (overflow.length) this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...overflow]);
     return toStart.length;
+  }
+
+  /** Start queued members up to the lead's concurrency cap, unless the budget is paused. Called when a
+   *  member frees a slot (its turn ends) so a large plan drains as capacity + budget allow. */
+  private drainQueuedMembers(leadId: string): void {
+    const queue = this.queuedMembers.get(leadId);
+    if (!queue || queue.length === 0) return;
+    const lead = this.sessions.get(leadId);
+    if (!lead || lead.data.teamRole !== "lead") return;
+    if (spawnPaused(this.budget())) return; // still under budget pressure — leave them queued
+    const cap = lead.data.team?.maxConcurrentMembers ?? 3;
+    let room = Math.max(0, cap - this.activeMemberCount(leadId));
+    while (room > 0 && queue.length > 0) {
+      const m = queue.shift()!;
+      try {
+        this.teamCreateMember(leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
+        room--;
+      } catch (e) {
+        console.error(`[teams] queued member spawn failed for "${m.title}":`, e instanceof Error ? e.message : e);
+      }
+    }
+    if (queue.length === 0) this.queuedMembers.delete(leadId);
   }
 
   /** Members currently occupying a concurrency slot (spawned and not yet terminal). */
@@ -2418,6 +2445,9 @@ export class Supervisor {
     // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
     const s = this.sessions.get(sessionId);
     if (s) this.refreshGit(s);
+    // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
+    // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
+    if (s?.data.parentId) this.drainQueuedMembers(s.data.parentId);
     // Refresh the live context-window meter from this turn's reading (§context). Broadcast so every
     // device's composer gauge updates; skip the push when the SDK didn't report (keep the last value).
     if (s && usage.contextUsage) {
