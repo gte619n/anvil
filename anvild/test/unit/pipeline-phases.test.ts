@@ -73,7 +73,7 @@ test("requirements: GLM drafts (persisted to trace), Claude audits; clean audit 
   expect(out.status).toBe("pass");
   expect(t.acceptanceCriteria[0]).toMatchObject({ id: "AC1", kind: "automatable" });
   expect(t.nonGoals).toEqual(["no auth change"]);
-  expect(t.modelAssignment.find((a) => a.phase === "requirements")).toMatchObject({ author: "GLM 5.2", adversary: "Claude Opus 4.8" });
+  expect(t.modelAssignment.find((a) => a.phase === "requirements")).toMatchObject({ author: "GLM 5.2", adversary: "Claude Opus 5" });
   expect(m.rejectionRate("requirements", "claude")).toBe(0); // first-pass, not rejected
 });
 
@@ -95,14 +95,14 @@ test("design: Claude authors the plan (stored on the trace), GLM red-teams", asy
   const out = await buildPhases(deps()).design(ctx(t));
   expect(out.status).toBe("pass");
   expect(t.planRef).toContain("Bind AC1");
-  expect(t.modelAssignment.find((a) => a.phase === "design")).toMatchObject({ author: "Claude Opus 4.8", adversary: "GLM 5.2" });
+  expect(t.modelAssignment.find((a) => a.phase === "design")).toMatchObject({ author: "Claude Opus 5", adversary: "GLM 5.2" });
 });
 
 // ── P3 implementation ──
 test("implementation: GLM by default; escalates authorship to Claude on the high tier", async () => {
   const t = newTrace("wu1", "task");
   await buildPhases(deps()).implementation(ctx(t, { riskTier: "high" }));
-  expect(t.modelAssignment.find((a) => a.phase === "implementation")?.author).toBe("Claude Opus 4.8");
+  expect(t.modelAssignment.find((a) => a.phase === "implementation")?.author).toBe("Claude Opus 5");
 });
 
 test("implementation: an INFEASIBLE report loops back to design", async () => {

@@ -81,7 +81,7 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  *    This is exactly the "supports X but not Y across a partially-updated fleet" case PROTOCOL_VERSION
  *    can't express, which is why that number is deliberately NOT bumped for this feature (HJ-32).
  */
-export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts", "lapo", "pairing"];
+export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts", "lapo", "pairing", "model-labels"];
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
 export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {

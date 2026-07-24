@@ -20,8 +20,8 @@ test("renderTraceRecord emits the structured PR body with the spine fields", () 
   t.diffRef = "diff#def";
   t.verification = { criteriaTests: "pass", adversaryTests: "pass", lintTypesBuild: "pass", coverage: "88%" };
   t.validation.operatorSignoff = "yes";
-  recordAssignment(t, { phase: "requirements", author: "GLM 5.2", adversary: "Claude Opus 4.8" });
-  recordAssignment(t, { phase: "design", author: "Claude Opus 4.8", adversary: "GLM 5.2" });
+  recordAssignment(t, { phase: "requirements", author: "GLM 5.2", adversary: "Claude Opus 5" });
+  recordAssignment(t, { phase: "design", author: "Claude Opus 5", adversary: "GLM 5.2" });
   t.loopbackCount = { requirements: 1 };
 
   const md = renderTraceRecord(t);
@@ -32,7 +32,7 @@ test("renderTraceRecord emits the structured PR body with the spine fields", () 
   expect(md).toContain("AC1 [automatable] uploads retry 3× on 5xx");
   expect(md).toContain("AC2 [human-validates]");
   expect(md).toContain("criteria_tests: pass");
-  expect(md).toContain("requirements: author=GLM 5.2 adversary=Claude Opus 4.8");
+  expect(md).toContain("requirements: author=GLM 5.2 adversary=Claude Opus 5");
   expect(md).toContain("requirements: 1");
 });
 
@@ -49,9 +49,9 @@ test("a multi-line plan_ref is rendered as an indented YAML block (doesn't break
 test("recordAssignment overwrites a phase's prior assignment rather than duplicating it", () => {
   const t = newTrace("x", "y");
   recordAssignment(t, { phase: "implementation", author: "GLM 5.2" });
-  recordAssignment(t, { phase: "implementation", author: "Claude Opus 4.8" }); // escalated to Claude
+  recordAssignment(t, { phase: "implementation", author: "Claude Opus 5" }); // escalated to Claude
   expect(t.modelAssignment).toHaveLength(1);
-  expect(t.modelAssignment[0]!.author).toBe("Claude Opus 4.8");
+  expect(t.modelAssignment[0]!.author).toBe("Claude Opus 5");
 });
 
 // ── Collusion / theater metric (§6.3) ──

@@ -94,7 +94,7 @@ test("toPipelineTraceInfo projects the trace onto the reader's wire shape", () =
   trace.validation.builtVsAskedNote = "matches";
   trace.prRef = "https://gh/pr/3";
   trace.loopbackCount = { requirements: 2 };
-  recordAssignment(trace, { phase: "requirements", author: "GLM 5.2", adversary: "Claude Opus 4.8" });
+  recordAssignment(trace, { phase: "requirements", author: "GLM 5.2", adversary: "Claude Opus 5" });
 
   const info = toPipelineTraceInfo({ status: "shipped", phaseReached: "transfer", trace });
   expect(info.status).toBe("shipped");
@@ -102,7 +102,7 @@ test("toPipelineTraceInfo projects the trace onto the reader's wire shape", () =
   expect(info.criteria).toEqual([{ id: "AC1", text: "retries on 5xx", kind: "automatable" }]);
   expect(info.prRef).toBe("https://gh/pr/3");
   expect(info.validationNote).toBe("matches");
-  expect(info.assignments).toEqual([{ phase: "requirements", author: "GLM 5.2", adversary: "Claude Opus 4.8" }]);
+  expect(info.assignments).toEqual([{ phase: "requirements", author: "GLM 5.2", adversary: "Claude Opus 5" }]);
   expect(info.loopbacks).toEqual([{ phase: "requirements", count: 2 }]);
 });
 

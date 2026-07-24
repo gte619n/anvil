@@ -27,6 +27,7 @@ const CONNECT_FRAMES = new Set([
   "budget",
   "environments",
   "prompts",
+  "model.labels",
   "todoist.status",
   "lapo.status",
   "autopilot.schedule",

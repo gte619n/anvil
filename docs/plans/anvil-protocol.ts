@@ -82,7 +82,7 @@ export type Model = "opus" | "sonnet" | "haiku" | "fable";
 /** The models a session can run on, in picker order. `label` is the human name shown in the UI;
  *  the daemon maps each `id` to the string the Agent SDK expects (see agent/models.ts). */
 export const MODELS: readonly { id: Model; label: string }[] = [
-  { id: "opus", label: "Opus 4.8" },
+  { id: "opus", label: "Opus 5" },
   { id: "sonnet", label: "Sonnet 4.6" },
   { id: "haiku", label: "Haiku 4.5" },
   { id: "fable", label: "Fable 5" },
@@ -460,6 +460,16 @@ export interface Prompt {
 export interface PromptsEvent extends Envelope {
   type: "prompts";
   prompts: Prompt[];
+}
+/**
+ * Live human labels for the session model tiers, refreshed by the hub from the Anthropic Models API so
+ * the picker tracks new releases (e.g. "Opus 4.8" → "Opus 5") without a code change. A partial map:
+ * tiers the hub couldn't resolve are absent, and the client falls back to the static `MODELS` label.
+ * Hub-authoritative (like `prompts`) — a fleet member's own copy is ignored by the client.
+ */
+export interface ModelLabelsEvent extends Envelope {
+  type: "model.labels";
+  labels: Partial<Record<Model, string>>;
 }
 /**
  * First frame the server sends on every WS connection (before session.list/budget/
@@ -870,6 +880,7 @@ export type ServerEvent =
   | BudgetEvent
   | EnvironmentsEvent
   | PromptsEvent
+  | ModelLabelsEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
   | LapoStatusEvent

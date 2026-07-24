@@ -14,6 +14,7 @@ import {
   type EnvironmentsEvent,
   type EnvironmentValidation,
   type PromptsEvent,
+  type ModelLabelsEvent,
   type TodoistStatusEvent,
   type TodoistProjectsResultEvent,
   type TodoistProjectInfo,
@@ -66,6 +67,9 @@ import { buildMemberToolsServer, MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from 
 import { memberBaseRef } from "../integrations/member-base";
 import { shouldAutoApprove, spawnPaused, relayExhausted, MAX_TEAM_RELAY_HOPS } from "../integrations/team-gate";
 import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
+import { fetchModelCatalog, resolveModelLabels } from "../agent/model-catalog";
+import { ModelLabelStore } from "../models/store";
+import { CLAUDE_TOKEN_KEY } from "../auth/store";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
@@ -149,6 +153,10 @@ export interface SupervisorConfig {
   clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
+  /** Fire one model-label refresh shortly after construction. The real daemon (main.ts) sets this; it
+   *  defaults off so tests that spin up a Supervisor never make a live Models API call. The recurring
+   *  ~4h refresh is always armed regardless (it just never fires within a test's lifetime). */
+  refreshModelLabelsOnBoot?: boolean;
   renderer?: MarkdownRenderer;
   /** Competing models the adversarial panel critiques plans with (OpenRouter slugs). The KEY itself is
    *  read live from the environment at run time (Settings → Models writes it), not passed here. */
@@ -207,6 +215,9 @@ export class Supervisor {
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
+  /** Live model-tier labels (hub-refreshed from the Models API); empty until the first refresh lands. */
+  private readonly modelLabels: ModelLabelStore;
+  private modelLabelTimer?: ReturnType<typeof setInterval>;
   private readonly integrations: IntegrationStore;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
@@ -264,6 +275,7 @@ export class Supervisor {
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.promptStore = new PromptStore(cfg.stateDir);
+    this.modelLabels = new ModelLabelStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
     this.workUnits = new WorkUnitStore(cfg.stateDir);
     this.autopilotSchedule = new AutopilotScheduleStore(cfg.stateDir);
@@ -279,6 +291,7 @@ export class Supervisor {
     this.restore();
     this.startAutopilotScheduler();
     this.startPrStateSweeper();
+    this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
     // the lapo status once discovery completes so an already-connected client sees the callback URL.
     void this.selfBaseUrl().then(() => this.registry.toAll(this.lapoStatusEvent()));
@@ -309,6 +322,34 @@ export class Supervisor {
       if (this.registry.all().length > 0) void this.refreshAllPrStates();
     }, 4 * 60_000);
     this.prSweepTimer.unref?.();
+  }
+  /** Current hub-resolved model labels, broadcast to clients (empty until the first refresh). */
+  modelLabelsEvent(): ModelLabelsEvent {
+    return { v: PROTOCOL_VERSION, type: "model.labels", ts: now(), labels: this.modelLabels.get() };
+  }
+  /** Keep the picker's model labels current by re-deriving them from the Models API every ~4h. Fires an
+   *  immediate refresh so a fresh install/label bump shows up shortly after boot rather than 4h later;
+   *  `unref` so it never holds the process/test open. Any daemon runs this, but the client only applies
+   *  the hub's copy (like the prompt library), so members' refreshes are harmless. */
+  private startModelLabelRefresh(onBoot: boolean): void {
+    if (onBoot) void this.refreshModelLabels();
+    this.modelLabelTimer = setInterval(() => void this.refreshModelLabels(), 4 * 60 * 60_000);
+    this.modelLabelTimer.unref?.();
+  }
+  /** Fetch the live catalog with the subscription OAuth token, re-derive the tier labels, and broadcast
+   *  iff they changed. No token (unpaired/logged out) or an API error just leaves the last-known labels
+   *  in place — never throws into the timer. */
+  private async refreshModelLabels(): Promise<void> {
+    const token = (process.env[CLAUDE_TOKEN_KEY] ?? "").trim();
+    if (!token) return; // no subscription login yet — keep the cached/static labels
+    try {
+      const labels = resolveModelLabels(await fetchModelCatalog(token));
+      if (Object.keys(labels).length > 0 && this.modelLabels.set(labels)) {
+        this.registry.toAll(this.modelLabelsEvent());
+      }
+    } catch (e) {
+      console.warn(`[models] label refresh failed: ${(e as Error).message}`);
+    }
   }
   private async maybeRunScheduled(): Promise<void> {
     const sched = this.autopilotSchedule.get();
