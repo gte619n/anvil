@@ -147,6 +147,16 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "team.plan.approve":
+        deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan);
+        if (cid) send(ack(cid));
+        return;
+
+      case "team.plan.reject":
+        deps.supervisor.rejectTeamPlan(cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.send": {
         // attach so this connection receives the streamed turn (arch §6.4)
         conn.attached.add(cmd.sessionId);
