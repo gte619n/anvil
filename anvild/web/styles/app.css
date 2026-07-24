@@ -180,8 +180,13 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   background: color-mix(in srgb, var(--accent) 5%, var(--bg));
   border-bottom: 1px solid var(--border);
 }
-.team-board-head { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--muted); font-weight: 600; }
+.team-board-head { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; }
 .team-board-head .msym { vertical-align: -3px; margin-right: 3px; }
+.tmb-collapse { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0; display: flex; align-items: center; }
+.tmb-collapse .msym { font-size: 20px; margin: 0; }
+.team-board-head:hover .tmb-collapse { color: var(--accent); }
+/* Bound the rows so a big team scrolls within the board instead of pushing the conversation away. */
+.tmb-rows { max-height: 38vh; overflow-y: auto; }
 .tpc-approve, .tpc-reject {
   padding: 4px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg);
   color: var(--text); font-weight: 600; cursor: pointer; font-size: 12px;

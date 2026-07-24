@@ -2218,12 +2218,21 @@ function renderTeamBoard(lead: Session | undefined): void {
   // Observational board only — integration + teardown are driven by the lead agent (via its
   // integrate / dismiss_member tools), so there are no action buttons here. The user directs the
   // lead conversationally ("integrate now", "dismiss the docs member").
+  // Collapsible so a big team (10+ members) doesn't take over the pane; the choice persists.
+  const collapsed = localStorage.getItem("anvil.teamBoardCollapsed") === "1";
   el.innerHTML = `${planCard}
     <div class="team-board-head">
+      <button class="tmb-collapse" title="${collapsed ? "Expand team" : "Collapse team"}">${icon(collapsed ? "chevron_right" : "expand_more")}</button>
       <span class="tmb-title">${icon("groups")} Team · ${members.length} member(s) · ${esc(policy)}</span>
     </div>
-    <div class="tmb-rows">${rows || `<div class="tmb-empty">No members yet.</div>`}</div>`;
+    ${collapsed ? "" : `<div class="tmb-rows">${rows || `<div class="tmb-empty">No members yet.</div>`}</div>`}`;
 
+  // Collapse/expand the member list (persisted). Clicking anywhere on the header toggles it.
+  el.querySelector(".team-board-head")?.addEventListener("click", () => {
+    const now = localStorage.getItem("anvil.teamBoardCollapsed") === "1";
+    localStorage.setItem("anvil.teamBoardCollapsed", now ? "0" : "1");
+    renderTeamBoard(lead);
+  });
   // Member rows deep-link to that member (its cards then route correctly as the active session).
   el.querySelectorAll<HTMLElement>(".tmb-row").forEach((row) =>
     row.addEventListener("click", () => { const id = row.dataset.id; if (id) selectSession(id); }),
