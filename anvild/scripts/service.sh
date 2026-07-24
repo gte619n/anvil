@@ -134,10 +134,24 @@ SERVE_OK=0
 setup_serve() {
   SERVE_OK=0
   local ts; ts="$(resolve_tailscale)" || { echo "tailscale CLI not found — daemon will bind the tailnet IP over plain HTTP"; return 0; }
-  if "$ts" serve --bg --https="$PORT" "http://127.0.0.1:$PORT" >/dev/null 2>&1 \
-     && "$ts" serve status 2>/dev/null | grep -q ":$PORT"; then
+  # Capture stderr: `serve --bg` exits 0 even when the operator check denies it, so the real success
+  # signal is `serve status` showing the port — but the stderr text is what tells a denied install
+  # apart from a genuinely-serve-less one (App Store Tailscale), so we can print the right fix.
+  local serve_err; serve_err="$("$ts" serve --bg --https="$PORT" "http://127.0.0.1:$PORT" 2>&1)"
+  if "$ts" serve status 2>/dev/null | grep -q ":$PORT"; then
     SERVE_OK=1
     echo "tailscale serve active — daemon will bind loopback, reachable at https://<magicdns>:$PORT"
+  elif printf '%s' "$serve_err" | grep -qiE "operator|serve config denied|access denied"; then
+    # The most common headless-Linux footgun: `tailscale serve` is root-only by default, so a non-root
+    # install falls back to plain HTTP — and a plain-HTTP daemon can't be reached from an HTTPS hub page
+    # (mixed content + no cert for a raw IP), so it pairs but shows permanently disconnected. Tell the
+    # user the exact one-time grant instead of the misleading "App Store?" message.
+    echo "⚠  tailscale serve was DENIED for this user — the daemon will fall back to plain HTTP on the"
+    echo "   tailnet IP, which an HTTPS-served fleet hub CANNOT reach (it'll pair but stay disconnected)."
+    echo "   Grant this user serve permission once, then re-run install:"
+    echo "       sudo tailscale set --operator=$(id -un)"
+    echo "       $0 install"
+    echo "   (Also ensure HTTPS Certificates are enabled: admin console → Settings → Features.)"
   else
     echo "tailscale serve unavailable (App Store Tailscale?) — daemon will bind the tailnet IP over plain HTTP"
   fi

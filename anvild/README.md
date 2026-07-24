@@ -89,6 +89,24 @@ login and restarts on crash.
 > (`loginctl enable-linger "$USER"`; `install` attempts this for you). Installing over SSH?
 > Enable lingering first, then reconnect, so `systemctl --user` has a session bus.
 
+> **Grant `tailscale serve` permission first (Linux/CLI Tailscale).** `install` fronts the daemon
+> with `tailscale serve` so it's reachable over **HTTPS on your MagicDNS name** — which is what lets
+> an HTTPS-served hub (and every other fleet member) actually connect to it. But `tailscale serve` is
+> **root-only by default**, so a non-root install silently falls back to plain HTTP on the tailnet IP.
+> A plain-HTTP daemon **cannot be reached from an HTTPS page** (the browser blocks mixed `ws://` and a
+> raw IP has no TLS cert), so it pairs into a fleet but shows **permanently disconnected**. Grant your
+> user serve permission **once**, then (re-)install:
+>
+> ```sh
+> sudo tailscale set --operator="$USER"   # one-time: let this user run `tailscale serve`
+> ./scripts/service.sh install            # now binds loopback + HTTPS on the MagicDNS name
+> ```
+>
+> This also requires **HTTPS Certificates** enabled for your tailnet (admin console → Settings →
+> Features). The macOS [Anvil Server](../anvil-server/) app already holds this permission, so Macs
+> don't hit it — it's specific to a headless/CLI Linux join. `install` prints exactly this hint if it
+> detects the denial.
+
 > The daemon runs with `settingSources: []`, so it does **not** inherit your ambient Claude
 > Code allow-rules — the daemon is the permission authority. Trade-off: the repo's
 > `CLAUDE.md` isn't auto-loaded; project-context injection is a later item.
