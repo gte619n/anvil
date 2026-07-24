@@ -54,6 +54,13 @@ function gitSurface(): { git: IntegrateGit; pushes: number; prs: number } {
   return { git: g, get pushes() { return state.pushes; }, get prs() { return state.prs; } } as any;
 }
 
+test("#1: branchExists detects a taken slug (the auto-suffix collision check)", () => {
+  const repo = makeTeamRepo(); // has branches lead, m1, m2
+  expect(git.branchExists(repo, "m1")).toBe(true);
+  expect(git.branchExists(repo, "lead")).toBe(true);
+  expect(git.branchExists(repo, "does-not-exist")).toBe(false);
+});
+
 test("combined-pr merges both member branches into the lead branch and opens one PR", () => {
   const repo = makeTeamRepo();
   const s = gitSurface();

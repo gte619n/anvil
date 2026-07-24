@@ -882,6 +882,7 @@ export class Supervisor {
     if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
     const chosen = plan ?? this.pendingTeamPlans.get(leadId);
     if (!chosen) throw new BadCommand(`no pending team plan for ${leadId}`);
+    if (!chosen.members?.length) throw new BadCommand("cannot approve an empty team plan (no members)"); // #8
     this.pendingTeamPlans.delete(leadId);
     this.startTeamPlan({ ...chosen, leadId });
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "team.plan.resolved", ts: now(), sessionId: leadId, approved: true });
@@ -900,6 +901,7 @@ export class Supervisor {
   private startTeamPlan(plan: TeamPlan): number {
     const lead = this.require(plan.leadId);
     if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
+    if (!plan.members?.length) throw new BadCommand("cannot start an empty team plan (no members)"); // #8
     lead.data.team = lead.data.team ?? { integration: plan.integration, maxConcurrentMembers: 3 };
     lead.data.team.integration = plan.integration; // honor the plan's integration choice
     this.persist();
@@ -910,7 +912,7 @@ export class Supervisor {
       this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...plan.members]);
       return 0;
     }
-    const cap = lead.data.team.maxConcurrentMembers ?? 3;
+    const cap = Math.max(1, lead.data.team.maxConcurrentMembers ?? 3); // #3: never 0/negative
     const room = Math.max(0, cap - this.activeMemberCount(plan.leadId));
     const toStart = plan.members.slice(0, room);
     const overflow = plan.members.slice(room);
@@ -947,7 +949,7 @@ export class Supervisor {
     const lead = this.sessions.get(leadId);
     if (!lead || lead.data.teamRole !== "lead") return;
     if (spawnPaused(this.budget())) return; // still under budget pressure — leave them queued
-    const cap = lead.data.team?.maxConcurrentMembers ?? 3;
+    const cap = Math.max(1, lead.data.team?.maxConcurrentMembers ?? 3); // #3
     let room = Math.max(0, cap - this.activeMemberCount(leadId, justFinishedId));
     while (room > 0 && queue.length > 0) {
       const m = queue.shift()!;
@@ -973,12 +975,19 @@ export class Supervisor {
     const leadBranch = lead.data.worktree?.branch ?? lead.data.git?.branch;
     const env = lead.data.environmentId ? this.envStore.get(lead.data.environmentId) : undefined;
     const base = a.base ?? memberBaseRef({ source: a.source, leadBranch, envDefault: env?.defaultBase });
+    // #1: auto-suffix the title so its branch slug is unique — two members whose titles slugify the
+    // same (dup / case / punctuation / 32-char-truncation collision) no longer drop one silently.
+    // #7: a lead without an env can still spawn members off its own repo (worktree repoRoot, or its
+    // cwd when it's an existing-dir lead pointing at a git repo).
+    const repoRoot = lead.data.worktree?.repoRoot ?? env?.repoRoot ?? lead.data.cwd;
+    const title = a.source === "fresh-worktree" && repoRoot ? this.uniqueMemberTitle(repoRoot, a.title) : a.title;
     return this.handoffCreate({
       environmentId: lead.data.environmentId,
+      repoRoot,
       source: a.source,
       cwd: a.source === "existing-dir" ? lead.data.cwd : undefined,
       base,
-      title: a.title,
+      title,
       model: lead.data.model,
       autonomy: lead.data.autonomy,
       brief: a.brief,
@@ -986,6 +995,16 @@ export class Supervisor {
       teamRole: "member",
       memberTask: a.task,
     });
+  }
+
+  /** A member title whose branch slug is free in `repoRoot` — appends " 2", " 3", … on collision. */
+  private uniqueMemberTitle(repoRoot: string, desired: string): string {
+    if (!git.branchExists(repoRoot, slugify(desired))) return desired;
+    for (let n = 2; n < 200; n++) {
+      const cand = `${desired} ${n}`;
+      if (!git.branchExists(repoRoot, slugify(cand))) return cand;
+    }
+    return desired; // exhausted — let the spawn fail and surface the error via spawnMember
   }
 
   private teamListMembers(leadId: string): TeamInfo | null {
@@ -1000,6 +1019,14 @@ export class Supervisor {
     if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can integrate");
     const team = deriveTeams(this.list()).find((t) => t.leadId === leadId);
     if (!team || team.members.length === 0) throw new BadCommand("this lead has no members to integrate");
+    // #6: don't merge a member's branch while it's mid-work — refuse until every member is terminal.
+    const stillRunning = team.members.filter((m) => m.status !== "idle" && m.status !== "exited" && m.status !== "error");
+    if (stillRunning.length) {
+      throw new BadCommand(
+        `Cannot integrate yet — ${stillRunning.length} member(s) still working: ${stillRunning.map((m) => m.task ?? m.sessionId).join(", ")}. ` +
+          `Wait for them to finish (or dismiss them) before integrating.`,
+      );
+    }
 
     // Order members by the plan's dependsOn when we have it (session.title === plan member title,
     // stamped at spawn); hand-added members with no plan entry keep their natural order at the end.
@@ -1055,6 +1082,8 @@ export class Supervisor {
           `Resolve the conflicts in this worktree, commit the merge, then call the integrate tool again to continue.`,
       );
     }
+    // #8: a completed integrate consumes the active plan (no stale dependsOn lingering for a re-run).
+    if (result.ok) this.activeTeamPlans.delete(leadId);
     return result.output;
   }
 
@@ -1719,7 +1748,8 @@ export class Supervisor {
       data.teamRole = "lead";
       data.team = {
         integration: cmd.team?.integration === "pr-per-member" ? "pr-per-member" : "combined-pr",
-        maxConcurrentMembers: cmd.team?.maxConcurrentMembers ?? 3,
+        // #3: clamp to >= 1 — a cap of 0/negative would queue every member and start none (wedge).
+        maxConcurrentMembers: Math.max(1, Math.floor(cmd.team?.maxConcurrentMembers ?? 3)),
       };
     }
 
@@ -1749,22 +1779,26 @@ export class Supervisor {
     parentId?: string;
     teamRole?: "lead" | "member";
     memberTask?: string;
+    repoRoot?: string; // #7: spawn a fresh-worktree member off this repo when there's no environment
   }): { id: string; title: string; cwd: string } {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
       const env = a.environmentId ? this.envStore.get(a.environmentId) : undefined;
-      if (!env) {
-        throw new BadCommand("environmentId is required and must be a known environment for a fresh-worktree handoff");
+      // #7: fall back to an explicit repoRoot (the lead's own repo) when no environment is registered,
+      // so a team lead created from a raw folder can still spawn members instead of every spawn failing.
+      const repoRoot = env?.repoRoot ?? a.repoRoot;
+      if (!repoRoot) {
+        throw new BadCommand("a fresh-worktree handoff needs an environment or a repoRoot");
       }
       cmd = {
         v: PROTOCOL_VERSION,
         type: "session.create",
         ts: now(),
         source: "fresh-worktree",
-        repoRoot: env.repoRoot,
-        base: a.base ?? env.defaultBase,
+        repoRoot,
+        base: a.base ?? env?.defaultBase ?? "HEAD",
         title: a.title,
-        environmentId: env.id,
+        environmentId: env?.id,
         model: a.model,
         autonomy: a.autonomy,
       };
@@ -2300,6 +2334,20 @@ export class Supervisor {
   async kill(id: string): Promise<void> {
     if (id === DEFAULT_SESSION_ID) throw new BadCommand("the default chat cannot be deleted");
     const s = this.require(id);
+    const isLead = s.data.teamRole === "lead";
+    const parentId = s.data.parentId;
+    // Teams (#4): killing a lead cascades to its members — no orphans left running that leak budget and
+    // are unreachable by team tools. Drop the lead's orchestration state FIRST so the cascade kills
+    // can't re-spawn queued members off a dying lead (#8: clears activeTeamPlans/queue too).
+    if (isLead) {
+      this.queuedMembers.delete(id);
+      this.pendingTeamPlans.delete(id);
+      this.activeTeamPlans.delete(id);
+      this.teamRelayHops.delete(id);
+      for (const m of this.list().filter((x) => x.parentId === id)) {
+        await this.kill(m.id).catch((e) => console.error(`[teams] cascade teardown failed for member ${m.id}:`, e));
+      }
+    }
     s.dispose(); // stop accepting events first, so a late-draining turn can't write to a removed dir
     this.clearNotifications(id); // dismiss any lingering "your turn" reminder for the gone session
     this.sessions.delete(id);
@@ -2307,6 +2355,9 @@ export class Supervisor {
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
+    // Teams (#5): a killed member frees a concurrency slot — start a queued member (no-op if the lead
+    // is also being torn down, since its queue was cleared above).
+    if (parentId && !isLead) this.drainQueuedMembers(parentId);
     this.trackTeardown(this.teardownSession(id, s));
   }
 
@@ -2474,6 +2525,7 @@ export class Supervisor {
         this.registry.toAttached(sessionId, event);
         this.maybeNotify(sessionId, event);
         this.maybeBroadcastAwaiting(sessionId, event);
+        this.maybeBroadcastTeamStatus(sessionId, event);
       },
       () => this.persistSoon(), // [BE-1] high-frequency emit path is debounced; lifecycle ops flush now
       (event) => log.append(event),
@@ -2495,6 +2547,17 @@ export class Supervisor {
     else this.awaitingAnnounced.delete(sessionId);
     const data = this.sessions.get(sessionId)?.data;
     if (data) this.broadcastUpdated(data);
+  }
+
+  /** Teams (#2): a member's `status` event is session-scoped (only its attached clients get it), so a
+   *  device viewing the LEAD would never see members go idle — the board + rollup would freeze at
+   *  "thinking" until a reload. Broadcast a `session.updated` (carries the new status, and refreshes
+   *  team.info) on any team session's status change so the tree/board/rollup stay live everywhere. */
+  private maybeBroadcastTeamStatus(sessionId: string, event: ServerEvent): void {
+    if (event.type !== "status") return;
+    const data = this.sessions.get(sessionId)?.data;
+    if (!data || (!data.teamRole && !data.parentId)) return; // only sessions that belong to a team
+    this.broadcastUpdated(data);
   }
 
   /** Push a notification on the events that mean "your turn" (arch §6.7). */

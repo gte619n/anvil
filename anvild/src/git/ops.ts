@@ -158,6 +158,12 @@ export function mergeBranch(cwd: string, branch: string, message?: string): { ok
   return { ok: false, conflicted, output: r.out || `merge of ${branch} failed (exit ${r.code})` };
 }
 
+/** True when a local branch named `name` already exists in the repo at `cwd`. Used to auto-suffix a
+ *  team member's branch slug so two members with colliding titles don't drop one silently. */
+export function branchExists(cwd: string, name: string): boolean {
+  return run(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${name}`], cwd).code === 0;
+}
+
 /** True when `ref` is already an ancestor of HEAD in `cwd` — i.e. its commits are already merged.
  *  Lets integration be idempotent: a member merged in an earlier (interrupted) run is skipped. */
 export function isAncestor(cwd: string, ref: string): boolean {

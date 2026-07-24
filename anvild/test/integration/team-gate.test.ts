@@ -53,6 +53,20 @@ test("a lead with no explicit policy gets combined-pr + cap 3 defaults", () => {
   expect(lead.data.team).toEqual({ integration: "combined-pr", maxConcurrentMembers: 3 });
 });
 
+test("#3: maxConcurrentMembers is clamped to >= 1 (a 0/negative cap would wedge the team)", () => {
+  const { sup } = makeSup();
+  const zero = sup.create(leadCmd(makeRepo(), { team: { integration: "combined-pr", maxConcurrentMembers: 0 } }));
+  expect(zero.data.team?.maxConcurrentMembers).toBe(1);
+  const neg = sup.create(leadCmd(makeRepo(), { team: { integration: "combined-pr", maxConcurrentMembers: -5 } }));
+  expect(neg.data.team?.maxConcurrentMembers).toBe(1);
+});
+
+test("#8: approving an empty plan is rejected (no silent no-op spawn)", () => {
+  const { sup } = makeSup();
+  const lead = sup.create(leadCmd(makeRepo()));
+  expect(() => sup.approveTeamPlan(lead.id, { leadId: lead.id, members: [], integration: "combined-pr" })).toThrow();
+});
+
 test("rejectTeamPlan broadcasts team.plan.resolved{approved:false} without spawning members", () => {
   const { sup, reg } = makeSup();
   const lead = sup.create(leadCmd(makeRepo()));
