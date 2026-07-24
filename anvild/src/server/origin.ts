@@ -41,7 +41,35 @@ export function isAllowedWsOrigin(
   // Same-origin PWA: the Origin's host[:port] matches the daemon's own Host header.
   if (host && u.host === host) return true;
 
+  // Same-tailnet fleet peer: trust any Origin within THIS daemon's own Tailscale MagicDNS domain,
+  // derived from our own Host header (e.g. Host "beelink.tailnet.ts.net:7701" → domain "tailnet.ts.net";
+  // `tailscale serve` preserves the client-facing Host). Tailscale is the security boundary, and a
+  // *.ts.net name is Tailscale-issued and only resolvable/reachable from within the tailnet — a public
+  // drive-by page can't present one. This is what lets a whole fleet connect cross-origin in a browser
+  // (the hub's page opening a WS to each member) with no per-member ANVIL_ALLOWED_ORIGINS config.
+  const tailnet = tailnetDomainOf(host);
+  if (tailnet && (u.hostname === tailnet || u.hostname.endsWith(`.${tailnet}`))) return true;
+
   return false;
+}
+
+/**
+ * The registrable Tailscale MagicDNS domain from a daemon's own `Host` header — the host minus its
+ * leading DNS label (the machine name) and any `:port`. Returns undefined unless it's a real `*.ts.net`
+ * MagicDNS name, so a direct-IP or non-Tailscale Host grants no same-tailnet trust.
+ *   "beelink-4450.softshell-mark.ts.net:7701" → "softshell-mark.ts.net"
+ *   "100.116.161.46:7701" / "localhost:7701"  → undefined
+ */
+function tailnetDomainOf(host: string | null | undefined): string | undefined {
+  if (!host) return undefined;
+  const hostname = host.replace(/:\d+$/, ""); // strip :port
+  if (!hostname.endsWith(".ts.net")) return undefined; // only Tailscale MagicDNS names
+  const dot = hostname.indexOf(".");
+  if (dot < 0 || dot === hostname.length - 1) return undefined;
+  const domain = hostname.slice(dot + 1); // drop the leading machine label → "<tailnet>.ts.net"
+  // Require a real tailnet label in front of ".ts.net" — never let a degenerate "ts.net" through, which
+  // would over-match every tailnet on the internet.
+  return domain.endsWith(".ts.net") ? domain : undefined;
 }
 
 /** Parse the ANVIL_ALLOWED_ORIGINS env (comma/space separated) into an exact-match allowlist. */
