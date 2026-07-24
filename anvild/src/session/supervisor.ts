@@ -1431,6 +1431,10 @@ export class Supervisor {
     model?: Model;
     autonomy?: AutonomyPolicy;
     brief: string;
+    // ── Teams: link the new session to a lead as a member (see docs/plans/anvil-team-support.md) ──
+    parentId?: string;
+    teamRole?: "lead" | "member";
+    memberTask?: string;
   }): { id: string; title: string; cwd: string } {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
@@ -1465,6 +1469,13 @@ export class Supervisor {
       };
     }
     const session = this.create(cmd);
+    // Teams: stamp the parent link BEFORE the session.created broadcast so members arrive labeled.
+    if (a.parentId || a.teamRole || a.memberTask) {
+      session.data.parentId = a.parentId;
+      session.data.teamRole = a.teamRole;
+      session.data.memberTask = a.memberTask;
+      this.persist();
+    }
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
     this.prompt(session.id, a.brief); // lazily starts the driver and runs the first turn
     return { id: session.id, title: session.data.title, cwd: session.data.cwd };

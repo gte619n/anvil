@@ -25,6 +25,10 @@ export interface DefaultToolDeps {
     model?: Model;
     autonomy?: AutonomyPolicy;
     brief: string;
+    // ── Teams: stamp the new session as a member of a lead (see docs/plans/anvil-team-support.md) ──
+    parentId?: string;
+    teamRole?: "lead" | "member";
+    memberTask?: string;
   }): { id: string; title: string; cwd: string };
 }
 
