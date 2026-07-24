@@ -249,6 +249,26 @@ export interface TeamPolicy {
   maxConcurrentMembers: number; // spawn/concurrency cap (default 3)
 }
 
+/** A team, computed from the session list by grouping on `parentId`. Sent via `team.info`. */
+export interface TeamInfo {
+  leadId: SessionId;
+  policy: TeamPolicy;
+  members: TeamMemberInfo[];
+  rollup: { total: number; running: number; awaiting: number; done: number; error: number };
+}
+export interface TeamMemberInfo {
+  sessionId: SessionId;
+  task?: string;
+  status: SessionStatus;
+  git?: GitStatus; // reuse the existing per-session git projection
+}
+export type TeamPlanMember = { title: string; task: string; source: SessionSource; dependsOn?: string[] };
+export interface TeamPlan {
+  leadId: SessionId;
+  members: TeamPlanMember[];
+  integration: TeamPolicy["integration"];
+}
+
 /** One entry in a session's `/` autocomplete: an invocable slash-command or skill. `name` is the exact
  *  invocable string (built-ins bare, e.g. "compact"; plugin skills namespaced, e.g. "user:deep-research")
  *  — the composer sends "/" + name verbatim. (§skills) */
@@ -400,6 +420,20 @@ export interface SessionUpdatedEvent extends Envelope {
 export interface SessionDeletedEvent extends Envelope {
   type: "session.deleted";
   sessionId: SessionId;
+}
+export interface TeamInfoEvent extends Envelope {
+  type: "team.info";
+  teams: TeamInfo[];
+}
+export interface TeamPlanEvent extends Envelope {
+  type: "team.plan";
+  sessionId: SessionId;
+  plan: TeamPlan;
+}
+export interface TeamPlanResolvedEvent extends Envelope {
+  type: "team.plan.resolved";
+  sessionId: SessionId;
+  approved: boolean;
 }
 export interface BudgetEvent extends Envelope {
   type: "budget";
@@ -830,6 +864,9 @@ export type ServerEvent =
   | SessionCreatedEvent
   | SessionUpdatedEvent
   | SessionDeletedEvent
+  | TeamInfoEvent
+  | TeamPlanEvent
+  | TeamPlanResolvedEvent
   | BudgetEvent
   | EnvironmentsEvent
   | PromptsEvent
@@ -960,6 +997,20 @@ export interface SessionSetAdversarialReviewCmd extends Envelope, Correlated {
   type: "session.set_adversarial_review";
   sessionId: SessionId;
   enabled: boolean;
+}
+// ── Teams (see docs/plans/anvil-team-support.md) ──────────────────────────
+export interface TeamPlanApproveCmd extends Envelope, Correlated {
+  type: "team.plan.approve";
+  sessionId: SessionId;
+  plan: TeamPlan;
+}
+export interface TeamPlanRejectCmd extends Envelope, Correlated {
+  type: "team.plan.reject";
+  sessionId: SessionId;
+}
+export interface TeamIntegrateCmd extends Envelope, Correlated {
+  type: "team.integrate";
+  sessionId: SessionId;
 }
 
 // 5b. Conversation
@@ -1257,6 +1308,9 @@ export type ClientCommand =
   | SessionSetModelCmd
   | SessionSetAutonomyCmd
   | SessionSetAdversarialReviewCmd
+  | TeamPlanApproveCmd
+  | TeamPlanRejectCmd
+  | TeamIntegrateCmd
   | GitCmd
   // conversation
   | PromptSendCmd
