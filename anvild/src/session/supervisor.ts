@@ -809,6 +809,9 @@ export class Supervisor {
   /** Approve a parked plan (possibly user-edited) and spawn its members up to the concurrency cap. */
   approveTeamPlan(leadId: string, plan?: TeamPlan): void {
     const lead = this.require(leadId);
+    // Guard the auth boundary: a client-supplied sessionId + hand-built plan must not spawn members
+    // off a session that was never created as a lead (e.g. the concierge). Mirrors teamProposePlan.
+    if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
     const chosen = plan ?? this.pendingTeamPlans.get(leadId);
     if (!chosen) throw new BadCommand(`no pending team plan for ${leadId}`);
     this.pendingTeamPlans.delete(leadId);
@@ -828,6 +831,7 @@ export class Supervisor {
    *  count started now. */
   private startTeamPlan(plan: TeamPlan): number {
     const lead = this.require(plan.leadId);
+    if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
     lead.data.team = lead.data.team ?? { integration: plan.integration, maxConcurrentMembers: 3 };
     lead.data.team.integration = plan.integration; // honor the plan's integration choice
     this.persist();
@@ -854,15 +858,18 @@ export class Supervisor {
   }
 
   /** Start queued members up to the lead's concurrency cap, unless the budget is paused. Called when a
-   *  member frees a slot (its turn ends) so a large plan drains as capacity + budget allow. */
-  private drainQueuedMembers(leadId: string): void {
+   *  member frees a slot (its turn ends) so a large plan drains as capacity + budget allow.
+   *  `justFinishedId` is the member whose completion triggered this: the driver fires `onResult` BEFORE
+   *  flipping its status to idle (driver.ts), so we must exclude it from the active count or it would
+   *  still occupy its own slot and the drain would be short by one (stalling a cap-1 team entirely). */
+  private drainQueuedMembers(leadId: string, justFinishedId?: string): void {
     const queue = this.queuedMembers.get(leadId);
     if (!queue || queue.length === 0) return;
     const lead = this.sessions.get(leadId);
     if (!lead || lead.data.teamRole !== "lead") return;
     if (spawnPaused(this.budget())) return; // still under budget pressure — leave them queued
     const cap = lead.data.team?.maxConcurrentMembers ?? 3;
-    let room = Math.max(0, cap - this.activeMemberCount(leadId));
+    let room = Math.max(0, cap - this.activeMemberCount(leadId, justFinishedId));
     while (room > 0 && queue.length > 0) {
       const m = queue.shift()!;
       try {
@@ -875,10 +882,11 @@ export class Supervisor {
     if (queue.length === 0) this.queuedMembers.delete(leadId);
   }
 
-  /** Members currently occupying a concurrency slot (spawned and not yet terminal). */
-  private activeMemberCount(leadId: string): number {
+  /** Members currently occupying a concurrency slot (spawned and not yet terminal). `excludeId` drops a
+   *  member that is about to free its slot but hasn't flipped to idle yet (see drainQueuedMembers). */
+  private activeMemberCount(leadId: string, excludeId?: string): number {
     return this.list().filter(
-      (s) => s.parentId === leadId && s.status !== "idle" && s.status !== "exited" && s.status !== "error",
+      (s) => s.parentId === leadId && s.id !== excludeId && s.status !== "idle" && s.status !== "exited" && s.status !== "error",
     ).length;
   }
 
@@ -960,11 +968,11 @@ export class Supervisor {
     this.persist();
     this.broadcastUpdated(lead.data);
 
-    if (!result.ok && result.conflictedMember) {
-      // Hand the conflict to the lead as an agent turn; a re-run of integrate() then continues past it.
+    if (!result.ok && result.failedMember && result.conflicted) {
+      // A real conflict: hand it to the lead as an agent turn; a re-run of integrate() continues past it.
       this.prompt(
         leadId,
-        `Integration hit a merge conflict pulling in member "${result.conflictedMember}". ` +
+        `Integration hit a merge conflict pulling in member "${result.failedMember}". ` +
           `Resolve the conflicts in this worktree, commit the merge, then call the integrate tool again to continue.`,
       );
     }
@@ -2447,7 +2455,7 @@ export class Supervisor {
     if (s) this.refreshGit(s);
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
-    if (s?.data.parentId) this.drainQueuedMembers(s.data.parentId);
+    if (s?.data.parentId) this.drainQueuedMembers(s.data.parentId, sessionId);
     // Refresh the live context-window meter from this turn's reading (§context). Broadcast so every
     // device's composer gauge updates; skip the push when the SDK didn't report (keep the last value).
     if (s && usage.contextUsage) {

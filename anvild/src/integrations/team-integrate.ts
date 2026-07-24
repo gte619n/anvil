@@ -39,7 +39,8 @@ export interface IntegrateResult {
   ok: boolean;
   mode: "combined-pr" | "pr-per-member";
   merged: string[]; // member titles merged (or already-merged) this run
-  conflictedMember?: string; // set when a merge conflicted → team parks needs-human, no PR
+  failedMember?: string; // set when a member's merge failed (conflict OR other) → no PR
+  conflicted?: boolean; // true only for a real merge conflict (markers in the tree the lead can resolve)
   prUrl?: string;
   output: string;
 }
@@ -63,15 +64,14 @@ export function integrateTeam(input: IntegrateInput): IntegrateResult {
     }
     const r = input.git.mergeBranch(input.leadCwd, m.branch, `Merge team member ${m.title} (${m.branch})`);
     if (!r.ok) {
-      return {
-        ok: false,
-        mode: "combined-pr",
-        merged,
-        conflictedMember: m.title,
-        output:
-          `Merge conflict integrating "${m.title}" (${m.branch}) into ${input.leadBranch}. ` +
-          `Resolve the conflicts in the lead worktree, commit, then run integrate again to continue.\n${r.output}`,
-      };
+      // A real conflict leaves markers the lead can resolve; any other failure (dirty tree, missing
+      // branch, detached HEAD) is NOT resolvable by "fix the conflicts" — report it differently.
+      const output = r.conflicted
+        ? `Merge conflict integrating "${m.title}" (${m.branch}) into ${input.leadBranch}. ` +
+          `Resolve the conflicts in the lead worktree, commit, then run integrate again to continue.\n${r.output}`
+        : `Could not merge "${m.title}" (${m.branch}) into ${input.leadBranch} — this is NOT a conflict ` +
+          `(e.g. uncommitted changes in the lead worktree, or a missing branch). Fix the reported cause, then run integrate again.\n${r.output}`;
+      return { ok: false, mode: "combined-pr", merged, failedMember: m.title, conflicted: r.conflicted, output };
     }
     merged.push(m.title);
   }

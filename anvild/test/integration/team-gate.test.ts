@@ -69,3 +69,13 @@ test("approving/rejecting an unknown session throws a BadCommand", () => {
   expect(() => sup.rejectTeamPlan("sess_nope")).toThrow();
   expect(() => sup.approveTeamPlan("sess_nope")).toThrow();
 });
+
+test("approveTeamPlan refuses a non-lead session (auth boundary — no member spawn off a plain session)", () => {
+  const { sup } = makeSup();
+  // A plain (non-lead) session, plus a hand-built plan a malicious/confused client could send.
+  const plain = sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "fresh-worktree", repoRoot: makeRepo(), base: "HEAD", title: "plain" } as SessionCreateCmd);
+  expect(plain.data.teamRole).toBeUndefined();
+  const plan = { leadId: plain.id, integration: "combined-pr" as const, members: [{ title: "X", task: "t", source: "fresh-worktree" as const }] };
+  expect(() => sup.approveTeamPlan(plain.id, plan)).toThrow();
+  expect(sup.list().filter((s) => s.parentId === plain.id)).toHaveLength(0);
+});

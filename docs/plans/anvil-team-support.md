@@ -217,6 +217,14 @@ Findings from the web-client map (`anvild/web/src/main.ts`) drive minimal, addit
   needs relaxing the single-active-session `activeId` drop-guard (`main.ts:920`) into a
   "team-group-active" concept. v1 selects the member instead.
 - **Member↔member worktree sharing / stacked branches** beyond the two integration modes.
+- **Persisting in-flight orchestration state across a daemon restart.** The lead's queued-but-not-yet-
+  spawned members (`queuedMembers`), the active plan (`activeTeamPlans`, used only to order the merge),
+  and a not-yet-approved `team.plan` card (`pendingTeamPlans`) live in memory only. A restart
+  reconstitutes the *derived* team tree and already-spawned members (§6) but drops these: an overflow
+  plan's unspawned tail never spawns, and an unapproved plan card vanishes (the lead's tool call
+  already returned "awaiting approval"). Known v1 limitation — surfaced in code review 2026-07-24;
+  spawn every member up front (no cap) or persist a small team sidecar to close it. Low-frequency
+  (only a restart mid-run with an overflowing/unapproved plan), so deferred, not fixed, in v1.
 
 ---
 

@@ -53,12 +53,28 @@ test("a member with no branch (read-only) is not merged", () => {
   expect(r.ok).toBe(true);
 });
 
-test("a merge conflict parks: reports the member, opens no PR", () => {
+test("a merge conflict parks: reports the member as a real conflict, opens no PR", () => {
   const fg = fakeGit({ conflictOn: "b_B" });
   const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B"), M("C")], prTitle: "t", prBody: "b", git: fg.git });
   expect(r.ok).toBe(false);
-  expect(r.conflictedMember).toBe("B");
+  expect(r.failedMember).toBe("B");
+  expect(r.conflicted).toBe(true);
   expect(fg.merged).toEqual(["b_A"]); // stopped at the conflict; C not attempted
   expect(fg.prs).toBe(0);
   expect(r.output).toContain("Merge conflict");
+});
+
+test("a non-conflict merge failure is reported distinctly (not as a resolvable conflict)", () => {
+  const g: IntegrateGit = {
+    isAncestor: () => false,
+    mergeBranch: () => ({ ok: false, conflicted: false, output: "error: Your local changes would be overwritten" }),
+    push: () => ({ ok: true, output: "pushed" }),
+    createPr: () => ({ ok: true, output: "created", url: "u" }),
+  };
+  const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A")], prTitle: "t", prBody: "b", git: g });
+  expect(r.ok).toBe(false);
+  expect(r.failedMember).toBe("A");
+  expect(r.conflicted).toBe(false);
+  expect(r.output).toContain("NOT a conflict");
+  expect(r.output).not.toContain("Resolve the conflicts");
 });
