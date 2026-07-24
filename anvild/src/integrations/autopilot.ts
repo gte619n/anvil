@@ -3,7 +3,7 @@ import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
 import { makePipelineGuardHook } from "../agent/pipeline-guard";
 import type { QueryLike } from "../agent/query";
-import type { TodoistClient, TodoistTask, TodoistSection } from "./todoist";
+import type { TodoistClient, TodoistTask, TodoistSection, TodoistComment } from "./todoist";
 import { readStatus, withStatus, type AnvilStatus } from "./status";
 import { extractPlanMeta, PLAN_META_INSTRUCTION, type PlanClarification } from "./plan-meta";
 import { extractJson } from "./json";
@@ -135,16 +135,61 @@ function resolvePlan(out: { text: string; plan?: string }): { plan: string; summ
   };
 }
 
-function taskLine(t: TodoistTask, sectionName?: string): string {
+// A single field can't be allowed to balloon the prompt without bound, but the old 300-char clip was
+// truncating real specs mid-sentence (a task whose destination lived past char 300 read as
+// "unspecified" and got wrongly held for clarification). 4000 chars (~600 words) is a generous safety
+// ceiling, not a summary — the planner sees the whole description/comment in the overwhelming case.
+const FIELD_CHAR_CAP = 4000;
+
+/** Render a description/comment body as an indented block under a task line, PRESERVING internal line
+ *  breaks so tables/lists/structure survive into the planning prompt (the old collapse-to-one-line
+ *  flattened exactly the kind of dated table these tasks describe). Capped generously per field. */
+function indentBlock(text: string, prefix: string): string {
+  return text
+    .trim()
+    .slice(0, FIELD_CHAR_CAP)
+    .split("\n")
+    .map((line) => `${prefix}${line.trimEnd()}`)
+    .join("\n");
+}
+
+function taskLine(t: TodoistTask, opts: { sectionName?: string; comments?: TodoistComment[] } = {}): string {
   const bits = [
     `id=${t.id}`,
     `P${5 - (t.priority ?? 1)}`,
-    sectionName ? `section="${sectionName}"` : null,
+    opts.sectionName ? `section="${opts.sectionName}"` : null,
     t.labels?.length ? `labels=[${t.labels.join(",")}]` : null,
     t.parent_id ? "subtask" : null,
   ].filter(Boolean);
-  const desc = t.description?.trim() ? `\n    ${t.description.trim().replace(/\s+/g, " ").slice(0, 300)}` : "";
-  return `- ${t.content}  (${bits.join(" ")})${desc}`;
+  const desc = t.description?.trim() ? `\n${indentBlock(t.description, "    ")}` : "";
+  // Comments carry clarifications the user added after writing the task (answers to open questions,
+  // extra spec). Fold them into the same task block so the planner reasons over the FULL thread.
+  const comments = (opts.comments ?? [])
+    .filter((c) => c.content?.trim())
+    .map((c) => `\n    💬 comment:\n${indentBlock(c.content, "      ")}`)
+    .join("");
+  return `- ${t.content}  (${bits.join(" ")})${desc}${comments}`;
+}
+
+/** Fetch each task's Todoist comment thread, keyed by task id. Best-effort: a failed fetch for one task
+ *  yields an empty thread rather than wedging the whole run — planning proceeds on the description alone. */
+async function fetchComments(
+  client: TodoistClient,
+  tasks: TodoistTask[],
+  signal?: AbortSignal,
+): Promise<Map<string, TodoistComment[]>> {
+  const map = new Map<string, TodoistComment[]>();
+  await Promise.all(
+    tasks.map(async (t) => {
+      if (signal?.aborted) return;
+      try {
+        map.set(t.id, await client.comments(t.id));
+      } catch {
+        map.set(t.id, []);
+      }
+    }),
+  );
+  return map;
 }
 
 /**
@@ -158,7 +203,7 @@ export async function bundleTasks(
 ): Promise<ProposedUnit[]> {
   if (tasks.length === 0) return [];
   const sectionName = (id?: string | null) => sections.find((s) => s.id === id)?.name;
-  const list = tasks.map((t) => taskLine(t, sectionName(t.section_id))).join("\n");
+  const list = tasks.map((t) => taskLine(t, { sectionName: sectionName(t.section_id) })).join("\n");
   const prompt = `You are planning engineering work${opts.repoName ? ` for the "${opts.repoName}" repo` : ""}.
 Below are outstanding Todoist tasks. Group them into "units of work" — bundles that make sense to implement together in a single branch/PR (related features, same area of the code, shared setup). A standalone task becomes a unit of one. Prefer cohesive, reviewable units; don't force unrelated tasks together.
 
@@ -188,10 +233,10 @@ Respond with ONLY a JSON array, no prose:
 export async function planUnit(
   unit: ProposedUnit,
   tasks: TodoistTask[],
-  opts: { model?: Model; repoRoot: string; signal?: AbortSignal; adversarial?: AdversarialOpts },
+  opts: { model?: Model; repoRoot: string; signal?: AbortSignal; adversarial?: AdversarialOpts; comments?: Map<string, TodoistComment[]> },
 ): Promise<PlannedUnit> {
   const members = tasks.filter((t) => unit.taskIds.includes(t.id));
-  const taskBlock = members.map((t) => taskLine(t)).join("\n");
+  const taskBlock = members.map((t) => taskLine(t, { comments: opts.comments?.get(t.id) })).join("\n");
   const prompt = `You are an engineer planning a unit of work in this repository. Inspect the codebase (read-only) and write a concrete implementation plan.
 
 Unit: ${unit.title}
@@ -243,9 +288,9 @@ ${PLAN_META_INSTRUCTION}`;
 export async function classifyIntake(
   unit: ProposedUnit,
   tasks: TodoistTask[],
-  opts: { model?: Model; signal?: AbortSignal } = {},
+  opts: { model?: Model; signal?: AbortSignal; comments?: Map<string, TodoistComment[]> } = {},
 ): Promise<IntakeVerdict> {
-  const taskBlock = tasks.map((t) => taskLine(t)).join("\n");
+  const taskBlock = tasks.map((t) => taskLine(t, { comments: opts.comments?.get(t.id) })).join("\n");
   const prompt = `You are the User Advocate at intake for an autonomous engineering autopilot. If you approve this, it will be implemented UNATTENDED — no human in the loop — and shipped as a pull request. Judge ONLY whether the request is specified well enough to build without inventing material product decisions. Do not plan or solve it.
 
 Classify as exactly one of:
@@ -308,7 +353,11 @@ async function processUnit(
   },
 ): Promise<WorkUnit> {
   const members = candidates.filter((t) => unit.taskIds.includes(t.id));
-  const verdict = await classifyIntake(unit, members, { model: opts.intakeModel, signal: opts.signal });
+  // Pull each member's Todoist comment thread ONCE and thread it through both gates: the user often adds
+  // the missing spec as a comment after writing the task, so intake + planning must see it or they'll hold
+  // an already-answered task for clarification.
+  const comments = await fetchComments(deps.client, members, opts.signal);
+  const verdict = await classifyIntake(unit, members, { model: opts.intakeModel, signal: opts.signal, comments });
 
   let clarification: { reason: string; questions: string[] } | undefined;
   let planned: PlannedUnit | undefined;
@@ -321,7 +370,7 @@ async function processUnit(
         : "This task is underspecified — it needs answers before it can be built.");
     clarification = { reason, questions: verdict.questions };
   } else {
-    planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial });
+    planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial, comments });
     if (planned.clarification) {
       clarification = {
         reason: planned.summary?.trim() || "Planning surfaced open questions that must be answered before this can be built.",
@@ -531,7 +580,9 @@ export async function dryRunProject(
   const planned: PlannedUnit[] = [];
   for (const [i, unit] of units.entries()) {
     log(`  [${i + 1}/${units.length}] planning "${unit.title}" (${unit.taskIds.length} tasks)…`);
-    planned.push(await planUnit(unit, tasks, { model: opts.planModel, repoRoot: opts.repoRoot, adversarial: opts.adversarial }));
+    const members = tasks.filter((t) => unit.taskIds.includes(t.id));
+    const comments = await fetchComments(client, members);
+    planned.push(await planUnit(unit, tasks, { model: opts.planModel, repoRoot: opts.repoRoot, adversarial: opts.adversarial, comments }));
   }
   return planned;
 }
