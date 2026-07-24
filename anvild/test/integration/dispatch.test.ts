@@ -23,6 +23,7 @@ afterAll(() => {
 const CONNECT_FRAMES = new Set([
   "server.hello",
   "session.list",
+  "team.info",
   "budget",
   "environments",
   "prompts",

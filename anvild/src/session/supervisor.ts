@@ -22,6 +22,7 @@ import {
   type AutopilotPlanInfo,
   type AutopilotPipelineMetricsEvent,
   type AutopilotPlansEvent,
+  type TeamInfoEvent,
   type AutopilotPlanResultEvent,
   type AutopilotStartedEvent,
   type AutopilotSchedule,
@@ -67,6 +68,7 @@ import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
+import { deriveTeams } from "../integrations/team-tree";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint, type LapoConfig } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
@@ -751,6 +753,14 @@ export class Supervisor {
   }
   private broadcastAutopilotPlans(): void {
     this.registry.toAll(this.autopilotPlansEvent());
+  }
+
+  /** Teams are derived (not stored): group the flat session list by `parentId` (see team-tree.ts). */
+  teamInfoEvent(): TeamInfoEvent {
+    return { v: PROTOCOL_VERSION, type: "team.info", ts: now(), teams: deriveTeams(this.list()) };
+  }
+  private broadcastTeamInfo(): void {
+    this.registry.toAll(this.teamInfoEvent());
   }
 
   /** Refine a plan from reviewer feedback (Opus, read-only against the repo): persist the revised
@@ -1477,6 +1487,7 @@ export class Supervisor {
       this.persist();
     }
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
+    this.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
     this.prompt(session.id, a.brief); // lazily starts the driver and runs the first turn
     return { id: session.id, title: session.data.title, cwd: session.data.cwd };
   }
@@ -1983,6 +1994,7 @@ export class Supervisor {
     this.logs.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
+    this.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
     this.trackTeardown(this.teardownSession(id, s));
   }
 
@@ -2365,6 +2377,8 @@ export class Supervisor {
 
   private broadcastUpdated(data: SessionData): void {
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.updated", ts: now(), session: data });
+    // Teams are derived from the session list, so any session change can shift a team's rollup.
+    this.broadcastTeamInfo();
   }
 }
 
