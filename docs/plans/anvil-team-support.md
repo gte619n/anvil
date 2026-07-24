@@ -205,14 +205,17 @@ Findings from the web-client map (`anvild/web/src/main.ts`) drive minimal, addit
 
 ## 8. Deferred (revisit in review or later)
 
-- **Member↔member messaging** (the SDK-team capability child-sessions lack). Lead-as-hub covers the
-  decompose→integrate pattern; add peer messaging only when a workflow needs peers to negotiate.
-  **Lift:** the *plumbing* is small — a `message_member(id, text)` MCP tool that calls
-  `supervisor.prompt(targetId, text)` reuses the existing input queue (`agent/input-queue.ts`,
-  `supervisor.prompt` at `supervisor.ts:1783`) that already lets any session be prompted. The real
-  cost is the *semantics* (a sibling roster so a member can address peers; loop / turn-taking guards
-  so agents don't ping-pong) and *GUI attribution* (showing who said what to whom across lanes) —
-  which is why it's deferred, not because delivering the bytes is hard.
+- ~~**Lead↔member messaging.**~~ **Implemented (2026-07-24, clarified during live verification — the
+  original deferral was meant for member↔member *peer* messaging, not lead↔member).** Full two-way
+  conversation, lead-as-hub: the lead has `message_member(id, text)` and each member has
+  `message_lead(text)` (`agent/team-tools.ts` / `agent/member-tools.ts`), both reusing
+  `supervisor.prompt(targetId, text)` and the existing input queue. A **relay hop guard**
+  (`MAX_TEAM_RELAY_HOPS`, reset by any human prompt via `noteHumanPrompt`) bounds runaway
+  agent↔agent ping-pong — the loop-safety concern that made this look risky.
+- **Member↔member (peer) messaging** — still deferred. A member can talk only to its lead, never to a
+  sibling. Lead-as-hub covers decompose→discuss→integrate; add peer messaging only when a workflow
+  needs members to negotiate directly. The remaining cost is the *semantics* (a sibling roster; peer
+  loop guards) and *GUI attribution* across peers — not the plumbing.
 - **Cross-member gating from the team header** (answer any member's card without leaving the lead) —
   needs relaxing the single-active-session `activeId` drop-guard (`main.ts:920`) into a
   "team-group-active" concept. v1 selects the member instead.

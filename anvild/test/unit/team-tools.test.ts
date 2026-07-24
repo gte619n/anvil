@@ -3,7 +3,7 @@ import { teamTools, TEAM_TOOL_IDS, type TeamToolDeps } from "../../src/agent/tea
 import type { TeamInfo, TeamPlanMember } from "@protocol";
 
 function stub(over: Partial<TeamToolDeps> = {}): { deps: TeamToolDeps; calls: any } {
-  const calls: any = { proposed: null as null | { members: TeamPlanMember[]; integration: string }, created: [] as any[], integrated: 0, dismissed: [] as string[] };
+  const calls: any = { proposed: null as null | { members: TeamPlanMember[]; integration: string }, created: [] as any[], integrated: 0, dismissed: [] as string[], messaged: [] as any[] };
   const deps: TeamToolDeps = {
     leadId: "lead",
     proposePlan: (members, integration) => { calls.proposed = { members, integration }; return `proposed ${members.length}`; },
@@ -11,6 +11,7 @@ function stub(over: Partial<TeamToolDeps> = {}): { deps: TeamToolDeps; calls: an
     listMembers: () => ({ leadId: "lead", policy: { integration: "combined-pr", maxConcurrentMembers: 3 }, members: [], rollup: { total: 0, running: 0, awaiting: 0, done: 0, error: 0 } } as TeamInfo),
     integrate: () => { calls.integrated++; return "integrated"; },
     dismissMember: (sid) => { calls.dismissed.push(sid); return `dismissed ${sid}`; },
+    messageMember: (sid, text) => { calls.messaged.push({ sid, text }); return `messaged ${sid}`; },
     ...over,
   };
   return { deps, calls };
@@ -26,7 +27,14 @@ test("TEAM_TOOL_IDS are the namespaced lead tools", () => {
     "mcp__anvil_team__list_members",
     "mcp__anvil_team__integrate",
     "mcp__anvil_team__dismiss_member",
+    "mcp__anvil_team__message_member",
   ]);
+});
+
+test("message_member forwards the id + text to the steering dep", async () => {
+  const { deps, calls } = stub();
+  await byName(deps).get("message_member")!.handler({ sessionId: "sess_m2", text: "focus on the API layer" }, {});
+  expect(calls.messaged).toEqual([{ sid: "sess_m2", text: "focus on the API layer" }]);
 });
 
 test("dismiss_member forwards the session id to the teardown dep", async () => {

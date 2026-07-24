@@ -173,6 +173,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           text = `${ctx}\n\n${text}`;
         }
         deps.supervisor.prompt(cmd.sessionId, text, cmd.attachmentIds ?? []);
+        deps.supervisor.noteHumanPrompt(cmd.sessionId); // a human in the loop resets the team relay guard
         if (cid) send(ack(cid));
         return;
       }

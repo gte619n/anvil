@@ -62,8 +62,9 @@ import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildTeamToolsServer, TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
+import { buildMemberToolsServer, MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
 import { memberBaseRef } from "../integrations/member-base";
-import { shouldAutoApprove, spawnPaused } from "../integrations/team-gate";
+import { shouldAutoApprove, spawnPaused, relayExhausted, MAX_TEAM_RELAY_HOPS } from "../integrations/team-gate";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
@@ -194,6 +195,9 @@ export class Supervisor {
   private readonly activeTeamPlans = new Map<string, TeamPlan>();
   /** Members not yet spawned because the lead is at its concurrency cap; drained as members finish. */
   private readonly queuedMembers = new Map<string, TeamPlanMember[]>();
+  /** Per-team (leadId) count of automatic lead↔member relay hops since the last human prompt — the
+   *  loop guard for two-way conversations. Reset by `noteHumanPrompt`. */
+  private readonly teamRelayHops = new Map<string, number>();
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
@@ -788,7 +792,60 @@ export class Supervisor {
       listMembers: () => this.teamListMembers(leadId),
       integrate: () => this.integrateTeam(leadId),
       dismissMember: (sid) => this.teamDismissMember(leadId, sid),
+      messageMember: (sid, text) => this.teamMessageMember(leadId, sid, text),
     });
+  }
+
+  /** Steer a member (lead→member): queue `text` as a prompt for the member's next turn — the same
+   *  input path any session uses. Guarded to the lead's own members. Member↔member peer messaging
+   *  stays deferred (only leads get this tool), so there's no ping-pong risk between members. */
+  private teamMessageMember(leadId: string, memberId: string, text: string): string {
+    const member = this.sessions.get(memberId);
+    if (!member || member.data.parentId !== leadId) throw new BadCommand(`not a member of this team: ${memberId}`);
+    this.chargeRelay(leadId);
+    this.prompt(memberId, text); // queues via the member's InputQueue; starts a turn if idle
+    return `Sent to member "${member.data.title}" (${memberId}); it will act on your message next turn.`;
+  }
+
+  /** Member→lead reply: the other half of the two-way conversation. Queues the member's message as a
+   *  prompt for the lead's next turn, attributed so the lead knows who spoke. Guarded to the member's
+   *  own lead (a member can talk only to its lead — never a sibling: member↔member stays deferred). */
+  private teamMessageLead(memberId: string, text: string): string {
+    const member = this.sessions.get(memberId);
+    const leadId = member?.data.parentId;
+    if (!member || !leadId) throw new BadCommand(`not a team member: ${memberId}`);
+    const lead = this.sessions.get(leadId);
+    if (!lead || lead.data.teamRole !== "lead") throw new BadCommand("this member has no lead to message");
+    this.chargeRelay(leadId);
+    this.prompt(leadId, `Member "${member.data.title}" (${memberId}) says: ${text}`);
+    return `Relayed to your lead "${lead.data.title}"; it will see your message next turn.`;
+  }
+
+  /** Charge one lead↔member relay hop and enforce the loop guard. A human prompt to any team session
+   *  resets the counter (see `noteHumanPrompt`), so a person can always continue a long conversation. */
+  private chargeRelay(leadId: string): void {
+    const hops = (this.teamRelayHops.get(leadId) ?? 0) + 1;
+    if (relayExhausted(hops)) {
+      throw new BadCommand(
+        `Team relay limit reached (${MAX_TEAM_RELAY_HOPS} automatic lead↔member messages with no human input). ` +
+          `Pausing the exchange to avoid a runaway agent-to-agent loop — the user can send a message to continue.`,
+      );
+    }
+    this.teamRelayHops.set(leadId, hops);
+  }
+
+  /** A human prompt to a team session (lead or member) resets that team's relay hop counter — a real
+   *  person in the loop clears the ping-pong guard. Called from the `prompt.send` dispatch path. */
+  noteHumanPrompt(sessionId: string): void {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    const leadId = s.data.teamRole === "lead" ? s.data.id : s.data.parentId;
+    if (leadId) this.teamRelayHops.delete(leadId);
+  }
+
+  /** Build the member-only tool server (message_lead), closed over this member's id. */
+  private buildMemberServer(memberId: string) {
+    return buildMemberToolsServer({ memberId, messageLead: (text) => this.teamMessageLead(memberId, text) });
   }
 
   /** Dismiss (tear down) a member of this lead: reuse the standard session teardown (kill worktree +
@@ -2097,6 +2154,7 @@ export class Supervisor {
       const s = this.require(id);
       const isDefault = s.data.isDefault === true;
       const isLead = s.data.teamRole === "lead";
+      const isMember = s.data.teamRole === "member" && !!s.data.parentId;
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -2108,8 +2166,10 @@ export class Supervisor {
           ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
           : isLead
             ? { [TEAM_MCP_SERVER_NAME]: this.buildTeamServer(id) }
-            : undefined,
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : undefined,
+            : isMember
+              ? { [MEMBER_MCP_SERVER_NAME]: this.buildMemberServer(id) }
+              : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),

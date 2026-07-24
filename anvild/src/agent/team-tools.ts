@@ -28,6 +28,9 @@ export interface TeamToolDeps {
   integrate(): string;
   /** Tear a member down: stop it and remove its worktree + branch + state. Returns a summary. */
   dismissMember(sessionId: string): string;
+  /** Send a steering message to a member (lead→member; queues for the member's next turn). Returns a
+   *  summary. Member↔member peer messaging stays deferred — only the lead can message members. */
+  messageMember(sessionId: string, text: string): string;
 }
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -36,7 +39,7 @@ const fail = (text: string) => ({ content: [{ type: "text" as const, text }], is
 export const TEAM_MCP_SERVER_NAME = "anvil_team";
 
 /** Tool ids as the SDK exposes them (`mcp__<server>__<tool>`), for the driver allowlist. */
-export const TEAM_TOOL_IDS = ["propose_team_plan", "create_member", "list_members", "integrate", "dismiss_member"].map(
+export const TEAM_TOOL_IDS = ["propose_team_plan", "create_member", "list_members", "integrate", "dismiss_member", "message_member"].map(
   (t) => `mcp__${TEAM_MCP_SERVER_NAME}__${t}`,
 );
 
@@ -142,6 +145,24 @@ export function teamTools(deps: TeamToolDeps): SdkMcpToolDefinition<any>[] {
         async ({ sessionId }) => {
           try {
             return ok(deps.dismissMember(sessionId));
+          } catch (e) {
+            return fail(e instanceof Error ? e.message : String(e));
+          }
+        },
+      ),
+      tool(
+        "message_member",
+        "Send a steering message to one of YOUR members — a course correction, extra context, a new " +
+          "constraint, or an answer to something it's waiting on. The message is queued for the member's " +
+          "next turn (it's an ordinary session prompt). Use this to guide a member mid-flight instead of " +
+          "dismissing and re-spawning. You can only message your own team's members.",
+        {
+          sessionId: z.string().describe("The member session id to message (from list_members)."),
+          text: z.string().describe("The message to send the member (its next turn acts on it)."),
+        },
+        async ({ sessionId, text }) => {
+          try {
+            return ok(deps.messageMember(sessionId, text));
           } catch (e) {
             return fail(e instanceof Error ? e.message : String(e));
           }
