@@ -147,15 +147,26 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
 .session .meta .msym { font-size: 13px; vertical-align: -2px; margin-right: 1px; }
-/* Teams (anvil-team-support.md §5): members nest under their lead's row as an indented list. */
-.team-members { list-style: none; margin: 2px 0 4px; padding: 0; }
-.team-members > .session.member { margin-left: 14px; position: relative; }
+/* Teams (anvil-team-support.md §5): a lead row on top, its members as an indented tree BELOW it.
+   The `.session` li is display:flex, so a lead-with-members wraps and the member list takes a full
+   width row underneath (never beside the lead). */
+.session.has-members { flex-wrap: wrap; }
+/* full-width row below the lead; box-sizing + inner padding do the indent so it never overflows */
+.team-members { list-style: none; margin: 4px 0 2px; padding: 0 0 0 22px; box-sizing: border-box; flex: 0 0 100%; width: 100%; display: flex; flex-direction: column; gap: 4px; position: relative; }
+/* the vertical trunk of the tree, running down the left of the member column */
+.team-members::before {
+  content: ""; position: absolute; left: 10px; top: -2px; bottom: 12px; width: 2px;
+  background: color-mix(in srgb, var(--border) 90%, transparent); border-radius: 2px;
+}
+.team-members > .session.member { position: relative; }
+/* the horizontal elbow connecting the trunk to each member row */
 .team-members > .session.member::before {
-  content: ""; position: absolute; left: -8px; top: 0; bottom: 0; width: 2px;
-  background: color-mix(in srgb, var(--border) 80%, transparent); border-radius: 2px;
+  content: ""; position: absolute; left: -12px; top: 50%; width: 12px; height: 2px;
+  background: color-mix(in srgb, var(--border) 90%, transparent);
 }
 .session.member .srow .title .t { font-weight: 400; }
-.session.member .srow { font-size: 0.94em; }
+.session.member .srow { font-size: 0.94em; padding: 6px 8px; }
+.session.member .title .msym { font-size: 15px; }
 /* lead rollup chip: "3 · 2▶ · 1⏳" next to the lead's title */
 .team-rollup {
   margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 11px; font-weight: 600;

@@ -2130,6 +2130,7 @@ function renderSessions(): void {
     if (s.teamRole === "lead") {
       const members = membersOfLead(s.id).sort(sortFn);
       if (members.length) {
+        li.classList.add("has-members"); // stack the member list BELOW the lead row (not beside it)
         const mul = document.createElement("ul");
         mul.className = "team-members";
         for (const m of members) mul.appendChild(renderSessionItem(m, true));
