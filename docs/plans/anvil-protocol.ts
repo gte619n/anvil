@@ -46,7 +46,7 @@
 // 0. Primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
 /** ISO 8601 timestamp, always UTC, e.g. "2026-06-19T14:03:00.000Z". */
