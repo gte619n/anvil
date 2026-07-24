@@ -156,6 +156,9 @@ export interface ServerOptions {
   /** OpenRouter key + models for the adversarial planning panel (see `Config`). */
   adversarialModels?: string[];
   adversarialProvider?: string;
+  /** Set by the real daemon (main.ts) to refresh model labels from the Models API shortly after boot;
+   *  omitted by tests so they never make a live API call. */
+  refreshModelLabelsOnBoot?: boolean;
 }
 
 /**
@@ -186,6 +189,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       renderer: opts.renderer,
       adversarialModels: opts.adversarialModels,
       adversarialProvider: opts.adversarialProvider,
+      refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
     },
     registry,
   );
@@ -314,6 +318,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.promptsEvent()));
+      ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
       const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state

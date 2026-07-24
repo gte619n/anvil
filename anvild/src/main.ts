@@ -55,6 +55,7 @@ const server = ((): ReturnType<typeof createServer> => {
       adversarialModels: config.adversarialModels,
       adversarialProvider: config.adversarialProvider,
       renderer,
+      refreshModelLabelsOnBoot: true, // real daemon: pull live model labels shortly after boot
     });
   } catch (e) {
     // Bind failed (EADDRINUSE past the retry window, or another listen error). Record it so the next

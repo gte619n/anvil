@@ -60,6 +60,7 @@
     "lapo.disconnect",
     "lapo.status",
     "message.user",
+    "model.labels",
     "permission.request",
     "permission.resolved",
     "permission.respond",

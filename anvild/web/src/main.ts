@@ -36,7 +36,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
   for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
   return a;
 };
-import { MODELS, modelLabel } from "../../protocol";
+import { MODELS, modelLabel, type Model } from "../../protocol";
 import type {
   AttachmentRef,
   AuthStatusEvent,
@@ -105,6 +105,20 @@ let prompts: Prompt[] = (() => {
     return [];
   }
 })();
+// Live model-tier labels the hub resolves from the Models API (e.g. "Opus 5"). Seeded from a
+// localStorage cache so the picker paints the latest labels instantly, then overwritten by the hub's
+// `model.labels` broadcast. A partial map — tiers absent here fall back to the static MODELS label.
+const MODEL_LABELS_CACHE_KEY = "anvil.model-labels.cache";
+let modelLabelOverrides: Partial<Record<Model, string>> = (() => {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MODEL_LABELS_CACHE_KEY) ?? "{}") as unknown;
+    return raw && typeof raw === "object" ? (raw as Partial<Record<Model, string>>) : {};
+  } catch {
+    return {};
+  }
+})();
+/** The label to show for a model tier: the hub's live label if it has one, else the static fallback. */
+const modelLabelOf = (m: Model): string => modelLabelOverrides[m] ?? modelLabel(m);
 // Sessions being cleaned up: shown disabled in the sidebar until the daemon confirms deletion
 // (session.deleted). Transient — not persisted. (UI refinement §8)
 const removingSessions = new Set<string>();
@@ -896,6 +910,11 @@ function onEvent(url: string, e: ServerEvent): void {
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
       // own prompts event so it can't clobber the hub's synced library.
       if (url === HUB_URL) onPrompts(e.prompts);
+      return;
+    case "model.labels":
+      // Model labels are hub-authoritative (the hub resolves them from the Models API). Ignore a
+      // fleet member's own copy so it can't clobber the hub's labels.
+      if (url === HUB_URL) onModelLabels(e.labels);
       return;
     case "todoist.status":
       // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
@@ -2425,7 +2444,7 @@ function updateHeaderModel(s: Session | undefined): void {
   const el = document.getElementById("btn-model");
   if (!el) return;
   if (s) {
-    el.innerHTML = `${icon("smart_toy")}<span class="cm-name">${esc(modelLabel(s.model))}</span>`;
+    el.innerHTML = `${icon("smart_toy")}<span class="cm-name">${esc(modelLabelOf(s.model))}</span>`;
     el.title = "Switch model";
     el.hidden = false;
   } else {
@@ -2467,8 +2486,8 @@ $("#btn-model").addEventListener("click", () => {
     $("#btn-model"),
     MODELS.map((m) => ({
       icon: m.id === s.model ? "check" : "smart_toy",
-      label: m.label,
-      title: m.id === s.model ? `${m.label} (current)` : `Switch to ${m.label}`,
+      label: modelLabelOf(m.id),
+      title: m.id === s.model ? `${modelLabelOf(m.id)} (current)` : `Switch to ${modelLabelOf(m.id)}`,
       run: () => {
         if (m.id === s.model) return;
         sendTo(activeId, { type: "session.set_model", sessionId: activeId, model: m.id });
@@ -2558,6 +2577,17 @@ function onPrompts(list: Prompt[]): void {
   }
   refreshPromptsButton();
   if (document.getElementById("prompt-cards")) renderPromptsPanel();
+}
+/** Apply a `model.labels` broadcast from the hub: replace the overrides, cache them, repaint the model
+ *  surfaces (header pill + any open picker rebuilds on next open). */
+function onModelLabels(labels: Partial<Record<Model, string>>): void {
+  modelLabelOverrides = labels ?? {};
+  try {
+    localStorage.setItem(MODEL_LABELS_CACHE_KEY, JSON.stringify(modelLabelOverrides));
+  } catch {
+    /* quota — the daemon is still the source of truth */
+  }
+  updateHeaderModel(activeId ? sessions.get(activeId) : undefined);
 }
 /** True once the hub is connected AND new enough to hold the prompt store. */
 function promptsSupported(): boolean {

@@ -1,6 +1,6 @@
 /**
  * The autonomous-dev-pipeline model roster (spec §3): exactly two decorrelated, near-peer models —
- * Claude Opus 4.8 (subscription, via the Agent SDK) and GLM 5.2 (OpenRouter's Anthropic Skin, via the
+ * Claude Opus 5 (subscription, via the Agent SDK) and GLM 5.2 (OpenRouter's Anthropic Skin, via the
  * SAME Agent SDK). Both run through one execution path, differentiated only by their `profile` (which
  * env buildAgentEnv assembles) and their `sdkModel` id.
  *
@@ -21,8 +21,8 @@ export interface ModelSpec {
   label: string;
 }
 
-/** Claude Opus 4.8 — strongest on novel from-scratch design + judgment; carries the two judgment gates. */
-export const CLAUDE: ModelSpec = { id: "claude", profile: "claude", sdkModel: "opus", label: "Claude Opus 4.8" };
+/** Claude Opus 5 — strongest on novel from-scratch design + judgment; carries the two judgment gates. */
+export const CLAUDE: ModelSpec = { id: "claude", profile: "claude", sdkModel: "opus", label: "Claude Opus 5" };
 
 /** GLM 5.2 — near-peer coder, decorrelated lineage, cheap; carries cheap agentic authorship + test-gen.
  *  The exact OpenRouter slug is overridable via config so the roster can track new GLM releases. */
