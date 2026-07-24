@@ -937,6 +937,11 @@ export interface SessionCreateCmd extends Envelope, Correlated {
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "mostly-autonomous"
   adversarialReview?: boolean; // defaults to false (adversarial plan review; needs an OpenRouter key)
+  // ── Teams: create this session as a team lead (see docs/plans/anvil-team-support.md). A lead is an
+  //    ordinary session that also gets the lead orchestration MCP tools + an integration/concurrency
+  //    policy. Members are created via the lead's tools, not this command. ──
+  teamRole?: "lead"; // set to "lead" to make this a team lead; members are stamped by handoffCreate
+  team?: TeamPolicy; // the lead's integration/concurrency policy (defaults applied server-side)
 }
 /** Resume: replay events with seq > lastSeq, else server sends a snapshot (§6.4). */
 export interface SessionAttachCmd extends Envelope, Correlated {

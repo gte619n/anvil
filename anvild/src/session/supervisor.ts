@@ -23,6 +23,10 @@ import {
   type AutopilotPipelineMetricsEvent,
   type AutopilotPlansEvent,
   type TeamInfoEvent,
+  type TeamInfo,
+  type TeamPlan,
+  type TeamPlanMember,
+  type TeamPlanEvent,
   type AutopilotPlanResultEvent,
   type AutopilotStartedEvent,
   type AutopilotSchedule,
@@ -57,6 +61,9 @@ import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
+import { buildTeamToolsServer, TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
+import { memberBaseRef } from "../integrations/member-base";
+import { shouldAutoApprove } from "../integrations/team-gate";
 import { buildAgentEnv } from "../agent/env";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
@@ -178,6 +185,13 @@ export class Supervisor {
     listEnvironments: () => this.envStore.list(),
     handoff: (a) => this.handoffCreate(a),
   });
+  // ── Teams (see docs/plans/anvil-team-support.md) ──────────────────────────────────────────────
+  /** Plans awaiting the user's approval, keyed by lead id (the reviewable team-plan card). */
+  private readonly pendingTeamPlans = new Map<string, TeamPlan>();
+  /** The approved/active plan per lead — kept so `integrate` can order the merge by `dependsOn`. */
+  private readonly activeTeamPlans = new Map<string, TeamPlan>();
+  /** Members not yet spawned because the lead is at its concurrency cap; drained as members finish. */
+  private readonly queuedMembers = new Map<string, TeamPlanMember[]>();
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
@@ -761,6 +775,116 @@ export class Supervisor {
   }
   private broadcastTeamInfo(): void {
     this.registry.toAll(this.teamInfoEvent());
+  }
+
+  /** Build the lead-only orchestration MCP server, closed over this lead's session id. */
+  private buildTeamServer(leadId: string) {
+    return buildTeamToolsServer({
+      leadId,
+      proposePlan: (members, integration) => this.teamProposePlan(leadId, members, integration),
+      createMember: (a) => this.teamCreateMember(leadId, a),
+      listMembers: () => this.teamListMembers(leadId),
+      integrate: () => this.integrateTeam(leadId),
+    });
+  }
+
+  /** The lead proposed a decomposition. At `bypass` autonomy it auto-approves and spawns; otherwise it
+   *  parks a reviewable `team.plan` card and waits for `team.plan.approve` (see team-gate.ts). */
+  private teamProposePlan(leadId: string, members: TeamPlanMember[], integration: TeamPlan["integration"]): string {
+    const lead = this.require(leadId);
+    if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can propose a team plan");
+    const plan: TeamPlan = { leadId, members, integration };
+    if (shouldAutoApprove(lead.data.autonomy)) {
+      const started = this.startTeamPlan(plan);
+      return `Auto-approved (bypass autonomy): started ${started} of ${members.length} member(s); the rest queue as slots free.`;
+    }
+    this.pendingTeamPlans.set(leadId, plan);
+    const ev: TeamPlanEvent = { v: PROTOCOL_VERSION, type: "team.plan", ts: now(), sessionId: leadId, plan };
+    this.registry.toAll(ev);
+    return `Proposed a ${members.length}-member plan (${integration}); awaiting the user's approval before spawning.`;
+  }
+
+  /** Approve a parked plan (possibly user-edited) and spawn its members up to the concurrency cap. */
+  approveTeamPlan(leadId: string, plan?: TeamPlan): void {
+    const lead = this.require(leadId);
+    const chosen = plan ?? this.pendingTeamPlans.get(leadId);
+    if (!chosen) throw new BadCommand(`no pending team plan for ${leadId}`);
+    this.pendingTeamPlans.delete(leadId);
+    this.startTeamPlan({ ...chosen, leadId });
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "team.plan.resolved", ts: now(), sessionId: leadId, approved: true });
+    void lead;
+  }
+
+  /** Reject a parked plan — no members spawn. */
+  rejectTeamPlan(leadId: string): void {
+    this.require(leadId);
+    this.pendingTeamPlans.delete(leadId);
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "team.plan.resolved", ts: now(), sessionId: leadId, approved: false });
+  }
+
+  /** Record the plan as active and spawn members up to the lead's cap; queue any overflow. Returns the
+   *  count started now. */
+  private startTeamPlan(plan: TeamPlan): number {
+    const lead = this.require(plan.leadId);
+    lead.data.team = lead.data.team ?? { integration: plan.integration, maxConcurrentMembers: 3 };
+    lead.data.team.integration = plan.integration; // honor the plan's integration choice
+    this.persist();
+    this.activeTeamPlans.set(plan.leadId, plan);
+    const cap = lead.data.team.maxConcurrentMembers ?? 3;
+    const active = this.activeMemberCount(plan.leadId);
+    const room = Math.max(0, cap - active);
+    const toStart = plan.members.slice(0, room);
+    const overflow = plan.members.slice(room);
+    for (const m of toStart) {
+      try {
+        this.teamCreateMember(plan.leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
+      } catch (e) {
+        console.error(`[teams] member spawn failed for "${m.title}":`, e instanceof Error ? e.message : e);
+      }
+    }
+    if (overflow.length) this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...overflow]);
+    return toStart.length;
+  }
+
+  /** Members currently occupying a concurrency slot (spawned and not yet terminal). */
+  private activeMemberCount(leadId: string): number {
+    return this.list().filter(
+      (s) => s.parentId === leadId && s.status !== "idle" && s.status !== "exited" && s.status !== "error",
+    ).length;
+  }
+
+  /** Spawn one member session off the lead: its worktree branches off the lead's branch HEAD. */
+  private teamCreateMember(
+    leadId: string,
+    a: { title: string; task: string; source: "fresh-worktree" | "existing-dir"; base?: string; brief: string },
+  ): { id: string; title: string; cwd: string } {
+    const lead = this.require(leadId);
+    const leadBranch = lead.data.worktree?.branch ?? lead.data.git?.branch;
+    const env = lead.data.environmentId ? this.envStore.get(lead.data.environmentId) : undefined;
+    const base = a.base ?? memberBaseRef({ source: a.source, leadBranch, envDefault: env?.defaultBase });
+    return this.handoffCreate({
+      environmentId: lead.data.environmentId,
+      source: a.source,
+      cwd: a.source === "existing-dir" ? lead.data.cwd : undefined,
+      base,
+      title: a.title,
+      model: lead.data.model,
+      autonomy: lead.data.autonomy,
+      brief: a.brief,
+      parentId: leadId,
+      teamRole: "member",
+      memberTask: a.task,
+    });
+  }
+
+  private teamListMembers(leadId: string): TeamInfo | null {
+    return deriveTeams(this.list()).find((t) => t.leadId === leadId) ?? null;
+  }
+
+  /** Integrate member branches per the team policy. Implemented in Phase 4 (team-integrate). */
+  private integrateTeam(leadId: string): string {
+    this.require(leadId);
+    throw new BadCommand("integration is not available yet in this build");
   }
 
   /** Refine a plan from reviewer feedback (Opus, read-only against the repo): persist the revised
@@ -1418,6 +1542,15 @@ export class Supervisor {
       lastActivityAt: now(),
       usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
     };
+    // Teams: a session created as a lead carries its role + integration/concurrency policy (defaults
+    // applied here). Members are never created via this command — the lead's MCP tools stamp them.
+    if (cmd.teamRole === "lead") {
+      data.teamRole = "lead";
+      data.team = {
+        integration: cmd.team?.integration === "pr-per-member" ? "pr-per-member" : "combined-pr",
+        maxConcurrentMembers: cmd.team?.maxConcurrentMembers ?? 3,
+      };
+    }
 
     const session = this.wrap(data, 0);
     this.sessions.set(id, session);
@@ -1849,6 +1982,7 @@ export class Supervisor {
     if (!driver) {
       const s = this.require(id);
       const isDefault = s.data.isDefault === true;
+      const isLead = s.data.teamRole === "lead";
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -1856,8 +1990,12 @@ export class Supervisor {
         this.questionBroker,
         this.agentEnv(),
         (usage) => this.onAgentResult(id, usage),
-        isDefault ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer } : undefined,
-        isDefault ? DEFAULT_TOOL_IDS : undefined,
+        isDefault
+          ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
+          : isLead
+            ? { [TEAM_MCP_SERVER_NAME]: this.buildTeamServer(id) }
+            : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
