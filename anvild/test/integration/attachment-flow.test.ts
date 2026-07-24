@@ -7,7 +7,16 @@ import { PROTOCOL_VERSION } from "@protocol";
 // Capture every streaming-input SDKUserMessage the agent driver pushes to the SDK. The icon
 // picker also calls query() but with a *string* prompt (not an AsyncIterable) — skip those.
 const captured: any[] = [];
+// mock.module replaces the SDK module GLOBALLY for the rest of the run — it is not scoped to this
+// file and is not undone when it finishes. So the replacement must carry every export the rest of the
+// codebase pulls from the SDK, not just the one being faked: `default-tools.ts` (the concierge's
+// in-process MCP server, constructed by every Supervisor) imports `createSdkMcpServer` and `tool`.
+// A query-only stub link-errors any file that loads the supervisor AFTER this one —
+// "Export named 'createSdkMcpServer' not found" — which reads like a flaky SDK extraction but is
+// really just this mock. Same fix, same reason, as test/unit/autopilot-adversarial.test.ts.
 mock.module("@anthropic-ai/claude-agent-sdk", () => ({
+  createSdkMcpServer: () => ({ type: "sdk", name: "mock", instance: {} }),
+  tool: (name: string, _desc: unknown, _schema: unknown, handler: unknown) => ({ name, handler }),
   query: (opts: any) => {
     if (opts.prompt && typeof opts.prompt !== "string" && typeof opts.prompt[Symbol.asyncIterator] === "function") {
       void (async () => {
@@ -24,6 +33,12 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
     };
   },
 }));
+
+// These tests drive a real prompt through the supervisor, and a degraded machine (no Claude login)
+// now refuses one with the §4.3 pair-this-machine error instead of spawning — see
+// anvil-headless-join.md. Give the daemon a placeholder credential so the attachment path under test
+// is reachable. (The SDK itself is mocked above, so the value is never used for anything.)
+process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
 
 const { createServer } = await import("../../src/server/http");
 

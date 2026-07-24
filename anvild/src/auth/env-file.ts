@@ -16,6 +16,14 @@ export function envFile(home: string = homedir()): string {
   return join(home, ".config", "anvil", "env");
 }
 
+/** A value that looks like a metered API key rather than a subscription OAuth token. §3 forbids it:
+ *  ANTHROPIC_API_KEY-style credentials outrank the OAuth token and would bill per-token. Lives here
+ *  (not in auth/store) so the §3 guard can reuse it without importing the store — store.ts imports
+ *  auth/degrade, which imports the guard, so a guard→store edge would close a cycle. */
+export function looksLikeMeteredKey(token: string): boolean {
+  return /^sk-ant-api/i.test(token.trim());
+}
+
 /** Show enough of a secret to recognise it without leaking it (first 8 + last 4 chars). */
 export function mask(secret: string): string {
   const t = secret.trim();

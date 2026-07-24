@@ -1,4 +1,5 @@
-import { envFile, envFileHasKey, mask, readEnvKey, removeEnvLine, upsertEnvLine } from "./env-file";
+import { envFile, envFileHasKey, looksLikeMeteredKey, mask, readEnvKey, removeEnvLine, upsertEnvLine } from "./env-file";
+import { clearBoundDegradeMarker } from "./degrade";
 
 /**
  * The daemon's Claude subscription OAuth token, set/reset from the UI (auth.set / auth.clear).
@@ -29,11 +30,9 @@ export interface AuthStatus {
  *  historical name so existing call sites keep working. */
 export const authEnvFile = envFile;
 
-/** A value that looks like a metered API key rather than a subscription OAuth token. §3 forbids it:
- *  ANTHROPIC_API_KEY-style credentials outrank the OAuth token and would bill per-token. */
-export function looksLikeMeteredKey(token: string): boolean {
-  return /^sk-ant-api/i.test(token.trim());
-}
+/** Re-exported from ./env-file, where it lives so the §3 guard can use it without importing this
+ *  store (store → degrade → guard would otherwise close an import cycle). */
+export { looksLikeMeteredKey };
 
 export function claudeAuthStatus(env: NodeJS.ProcessEnv = process.env, file: string = authEnvFile()): AuthStatus {
   const tok = (env[CLAUDE_TOKEN_KEY] ?? "").trim();
@@ -57,6 +56,9 @@ export function setClaudeToken(token: string, file: string = authEnvFile()): Aut
   }
   process.env[CLAUDE_TOKEN_KEY] = t;
   upsertEnvLine(file, CLAUDE_TOKEN_KEY, t);
+  // A successful credential write is the ONLY way out of auto-degraded mode besides a pair/rotation
+  // (which route through here too) — drop the marker so a restart doesn't come back degraded (§4.6).
+  clearBoundDegradeMarker();
   return claudeAuthStatus(process.env, file);
 }
 // (env-file read/write primitives live in ./env-file and are shared with the OpenRouter key store.)

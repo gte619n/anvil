@@ -123,6 +123,19 @@ no token is present**. So a freshly-installed Mac has *no running daemon* to rec
 pairing receiver therefore lives in the **always-running app**, not the daemon. The app accepts the
 token, writes the env, *then* starts the daemon for the first time.
 
+> **⚠️ Superseded — the premise is lifted.** `anvil-headless-join.md` §4.1 split the guard: only a
+> *metered key* (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`) is still fatal. A **missing** token now
+> boots the daemon **degraded** — up, reachable, reporting `subscriptionAuthOk: false`, and refusing
+> only agent turns. A fresh machine therefore *does* have a running daemon to receive a token, and it
+> hosts the pairing routes itself on `:7701` (`/api/fleet/pair`, `/pair/ack`, `/token`), advertised via
+> the `pairing` capability on `/api/health`.
+>
+> Everything below still describes the **macOS** path, which is unchanged and keeps working (HJ-5):
+> `:7702` remains the destination for a daemon that predates the `pairing` capability. What changed is
+> that it is no longer the *only* path — which is what let a headless Linux box join a fleet at all.
+> Note the setup/pairing UI on a joiner is **browser-only** in this release (HJ-36): the Android and
+> Apple shells bundle their own `web/dist`, so they need a re-ship to show it.
+
 ### 4.1 Two roles
 
 - **Establish a fleet** (first Mac → hub): the wizard runs `claude setup-token` (browser OAuth),

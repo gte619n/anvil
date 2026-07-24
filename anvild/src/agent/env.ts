@@ -22,6 +22,11 @@ export type ModelProfile = "claude" | "glm";
  *  protocol here and OpenRouter maps the `model` slug (e.g. "z-ai/glm-5.2") to the right provider. */
 export const OPENROUTER_ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
 
+/** What a spawn reports when this machine has no usable Claude token. Surfaced verbatim in the
+ *  session so the operator is pointed at pairing rather than at an opaque SDK error (§4.3). */
+export const NO_CLAUDE_TOKEN_ERROR =
+  "no Claude OAuth token — pair this machine with your fleet, or set a token in Settings → Auth.";
+
 /** Non-secret basics every spawned agent needs, regardless of model provider. */
 const BASE_KEEP = [
   "PATH",
@@ -38,7 +43,13 @@ const BASE_KEEP = [
 ] as const;
 
 export function buildAgentEnv(
-  opts: { profile?: ModelProfile; src?: Record<string, string | undefined> } = {},
+  opts: {
+    profile?: ModelProfile;
+    src?: Record<string, string | undefined>;
+    /** Set false for a NON-agent spawn (the session terminal / PTY) so a tokenless machine still gets a
+     *  shell. Degraded mode restricts turns only — terminal, files, and git keep working (HJ-25/§8.3). */
+    requireToken?: boolean;
+  } = {},
 ): Record<string, string> {
   const src = opts.src ?? process.env;
   const profile = opts.profile ?? "claude";
@@ -57,8 +68,12 @@ export function buildAgentEnv(
     out.ANTHROPIC_BASE_URL = OPENROUTER_ANTHROPIC_BASE_URL;
     out.ANTHROPIC_AUTH_TOKEN = key;
   } else {
-    const tok = src.CLAUDE_CODE_OAUTH_TOKEN;
-    if (typeof tok === "string" && tok.length > 0) out.CLAUDE_CODE_OAUTH_TOKEN = tok;
+    // Mirror the glm branch's explicit precondition. Silently omitting the key here produced an opaque
+    // SDK failure several layers down — useless on a machine that is degraded on purpose and needs to
+    // be told to pair (headless-join §4.3).
+    const tok = (src.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim();
+    if (!tok && opts.requireToken !== false) throw new Error(NO_CLAUDE_TOKEN_ERROR);
+    if (tok) out.CLAUDE_CODE_OAUTH_TOKEN = tok;
   }
   return out;
 }

@@ -33,3 +33,27 @@ test("rejects a foreign browser origin (the drive-by attack)", () => {
 test("honors an extra configured allowlist", () => {
   expect(isAllowedWsOrigin("https://my.other.app", HOST, ["https://my.other.app"])).toBe(true);
 });
+
+// A serve-mode daemon's Host is its MagicDNS name, so a sibling fleet member's browser page (a different
+// MagicDNS host in the SAME tailnet) can open a cross-origin WS with no ANVIL_ALLOWED_ORIGINS config.
+const TS_HOST = "beelink-4450.softshell-mark.ts.net:7701";
+
+test("allows same-tailnet fleet-peer origins (cross-origin WS within the tailnet)", () => {
+  expect(isAllowedWsOrigin("https://mac-mini-m4.softshell-mark.ts.net:7701", TS_HOST)).toBe(true); // the hub's page
+  expect(isAllowedWsOrigin("https://mac-mini-m1.softshell-mark.ts.net:7701", TS_HOST)).toBe(true); // another member
+  expect(isAllowedWsOrigin("https://beelink-4450.softshell-mark.ts.net:7701", TS_HOST)).toBe(true); // self
+});
+
+test("same-tailnet trust does not leak to other tailnets, spoofs, or public sites", () => {
+  expect(isAllowedWsOrigin("https://mac.other-tailnet.ts.net:7701", TS_HOST)).toBe(false); // different tailnet
+  expect(isAllowedWsOrigin("https://softshell-mark.ts.net.evil.com", TS_HOST)).toBe(false); // suffix in the middle
+  expect(isAllowedWsOrigin("https://evilsoftshell-mark.ts.net", TS_HOST)).toBe(false); // no dot boundary
+  expect(isAllowedWsOrigin("https://evil.example.com", TS_HOST)).toBe(false);
+});
+
+test("no same-tailnet trust when the daemon binds a bare IP (not serve mode)", () => {
+  // Direct-IP Host → no MagicDNS domain derivable → a .ts.net origin gets no free pass.
+  expect(isAllowedWsOrigin("https://mac-mini-m4.softshell-mark.ts.net:7701", "100.116.161.46:7701")).toBe(false);
+  // And a Host directly under ts.net must not yield a bare "ts.net" that matches every tailnet.
+  expect(isAllowedWsOrigin("https://anything.ts.net", "host.ts.net:7701")).toBe(false);
+});

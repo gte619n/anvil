@@ -21,6 +21,7 @@ import {
   setSessionHash,
 } from "./overlays";
 import { initPush, isAndroidApp, nativeBridge } from "./push";
+import { initSetupTakeover, refreshSetupState, armJoinWindow } from "./setup";
 import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 
 const strToB64 = (s: string): string => {
@@ -157,6 +158,16 @@ const hostOf = (url: string): string => {
     return new URL(url).host;
   } catch {
     return url;
+  }
+};
+// Port-stripped hostname. Fleet members are stored under a bare host ("beelink.ts.net"), but a card's
+// url carries the :7701 port — matching the two (e.g. to eject a member on Remove) has to compare the
+// hostname alone, or the lookup silently misses and the eject never fires.
+const hostnameOf = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url.replace(/:\d+$/, "");
   }
 };
 const servers = new Map<string, Server>(); // keyed by url
@@ -662,6 +673,15 @@ void loadFleetMembers();
 // reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
 if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
 else if (deepLinkedAutopilot) openAutopilot(); // bare #autopilot deep link → open the grid
+
+// A daemon with no Claude login can't run a single turn, so the session list would be a lie — take the
+// screen over with the pairing/setup flow instead (headless-join §5.1). No-op on a healthy daemon.
+initSetupTakeover({
+  setToken: async (token) => {
+    const res = await sendAwait(hub(), { type: "auth.set", token, cid: newCid() }, 20_000);
+    if (res.type === "command.error") throw new Error(res.message); // e.g. the metered-key rejection
+  },
+});
 
 // The native shell bridge (nativeBridge/isAndroidApp) and Web Push live in push.ts.
 void initPush();
@@ -2923,6 +2943,10 @@ function onAuthStatus(e: AuthStatusEvent): void {
   if (e.provider === "openrouter") openRouterAuth = state;
   else claudeAuth = state;
   if (document.getElementById("models-panel")) renderModelsPanel();
+  // A Claude-token change is exactly the transition the setup takeover exists for — a pair, a paste, or
+  // an auto-degrade. Re-read health so the screen appears/clears live on every open device, rather than
+  // only on the next reload (anvil-headless-join.md §5.1).
+  if (e.provider !== "openrouter") void refreshSetupState();
 }
 
 /** Persist a new/replacement Claude OAuth token on the hub daemon. */
@@ -4065,10 +4089,10 @@ function renderServerCards(): void {
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
-    `<button id="fleet-rotate" class="mini" title="Push the current login to every Mac in the fleet">${icon("autorenew")} Update token</button>` +
-    `<button id="fleet-add" class="mini primary">${icon("add")} Add a Mac</button>` +
+    `<button id="fleet-rotate" class="mini" title="Push the current login to every machine in the fleet">${icon("autorenew")} Update token</button>` +
+    `<button id="fleet-add" class="mini primary">${icon("add")} Add a machine</button>` +
     `</div></div>` +
-    `<p class="small muted">Every Mac here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    `<p class="small muted">Every machine here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
     list.map(serverCardHtml).join("");
   for (const srv of list) {
     wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
@@ -4079,6 +4103,7 @@ function renderServerCards(): void {
   document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
+  void maybeRenderRepairCard(host); // this-machine "get a join code" — only when it's already in a fleet
   if (nativeBridge) {
     const bridge = nativeBridge; // local const so the non-undefined narrowing flows into the closures below
     const setOut = (t: string): void => {
@@ -4139,14 +4164,16 @@ async function rotateFleetToken(): Promise<void> {
   } catch { toast("Couldn't push the login — is the hub reachable?"); }
 }
 
-/** The "+ Add a Mac" dialog: invite by join code (primary), or adopt a server that's already running. */
+/** The "+ Add a machine" dialog: invite by join code (primary), or adopt a server that's already
+ *  running. Not "Add a Mac" any more — a Linux/headless daemon receives the credential on its own
+ *  :7701 API, so the joiner no longer has to be a Mac (anvil-headless-join.md). */
 function showAddMac(): void {
   const m = document.createElement("div");
   m.className = "modal";
-  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a Mac</h3>
-    <p class="small muted">On the new Mac open <b>Anvil Server → Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
-    <label>Mac<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
-    <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" /></label>
+  m.innerHTML = `<div class="modal-box"><h3>${icon("add")} Add a machine</h3>
+    <p class="small muted">On the machine you're adding, open its Anvil web UI (a Mac can also use <b>Anvil Server → Join a fleet</b>) and choose <b>Join a fleet</b> for a 6-digit code. Pick it here and enter the code — no IP to track down. It'll share this server's Claude login.</p>
+    <label>Machine<div class="env-row"><select id="fleet-host"><option value="">Scanning your tailnet…</option></select></div></label>
+    <label>Join code<input id="fleet-code" type="tel" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="6-digit code" /></label>
     <div id="fleet-status" class="small muted"></div>
     <div class="btns"><button type="button" id="am-close">Done</button><button type="button" id="fleet-invite" class="primary">${icon("add")} Add</button></div>
   </div>`;
@@ -4154,12 +4181,17 @@ function showAddMac(): void {
   enhanceSelect(document.getElementById("fleet-host") as HTMLSelectElement | null);
   void loadFleetPeers();
   const setStatus = (t: string): void => { const el = document.getElementById("fleet-status"); if (el) el.textContent = t; };
+  // The joiner shows the code grouped as "123 456" for readability, so a copy-paste arrives with a
+  // space (and pasting into a maxlength=6 field used to truncate it to "123 45"). Strip everything but
+  // digits on every input and cap at 6, so a pasted grouped code Just Works.
+  const codeInput = document.getElementById("fleet-code") as HTMLInputElement | null;
+  codeInput?.addEventListener("input", () => { codeInput.value = codeInput.value.replace(/\D/g, "").slice(0, 6); });
   $<HTMLButtonElement>("#am-close").onclick = closeModal; // returns to Settings underneath
   document.getElementById("fleet-invite")?.addEventListener("click", async () => {
     const host = ($<HTMLSelectElement>("#fleet-host").value || "").trim();
-    const code = ($<HTMLInputElement>("#fleet-code").value || "").trim();
-    if (!host) { setStatus("Pick the Mac you're adding."); return; }
-    if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that Mac is showing."); return; }
+    const code = ($<HTMLInputElement>("#fleet-code").value || "").replace(/\D/g, "");
+    if (!host) { setStatus("Pick the machine you're adding."); return; }
+    if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that machine is showing."); return; }
     setStatus(`Sending the login to ${host} over the tailnet…`);
     try {
       const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; member?: { url: string }; error?: string };
@@ -4171,10 +4203,55 @@ function showAddMac(): void {
         void loadFleetPeers();
         renderServerCards();
       } else {
-        setStatus(`Rejected: ${r.error ?? "unknown"}. Make sure that Mac's “Join a fleet” screen is still open.`);
+        setStatus(`Rejected: ${r.error ?? "unknown"}. Make sure that machine's “Join a fleet” screen is still open and showing a code.`);
       }
     } catch { setStatus("Couldn't reach the hub daemon."); }
   });
+}
+
+/**
+ * Append a "this machine" card offering a fresh join code — but ONLY when this machine is already in a
+ * fleet. The tokenless setup takeover (setup.ts) is the usual place to get a code, but it renders only
+ * while a machine has NO login; once it's joined (has a login) the takeover never shows, leaving no
+ * in-UI way to re-open a pairing window if the hub later loses the member. This is that missing entry
+ * point. Gated on the LOCAL daemon's arm-state carrying `hubServerId` — present only for a machine
+ * paired to a hub, so it never appears on the hub itself or on an unpaired standalone box.
+ */
+async function maybeRenderRepairCard(host: HTMLElement): Promise<void> {
+  let st: { hubServerId?: string };
+  try {
+    st = (await (await apiFetch("/api/fleet/arm")).json()) as { hubServerId?: string };
+  } catch {
+    return; // daemon unreachable — nothing to offer
+  }
+  if (!st.hubServerId) return; // not joined to a hub → no re-pair to offer (the hub, or a standalone box)
+  // Idempotent append: renderServerCards can be in flight several times at once (adoption, server.hello),
+  // and this runs AFTER its own await — so without removing a prior copy each in-flight render stacks
+  // another card. Drop any existing one before inserting so there's exactly one, no matter the render count.
+  document.getElementById("fleet-repair-card")?.remove();
+  host.insertAdjacentHTML(
+    "beforeend",
+    `<div class="card" id="fleet-repair-card"><div class="card-main">${icon("hub")} <b>This machine</b></div>
+      <div class="small muted">Already in a fleet. If the hub lost track of it, open a join window here and re-enter the code on the hub's <b>Add a machine</b>.</div>
+      <div class="git-row" style="margin-top:10px"><button class="mini" id="fleet-repair">${icon("vpn_key")} Get a join code</button></div>
+    </div>`,
+  );
+  document.getElementById("fleet-repair")?.addEventListener("click", () => showRepairDialog());
+}
+
+/** The "Get a join code" modal for THIS machine (Settings → Fleet). Arms the local daemon — apiFetch
+ *  targets the page's own daemon — and shows a code to enter on the hub's "Add a machine". The
+ *  standard-UI counterpart to the tokenless takeover's "Join a fleet", for an already-set-up machine. */
+function showRepairDialog(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("hub")} Re-pair this machine</h3>
+    <p class="small muted">Opens a join window on <b>this</b> machine. On the hub, open <b>Settings → Fleet → Add a machine</b>, pick this machine, and enter the code below — it re-shares the hub's Claude login with this machine.</p>
+    <div id="repair-panel"></div>
+  </div>`;
+  showModal(m);
+  const p = document.getElementById("repair-panel");
+  if (p) void armJoinWindow(p, { onCancel: () => closeModal() });
 }
 
 /** Click handler for a server card's "Remove": dim the card, eject it from the fleet (if it's a member),
@@ -4193,12 +4270,16 @@ async function confirmRemoveServer(srv: Server): Promise<void> {
   const btn = document.getElementById(`srv-remove-${cssId(srv.url)}`) as HTMLButtonElement | null;
   card?.classList.add("removing"); // dim + ignore further clicks until this resolves
   if (btn) { btn.disabled = true; btn.innerHTML = `${icon("progress_activity")} Removing…`; btn.querySelector(".msym")?.classList.add("spin"); }
-  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login.
-  const memberId = fleetMemberIdByHost.get(hostOf(srv.url));
+  // If the hub tracks this Mac as a fleet member, ejecting it there stops it sharing the login. Match
+  // by port-stripped hostname; fall back to the card's own serverId when it's a known member (covers a
+  // MagicDNS-off member whose card was adopted under a raw IP that doesn't equal its stored `host`).
+  const memberId =
+    fleetMemberIdByHost.get(hostnameOf(srv.url)) ??
+    (srv.id && new Set(fleetMemberIdByHost.values()).has(srv.id) ? srv.id : undefined);
   if (memberId) {
     try {
       await apiFetch(`/api/fleet/members/${encodeURIComponent(memberId)}`, { method: "DELETE" });
-      fleetMemberIdByHost.delete(hostOf(srv.url));
+      for (const [k, v] of [...fleetMemberIdByHost]) if (v === memberId) fleetMemberIdByHost.delete(k);
     } catch {
       card?.classList.remove("removing");
       if (btn) { btn.disabled = false; btn.innerHTML = `${icon("close")} Remove`; }
@@ -4216,7 +4297,11 @@ async function loadFleetMembers(): Promise<void> {
     fleetMemberIdByHost.clear();
     let adopted = false;
     for (const m of members) {
-      fleetMemberIdByHost.set(m.host, m.serverId);
+      // Index under the bare host AND the url's hostname: with MagicDNS off the url can be healed to a
+      // raw tailnet IP while `host` stays the (now-unresolvable) name, so a card adopted under either
+      // form still maps back to the member for Remove.
+      if (m.host) fleetMemberIdByHost.set(hostnameOf(m.host), m.serverId);
+      fleetMemberIdByHost.set(hostnameOf(m.url), m.serverId);
       const url = m.url.replace(/\/+$/, "");
       if (!url || url === HUB_URL) continue;
       // The hub can heal a member's scheme (http→https once `tailscale serve` is up). If we'd adopted it
@@ -4236,20 +4321,47 @@ async function loadFleetMembers(): Promise<void> {
     /* hub unreachable — cards still render from the locally-known servers */
   }
 }
-/** Fill the "Add a Mac" dropdown from the hub's tailnet peers — so you pick a name, not an IP. */
+/**
+ * Fill the "Add a machine" dropdown from the hub's tailnet peers — so you pick a name, not an IP.
+ *
+ * Peers come from `/api/fleet/peers` (every tailnet node), and discovery (`/api/fleet/discover`, which
+ * probes each peer's `/api/health`) tells us which of them are Anvil daemons *without a Claude login* —
+ * exactly the machines someone is here to add. Those are labelled **"needs setup"** (HJ-9). We use the
+ * honest `subscriptionAuthOk` rather than a separate "pairable" advertisement, so there is only one
+ * signal and it can't disagree with itself; arm-state is deliberately never on the wire.
+ */
 async function loadFleetPeers(): Promise<void> {
   const sel = document.getElementById("fleet-host") as HTMLSelectElement | null;
   if (!sel) return;
   try {
-    const r = (await (await apiFetch("/api/fleet/peers")).json()) as { ok: boolean; peers: { name: string; host: string; online: boolean }[]; warning?: string };
-    const knownHosts = new Set([...servers.values()].map((s) => hostOf(s.url)));
-    const candidates = (r.peers ?? []).filter((p) => p.online && !knownHosts.has(p.host));
-    if (!r.ok) {
-      sel.innerHTML = `<option value="">${esc(r.warning ?? "Tailscale unavailable")}</option>`;
+    const [peersRes, discovered] = await Promise.all([
+      apiFetch("/api/fleet/peers").then((r) => r.json()) as Promise<{ ok: boolean; peers: { name: string; host: string; online: boolean }[]; warning?: string }>,
+      // Discovery is best-effort garnish: without it every candidate simply shows unlabelled.
+      apiFetch("/api/fleet/discover")
+        .then((r) => r.json())
+        .catch(() => ({ servers: [] })) as Promise<{ servers?: { url: string; subscriptionAuthOk?: boolean }[] }>,
+    ]);
+    // Compare on the bare hostname (no port). The peer list's `host` is a MagicDNS name with no port,
+    // but hostOf()/URL.host carries the :7701 — so matching on hostOf here silently never fires, and
+    // neither "needs setup" nor the already-added filter would work. Strip the port on both sides.
+    const hostname = (u: string): string => { try { return new URL(u).hostname; } catch { return hostOf(u).replace(/:\d+$/, ""); } };
+    const needsSetup = new Set(
+      (discovered.servers ?? []).filter((s) => s.subscriptionAuthOk === false).map((s) => hostname(s.url)),
+    );
+    const knownHosts = new Set([...servers.values()].map((s) => hostname(s.url)));
+    const candidates = (peersRes.peers ?? []).filter((p) => p.online && !knownHosts.has(p.host));
+    if (!peersRes.ok) {
+      sel.innerHTML = `<option value="">${esc(peersRes.warning ?? "Tailscale unavailable")}</option>`;
     } else if (!candidates.length) {
-      sel.innerHTML = `<option value="">No other Macs found on your tailnet</option>`;
+      sel.innerHTML = `<option value="">No other machines found on your tailnet</option>`;
     } else {
-      sel.innerHTML = `<option value="">Choose a Mac…</option>` + candidates.map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}</option>`).join("");
+      // Machines waiting for a login sort first — that's who the operator came here for.
+      candidates.sort((a, b) => Number(needsSetup.has(b.host)) - Number(needsSetup.has(a.host)));
+      sel.innerHTML =
+        `<option value="">Select a machine…</option>` +
+        candidates
+          .map((p) => `<option value="${esc(p.host)}" data-icon="computer">${esc(p.name)}${needsSetup.has(p.host) ? " — needs setup" : ""}</option>`)
+          .join("");
     }
   } catch {
     sel.innerHTML = `<option value="">Couldn't scan the tailnet</option>`;

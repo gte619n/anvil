@@ -15,6 +15,11 @@ import { test, expect } from "bun:test";
 import { refinePlanQuery } from "../../src/integrations/autopilot";
 import type { QueryLike } from "../../src/agent/query";
 
+// A `claude`-profile spawn now REQUIRES a subscription token (agent/env.ts) — a tokenless machine
+// fails loudly with a pair-this-machine message instead of an opaque SDK error. These tests drive
+// the SDK layer with a fake query, so give them a placeholder credential to get past that gate.
+process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
+
 /** A fake SDK query that captures the options and yields a canned ExitPlanMode plan + result. */
 function captureQuery(): { fn: QueryLike; opts: () => Record<string, any> } {
   let captured: Record<string, any> = {};

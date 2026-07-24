@@ -70,8 +70,10 @@ finishes — or needs your permission for something risky.
   reports/archives/media come back as download cards (with best-effort Tailscale Taildrop).
 - 🧩 **Reusable prompts & skills** — a device-synced prompt library in the composer, plus
   `/`-autocomplete for your Claude Code user/project skills.
-- 🔗 **Fleet-ready** — one client can manage `anvild` across several Macs on one Max plan,
-  with a persistent **concierge** session that can see and spin up work across the fleet.
+- 🔗 **Fleet-ready** — one client can manage `anvild` across several machines on one Max plan,
+  with a persistent **concierge** session that can see and spin up work across the fleet. Macs *and*
+  headless Linux boxes can join: a machine with no login boots into a setup screen in its own web UI,
+  shows a 6-digit code, and the hub pushes the fleet's credentials over the tailnet.
 
 ---
 
@@ -246,7 +248,7 @@ Full reasoning in [`anvil-native-architecture.md` §8.3](docs/plans/anvil-native
 | **Web client** | [`anvild/web/`](anvild/web/) | Vanilla TS | The daily-driver UI and the reusable render surface, served by the daemon at `/`. Also bundled into the native shells. |
 | **Android app** | [`app/`](app/) | Kotlin | A WebView shell hosting the web client over Tailscale + native FCM push, ADB-over-Tailscale, offline app-shell. `com.gte619n.anvil`. |
 | **Apple app** | [`apple/`](apple/) | SwiftUI · WKWebView | macOS-first hybrid shell (same model as Android); iOS + APNs gated on an Apple Developer account. |
-| **Server control panel** | [`anvil-server/`](anvil-server/) | SwiftUI | A macOS menu-bar app that stands up and manages `anvild` and joins Macs into a fleet — terminal-free setup. |
+| **Server control panel** | [`anvil-server/`](anvil-server/) | SwiftUI | A macOS menu-bar app that stands up and manages `anvild` and joins Macs into a fleet — terminal-free setup. Non-Mac machines join from the daemon's own web UI instead. |
 | **Build & release scripts** | [`scripts/`](scripts/) | Bash · TS | CI release notes + Apple Developer ID signing. |
 
 ---
@@ -267,9 +269,26 @@ It installs a launcher that sources `~/.config/anvil/env`, strips any
 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment, runs at login, and
 restarts on crash. No secrets live in the plist. See [`anvild/README.md`](anvild/README.md).
 
-For a **terminal-free** setup — install Bun, capture the OAuth token, wire Tailscale, and
+For a **terminal-free** setup on a Mac — install Bun, capture the OAuth token, wire Tailscale, and
 join several Macs into a fleet from a menu-bar UI — use the **Anvil Server** app in
 [`anvil-server/`](anvil-server/).
+
+### Headless / Linux machines
+
+`service.sh install` no longer requires a Claude login up front. With no token the daemon starts
+**degraded**: it serves its API and web UI and reports `subscriptionAuthOk: false`, but refuses agent
+turns (terminal, files, and git keep working). Open that machine's own web UI over Tailscale —
+`https://<machine>.<tailnet>.ts.net:7701` — and it takes the screen over with a setup flow:
+
+- **Join a fleet** → shows a 6-digit code. On an existing machine, go to
+  **Settings → Servers → Add a machine**, pick this one (it's labelled *needs setup*), and enter the
+  code. The hub pushes its Claude login — plus the Todoist/OpenRouter keys — over the tailnet.
+- **Enter a token directly** → paste a `claude setup-token` value for a standalone machine.
+
+Nothing after the one-time `install` needs a terminal. **The setup screen is browser-only in this
+release** — the Android/iOS/macOS apps bundle their own copy of the web UI, so they need an app update
+before it appears there; point a browser at the machine instead. Details:
+[`docs/plans/anvil-headless-join.md`](docs/plans/anvil-headless-join.md).
 
 ---
 
@@ -327,6 +346,7 @@ anvil/
 | [`docs/plans/anvil-protocol.ts`](docs/plans/anvil-protocol.ts) | The wire protocol — every envelope, event, and command (the source of truth). |
 | [`docs/plans/anvil-impl-INDEX.md`](docs/plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans. |
 | [`docs/plans/anvil-multi-server.md`](docs/plans/anvil-multi-server.md) | Multi-server fleet design (one client, many Macs, one Max plan). |
+| [`docs/plans/anvil-headless-join.md`](docs/plans/anvil-headless-join.md) | Tokenless boot + joining a fleet from a headless (non-Mac) machine. |
 | [`docs/plans/anvil-server-app.md`](docs/plans/anvil-server-app.md) | The menu-bar control panel design. |
 | [`docs/plans/anvil-autopilot-ui.md`](docs/plans/anvil-autopilot-ui.md) · [`anvil-todoist-integration.md`](docs/plans/anvil-todoist-integration.md) | Todoist autopilot + the plan-review UI. |
 | [`docs/plans/anvil-adversarial-pipeline.md`](docs/plans/anvil-adversarial-pipeline.md) | The OpenRouter/GLM adversarial planning panel + the unattended dev pipeline. |

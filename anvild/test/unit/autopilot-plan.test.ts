@@ -7,6 +7,11 @@ import { readStatus, withStatus, STATUSES } from "../../src/integrations/status"
 import { WorkUnitStore } from "../../src/integrations/workunit";
 import { TodoistClient } from "../../src/integrations/todoist";
 
+// A `claude`-profile spawn now REQUIRES a subscription token (agent/env.ts) — a tokenless machine
+// fails loudly with a pair-this-machine message instead of an opaque SDK error. These tests drive
+// the SDK layer with a fake query, so give them a placeholder credential to get past that gate.
+process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
+
 // extractPlanMeta is the pure (SDK-free) parser for the planner's trailing metadata block.
 
 test("extractPlanMeta pulls summary + effort and strips the block", () => {

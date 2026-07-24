@@ -12,6 +12,11 @@ import { pipelineGuardVerdict, makePipelineGuardHook } from "../../src/agent/pip
 import { runAgentQuery, type QueryLike } from "../../src/agent/query";
 import { CLAUDE } from "../../src/agent/model-roster";
 
+// A `claude`-profile spawn now REQUIRES a subscription token (agent/env.ts) — a tokenless machine
+// fails loudly with a pair-this-machine message instead of an opaque SDK error. These tests drive
+// the SDK layer with a fake query, so give them a placeholder credential to get past that gate.
+process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
+
 test("pipelineGuardVerdict denies the danger-list set, allows benign tools", () => {
   const cwd = "/tmp/worktree";
   expect(pipelineGuardVerdict("Bash", { command: "rm -rf /" }, cwd).behavior).toBe("deny");

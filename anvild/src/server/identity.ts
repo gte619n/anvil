@@ -74,8 +74,14 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  *  - "prompts": the saved-prompt library (prompt.list/save/remove) — Settings → Prompts + sidebar.
  *  - "lapo": the lapo OAuth information-entry integration (lapo.status/connect/disconnect) — the
  *    Settings → Lapo card + the autopilot run report.
+ *  - "pairing": this daemon receives fleet credentials on its OWN :7701 API (/api/fleet/pair,
+ *    /pair/ack, /token) rather than needing the macOS Server.app's :7702 listener — so a hub can
+ *    join/rotate a Linux or headless member (anvil-headless-join.md §3.5). A hub reads this off
+ *    /api/health to pick the destination; absent ⇒ pre-capability daemon ⇒ fall back to :7702.
+ *    This is exactly the "supports X but not Y across a partially-updated fleet" case PROTOCOL_VERSION
+ *    can't express, which is why that number is deliberately NOT bumped for this feature (HJ-32).
  */
-export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts", "lapo"];
+export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts", "lapo", "pairing"];
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
 export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {

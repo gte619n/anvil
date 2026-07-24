@@ -84,7 +84,7 @@ flowchart TB
   (SwiftUI WKWebView) apps. They host the web client and add platform-native push and
   device integration.
 - **Anvil Server** — a [macOS menu-bar app](../anvil-server/) that installs and manages the
-  daemon and joins Macs into a fleet, so setup needs no terminal.
+  daemon and joins Macs into a fleet, so setup needs no terminal. Non-Mac machines join from the daemon's own web UI instead.
 
 ---
 
@@ -216,7 +216,11 @@ one mistake that quietly costs money:
 Anvil **always** goes through the Agent SDK, authenticated by `CLAUDE_CODE_OAUTH_TOKEN`
 (from `claude setup-token`). `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` must be **absent**
 — they outrank the OAuth token and would meter every turn — so the daemon asserts this at
-startup and refuses to run otherwise. Because the default model is Opus and sessions can run
+startup and refuses to run otherwise. Note the asymmetry: a **metered key is fatal**, but a
+**missing** OAuth token is not. A tokenless daemon boots *degraded* — up, reachable, reporting
+`subscriptionAuthOk: false`, serving its terminal/file/git surfaces, and refusing only agent turns —
+so a fresh machine exists long enough to be handed a credential (see *The fleet*). An absent token
+can't cause a surprise charge; a stray API key can. Because the default model is Opus and sessions can run
 mostly-autonomously and concurrently, the **budget tracker** (remaining Opus/Sonnet hours,
 per-session burn, a warn threshold, and a soft-stop) is load-bearing, not a nicety. Full
 detail: [`anvil-native-architecture.md` §3](plans/anvil-native-architecture.md).
@@ -293,24 +297,31 @@ watches for reviewers that rubber-stamp. Design:
 
 ## The fleet (optional)
 
-One client can manage `anvild` on several Macs over the same tailnet, all on one Max plan —
-useful when work is spread across machines. A **hub** Mac holds the OAuth token and pushes it
-to **member** Macs over a code-gated, WireGuard-encrypted listener; afterwards it can rotate
-the token to every recorded member. The menu-bar **Anvil Server** app drives the join and
-rotation flows.
+One client can manage `anvild` on several machines over the same tailnet, all on one Max plan —
+useful when work is spread across machines. A **hub** holds the OAuth token and pushes it to
+**members** over a code-gated, WireGuard-encrypted route; afterwards it can rotate the token to every
+recorded member.
+
+Members do **not** have to be Macs. A machine with no login boots degraded and its own web UI takes
+over with a setup screen: *Join a fleet* shows a 6-digit code, the hub's **Settings → Servers → Add a
+machine** lists it as *needs setup*, and entering the code pushes the fleet's credentials to the
+joiner's own `:7701` API. The hub picks that destination from the `pairing` capability on the peer's
+`/api/health`, falling back to the macOS **Anvil Server** app's `:7702` listener for daemons that
+predate it. (That setup screen is browser-only for now — the native shells bundle their own copy of
+the web UI.)
 
 ```mermaid
 flowchart LR
-    client["Client<br/>(one app, all Macs)"]
+    client["Client<br/>(one app, whole fleet)"]
     subgraph tailnet["Tailscale tailnet"]
-        hub["Hub Mac<br/>anvild + token"]
+        hub["Hub<br/>anvild + token"]
         m1["Member Mac<br/>anvild"]
         m2["Member Mac<br/>anvild"]
     end
     client <--> hub
     client <--> m1
     client <--> m2
-    hub -.->|"code-gated token push<br/>+ rotation (:7702)"| m1
+    hub -.->|"code-gated token push<br/>+ rotation (:7701, or :7702 pre-upgrade)"| m1
     hub -.->|"…"| m2
     classDef n fill:#635F6A,stroke:#2F2739,color:#F0F6FC;
     classDef h fill:#D39450,stroke:#2F2739,color:#2F2739;
@@ -318,8 +329,9 @@ flowchart LR
     class hub h;
 ```
 
-Design: [`plans/anvil-multi-server.md`](plans/anvil-multi-server.md) and
-[`plans/anvil-server-app.md`](plans/anvil-server-app.md).
+Design: [`plans/anvil-multi-server.md`](plans/anvil-multi-server.md),
+[`plans/anvil-server-app.md`](plans/anvil-server-app.md), and
+[`plans/anvil-headless-join.md`](plans/anvil-headless-join.md) (tokenless boot + non-Mac joiners).
 
 ---
 

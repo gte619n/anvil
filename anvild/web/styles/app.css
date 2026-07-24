@@ -1018,3 +1018,35 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
     scroll-behavior: auto !important;
   }
 }
+
+/* ── Setup takeover (anvil-headless-join.md §5.1 / HJ-21) ─────────────────────────────────────
+   Shown full-screen when this daemon has no usable Claude login. It sits ABOVE modals (z-index
+   1000) on purpose: nothing under it can do useful work, so nothing under it should be reachable. */
+.setup-takeover { position: fixed; inset: 0; z-index: 2000; background: var(--bg); overflow-y: auto; display: flex; align-items: flex-start; justify-content: center; padding: 24px 16px; }
+.setup-box { width: min(560px, 100%); margin: auto; }
+.setup-brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 18px; margin-bottom: 22px; }
+.setup-box h2 { margin: 0 0 8px; font-size: 20px; display: flex; align-items: center; gap: 8px; }
+.setup-box h2 .msym { font-size: 24px; }
+.setup-lede { color: var(--muted); font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
+.setup-lede b { color: var(--text); }
+.setup-actions { display: flex; flex-direction: column; gap: 10px; }
+.setup-actions button { display: flex; align-items: flex-start; gap: 12px; width: 100%; text-align: left; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); color: var(--text); font: inherit; cursor: pointer; transition: background 0.12s, border-color 0.12s; }
+.setup-actions button:hover { background: var(--panel); border-color: var(--muted); }
+.setup-actions button .msym { font-size: 22px; flex: none; margin-top: 1px; }
+.setup-actions button span { display: flex; flex-direction: column; gap: 3px; }
+.setup-actions button small { color: var(--muted); font-weight: 400; line-height: 1.45; }
+.setup-primary { border-color: var(--accent) !important; }
+.setup-panel-box { margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
+.setup-panel-box p { margin: 0 0 10px; line-height: 1.5; }
+.setup-panel-box .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+.setup-panel-box .btns button { padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-weight: 600; cursor: pointer; }
+.setup-panel-box .btns button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.setup-panel-box label { display: block; font-size: 13px; margin-bottom: 10px; }
+.setup-panel-box input { width: 100%; padding: 8px; margin-top: 4px; border: 1px solid var(--border); border-radius: 8px; font: inherit; }
+.setup-warn p { display: flex; gap: 8px; align-items: flex-start; }
+.setup-warn .msym { color: var(--warn); flex: none; }
+/* The code is the one thing on screen someone is reading off a phone from across a room — make it
+   unmissable, monospaced (so 0/O and 1/l can't be confused), and selectable for copy-paste. */
+.setup-code-box { text-align: center; }
+.setup-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: clamp(34px, 11vw, 46px); font-weight: 700; letter-spacing: 0.12em; margin: 10px 0 8px; user-select: all; }
+.setup-foot { margin-top: 22px; text-align: center; }

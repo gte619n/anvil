@@ -13,7 +13,11 @@ import { tailnetIPv4 } from "../config";
  */
 
 export interface TailscalePeer {
-  dnsName: string; // MagicDNS name, trailing dot stripped
+  dnsName: string; // MagicDNS name, trailing dot stripped ("" when the node has none)
+  /** The node's CGNAT-range (100.64.0.0/10) tailnet IPv4, if any. This is the reachability floor:
+   *  it needs no DNS at all, so it's the ONLY address that works when MagicDNS is disabled on the
+   *  tailnet (or a node simply has no name). Reached over plain http (a bare IP has no TLS cert). */
+  ipv4?: string;
   online: boolean;
   isSelf: boolean;
 }
@@ -22,6 +26,12 @@ export interface ProbeResult {
   serverId: string;
   serverName: string;
   version: string;
+  /** From the peer's /api/health. False ⇒ up but with no Claude login, so discovery labels it
+   *  "needs setup" and the operator can pair it (headless-join HJ-9). */
+  subscriptionAuthOk?: boolean;
+  /** The peer's `SERVER_CAPABILITIES`. Contains "pairing" when credentials can be pushed to its own
+   *  :7701 API; absent/omitted means a pre-capability daemon → the macOS :7702 listener (HJ-32/§5.4). */
+  capabilities?: string[];
 }
 
 export type RunTailscale = () => Promise<string | null>; // null → CLI unavailable / not logged in
@@ -45,23 +55,86 @@ export async function tailnetPeers(runTailscale: RunTailscale = defaultRunTailsc
     return { ok: false, peers: [], warning: "Couldn't parse `tailscale status --json`." };
   }
   const peers = parsed
-    .filter((p) => !p.isSelf && p.dnsName)
-    .map((p) => ({ name: p.dnsName.split(".")[0]!, host: p.dnsName, online: p.online }));
+    .filter((p) => !p.isSelf && (p.dnsName || p.ipv4))
+    .map((p) => ({
+      // Prefer the friendly short name; for an IP-only node (no MagicDNS) the IP IS the label/host.
+      name: p.dnsName ? p.dnsName.split(".")[0]! : p.ipv4!,
+      host: p.dnsName || p.ipv4!,
+      online: p.online,
+    }));
   return { ok: true, peers };
 }
 
-/** Parse `tailscale status --json` into the peers we might probe (Self + every Peer). */
+/** The CGNAT-range (100.64.0.0/10) IPv4 from a Tailscale node's `TailscaleIPs`, if present. Mirrors
+ *  the interface-based {@link tailnetIPv4} in config.ts, but reads the address off the status JSON so
+ *  it works for *peers* (whose interfaces we can't see), not just self. */
+function cgnatIPv4(ips?: string[]): string | undefined {
+  for (const ip of ips ?? []) {
+    const o = ip.split(".");
+    if (o.length !== 4) continue; // skip IPv6 (fd7a:…) and anything malformed
+    const a = Number(o[0]);
+    const b = Number(o[1]);
+    if (a === 100 && b >= 64 && b <= 127) return ip;
+  }
+  return undefined;
+}
+
+/** True for a bare IPv4 literal (as opposed to a MagicDNS name). Used to skip the pointless https
+ *  probe to a raw tailnet IP — no TLS cert exists for a 100.x address, so only http reaches it. */
+function isBareIPv4(host: string): boolean {
+  const o = host.split(".");
+  return o.length === 4 && o.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+}
+
+/**
+ * Candidate `:7701` daemon base URLs for a host, most-preferred first. A MagicDNS name is tried over
+ * https (serve mode — the joiner binds loopback and only https reaches it) then http (a direct-bind
+ * host answers only http). A bare tailnet IP is http-ONLY: a 100.x literal has no TLS cert, so an
+ * https attempt to it is a guaranteed-wasted probe (and a wasted timeout). Shared by every reach path
+ * — discovery, pairing/rotation, ack, Todoist propagation — so they agree on scheme order.
+ */
+function daemonBases(host: string, port: number | string): string[] {
+  return isBareIPv4(host) ? [`http://${host}:${port}`] : [`https://${host}:${port}`, `http://${host}:${port}`];
+}
+
+/**
+ * Every base URL worth probing for a discovered peer, most-preferred first:
+ *   1. `https://<name>`  — serve-mode (Mac) daemons: TLS cert is bound to the MagicDNS name, so the
+ *      name is mandatory here and can't be swapped for the IP.
+ *   2. `http://<ip>`     — plain-http (direct-bind) daemons: preferred over the name because a non-TLS
+ *      daemon gains nothing from MagicDNS (no cert to match) and the raw tailnet IP needs no DNS, so it
+ *      stays reachable when MagicDNS is down. This is what makes a plain-http member's stored url a
+ *      DNS-independent `http://100.x:7701` instead of a name that dies with the resolver.
+ *   3. `http://<name>`   — last-ditch fallback if the IP probe is somehow blocked but the name resolves.
+ * Whichever answers first becomes the recorded url, so the ORDER here decides how a member is addressed.
+ */
+export function peerBases(peer: { dnsName?: string; ipv4?: string }, port: number): string[] {
+  const bases: string[] = [];
+  if (peer.dnsName && !isBareIPv4(peer.dnsName)) bases.push(`https://${peer.dnsName}:${port}`);
+  if (peer.ipv4) bases.push(`http://${peer.ipv4}:${port}`);
+  if (peer.dnsName) bases.push(`http://${peer.dnsName}:${port}`);
+  return bases;
+}
+
+/** Parse `tailscale status --json` into the peers we might probe (Self + every Peer). A node is
+ *  admitted if it's reachable by EITHER a MagicDNS name OR a raw tailnet IP — dropping IP-only nodes
+ *  (the no-MagicDNS case) made them invisible even though http://<ip>:7701 reaches them fine. */
 export function parseTailscalePeers(statusJson: string): TailscalePeer[] {
   const s = JSON.parse(statusJson) as {
-    Self?: { DNSName?: string };
-    Peer?: Record<string, { DNSName?: string; Online?: boolean }>;
+    Self?: { DNSName?: string; TailscaleIPs?: string[] };
+    Peer?: Record<string, { DNSName?: string; Online?: boolean; TailscaleIPs?: string[] }>;
   };
   const strip = (d?: string): string => (d ?? "").replace(/\.$/, "");
   const out: TailscalePeer[] = [];
-  if (s.Self?.DNSName) out.push({ dnsName: strip(s.Self.DNSName), online: true, isSelf: true });
-  for (const peer of Object.values(s.Peer ?? {})) {
-    if (peer.DNSName) out.push({ dnsName: strip(peer.DNSName), online: !!peer.Online, isSelf: false });
-  }
+  const add = (node: { DNSName?: string; TailscaleIPs?: string[] } | undefined, online: boolean, isSelf: boolean): void => {
+    if (!node) return;
+    const dnsName = strip(node.DNSName);
+    const ipv4 = cgnatIPv4(node.TailscaleIPs);
+    if (!dnsName && !ipv4) return; // no way to reach it — neither a name nor a tailnet IP
+    out.push({ dnsName, online, isSelf, ...(ipv4 ? { ipv4 } : {}) });
+  };
+  add(s.Self, true, true);
+  for (const peer of Object.values(s.Peer ?? {})) add(peer, !!peer.Online, false);
   return out;
 }
 
@@ -96,12 +169,32 @@ async function defaultRunTailscale(): Promise<string | null> {
  * serverId/serverName — important because the `:7702` pairing outcome may omit a serverId, and falling
  * back to the bare host as the serverId silently breaks *targeted* token propagation (members are
  * matched by serverId). Defaults to http with no identity if neither scheme answers (the member may
- * still be starting up) so the registry still gets a usable entry. `host` is a bare MagicDNS name.
+ * still be starting up) so the registry still gets a usable entry. `host` is a bare MagicDNS name or,
+ * when MagicDNS is off, a raw tailnet IP (http-only — see {@link daemonBases}).
  */
-export async function resolveMember(host: string, port: number, probe: Probe = defaultProbe): Promise<{ url: string; serverId?: string; serverName?: string }> {
-  for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
+export async function resolveMember(
+  host: string,
+  port: number,
+  probe: Probe = defaultProbe,
+  ipv4?: string,
+): Promise<{ url: string; serverId?: string; serverName?: string; capabilities?: string[]; subscriptionAuthOk?: boolean }> {
+  // With the peer's tailnet IP in hand, probe IP-before-name for http (via peerBases) so a plain-http
+  // member is recorded at its DNS-independent http://<ip> url, not a MagicDNS name. Without it, fall
+  // back to name-only ordering.
+  const bases = ipv4 ? peerBases({ dnsName: isBareIPv4(host) ? undefined : host, ipv4 }, port) : daemonBases(host, port);
+  for (const base of bases) {
     const r = await probe(base);
-    if (r) return { url: `${base}/`, serverId: r.serverId, serverName: r.serverName };
+    // `capabilities` rides along so the invite path can pick a push destination from what the joiner
+    // actually advertises rather than guessing (headless-join HJ-15) — same probe, no extra round trip.
+    if (r) {
+      return {
+        url: `${base}/`,
+        serverId: r.serverId,
+        serverName: r.serverName,
+        ...(r.capabilities ? { capabilities: r.capabilities } : {}),
+        ...(r.subscriptionAuthOk !== undefined ? { subscriptionAuthOk: r.subscriptionAuthOk } : {}),
+      };
+    }
   }
   return { url: `http://${host}:${port}/` };
 }
@@ -111,13 +204,40 @@ export async function resolveMemberUrl(host: string, port: number, probe: Probe 
   return (await resolveMember(host, port, probe)).url;
 }
 
+/**
+ * The CGNAT tailnet IPv4 for a peer host (a MagicDNS name), read from `tailscale status`. Returns the
+ * host unchanged if it's already a bare IP, or undefined when the peer has no tailnet IPv4 or status is
+ * unavailable. Feeds {@link resolveMember}'s `ipv4` so the invite path records a plain-http member at its
+ * DNS-independent http://<ip> url the moment it's paired — not a MagicDNS name that dies with the resolver.
+ */
+export async function peerIPv4(host: string, runTailscale: RunTailscale = defaultRunTailscale): Promise<string | undefined> {
+  if (isBareIPv4(host)) return host;
+  const status = await runTailscale();
+  if (!status) return undefined;
+  try {
+    const bare = host.replace(/\.$/, "");
+    return parseTailscalePeers(status).find((p) => p.dnsName === bare)?.ipv4;
+  } catch {
+    return undefined;
+  }
+}
+
 async function defaultProbe(baseUrl: string): Promise<ProbeResult | null> {
   try {
     const res = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1500) });
     if (!res.ok) return null;
     const h = (await res.json()) as Partial<rest.HealthResponse>;
     if (typeof h.serverId === "string" && h.serverId) {
-      return { serverId: h.serverId, serverName: h.serverName ?? "", version: h.version ?? "" };
+      return {
+        serverId: h.serverId,
+        serverName: h.serverName ?? "",
+        version: h.version ?? "",
+        // Carried through so the hub can label a tokenless peer AND route a credential push by
+        // capability rather than by guessing (headless-join HJ-9/HJ-15). Both are optional on the
+        // wire: a peer whose health predates them simply omits them.
+        ...(typeof h.subscriptionAuthOk === "boolean" ? { subscriptionAuthOk: h.subscriptionAuthOk } : {}),
+        ...(Array.isArray(h.capabilities) ? { capabilities: h.capabilities.filter((c): c is string => typeof c === "string") } : {}),
+      };
     }
   } catch {
     /* unreachable, timed out, or not an Anvil daemon */
@@ -196,10 +316,10 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
   // name; App-Store-Tailscale hosts bind the tailnet IP directly and answer over plain http. So try
   // https first, then http, and record whichever URL answered (server-side fetch isn't subject to
   // the browser's ts.net HSTS, so http://<name> reaches a direct-bind peer fine).
-  const targets = peers.filter((p) => p.online && p.dnsName);
+  const targets = peers.filter((p) => p.online && (p.dnsName || p.ipv4));
   const probed = await Promise.all(
     targets.map(async (p) => {
-      for (const url of [`https://${p.dnsName}:${opts.port}`, `http://${p.dnsName}:${opts.port}`]) {
+      for (const url of peerBases(p, opts.port)) {
         const r = await probe(url);
         if (r) return { ...r, peer: p, url };
       }
@@ -212,63 +332,239 @@ export async function discoverFleet(opts: DiscoverOpts): Promise<rest.FleetDisco
     if (!x || byId.has(x.serverId)) continue; // dedup by serverId (first address wins)
     byId.set(x.serverId, {
       serverId: x.serverId,
-      serverName: x.serverName || x.peer.dnsName,
+      serverName: x.serverName || x.peer.dnsName || x.peer.ipv4 || x.url,
       url: x.url,
       version: x.version,
       online: true,
       isSelf: x.serverId === opts.selfServerId,
+      ...(x.subscriptionAuthOk !== undefined ? { subscriptionAuthOk: x.subscriptionAuthOk } : {}),
+      ...(x.capabilities ? { capabilities: x.capabilities } : {}),
     });
   }
   return { ok: true, servers: [...byId.values()] };
 }
 
-// ─── Hub-side token distribution (anvil-server-app.md §4) ──────────────────────────────────────
-// The hub daemon pushes ITS subscription token to a joiner's pairing listener (:7702, hosted by the
-// joiner's Anvil Server.app) so the fleet can be managed from any client — web/Android/Mac — without
-// touching the hub's Mac app. The token is read from the daemon's own env and never returned to a
-// client. First join is code-gated (/anvil-pair); rotation is identity-gated (/anvil-token).
+/**
+ * Reconcile stored fleet members against a fresh discovery pass and return the `{ serverId, url }` heals
+ * to apply: a member whose real serverId was just rediscovered at a *different, reachable* address. The
+ * canonical trigger is MagicDNS going dark — a member paired under `https://name.ts.net:7701` stops
+ * resolving and now answers only on its raw tailnet IP (`http://100.x:7701`), so its stored url is dead
+ * and every client renders it disconnected. Matching by **serverId** (not host) is what lets a name↔IP
+ * swap still correlate; a bare scheme change (http→https once `tailscale serve` comes up) heals the same
+ * way. Only `srv_…` members are considered — legacy bare-host records heal via {@link resolveMember}
+ * instead — and a member absent from discovery (merely offline) is left untouched, never blanked.
+ */
+export function planMemberUrlHeals(
+  members: readonly { serverId: string; url: string }[],
+  discovered: readonly { serverId: string; url: string }[],
+): { serverId: string; url: string }[] {
+  const urlById = new Map(discovered.map((d) => [d.serverId, d.url]));
+  const heals: { serverId: string; url: string }[] = [];
+  for (const m of members) {
+    if (!m.serverId.startsWith("srv_")) continue; // unresolved legacy record — resolveMember's job
+    const url = urlById.get(m.serverId);
+    if (url && url !== m.url) heals.push({ serverId: m.serverId, url });
+  }
+  return heals;
+}
+
+// ─── Hub-side token distribution (anvil-server-app.md §4 · anvil-headless-join.md §5.4/§6) ─────
+// The hub daemon pushes ITS subscription token to a joiner so the fleet can be managed from any
+// client — web/Android/Mac — without touching the hub's Mac app. The token is read from the daemon's
+// own env and never returned to a client. First join is code-gated; rotation is identity-gated.
 //
-// Transport is PLAIN HTTP over the tailnet (not `tailscale serve` HTTPS): the joiner binds :7702
-// directly on its tailnet interface, so this works with any Tailscale install (incl. the sandboxed
-// App Store build that can't run `serve`). WireGuard encrypts the hop; the joiner verifies the
-// caller via `tailscale whois` on the connecting IP + the 6-digit code (anvil-server-app.md §4.3).
+// There are TWO possible destinations, and the hub picks by capability, not by guessing:
+//   :7701 /api/fleet/pair|token — the joiner's OWN daemon API. Works on any platform, which is what
+//     lets a headless Linux box join at all. Reached over https (serve mode, where the joiner binds
+//     loopback only) or http (direct bind) — the scheme fallback is not optional.
+//   :7702 /anvil-pair|/anvil-token — the macOS Server.app's standalone listener, plain HTTP bound
+//     directly on the tailnet so it works with the sandboxed App Store Tailscale (Pairing.swift:47).
+//     This is now the PRE-UPGRADE path only: an upgraded Mac takes the :7701 route like everyone else.
+//
+// Either way WireGuard encrypts the hop, and the joiner verifies the caller by tailnet identity —
+// `tailscale whois` on a direct bind, the serve-injected `Tailscale-User-Login` header on loopback
+// (headless-join §7) — plus the 6-digit code for a first join.
 
 interface PairOutcome {
   ok: boolean;
   serverId?: string;
   serverName?: string;
   error?: string;
+  /** The route answered, but with "no such route" semantics (404/405, or a non-JSON error page). The
+   *  caller treats this as "try the other destination", NOT as a hard failure — see {@link pushCredential}. */
+  routeMissing?: boolean;
+  /** The fetch never produced a response at all — connection refused, DNS failure, TLS-to-plain-HTTP
+   *  mismatch, or timeout. The caller retries the next scheme/port rather than surfacing it as a real
+   *  rejection (see {@link pushCredential}). Deliberately a FLAG set at the fetch boundary, not a
+   *  string match on `error`: Bun's refused-connection message ("Unable to connect…") contains none of
+   *  the keywords a regex would look for, so classifying by text silently defeated the https→http
+   *  fallback and broke pairing to every direct-bind (serve-less) joiner. */
+  transportError?: boolean;
 }
 
-async function postPairing(url: string, body: Record<string, unknown>, timeoutMs = 12_000): Promise<PairOutcome> {
+async function postPairing(url: string, body: Record<string, unknown>, timeoutMs = 12_000, fetchImpl: typeof fetch = fetch): Promise<PairOutcome> {
   try {
-    const res = await fetch(url, {
+    const res = await fetchImpl(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
-    const data = (await res.json().catch(() => ({}))) as PairOutcome;
+    // An un-upgraded daemon ANSWERS on :7701 — it's the ordinary daemon port — and 404s an unknown
+    // route. So a status check, not just a connection error, is what tells us to try :7702 (HJ-15).
+    if (res.status === 404 || res.status === 405) return { ok: false, routeMissing: true, error: `HTTP ${res.status}` };
+    const text = await res.text();
+    let data: PairOutcome | null = null;
+    try {
+      data = JSON.parse(text) as PairOutcome;
+    } catch {
+      // A proxy's HTML error page is the same signal as a 404: whatever answered isn't the pair route.
+      return { ok: false, routeMissing: !res.ok, error: `HTTP ${res.status} (non-JSON response)` };
+    }
     return { ok: res.ok && data.ok !== false, serverId: data.serverId, serverName: data.serverName, error: data.error };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    // Threw before any response: unreachable scheme/port, DNS failure, TLS mismatch, or timeout. Flag
+    // it so the caller retries the next base instead of reading the message — see transportError.
+    return { ok: false, transportError: true, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
-/** Invite a Mac: push the hub token to `host:7702/anvil-pair`, code-gated (first join). */
-export async function inviteMac(opts: { host: string; code: string; token: string; hubServerId: string; pairingPort?: number }): Promise<PairOutcome> {
-  if (!opts.token) return { ok: false, error: "this server has no OAuth token to share" };
-  const host = opts.host.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-  const url = `http://${host}:${opts.pairingPort ?? 7702}/anvil-pair`;
-  return postPairing(url, { code: opts.code, token: opts.token, hubServerId: opts.hubServerId });
+/** Strip any scheme/path an operator (or a stored URL) left on a host so it can be used bare. */
+function bareHost(host: string): string {
+  return host.replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/:\d+$/, "");
+}
+
+/** Does this peer's advertised capability set say it receives credentials on its own :7701 API? */
+export function speaksPairing(capabilities: string[] | undefined): boolean {
+  return Array.isArray(capabilities) && capabilities.includes("pairing");
 }
 
 /**
- * Candidate daemon base URLs for a member, https first then http. We deliberately re-derive these from
- * the member's host:port and IGNORE the stored scheme: a member's transport can change after pairing
- * (e.g. `tailscale serve` HTTPS comes up only after the join), and a token POST sent to the wrong scheme
- * is hard-rejected ("Client sent an HTTP request to an HTTPS server") — silently stranding the member
- * without a token forever. Trying both schemes lets propagation self-correct a stale registry entry.
+ * Push a credential payload to a member, choosing the destination by **capability, not by failure**
+ * (HJ-15 · headless-join §5.4/§6):
+ *
+ *   1. health advertises `pairing`         → the daemon's own `:7701` route;
+ *   2. capabilities present but no `pairing`, or absent entirely (a pre-capability daemon)
+ *                                          → the macOS Server.app's `:7702` listener;
+ *   3. `:7701` answers 404/405 (or an HTML error page) → fall back to `:7702` anyway.
+ *
+ * Step 3 is load-bearing: an un-upgraded Mac *does* answer on :7701 and returns 404 for an unknown
+ * route, so a connect-failure-only fallback would treat that as a hard failure and break pairing
+ * against every Mac not yet upgraded.
+ *
+ * The `:7701` leg reuses the https-then-http scheme fallback (see {@link memberBases}) because it is
+ * not optional: in serve mode the joiner binds **loopback only** so only `https://` reaches it, while a
+ * direct-bind joiner answers only `http://`. The `:7702` leg is plain HTTP by design (Pairing.swift:47).
+ */
+async function pushCredential(opts: {
+  host: string;
+  capabilities?: string[];
+  /** The daemon route on :7701, e.g. "/api/fleet/pair". */
+  daemonPath: string;
+  /** The Server.app route on :7702, e.g. "/anvil-pair". */
+  legacyPath: string;
+  body: Record<string, unknown>;
+  port?: number;
+  pairingPort?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<PairOutcome> {
+  const host = bareHost(opts.host);
+  const doFetch = opts.fetchImpl ?? fetch;
+  const port = opts.port ?? 7701;
+  const legacyUrl = `http://${host}:${opts.pairingPort ?? 7702}${opts.legacyPath}`;
+
+  if (speaksPairing(opts.capabilities)) {
+    let last: PairOutcome = { ok: false, error: "no reachable transport" };
+    for (const base of daemonBases(host, port)) {
+      const r = await postPairing(`${base}${opts.daemonPath}`, opts.body, 12_000, doFetch);
+      if (r.ok) return r;
+      last = r;
+      // A real rejection ("wrong code") is an ANSWER — stop, don't shop the credential around. Only a
+      // transport failure (this scheme was unreachable) or a missing route justifies trying elsewhere.
+      // Gate on the transportError FLAG, not the error text: Bun's connection-refused message
+      // ("Unable to connect…") matches none of the obvious keywords, so a regex here silently treated
+      // an unreachable https scheme as a real rejection and never tried http — which is exactly the
+      // state of every direct-bind (serve-less) joiner, i.e. the whole headless case.
+      if (!r.routeMissing && !r.transportError) return r;
+      if (r.routeMissing) break; // it's a daemon, but an old one — go straight to :7702
+    }
+    const legacy = await postPairing(legacyUrl, opts.body, 12_000, doFetch);
+    return legacy.ok ? legacy : { ...legacy, error: legacy.error ?? last.error };
+  }
+
+  return postPairing(legacyUrl, opts.body, 12_000, doFetch);
+}
+
+/**
+ * First join: push the hub's credentials to a joiner, code-gated. Named `invitePeer` (not `inviteMac`)
+ * since the joiner no longer has to be a Mac — that was the whole point of headless-join. Sibling
+ * secrets ride along in the same payload so joining a fleet means adopting its config (HJ-24/HJ-27);
+ * the `:7702` listener ignores the extra fields, so the legacy path is unaffected.
+ */
+export async function invitePeer(opts: {
+  host: string;
+  code: string;
+  token: string;
+  hubServerId: string;
+  capabilities?: string[];
+  fleetName?: string;
+  todoistToken?: string;
+  openRouterKey?: string;
+  port?: number;
+  pairingPort?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<PairOutcome> {
+  if (!opts.token) return { ok: false, error: "this server has no OAuth token to share" };
+  return pushCredential({
+    host: opts.host,
+    capabilities: opts.capabilities,
+    daemonPath: "/api/fleet/pair",
+    legacyPath: "/anvil-pair",
+    port: opts.port,
+    pairingPort: opts.pairingPort,
+    fetchImpl: opts.fetchImpl,
+    body: {
+      code: opts.code,
+      token: opts.token,
+      hubServerId: opts.hubServerId,
+      ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
+      ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
+      ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+    },
+  });
+}
+
+/**
+ * Confirm to the joiner that the member is recorded, so it disarms its window (HJ-16). Best-effort and
+ * :7701-only — the `:7702` listener disarms on its own successful pair, so there is nothing to ack.
+ */
+export async function ackPair(opts: {
+  host: string;
+  code: string;
+  hubServerId: string;
+  capabilities?: string[];
+  port?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<PairOutcome> {
+  if (!speaksPairing(opts.capabilities)) return { ok: true };
+  const host = bareHost(opts.host);
+  const port = opts.port ?? 7701;
+  let last: PairOutcome = { ok: false, error: "no reachable transport" };
+  for (const base of daemonBases(host, port)) {
+    const r = await postPairing(`${base}/api/fleet/pair/ack`, { code: opts.code, hubServerId: opts.hubServerId }, 8_000, opts.fetchImpl ?? fetch);
+    if (r.ok) return r;
+    last = r;
+  }
+  return last;
+}
+
+/**
+ * Candidate daemon base URLs for a member, https first then http (http only for a bare IP host — see
+ * {@link daemonBases}). We deliberately re-derive these from the member's host:port and IGNORE the
+ * stored scheme: a member's transport can change after pairing (e.g. `tailscale serve` HTTPS comes up
+ * only after the join), and a token POST sent to the wrong scheme is hard-rejected ("Client sent an
+ * HTTP request to an HTTPS server") — silently stranding the member without a token forever. Trying
+ * both schemes lets propagation self-correct a stale registry entry.
  */
 function memberBases(m: { url: string; host?: string }): string[] {
   let host = m.host ?? "";
@@ -280,7 +576,7 @@ function memberBases(m: { url: string; host?: string }): string[] {
   } catch {
     /* malformed stored url — fall back to the bare host on the default port */
   }
-  return host ? [`https://${host}:${port}`, `http://${host}:${port}`] : [];
+  return host ? daemonBases(host, port) : [];
 }
 
 /**
@@ -327,13 +623,59 @@ export async function propagateTodoist(opts: {
   );
 }
 
-/** Rotate: push the current hub token to each member's `:7702/anvil-token`, identity-gated. */
-export async function rotateToken(opts: { members: { host: string }[]; token: string; hubServerId: string; pairingPort?: number }): Promise<{ host: string; ok: boolean; error?: string }[]> {
+/**
+ * Rotate: push the current hub token to every member, identity-gated (no code). First-join and
+ * rotation are the same push differing only in gate — the split macOS already makes.
+ *
+ * Destination selection is identical to {@link invitePeer}'s (headless-join §6): capability-directed,
+ * with the 404/405 fallback. Consequence worth stating — once this ships, an **upgraded Mac** receives
+ * rotation on `:7701` like any other member; `:7702` is the path for pre-upgrade daemons only.
+ *
+ * A member's capabilities are probed here rather than stored, so a member that upgrades later starts
+ * getting the :7701 route without needing to be re-paired.
+ */
+export async function rotateToken(opts: {
+  members: { host: string; capabilities?: string[] }[];
+  token: string;
+  hubServerId: string;
+  todoistToken?: string;
+  openRouterKey?: string;
+  port?: number;
+  pairingPort?: number;
+  probe?: Probe;
+  fetchImpl?: typeof fetch;
+}): Promise<{ host: string; ok: boolean; error?: string }[]> {
   if (!opts.token) return opts.members.map((m) => ({ host: m.host, ok: false, error: "no token" }));
+  const probe = opts.probe ?? defaultProbe;
+  const port = opts.port ?? 7701;
   return Promise.all(
     opts.members.map(async (m) => {
-      const url = `http://${m.host}:${opts.pairingPort ?? 7702}/anvil-token`;
-      const r = await postPairing(url, { token: opts.token, hubServerId: opts.hubServerId });
+      const host = bareHost(m.host);
+      let capabilities = m.capabilities;
+      if (capabilities === undefined) {
+        for (const base of [`https://${host}:${port}`, `http://${host}:${port}`]) {
+          const r = await probe(base);
+          if (r) {
+            capabilities = r.capabilities ?? [];
+            break;
+          }
+        }
+      }
+      const r = await pushCredential({
+        host,
+        capabilities,
+        daemonPath: "/api/fleet/token",
+        legacyPath: "/anvil-token",
+        port: opts.port,
+        pairingPort: opts.pairingPort,
+        fetchImpl: opts.fetchImpl,
+        body: {
+          token: opts.token,
+          hubServerId: opts.hubServerId,
+          ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
+          ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+        },
+      });
       return { host: m.host, ok: r.ok, error: r.error };
     }),
   );
