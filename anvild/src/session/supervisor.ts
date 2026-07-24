@@ -76,6 +76,8 @@ import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
+import { integrationOrder } from "../integrations/team-plan";
+import { integrateTeam as runTeamIntegration, type IntegrateMember } from "../integrations/team-integrate";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint, type LapoConfig } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
@@ -881,10 +883,65 @@ export class Supervisor {
     return deriveTeams(this.list()).find((t) => t.leadId === leadId) ?? null;
   }
 
-  /** Integrate member branches per the team policy. Implemented in Phase 4 (team-integrate). */
-  private integrateTeam(leadId: string): string {
-    this.require(leadId);
-    throw new BadCommand("integration is not available yet in this build");
+  /** Integrate member branches per the team policy (combined-pr merges into the lead's worktree in
+   *  dependency order → one PR; pr-per-member is a no-op merge). Idempotent + resumable: on a merge
+   *  conflict it prompts the lead to resolve as an agent turn, then a re-run continues. */
+  integrateTeam(leadId: string): string {
+    const lead = this.require(leadId);
+    if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can integrate");
+    const team = deriveTeams(this.list()).find((t) => t.leadId === leadId);
+    if (!team || team.members.length === 0) throw new BadCommand("this lead has no members to integrate");
+
+    // Order members by the plan's dependsOn when we have it (session.title === plan member title,
+    // stamped at spawn); hand-added members with no plan entry keep their natural order at the end.
+    const memberSessions = team.members
+      .map((m) => this.sessions.get(m.sessionId)?.data)
+      .filter((s): s is SessionData => !!s);
+    const plan = this.activeTeamPlans.get(leadId);
+    let ordered = memberSessions;
+    if (plan) {
+      const byTitle = new Map(memberSessions.map((s) => [s.title, s]));
+      const seen = new Set<string>();
+      const out: SessionData[] = [];
+      for (const pm of integrationOrder(plan.members)) {
+        const s = byTitle.get(pm.title);
+        if (s && !seen.has(s.id)) { out.push(s); seen.add(s.id); }
+      }
+      for (const s of memberSessions) if (!seen.has(s.id)) out.push(s);
+      ordered = out;
+    }
+
+    const members: IntegrateMember[] = ordered.map((s) => ({
+      sessionId: s.id,
+      title: s.title,
+      branch: s.worktree?.branch,
+    }));
+    const integration = lead.data.team?.integration ?? "combined-pr";
+    const result = runTeamIntegration({
+      integration,
+      leadCwd: lead.data.cwd,
+      leadBranch: lead.data.worktree?.branch ?? lead.data.git?.branch ?? "HEAD",
+      leadRemoteBranch: lead.data.worktree?.remoteBranch,
+      members,
+      prTitle: `${lead.data.title}: team integration`,
+      prBody: `Combined PR integrating ${members.length} team member(s):\n${members.map((m) => `- ${m.title}${m.branch ? ` (${m.branch})` : ""}`).join("\n")}`,
+      git,
+    });
+
+    // Refresh the lead's git projection (branch/PR badge) and the derived team rollup.
+    lead.data.git = gitStatus(lead.data.cwd);
+    this.persist();
+    this.broadcastUpdated(lead.data);
+
+    if (!result.ok && result.conflictedMember) {
+      // Hand the conflict to the lead as an agent turn; a re-run of integrate() then continues past it.
+      this.prompt(
+        leadId,
+        `Integration hit a merge conflict pulling in member "${result.conflictedMember}". ` +
+          `Resolve the conflicts in this worktree, commit the merge, then call the integrate tool again to continue.`,
+      );
+    }
+    return result.output;
   }
 
   /** Refine a plan from reviewer feedback (Opus, read-only against the repo): persist the revised

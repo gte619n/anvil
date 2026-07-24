@@ -144,6 +144,26 @@ export function upstreamRemoteBranch(cwd: string): string | undefined {
   return name.startsWith("origin/") ? name.slice("origin/".length) : name || undefined;
 }
 
+/**
+ * Merge `branch` into the current branch in `cwd` (a team lead's worktree merging a member branch,
+ * arch teams §4). Returns `conflicted` when git left the worktree mid-conflict — the caller resolves
+ * it as an agent turn and re-runs integration; a conflicted merge is deliberately NOT auto-aborted so
+ * the conflict markers stay in the tree for the lead to fix.
+ */
+export function mergeBranch(cwd: string, branch: string, message?: string): { ok: boolean; conflicted: boolean; output: string } {
+  const args = ["git", "merge", "--no-edit", ...(message ? ["-m", message] : []), branch];
+  const r = run(args, cwd);
+  if (r.code === 0) return { ok: true, conflicted: false, output: r.out || `merged ${branch}` };
+  const conflicted = /conflict/i.test(r.out) || run(["git", "ls-files", "-u"], cwd).out.trim().length > 0;
+  return { ok: false, conflicted, output: r.out || `merge of ${branch} failed (exit ${r.code})` };
+}
+
+/** True when `ref` is already an ancestor of HEAD in `cwd` — i.e. its commits are already merged.
+ *  Lets integration be idempotent: a member merged in an earlier (interrupted) run is skipped. */
+export function isAncestor(cwd: string, ref: string): boolean {
+  return run(["git", "merge-base", "--is-ancestor", ref, "HEAD"], cwd).code === 0;
+}
+
 export function createPr(cwd: string, title: string, body: string): { ok: boolean; output: string; url?: string } {
   const r = run(["gh", "pr", "create", "--title", title, "--body", body], cwd, NET_TIMEOUT_MS);
   const url = r.out.match(/https?:\/\/\S+/)?.[0];

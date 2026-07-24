@@ -157,6 +157,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "team.integrate":
+        deps.supervisor.integrateTeam(cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.send": {
         // attach so this connection receives the streamed turn (arch §6.4)
         conn.attached.add(cmd.sessionId);
