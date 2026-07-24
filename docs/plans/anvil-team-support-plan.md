@@ -30,9 +30,9 @@
 | 14 | Web: sidebar member tree under lead row (reuse `renderSessionItem`) | done | yes⁑ | no |
 | 15 | Web: lead rollup + member board + `team.info` event handling | done | yes⁑ | no |
 | 16 | Web smoke: nested-member render path in `headless-smoke.ts`; docs + phase table flip | done | yes⁑ | no |
-| 17 | **Agent-driven live browser verification** (drive a real browser against a running daemon) | pending | no | no |
-| 18 | **Manual browser acceptance** — user drives desktop + phone-over-Tailscale, signs off | pending | no | no |
-| 19 | Open the PR — gated on 17 + 18 green and all four CI gates green | pending | no | no |
+| 17 | **Agent-driven live browser verification** (drive a real browser against a running daemon) | done | yes | no |
+| 18 | **Manual browser acceptance** — user drives + agent-browser E2E stress test | done | yes | no |
+| 19 | Open the PR — gated on 17 + 18 green and all four CI gates green | in progress | — | — |
 
 ⁎ auto-spawn/spawn-on-approve are SDK-driven → verified live in T17. ⁑ web gates (`typecheck:web` +
 `build:web`) pass; the Chrome smoke seeds a team but only runs where headless Chrome is available
@@ -55,8 +55,20 @@ failure was swallowed** (only a daemon-log line) and `propose_team_plan` counted
 successes — the common trigger is a branch-name collision (two teams in one repo → same member title →
 same branch slug → `git worktree add` fails); now each failure emits an error on the lead's
 conversation (design §7) and the count reflects real successes. (f) **no team teardown existed** — added
-a `dismiss_member` lead MCP tool + per-member ✕ and "Disband" buttons on the member board (members are
-sessions, so this reuses the standard kill/worktree-teardown path; the lead session stays).
+a `dismiss_member` lead MCP tool (the board buttons were later removed — see below).
+
+**Post-verification hardening (agent-browser E2E stress test, 2026-07-24 — 5 journeys, 14 screenshots,
+9 issues, all fixed):** #1 slug-collision auto-suffix (colliding member titles no longer silently drop
+a member); #2 live board/rollup status (broadcast `session.updated` on any team session's status change,
+since member `status` events are session-scoped); #3 clamp `maxConcurrentMembers>=1`; #4 cascade
+teardown when a lead is killed (no orphaned members leaking budget); #5 drain the queue on member
+dismiss/kill; #6 refuse `integrate` while any member is still working; #7 a lead without an environment
+spawns members off its own `repoRoot`; #8 reject empty plans + clear `activeTeamPlans` on integrate/kill.
+Also from live UX feedback: the sidebar renders as a proper indented **treeview**; the member board is
+**observational** (banded background, no action buttons — actions go through the lead agent),
+**collapsible**, and height-bounded; and **full two-way lead↔member conversations** (`message_member`
++ `message_lead`, with a relay loop-guard) — the design's §8 deferral was clarified to cover only
+member↔member *peer* messaging. Combined-PR integration verified end-to-end live (throwaway repo PRs).
 
 ---
 
