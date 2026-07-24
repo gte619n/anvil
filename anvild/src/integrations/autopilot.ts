@@ -86,9 +86,8 @@ async function runQuery(
       // A headless run has no human to answer a permission "ask", and in plan mode the model
       // delivers its plan through an `ExitPlanMode` tool call — an approval-gated op. With no
       // PreToolUse hook (and no canUseTool), that ask has no responder and the query never reaches
-      // a terminal result: the `for await` below blocks forever. That is exactly what pinned the
-      // Autopilot "refine" spinner open (refinePlanQuery runs plan-mode with no watchdog to abort
-      // the stall). Give every tool an allow/deny decision — the same SEC-H4 danger backstop the
+      // a terminal result: the `for await` below blocks forever. Give every tool an allow/deny
+      // decision — the same SEC-H4 danger backstop the
       // dev pipeline uses (agent/query.ts) — so ExitPlanMode is allowed and the run completes.
       hooks: {
         PreToolUse: [{ hooks: [makePipelineGuardHook(opts.cwd)], timeout: 3600 }],
@@ -320,7 +319,7 @@ ${taskBlock}`;
  *  the planner did produce preserved below so its context isn't lost. */
 function clarificationDoc(c: { reason: string; questions: string[] }, draftPlan?: string): string {
   const qs = c.questions.length ? c.questions.map((q) => `- ${q}`).join("\n") : "- (The task needs more detail before it can be implemented.)";
-  const head = `# Needs clarification\n\n${c.reason || "This task is underspecified — it needs answers before it can be built safely."}\n\n## Open questions\n\n${qs}\n\n_Answer these in the refine chat (or on the Todoist task) and the unit returns to \`planned\`._`;
+  const head = `# Needs clarification\n\n${c.reason || "This task is underspecified — it needs answers before it can be built safely."}\n\n## Open questions\n\n${qs}\n\n_Open a planning session (Plan with Claude) to answer these — Claude works the plan out with you and the unit becomes buildable._`;
   return draftPlan ? `${head}\n\n---\n\n## Draft plan (assumptions — pending the answers above)\n\n${draftPlan}` : head;
 }
 
@@ -422,34 +421,24 @@ async function processUnit(
 }
 
 /**
- * REFINE: revise an existing plan from reviewer feedback (the Autopilot "refine with Claude" chat).
- * Read-only against the repo; returns the full rewritten plan plus refreshed summary/effort metadata.
+ * Reassemble the live Todoist prompt for a work unit's tasks — each task's content, description, and
+ * comment thread — so an interactive planning session sees exactly what the user asked for (not just the
+ * planner's derived plan). Best-effort per task: a closed/deleted/unreachable task is skipped rather than
+ * failing the whole assembly. Returns "" when nothing could be fetched.
  */
-export async function refinePlanQuery(opts: {
-  title: string;
-  currentPlan: string;
-  feedback: string;
-  repoRoot: string;
-  model?: Model;
-  signal?: AbortSignal; // bounds the run so a stuck query can't pin the refine spinner open forever
-  queryFn?: QueryLike; // test seam: inject a fake SDK query so no subprocess spawns
-}): Promise<{ plan: string; summary?: string; effort?: AutopilotEffort }> {
-  const prompt = `You are revising an implementation plan for the unit of work "${opts.title}" in this repository, based on reviewer feedback. Inspect the codebase (read-only) as needed, then produce the FULL revised plan in markdown — the complete updated plan, not a diff.
-
-Current plan:
-${opts.currentPlan.trim() || "(no plan yet)"}
-
-Reviewer feedback:
-${opts.feedback.trim()}
-
-Rewrite the plan to address the feedback while keeping the parts that are still valid. Do not make any edits to the repo — planning only.
-
-${VALIDATION_INSTRUCTION}
-
-${PLAN_META_INSTRUCTION}`;
-
-  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true, signal: opts.signal, ...(opts.queryFn ? { queryFn: opts.queryFn } : {}) });
-  return resolvePlan(out);
+export async function buildTodoistPrompt(client: TodoistClient, taskIds: string[], signal?: AbortSignal): Promise<string> {
+  const tasks: TodoistTask[] = [];
+  for (const id of taskIds) {
+    if (signal?.aborted) break;
+    try {
+      tasks.push(await client.getTask(id));
+    } catch {
+      /* task closed/deleted or Todoist unreachable — skip it, plan on the rest */
+    }
+  }
+  if (tasks.length === 0) return "";
+  const comments = await fetchComments(client, tasks, signal);
+  return tasks.map((t) => taskLine(t, { comments: comments.get(t.id) })).join("\n");
 }
 
 /** Tasks eligible for planning: not already in the anvil pipeline (no anvil:* label, no work unit). */

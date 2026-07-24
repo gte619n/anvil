@@ -63,6 +63,7 @@ import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
 import { buildTeamToolsServer, TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
 import { buildMemberToolsServer, MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
+import { buildPlanningToolsServer, PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
 import { memberBaseRef } from "../integrations/member-base";
 import { shouldAutoApprove, spawnPaused, relayExhausted, MAX_TEAM_RELAY_HOPS } from "../integrations/team-gate";
 import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
@@ -75,7 +76,7 @@ import { EnvironmentStore } from "../env/store";
 import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
-import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
+import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildPlanningBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
 import { integrationOrder } from "../integrations/team-plan";
 import { integrateTeam as runTeamIntegration, safeRemoteBranch, type IntegrateMember } from "../integrations/team-integrate";
@@ -86,7 +87,7 @@ import { resolveLapoConfig } from "../config";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
-import { planAndTagProject, planAndTagTasks, planUnit, refinePlanQuery } from "../integrations/autopilot";
+import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { reviewPlan, formatReview } from "../integrations/adversarial";
@@ -125,10 +126,6 @@ const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
 /** Per-unit budget for a background dev-pipeline run auto-started by the scheduler. Generous: a full
  *  7-gate run with both live models + real checks + loop-backs can legitimately take a while. */
 const PIPELINE_RUN_BUDGET_MS = 45 * 60_000;
-/** Budget for an interactive plan-refine query. Unlike a scheduled run there is no watchdog around it,
- *  so bound it here — a stuck query then aborts with a clean error instead of spinning the refine
- *  window forever. Kept under the client's 600s await so the user sees the failure, not a dead timeout. */
-const REFINE_RUN_BUDGET_MS = 9 * 60_000;
 
 /** How often the scheduler checks whether the scheduled time has arrived. */
 const SCHEDULE_TICK_MS = 5 * 60_000;
@@ -1154,27 +1151,90 @@ export class Supervisor {
     return result.output;
   }
 
-  /** Refine a plan from reviewer feedback (Opus, read-only against the repo): persist the revised
-   *  plan + metadata, post it back as a Todoist comment, broadcast, and return the updated plan. */
-  async refinePlan(workUnitId: string, feedback: string, cid?: string): Promise<AutopilotPlanResultEvent> {
+  /**
+   * Open an interactive "Plan with Claude" session on a work unit (replaces the old refine chat).
+   * Unlike Go (`startPlan`, which seeds the plan and builds autonomously), this hands the session the
+   * FULL context — the live Todoist prompt, the design so far, and any open questions — and lets the
+   * user and Claude settle the plan together before building. It's a continuous session: once the plan
+   * is agreed it can implement here, or call `run_pipeline` to hand off to the autonomous loop. Works on
+   * held (needs-clarification) units too — this is how their open questions get answered.
+   */
+  async startPlanningSession(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (!feedback.trim()) throw new BadCommand("feedback is required");
+    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a live session");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
-    const revised = await refinePlanQuery({ title: u.title, currentPlan: u.plan ?? "", feedback, repoRoot: env.repoRoot, signal: AbortSignal.timeout(REFINE_RUN_BUDGET_MS) });
-    const updated = this.workUnits.update(u.id, {
-      plan: revised.plan,
-      ...(revised.summary ? { summary: revised.summary } : {}),
-      ...(revised.effort ? { effort: revised.effort } : {}),
-      // Answering a held unit's questions in the refine chat is what un-holds it: promote it back to
-      // `planned` so it becomes startable again. Re-tag the member tasks to match.
-      ...(u.status === "needs-clarification" ? { status: "planned" as const } : {}),
+    // Best-effort: re-fetch the live Todoist prompt (task text + comments) so the session sees exactly
+    // what the user asked for, not just the planner's derived plan. Todoist offline → empty, plan carries on.
+    let todoistPrompt = "";
+    const state = this.integrations.todoist();
+    if (state?.accessToken) {
+      try {
+        todoistPrompt = await buildTodoistPrompt(new TodoistClient(state.accessToken), u.taskIds, AbortSignal.timeout(30_000));
+      } catch {
+        /* Todoist unreachable — plan on the derived plan alone */
+      }
+    }
+    const { id } = this.handoffCreate({
+      environmentId: env.id,
+      source: "fresh-worktree",
+      title: u.title,
+      model: model ?? "opus",
+      // Interactive by default: it should ask the open questions and confirm the design, not blast ahead.
+      autonomy: autonomy ?? "mostly-autonomous",
+      brief: buildPlanningBrief(u, todoistPrompt),
+      workUnitId: u.id,
+      workUnitRole: "planner",
     });
-    if (u.status === "needs-clarification") void this.tagTasks(u, "planned");
-    void this.postPlanComment(u, `🤖 **anvil** refined the plan for “${u.title}”.\n\n${revised.summary?.trim() || "Plan updated."}`);
+    this.workUnits.update(u.id, { sessionId: id, status: "planning" });
+    void this.tagTasks(u, "planning");
     this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
+    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
+  }
+
+  /** Build the planning-session MCP server (save_plan / run_pipeline), closed over its session id. */
+  private buildPlanningServer(sessionId: string) {
+    return buildPlanningToolsServer({
+      sessionId,
+      savePlan: (plan, ready) => this.plannerSavePlan(sessionId, plan, ready),
+      runPipeline: () => this.plannerRunPipeline(sessionId),
+    });
+  }
+
+  /** `save_plan` tool: a planning session writes its settled plan back onto its work unit and posts it
+   *  to Todoist. Scoped to the session's own unit. `ready` is advisory (the unit stays owned by the live
+   *  session); it just marks the plan settled in the Todoist note. */
+  private plannerSavePlan(sessionId: string, plan: string, ready: boolean): string {
+    const u = this.plannerUnit(sessionId);
+    this.workUnits.update(u.id, { plan });
+    void this.postPlanComment(
+      u,
+      ready
+        ? `🤖 **anvil** settled the plan for “${u.title}” in a planning session.`
+        : `🤖 **anvil** checkpointed a work-in-progress plan for “${u.title}”.`,
+    );
+    this.broadcastAutopilotPlans();
+    return `Saved the plan to “${u.title}”${ready ? " and marked it settled" : " as a checkpoint"}. Posted it to Todoist.`;
+  }
+
+  /** `run_pipeline` tool: a planning session hands its settled unit to the autonomous dev pipeline (§4).
+   *  Fire-and-forget — progress streams to the Autopilot screen; returns once the run is launched. */
+  private plannerRunPipeline(sessionId: string): string {
+    const u = this.plannerUnit(sessionId);
+    void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) }).catch((e) => {
+      this.broadcastRunProgress(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+    return `Started the review→development→testing pipeline for “${u.title}”. It builds in a fresh worktree and opens a PR; watch the Autopilot screen for progress.`;
+  }
+
+  /** Resolve + validate a planning session's work unit (guards the save_plan/run_pipeline tools). */
+  private plannerUnit(sessionId: string): WorkUnit {
+    const s = this.require(sessionId);
+    if (s.data.workUnitRole !== "planner" || !s.data.workUnitId) throw new BadCommand("not a planning session");
+    const u = this.workUnits.get(s.data.workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${s.data.workUnitId}`);
+    return u;
   }
 
   /** Reassign a plan to a different environment (repo) and re-evaluate it there: re-plan the unit's
@@ -1381,8 +1441,8 @@ export class Supervisor {
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
     // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
-    // the reviewer to answer (Refine → promotes it to `planned`) before it can start.
-    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — answer its open questions (Refine) before starting");
+    // the reviewer to answer them first, in a "Plan with Claude" session, before it can start.
+    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before starting");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
     const brief = this.autopilotBrief(u);
@@ -1618,7 +1678,7 @@ export class Supervisor {
   async runDevPipeline(workUnitId: string, opts: { signal?: AbortSignal; onProgress?: (m: string) => void } = {}): Promise<PipelineOutcome> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — answer its open questions (Refine) before running the pipeline");
+    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before running the pipeline");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the work unit's environment no longer exists");
     if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
@@ -1727,7 +1787,7 @@ export class Supervisor {
     try {
       await new TodoistClient(state.accessToken).addComment(taskId, content);
     } catch {
-      /* comment is an audit nicety — never fail the refine over it */
+      /* comment is an audit nicety — never fail the plan save over it */
     }
   }
 
@@ -1847,6 +1907,9 @@ export class Supervisor {
     teamRole?: "lead" | "member";
     memberTask?: string;
     repoRoot?: string; // #7: spawn a fresh-worktree member off this repo when there's no environment
+    // ── Autopilot: mark a "Plan with Claude" planning session and link it to its work unit ──
+    workUnitId?: string;
+    workUnitRole?: "planner";
   }): { id: string; title: string; cwd: string } {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
@@ -1889,6 +1952,13 @@ export class Supervisor {
       session.data.parentId = a.parentId;
       session.data.teamRole = a.teamRole;
       session.data.memberTask = a.memberTask;
+      this.persist();
+    }
+    // Autopilot planning session: stamp its work-unit link (before broadcast) so it's driven with the
+    // planning tools (save_plan / run_pipeline) and the card can jump to it.
+    if (a.workUnitId || a.workUnitRole) {
+      session.data.workUnitId = a.workUnitId;
+      session.data.workUnitRole = a.workUnitRole;
       this.persist();
     }
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
@@ -2270,6 +2340,7 @@ export class Supervisor {
       const isDefault = s.data.isDefault === true;
       const isLead = s.data.teamRole === "lead";
       const isMember = s.data.teamRole === "member" && !!s.data.parentId;
+      const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -2283,8 +2354,10 @@ export class Supervisor {
             ? { [TEAM_MCP_SERVER_NAME]: this.buildTeamServer(id) }
             : isMember
               ? { [MEMBER_MCP_SERVER_NAME]: this.buildMemberServer(id) }
-              : undefined,
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : undefined,
+              : isPlanner
+                ? { [PLANNING_MCP_SERVER_NAME]: this.buildPlanningServer(id) }
+                : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),

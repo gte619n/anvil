@@ -216,6 +216,9 @@ export interface Session {
   teamRole?: "lead" | "member"; // absent on a plain (non-team) session
   memberTask?: string; // the one-line task the lead assigned this member
   team?: TeamPolicy; // set only on a lead: this team's integration/concurrency policy
+  // ── Autopilot planning session (see docs/plans/anvil-improvement-program.md) ──
+  workUnitId?: string; // set on a "Plan with Claude" session: the autopilot work unit it plans/builds
+  workUnitRole?: "planner"; // marks a session created to plan (then build) an autopilot work unit
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted
   finished?: boolean; // user-parked in the sidebar's "Finished" group (done, e.g. pending deploy)
   order?: number; // explicit sidebar sort position (lower = higher); unset sorts newest-on-top
@@ -545,7 +548,7 @@ export interface AutopilotEffort {
 }
 /** The anvil autopilot's status, mirrored from the `anvil:*` Todoist labels. Kept in lockstep with
  *  STATUSES in src/integrations/status.ts (the server is the source of truth). */
-export type AnvilStatus = "planned" | "needs-clarification" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
+export type AnvilStatus = "planned" | "needs-clarification" | "planning" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
 /** A focused projection of the autonomous-dev-pipeline trace record (§7), shaped for the reader. The
  *  full plan markdown stays in `AutopilotPlanInfo.plan`; this carries the gate/assignment residue. */
 export interface PipelineTraceInfo {
@@ -572,6 +575,7 @@ export interface AutopilotPlanInfo {
   summary?: string; // 1–2 line description for the card
   status: AnvilStatus;
   source?: "project" | "label"; // "label" = pulled in account-wide by the Autopilot label (catch-all env)
+  sessionId?: SessionId; // the linked session, if any (a live planning session, or the build session)
   effort?: AutopilotEffort;
   taskCount: number; // Todoist tasks bundled into the unit
   plan?: RenderedMarkdown; // full implementation plan (source + sanitized HTML) for the reader
@@ -580,19 +584,20 @@ export interface AutopilotPlanInfo {
   updatedAt: Iso8601;
 }
 /** The server's pending plans — answer to `autopilot.plans.list` (carries cid), and broadcast (no cid)
- *  whenever the set changes (a run plans new units, a refine updates one, a dismiss/start removes one). */
+ *  whenever the set changes (a run plans new units, a planning session saves one, a dismiss/start removes one). */
 export interface AutopilotPlansEvent extends Envelope {
   type: "autopilot.plans";
   cid?: Cid;
   plans: AutopilotPlanInfo[];
 }
-/** One updated plan — the result of `autopilot.refine` (carries cid). */
+/** One updated plan — the result of `autopilot.reassign` (carries cid). */
 export interface AutopilotPlanResultEvent extends Envelope {
   type: "autopilot.plan";
   cid?: Cid;
   plan: AutopilotPlanInfo;
 }
-/** The session a Go (`autopilot.start`) created to implement a plan. */
+/** The session created for a plan — by a Go (`autopilot.start`, build) or a "Plan with Claude"
+ *  (`autopilot.plan.session`, plan-then-build). Carries the workUnit and the new session id. */
 export interface AutopilotStartedEvent extends Envelope {
   type: "autopilot.started";
   cid?: Cid;
@@ -1185,10 +1190,12 @@ export interface AuthClearCmd extends Envelope, Correlated {
 export interface AutopilotPlansListCmd extends Envelope, Correlated {
   type: "autopilot.plans.list"; // this server's pending plans → autopilot.plans
 }
-export interface AutopilotRefineCmd extends Envelope, Correlated {
-  type: "autopilot.refine"; // Claude rewrites the plan from the user's feedback → autopilot.plan
+export interface AutopilotPlanSessionCmd extends Envelope, Correlated {
+  type: "autopilot.plan.session"; // open an interactive planning session seeded with the Todoist prompt,
+  // the design so far, and any open questions; Claude works the plan out (and can build) → autopilot.started
   workUnitId: string;
-  feedback: string;
+  model?: Model; // defaults to "opus"
+  autonomy?: AutonomyPolicy; // defaults to "mostly-autonomous" (interactive: it asks the open questions, doesn't blast ahead)
 }
 export interface AutopilotDismissCmd extends Envelope, Correlated {
   type: "autopilot.dismiss"; // reject a plan: label its tasks anvil:dismissed, drop the card
@@ -1348,7 +1355,7 @@ export type ClientCommand =
   | AuthSetCmd
   | AuthClearCmd
   | AutopilotPlansListCmd
-  | AutopilotRefineCmd
+  | AutopilotPlanSessionCmd
   | AutopilotDismissCmd
   | AutopilotStartCmd
   | AutopilotPipelineStartCmd

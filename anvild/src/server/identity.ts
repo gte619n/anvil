@@ -67,7 +67,7 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  * treats every capability as unsupported for it. PROTOCOL_VERSION can't serve this — it's a single
  * frozen number, so it can't express "supports X but not Y" across a partially-updated fleet.
  *  - "autopilot": the plan-review + in-daemon scheduler command family (autopilot.plans.list,
- *    autopilot.schedule.get/set, refine/dismiss/start/resolve/link/reassign/run). Added in PR #51.
+ *    autopilot.schedule.get/set, plan.session/dismiss/start/resolve/link/reassign/run). Added in PR #51.
  *  - "autopilot-maintenance": reset anvil:* tags / clear the pipeline (autopilot.tags.reset,
  *    autopilot.clear) — the Todoist-settings maintenance buttons.
  *  - "auth": model-provider token management (auth.status/set/clear) — the Settings → Models card.
