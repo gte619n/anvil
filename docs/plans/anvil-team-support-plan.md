@@ -14,25 +14,38 @@
 
 | Task | Description | Status | Tested | Pushed |
 |------|-------------|--------|--------|--------|
-| 1 | Protocol: `parentId`/`teamRole`/`memberTask`/`TeamPolicy` on `Session` | pending | no | no |
-| 2 | Protocol: `TeamInfo` type + `team.*` events & commands + `ServerEvent`/command unions | pending | no | no |
-| 3 | Contract: regenerate golden, bump `PROTOCOL_VERSION`, test green | pending | no | no |
-| 4 | `team-tree.ts`: derive `TeamInfo` from sessions (pure) + unit test | pending | no | no |
-| 5 | `team-plan.ts`: parse lead's fenced-JSON plan + integration order from `dependsOn` (pure) + unit test | pending | no | no |
-| 6 | `team-gate.ts`: autonomy → auto-approve vs wait decision (pure) + unit test | pending | no | no |
-| 7 | `member-base.ts`: resolve a member's base ref off the lead (pure) + unit test | pending | no | no |
-| 8 | Supervisor: `handoffCreate` stamps `parentId`/`teamRole`/`memberTask`; broadcast members | pending | no | no |
-| 9 | Supervisor: `teamInfo()` derivation + emit `team.info` on session changes | pending | no | no |
-| 10 | Lead MCP tools: `propose_team_plan`/`create_member`/`list_members`/`integrate` + wire to lead sessions | pending | no | no |
-| 11 | Team-plan gate: card event + approve/reject commands + autonomy auto-approve | pending | no | no |
-| 12 | Integration: ordered merge in lead worktree → combined PR; `pr-per-member`; `needs-human` park | pending | no | no |
-| 13 | Budget + danger backstops for autonomous teams (spawn cap, budget pause) | pending | no | no |
-| 14 | Web: sidebar member tree under lead row (reuse `renderSessionItem`) | pending | no | no |
-| 15 | Web: lead rollup + member board + `team.info` event handling | pending | no | no |
-| 16 | Web smoke: nested-member render path in `headless-smoke.ts`; docs + phase table flip | pending | no | no |
+| 1 | Protocol: `parentId`/`teamRole`/`memberTask`/`TeamPolicy` on `Session` | done | yes | no |
+| 2 | Protocol: `TeamInfo` type + `team.*` events & commands + `ServerEvent`/command unions | done | yes | no |
+| 3 | Contract: regenerate golden, bump `PROTOCOL_VERSION`, test green | done | yes | no |
+| 4 | `team-tree.ts`: derive `TeamInfo` from sessions (pure) + unit test | done | yes | no |
+| 5 | `team-plan.ts`: parse lead's fenced-JSON plan + integration order from `dependsOn` (pure) + unit test | done | yes | no |
+| 6 | `team-gate.ts`: autonomy → auto-approve vs wait decision (pure) + unit test | done | yes | no |
+| 7 | `member-base.ts`: resolve a member's base ref off the lead (pure) + unit test | done | yes | no |
+| 8 | Supervisor: `handoffCreate` stamps `parentId`/`teamRole`/`memberTask`; broadcast members | done | yes | no |
+| 9 | Supervisor: `teamInfo()` derivation + emit `team.info` on session changes | done | yes | no |
+| 10 | Lead MCP tools: `propose_team_plan`/`create_member`/`list_members`/`integrate` + wire to lead sessions | done | yes | no |
+| 11 | Team-plan gate: card event + approve/reject commands + autonomy auto-approve | done | yes⁎ | no |
+| 12 | Integration: ordered merge in lead worktree → combined PR; `pr-per-member`; `needs-human` park | done | yes | no |
+| 13 | Budget + danger backstops for autonomous teams (spawn cap, budget pause) | done | yes | no |
+| 14 | Web: sidebar member tree under lead row (reuse `renderSessionItem`) | done | yes⁑ | no |
+| 15 | Web: lead rollup + member board + `team.info` event handling | done | yes⁑ | no |
+| 16 | Web smoke: nested-member render path in `headless-smoke.ts`; docs + phase table flip | done | yes⁑ | no |
 | 17 | **Agent-driven live browser verification** (drive a real browser against a running daemon) | pending | no | no |
 | 18 | **Manual browser acceptance** — user drives desktop + phone-over-Tailscale, signs off | pending | no | no |
 | 19 | Open the PR — gated on 17 + 18 green and all four CI gates green | pending | no | no |
+
+⁎ auto-spawn/spawn-on-approve are SDK-driven → verified live in T17. ⁑ web gates (`typecheck:web` +
+`build:web`) pass; the Chrome smoke seeds a team but only runs where headless Chrome is available
+(the user's Mac, T17/T18) — full visual acceptance is the T17/T18 gate.
+
+**Deviations from the plan (filled gaps, all committed):** (a) added optional `teamRole`/`team` to
+`SessionCreateCmd` + a "Team lead" toggle in the new-session dialog — the plan added the fields to
+`Session` but never specified how a lead is created; (b) the repo's documented
+`bun test/contract/regen-golden.ts` is broken under Bun 1.3.14 (it imports the test module, which runs
+`test()` at import) — the golden was regenerated via an equivalent standalone script; the regen tool
+itself is left as-is. (c) conflict handling is an idempotent resume (prompt lead → re-integrate skips
+already-merged members) rather than an in-call agent round-trip; no `needs-human` protocol field was
+added (the conflict surfaces via the lead's conversation + no PR).
 
 ---
 

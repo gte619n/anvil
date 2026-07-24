@@ -258,9 +258,19 @@ stay green.
 
 | Phase | Description | Status | Tested | Pushed |
 |-------|-------------|--------|--------|--------|
-| 1 | Protocol + data model: `parentId`/`teamRole`/`memberTask`/`TeamPolicy` on `Session`; `TeamInfo`; team events/commands; bump `PROTOCOL_VERSION` + golden | pending | no | no |
-| 2 | Daemon team lifecycle: `handoffCreate` stamps parent link + lead-branch base; `TeamInfo` derivation + rollup; member spawn cap; restart reconstitution | pending | no | no |
-| 3 | Lead orchestration: in-process MCP tools (`propose_team_plan`/`create_member`/`list_members`/`integrate`); team-plan card + gate on `AutonomyPolicy` | pending | no | no |
-| 4 | Integration: lead-driven ordered merge + conflict-as-agent-turn → combined PR; `pr-per-member` mode; `needs-human` parking | pending | no | no |
-| 5 | Web GUI: sidebar member tree, lead rollup, member board, member-as-active-session view | pending | no | no |
-| 6 | Budget/danger backstops for autonomous teams; docs | pending | no | no |
+| 1 | Protocol + data model: `parentId`/`teamRole`/`memberTask`/`TeamPolicy` on `Session`; `TeamInfo`; team events/commands; bump `PROTOCOL_VERSION` + golden | done | yes | no |
+| 2 | Daemon team lifecycle: `handoffCreate` stamps parent link + lead-branch base; `TeamInfo` derivation + rollup; member spawn cap; restart reconstitution | done | yes | no |
+| 3 | Lead orchestration: in-process MCP tools (`propose_team_plan`/`create_member`/`list_members`/`integrate`); team-plan card + gate on `AutonomyPolicy` | done | yes¹ | no |
+| 4 | Integration: lead-driven ordered merge + conflict-as-agent-turn → combined PR; `pr-per-member` mode; `needs-human` parking | done | yes² | no |
+| 5 | Web GUI: sidebar member tree, lead rollup, member board, member-as-active-session view | done | yes³ | no |
+| 6 | Budget/danger backstops for autonomous teams; docs | done | yes | no |
+
+¹ Unit + integration tests cover the tools, the gate decision, and the reject/policy paths; the
+  bypass **auto-spawn** and spawn-on-approve run real SDK drivers, so they're verified live (Phase 7,
+  plan T17). ² Merge/order/resume/conflict logic is unit-tested (fake git) and the combined-pr vs
+  pr-per-member merge is integration-tested against a real temp repo (push/PR faked). The
+  conflict-as-agent-turn is implemented as an idempotent, resumable prompt-then-re-integrate flow
+  (not an in-call recursion). ³ jsdom + a Chrome headless smoke (seeded lead+members) guard the
+  render path; full visual acceptance on desktop + phone-over-Tailscale is the Phase 7 user gate
+  (plan T17/T18). **A lead is created via a "Team lead" toggle in the new-session dialog** (a small
+  addition beyond the original design, which left lead-creation implicit).
