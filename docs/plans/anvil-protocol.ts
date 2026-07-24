@@ -46,7 +46,7 @@
 // 0. Primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
 /** ISO 8601 timestamp, always UTC, e.g. "2026-06-19T14:03:00.000Z". */
@@ -211,6 +211,11 @@ export interface Session {
   pending?: boolean; // client-only: created offline, not yet realized on the daemon (never set by the server)
   icon?: string; // Material Symbols name chosen by Sonnet from the session title (arch §5)
   environmentId?: string; // the Environment this session was created from, if any
+  // ── Teams (see docs/plans/anvil-team-support.md) ──────────────────────────
+  parentId?: SessionId; // present on a member; points at its lead session
+  teamRole?: "lead" | "member"; // absent on a plain (non-team) session
+  memberTask?: string; // the one-line task the lead assigned this member
+  team?: TeamPolicy; // set only on a lead: this team's integration/concurrency policy
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted
   finished?: boolean; // user-parked in the sidebar's "Finished" group (done, e.g. pending deploy)
   order?: number; // explicit sidebar sort position (lower = higher); unset sorts newest-on-top
@@ -236,6 +241,32 @@ export interface Session {
   // enriched with SKILL.md descriptions — drives the composer's `/` autocomplete. Populated once the
   // driver starts (absent until the first turn); rides session.updated/session.list. (§skills)
   commands?: CommandInfo[];
+}
+
+/** A team's policy. Lives on the lead `Session`; a team is otherwise derived from `parentId`. */
+export interface TeamPolicy {
+  integration: "combined-pr" | "pr-per-member"; // default "combined-pr"
+  maxConcurrentMembers: number; // spawn/concurrency cap (default 3)
+}
+
+/** A team, computed from the session list by grouping on `parentId`. Sent via `team.info`. */
+export interface TeamInfo {
+  leadId: SessionId;
+  policy: TeamPolicy;
+  members: TeamMemberInfo[];
+  rollup: { total: number; running: number; awaiting: number; done: number; error: number };
+}
+export interface TeamMemberInfo {
+  sessionId: SessionId;
+  task?: string;
+  status: SessionStatus;
+  git?: GitStatus; // reuse the existing per-session git projection
+}
+export type TeamPlanMember = { title: string; task: string; source: SessionSource; dependsOn?: string[] };
+export interface TeamPlan {
+  leadId: SessionId;
+  members: TeamPlanMember[];
+  integration: TeamPolicy["integration"];
 }
 
 /** One entry in a session's `/` autocomplete: an invocable slash-command or skill. `name` is the exact
@@ -389,6 +420,20 @@ export interface SessionUpdatedEvent extends Envelope {
 export interface SessionDeletedEvent extends Envelope {
   type: "session.deleted";
   sessionId: SessionId;
+}
+export interface TeamInfoEvent extends Envelope {
+  type: "team.info";
+  teams: TeamInfo[];
+}
+export interface TeamPlanEvent extends Envelope {
+  type: "team.plan";
+  sessionId: SessionId;
+  plan: TeamPlan;
+}
+export interface TeamPlanResolvedEvent extends Envelope {
+  type: "team.plan.resolved";
+  sessionId: SessionId;
+  approved: boolean;
 }
 export interface BudgetEvent extends Envelope {
   type: "budget";
@@ -819,6 +864,9 @@ export type ServerEvent =
   | SessionCreatedEvent
   | SessionUpdatedEvent
   | SessionDeletedEvent
+  | TeamInfoEvent
+  | TeamPlanEvent
+  | TeamPlanResolvedEvent
   | BudgetEvent
   | EnvironmentsEvent
   | PromptsEvent
@@ -889,6 +937,11 @@ export interface SessionCreateCmd extends Envelope, Correlated {
   model?: Model; // defaults to "opus"
   autonomy?: AutonomyPolicy; // defaults to "mostly-autonomous"
   adversarialReview?: boolean; // defaults to false (adversarial plan review; needs an OpenRouter key)
+  // ── Teams: create this session as a team lead (see docs/plans/anvil-team-support.md). A lead is an
+  //    ordinary session that also gets the lead orchestration MCP tools + an integration/concurrency
+  //    policy. Members are created via the lead's tools, not this command. ──
+  teamRole?: "lead"; // set to "lead" to make this a team lead; members are stamped by handoffCreate
+  team?: TeamPolicy; // the lead's integration/concurrency policy (defaults applied server-side)
 }
 /** Resume: replay events with seq > lastSeq, else server sends a snapshot (§6.4). */
 export interface SessionAttachCmd extends Envelope, Correlated {
@@ -949,6 +1002,20 @@ export interface SessionSetAdversarialReviewCmd extends Envelope, Correlated {
   type: "session.set_adversarial_review";
   sessionId: SessionId;
   enabled: boolean;
+}
+// ── Teams (see docs/plans/anvil-team-support.md) ──────────────────────────
+export interface TeamPlanApproveCmd extends Envelope, Correlated {
+  type: "team.plan.approve";
+  sessionId: SessionId;
+  plan: TeamPlan;
+}
+export interface TeamPlanRejectCmd extends Envelope, Correlated {
+  type: "team.plan.reject";
+  sessionId: SessionId;
+}
+export interface TeamIntegrateCmd extends Envelope, Correlated {
+  type: "team.integrate";
+  sessionId: SessionId;
 }
 
 // 5b. Conversation
@@ -1246,6 +1313,9 @@ export type ClientCommand =
   | SessionSetModelCmd
   | SessionSetAutonomyCmd
   | SessionSetAdversarialReviewCmd
+  | TeamPlanApproveCmd
+  | TeamPlanRejectCmd
+  | TeamIntegrateCmd
   | GitCmd
   // conversation
   | PromptSendCmd

@@ -1,5 +1,5 @@
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "wireTypes": [
     "ack",
     "assistant.delta",
@@ -94,6 +94,12 @@
     "session.unarchive",
     "session.updated",
     "status",
+    "team.info",
+    "team.integrate",
+    "team.plan",
+    "team.plan.approve",
+    "team.plan.reject",
+    "team.plan.resolved",
     "terminal.close",
     "terminal.data",
     "terminal.exit",

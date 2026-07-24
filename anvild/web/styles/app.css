@@ -147,6 +147,78 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
 .session .meta .msym { font-size: 13px; vertical-align: -2px; margin-right: 1px; }
+/* Teams (anvil-team-support.md §5): a lead row on top, its members as an indented tree BELOW it.
+   The `.session` li is display:flex, so a lead-with-members wraps and the member list takes a full
+   width row underneath (never beside the lead). */
+.session.has-members { flex-wrap: wrap; }
+/* full-width row below the lead; box-sizing + inner padding do the indent so it never overflows */
+.team-members { list-style: none; margin: 4px 0 2px; padding: 0 0 0 22px; box-sizing: border-box; flex: 0 0 100%; width: 100%; display: flex; flex-direction: column; gap: 4px; position: relative; }
+/* the vertical trunk of the tree, running down the left of the member column */
+.team-members::before {
+  content: ""; position: absolute; left: 10px; top: -2px; bottom: 12px; width: 2px;
+  background: color-mix(in srgb, var(--border) 90%, transparent); border-radius: 2px;
+}
+.team-members > .session.member { position: relative; }
+/* the horizontal elbow connecting the trunk to each member row */
+.team-members > .session.member::before {
+  content: ""; position: absolute; left: -12px; top: 50%; width: 12px; height: 2px;
+  background: color-mix(in srgb, var(--border) 90%, transparent);
+}
+.session.member .srow .title .t { font-weight: 400; }
+.session.member .srow { font-size: 0.94em; padding: 6px 8px; }
+.session.member .title .msym { font-size: 15px; }
+/* lead rollup chip: "3 · 2▶ · 1⏳" next to the lead's title */
+.team-rollup {
+  margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  color: var(--muted); background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  border: 1px solid var(--border); white-space: nowrap; vertical-align: 1px;
+}
+/* Lead member board (shown above the lead's conversation) + the plan-approval card.
+   Banded background + bottom divider so it reads as its own section, distinct from the conversation. */
+#team-board {
+  padding: 10px 14px; display: flex; flex-direction: column; gap: 8px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg));
+  border-bottom: 1px solid var(--border);
+}
+.team-board-head { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; }
+.team-board-head .msym { vertical-align: -3px; margin-right: 3px; }
+.tmb-collapse { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0; display: flex; align-items: center; }
+.tmb-collapse .msym { font-size: 20px; margin: 0; }
+.team-board-head:hover .tmb-collapse { color: var(--accent); }
+/* Bound the rows so a big team scrolls within the board instead of pushing the conversation away. */
+.tmb-rows { max-height: 38vh; overflow-y: auto; }
+.tpc-approve, .tpc-reject {
+  padding: 4px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg);
+  color: var(--text); font-weight: 600; cursor: pointer; font-size: 12px;
+}
+.tpc-approve:hover { border-color: var(--accent); color: var(--accent); }
+.tpc-reject:hover { border-color: #e0564f; color: #e0564f; }
+.tmb-rows { display: flex; flex-direction: column; gap: 3px; }
+.tmb-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px;
+  border: 1px solid var(--border); cursor: pointer;
+}
+.tmb-row:hover { border-color: var(--accent); }
+.tmb-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+.tmb-dot.running { background: #3b82f6; }
+.tmb-dot.awaiting { background: #eab308; }
+.tmb-dot.error { background: #e0564f; }
+.tmb-dot.idle { background: color-mix(in srgb, var(--muted) 60%, transparent); }
+.tmb-task { flex: 1 1 auto; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tmb-meta { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.tmb-pr { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); text-transform: uppercase; letter-spacing: 0.03em; }
+.tmb-pr.merged { color: #8957e5; border-color: #8957e5; }
+.tmb-pr.open { color: #3fb950; border-color: #3fb950; }
+.tmb-empty { font-size: 12px; color: var(--muted); padding: 4px 2px; }
+.team-plan-card { border: 1px solid var(--accent); border-radius: 12px; padding: 10px 12px; background: color-mix(in srgb, var(--accent) 7%, var(--bg)); }
+.tpc-head { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.tpc-head .msym { vertical-align: -3px; }
+.tpc-members { margin: 0 0 8px; padding-left: 20px; font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
+.tpc-dep { color: var(--muted); font-size: 11px; }
+.tpc-actions { display: flex; gap: 8px; }
+/* new-session: "team lead" toggle */
+.ns-lead-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 8px 0 2px; cursor: pointer; }
+.ns-lead-row input { width: auto; margin: 0; }
 /* Settings → Servers: add-a-server card, discovered rows */
 .add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }

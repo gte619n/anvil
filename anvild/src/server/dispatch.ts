@@ -147,6 +147,21 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "team.plan.approve":
+        deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan);
+        if (cid) send(ack(cid));
+        return;
+
+      case "team.plan.reject":
+        deps.supervisor.rejectTeamPlan(cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
+      case "team.integrate":
+        deps.supervisor.integrateTeam(cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.send": {
         // attach so this connection receives the streamed turn (arch §6.4)
         conn.attached.add(cmd.sessionId);
@@ -158,6 +173,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           text = `${ctx}\n\n${text}`;
         }
         deps.supervisor.prompt(cmd.sessionId, text, cmd.attachmentIds ?? []);
+        deps.supervisor.noteHumanPrompt(cmd.sessionId); // a human in the loop resets the team relay guard
         if (cid) send(ack(cid));
         return;
       }

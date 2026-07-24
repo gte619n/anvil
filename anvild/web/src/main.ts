@@ -62,6 +62,8 @@ import type {
   QuestionAnswer,
   ServerEvent,
   Session,
+  TeamInfo,
+  TeamPlan,
   TodoistProjectInfo,
 } from "../../protocol";
 import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
@@ -177,6 +179,10 @@ const envServer = new Map<string, string>(); // environmentId → server url (gr
 // up here with the other early-init routing state so a lower declaration can't TDZ-crash module init.
 const serverPlans = new Map<string, AutopilotPlanInfo[]>(); // server url → its pending plans
 const planServer = new Map<string, string>(); // workUnitId → server url (route refine/dismiss/start)
+// Team trees, derived on the daemon and tagged by server (anvil-team-support.md §5). Cached like
+// serverPlans so the sidebar rollup + the lead's member board stay live off `team.info`.
+const serverTeams = new Map<string, TeamInfo[]>(); // server url → its teams
+const pendingTeamPlans = new Map<string, TeamPlan>(); // lead sessionId → a plan awaiting approval
 (function hydrateRouting() {
   try {
     for (const [k, v] of JSON.parse(localStorage.getItem("anvil.sessionServer") ?? "[]") as [string, string][]) sessionServer.set(k, v);
@@ -251,6 +257,7 @@ function removeServer(url: string): void {
   for (const [sid, u] of [...sessionServer]) if (u === url) { sessionServer.delete(sid); sessions.delete(sid); }
   for (const [eid, u] of [...envServer]) if (u === url) { envServer.delete(eid); environments.delete(eid); }
   serverPlans.delete(url);
+  serverTeams.delete(url);
   for (const [pid, u] of [...planServer]) if (u === url) planServer.delete(pid);
   // Drop the removed server's autopilot state too, else a lingering `running: true` keeps the fleet-wide
   // spinner spinning for a server that no longer exists (and the user's "remove it" never clears it).
@@ -818,9 +825,32 @@ function onEvent(url: string, e: ServerEvent): void {
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
         updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
       }
+      // Teams: a member's status/git change refreshes the active lead's board (and the lead's own row).
+      if (activeId && (e.session.id === activeId || e.session.parentId === activeId)) {
+        const lead = sessions.get(activeId);
+        if (lead?.teamRole === "lead") renderTeamBoard(lead);
+      }
       return;
     case "session.deleted":
       purgeSessionLocally(e.sessionId);
+      return;
+    case "team.info":
+      // Derived team tree for this server (grouped by parentId on the daemon). Drives the sidebar
+      // rollup chip and the lead's member board; both also read live status off the session objects.
+      serverTeams.set(url, e.teams);
+      renderSessions();
+      if (activeId && sessions.get(activeId)?.teamRole === "lead") renderTeamBoard(sessions.get(activeId)!);
+      return;
+    case "team.plan":
+      // A lead proposed a decomposition that needs approval (non-bypass autonomy). Park it as a card.
+      pendingTeamPlans.set(e.sessionId, e.plan);
+      renderSessions();
+      if (e.sessionId === activeId) renderTeamBoard(sessions.get(activeId)!);
+      return;
+    case "team.plan.resolved":
+      pendingTeamPlans.delete(e.sessionId);
+      renderSessions();
+      if (e.sessionId === activeId) renderTeamBoard(sessions.get(activeId)!);
       return;
     case "server.hello": {
       // identify the server on this socket as soon as it opens (fleet §3/§6).
@@ -2107,18 +2137,148 @@ function renderSessions(): void {
   const rest = all.filter((s) => !s.isDefault);
   const anyFinished = rest.some((s) => s.finished);
 
+  // Teams: a member (parentId → a lead we know) is NOT rendered at the top level — it appears nested
+  // under its lead's row instead (anvil-team-support.md §5).
+  const isNestedMember = (s: Session): boolean => !!s.parentId && sessions.has(s.parentId);
+
   // One flat list across every server — no per-machine grouping. Sessions interleave by their
   // server-synced order; which machine a session lives on is shown subtly in its row meta when
   // there's more than one server. (fleet — anvil-multi-server.md §4)
-  for (const s of rest.sort(sortFn)) (s.finished ? finishedUl : activeUl).appendChild(renderSessionItem(s));
+  for (const s of rest.filter((s) => !isNestedMember(s)).sort(sortFn)) {
+    const li = renderSessionItem(s);
+    (s.finished ? finishedUl : activeUl).appendChild(li);
+    if (s.teamRole === "lead") {
+      const members = membersOfLead(s.id).sort(sortFn);
+      if (members.length) {
+        li.classList.add("has-members"); // stack the member list BELOW the lead row (not beside it)
+        const mul = document.createElement("ul");
+        mul.className = "team-members";
+        for (const m of members) mul.appendChild(renderSessionItem(m, true));
+        li.appendChild(mul);
+      }
+    }
+  }
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
 }
 
-function renderSessionItem(s: Session): HTMLLIElement {
+/** A lead's member sessions (nested under it in the sidebar), across all servers. */
+function membersOfLead(leadId: string): Session[] {
+  return [...sessions.values()].filter((s) => s.parentId === leadId);
+}
+
+/** Roll a lead's members up to counts for its sidebar chip — derived live from the member sessions
+ *  (kept in sync by session.updated), so it's correct even before the first `team.info`. */
+function leadRollup(leadId: string): { total: number; running: number; awaiting: number; done: number; error: number } {
+  const r = { total: 0, running: 0, awaiting: 0, done: 0, error: 0 };
+  for (const m of membersOfLead(leadId)) {
+    r.total++;
+    if (m.status === "thinking" || m.status === "running_tool") r.running++;
+    else if (m.status === "awaiting_permission" || m.status === "awaiting_question") r.awaiting++;
+    else if (m.status === "error") r.error++;
+    else if (m.status === "idle" || m.status === "exited") r.done++;
+  }
+  return r;
+}
+
+/** A compact "3 · 2▶ · 1⏳ · 1⚠" chip for a lead row; empty when the lead has no members yet. */
+function teamRollupChip(r: { total: number; running: number; awaiting: number; done: number; error: number }): string {
+  if (r.total === 0) return "";
+  const parts = [`${r.total}`];
+  if (r.running) parts.push(`${r.running}▶`);
+  if (r.awaiting) parts.push(`${r.awaiting}⏳`);
+  if (r.done) parts.push(`${r.done}✓`);
+  if (r.error) parts.push(`${r.error}⚠`);
+  const title = `${r.total} member(s): ${r.running} running, ${r.awaiting} need approval, ${r.done} done, ${r.error} error`;
+  return `<span class="team-rollup" title="${esc(title)}">${parts.join(" · ")}</span>`;
+}
+
+/** The lead's member board + plan-gate card, rendered above its conversation (anvil-team-support.md
+ *  §5). A member row deep-links to that member (selecting it makes its cards routable). Hidden unless
+ *  the active session is a lead. */
+function renderTeamBoard(lead: Session | undefined): void {
+  const el = document.getElementById("team-board");
+  if (!el) return;
+  if (!lead || lead.teamRole !== "lead" || lead.id !== activeId) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  const members = membersOfLead(lead.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const pending = pendingTeamPlans.get(lead.id);
+  const policy = lead.team?.integration ?? "combined-pr";
+
+  const planCard = pending
+    ? `<div class="team-plan-card">
+         <div class="tpc-head">${icon("groups")}<span>Proposed team plan · ${esc(pending.integration)}</span></div>
+         <ol class="tpc-members">${pending.members
+           .map((m) => `<li><b>${esc(m.title)}</b> — ${esc(m.task)}${m.dependsOn?.length ? ` <span class="tpc-dep">after ${esc(m.dependsOn.join(", "))}</span>` : ""}</li>`)
+           .join("")}</ol>
+         <div class="tpc-actions">
+           <button class="tpc-approve" data-lead="${esc(lead.id)}">Approve &amp; spawn</button>
+           <button class="tpc-reject" data-lead="${esc(lead.id)}">Reject</button>
+         </div>
+       </div>`
+    : "";
+
+  const rows = members
+    .map((m) => {
+      const dot = statusDotClass(m.status);
+      const git = m.git ? `${m.git.dirtyFileCount ? `${m.git.dirtyFileCount}●` : ""}${m.git.ahead ? ` ↑${m.git.ahead}` : ""}`.trim() : "";
+      const pr = m.git?.prState ? `<span class="tmb-pr ${esc(m.git.prState)}">${esc(m.git.prState)}</span>` : "";
+      return `<div class="tmb-row" data-id="${esc(m.id)}" role="button" tabindex="0">
+        <span class="tmb-dot ${dot}"></span>
+        <span class="tmb-task">${esc(m.memberTask ?? m.title)}</span>
+        <span class="tmb-meta">${esc(m.status)}${git ? ` · ${esc(git)}` : ""}</span>
+        ${pr}
+      </div>`;
+    })
+    .join("");
+
+  // Observational board only — integration + teardown are driven by the lead agent (via its
+  // integrate / dismiss_member tools), so there are no action buttons here. The user directs the
+  // lead conversationally ("integrate now", "dismiss the docs member").
+  // Collapsible so a big team (10+ members) doesn't take over the pane; the choice persists.
+  const collapsed = localStorage.getItem("anvil.teamBoardCollapsed") === "1";
+  el.innerHTML = `${planCard}
+    <div class="team-board-head">
+      <button class="tmb-collapse" title="${collapsed ? "Expand team" : "Collapse team"}">${icon(collapsed ? "chevron_right" : "expand_more")}</button>
+      <span class="tmb-title">${icon("groups")} Team · ${members.length} member(s) · ${esc(policy)}</span>
+    </div>
+    ${collapsed ? "" : `<div class="tmb-rows">${rows || `<div class="tmb-empty">No members yet.</div>`}</div>`}`;
+
+  // Collapse/expand the member list (persisted). Clicking anywhere on the header toggles it.
+  el.querySelector(".team-board-head")?.addEventListener("click", () => {
+    const now = localStorage.getItem("anvil.teamBoardCollapsed") === "1";
+    localStorage.setItem("anvil.teamBoardCollapsed", now ? "0" : "1");
+    renderTeamBoard(lead);
+  });
+  // Member rows deep-link to that member (its cards then route correctly as the active session).
+  el.querySelectorAll<HTMLElement>(".tmb-row").forEach((row) =>
+    row.addEventListener("click", () => { const id = row.dataset.id; if (id) selectSession(id); }),
+  );
+  // The plan-approval card keeps its Approve/Reject (that's the gate, not a team action).
+  el.querySelector(".tpc-approve")?.addEventListener("click", () => {
+    if (pending) sendTo(lead.id, { type: "team.plan.approve", sessionId: lead.id, plan: pending, cid: newCid() });
+  });
+  el.querySelector(".tpc-reject")?.addEventListener("click", () =>
+    sendTo(lead.id, { type: "team.plan.reject", sessionId: lead.id, cid: newCid() }),
+  );
+}
+
+/** Map a session status to a colored status-dot class for the member board. */
+function statusDotClass(status: Session["status"]): string {
+  if (status === "thinking" || status === "running_tool") return "running";
+  if (status === "awaiting_permission" || status === "awaiting_question") return "awaiting";
+  if (status === "error") return "error";
+  return "idle";
+}
+
+function renderSessionItem(s: Session, isMember = false): HTMLLIElement {
   const removing = removingSessions.has(s.id);
   const awaiting = !removing && !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
   const li = document.createElement("li");
-  li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}`;
+  li.className = `session${s.id === activeId ? " active" : ""}${s.archived ? " archived" : ""}${s.pending ? " pending" : ""}${awaiting ? " awaiting" : ""}${removing ? " removing" : ""}${isMember ? " member" : ""}`;
   li.dataset.id = s.id;
   if (s.environmentId && !removing) {
     const env = environments.get(s.environmentId);
@@ -2138,7 +2298,10 @@ function renderSessionItem(s: Session): HTMLLIElement {
   a.className = "srow";
   a.href = sessionHref(s.id);
   const merged = s.git?.prState === "merged" ? `<span class="merged-badge" title="PR merged">${icon("merge")}</span>` : "";
-  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}</div><div class="meta">${esc(where)} · ${tag} · ${esc(s.model)}${machine}</div>`;
+  const rollup = s.teamRole === "lead" ? teamRollupChip(leadRollup(s.id)) : "";
+  // A member row leads its meta with the task the lead assigned it (anvil-team-support.md §5).
+  const memberMeta = isMember && s.memberTask ? `${esc(s.memberTask)} · ` : "";
+  a.innerHTML = `<div class="title">${icon(removing ? "cleaning_services" : sessIcon(s))}<span class="t">${esc(s.title)}</span>${merged}${rollup}</div><div class="meta">${memberMeta}${esc(where)} · ${tag} · ${esc(s.model)}${machine}</div>`;
   a.addEventListener("click", (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
     e.preventDefault();
@@ -2209,7 +2372,8 @@ function initSortables(): void {
 /** Read both lists' DOM order → order + Finished membership, apply optimistically, sync to the daemon. */
 function commitOrderFromDom(): void {
   const ids = (sel: string): string[] =>
-    [...$(sel).querySelectorAll<HTMLElement>(".session")].map((el) => el.dataset.id).filter((x): x is string => !!x);
+    // `:scope > .session` = only the list's OWN rows, never a lead's nested member rows (teams §5).
+    [...$(sel).querySelectorAll<HTMLElement>(":scope > .session")].map((el) => el.dataset.id).filter((x): x is string => !!x);
   const active = ids("#session-list");
   const finished = ids("#finished-list");
   const order = [...active, ...finished];
@@ -2237,6 +2401,7 @@ function setHeaderTitle(s: Session | undefined): void {
   updateHeaderBranch(s);
   updateHeaderModel(s);
   updateContextMeter(s);
+  renderTeamBoard(s); // show the member board when a lead is active; hide it otherwise
   void setFavicon(s);
 }
 /** Show the active session's git branch as a chip in the header; tap it to open the Git panel. */
@@ -5753,6 +5918,7 @@ function showNewSession(): void {
       <p class="small warn-text" id="ns-warn"></p>
       ${AUTONOMY_PICKER}
       ${ADVERSARIAL_PICKER}
+      <label class="ns-lead-row" id="ns-lead-row"><input type="checkbox" id="ns-lead" /> <span>Team lead — fans the goal out to member sessions and integrates their branches</span></label>
       <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-create">Create</button></div>
       <p class="small muted"><a id="ns-manage" href="#">⚙ Manage environments…</a> · <a id="ns-oneoff" href="#">one-off folder…</a></p></div>`;
   }
@@ -5795,6 +5961,8 @@ function showNewSession(): void {
           : `Works directly in ${env.repoRoot} (no worktree).`;
     }
     if (warn) warn.textContent = dup ? `A session named “${name}” already exists in this environment.` : "";
+    const leadRow = document.getElementById("ns-lead-row");
+    if (leadRow) leadRow.hidden = !env?.isRepo; // a lead needs a worktree; hide for existing-dir envs
     createBtn.disabled = !env || !name || dup;
   };
   envSel?.addEventListener("change", validate);
@@ -5824,8 +5992,10 @@ function showNewSession(): void {
       adversarialReview: selectedAdversarial(),
     };
     const cid = newCid();
+    // Teams: a lead needs its own worktree/branch to merge members into, so it's a fresh-worktree option.
+    const asLead = env.isRepo && !!(document.getElementById("ns-lead") as HTMLInputElement | null)?.checked;
     const cmd = env.isRepo
-      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", cid, ...common }
+      ? { type: "session.create" as const, source: "fresh-worktree", repoRoot: env.repoRoot, base: env.defaultBase ?? "HEAD", cid, ...(asLead ? { teamRole: "lead" as const } : {}), ...common }
       : { type: "session.create" as const, source: "existing-dir", cwd: env.repoRoot, cid, ...common };
     const srv = serverOfEnv(env.id); // the session is created on the env's server
     if (srv.sock.isOpen()) {
