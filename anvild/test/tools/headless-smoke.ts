@@ -12,7 +12,8 @@ import { join } from "node:path";
 
 const DIST = join(import.meta.dir, "..", "..", "web", "dist");
 const ROOT = join(import.meta.dir, "..", "..", "web");
-const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+// macOS default; override with CHROME_BIN for Linux/CI (e.g. /usr/bin/google-chrome).
+const CHROME = process.env.CHROME_BIN || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 const TYPES: Record<string, string> = {
   ".html": "text/html",
@@ -110,9 +111,10 @@ ws.onopen = () => {
   send("Runtime.enable");
   send("Log.enable");
   send("Page.enable");
-  // Seed the team into localStorage on the current document, THEN reload so it hydrates + renders.
-  send("Runtime.evaluate", { expression: `localStorage.setItem('anvil.sessions', ${JSON.stringify(JSON.stringify(teamSeed))}); localStorage.setItem('anvil.active','lead1');` });
-  send("Page.reload", { ignoreCache: true }); // reload now that listeners are armed
+  // Seed the team into localStorage BEFORE the bundle runs on the reloaded document (its
+  // `hydrateOffline` IIFE reads `anvil.sessions` at import), so the reload renders the tree.
+  send("Page.addScriptToEvaluateOnNewDocument", { source: `try{localStorage.setItem('anvil.sessions', ${JSON.stringify(JSON.stringify(teamSeed))});localStorage.setItem('anvil.active','lead1');}catch(e){}` });
+  send("Page.reload", { ignoreCache: true }); // reload now that the seed-on-new-document is armed
 };
 ws.onmessage = (ev) => {
   const msg = JSON.parse(String(ev.data)) as { method?: string; params?: any };
