@@ -147,6 +147,21 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .card-main { display: flex; align-items: center; gap: 8px; }
 /* owning-machine tag shown inline in a session row's meta (flat list, multi-server only) */
 .session .meta .msym { font-size: 13px; vertical-align: -2px; margin-right: 1px; }
+/* Teams (anvil-team-support.md §5): members nest under their lead's row as an indented list. */
+.team-members { list-style: none; margin: 2px 0 4px; padding: 0; }
+.team-members > .session.member { margin-left: 14px; position: relative; }
+.team-members > .session.member::before {
+  content: ""; position: absolute; left: -8px; top: 0; bottom: 0; width: 2px;
+  background: color-mix(in srgb, var(--border) 80%, transparent); border-radius: 2px;
+}
+.session.member .srow .title .t { font-weight: 400; }
+.session.member .srow { font-size: 0.94em; }
+/* lead rollup chip: "3 · 2▶ · 1⏳" next to the lead's title */
+.team-rollup {
+  margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  color: var(--muted); background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  border: 1px solid var(--border); white-space: nowrap; vertical-align: 1px;
+}
 /* Settings → Servers: add-a-server card, discovered rows */
 .add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
