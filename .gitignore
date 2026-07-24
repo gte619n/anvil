@@ -32,3 +32,4 @@ __pycache__/
 
 # Firebase Hosting deploy cache (marketing site — website/)
 .firebase/
+docs/plans/assets/team-verify/
