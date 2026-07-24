@@ -26,6 +26,8 @@ export interface TeamToolDeps {
   listMembers(): TeamInfo | null;
   /** Integrate member branches per the team's policy (combined-pr / pr-per-member). Returns a summary. */
   integrate(): string;
+  /** Tear a member down: stop it and remove its worktree + branch + state. Returns a summary. */
+  dismissMember(sessionId: string): string;
 }
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -34,7 +36,7 @@ const fail = (text: string) => ({ content: [{ type: "text" as const, text }], is
 export const TEAM_MCP_SERVER_NAME = "anvil_team";
 
 /** Tool ids as the SDK exposes them (`mcp__<server>__<tool>`), for the driver allowlist. */
-export const TEAM_TOOL_IDS = ["propose_team_plan", "create_member", "list_members", "integrate"].map(
+export const TEAM_TOOL_IDS = ["propose_team_plan", "create_member", "list_members", "integrate", "dismiss_member"].map(
   (t) => `mcp__${TEAM_MCP_SERVER_NAME}__${t}`,
 );
 
@@ -126,6 +128,20 @@ export function teamTools(deps: TeamToolDeps): SdkMcpToolDefinition<any>[] {
         async () => {
           try {
             return ok(deps.integrate());
+          } catch (e) {
+            return fail(e instanceof Error ? e.message : String(e));
+          }
+        },
+      ),
+      tool(
+        "dismiss_member",
+        "Tear a member down when its work is done or unwanted: stops the member and removes its worktree, " +
+          "branch, and state. Only members of YOUR team can be dismissed. Use after integrate, or to drop a " +
+          "member you no longer need. This is destructive — the member's uncommitted work is discarded.",
+        { sessionId: z.string().describe("The member session id to dismiss (from list_members).") },
+        async ({ sessionId }) => {
+          try {
+            return ok(deps.dismissMember(sessionId));
           } catch (e) {
             return fail(e instanceof Error ? e.message : String(e));
           }

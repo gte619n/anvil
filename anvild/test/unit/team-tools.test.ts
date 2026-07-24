@@ -3,13 +3,14 @@ import { teamTools, TEAM_TOOL_IDS, type TeamToolDeps } from "../../src/agent/tea
 import type { TeamInfo, TeamPlanMember } from "@protocol";
 
 function stub(over: Partial<TeamToolDeps> = {}): { deps: TeamToolDeps; calls: any } {
-  const calls: any = { proposed: null as null | { members: TeamPlanMember[]; integration: string }, created: [] as any[], integrated: 0 };
+  const calls: any = { proposed: null as null | { members: TeamPlanMember[]; integration: string }, created: [] as any[], integrated: 0, dismissed: [] as string[] };
   const deps: TeamToolDeps = {
     leadId: "lead",
     proposePlan: (members, integration) => { calls.proposed = { members, integration }; return `proposed ${members.length}`; },
     createMember: (a) => { calls.created.push(a); return { id: "sess_m", title: a.title, cwd: "/w/m" }; },
     listMembers: () => ({ leadId: "lead", policy: { integration: "combined-pr", maxConcurrentMembers: 3 }, members: [], rollup: { total: 0, running: 0, awaiting: 0, done: 0, error: 0 } } as TeamInfo),
     integrate: () => { calls.integrated++; return "integrated"; },
+    dismissMember: (sid) => { calls.dismissed.push(sid); return `dismissed ${sid}`; },
     ...over,
   };
   return { deps, calls };
@@ -18,13 +19,21 @@ function stub(over: Partial<TeamToolDeps> = {}): { deps: TeamToolDeps; calls: an
 const byName = (deps: TeamToolDeps) => new Map(teamTools(deps).map((t) => [t.name, t]));
 const text = (r: any) => r.content[0].text as string;
 
-test("TEAM_TOOL_IDS are the four namespaced lead tools", () => {
+test("TEAM_TOOL_IDS are the namespaced lead tools", () => {
   expect(TEAM_TOOL_IDS).toEqual([
     "mcp__anvil_team__propose_team_plan",
     "mcp__anvil_team__create_member",
     "mcp__anvil_team__list_members",
     "mcp__anvil_team__integrate",
+    "mcp__anvil_team__dismiss_member",
   ]);
+});
+
+test("dismiss_member forwards the session id to the teardown dep", async () => {
+  const { deps, calls } = stub();
+  const r = await byName(deps).get("dismiss_member")!.handler({ sessionId: "sess_m1" }, {});
+  expect(calls.dismissed).toEqual(["sess_m1"]);
+  expect(text(r)).toContain("sess_m1");
 });
 
 test("create_member forwards args to deps and confirms the spawn", async () => {

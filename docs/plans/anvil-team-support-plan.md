@@ -47,6 +47,17 @@ itself is left as-is. (c) conflict handling is an idempotent resume (prompt lead
 already-merged members) rather than an in-call agent round-trip; no `needs-human` protocol field was
 added (the conflict surfaces via the lead's conversation + no PR).
 
+**Live-verification findings + fixes (agent-driven run, 2026-07-24):** driving a real browser against
+a running daemon surfaced three issues, all fixed: (d) the sidebar team **rendered side-by-side**
+(lead squished left, members overflowing right) because the nested member `<ul>` landed inside the
+lead's flex row — now a proper top-down indented tree (trunk + elbow connectors). (e) a **member spawn
+failure was swallowed** (only a daemon-log line) and `propose_team_plan` counted attempts not
+successes — the common trigger is a branch-name collision (two teams in one repo → same member title →
+same branch slug → `git worktree add` fails); now each failure emits an error on the lead's
+conversation (design §7) and the count reflects real successes. (f) **no team teardown existed** — added
+a `dismiss_member` lead MCP tool + per-member ✕ and "Disband" buttons on the member board (members are
+sessions, so this reuses the standard kill/worktree-teardown path; the lead session stays).
+
 ---
 
 ## Phase 1 — Protocol & data model

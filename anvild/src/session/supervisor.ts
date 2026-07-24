@@ -787,7 +787,18 @@ export class Supervisor {
       createMember: (a) => this.teamCreateMember(leadId, a),
       listMembers: () => this.teamListMembers(leadId),
       integrate: () => this.integrateTeam(leadId),
+      dismissMember: (sid) => this.teamDismissMember(leadId, sid),
     });
+  }
+
+  /** Dismiss (tear down) a member of this lead: reuse the standard session teardown (kill worktree +
+   *  branch + state). Guarded so a lead can only dismiss its OWN members. */
+  private teamDismissMember(leadId: string, memberId: string): string {
+    const member = this.sessions.get(memberId);
+    if (!member || member.data.parentId !== leadId) throw new BadCommand(`not a member of this team: ${memberId}`);
+    const title = member.data.title;
+    void this.kill(memberId); // async teardown; broadcasts session.deleted + team.info
+    return `Dismissed member "${title}" (${memberId}); its worktree and branch are being removed.`;
   }
 
   /** The lead proposed a decomposition. At `bypass` autonomy it auto-approves and spawns; otherwise it
