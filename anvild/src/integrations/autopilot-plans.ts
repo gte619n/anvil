@@ -15,9 +15,12 @@ export function selectPendingPlans(units: WorkUnit[]): WorkUnit[] {
   return units.filter(
     (u) =>
       (u.status === "planned" && !u.sessionId) ||
-      // Held-for-clarification units live on the grid too, so the reviewer can read the open
-      // questions and answer them (via refine, which promotes the unit back to `planned`) or dismiss.
+      // Held-for-clarification units live on the grid too, so the reviewer can read the open questions
+      // and answer them (by opening a planning session, which promotes the unit back to `planned`) or dismiss.
       (u.status === "needs-clarification" && !u.sessionId) ||
+      // A unit with a live planning session ("Plan with Claude") stays on the grid — its card shows a
+      // jump-link into that session — until the session saves the settled plan or it's built/dismissed.
+      u.status === "planning" ||
       // Keep pipeline-completed units on the grid so their trace + PR stay reviewable until the
       // operator resolves them. Only pipeline-run units gain this visibility — a normal
       // planned→built unit has no devPipeline.
@@ -72,6 +75,7 @@ export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, ren
     status: u.status,
     ...(u.source ? { source: u.source } : {}),
     ...(u.effort ? { effort: u.effort } : {}),
+    ...(u.sessionId ? { sessionId: u.sessionId } : {}),
     taskCount: u.taskIds.length,
     ...(u.plan ? { plan: renderer.render(u.plan) } : {}),
     ...(u.devPipeline ? { pipeline: toPipelineTraceInfo(u.devPipeline) } : {}),
@@ -85,4 +89,36 @@ export function buildAutopilotBrief(u: WorkUnit): string {
   const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
   const body = u.plan ? `\n\nHere is the plan to implement:\n\n${u.plan}` : "";
   return `${head}${body}\n\nImplement it end to end in this worktree, then summarize what you changed.`;
+}
+
+/**
+ * The opening brief handed to an interactive "Plan with Claude" planning session (replaces the old
+ * refine chat). Unlike a build brief, this hands over the FULL context — the live Todoist prompt, the
+ * design worked out so far, and any open questions the planner held on — and asks the session to settle
+ * the plan WITH the user before writing code. A held unit's `plan` field is its open questions, so it's
+ * framed as questions to answer; otherwise it's the design so far. `todoistPrompt` is best-effort: an
+ * empty string (Todoist unreachable) just drops that section, the plan still carries the intent.
+ */
+export function buildPlanningBrief(u: WorkUnit, todoistPrompt: string): string {
+  const held = u.status === "needs-clarification";
+  const parts: string[] = [
+    `You are planning the autopilot work unit “${u.title}” with the user, in this worktree.${u.rationale ? `\n\n${u.rationale}` : ""}`,
+  ];
+  if (todoistPrompt.trim()) {
+    parts.push(`## The original request (from Todoist)\n\n${todoistPrompt.trim()}`);
+  }
+  if (u.plan?.trim()) {
+    parts.push(held ? `## Open questions to resolve first\n\n${u.plan.trim()}` : `## The design worked out so far\n\n${u.plan.trim()}`);
+  }
+  parts.push(
+    [
+      "## How to work",
+      held
+        ? "- This unit was held because it's underspecified. Start by asking the user the open questions above (use AskUserQuestion) — do not guess. Explore the repo read-only to inform the questions."
+        : "- Review the design against the request and the actual repo. Raise anything unclear or risky with the user before building (use AskUserQuestion) — do not silently diverge from the request.",
+      "- Once you and the user agree on the plan, call the `save_plan` tool (with `ready: true`) to store the settled plan back on the work unit. This un-holds the card so it's buildable, and posts the plan to Todoist.",
+      "- Then, when the user is ready, either implement it here yourself, or call the `run_pipeline` tool to hand the settled plan to the autonomous review→development→testing pipeline (it builds in a fresh worktree and opens a PR).",
+    ].join("\n"),
+  );
+  return parts.join("\n\n");
 }

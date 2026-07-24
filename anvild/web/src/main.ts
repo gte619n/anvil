@@ -192,7 +192,7 @@ const envServer = new Map<string, string>(); // environmentId → server url (gr
 // Autopilot pending plans, tagged by the server they arrived from (anvil-autopilot-ui.md). Declared
 // up here with the other early-init routing state so a lower declaration can't TDZ-crash module init.
 const serverPlans = new Map<string, AutopilotPlanInfo[]>(); // server url → its pending plans
-const planServer = new Map<string, string>(); // workUnitId → server url (route refine/dismiss/start)
+const planServer = new Map<string, string>(); // workUnitId → server url (route plan.session/dismiss/start)
 // Team trees, derived on the daemon and tagged by server (anvil-team-support.md §5). Cached like
 // serverPlans so the sidebar rollup + the lead's member board stay live off `team.info`.
 const serverTeams = new Map<string, TeamInfo[]>(); // server url → its teams
@@ -942,9 +942,9 @@ function onEvent(url: string, e: ServerEvent): void {
       onAutopilotPlans(url, e.plans);
       return;
     case "autopilot.plan":
-      return; // resolved via cidWaiter (refinePlan); the matching autopilot.plans broadcast refreshes state
+      return; // resolved via cidWaiter (reassignPlan); the matching autopilot.plans broadcast refreshes state
     case "autopilot.started":
-      return; // resolved via cidWaiter (startPlan)
+      return; // resolved via cidWaiter (startPlan / openPlanningSession)
     case "autopilot.run.result":
       return; // resolved via cidWaiter (runAutopilot)
     case "autopilot.pipeline.result":
@@ -3431,7 +3431,7 @@ function onAutopilotPlans(url: string, plans: AutopilotPlanInfo[]): void {
   tryOpenPendingPlan(); // a deep-linked plan may have just arrived
   if (!document.querySelector(".autopilot-view")) return;
   // A reader open on a plan that just vanished (dismissed/started elsewhere) falls back to the grid;
-  // otherwise leave an open reader untouched (refine updates it in place) and only re-flow the grid.
+  // otherwise leave an open reader untouched and only re-flow the grid.
   if (openPlanId) {
     if (!findPlan(openPlanId)) backToGrid(); // the open plan vanished (dismissed/started) → unwind to the grid
   } else {
@@ -3677,24 +3677,7 @@ function backToGrid(): void {
   else renderAutopilotGrid();
 }
 
-// Keep the floating Refine window clear of the on-screen keyboard. interactive-widget=resizes-content
-// handles this on Android (the layout viewport shrinks, so a bottom-anchored fixed element rides up),
-// but iOS/PWA overlay the keyboard without resizing — there `window.innerHeight` stays full while
-// `visualViewport.height` shrinks, and that gap is the keyboard's height. Lift the window by it so the
-// input never ends up buried. No-op (inset 0) when the keyboard is closed or interactive-widget applies.
-function positionRefineWindow(): void {
-  const win = document.getElementById("plan-refine");
-  const fab = document.getElementById("plan-refine-toggle");
-  if (!win && !fab) return;
-  const vv = window.visualViewport;
-  const inset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  if (win?.classList.contains("open")) (win as HTMLElement).style.bottom = `${inset + 16}px`;
-  if (fab) (fab as HTMLElement).style.bottom = `${inset + 16}px`;
-}
-window.visualViewport?.addEventListener("resize", positionRefineWindow);
-window.visualViewport?.addEventListener("scroll", positionRefineWindow);
-
-/** The full-plan reader + refine chat + Dismiss/Go, rendered in place of the grid (same overlay). */
+/** The full-plan reader + actions (Plan with Claude / Start / Pipeline / Dismiss …), rendered in place of the grid (same overlay). */
 /** Render the autonomous-dev-pipeline trace (§7) as a card above the plan doc in the reader. */
 function renderPipelineTrace(t: PipelineTraceInfo): string {
   const cls = t.status === "shipped" ? "ok" : t.status === "operator_required" ? "warn" : "danger";
@@ -3735,134 +3718,106 @@ function openPlan(id: string): void {
   openPlanId = id;
   const env = p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined);
   // A held (needs-clarification) unit can't be built until its questions are answered: its "plan" is just
-  // the open questions. Disable Start / hide Pipeline and point the reviewer at Refine instead.
+  // the open questions. Disable Start / hide Pipeline and steer the reviewer to "Plan with Claude".
   const held = p.status === "needs-clarification";
-  host.innerHTML = `<div class="plan-reader" data-id="${esc(id)}">
-    <div class="plan-reader-head">
-      <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
-      <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
-      <span class="plan-reader-actions">
-        <button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
+  // A unit with a live "Plan with Claude" session is owned by that session — Start/Plan/Pipeline would all
+  // just error ("already has a live session"). Swap the whole action set for a jump-into-the-session button.
+  const planning = p.status === "planning";
+  const actions = planning
+    ? `<button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
+        <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
+        <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
+        <button class="primary" id="plan-open-session"${p.sessionId ? "" : " disabled title=\"Its planning session is no longer available\""}>${icon("open_in_new")} Open session</button>`
+    : `<button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
         <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign</button>
         <button class="mini" id="plan-link">${icon("link")} Link</button>
         <button class="mini" id="plan-pipeline" title="Run the autonomous multi-model pipeline (Claude + GLM) end to end"${held ? " hidden" : ""}>${icon("hub")} Pipeline</button>
-        <button class="primary" id="plan-start"${held ? ` disabled title="Answer the open questions (Refine) to unblock"` : ""}>${held ? `${icon("lock")} Needs answers` : `${icon("rocket_launch")} Start`}</button>
-      </span>
+        <button class="${held ? "primary" : "mini"}" id="plan-plan" title="Open an interactive session seeded with the request, the design so far, and any open questions — work the plan out with Claude, then build">${icon("auto_awesome")} Plan with Claude</button>
+        <button class="${held ? "mini" : "primary"}" id="plan-start"${held ? ` disabled title="Answer the open questions first — use Plan with Claude"` : ""}>${held ? `${icon("lock")} Needs answers` : `${icon("rocket_launch")} Start`}</button>`;
+  host.innerHTML = `<div class="plan-reader" data-id="${esc(id)}">
+    <div class="plan-reader-head">
+      <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
+      <span class="plan-reader-title">${esc(p.title)}${env ? ` <span class="small muted">· ${esc(env)}</span>` : ""}</span>
+      <span class="plan-reader-actions">${actions}</span>
     </div>
     <div class="plan-reader-body">
+      ${planning ? `<p class="small muted">${icon("auto_awesome")} This plan is being worked out in a live planning session. Open it to continue, answer questions, and build.</p>` : ""}
       ${p.pipeline ? renderPipelineTrace(p.pipeline) : ""}
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
     </div>
-    <div class="plan-refine-backdrop" id="plan-refine-backdrop" hidden></div>
-    <aside class="plan-refine plan-refine-drawer" id="plan-refine" aria-hidden="true">
-      <div class="plan-refine-head">
-        <h4>${icon("auto_awesome")} Refine with Claude</h4>
-        <button class="icon-btn" id="plan-refine-close" title="Close">${icon("close")}</button>
-      </div>
-      <p class="small muted">Suggest a change; Claude rewrites the plan and saves it back to Todoist.</p>
-      <div id="plan-refine-log" class="plan-refine-log"></div>
-      <form id="plan-refine-form" class="plan-refine-form">
-        <textarea id="plan-refine-input" rows="2" placeholder="e.g. also cover the offline case, and keep the existing API"></textarea>
-        <button type="submit" class="primary" id="plan-refine-send" title="Send">${icon("send")}</button>
-      </form>
-    </aside>
-    <button class="plan-refine-fab" id="plan-refine-toggle" aria-pressed="false" title="Refine with Claude">${icon("auto_awesome")} Refine</button>
   </div>`;
   // The reader is its own back-stack layer (no hash of its own — it lives inside the autopilot
   // overlay's #autopilot URL): device/browser Back pops just this layer back to the grid instead of
   // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
   openOverlay("plan", () => renderAutopilotGrid());
-  // The refine conversation is a dismissible side drawer (Option A): the plan reads full-width and the
-  // chat slides in over the right edge on demand, so investigating a plan never squeezes the document.
-  const refineDrawer = $("#plan-refine");
-  const refineBackdrop = $("#plan-refine-backdrop");
-  const refineToggle = $("#plan-refine-toggle");
-  const setRefineOpen = (open: boolean): void => {
-    refineDrawer.classList.toggle("open", open);
-    refineDrawer.setAttribute("aria-hidden", open ? "false" : "true");
-    refineToggle.setAttribute("aria-pressed", open ? "true" : "false");
-    refineToggle.hidden = open; // the window takes over the corner — hide the FAB behind it
-    refineBackdrop.hidden = !open;
-    positionRefineWindow(); // sit the window (and FAB) above the keyboard before it animates in
-    // preventScroll: focusing the textarea otherwise makes the browser scroll the plan body to reveal
-    // it, snapping the document to the bottom every time the window opens.
-    if (open) ($("#plan-refine-input") as HTMLTextAreaElement).focus({ preventScroll: true });
-  };
-  refineToggle.addEventListener("click", () => setRefineOpen(!refineDrawer.classList.contains("open")));
-  $("#plan-refine-close").addEventListener("click", () => setRefineOpen(false));
-  refineBackdrop.addEventListener("click", () => setRefineOpen(false));
   $("#plan-back").addEventListener("click", () => backToGrid());
   $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
   $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
   $("#plan-dismiss").addEventListener("click", () => void dismissPlan(id));
-  $("#plan-reassign").addEventListener("click", () => void reassignPlan(id));
-  $("#plan-link").addEventListener("click", () => void linkPlanToSession(id));
-  $("#plan-start").addEventListener("click", () => void startPlan(id));
-  $("#plan-pipeline").addEventListener("click", () => void startDevPipeline(id));
-  $("#plan-refine-form").addEventListener("submit", (e) => {
-    e.preventDefault();
-    void refinePlan(id);
-  });
-  // Enter sends, Shift+Enter newlines — same as the main composer, so the chat actually submits
-  // (a bare textarea swallows Enter as a newline, which read as "refine does nothing").
-  $<HTMLTextAreaElement>("#plan-refine-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      $<HTMLFormElement>("#plan-refine-form").requestSubmit();
-    }
-  });
+  if (planning) {
+    $("#plan-open-session").addEventListener("click", () => {
+      if (!p.sessionId) return;
+      dismissOverlay("autopilot");
+      selectSession(p.sessionId);
+    });
+  } else {
+    $("#plan-reassign").addEventListener("click", () => void reassignPlan(id));
+    $("#plan-link").addEventListener("click", () => void linkPlanToSession(id));
+    $("#plan-start").addEventListener("click", () => void startPlan(id));
+    $("#plan-pipeline").addEventListener("click", () => void startDevPipeline(id));
+    $("#plan-plan").addEventListener("click", () => void openPlanningSession(id));
+  }
   // A fresh plan reads from the top, not wherever the grid (or a prior plan) was scrolled to.
   if (body) body.scrollTop = 0;
   document.querySelector(".plan-reader-body")?.scrollTo(0, 0);
 }
 
-/** The server that owns a plan (refine/dismiss/start route there), or undefined if offline/unknown.
+/** The server that owns a plan (plan.session/dismiss/start route there), or undefined if offline/unknown.
  *  Uses {@link serverByUrl} (not a raw `servers.get`) so a plan tagged to a member whose url has drifted
  *  scheme/slash still routes to the connected owner instead of falsely reporting "server offline". */
 function planSock(id: string): Server | undefined {
   return serverByUrl(planServer.get(id));
 }
 
-async function refinePlan(id: string): Promise<void> {
-  const input = $<HTMLTextAreaElement>("#plan-refine-input");
-  const feedback = input.value.trim();
-  if (!feedback) return;
+/** "Plan with Claude": open an interactive session seeded with the Todoist prompt, the design so far,
+ *  and any open questions — the replacement for the old refine chat. Claude works the plan out with the
+ *  user (and can build or hand off to the pipeline from there). Jumps into the new session, like Go. */
+async function openPlanningSession(id: string): Promise<void> {
   const srv = planSock(id);
   if (!srv?.sock.isOpen()) {
     toast("That plan's server is offline");
     return;
   }
-  const log = $("#plan-refine-log");
-  log.insertAdjacentHTML("beforeend", `<div class="rf-msg rf-you">${esc(feedback)}</div>`);
-  const pending = document.createElement("div");
-  pending.className = "rf-msg rf-claude rf-pending";
-  pending.innerHTML = `<span class="dots"><i></i><i></i><i></i></span> Refining…`;
-  log.appendChild(pending);
-  log.scrollTop = log.scrollHeight;
-  input.value = "";
-  const send = $<HTMLButtonElement>("#plan-refine-send");
-  send.disabled = true;
+  const btn = document.getElementById("plan-plan") as HTMLButtonElement | null;
+  const reset = (): void => {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `${icon("auto_awesome")} Plan with Claude`;
+    }
+  };
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `${icon("hourglass_empty")} Opening…`;
+  }
   try {
-    // Refine runs a fresh read-only Opus pass over the repo — that can take minutes, so allow the same
-    // generous budget as a full autopilot run rather than the old 3-min cap (which timed out mid-think).
-    const res = await sendAwait(srv, { type: "autopilot.refine", workUnitId: id, feedback, cid: newCid() }, 600_000);
+    const res = await sendAwait(srv, { type: "autopilot.plan.session", workUnitId: id, cid: newCid() }, 60_000);
     if (res.type === "command.error") {
-      pending.className = "rf-msg rf-claude rf-err";
-      pending.textContent = res.message;
+      toast(res.message);
+      reset();
       return;
     }
-    if (res.type !== "autopilot.plan") return;
-    pending.className = "rf-msg rf-claude";
-    pending.textContent = "Updated the plan.";
-    const doc = document.getElementById("plan-doc");
-    if (doc && res.plan.plan) doc.innerHTML = res.plan.plan.html;
+    if (res.type !== "autopilot.started") {
+      reset();
+      return;
+    }
+    // The session.created broadcast arrives before this reply, so the session is already registered.
+    dismissOverlay("autopilot");
+    selectSession(res.sessionId);
   } catch (err) {
-    pending.className = "rf-msg rf-claude rf-err";
-    pending.textContent = `Refine failed: ${err instanceof Error ? err.message : String(err)}`;
-  } finally {
-    if (document.getElementById("plan-refine-send")) send.disabled = false;
+    toast(`Couldn't open a planning session: ${err instanceof Error ? err.message : String(err)}`);
+    reset();
   }
 }
 
@@ -4052,8 +4007,8 @@ async function reassignPlan(id: string): Promise<void> {
   }
   doc?.classList.add("dim");
   try {
-    // A reassign re-plans the unit against the new repo (read-only Opus) — allow the same generous
-    // budget as refine rather than the default short cap.
+    // A reassign re-plans the unit against the new repo (read-only Opus) — allow a generous budget
+    // (a full planning pass over the repo) rather than the default short cap.
     const res = await sendAwait(srv, { type: "autopilot.reassign", workUnitId: id, environmentId: envId, cid: newCid() }, 600_000);
     if (res.type === "command.error") {
       toast(res.message);

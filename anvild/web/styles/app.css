@@ -904,6 +904,7 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .ap-chip .msym { font-size: 13px; }
 .ap-chip.status-planned { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
 .ap-chip.status-needs-clarification { color: #e8730c; border-color: #e8730c66; }
+.ap-chip.status-planning { color: #2196c9; border-color: #2196c966; }
 .ap-chip.status-building { color: #f2c037; border-color: #f2c03766; }
 .ap-chip.status-review { color: #21ba45; border-color: #21ba4566; }
 .ap-chip.status-blocked, .ap-chip.status-dismissed { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
@@ -915,53 +916,15 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .ap-chip.eff-m { color: #f2c037; }
 .ap-chip.eff-l, .ap-chip.eff-xl { color: #e8703a; }
 
-/* Plan reader + refine chat. The plan reads full-width; the refine conversation is a slide-over drawer
-   (Option A), so `position: relative` anchors that drawer and `overflow: hidden` clips it off-screen
-   when closed (the body owns the vertical scroll, so this never clips the document). */
+/* Plan reader. The plan reads full-width; `position: relative` anchors the pipeline-trace card and
+   `overflow: hidden` clips nothing here (the body owns the vertical scroll). */
 .plan-reader { display: flex; flex-direction: column; height: 100%; position: relative; overflow: hidden; }
 .plan-reader-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .plan-reader-title { font-weight: 700; font-size: 15px; flex: 1; min-width: 140px; }
 .plan-reader-actions { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .plan-reader-body { flex: 1; min-height: 0; overflow: auto; }
 .plan-doc { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 16px 20px; max-width: 980px; margin: 0 auto; }
-.plan-refine { border: 1px solid var(--border); border-radius: 12px; background: var(--bg); padding: 14px; position: sticky; top: 0; }
-/* Refine window: a floating panel anchored to the viewport's bottom-right corner. It fades/scales in
-   over the plan (which stays fully visible and keeps its scroll position) rather than sliding in from the
-   edge; dismissible via its close button, the Refine toggle, or a click outside (the backdrop).
-   `position: fixed` (not absolute) so its bottom tracks the visual viewport — `positionRefineWindow()`
-   lifts it above the on-screen keyboard, which would otherwise bury it on iOS/PWA. `bottom` is set
-   inline from JS; the 16px here is the keyboard-closed fallback. max-height in dvh keeps it on-screen. */
-.plan-refine-drawer { position: fixed; top: auto; left: auto; right: 16px; bottom: 16px; width: 380px; max-width: calc(100% - 32px); max-height: min(72dvh, 560px); margin: 0; border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 14px 44px rgba(0, 0, 0, 0.32); display: flex; flex-direction: column; opacity: 0; transform: translateY(10px) scale(0.98); transform-origin: bottom right; pointer-events: none; transition: opacity 0.16s ease, transform 0.16s ease; z-index: 8; }
-.plan-refine-drawer.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
-.plan-refine-head { display: flex; align-items: center; gap: 8px; }
-.plan-refine-head h4 { margin: 0; flex: 1; }
-.plan-refine-drawer .plan-refine-log { flex: 1; max-height: none; }
-/* Transparent click-catcher: closes the window on an outside click while leaving the plan visible
-   underneath (no dim), so refining reads as a floating window over the document, not a modal. */
-.plan-refine-backdrop { position: absolute; inset: 0; background: transparent; z-index: 7; }
-.plan-refine-backdrop[hidden] { display: none; }
-/* Refine FAB: a floating action button pinned to the viewport's bottom-right. `position: fixed` keeps it
-   put while the plan scrolls; `bottom` is set inline by positionRefineWindow() so it rides above the
-   on-screen keyboard (16px fallback when closed). It hides while the Refine window owns that corner. */
-.plan-refine-fab { position: fixed; right: 16px; bottom: 16px; z-index: 9; display: inline-flex; align-items: center; gap: 6px; padding: 11px 16px; border: 1px solid var(--accent); border-radius: 999px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; font-size: 13px; cursor: pointer; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28); }
-.plan-refine-fab .msym { font-size: 18px; }
-/* display:inline-flex outranks the [hidden] UA rule — re-hide explicitly so the FAB disappears behind the open window. */
-.plan-refine-fab[hidden] { display: none; }
 .autopilot-view .mini[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-.plan-refine h4 { margin: 0 0 4px; display: flex; align-items: center; gap: 6px; font-size: 14px; }
-.plan-refine h4 .msym { font-size: 18px; color: var(--accent); }
-.plan-refine-log { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; max-height: 40vh; overflow: auto; }
-.rf-msg { font-size: 12.5px; line-height: 1.45; padding: 8px 11px; border-radius: 10px; word-break: break-word; }
-.rf-you { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; max-width: 90%; }
-.rf-claude { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); color: var(--muted); border-bottom-left-radius: 3px; max-width: 90%; }
-.rf-err { color: var(--danger); border-color: var(--danger); }
-.rf-pending .dots { display: inline-flex; gap: 4px; vertical-align: middle; }
-.rf-pending .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: think 1.1s infinite ease-in-out; }
-.rf-pending .dots i:nth-child(2) { animation-delay: 0.18s; }
-.rf-pending .dots i:nth-child(3) { animation-delay: 0.36s; }
-.plan-refine-form { display: flex; gap: 8px; align-items: flex-end; }
-.plan-refine-form textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); color: var(--text); padding: 8px 10px; font: inherit; font-size: 13px; }
-.plan-refine-form .primary { padding: 8px 11px; }
 
 /* Autopilot header: title + inline schedule summary on the left, actions on the right. */
 .ap-head { align-items: flex-start; }
@@ -1023,8 +986,6 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 @media (max-width: 700px) {
   /* on narrow screens the sidebar overlays the conversation instead of squishing it */
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
-  /* the refine drawer goes full-screen on a phone (the plan doc already reads full-width) */
-  .plan-refine-drawer { width: 100%; max-width: 100%; }
   /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
   .resizer { display: none; }
 }

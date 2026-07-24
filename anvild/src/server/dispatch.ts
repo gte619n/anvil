@@ -327,9 +327,9 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         send(deps.supervisor.autopilotPlansEvent(cid));
         return;
 
-      case "autopilot.refine":
+      case "autopilot.plan.session":
         deps.supervisor
-          .refinePlan(cmd.workUnitId, cmd.feedback, cid)
+          .startPlanningSession(cmd.workUnitId, cmd.model, cmd.autonomy, cid)
           .then((event) => send(event))
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
