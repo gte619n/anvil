@@ -45,6 +45,15 @@ export interface IntegrateResult {
   output: string;
 }
 
+/** The remote branch to push the combined lead branch to. NEVER the repo's default/base branch: a
+ *  remoteBranch the classifier tagged as main/master (or equal to the base) falls back to undefined
+ *  (push to the branch's own name), so integrate can never shove team work straight onto main. */
+export function safeRemoteBranch(remoteBranch: string | undefined, baseName: string | undefined): string | undefined {
+  if (!remoteBranch) return undefined;
+  if (remoteBranch === "main" || remoteBranch === "master" || remoteBranch === baseName) return undefined;
+  return remoteBranch;
+}
+
 export function integrateTeam(input: IntegrateInput): IntegrateResult {
   if (input.integration === "pr-per-member") {
     return {

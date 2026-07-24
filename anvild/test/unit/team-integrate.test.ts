@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { integrateTeam, type IntegrateGit, type IntegrateMember } from "../../src/integrations/team-integrate";
+import { integrateTeam, safeRemoteBranch, type IntegrateGit, type IntegrateMember } from "../../src/integrations/team-integrate";
 
 function fakeGit(over: Partial<IntegrateGit> & { ancestors?: string[]; conflictOn?: string } = {}): { git: IntegrateGit; merged: string[]; prs: number } {
   const merged: string[] = [];
@@ -19,6 +19,15 @@ function fakeGit(over: Partial<IntegrateGit> & { ancestors?: string[]; conflictO
 }
 
 const M = (title: string, branch?: string): IntegrateMember => ({ sessionId: `s_${title}`, title, branch: branch ?? `b_${title}` });
+
+test("safeRemoteBranch never pushes the combined branch onto main/master/base", () => {
+  expect(safeRemoteBranch("main", "main")).toBeUndefined();
+  expect(safeRemoteBranch("master", "main")).toBeUndefined();
+  expect(safeRemoteBranch("main", undefined)).toBeUndefined();
+  expect(safeRemoteBranch("develop", "develop")).toBeUndefined(); // equals base
+  expect(safeRemoteBranch("feature/ship-team-demo", "main")).toBe("feature/ship-team-demo"); // a real prefix survives
+  expect(safeRemoteBranch(undefined, "main")).toBeUndefined();
+});
 
 test("pr-per-member merges nothing and opens no combined PR", () => {
   const fg = fakeGit();

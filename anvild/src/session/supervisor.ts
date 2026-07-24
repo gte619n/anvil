@@ -77,7 +77,7 @@ import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
 import { integrationOrder } from "../integrations/team-plan";
-import { integrateTeam as runTeamIntegration, type IntegrateMember } from "../integrations/team-integrate";
+import { integrateTeam as runTeamIntegration, safeRemoteBranch, type IntegrateMember } from "../integrations/team-integrate";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint, type LapoConfig } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
@@ -969,11 +969,16 @@ export class Supervisor {
       branch: s.worktree?.branch,
     }));
     const integration = lead.data.team?.integration ?? "combined-pr";
+    // Guard the push target: never push the combined branch ONTO the repo's default/base branch. If the
+    // remote-branch classifier tagged the lead as "main"/"master" (or the base), pushing branch:main
+    // would try to shove team work straight onto main — fall back to the branch's own name instead.
+    const baseName = lead.data.worktree?.base?.replace(/^origin\//, "");
+    const leadRemoteBranch = safeRemoteBranch(lead.data.worktree?.remoteBranch, baseName);
     const result = runTeamIntegration({
       integration,
       leadCwd: lead.data.cwd,
       leadBranch: lead.data.worktree?.branch ?? lead.data.git?.branch ?? "HEAD",
-      leadRemoteBranch: lead.data.worktree?.remoteBranch,
+      leadRemoteBranch,
       members,
       prTitle: `${lead.data.title}: team integration`,
       prBody: `Combined PR integrating ${members.length} team member(s):\n${members.map((m) => `- ${m.title}${m.branch ? ` (${m.branch})` : ""}`).join("\n")}`,
