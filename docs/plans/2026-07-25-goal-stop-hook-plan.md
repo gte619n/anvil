@@ -22,19 +22,49 @@ to every device. Display-only composer chip; cleared via `/goal clear`.
 
 | Task | Description | Status | Tested | Pushed |
 |------|-------------|--------|--------|--------|
-| 1 | Protocol: `SessionGoal`, `Session.goal`, `GOAL_MAX_ITERATIONS` | pending | no | no |
-| 2 | `goal.ts`: `parseGoalCommand` | pending | no | no |
-| 3 | `goal.ts`: `judgeGoal` (Haiku one-shot) | pending | no | no |
-| 4 | `Session`: `recentTurns` rolling buffer | pending | no | no |
-| 5 | `goal.ts`: `makeStopHook` | pending | no | no |
-| 6 | `driver.ts`: register `Stop` hook + feed `recentTurns` | pending | no | no |
-| 7 | `supervisor.ts`: `/goal` intercept, dividers, counter reset | pending | no | no |
-| 8 | `supervisor.ts`: push suppression + resolve push | pending | no | no |
-| 9 | `skills.ts`: `/goal` menu blurb | pending | no | no |
-| 10 | Web: composer chip | pending | no | no |
-| 11 | Integration test: full `/goal` flow | pending | no | no |
-| 12 | **User-driven E2E verification** (manual, live daemon) | pending | no | no |
-| 13 | Full gate + PR | pending | no | no |
+| 1 | Protocol: `SessionGoal`, `Session.goal`, `GOAL_MAX_ITERATIONS` | done | yes | no |
+| 2 | `goal.ts`: `parseGoalCommand` | done | yes | no |
+| 3 | `goal.ts`: `judgeGoal` (Haiku one-shot) | done | yes | no |
+| 4 | `Session`: `recentTurns` rolling buffer | done | yes | no |
+| 5 | `goal.ts`: `makeStopHook` | done | yes | no |
+| 6 | `driver.ts`: register `Stop` hook + feed `recentTurns` | done | yes | no |
+| 7 | `supervisor.ts`: `/goal` intercept, dividers, counter reset | done | yes | no |
+| 8 | `supervisor.ts`: push suppression + resolve push | done | yes | no |
+| 9 | `skills.ts`: `/goal` menu blurb | done | yes | no |
+| 10 | Web: composer chip | done | yes | no |
+| 11 | Integration test: full `/goal` flow | done | yes | no |
+| 12 | **User-driven E2E verification** (manual, live daemon) | done | yes | no |
+| 13 | Full gate + PR | gate green; PR held | yes | no |
+
+**Verified 2026-07-25** against a live daemon on the branch (`bun run dev`, port 7703) in two passes: a
+wire-protocol pass (WebSocket, the same channel the UI uses) and a browser pass (19 screenshots,
+`goal-e2e-report.md`). **0 functional bugs.** Confirmed live: `/goal` set/clear/status consume no turn;
+the real Haiku judge returns evidence-based UNMET (*"No file creation attempted; only a greeting shown
+in transcript"*); the block makes the session keep working instead of idling; the counter climbs and
+resets on a new prompt (D8); MET clears the goal; the chip escapes HTML and truncates a long condition;
+`/goalx` is not a goal; clear halts a live loop; goal state persists to `sessions.json`.
+
+Deviations from the plan as written, both found during implementation:
+1. **One-shot push-suppression marker** (`goalPushSuppressed`). The plan's `if (data?.goal …) return`
+   cannot suppress the FINAL turn's duplicate: the Stop hook clears `data.goal` before the SDK emits
+   `result`, so a met goal would push twice ("Goal met" + "your turn"). Pinned by `test/unit/goal-push.test.ts`.
+2. **`/goal` added to the `skills.ts` guarantee pass.** The blurb alone was not enough — a daemon-only
+   command never appears in the SDK's `slash_commands`, so `/goal` would have been absent from the `/` menu.
+
+Not click-verifiable, so covered by test instead (`test/unit/goal-push.test.ts`): D3 suppression, the
+one-push-per-goal marker, the D4 ceiling push, permission/question pushes surviving a goal, and D5
+restore-as-paused. `web-push` hardcodes `https.request`, so a local HTTP sink can never receive a
+delivery (confirmed with a no-goal control); observing restore needs a restart that would kill the
+dev server under test.
+
+Known-and-accepted, observed live: a judge failure fails open (D6) and can park a session mid-count
+with the goal still armed and no divider explaining why — bounded, never a runaway, but silent (see
+"Follow-ups"). The first judge call can miss a tool result still in flight, costing one spurious UNMET
+(accepted risk R2).
+
+**Follow-ups (not in this branch):** surface a fail-open judge error in `SessionGoal.lastReason` so the
+chip tooltip explains a silent park; teams (a goal binds only the session it is set on, and the hook
+ignores `StopHookInput.background_tasks`, so a lead waiting on members reads as idle) — both design §8.
 
 **Conventions to preserve (verified in-repo):**
 - Unit tests: `test/unit/*.test.ts`, `bun:test`, direct `src/` imports, dependencies injected

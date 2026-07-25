@@ -257,17 +257,17 @@ Gate: `bun run typecheck`, `bun run typecheck:web`, `bun run build:web`, `bun te
 | Phase | Description | Status | Tested | Pushed |
 |-------|-------------|--------|--------|--------|
 | 0 | **Spike** — verify the Stop-hook block mechanism | **done** | **yes** | n/a |
-| 1 | `goal.ts`: `SessionGoal`, `parseGoalCommand`, constants | pending | no | no |
-| 2 | `judgeGoal()` — Haiku one-shot mirroring `classifyBranchKind` | pending | no | no |
-| 3 | `makeStopHook()` — iteration accounting, ceiling, fail-open. Return shape is **settled** by Phase 0: `{decision:"block", reason}` | pending | no | no |
-| 4 | Protocol: `SessionGoal` + `Session.goal` (additive) | pending | no | no |
-| 5 | `driver.ts`: register the `Stop` hook | pending | no | no |
-| 6 | `supervisor.ts`: `/goal` intercept, dividers, counter reset | pending | no | no |
-| 7 | `supervisor.ts`: `maybeNotify` suppression + resolve push | pending | no | no |
-| 8 | Persistence: `SessionData.goal`, restore-as-paused | pending | no | no |
-| 9 | Web: composer chip + styles | pending | no | no |
-| 10 | Tests: `goal.test.ts` + notify suppression | pending | no | no |
-| 11 | Full gate (typecheck ×2, build:web, bun test) + PR | pending | no | no |
+| 1 | `goal.ts`: `SessionGoal`, `parseGoalCommand`, constants | done | yes | no |
+| 2 | `judgeGoal()` — Haiku one-shot mirroring `classifyBranchKind` | done | yes | no |
+| 3 | `makeStopHook()` — iteration accounting, ceiling, fail-open. Return shape is **settled** by Phase 0: `{decision:"block", reason}` | done | yes | no |
+| 4 | Protocol: `SessionGoal` + `Session.goal` (additive) | done | yes | no |
+| 5 | `driver.ts`: register the `Stop` hook | done | yes | no |
+| 6 | `supervisor.ts`: `/goal` intercept, dividers, counter reset | done | yes | no |
+| 7 | `supervisor.ts`: `maybeNotify` suppression + resolve push | done | yes | no |
+| 8 | Persistence: `SessionData.goal`, restore-as-paused | done | yes | no |
+| 9 | Web: composer chip + styles | done | yes | no |
+| 10 | Tests: `goal.test.ts` + notify suppression | done | yes | no |
+| 11 | Full gate (typecheck ×2, build:web, bun test) + PR | gate green; PR held | yes | no |
 
 ---
 
