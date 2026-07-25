@@ -2741,11 +2741,12 @@ export class Supervisor {
       this.goalDivider(
         s,
         "Goal set",
-        `${cmd.condition}\n\nThis session will keep working until the goal is met, ${GOAL_MAX_ITERATIONS} attempts pass, or you send \`/goal clear\`.`,
+        `Working toward “${cmd.condition}” — the session keeps going until the goal is met, ` +
+          `${GOAL_MAX_ITERATIONS} attempts pass, or you send /goal clear.`,
       );
     } else if (cmd.kind === "clear") {
       if (!s.data.goal) {
-        this.goalDivider(s, "No goal set", "Send `/goal <condition>` to set one.");
+        this.goalDivider(s, "No goal set", "Send /goal <condition> to set one.");
         return;
       }
       s.data.goal = undefined;
@@ -2756,8 +2757,10 @@ export class Supervisor {
         s,
         g ? "Goal" : "No goal set",
         g
-          ? `${g.condition}\n\n${g.iterations}/${GOAL_MAX_ITERATIONS} attempts${g.paused ? " · paused until your next message" : ""}${g.lastReason ? `\n\nLast blocker: ${g.lastReason}` : ""}`
-          : "Usage: `/goal <condition>`",
+          ? `“${g.condition}” — ${g.iterations}/${GOAL_MAX_ITERATIONS} attempts` +
+            `${g.paused ? " · paused until your next message" : ""}` +
+            `${g.lastReason ? ` · last blocker: ${g.lastReason}` : ""}`
+          : "Usage: /goal <condition>",
       );
       return; // status is read-only — nothing to persist
     }
@@ -2777,8 +2780,8 @@ export class Supervisor {
     if (!s) return;
     const label = met ? "Goal met" : `Goal abandoned after ${GOAL_MAX_ITERATIONS} turns`;
     const note = met
-      ? `${goal.condition}\n\nReached in ${goal.iterations} attempt${goal.iterations === 1 ? "" : "s"}.`
-      : `${goal.condition}\n\nLast blocker: ${goal.lastReason ?? "unknown"}`;
+      ? `“${goal.condition}” — reached in ${goal.iterations} attempt${goal.iterations === 1 ? "" : "s"}.`
+      : `“${goal.condition}” — last blocker: ${goal.lastReason ?? "unknown"}`;
     this.goalDivider(s, label, note);
     this.persist();
     this.broadcastUpdated(s.data);
