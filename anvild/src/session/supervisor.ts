@@ -48,7 +48,9 @@ import {
   type SessionCreateCmd,
   type SessionListEvent,
   type SessionSource,
+  type SessionGoal,
 } from "@protocol";
+import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
 import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
@@ -2350,6 +2352,26 @@ export class Supervisor {
       return;
     }
 
+    // `/goal` (design 2026-07-25) — daemon-handled like the context controls. Sets/clears/reports the
+    // session's goal without consuming a turn; the Stop hook registered in the driver enforces it.
+    const goalCmd = parseGoalCommand(text);
+    if (goalCmd) {
+      this.handleGoalCommand(s, goalCmd);
+      return;
+    }
+
+    // Any ordinary prompt is new information: re-arm a restored goal and reset the ceiling, so it
+    // means "10 turns without human help" rather than "10 turns ever" (design D8/D5).
+    if (s.data.goal) {
+      s.data.goal.iterations = 0;
+      s.data.goal.paused = undefined;
+      this.persist();
+      this.broadcastUpdated(s.data);
+    }
+    // A fresh user turn supersedes any pending goal-resolution push suppression (see onGoalResolved):
+    // the next `result` is this turn's, and it deserves its ordinary "your turn" reminder.
+    this.goalPushSuppressed.delete(id);
+
     const attachments = attachmentIds
       .map((aid) => this.attachStore.ref(id, aid))
       .filter((r): r is AttachmentRef => r !== undefined);
@@ -2404,6 +2426,11 @@ export class Supervisor {
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
         (commands) => this.onSessionCommands(id, commands),
         (err) => this.onTurnError(err),
+        (met, goal) => this.onGoalResolved(id, met, goal),
+        () => {
+          this.persist();
+          this.broadcastUpdated(s.data);
+        },
       );
       this.drivers.set(id, driver);
     }
@@ -2702,6 +2729,77 @@ export class Supervisor {
     this.registry.toAll(this.sessionListEvent()); // clients refresh; pin happens via list() ordering
   }
 
+  /** Sessions whose next `result` push is already covered by a goal-resolution push (see
+   *  `onGoalResolved`). The Stop hook clears `data.goal` BEFORE the SDK emits `result`, so the
+   *  goal-presence check in `maybeNotify` can't suppress the final turn's duplicate on its own. */
+  private readonly goalPushSuppressed = new Set<string>();
+
+  /** Apply a parsed `/goal` command. Never consumes a turn. */
+  private handleGoalCommand(s: Session, cmd: GoalCommand): void {
+    if (cmd.kind === "set") {
+      s.data.goal = { condition: cmd.condition, iterations: 0, setAt: now() };
+      this.goalDivider(
+        s,
+        "Goal set",
+        `${cmd.condition}\n\nThis session will keep working until the goal is met, ${GOAL_MAX_ITERATIONS} attempts pass, or you send \`/goal clear\`.`,
+      );
+    } else if (cmd.kind === "clear") {
+      if (!s.data.goal) {
+        this.goalDivider(s, "No goal set", "Send `/goal <condition>` to set one.");
+        return;
+      }
+      s.data.goal = undefined;
+      this.goalDivider(s, "Goal cleared", "The session will stop normally from now on.");
+    } else {
+      const g = s.data.goal;
+      this.goalDivider(
+        s,
+        g ? "Goal" : "No goal set",
+        g
+          ? `${g.condition}\n\n${g.iterations}/${GOAL_MAX_ITERATIONS} attempts${g.paused ? " · paused until your next message" : ""}${g.lastReason ? `\n\nLast blocker: ${g.lastReason}` : ""}`
+          : "Usage: `/goal <condition>`",
+      );
+      return; // status is read-only — nothing to persist
+    }
+    this.persist();
+    this.broadcastUpdated(s.data);
+  }
+
+  /** A goal lifecycle marker in the transcript — same divider block the compact boundary uses. */
+  private goalDivider(s: Session, label: string, note: string): void {
+    s.emit({ type: "assistant.message", blocks: [{ kind: "divider", label, note }] });
+  }
+
+  /** A goal finished — met, or abandoned at the ceiling. Marks the transcript, persists, and sends
+   *  the ONE push the whole goal is allowed (design D3/D4). */
+  private onGoalResolved(id: string, met: boolean, goal: SessionGoal): void {
+    const s = this.sessions.get(id);
+    if (!s) return;
+    const label = met ? "Goal met" : `Goal abandoned after ${GOAL_MAX_ITERATIONS} turns`;
+    const note = met
+      ? `${goal.condition}\n\nReached in ${goal.iterations} attempt${goal.iterations === 1 ? "" : "s"}.`
+      : `${goal.condition}\n\nLast blocker: ${goal.lastReason ?? "unknown"}`;
+    this.goalDivider(s, label, note);
+    this.persist();
+    this.broadcastUpdated(s.data);
+    // This push IS the turn's notification — swallow the ordinary "your turn" that the `result`
+    // arriving moments later would otherwise fire (the goal is already cleared by then).
+    this.goalPushSuppressed.add(id);
+    const dir = s.data.cwd ? basename(s.data.cwd) : undefined;
+    const payload: PushPayload = {
+      title: s.data.title,
+      body: `${label}: ${goal.condition}`,
+      dir,
+      sessionId: id,
+      tag: `goal-${id}`,
+      kind: "result",
+    };
+    this.notified.add(id); // a later view/answer dismisses it everywhere, like any other reminder
+    void this.webpush.notify(payload);
+    void this.fcm.notify(payload);
+    void this.apns.notify(payload);
+  }
+
   /**
    * Reset the topic (§0.6): start a fresh Claude SDK context (drop `--resume`) WITHOUT touching the
    * visible scrollback. Drops the live driver, clears any parked prompt, and writes a persisted
@@ -2800,6 +2898,15 @@ export class Supervisor {
       const more = event.questions.length > 1 ? ` (+${event.questions.length - 1} more)` : "";
       payload = { title, body: `${first}${more}${opts ? `\n${opts}` : ""}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
+      // A goal in flight ends a turn on every iteration. Suppressing the "your turn" push here is
+      // what makes a 10-iteration goal send ONE notification instead of ten (design D3). The
+      // permission and question branches above are deliberately untouched: a goal blocked on an
+      // approval still has to reach the user.
+      if (data?.goal && !data.goal.paused) return;
+      // The turn that RESOLVED a goal has no `data.goal` left to match on (the hook cleared it before
+      // the SDK emitted this `result`), so consume the marker `onGoalResolved` left instead — its
+      // "Goal met" push already covered this turn.
+      if (this.goalPushSuppressed.delete(sessionId)) return;
       // A short, plain-text summary of what Claude said — no Markdown, no novel — so the reminder
       // carries real context at a glance instead of raw "## heading **bold**" glyphs.
       const snippet = summarize(this.sessions.get(sessionId)?.lastAssistantText ?? "");
@@ -2859,6 +2966,9 @@ export class Supervisor {
         // turn interrupted — reset to idle and leave a visible notice so it isn't silently lost.
         const interrupted = transient.includes(p.data.status);
         if (interrupted) p.data.status = "idle";
+        // A restored goal is re-armed PAUSED (design D5): a self-update must never resume an
+        // unattended loop. The next user prompt un-pauses it (see prompt()).
+        if (p.data.goal) p.data.goal.paused = true;
         const session = this.wrap(p.data, p.lastSeq);
         this.sessions.set(p.data.id, session);
 
