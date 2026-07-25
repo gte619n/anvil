@@ -97,3 +97,56 @@ export async function judgeGoal(
     clearTimeout(timer);
   }
 }
+
+/** Called when a goal resolves — met (true) or abandoned at the ceiling (false). */
+export type GoalResolved = (met: boolean, goal: SessionGoal) => void;
+/** Called after an unmet attempt so the supervisor can persist + broadcast the new count. */
+export type GoalProgress = (goal: SessionGoal) => void;
+
+/**
+ * The `Stop` hook. Registered unconditionally at query start (the SDK has no `setHooks`, so it can
+ * never be added later) and reads goal state off the LIVE session each time it fires — which is what
+ * lets `/goal` arm mid-session with no driver restart.
+ *
+ * Return shape verified by spike (design §10 R1): `{decision:"block", reason}` blocks the stop and
+ * the model complies, receiving `Stop hook feedback:\n<reason>`. Do NOT switch to
+ * `hookSpecificOutput.additionalContext` — that arrives as a system reminder the model refuses as a
+ * suspected prompt injection, yielding a session that loops without doing the work.
+ */
+export function makeStopHook(
+  session: Session,
+  env: () => Record<string, string>,
+  onResolved: GoalResolved,
+  judge: (c: string, t: string, e: Record<string, string>) => Promise<GoalVerdict> = judgeGoal,
+  onProgress: GoalProgress = () => {},
+): HookCallback {
+  return async () => {
+    const goal = session.data.goal;
+    // Free path: the overwhelming majority of stops belong to sessions with no goal.
+    if (!goal || goal.paused) return { continue: true };
+
+    if (goal.iterations >= GOAL_MAX_ITERATIONS) {
+      session.data.goal = undefined;
+      onResolved(false, goal);
+      return { continue: true };
+    }
+
+    let verdict: GoalVerdict;
+    try {
+      verdict = await judge(goal.condition, session.recentTurns.join("\n"), env());
+    } catch {
+      return { continue: true }; // D6: fail open — never trap a session on an unreachable judge
+    }
+
+    if (verdict.met) {
+      session.data.goal = undefined;
+      onResolved(true, goal);
+      return { continue: true };
+    }
+
+    goal.iterations += 1;
+    goal.lastReason = verdict.reason;
+    onProgress(goal);
+    return { decision: "block", reason: `[${goal.condition}]: ${verdict.reason}` };
+  };
+}
