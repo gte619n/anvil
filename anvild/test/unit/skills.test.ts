@@ -40,6 +40,23 @@ test("buildCommandInfo tags built-ins and enriches project skills with descripti
   });
 });
 
+test("buildCommandInfo blurbs /goal — it is genuinely daemon-handled", () => {
+  const cmds = buildCommandInfo(["goal"], "/tmp");
+  expect(cmds).toContainEqual({
+    name: "goal",
+    source: "builtin",
+    description: "Keep working until a condition is met — /goal <condition>, /goal clear to stop",
+  });
+  expect(cmds.filter((c) => c.name === "goal")).toHaveLength(1); // the guarantee pass must not duplicate it
+});
+
+test("buildCommandInfo guarantees /goal even when the SDK never lists it", () => {
+  // /goal is intercepted by the supervisor and never reaches the CLI, so it is NOT in the SDK's
+  // `slash_commands`. Without the guarantee pass it would be missing from the composer's `/` menu.
+  const cmds = buildCommandInfo(["context"], "/tmp");
+  expect(cmds).toContainEqual({ name: "goal", source: "builtin", description: expect.any(String) });
+});
+
 test("buildCommandInfo keeps a namespaced skill even when its SKILL.md is missing (no description)", () => {
   const repo = mkdtempSync(join(tmpdir(), "anvil-skills-"));
   mkdirSync(join(repo, ".git"));

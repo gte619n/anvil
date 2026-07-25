@@ -138,6 +138,7 @@ function skillDescription(skillsDir: string, skill: string): string | undefined 
 const BUILTIN_DESCRIPTIONS: Record<string, string> = {
   clear: "Start a fresh topic — Claude forgets the conversation above; your visible history stays",
   compact: "Summarize the conversation so far to free up the context window, then continue",
+  goal: "Keep working until a condition is met — /goal <condition>, /goal clear to stop",
 };
 
 /**
@@ -162,7 +163,10 @@ export function buildCommandInfo(slashCommands: readonly string[], cwd: string):
     return description ? { name, description, source: "builtin" as const } : { name, source: "builtin" as const };
   });
   const have = new Set(out.map((c) => c.name));
-  for (const name of ["clear", "compact"]) {
+  // `/goal` joins the context controls in the guarantee pass: like them it is intercepted by the
+  // supervisor, and unlike them it is not a CLI built-in at all — the SDK never lists it, so without
+  // this it would be absent from the composer's `/` menu entirely. (design 2026-07-25)
+  for (const name of ["clear", "compact", "goal"]) {
     if (!have.has(name)) out.unshift({ name, description: BUILTIN_DESCRIPTIONS[name], source: "builtin" });
   }
   return out;
