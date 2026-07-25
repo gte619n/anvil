@@ -49,6 +49,10 @@ export class Session {
   /** The most recent assistant prose (plain text, trimmed) — used to give the "your turn"
    *  notification real context ("…here's the summary") instead of a generic "Finished". Transient. */
   lastAssistantText: string | undefined;
+  /** Recent transcript lines (assistant prose + tool results), newest last, capped for the goal
+   *  judge (design D2 — judge evidence, not the last claim). In memory only; a restart drops it,
+   *  which is correct: a restored goal is paused until the user prompts again anyway (D5). */
+  readonly recentTurns: string[] = [];
   /** The session's opening user prompt (plain text, trimmed) — the raw brief that reveals the goal,
    *  fed to the branch-kind classifier to prefix the remote branch (arch §8). Captured once, in
    *  memory only; a restart drops it, which is fine (the remote branch is classified & persisted by
@@ -106,6 +110,16 @@ export class Session {
       console.error(`[session ${this.data.id}] persist failed: ${e instanceof Error ? e.message : e}`);
     }
     return event;
+  }
+
+  /** Append a transcript line for the goal judge, trimming to the cap. Cheap and allocation-free
+   *  when no goal is set — the buffer is maintained unconditionally so a goal set mid-session
+   *  immediately has evidence to judge. */
+  recordTurnLine(line: string, cap: number): void {
+    const t = line.trim();
+    if (!t) return;
+    this.recentTurns.push(t.length > 500 ? `${t.slice(0, 500)}…` : t);
+    while (this.recentTurns.length > cap) this.recentTurns.shift();
   }
 
   /** Per-session "always allow" set for allow_always decisions (arch §6.6). */
