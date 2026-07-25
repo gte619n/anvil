@@ -7,6 +7,7 @@ import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
+import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
 import { makeCanUseTool, type QuestionBroker } from "./questions";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
@@ -74,6 +75,10 @@ export class AgentDriver {
      *  rejections and auto-degrade after N consecutive ones (headless-join §4.6). Advisory: the error
      *  is still surfaced in the session either way. */
     private readonly onTurnError?: (err: unknown) => void,
+    /** Called when this session's goal resolves — met, or abandoned at the ceiling. */
+    private readonly onGoalResolved?: GoalResolved,
+    /** Called after each unmet attempt so the supervisor can persist + broadcast the count. */
+    private readonly onGoalProgress?: GoalProgress,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -181,6 +186,23 @@ export class AgentDriver {
         // CLI already flags.
         hooks: {
           PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker, this.onPlanProposed)], timeout: 3600 }],
+          // The goal hook (design 2026-07-25). Registered unconditionally — the SDK offers no way to
+          // add a hook to a live query — and returns `{continue:true}` immediately when the session
+          // has no goal. 60s covers the judge's own 20s abort with headroom.
+          Stop: [
+            {
+              hooks: [
+                makeStopHook(
+                  s,
+                  () => this.env,
+                  (met, goal) => this.onGoalResolved?.(met, goal),
+                  undefined,
+                  (goal) => this.onGoalProgress?.(goal),
+                ),
+              ],
+              timeout: 60,
+            },
+          ],
         },
         // AskUserQuestion never returns a normal tool result: its checkPermissions always resolves
         // to "ask", and the SDK surfaces that through canUseTool (NOT onUserDialog — verified live
@@ -248,6 +270,16 @@ export class AgentDriver {
         }
 
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
+        // Tool results are the evidence the goal judge needs (design D2) — a claim of success that
+        // the tool result contradicts must be visible to it.
+        if (m.type === "user") {
+          for (const b of ((m as any).message?.content ?? []) as any[]) {
+            if (b?.type === "tool_result") {
+              const body = typeof b.content === "string" ? b.content : JSON.stringify(b.content);
+              this.session.recordTurnLine(`tool${b.is_error ? " ERROR" : ""}: ${body}`, GOAL_TRANSCRIPT_LINES);
+            }
+          }
+        }
         // Stash the assistant's prose so a "your turn" push can quote it (real context, not a
         // generic "Finished"). Cheap: read text blocks straight off the SDK message.
         if (m.type === "assistant") {
@@ -257,6 +289,7 @@ export class AgentDriver {
             .join(" ")
             .trim();
           if (text) this.session.lastAssistantText = text;
+          if (text) this.session.recordTurnLine(`assistant: ${text}`, GOAL_TRANSCRIPT_LINES);
         }
         const bodies = mapMessage(m, this.renderer);
         let sawToolUse = false;
