@@ -1083,3 +1083,31 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .setup-code-box { text-align: center; }
 .setup-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: clamp(34px, 11vw, 46px); font-weight: 700; letter-spacing: 0.12em; margin: 10px 0 8px; user-select: all; }
 .setup-foot { margin-top: 22px; text-align: center; }
+
+/* Goal chip — display-only bar above the composer (design 2026-07-25). */
+.goal-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  font-size: 0.85rem;
+  min-width: 0;
+}
+.goal-chip .goal-cond {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.goal-chip .goal-count {
+  flex: none;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+.goal-chip.paused {
+  opacity: 0.6;
+}

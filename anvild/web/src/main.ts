@@ -36,7 +36,7 @@ const b64ToBytes = (b64: string): Uint8Array => {
   for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
   return a;
 };
-import { MODELS, modelLabel, type Model } from "../../protocol";
+import { GOAL_MAX_ITERATIONS, MODELS, modelLabel, type Model } from "../../protocol";
 import type {
   AttachmentRef,
   AuthStatusEvent,
@@ -838,6 +838,7 @@ function onEvent(url: string, e: ServerEvent): void {
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
         updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
+        updateGoalChip(e.session); // the goal's iteration count climbs on every unmet stop attempt
       }
       // Teams: a member's status/git change refreshes the active lead's board (and the lead's own row).
       if (activeId && (e.session.id === activeId || e.session.parentId === activeId)) {
@@ -2420,6 +2421,7 @@ function setHeaderTitle(s: Session | undefined): void {
   updateHeaderBranch(s);
   updateHeaderModel(s);
   updateContextMeter(s);
+  updateGoalChip(s);
   renderTeamBoard(s); // show the member board when a lead is active; hide it otherwise
   void setFavicon(s);
 }
@@ -2476,6 +2478,25 @@ function updateContextMeter(s: Session | undefined): void {
   el.className = "ctx-meter" + (pct >= 90 ? " hot" : pct >= 75 ? " warm" : "");
   el.innerHTML = `${icon("data_usage")}<span class="ctx-pct">${pct}%</span>`;
   el.title = `Context window: ${fmtK(ctx.used)} / ${fmtK(ctx.max)} tokens (${pct}%). Send /compact to free space, or /clear to start fresh.`;
+}
+/**
+ * Goal chip (design 2026-07-25): a slim, display-only bar above the composer showing the session's
+ * active goal and how many attempts it has made. Cleared with `/goal clear` — deliberately no button.
+ */
+function updateGoalChip(s: Session | undefined): void {
+  const el = document.getElementById("goal-chip");
+  if (!el) return;
+  const g = s?.goal;
+  if (!g) {
+    el.hidden = true;
+    el.replaceChildren();
+    return;
+  }
+  el.hidden = false;
+  el.className = "goal-chip" + (g.paused ? " paused" : "");
+  const count = g.paused ? "paused" : `${g.iterations}/${GOAL_MAX_ITERATIONS}`;
+  el.innerHTML = `${icon("target")}<span class="goal-cond">${esc(g.condition)}</span><span class="goal-count">${count}</span>`;
+  el.title = g.lastReason ? `Last blocker: ${g.lastReason}` : "Send /goal clear to stop early";
 }
 // Tapping the model pill opens a menu of the available models; picking one switches this session
 // live (session.set_model takes effect on the next message — no restart). A ✓ marks the current one.
