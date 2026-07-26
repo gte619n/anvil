@@ -189,6 +189,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       stateDir: opts.stateDir,
       port: opts.port,
       accounts,
+      pairedHub,
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
@@ -329,6 +330,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
+      ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
       const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state

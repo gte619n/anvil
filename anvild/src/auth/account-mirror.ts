@@ -1,6 +1,6 @@
 import { AccountStore } from "./accounts";
-import { looksLikeMeteredKey } from "./env-file";
-import { authEnvFile, clearClaudeToken, setClaudeToken } from "./store";
+import { envFileHasKey, looksLikeMeteredKey, readEnvKey } from "./env-file";
+import { authEnvFile, CLAUDE_TOKEN_KEY, clearClaudeToken, setClaudeToken } from "./store";
 
 /**
  * Mirror the roster's default account into `~/.config/anvil/env` (multi-account design §3.2).
@@ -30,6 +30,19 @@ export function mirrorDefault(store: AccountStore, file: string = authEnvFile())
   } catch (e) {
     return { persisted: false, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/**
+ * Read-only counterpart to `mirrorDefault()` — is the roster's default token CURRENTLY durable in the
+ * env file? Never writes/clears anything, so it's safe to call from a plain getter (the WS connect
+ * burst, `auth.accounts.get`) without the side effect of stomping a token that lives outside the
+ * roster entirely (e.g. a dev box that only ever set `CLAUDE_CODE_OAUTH_TOKEN` directly). An empty
+ * roster has nothing to persist, so it reports true — there's nothing at risk of being lost.
+ */
+export function defaultPersisted(store: AccountStore, file: string = authEnvFile()): boolean {
+  const token = store.token(undefined);
+  if (!token) return true;
+  return envFileHasKey(file, CLAUDE_TOKEN_KEY) && readEnvKey(file, CLAUDE_TOKEN_KEY) === token;
 }
 
 /**

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AccountStore } from "../../src/auth/accounts";
-import { mirrorDefault } from "../../src/auth/account-mirror";
+import { mirrorDefault, defaultPersisted } from "../../src/auth/account-mirror";
 import { CLAUDE_TOKEN_KEY } from "../../src/auth/store";
 
 const ORIGINAL = process.env[CLAUDE_TOKEN_KEY];
@@ -52,4 +52,23 @@ test("an unwritable env file is reported, not thrown", () => {
   expect(result.persisted).toBe(false);
   expect(result.error).toBeTruthy();
   expect(process.env[CLAUDE_TOKEN_KEY]).toBe("sk-ant-oat01-workworkwork-1111"); // live value still applied
+});
+
+// Regression: a plain READ (the WS connect burst, `auth.accounts.get`) must never mutate the env file.
+// `defaultPersisted()` is the read-only counterpart callers use instead of `mirrorDefault()` for that.
+test("defaultPersisted never writes or clears an existing token outside the roster", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-mirror-"));
+  const envFile = join(dir, "env");
+  const store = new AccountStore(dir); // empty roster
+  process.env[CLAUDE_TOKEN_KEY] = "sk-ant-oat01-devsettoken-9999"; // e.g. set directly, pre-migration
+  expect(defaultPersisted(store, envFile)).toBe(true); // nothing to persist — vacuously fine
+  expect(process.env[CLAUDE_TOKEN_KEY]).toBe("sk-ant-oat01-devsettoken-9999"); // untouched
+});
+
+test("defaultPersisted reflects the env file without writing to it", () => {
+  const { store, envFile } = tmp();
+  store.add("work", "sk-ant-oat01-workworkwork-1111");
+  expect(defaultPersisted(store, envFile)).toBe(false); // never mirrored yet
+  mirrorDefault(store, envFile);
+  expect(defaultPersisted(store, envFile)).toBe(true);
 });

@@ -323,6 +323,30 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         send(deps.supervisor.clearAuthToken(cmd.provider ?? "claude", cid));
         return;
 
+      case "auth.accounts.get":
+        send(deps.supervisor.accountsEvent(cid));
+        return;
+
+      case "auth.account.add":
+        send(deps.supervisor.accountAdd(cmd.label, cmd.token, cid)); // BadCommand (dup label/metered key) → command.error via the outer catch
+        return;
+
+      case "auth.account.rename":
+        send(deps.supervisor.accountRename(cmd.accountId, cmd.label, cid));
+        return;
+
+      case "auth.account.replace":
+        send(deps.supervisor.accountReplace(cmd.accountId, cmd.token, cid));
+        return;
+
+      case "auth.account.remove":
+        send(deps.supervisor.accountRemove(cmd.accountId, cid)); // BadCommand (last account) → command.error via the outer catch
+        return;
+
+      case "auth.account.default":
+        send(deps.supervisor.accountSetDefault(cmd.accountId, cid));
+        return;
+
       case "autopilot.plans.list":
         send(deps.supervisor.autopilotPlansEvent(cid));
         return;

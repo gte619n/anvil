@@ -36,6 +36,8 @@ import {
   type AutopilotMaintenanceResultEvent,
   type AuthProvider,
   type AuthStatusEvent,
+  type AuthAccountsEvent,
+  type AccountInfo,
   type CommandInfo,
   type GitCmd,
   type GitResultEvent,
@@ -91,6 +93,8 @@ import { resolveLapoConfig } from "../config";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { AccountStore } from "../auth/accounts";
+import { mirrorDefault, defaultPersisted } from "../auth/account-mirror";
+import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
@@ -149,6 +153,9 @@ export interface SupervisorConfig {
    *  one `AccountStore` instance per process; constructed over `stateDir` when omitted (unit tests that
    *  don't exercise accounts). */
   accounts?: AccountStore;
+  /** This machine's paired-hub record, so a replica's `auth.accounts` broadcast can name the hub that
+   *  owns it (§7.2). Read-only here — pairing itself is unaffected by the roster. */
+  pairedHub?: PairedHubStore;
   /** The tailnet-facing port (== ANVIL_PORT). Used to build this daemon's self-URL for deep links. */
   port?: number;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
@@ -255,6 +262,7 @@ export class Supervisor {
   /** The Claude account roster (multi-account §3). Exactly one instance per process — see
    *  `SupervisorConfig.accounts`. */
   readonly accounts: AccountStore;
+  private readonly pairedHub?: PairedHubStore;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
   readonly authDegrade!: AuthDegradeTracker;
@@ -272,6 +280,7 @@ export class Supervisor {
     };
     this.stateDir = cfg.stateDir;
     this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
+    this.pairedHub = cfg.pairedHub;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
     // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
@@ -838,6 +847,133 @@ export class Supervisor {
     else clearClaudeToken();
     this.registry.toAll(this.authStatusEvent(provider));
     return this.authStatusEvent(provider, cid);
+  }
+
+  // ── Claude account roster (Settings → Models; multi-account §7/§9) ───────────────────────────
+  /** Active (non-terminal) sessions currently bound to `accountId` — drives the removal confirm
+   *  (§9.1/§10) without a second round trip. */
+  sessionsUsingAccount(accountId: string): { sessionId: string; title: string }[] {
+    return [...this.sessions.values()]
+      .filter((s) => !s.data.archived && s.data.accountId === accountId)
+      .map((s) => ({ sessionId: s.data.id, title: s.data.title }));
+  }
+
+  private accountsInUse(): Record<string, { sessionId: string; title: string }[]> {
+    const out: Record<string, { sessionId: string; title: string }[]> = {};
+    for (const s of this.sessions.values()) {
+      if (s.data.archived || !s.data.accountId) continue;
+      (out[s.data.accountId] ??= []).push({ sessionId: s.data.id, title: s.data.title });
+    }
+    return out;
+  }
+
+  /** Roster snapshot for clients — masked previews only (§11). */
+  accountsEvent(cid?: string): AuthAccountsEvent {
+    const snap = this.accounts.snapshot();
+    const accounts: AccountInfo[] = this.accounts.publicList();
+    const inUse = this.accountsInUse();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "auth.accounts",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      rev: snap.rev,
+      ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
+      role: snap.role,
+      ...(snap.role === "replica" && this.pairedHub?.get()?.hubServerId ? { hubServerId: this.pairedHub.get()!.hubServerId } : {}),
+      accounts,
+      persisted: defaultPersisted(this.accounts),
+      ...(Object.keys(inUse).length ? { inUse } : {}),
+    };
+  }
+
+  /** Broadcast the roster to every connected client, like `broadcastAuthState()`. */
+  broadcastAccounts(): void {
+    this.registry.toAll(this.accountsEvent());
+  }
+
+  /** Every mutator: apply → mirror the default → broadcast → return the same event to the caller. A
+   *  mutation on a replica throws `AccountStore`'s "change accounts on the hub" message unchanged
+   *  (BadCommand via the caller's catch). */
+  private afterAccountMutation(cid: string | undefined, defaultTokenBefore: string | undefined): AuthAccountsEvent {
+    mirrorDefault(this.accounts); // the ONLY place a roster change is written to the launcher env file
+    // A mutation that changed the DEFAULT's resolved token invalidates every idle session's live driver
+    // env — restart them so the next turn picks it up (mirrors auth.set's existing behaviour; Task 21
+    // narrows this to only sessions whose OWN resolved token actually changed). Fire-and-forget, like
+    // every other credential-change call site (http.ts's pair/rotate handlers).
+    if (this.accounts.token(undefined) !== defaultTokenBefore) void this.restartIdleSessionsForNewToken();
+    const event = this.accountsEvent(cid);
+    this.registry.toAll(cid ? { ...event, cid: undefined } : event);
+    return event;
+  }
+
+  accountAdd(label: string, token: string, cid?: string): AuthAccountsEvent {
+    const before = this.accounts.token(undefined);
+    try {
+      this.accounts.add(label, token);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    return this.afterAccountMutation(cid, before);
+  }
+
+  accountRename(accountId: string, label: string, cid?: string): AuthAccountsEvent {
+    const before = this.accounts.token(undefined);
+    try {
+      this.accounts.rename(accountId, label);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    // accountLabel is denormalised for display; refresh every session bound to this account.
+    for (const s of this.sessions.values()) {
+      if (s.data.accountId === accountId) {
+        s.data.accountLabel = label;
+        this.broadcastUpdated(s.data);
+      }
+    }
+    this.persist();
+    return this.afterAccountMutation(cid, before);
+  }
+
+  accountReplace(accountId: string, token: string, cid?: string): AuthAccountsEvent {
+    const before = this.accounts.token(undefined);
+    try {
+      this.accounts.replace(accountId, token);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    return this.afterAccountMutation(cid, before);
+  }
+
+  accountSetDefault(accountId: string, cid?: string): AuthAccountsEvent {
+    const before = this.accounts.token(undefined);
+    try {
+      this.accounts.setDefault(accountId);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    return this.afterAccountMutation(cid, before);
+  }
+
+  accountRemove(accountId: string, cid?: string): AuthAccountsEvent {
+    const before = this.accounts.token(undefined);
+    try {
+      this.accounts.remove(accountId);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    // §5.4 removal fallback: fall every session bound to the removed account back to the new
+    // default, flagged so the client can render the "⚠ was <label>" badge (Task 24).
+    const fallbackLabel = this.accounts.labelOf(this.accounts.defaultId());
+    for (const s of this.sessions.values()) {
+      if (s.data.accountId !== accountId) continue;
+      s.data.accountId = this.accounts.defaultId();
+      s.data.accountLabel = fallbackLabel;
+      s.data.accountMissing = true;
+      this.broadcastUpdated(s.data);
+    }
+    this.persist();
+    return this.afterAccountMutation(cid, before);
   }
 
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
