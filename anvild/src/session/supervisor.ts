@@ -3086,6 +3086,7 @@ export class Supervisor {
         console.error(`[restore] quarantined session ${p?.data?.id ?? "<unknown>"}: ${e instanceof Error ? e.message : e}`);
       }
     }
+    this.reconcileSessionAccounts(); // §5.4: an account removed while this daemon was down
     this.persist(); // reconcile disk == memory after status resets / recovery (fixes drift)
     this.ensureDefaultSession(); // the concierge chat always exists (reused if persisted, else created)
     this.pruneFollowupBranches(); // reap merge-rollover branches the user never continued (best-effort)
@@ -3097,6 +3098,29 @@ export class Supervisor {
         ` · ${recovered} worktree(s) recovered · ${quarantined} quarantined` +
         (orphanDirs.length ? ` · ${orphanDirs.length} orphan state dir(s)` : ""),
     );
+  }
+
+  /**
+   * §5.4, boot half: `accountRemove()` falls live sessions back the moment an account goes, but an
+   * account can also disappear while this daemon is DOWN — a hand-edited accounts.json, or (much more
+   * likely) a hub push that replaced this member's whole roster. Reconcile once on restore so those
+   * sessions carry the same `accountMissing` badge as the live path instead of failing at spawn time
+   * with an opaque "unknown Claude account".
+   *
+   * A REPLICA is deliberately left alone: on a member an unknown id usually means "the hub's push
+   * hasn't landed yet", and rewriting the binding would silently repoint the session at the wrong
+   * subscription — exactly what §5.4 exists to prevent. `buildAgentEnv` refuses that spawn with the
+   * "press Sync now" message instead, and the binding heals itself when the push arrives.
+   */
+  private reconcileSessionAccounts(): void {
+    if (this.accounts.isEmpty() || this.accounts.snapshot().role === "replica") return;
+    const fallback = this.accounts.defaultId();
+    for (const s of this.sessions.values()) {
+      if (!s.data.accountId || this.accounts.has(s.data.accountId)) continue;
+      s.data.accountId = fallback; // accountLabel deliberately keeps the removed account's name
+      s.data.accountMissing = true;
+      console.log(`[restore] session ${s.data.id} was bound to a removed Claude account — fell back to the default`);
+    }
   }
 
   /**

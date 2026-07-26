@@ -83,7 +83,14 @@ export function buildAgentEnv(
     let tok: string;
     if (opts.accounts) {
       if (opts.accountId && !opts.accounts.has(opts.accountId)) {
-        throw new Error(`unknown Claude account ${opts.accountId} — it may have been removed; pick another in Settings → Models`);
+        // The two §5.4 cases read very differently to the operator, so they get different messages.
+        // On a REPLICA an unknown id almost always means the hub's push hasn't landed here yet — the
+        // fix is "Sync now", not "pick another account". On a hub it really is gone.
+        throw new Error(
+          opts.accounts.snapshot().role === "replica"
+            ? "this Mac hasn't received that Claude login from its hub yet — open Settings → Servers on the hub and press Sync now"
+            : `unknown Claude account ${opts.accountId} — it may have been removed; pick another in Settings → Models`,
+        );
       }
       tok = (opts.accounts.token(opts.accountId) ?? "").trim();
     } else {

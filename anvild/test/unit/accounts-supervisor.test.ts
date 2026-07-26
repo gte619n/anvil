@@ -87,3 +87,49 @@ test("a mutation on a replica throws BadCommand with AccountStore's message unch
   expect(() => sup.accountAdd("local", "sk-ant-oat01-nope-0000")).toThrow(BadCommand);
   rmSync(dir, { recursive: true, force: true });
 });
+
+// ── §5.4 boot reconciliation + the replica "not yet replicated" refusal ──────────────────────
+
+test("a session bound to an account removed while the daemon was DOWN is reconciled on restore", () => {
+  const dir = tempState();
+  const accounts = new AccountStore(dir);
+  const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
+  accounts.add("personal", "sk-ant-oat01-personalpers-2222");
+  const sup1 = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const s = sup1.create(createCmd(dir, work.id));
+  const sessionId = s.data.id;
+
+  // Simulate the account vanishing out-of-band (a hand-edited accounts.json, or a hub push that
+  // replaced the roster) — no live accountRemove() call runs, so nothing falls back at the time.
+  const accounts2 = new AccountStore(dir);
+  accounts2.remove(work.id);
+
+  const sup2 = new Supervisor({ stateDir: dir, accounts: accounts2 }, new ConnectionRegistry());
+  const restored = sup2.get(sessionId)!;
+  expect(restored.data.accountId).toBe(accounts2.defaultId());
+  expect(restored.data.accountMissing).toBe(true);
+  expect(restored.data.accountLabel).toBe("work"); // the removed account's name still names itself
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a REPLICA never rewrites a session's binding on restore (the push may just be late)", () => {
+  const dir = tempState();
+  const accounts = new AccountStore(dir);
+  const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
+  const sup1 = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sessionId = sup1.create(createCmd(dir, work.id)).data.id;
+
+  // This machine becomes a member and adopts a roster that doesn't (yet) carry `work`.
+  const accounts2 = new AccountStore(dir);
+  accounts2.adoptReplica({
+    rev: 9,
+    defaultId: "acct_hub",
+    entries: [{ id: "acct_hub", label: "hub-account", token: "sk-ant-oat01-hubpushed-9999", createdAt: 1 }],
+  });
+
+  const sup2 = new Supervisor({ stateDir: dir, accounts: accounts2 }, new ConnectionRegistry());
+  const restored = sup2.get(sessionId)!;
+  expect(restored.data.accountId).toBe(work.id); // binding preserved, NOT silently repointed
+  expect(restored.data.accountMissing).toBeUndefined();
+  rmSync(dir, { recursive: true, force: true });
+});

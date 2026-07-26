@@ -126,3 +126,17 @@ test("assertIndependent throws only when author and adversary are the same model
   expect(() => assertIndependent("requirements", "glm", "claude")).not.toThrow();
   expect(() => assertIndependent("requirements", "claude", "claude")).toThrow(/independence violation/);
 });
+
+test("a REPLICA's unknown accountId points at Sync now, not at picking another account", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  store.adoptReplica({
+    rev: 5,
+    defaultId: "acct_hub",
+    entries: [{ id: "acct_hub", label: "hub-account", token: "sk-ant-oat01-hubpushed-9999", createdAt: 1 }],
+  });
+  expect(() => buildAgentEnv({ accounts: store, accountId: "acct_notyetpushed" })).toThrow(/sync now/i);
+  // ...whereas on a hub the same missing id really is gone.
+  const hub = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  hub.add("work", "sk-ant-oat01-workworkwork-1111");
+  expect(() => buildAgentEnv({ accounts: hub, accountId: "acct_gone" })).toThrow(/removed/i);
+});
