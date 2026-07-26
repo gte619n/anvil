@@ -1,6 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import type { rest, PermissionDecision } from "@protocol";
-import { checkAuth } from "../auth/guard";
+import { AccountStore, resolveAuthStatus } from "../auth/accounts";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
@@ -148,6 +148,10 @@ export interface ServerOptions {
   host?: string;
   port: number;
   stateDir: string;
+  /** The Claude account roster (multi-account §3). The real daemon (main.ts) constructs it before the
+   *  §3 guard so the boot migration runs first, and passes it in so there is exactly one instance per
+   *  process. Tests that don't care about accounts may omit it — one is constructed over `stateDir`. */
+  accounts?: AccountStore;
   /** Clone destination for repos added by git URL (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
   clonesDir?: string;
   warnFraction?: number;
@@ -169,6 +173,7 @@ export interface ServerOptions {
  */
 export function createServer(opts: ServerOptions): ServerHandle {
   const identity = loadServerIdentity(opts.stateDir);
+  const accounts = opts.accounts ?? new AccountStore(opts.stateDir);
   const fleet = new FleetStore(opts.stateDir);
   // Bind the degrade marker's home so a credential write from ANY path (a direct paste via
   // `setClaudeToken`, a pair, a rotation) clears it without threading a state dir through (§4.6).
@@ -183,6 +188,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     {
       stateDir: opts.stateDir,
       port: opts.port,
+      accounts,
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
@@ -374,7 +380,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
       if (req.method === "GET" && url.pathname === "/api/health") {
-        const auth = checkAuth();
+        const auth = resolveAuthStatus({ accounts });
         const body: rest.HealthResponse = {
           ok: true,
           // Honest now (§4.2): false for an absent token AND for an `sk-ant-api…` value. Note the daemon

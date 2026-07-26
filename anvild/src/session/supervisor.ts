@@ -90,6 +90,7 @@ import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type 
 import { resolveLapoConfig } from "../config";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
+import { AccountStore } from "../auth/accounts";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
@@ -144,6 +145,10 @@ const RECONCILE_WINDOW_DAYS = 60;
 
 export interface SupervisorConfig {
   stateDir: string;
+  /** The Claude account roster (multi-account §3). Passed in from `createServer()` so there is exactly
+   *  one `AccountStore` instance per process; constructed over `stateDir` when omitted (unit tests that
+   *  don't exercise accounts). */
+  accounts?: AccountStore;
   /** The tailnet-facing port (== ANVIL_PORT). Used to build this daemon's self-URL for deep links. */
   port?: number;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
@@ -247,6 +252,9 @@ export class Supervisor {
   /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
   private readonly devPipelineMetrics: AdversaryMetrics;
   private readonly stateDir: string;
+  /** The Claude account roster (multi-account §3). Exactly one instance per process — see
+   *  `SupervisorConfig.accounts`. */
+  readonly accounts: AccountStore;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
   readonly authDegrade!: AuthDegradeTracker;
@@ -263,6 +271,7 @@ export class Supervisor {
       provider: cfg.adversarialProvider,
     };
     this.stateDir = cfg.stateDir;
+    this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
     // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
