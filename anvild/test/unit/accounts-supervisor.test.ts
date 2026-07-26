@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
@@ -16,7 +16,7 @@ const createCmd = (cwd: string, accountId?: string) =>
 test("accountAdd/rename/replace/setDefault/remove all return a fresh roster snapshot", () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const added = sup.accountAdd("work", "sk-ant-oat01-workworkwork-1111");
   expect(added.accounts).toHaveLength(1);
   expect(added.defaultId).toBe(added.accounts[0]!.id);
@@ -41,7 +41,7 @@ test("accountAdd/rename/replace/setDefault/remove all return a fresh roster snap
 test("removing an in-use account falls its sessions back to the default and PRESERVES the old label", () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   accounts.setDefault(personal.id); // default is now "personal"; "work" is the one we'll remove
@@ -69,7 +69,7 @@ test("removing an in-use account falls its sessions back to the default and PRES
 test("accountsEvent's inUse map only lists ACTIVE (non-archived) sessions", () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const s = sup.create(createCmd(dir, a.id));
   expect(sup.accountsEvent().inUse?.[a.id]).toHaveLength(1);
@@ -82,7 +82,7 @@ test("a mutation on a replica throws BadCommand with AccountStore's message unch
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.adoptReplica({ rev: 1, defaultId: "acct_x", entries: [{ id: "acct_x", label: "work", token: "sk-ant-oat01-pushed-9999", createdAt: 1 }] });
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   expect(() => sup.accountAdd("local", "sk-ant-oat01-nope-0000")).toThrow(/replica/i);
   expect(() => sup.accountAdd("local", "sk-ant-oat01-nope-0000")).toThrow(BadCommand);
   rmSync(dir, { recursive: true, force: true });
@@ -95,7 +95,7 @@ test("a session bound to an account removed while the daemon was DOWN is reconci
   const accounts = new AccountStore(dir);
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   accounts.add("personal", "sk-ant-oat01-personalpers-2222");
-  const sup1 = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup1 = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup1.create(createCmd(dir, work.id));
   const sessionId = s.data.id;
 
@@ -116,7 +116,7 @@ test("a REPLICA never rewrites a session's binding on restore (the push may just
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
-  const sup1 = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup1 = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const sessionId = sup1.create(createCmd(dir, work.id)).data.id;
 
   // This machine becomes a member and adopts a roster that doesn't (yet) carry `work`.
@@ -131,5 +131,25 @@ test("a REPLICA never rewrites a session's binding on restore (the push may just
   const restored = sup2.get(sessionId)!;
   expect(restored.data.accountId).toBe(work.id); // binding preserved, NOT silently repointed
   expect(restored.data.accountMissing).toBeUndefined();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// Regression: a roster mutation mirrors the default into the launcher env file unconditionally. With
+// no `envFile` override that is the developer's REAL ~/.config/anvil/env, so `bun test` silently
+// overwrote their working Claude credential with a fixture token. Caught by hand on 2026-07-26 after
+// the suite clobbered a live machine. The override is now the only thing standing between the test
+// suite and every contributor's daemon.
+test("a roster mutation mirrors into the CONFIGURED env file, never the real one", () => {
+  const dir = tempState();
+  const envFile = join(dir, "env");
+  const accounts = new AccountStore(dir);
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile }, new ConnectionRegistry());
+
+  sup.accountAdd("work", "sk-ant-oat01-workworkwork-1111");
+
+  expect(existsSync(envFile)).toBe(true);
+  expect(readFileSync(envFile, "utf8")).toContain("sk-ant-oat01-workworkwork-1111");
+  // ...and the event's `persisted` flag reads back from that same file, not the real one.
+  expect(sup.accountsEvent().persisted).toBe(true);
   rmSync(dir, { recursive: true, force: true });
 });

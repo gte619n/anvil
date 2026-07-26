@@ -36,7 +36,7 @@ test("adding a NON-default account restarts no drivers", () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // default
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir, a.id));
   driversOf(sup).set(s.data.id, fakeDriver());
 
@@ -50,7 +50,7 @@ test("changing the default's token restarts idle sessions on the default", async
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // default
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir)); // no explicit accountId -> resolves to the default
   expect(s.data.accountId).toBe(a.id);
   const driver = fakeDriver();
@@ -69,7 +69,7 @@ test("a session pinned to an untouched account is not restarted", async () => {
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // default
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir, b.id)); // pinned to "personal"
   const driver = fakeDriver();
   driversOf(sup).set(s.data.id, driver);
@@ -87,7 +87,7 @@ test("a mid-turn session is left running and gets the existing message", async (
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir));
   expect(s.data.accountId).toBe(a.id);
   s.setStatus("thinking"); // mid-turn

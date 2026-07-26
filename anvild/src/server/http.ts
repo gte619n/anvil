@@ -152,6 +152,9 @@ export interface ServerOptions {
    *  §3 guard so the boot migration runs first, and passes it in so there is exactly one instance per
    *  process. Tests that don't care about accounts may omit it — one is constructed over `stateDir`. */
   accounts?: AccountStore;
+  /** Where the roster's default account is mirrored. Defaults to the real `~/.config/anvil/env`;
+   *  override in tests so the suite can't overwrite a developer's own Claude credential. */
+  envFile?: string;
   /** Clone destination for repos added by git URL (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
   clonesDir?: string;
   warnFraction?: number;
@@ -194,6 +197,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // which exist by the time a mutation can fire, but the function itself is hoisted below this
       // constructor call.
       onRosterChanged: (reason) => pushRosterInBackground(reason),
+      envFile: opts.envFile,
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,

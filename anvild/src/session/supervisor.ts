@@ -159,6 +159,11 @@ export interface SupervisorConfig {
   /** Replicate this hub's roster to its fleet members after a mutation (§7.3). Defined in http.ts,
    *  where the FleetStore lives; omitted in unit tests and on a machine with no members. */
   onRosterChanged?: (reason: string) => void;
+  /** Where the roster's default account is mirrored (multi-account §3.2). Defaults to the launcher's
+   *  real `~/.config/anvil/env`. Tests MUST override this: a roster mutation mirrors unconditionally,
+   *  so without an override `bun test` overwrites the developer's own Claude credential with a
+   *  fixture token. */
+  envFile?: string;
   /** The tailnet-facing port (== ANVIL_PORT). Used to build this daemon's self-URL for deep links. */
   port?: number;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
@@ -269,6 +274,7 @@ export class Supervisor {
   readonly accounts: AccountStore;
   private readonly pairedHub?: PairedHubStore;
   private readonly onRosterChanged?: (reason: string) => void;
+  private readonly envFile?: string;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
   readonly authDegrade!: AuthDegradeTracker;
@@ -288,6 +294,7 @@ export class Supervisor {
     this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
     this.pairedHub = cfg.pairedHub;
     this.onRosterChanged = cfg.onRosterChanged;
+    this.envFile = cfg.envFile;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
     // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
@@ -919,7 +926,7 @@ export class Supervisor {
       role: snap.role,
       ...(snap.role === "replica" && this.pairedHub?.get()?.hubServerId ? { hubServerId: this.pairedHub.get()!.hubServerId } : {}),
       accounts,
-      persisted: defaultPersisted(this.accounts),
+      persisted: defaultPersisted(this.accounts, this.envFile),
       ...(Object.keys(inUse).length ? { inUse } : {}),
     };
   }
@@ -937,7 +944,7 @@ export class Supervisor {
    *  one). Fire-and-forget, like every other credential-change call site (http.ts's pair/rotate
    *  handlers). */
   private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>, reason: string): AuthAccountsEvent {
-    mirrorDefault(this.accounts); // the ONLY place a roster change is written to the launcher env file
+    mirrorDefault(this.accounts, this.envFile); // the ONLY place a roster change is written to the launcher env file
     this.onRosterChanged?.(reason); // replicate to fleet members (§7.3); fire-and-forget, no-op on a leaf
     void this.restartIdleSessionsForNewToken(before);
     const event = this.accountsEvent(cid);

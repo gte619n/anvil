@@ -18,7 +18,7 @@ test("a new session stamps the roster default's id and label", () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir));
   expect(s.data.accountId).toBe(a.id);
   expect(s.data.accountLabel).toBe("work");
@@ -30,7 +30,7 @@ test("an explicit accountId on the command wins over the default", () => {
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir, { accountId: b.id }));
   expect(s.data.accountId).toBe(b.id);
   expect(s.data.accountLabel).toBe("personal");
@@ -41,14 +41,14 @@ test("an unresolvable accountId is rejected rather than silently defaulted", () 
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111");
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   expect(() => sup.create(createCmd(dir, { accountId: "acct_gone" }))).toThrow(BadCommand);
   rmSync(dir, { recursive: true, force: true });
 });
 
 test("an empty roster leaves accountId/accountLabel unset (pre-migration/dev)", () => {
   const dir = tempState();
-  const sup = new Supervisor({ stateDir: dir, accounts: new AccountStore(dir) }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts: new AccountStore(dir), envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup.create(createCmd(dir));
   expect(s.data.accountId).toBeUndefined();
   expect(s.data.accountLabel).toBeUndefined();
@@ -60,7 +60,7 @@ test("a new session inherits the ENVIRONMENT's account over the roster default (
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // roster default
   const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
-  const sup = new Supervisor({ stateDir: dir, accounts }, new ConnectionRegistry());
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
 
   // addEnvironment insists on a real git repo and returns void, so go through the store the
   // supervisor already holds — this test is about accountId resolution, not env creation.

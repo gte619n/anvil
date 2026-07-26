@@ -62,7 +62,7 @@ const stamp = (o: object): string => JSON.stringify({ v: PROTOCOL_VERSION, ts: "
 test("an uploaded image survives the wire: shows in message.user AND reaches Claude", async () => {
   captured.length = 0;
   const dir = mkdtempSync(join(tmpdir(), "anvil-att-"));
-  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir, accounts: seededAccounts(dir) });
+  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir, accounts: seededAccounts(dir), envFile: join(dir, "env") });
   const base = `http://127.0.0.1:${srv.port}`;
 
   try {
@@ -130,7 +130,7 @@ test("an uploaded image survives the wire: shows in message.user AND reaches Cla
 test("a non-image file attachment lands in the chat AND its contents reach Claude as text", async () => {
   captured.length = 0;
   const dir = mkdtempSync(join(tmpdir(), "anvil-att-"));
-  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir, accounts: seededAccounts(dir) });
+  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir, accounts: seededAccounts(dir), envFile: join(dir, "env") });
   const base = `http://127.0.0.1:${srv.port}`;
 
   try {
