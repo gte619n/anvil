@@ -18,7 +18,7 @@ vanilla-TS web client (`anvild/web/`), the wire protocol at `anvild/protocol.ts`
 **Design source:** `docs/plans/2026-07-25-multi-account-tokens-design.md` (revision 2, approved
 2026-07-26).
 
-**Branch / worktree:** all work happens in `~/.anvil/worktrees/multi-account-tokens` on
+**Branch / worktree:** all work happens in `~/anvil/.claude/worktrees/multi-account-tokens` on
 `design/multi-account-tokens`, branched from `origin/main` at `507b243`.
 
 ---
@@ -36,7 +36,7 @@ This plan follows the house convention from `anvil-team-support-plan.md`:
 **Verify before every commit** (all four are CI gates):
 
 ```bash
-cd ~/.anvil/worktrees/multi-account-tokens/anvild
+cd ~/anvil/.claude/worktrees/multi-account-tokens/anvild
 bunx tsc --noEmit && bun run typecheck:web && bun run build:web && bun test
 ```
 
@@ -110,7 +110,7 @@ This cannot be automated — it needs two real Claude subscription tokens.
 **Step 1: Set up**
 
 ```bash
-cd ~/.anvil/worktrees/multi-account-tokens/anvild
+cd ~/anvil/.claude/worktrees/multi-account-tokens/anvild
 # Terminal A: token A in ~/.config/anvil/env, start the daemon, create a session, run 2-3 turns.
 # Note the session's claudeSessionId from ~/.anvil/sessions.json.
 ```
