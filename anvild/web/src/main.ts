@@ -4507,6 +4507,28 @@ async function saveSchedule(): Promise<void> {
 }
 
 /** One card per server in the fleet (hub first): live status, version, update & remove. */
+/**
+ * Per-Mac account-roster sync state (multi-account §7.3), shown under each server card. Compares the
+ * rev the HUB last confirmed pushing to that member against the hub's current rev.
+ *
+ * Rendered only once the roster is actually multi-account and we're looking at a fleet: on a
+ * standalone box, or with a single account, there's nothing to be out of sync about and the line is
+ * pure noise. A member that doesn't advertise "accounts" is called out separately — "Sync now" can
+ * never fix that one, only updating Anvil on that Mac can.
+ */
+function accountSyncLine(srv: Server, isHub: boolean): string {
+  const roster = claudeAccounts;
+  if (!roster || roster.accounts.length <= 1) return "";
+  const n = roster.accounts.length;
+  if (isHub) return `<div class="small muted">${icon("key")} ${n} Claude accounts · managed here</div>`;
+  if (srv.capabilities && !serverSupports(srv, "accounts")) {
+    return `<div class="small warn-text">${icon("warning")} Update Anvil to use multiple accounts</div>`;
+  }
+  const rev = srv.id ? fleetMemberAccountsRev.get(srv.id) : undefined;
+  if (rev === roster.rev) return `<div class="small muted">${icon("check")} in sync · ${n} accounts</div>`;
+  return `<div class="small warn-text">${icon("warning")} out of date — press Sync now</div>`;
+}
+
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
   const id = cssId(srv.url);
@@ -4520,6 +4542,7 @@ function serverCardHtml(srv: Server): string {
     ${removeX}
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
+    ${accountSyncLine(srv, isHub)}
     <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
     <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
@@ -4532,7 +4555,7 @@ function renderServerCards(): void {
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
   host.innerHTML =
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
-    `<button id="fleet-rotate" class="mini" title="Push the current login to every machine in the fleet">${icon("autorenew")} Update token</button>` +
+    `<button id="fleet-rotate" class="mini" title="Push the current login and Claude accounts to every machine in the fleet">${icon("autorenew")} Sync now</button>` +
     `<button id="fleet-add" class="mini primary">${icon("add")} Add a machine</button>` +
     `</div></div>` +
     `<p class="small muted">Every machine here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
@@ -4593,10 +4616,14 @@ function renderServerCards(): void {
 }
 // ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
 // All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
-interface FleetMember { serverId: string; serverName: string; host: string; url: string }
+interface FleetMember { serverId: string; serverName: string; host: string; url: string; accountsRev?: number }
 // host → serverId for every Mac the hub knows as a fleet member. Lets a server card's "Remove" also
 // eject that Mac from the fleet (the old separate "Forget" action), so there's one button, not two.
 const fleetMemberIdByHost = new Map<string, string>();
+/** Each member's last-confirmed account-roster `rev`, by serverId (multi-account §7.3). Absent ⇒ the
+ *  hub has never confirmed a roster push to it — either it predates the "accounts" capability, or
+ *  every push so far failed. Populated by {@link loadFleetMembers} from the hub's /api/fleet/members. */
+const fleetMemberAccountsRev = new Map<string, number | undefined>();
 
 /** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
 async function rotateFleetToken(): Promise<void> {
@@ -4617,6 +4644,7 @@ async function rotateFleetToken(): Promise<void> {
     }
     const okN = r.results.filter((x) => x.ok).length;
     toast(`Updated ${okN}/${r.results.length} Macs.`);
+    void loadFleetMembers(); // re-read each member's accountsRev so the per-card sync badges refresh
   } catch { toast("Couldn't push the login — is the hub reachable?"); }
 }
 
@@ -4816,8 +4844,11 @@ async function loadFleetMembers(): Promise<void> {
   try {
     const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
     fleetMemberIdByHost.clear();
+    const revsBefore = JSON.stringify([...fleetMemberAccountsRev]);
+    fleetMemberAccountsRev.clear();
     let adopted = false;
     for (const m of members) {
+      fleetMemberAccountsRev.set(m.serverId, m.accountsRev);
       // Index under the bare host AND the url's hostname: with MagicDNS off the url can be healed to a
       // raw tailnet IP while `host` stays the (now-unresolvable) name, so a card adopted under either
       // form still maps back to the member for Remove.
@@ -4837,7 +4868,10 @@ async function loadFleetMembers(): Promise<void> {
         adopted = true;
       }
     }
-    if (adopted && document.getElementById("server-cards")) renderServerCards();
+    // Re-render on a NEW member (adopted) or when any member's roster rev moved — the per-card sync
+    // badge is derived from those revs, so without this it stays stale until the next unrelated render.
+    const revsChanged = revsBefore !== JSON.stringify([...fleetMemberAccountsRev]);
+    if ((adopted || revsChanged) && document.getElementById("server-cards")) renderServerCards();
   } catch {
     /* hub unreachable — cards still render from the locally-known servers */
   }
