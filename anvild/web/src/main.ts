@@ -4516,11 +4516,24 @@ async function saveSchedule(): Promise<void> {
  * pure noise. A member that doesn't advertise "accounts" is called out separately — "Sync now" can
  * never fix that one, only updating Anvil on that Mac can.
  */
-function accountSyncLine(srv: Server, isHub: boolean): string {
+function accountSyncLine(srv: Server, isOrigin: boolean): string {
   const roster = claudeAccounts;
   if (!roster || roster.accounts.length <= 1) return "";
   const n = roster.accounts.length;
-  if (isHub) return `<div class="small muted">${icon("key")} ${n} Claude accounts · managed here</div>`;
+  // `isOrigin` means "this card is the page's own daemon" — NOT "this daemon owns the roster". A
+  // MEMBER viewing its own UI is the origin while holding a read-only replica, so conflating the two
+  // made its card claim "managed here" directly above the card explaining the accounts are managed on
+  // the hub and read-only here. The roster's own `role` is the authority.
+  if (isOrigin) {
+    if (roster.role !== "replica") return `<div class="small muted">${icon("key")} ${n} Claude accounts · managed here</div>`;
+    const owner = roster.hubServerId ? serverNameById(roster.hubServerId) : "";
+    const named = owner && owner !== roster.hubServerId ? ` · managed on ${esc(owner)}` : "";
+    return `<div class="small muted">${icon("key")} ${n} Claude accounts · read-only replica${named}</div>`;
+  }
+  // Per-member sync state is only meaningful on the roster OWNER: the rev map is read from this
+  // origin's own /api/fleet/members, which a replica doesn't have. Showing a badge from a member's
+  // page would report "out of date" about servers it neither tracks nor pushes to.
+  if (roster.role === "replica") return "";
   if (srv.capabilities && !serverSupports(srv, "accounts")) {
     return `<div class="small warn-text">${icon("warning")} Update Anvil to use multiple accounts</div>`;
   }
