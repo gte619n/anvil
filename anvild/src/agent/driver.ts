@@ -33,6 +33,26 @@ function fmtTokens(n: number): string {
 }
 
 /**
+ * Best-effort detection of a `--resume` rejected by the CLI/SDK (multi-account §5.3/Task 1 spike).
+ * The 2026-07-26 spike found cross-account resume actually SUCCEEDS for the two accounts tested, so
+ * this path is the rare/defensive case, not the common one — but a revoked/expired session, a
+ * deleted conversation on Anthropic's side, or some other account pairing could still hit it, and an
+ * opaque crash there would be a much worse experience than a friendly "started a fresh context".
+ * Matches on the shape Claude Code's CLI is documented to use for a missing/foreign session id
+ * ("session not found/does not exist") plus generic auth-rejection wording, rather than a single
+ * exact string — refine this pattern if Task 34's real acceptance run ever observes the actual text.
+ */
+export function isResumeRejectedError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return (
+    msg.includes("no conversation") ||
+    (msg.includes("session") && (msg.includes("not found") || msg.includes("does not exist"))) ||
+    msg.includes("unauthorized") ||
+    msg.includes("forbidden")
+  );
+}
+
+/**
  * Drives one Claude Code session via the Agent SDK in streaming-input mode (arch §2).
  * One long-lived `query()` for the session's life; pushes user turns into an InputQueue;
  * the consume loop maps `SDKMessage`s → session events. (impl plan 1 §4.4)
@@ -40,6 +60,8 @@ function fmtTokens(n: number): string {
 export class AgentDriver {
   private readonly input = new InputQueue();
   private q: Query | undefined;
+  /** Whether the CURRENT `this.q` was started with a `resume` id — see `ensureStarted()`. */
+  private startedWithResume = false;
 
   /** tool_use ids of in-flight AskUserQuestions — their tool.result (answers echo) is dropped. */
   private readonly askQuestionIds = new Set<string>();
@@ -157,6 +179,10 @@ export class AgentDriver {
   private ensureStarted(): void {
     if (this.q) return;
     const s = this.session;
+    // Captured so the catch in consume() can tell "this query attempted a resume" from "this was
+    // already a fresh start" — claudeSessionId may be cleared mid-run (extractSessionId/newTopic)
+    // before the error actually surfaces (multi-account §5.3, Task 23).
+    this.startedWithResume = !!s.data.claudeSessionId;
     this.q = this.queryFn({
       prompt: this.input,
       options: {
@@ -318,7 +344,25 @@ export class AgentDriver {
         }
       }
     } catch (e) {
-      this.session.emitError(e instanceof Error ? e.message : String(e), false);
+      if (this.startedWithResume && isResumeRejectedError(e)) {
+        // Same fallback as session.new_topic (§5.3/Task 23): forget the prior topic so the NEXT prompt
+        // starts a fresh context instead of retrying the same rejected resume forever. Friendly divider
+        // instead of the raw SDK error — this is an account-switch side effect, not a real failure.
+        this.session.data.claudeSessionId = undefined;
+        this.session.data.context = undefined;
+        this.session.emit({
+          type: "assistant.message",
+          blocks: [
+            {
+              kind: "divider",
+              label: "Started a fresh context",
+              note: "Couldn't carry the conversation across accounts — started a fresh context. Your worktree and files are untouched.",
+            },
+          ],
+        });
+      } else {
+        this.session.emitError(e instanceof Error ? e.message : String(e), false);
+      }
       this.onTurnError?.(e);
     } finally {
       // [BE-3] End-of-run cleanup. The consume loop only exits when the session ends (input closed
