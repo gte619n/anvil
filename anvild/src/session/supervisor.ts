@@ -511,6 +511,7 @@ export class Supervisor {
       icon?: string;
       todoistProjectId?: string | null;
       validation?: EnvironmentValidation | null;
+      accountId?: string | null;
     },
   ): void {
     this.envStore.update(id, fields);
@@ -1486,7 +1487,7 @@ export class Supervisor {
     const planned = await planUnit(
       { title: u.title, rationale: u.rationale ?? "", taskIds: tasks.map((t) => t.id) },
       tasks,
-      { repoRoot: env.repoRoot },
+      { repoRoot: env.repoRoot, accounts: this.accounts, ...(env.accountId ? { accountId: env.accountId } : {}) },
     );
     const updated = this.workUnits.update(u.id, {
       environmentId: env.id,
@@ -1777,7 +1778,10 @@ export class Supervisor {
     let started = 0;
     try {
       for (const env of envs) {
-        emit(`▸ ${env.name}`);
+        // Name the Claude account the run bills to, so the report/log says whose subscription paid
+        // for an unattended run rather than leaving it to be inferred (§6).
+        const envAcct = this.accounts.labelOf(env.accountId ?? this.accounts.defaultId());
+        emit(`▸ ${env.name}${envAcct ? ` · account: ${envAcct}` : ""}`);
         const res = await planAndTagProject(deps, {
           environmentId: env.id,
           projectId: env.todoistProjectId!,
@@ -1787,6 +1791,9 @@ export class Supervisor {
           signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
+          // Unattended runs bill to the environment's chosen account, else the roster default (§6).
+          accounts: this.accounts,
+          ...(env.accountId ? { accountId: env.accountId } : {}),
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
@@ -1794,7 +1801,8 @@ export class Supervisor {
       // Account-wide label pass: pull every @<label> task, drop those a linked project already covers
       // (coexist + dedup), and plan the rest against the catch-all env. These are review-only (below).
       if (labelPass && defaultEnv && schedule.label) {
-        emit(`▸ @${schedule.label} → ${defaultEnv.name}`);
+        const labelAcct = this.accounts.labelOf(defaultEnv.accountId ?? this.accounts.defaultId());
+        emit(`▸ @${schedule.label} → ${defaultEnv.name}${labelAcct ? ` · account: ${labelAcct}` : ""}`);
         const linkedProjectIds = new Set(
           this.envStore.list().map((e) => e.todoistProjectId).filter((id): id is string => !!id),
         );
@@ -1810,6 +1818,8 @@ export class Supervisor {
           signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
+          accounts: this.accounts,
+          ...(defaultEnv.accountId ? { accountId: defaultEnv.accountId } : {}),
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;

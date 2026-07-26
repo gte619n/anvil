@@ -1167,6 +1167,7 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
   icon?: string; // Material Symbols name; "" clears it (back to the default by repo kind)
   todoistProjectId?: string; // link to a Todoist project; "" unlinks
   validation?: EnvironmentValidation | null; // null clears the validation gate
+  accountId?: string; // default Claude account for this environment; "" clears it (roster default)
 }
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";

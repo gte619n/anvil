@@ -246,6 +246,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           icon: cmd.icon,
           todoistProjectId: cmd.todoistProjectId,
           validation: cmd.validation,
+          accountId: cmd.accountId,
         });
         if (cid) send(ack(cid));
         return;

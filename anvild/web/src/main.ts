@@ -6229,6 +6229,21 @@ const ADVERSARIAL_PICKER = `<label class="cd-option"><input type="checkbox" id="
 const selectedAdversarial = (): boolean =>
   (document.getElementById("ns-adv") as HTMLInputElement | null)?.checked ?? false;
 
+/** The Claude account picker for the ENVIRONMENT edit dialog (multi-account §6). Like the
+ *  new-session one, hidden entirely at ≤1 account. Offers an explicit "use the default" entry, since
+ *  an environment's account is genuinely optional — unset means "follow the roster default", which
+ *  keeps tracking it if the default later moves. */
+function envAccountPickerMarkup(selected?: string): string {
+  const list = claudeAccounts?.accounts ?? [];
+  if (list.length <= 1) return "";
+  const opts = [
+    `<option value=""${selected ? "" : " selected"}>Use the default account</option>`,
+    ...list.map((a) => `<option value="${esc(a.id)}"${a.id === selected ? " selected" : ""}>${esc(a.label)}</option>`),
+  ].join("");
+  return `<label>Claude account<div class="env-row"><select id="ee-account">${opts}</select></div>
+    <span class="small muted">Used for scheduled autopilot runs, and pre-selected for new sessions here.</span></label>`;
+}
+
 /** The Claude account picker for the new-session dialog (multi-account §5). Hidden entirely when the
  *  roster has ≤1 account — there's nothing to choose. */
 function accountPickerMarkup(): string {
@@ -6592,12 +6607,14 @@ function showEditEnvironment(id: string): void {
       <select id="ee-todoist">${projectOptions}</select>
     </label>
     ${todoistConnected ? "" : `<p class="small muted">Connect Todoist (Settings → Todoist) to link a project.</p>`}
+    ${envAccountPickerMarkup(env.accountId)}
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
   wireSwatchPicker();
   wireIconPicker();
   enhanceSelect(document.getElementById("ee-todoist") as HTMLSelectElement | null, true);
+  enhanceSelect(document.getElementById("ee-account") as HTMLSelectElement | null);
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
@@ -6619,6 +6636,9 @@ function showEditEnvironment(id: string): void {
       color: selectedSwatch(),
       icon: selectedIcon(), // "" resets to the default by repo kind
       todoistProjectId: $<HTMLSelectElement>("#ee-todoist").value, // "" unlinks
+      // Omitted entirely when the picker isn't rendered (<=1 account), so a single-account fleet can
+      // never accidentally clear a stored accountId. "" clears it back to the roster default.
+      ...(document.getElementById("ee-account") ? { accountId: $<HTMLSelectElement>("#ee-account").value } : {}),
       // validation gate omitted: autopilot doesn't auto-build/PR yet. Omitting the field preserves
       // any stored value (env.update only writes validation when it's present).
     });
