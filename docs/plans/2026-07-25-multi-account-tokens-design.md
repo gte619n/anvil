@@ -821,6 +821,10 @@ exception, and the divider copy is adjusted to say so plainly.
 | 6 | Hub identity, **client-side only**: derive `role`/`hubServerId` in `server.hello`, route roster writes by `serverId`, adopt-your-hub card from a member origin, replace the `0/0` toast. *(`PairedHubStore` already persists the hub — nothing new server-side)* | pending | no | no |
 | 7 | Replication: `accounts?` on `FleetPairRequest`/`FleetTokenRequest`, the `adoptCredentials()` branch, `GET /api/fleet/accounts`, auto-push on mutation and pair, per-member `rev`, Servers-tab sync state + Sync now, `accounts`-capability tiering. *(no new write endpoint; inherits the existing gate + transport routing)* | pending | no | no |
 | 8 | Environment `accountId` + autopilot resolution + autopilot report line | pending | no | no |
-| 9 | Docs: `SECURITY.md` blast-radius note, `anvil-multi-server.md` MS-2 superseded, `README`/`anvild/README` token setup | pending | no | no |
+| 9 | **User E2E acceptance** — a real second subscription, a real mid-session switch, a real member Mac. Hard pause; nothing below starts until it reports back | pending | no | no |
+| 10 | Fix everything phase 9 surfaced; amend this design in the same commit if a finding invalidates a decision | pending | no | no |
+| 11 | Docs: `SECURITY.md` blast-radius note, `anvil-multi-server.md` MS-2 superseded, `README`/`anvild/README` token setup | pending | no | no |
 
 Phases 1–5 are a complete, shippable single-server feature. Phases 6–8 layer the fleet on top.
+Phases 9–11 are acceptance and ship; **phase 9 is a hard pause** — no code gate can exercise a second
+real subscription, a real mid-session switch, or a real member Mac.
