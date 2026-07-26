@@ -2702,6 +2702,26 @@ export class Supervisor {
     this.broadcastUpdated(s.data);
   }
 
+  /** Rebind an IDLE session to another Claude account (multi-account §5.3/§10). Refused mid-turn — the
+   *  wording deliberately mirrors `restartIdleSessionsForNewToken()`'s existing message so both paths
+   *  read as one behaviour. `claudeSessionId` is untouched, so the SDK's `--resume` (or the Task 23
+   *  fresh-context fallback if that's rejected) decides what happens to the conversation. */
+  async setSessionAccount(id: string, accountId: string): Promise<void> {
+    const s = this.require(id);
+    const acct = this.accounts.get(accountId);
+    if (!acct) throw new BadCommand(`unknown Claude account ${accountId}`);
+    if (s.data.status !== "idle") {
+      throw new BadCommand("this session is mid-turn — finish or interrupt the turn, and the new login applies from the next one");
+    }
+    s.data.accountId = accountId;
+    s.data.accountLabel = acct.label;
+    delete s.data.accountMissing;
+    await this.restartDriverForNewToken(id);
+    this.persist();
+    this.broadcastUpdated(s.data);
+    s.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(`🔑 _Switched to **${acct.label}**._`) }] });
+  }
+
   /**
    * The ExitPlanMode hook for a session: run the adversarial panel over the plan the model is about to
    * commit to, and surface its verdict as an assistant message before execution. Advisory only — it

@@ -137,6 +137,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "session.account.set":
+        deps.supervisor
+          .setSessionAccount(cmd.sessionId, cmd.accountId)
+          .then(() => {
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "session.set_autonomy":
         deps.supervisor.setAutonomy(cmd.sessionId, cmd.policy);
         if (cid) send(ack(cid));
