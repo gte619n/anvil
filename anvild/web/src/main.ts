@@ -38,7 +38,9 @@ const b64ToBytes = (b64: string): Uint8Array => {
 };
 import { MODELS, modelLabel, type Model } from "../../protocol";
 import type {
+  AccountInfo,
   AttachmentRef,
+  AuthAccountsEvent,
   AuthStatusEvent,
   AutopilotPlanInfo,
   PipelineTraceInfo,
@@ -935,6 +937,10 @@ function onEvent(url: string, e: ServerEvent): void {
       // Model-provider auth is hub-scoped (the token lives on the hub daemon; the Models card routes
       // to hub()). Ignore a fleet member's own status so it can't clobber the hub's.
       if (url === HUB_URL) onAuthStatus(e);
+      return;
+    case "auth.accounts":
+      // Same hub-scoping as auth.status for now — Task 26/27 route this by fleet role instead.
+      if (url === HUB_URL) onAuthAccounts(e);
       return;
     case "autopilot.maintenance.result":
       return; // resolved via cidWaiter (resetAnvilTags / clearAutopilot)
@@ -2794,6 +2800,7 @@ function selectSettingsTab(tab: SettingsTab): void {
       hub().sock.send({ type: "auth.status", provider: "openrouter" });
       hub().sock.send({ type: "autopilot.pipeline.metrics" }); // §6.3 calibration card
     }
+    if (serverSupports(hub(), "accounts")) hub().sock.send({ type: "auth.accounts.get" }); // refresh the roster once per tab open
   }
 }
 
@@ -3144,6 +3151,15 @@ function onAuthStatus(e: AuthStatusEvent): void {
   if (e.provider !== "openrouter") void refreshSetupState();
 }
 
+// The Claude account roster (Settings → Models; multi-account §9). Absent until the connect burst or
+// an explicit auth.accounts.get lands. A pre-roster daemon (no "accounts" capability) never sends
+// this, so renderModelsPanel falls back to the single-token card in that case.
+let claudeAccounts: AuthAccountsEvent | undefined;
+function onAuthAccounts(e: AuthAccountsEvent): void {
+  claudeAccounts = e;
+  if (document.getElementById("models-panel")) renderModelsPanel();
+}
+
 /** Persist a new/replacement Claude OAuth token on the hub daemon. */
 async function saveClaudeToken(token: string, btn?: HTMLButtonElement): Promise<void> {
   const t = token.trim();
@@ -3274,17 +3290,10 @@ function renderModelsPanel(): void {
     persisted
       ? ""
       : `<p class="small muted" style="margin-top:8px">${icon("warning")} Not written to the launcher env file — it will revert on the next service restart.</p>`;
-  // ── Claude (drives the Agent SDK) ──
-  const claudeSection = !claudeAuth.connected
-    ? `<div class="card"><b>No Claude token set.</b>
-        <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
-        ${tokenForm("Save")}</div>`
-    : `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
-          <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
-          <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(claudeAuth.persisted)}</div>
-        <div class="card"><b>Replace token</b>
-          <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
-          ${tokenForm("Replace")}</div>`;
+  // ── Claude (drives the Agent SDK) — the roster list when the hub supports it, else the single-token
+  //    card an older daemon still understands. ──
+  const claudeSection =
+    serverSupports(hub(), "accounts") && claudeAccounts ? accountsSection(claudeAccounts, persistWarn) : legacyClaudeSection(tokenForm, persistWarn);
   // ── OpenRouter (drives the adversarial multi-model planning panel) ──
   const orForm = (saveLabel: string): string => `<div class="todoist-connect">
       <input id="or-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenRouter API key (sk-or-…)" />
@@ -3307,14 +3316,18 @@ function renderModelsPanel(): void {
   }
   host.innerHTML = `${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
 
-  // Wire Claude controls.
-  if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
-  const cInput = $<HTMLInputElement>("#claude-token");
-  const cBtn = $<HTMLButtonElement>("#claude-save");
-  cBtn.addEventListener("click", () => void saveClaudeToken(cInput.value, cBtn));
-  cInput.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") void saveClaudeToken(cInput.value, cBtn);
-  });
+  // Wire Claude controls: the roster's own row/menu/dialog handlers, or the legacy single-token form.
+  if (serverSupports(hub(), "accounts") && claudeAccounts) {
+    wireAccountsSection(claudeAccounts);
+  } else {
+    if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
+    const cInput = $<HTMLInputElement>("#claude-token");
+    const cBtn = $<HTMLButtonElement>("#claude-save");
+    cBtn.addEventListener("click", () => void saveClaudeToken(cInput.value, cBtn));
+    cInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") void saveClaudeToken(cInput.value, cBtn);
+    });
+  }
   // Wire OpenRouter controls (present unless its status is still loading).
   if (openRouterAuth) {
     if (openRouterAuth.connected) $("#or-clear").addEventListener("click", () => void clearOpenRouterKeyUi());
@@ -3326,6 +3339,189 @@ function renderModelsPanel(): void {
     });
   }
 }
+
+/** The pre-roster single-token card (an older daemon that doesn't advertise "accounts"). */
+function legacyClaudeSection(tokenForm: (saveLabel: string) => string, persistWarn: (persisted: boolean) => string): string {
+  if (!claudeAuth) return "";
+  return !claudeAuth.connected
+    ? `<div class="card"><b>No Claude token set.</b>
+        <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
+        ${tokenForm("Save")}</div>`
+    : `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+          <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
+          <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(claudeAuth.persisted)}</div>
+        <div class="card"><b>Replace token</b>
+          <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
+          ${tokenForm("Replace")}</div>`;
+}
+
+/** This server's display name, given its serverId — for the "managed on <hub>" replica note.
+ *  Falls back to the bare id when the hub isn't among the connected servers (Task 26/27 make this a
+ *  real lookup via rosterServer(); until then this is best-effort). */
+function serverNameById(id: string | undefined): string {
+  if (!id) return "the hub";
+  for (const s of servers.values()) if (s.id === id) return s.name;
+  return id;
+}
+
+/** The Claude account roster card (multi-account §9.1): a labelled list with a default marker, an
+ *  Add-account action on the hub, and — on a replica — a note pointing at the hub that manages it. */
+function accountsSection(acc: AuthAccountsEvent, persistWarn: (persisted: boolean) => string): string {
+  const isHub = acc.role === "hub";
+  const rows = acc.accounts
+    .map((a: AccountInfo) => {
+      const isDefault = a.id === acc.defaultId;
+      const defaultBtn = isHub
+        ? `<button class="mini acct-default" data-id="${esc(a.id)}" title="${isDefault ? "Default account" : "Make default"}" ${isDefault ? "disabled" : ""}>${icon(isDefault ? "radio_button_checked" : "radio_button_unchecked")}</button>`
+        : `<span class="mini" style="opacity:.6" title="${isDefault ? "Default account" : ""}">${icon(isDefault ? "radio_button_checked" : "radio_button_unchecked")}</span>`;
+      const menu = isHub
+        ? `<button class="mini acct-menu" data-id="${esc(a.id)}" data-label="${esc(a.label)}" title="More">${icon("more_vert")}</button>`
+        : "";
+      return `<div class="acct-row" id="acct-row-${cssId(a.id)}">
+          <div class="card-main">${defaultBtn}<span class="acct-label">${esc(a.label)}</span><code class="small muted">${esc(a.masked)}</code><span style="margin-left:auto"></span>${menu}</div>
+          <div class="acct-actions" id="acct-actions-${cssId(a.id)}" hidden></div>
+        </div>`;
+    })
+    .join("");
+  const replicaNote = isHub
+    ? ""
+    : `<p class="small muted" style="margin-top:8px">${icon("hub")} Managed on <b>${esc(serverNameById(acc.hubServerId))}</b> (the hub). Changes sync to every Mac.</p>`;
+  const addBtn = isHub ? `<div class="git-row" style="margin-top:10px"><button class="mini" id="acct-add">${icon("add")} Add account</button></div>` : "";
+  return `<div class="card"><b>Claude accounts</b>
+      <div class="acct-list" style="margin-top:8px">${rows}</div>
+      ${replicaNote}${persistWarn(acc.persisted)}${addBtn}
+    </div>`;
+}
+
+/** Toggle a roster row's inline action strip (Rename / Replace token / Set default / Remove) — the
+ *  "⋯" menu, implemented as an expand/collapse row rather than a floating popover (no popover
+ *  infrastructure exists elsewhere in this codebase, and this keeps focus/keyboard behaviour simple). */
+function toggleAccountActions(id: string, label: string): void {
+  const el = document.getElementById(`acct-actions-${cssId(id)}`);
+  if (!el) return;
+  const wasHidden = el.hidden;
+  // Only one row's actions open at a time.
+  document.querySelectorAll(".acct-actions").forEach((n) => ((n as HTMLElement).hidden = true));
+  if (!wasHidden) return;
+  el.hidden = false;
+  el.innerHTML = `<div class="git-row">
+      <button class="mini" data-act="rename">${icon("edit")} Rename</button>
+      <button class="mini" data-act="replace">${icon("key")} Replace token</button>
+      <button class="mini" data-act="default">${icon("radio_button_checked")} Set default</button>
+      <button class="mini danger" data-act="remove">${icon("delete")} Remove</button>
+    </div>`;
+  el.querySelector('[data-act="rename"]')?.addEventListener("click", () => showAccountDialog({ mode: "rename", id, label }));
+  el.querySelector('[data-act="replace"]')?.addEventListener("click", () => showAccountDialog({ mode: "replace", id, label }));
+  el.querySelector('[data-act="default"]')?.addEventListener("click", () => void setDefaultAccount(id));
+  el.querySelector('[data-act="remove"]')?.addEventListener("click", () => void removeAccountUi(id, label));
+}
+
+function wireAccountsSection(acc: AuthAccountsEvent): void {
+  document.getElementById("acct-add")?.addEventListener("click", () => showAccountDialog({ mode: "add" }));
+  document.querySelectorAll<HTMLButtonElement>(".acct-default").forEach((btn) => {
+    btn.addEventListener("click", () => void setDefaultAccount(btn.dataset.id!));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".acct-menu").forEach((btn) => {
+    btn.addEventListener("click", () => toggleAccountActions(btn.dataset.id!, btn.dataset.label ?? ""));
+  });
+  void acc; // acc is read via the DOM data- attributes above; kept as a param for symmetry with the render call
+}
+
+/** Send one `auth.account.*` command to the hub and await its `auth.accounts` reply (or a
+ *  `command.error`, surfaced as a toast). Returns true on success. */
+async function sendAccountCmd(cmd: Record<string, unknown> & { type: string }): Promise<boolean> {
+  try {
+    const res = await sendAwait(hub(), { ...cmd, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    toast(`Couldn't reach the hub: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+async function setDefaultAccount(accountId: string): Promise<void> {
+  await sendAccountCmd({ type: "auth.account.default", accountId });
+}
+
+async function removeAccountUi(accountId: string, label: string): Promise<void> {
+  const inUse = claudeAccounts?.inUse?.[accountId] ?? [];
+  const body =
+    inUse.length === 0
+      ? `Remove “${label}”? Any session bound to it falls back to the default account.`
+      : `“${label}” is in use by ${inUse.length} session${inUse.length === 1 ? "" : "s"}: ${inUse.map((s) => s.title).join(", ")}. Removing it falls those sessions back to the default account.`;
+  const ok = await confirmDialog({ icon: "delete", title: `Remove “${label}”?`, body, confirmLabel: "Remove", danger: true });
+  if (!ok) return;
+  if (await sendAccountCmd({ type: "auth.account.remove", accountId })) toast(`Removed “${label}”.`);
+}
+
+/** The Add/Rename/Replace-token dialog (multi-account §9.1) — one dialog, three modes, since Rename
+ *  and Replace are each a single field of the same form Add uses. */
+function showAccountDialog(opts: { mode: "add" } | { mode: "rename"; id: string; label: string } | { mode: "replace"; id: string; label: string }): void {
+  const host = hub().name;
+  const setupHint = `<p class="small muted">On <code>${esc(host)}</code> run <code>claude setup-token</code>, then paste it below.</p>`;
+  const title = opts.mode === "add" ? "Add a Claude account" : opts.mode === "rename" ? `Rename “${opts.label}”` : `Replace “${opts.label}”'s token`;
+  const showLabel = opts.mode !== "replace";
+  const showToken = opts.mode !== "rename";
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon(opts.mode === "add" ? "add" : opts.mode === "rename" ? "edit" : "key")} ${esc(title)}</h3>
+    ${showLabel ? `<label>Label<input id="acct-dlg-label" type="text" maxlength="32" placeholder="e.g. work, personal" value="${opts.mode === "rename" ? esc(opts.label) : ""}" /></label>` : ""}
+    ${showToken ? `${setupHint}<label>Token<input id="acct-dlg-token" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-oat…" /></label>` : ""}
+    <div id="acct-dlg-status" class="small muted"></div>
+    <div class="btns"><button type="button" id="acct-dlg-cancel">Cancel</button><button type="button" id="acct-dlg-ok" class="primary">${opts.mode === "add" ? "Add" : "Save"}</button></div>
+  </div>`;
+  showModal(m);
+  const setStatus = (t: string): void => {
+    const el = document.getElementById("acct-dlg-status");
+    if (el) el.textContent = t;
+  };
+  $<HTMLButtonElement>("#acct-dlg-cancel").onclick = closeModal;
+  const labelInput = document.getElementById("acct-dlg-label") as HTMLInputElement | null;
+  const tokenInput = document.getElementById("acct-dlg-token") as HTMLInputElement | null;
+  labelInput?.focus();
+  tokenInput?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $<HTMLButtonElement>("#acct-dlg-ok").click();
+  });
+  $<HTMLButtonElement>("#acct-dlg-ok").addEventListener("click", async () => {
+    const label = labelInput?.value.trim() ?? "";
+    const token = tokenInput?.value.trim() ?? "";
+    if (showLabel && !label) {
+      setStatus("Enter a label.");
+      return;
+    }
+    if (showToken && !token) {
+      setStatus("Paste the token.");
+      return;
+    }
+    const btn = $<HTMLButtonElement>("#acct-dlg-ok");
+    btn.disabled = true;
+    setStatus("Saving…");
+    let cmd: Record<string, unknown> & { type: string };
+    if (opts.mode === "add") cmd = { type: "auth.account.add", label, token };
+    else if (opts.mode === "rename") cmd = { type: "auth.account.rename", accountId: opts.id, label };
+    else cmd = { type: "auth.account.replace", accountId: opts.id, token };
+    try {
+      const res = await sendAwait(hub(), { ...cmd, cid: newCid() }, 20_000);
+      if (res.type === "command.error") {
+        // Rendered INLINE (dup label, metered key, …) rather than a toast, and the dialog stays open
+        // with the input intact so the user can fix it without retyping everything (§9.1).
+        setStatus(res.message);
+        btn.disabled = false;
+        return;
+      }
+      closeModal();
+      toast(opts.mode === "add" ? "Account added." : opts.mode === "rename" ? "Renamed." : "Token replaced.");
+    } catch (err) {
+      setStatus(`Couldn't reach the hub: ${err instanceof Error ? err.message : err}`);
+      btn.disabled = false;
+    }
+  });
+}
+
 // ── Autopilot (plan review & launch; anvil-autopilot-ui.md) ────────────────────────
 const autopilotLog: string[] = []; // streamed progress lines for the current/last run
 let openPlanId: string | null = null; // the plan open in the reader, if any (else the grid is shown)
