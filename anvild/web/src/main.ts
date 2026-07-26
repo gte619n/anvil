@@ -4600,9 +4600,21 @@ const fleetMemberIdByHost = new Map<string, string>();
 
 /** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
 async function rotateFleetToken(): Promise<void> {
+  // /api/fleet/rotate fans out from THIS daemon to ITS members. On a machine that has none — a member,
+  // or a standalone box — it succeeds over an empty list and used to report "Updated 0/0 Macs.", which
+  // reads as "done" when in fact nothing was even attempted (§7.2). Say what actually happened.
+  const origin = hub();
+  if (origin?.role === "member") {
+    toast("This Mac isn't the hub — sync accounts from the hub instead.");
+    return;
+  }
   toast("Pushing the current login to every Mac…");
   try {
     const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    if (r.results.length === 0) {
+      toast("No other Macs in this fleet yet.");
+      return;
+    }
     const okN = r.results.filter((x) => x.ok).length;
     toast(`Updated ${okN}/${r.results.length} Macs.`);
   } catch { toast("Couldn't push the login — is the hub reachable?"); }

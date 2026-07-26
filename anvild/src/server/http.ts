@@ -420,6 +420,19 @@ export function createServer(opts: ServerOptions): ServerHandle {
         void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP; healed url lands on the next poll
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
       }
+      // Read-only roster for the session-start picker, readable from ANY origin so a member's client
+      // can render it. Masked previews only — never a raw token (§11).
+      if (url.pathname === "/api/fleet/accounts" && req.method === "GET") {
+        const snap = accounts.snapshot();
+        const paired = pairedHub.get();
+        return Response.json({
+          rev: snap.rev,
+          ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
+          role: snap.role,
+          ...(paired ? { hubServerId: paired.hubServerId } : {}),
+          accounts: accounts.publicList(),
+        } satisfies rest.FleetAccountsResponse);
+      }
       // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
       if (url.pathname === "/api/fleet/peers" && req.method === "GET") {
         return Response.json((await tailnetPeers()) satisfies rest.FleetPeersResponse);
@@ -482,7 +495,21 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
       /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
        *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-      const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string }): string | null => {
+      const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
+        // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
+        // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
+        // anything.
+        const before = supervisor.tokensBySession();
+        // Adopt the roster BEFORE setClaudeToken, so the token being set is already consistent with the
+        // roster those sessions will resolve against (§7.3). Absent `accounts` (an older hub) leaves
+        // today's behaviour bit-for-bit unchanged.
+        if (body.accounts) {
+          try {
+            accounts.adoptReplica(body.accounts);
+          } catch (e) {
+            return e instanceof Error ? e.message : String(e);
+          }
+        }
         try {
           setClaudeToken(String(body.token ?? "")); // also clears the degrade marker + failure counter
         } catch (e) {
@@ -502,7 +529,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
         }
         supervisor.authDegrade.recover();
         supervisor.broadcastAuthState();
-        void supervisor.restartIdleSessionsForNewToken();
+        if (body.accounts) supervisor.broadcastAccounts();
+        void supervisor.restartIdleSessionsForNewToken(before);
         return null;
       };
 
