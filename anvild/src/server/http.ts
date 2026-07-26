@@ -318,7 +318,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const WS = {
     open(ws: ServerWebSocket<ConnState>) {
       registry.add(ws);
-      ws.send(JSON.stringify(serverHelloEvent(identity))); // who am I — first frame (fleet §3/§6)
+      ws.send(
+        JSON.stringify(
+          serverHelloEvent(identity, { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length }),
+        ),
+      ); // who am I — first frame (fleet §3/§6)
       ws.send(JSON.stringify(supervisor.sessionListEvent()));
       ws.send(JSON.stringify(supervisor.teamInfoEvent())); // derived team tree alongside the session list
       ws.send(JSON.stringify(supervisor.budgetEvent()));

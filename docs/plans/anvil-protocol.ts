@@ -46,7 +46,7 @@
 // 0. Primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 3 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
 /** ISO 8601 timestamp, always UTC, e.g. "2026-06-19T14:03:00.000Z". */
@@ -135,6 +135,8 @@ export interface Environment {
   icon?: string; // Material Symbols name (e.g. "rocket_launch") shown in selectors/cards; absent → folder/account_tree by repo kind
   todoistProjectId?: string; // linked Todoist project; its active tasks feed the nightly planner
   validation?: EnvironmentValidation; // gate a WorkUnit must pass before reaching anvil:review
+  /** Default account for new sessions here and for scheduled autopilot runs (§6). */
+  accountId?: string;
 }
 
 /**
@@ -244,6 +246,12 @@ export interface Session {
   // enriched with SKILL.md descriptions — drives the composer's `/` autocomplete. Populated once the
   // driver starts (absent until the first turn); rides session.updated/session.list. (§skills)
   commands?: CommandInfo[];
+  /** The Claude account this session's agent spawns under (multi-account §5). Absent = the default. */
+  accountId?: string;
+  /** Denormalised for display; refreshed on rename and on load. */
+  accountLabel?: string;
+  /** The bound account no longer resolves; the session fell back to the default (§5.4). */
+  accountMissing?: boolean;
 }
 
 /** A team's policy. Lives on the lead `Session`; a team is otherwise derived from `parentId`. */
@@ -491,6 +499,11 @@ export interface ServerHelloEvent extends Envelope {
   // member is too old to handle instead of getting `unknown command type` back. Absent on pre-capability
   // builds → the client treats every capability as unsupported for that server (graceful degradation).
   capabilities?: string[];
+  /** Fleet position (§7.2). `member` wins when a daemon is both paired and holds members — the
+   *  question the client is asking is "should I send roster writes here?". */
+  role: "hub" | "member" | "standalone";
+  /** Present when role === "member": the hub that owns this machine's roster (PairedHubStore). */
+  hubServerId?: string;
 }
 /** A Todoist project, trimmed to what the link UI / planner needs. */
 export interface TodoistProjectInfo {
@@ -547,6 +560,32 @@ export interface AuthStatusEvent extends Envelope {
   connected: boolean; // a token is present in the daemon's environment (agents can run)
   persisted: boolean; // the token is written to the launcher's env file → survives a service restart
   masked?: string; // e.g. "sk-ant-…lt4f2" — enough to recognise, never the full secret
+}
+
+// ── Claude account roster (Settings → Models). Hub-authoritative; members hold replicas (§7). ──
+/** A roster entry as clients see it — masked preview only, NEVER the raw token (§11). */
+export interface AccountInfo {
+  id: string;
+  label: string;
+  masked: string;
+  createdAt: number;
+}
+
+/** Broadcast on every roster mutation, like `auth.status`. */
+export interface AuthAccountsEvent extends Envelope {
+  type: "auth.accounts";
+  cid?: Cid;
+  rev: number;
+  defaultId?: string;
+  role: "hub" | "replica";
+  /** Set on a replica: the hub that owns this roster, from PairedHubStore (§7.2). */
+  hubServerId?: string;
+  accounts: AccountInfo[];
+  /** False when the default couldn't be written to the launcher env file — "won't survive a restart". */
+  persisted: boolean;
+  /** Active sessions bound to each account, so the removal confirm can name them without a
+   *  second round trip (§9.1). Keyed by accountId; absent keys mean "none". */
+  inUse?: Record<string, { sessionId: SessionId; title: string }[]>;
 }
 
 // ── Autopilot (task-autopilot plan review UI; see anvil-autopilot-ui.md) ──────────────
@@ -891,6 +930,7 @@ export type ServerEvent =
   | LapoStatusEvent
   | LapoAuthorizeEvent
   | AuthStatusEvent
+  | AuthAccountsEvent
   | AutopilotPlansEvent
   | AutopilotPlanResultEvent
   | AutopilotStartedEvent
@@ -958,6 +998,7 @@ export interface SessionCreateCmd extends Envelope, Correlated {
   //    policy. Members are created via the lead's tools, not this command. ──
   teamRole?: "lead"; // set to "lead" to make this a team lead; members are stamped by handoffCreate
   team?: TeamPolicy; // the lead's integration/concurrency policy (defaults applied server-side)
+  accountId?: string; // defaults to the environment's account, else the roster default
 }
 /** Resume: replay events with seq > lastSeq, else server sends a snapshot (§6.4). */
 export interface SessionAttachCmd extends Envelope, Correlated {
@@ -993,6 +1034,11 @@ export interface SessionResetCmd extends Envelope, Correlated {
 export interface SessionNewTopicCmd extends Envelope, Correlated {
   type: "session.new_topic"; // start a fresh Claude context (drop --resume) but keep the visible scrollback (§0.6)
   sessionId: SessionId;
+}
+export interface SessionAccountSetCmd extends Envelope, Correlated {
+  type: "session.account.set";
+  sessionId: SessionId;
+  accountId: string;
 }
 /** Git / gh operations on the session's worktree (arch §8). */
 export interface GitCmd extends Envelope, Correlated {
@@ -1196,6 +1242,34 @@ export interface AuthClearCmd extends Envelope, Correlated {
   provider?: AuthProvider;
 }
 
+// ── Claude account roster (Settings → Models). Hub-authoritative; members hold replicas (§7). ──
+export interface AuthAccountsGetCmd extends Envelope, Correlated {
+  type: "auth.accounts.get"; // request the current roster → auth.accounts
+}
+export interface AuthAccountAddCmd extends Envelope, Correlated {
+  type: "auth.account.add"; // add a new labelled account (rejected if the token looks like a metered key)
+  label: string;
+  token: string;
+}
+export interface AuthAccountRenameCmd extends Envelope, Correlated {
+  type: "auth.account.rename";
+  accountId: string;
+  label: string;
+}
+export interface AuthAccountReplaceCmd extends Envelope, Correlated {
+  type: "auth.account.replace"; // rotate an account's token in place
+  accountId: string;
+  token: string;
+}
+export interface AuthAccountRemoveCmd extends Envelope, Correlated {
+  type: "auth.account.remove"; // refused if it's the last account
+  accountId: string;
+}
+export interface AuthAccountDefaultCmd extends Envelope, Correlated {
+  type: "auth.account.default";
+  accountId: string;
+}
+
 // Autopilot plan review (anvil-autopilot-ui.md). These drive the Autopilot section: list/refine/
 // dismiss pending plans, launch one into a worktree session, or re-plan the linked projects.
 export interface AutopilotPlansListCmd extends Envelope, Correlated {
@@ -1328,6 +1402,7 @@ export type ClientCommand =
   | SessionArrangeCmd
   | SessionResetCmd
   | SessionNewTopicCmd
+  | SessionAccountSetCmd
   | SessionSetModelCmd
   | SessionSetAutonomyCmd
   | SessionSetAdversarialReviewCmd
@@ -1365,6 +1440,12 @@ export type ClientCommand =
   | AuthStatusCmd
   | AuthSetCmd
   | AuthClearCmd
+  | AuthAccountsGetCmd
+  | AuthAccountAddCmd
+  | AuthAccountRenameCmd
+  | AuthAccountReplaceCmd
+  | AuthAccountRemoveCmd
+  | AuthAccountDefaultCmd
   | AutopilotPlansListCmd
   | AutopilotPlanSessionCmd
   | AutopilotDismissCmd
@@ -1465,6 +1546,9 @@ export namespace rest {
     serverName: string;
     host: string; // tailnet MagicDNS host (where :7702 pairing + :7701 daemon live)
     url: string; // https://host:7701/ (for the client to connect to)
+    /** The account roster `rev` last confirmed pushed to this member (multi-account §7.3). Absent ⇒
+     *  never pushed, or the member predates the "accounts" capability. */
+    accountsRev?: number;
   }
   /** GET /api/fleet/members → the hub's recorded fleet (for the clients' Fleet UI). */
   export interface FleetMembersResponse {
@@ -1544,6 +1628,23 @@ export namespace rest {
      *  (HJ-24/HJ-27). Present keys OVERWRITE; absent keys are left alone. */
     todoistToken?: string;
     openRouterKey?: string;
+    /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
+     *  behaviour exactly; ignored by an older joiner. */
+    accounts?: RosterPush;
+  }
+  /** The wire shape of a roster push, hub → member (multi-account §7.3). */
+  export interface RosterPush {
+    rev: number;
+    defaultId: string;
+    entries: { id: string; label: string; token: string; createdAt: number }[];
+  }
+  /** GET /api/fleet/accounts — read-only, masked previews only. */
+  export interface FleetAccountsResponse {
+    rev: number;
+    defaultId?: string;
+    role: "hub" | "replica";
+    hubServerId?: string;
+    accounts: { id: string; label: string; masked: string; createdAt: number }[];
   }
   /** The joiner's reply — its own identity, so the hub can record a real member (not a bare host). */
   export interface FleetPairResponse {
@@ -1567,6 +1668,9 @@ export namespace rest {
     hubServerId: string;
     todoistToken?: string;
     openRouterKey?: string;
+    /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
+     *  behaviour exactly; ignored by an older joiner. */
+    accounts?: RosterPush;
   }
   /** GET /api/environments/:id/readme — the repo's README, rendered (arch §8). */
   export interface EnvReadmeResponse {
