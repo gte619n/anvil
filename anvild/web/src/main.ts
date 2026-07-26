@@ -838,6 +838,7 @@ function onEvent(url: string, e: ServerEvent): void {
       if (e.session.id === activeId) {
         updateGitPanelMeta();
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
+        updateHeaderAccount(e.session); // reflect an account switch + the idle/mid-turn tooltip
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
         updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
       }
@@ -1767,6 +1768,7 @@ function setStatus(status: string): void {
   if (s) {
     s.status = status as Session["status"];
     renderSessions();
+    updateHeaderAccount(s); // the account chip's switch tooltip depends on idle vs mid-turn
   }
 }
 
@@ -2476,7 +2478,8 @@ function updateHeaderAccount(s: Session | undefined): void {
     return;
   }
   el.innerHTML = `<span class="hb-name">● ${esc(label)}</span>`;
-  el.title = `Claude account: ${label}`;
+  // The daemon refuses a mid-turn switch (setSessionAccount), so say why before the click.
+  el.title = s.status === "idle" ? `Claude account: ${label} — tap to switch` : "finish or interrupt the current turn first";
   el.hidden = false;
 }
 
@@ -2532,6 +2535,31 @@ $("#btn-model").addEventListener("click", () => {
       run: () => {
         if (m.id === s.model) return;
         sendTo(activeId, { type: "session.set_model", sessionId: activeId, model: m.id });
+      },
+    })),
+  );
+});
+
+// Tapping the account chip switches this session's Claude account (multi-account §10). Only offered
+// while the session is IDLE: the daemon refuses mid-turn anyway (setSessionAccount), so the menu
+// explains why up front rather than letting the click fail. A ✓ marks the current account.
+$("#header-account").addEventListener("click", () => {
+  const s = activeId ? sessions.get(activeId) : undefined;
+  const list = claudeAccounts?.accounts ?? [];
+  if (!s || list.length <= 1) return;
+  if (s.status !== "idle") {
+    toast("Finish or interrupt the current turn first — the new login applies from the next one.");
+    return;
+  }
+  toggleHeaderMenu(
+    $("#header-account"),
+    list.map((a) => ({
+      icon: a.id === s.accountId ? "check" : "key",
+      label: a.label,
+      title: a.id === s.accountId ? `${a.label} (current)` : `Switch this session to ${a.label}`,
+      run: () => {
+        if (a.id === s.accountId) return;
+        sendTo(activeId, { type: "session.account.set", sessionId: activeId, accountId: a.id });
       },
     })),
   );
@@ -3193,6 +3221,9 @@ let claudeAccounts: AuthAccountsEvent | undefined;
 function onAuthAccounts(e: AuthAccountsEvent): void {
   claudeAccounts = e;
   if (document.getElementById("models-panel")) renderModelsPanel();
+  // The header chip appears/disappears at the 1↔2-account boundary and shows a label the roster owns,
+  // so a roster change has to repaint it even when no session.updated follows.
+  updateHeaderAccount(activeId ? sessions.get(activeId) : undefined);
 }
 
 /** Persist a new/replacement Claude OAuth token on the hub daemon. */
