@@ -248,7 +248,9 @@ export interface Session {
   commands?: CommandInfo[];
   /** The Claude account this session's agent spawns under (multi-account §5). Absent = the default. */
   accountId?: string;
-  /** Denormalised for display; refreshed on rename and on load. */
+  /** Denormalised for display; refreshed on rename. When `accountMissing` is set, this DELIBERATELY
+   *  keeps the REMOVED account's old label rather than the fallback's — it's the only place that name
+   *  survives, and the client already has the roster snapshot to look up the current default's label. */
   accountLabel?: string;
   /** The bound account no longer resolves; the session fell back to the default (§5.4). */
   accountMissing?: boolean;

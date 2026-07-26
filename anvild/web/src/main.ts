@@ -2424,6 +2424,7 @@ function setHeaderTitle(s: Session | undefined): void {
   document.title = s ? `Anvil: ${s.title}` : "Anvil";
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   updateHeaderBranch(s);
+  updateHeaderAccount(s);
   updateHeaderModel(s);
   updateContextMeter(s);
   renderTeamBoard(s); // show the member board when a lead is active; hide it otherwise
@@ -2444,6 +2445,40 @@ function updateHeaderBranch(s: Session | undefined): void {
   }
 }
 $("#header-branch").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
+
+/** Show the active session's Claude account as a chip in the header (multi-account §5). Omitted
+ *  entirely when the roster has ≤1 account — there's nothing to distinguish. When the session's bound
+ *  account no longer resolves (removed), the chip badges the fallback with the old label. */
+function updateHeaderAccount(s: Session | undefined): void {
+  const el = document.getElementById("header-account");
+  if (!el) return;
+  const list = claudeAccounts?.accounts ?? [];
+  if (!s || s.isDefault || list.length <= 1) {
+    el.innerHTML = "";
+    el.hidden = true;
+    return;
+  }
+  if (s.accountMissing) {
+    // `s.accountLabel` deliberately still names the REMOVED account (see the protocol's comment); the
+    // current fallback's label comes from the roster snapshot the client already has.
+    const oldLabel = s.accountLabel ?? "a removed account";
+    const defaultId = claudeAccounts?.defaultId;
+    const nowLabel = claudeAccounts?.accounts.find((a) => a.id === defaultId)?.label ?? "the default";
+    el.innerHTML = `${icon("warning")}<span class="hb-name">${esc(nowLabel)} ⚠ was ${esc(oldLabel)}</span>`;
+    el.title = `“${oldLabel}” was removed — this session fell back to “${nowLabel}”`;
+    el.hidden = false;
+    return;
+  }
+  const label = s.accountLabel ?? claudeAccounts?.accounts.find((a) => a.id === s.accountId)?.label;
+  if (!label) {
+    el.innerHTML = "";
+    el.hidden = true;
+    return;
+  }
+  el.innerHTML = `<span class="hb-name">● ${esc(label)}</span>`;
+  el.title = `Claude account: ${label}`;
+  el.hidden = false;
+}
 
 /** Show the active session's model as a pill in the composer (next to Attach); tap it to switch. */
 function updateHeaderModel(s: Session | undefined): void {
@@ -6020,6 +6055,27 @@ const ADVERSARIAL_PICKER = `<label class="cd-option"><input type="checkbox" id="
 const selectedAdversarial = (): boolean =>
   (document.getElementById("ns-adv") as HTMLInputElement | null)?.checked ?? false;
 
+/** The Claude account picker for the new-session dialog (multi-account §5). Hidden entirely when the
+ *  roster has ≤1 account — there's nothing to choose. */
+function accountPickerMarkup(): string {
+  const list = claudeAccounts?.accounts ?? [];
+  if (list.length <= 1) return "";
+  const opts = list.map((a) => `<option value="${esc(a.id)}">${esc(a.label)}</option>`).join("");
+  return `<label>Account<div class="env-row"><select id="ns-account">${opts}</select></div></label>`;
+}
+/** Pre-select the picker to `envId`'s default account, else the roster default. No-op if the picker
+ *  isn't rendered (≤1 account). Called once on open and again on every environment change. */
+function reselectAccountFor(envId: string | undefined): void {
+  const sel = document.getElementById("ns-account") as HTMLSelectElement | null;
+  if (!sel) return;
+  const pick = (envId ? environments.get(envId)?.accountId : undefined) ?? claudeAccounts?.defaultId;
+  if (pick) sel.value = pick;
+  refreshSelect(sel);
+}
+/** The chosen account id from the open dialog's picker, or undefined if it isn't present (≤1 account —
+ *  the server resolves the roster default). */
+const selectedAccountId = (): string | undefined => (document.getElementById("ns-account") as HTMLSelectElement | null)?.value || undefined;
+
 /** A server picker for the browse-based modals (add-env, one-off). Hidden when there's one server. */
 function serverPickerMarkup(): string {
   const list = orderedServers();
@@ -6094,6 +6150,7 @@ function showNewSession(): void {
       : [...envs].sort(byEnvName).map(opt).join("");
     m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
       <label>Environment<div class="env-row"><select id="ns-env">${opts}</select></div></label>
+      ${accountPickerMarkup()}
       <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
       <p class="small muted" id="ns-note"></p>
       <p class="small warn-text" id="ns-warn"></p>
@@ -6147,6 +6204,7 @@ function showNewSession(): void {
     createBtn.disabled = !env || !name || dup;
   };
   envSel?.addEventListener("change", validate);
+  envSel?.addEventListener("change", () => reselectAccountFor(envSel.value));
   nameInp?.addEventListener("input", validate);
   // Enter in the name field creates the session (unless the form's still invalid — e.g. blank/dup name).
   nameInp?.addEventListener("keydown", (e) => {
@@ -6157,6 +6215,8 @@ function showNewSession(): void {
   });
   enhanceSelect(envSel, true); // searchable — environment lists can grow long
   enhanceSelect(document.getElementById("ns-auto") as HTMLSelectElement | null);
+  enhanceSelect(document.getElementById("ns-account") as HTMLSelectElement | null);
+  reselectAccountFor(envSel?.value);
   nameInp?.focus();
   validate();
 
@@ -6165,12 +6225,14 @@ function showNewSession(): void {
     const env = environments.get(envSel.value);
     const name = nameInp.value.trim();
     if (!env || !name) return;
+    const accountId = selectedAccountId();
     const common = {
       title: name,
       environmentId: env.id,
       model: DEFAULT_MODEL,
       autonomy: selectedAutonomy(),
       adversarialReview: selectedAdversarial(),
+      ...(accountId ? { accountId } : {}),
     };
     const cid = newCid();
     // Teams: a lead needs its own worktree/branch to merge members into, so it's a fresh-worktree option.

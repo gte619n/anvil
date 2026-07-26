@@ -964,13 +964,14 @@ export class Supervisor {
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    // §5.4 removal fallback: fall every session bound to the removed account back to the new
-    // default, flagged so the client can render the "⚠ was <label>" badge (Task 24).
-    const fallbackLabel = this.accounts.labelOf(this.accounts.defaultId());
+    // §5.4 removal fallback: fall every session bound to the removed account back to the new default,
+    // flagged so the client can render the "⚠ was <label>" badge (Task 24/20). `accountLabel` is
+    // DELIBERATELY left holding the removed account's OLD label (not overwritten with the fallback's) —
+    // the client already has the roster snapshot and looks up the current default's label itself; this
+    // field is the only place the old name survives the removal.
     for (const s of this.sessions.values()) {
       if (s.data.accountId !== accountId) continue;
       s.data.accountId = this.accounts.defaultId();
-      s.data.accountLabel = fallbackLabel;
       s.data.accountMissing = true;
       this.broadcastUpdated(s.data);
     }
