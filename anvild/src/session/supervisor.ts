@@ -2040,6 +2040,14 @@ export class Supervisor {
       cwd = cmd.cwd;
     }
 
+    // Resolve the account this session spawns under (multi-account §5): the command's explicit choice,
+    // else the environment's default, else the roster default. An explicit accountId that doesn't
+    // resolve is rejected outright — silently falling back would bill another subscription.
+    const accountId = cmd.accountId ?? (cmd.environmentId ? this.envStore.get(cmd.environmentId)?.accountId : undefined) ?? this.accounts.defaultId();
+    if (accountId && !this.accounts.has(accountId)) {
+      throw new BadCommand(`unknown Claude account ${accountId} — it may have been removed; pick another in Settings → Models`);
+    }
+
     mkdirSync(this.store.sessionDir(id), { recursive: true });
     const data: SessionData = {
       id,
@@ -2056,6 +2064,7 @@ export class Supervisor {
       createdAt: now(),
       lastActivityAt: now(),
       usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
+      ...(accountId ? { accountId, accountLabel: this.accounts.labelOf(accountId) } : {}),
     };
     // Teams: a session created as a lead carries its role + integration/concurrency policy (defaults
     // applied here). Members are never created via this command — the lead's MCP tools stamp them.
