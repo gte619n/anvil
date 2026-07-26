@@ -559,3 +559,33 @@ test("invitePeer: a first join carries the roster only when the joiner speaks 'a
   await invitePeer({ host: "old.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing"], accounts: ROSTER, fetchImpl: older.fn });
   expect(older.bodies["https://old.ts.net:7701/api/fleet/pair"].accounts).toBeUndefined();
 });
+
+// Regression (found on a live 2-machine fleet, 2026-07-26): the pair path replicated the roster
+// correctly but the hub recorded the member with NO accountsRev, so the Servers tab said "out of date
+// — press Sync now" about a member that was perfectly in sync, until the next roster edit papered
+// over it. invitePeer now REPORTS the rev it sent, so the hub records exactly what was delivered and
+// the capability gate lives in one place instead of being re-derived by the caller.
+test("invitePeer reports the accountsRev it actually sent, and only on success", async () => {
+  const { fn } = bodyCapturingFetch();
+  const sent = await invitePeer({ host: "new.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], accounts: ROSTER, fetchImpl: fn });
+  expect(sent.ok).toBe(true);
+  expect(sent.accountsRev).toBe(ROSTER.rev);
+
+  // A joiner without the capability got no roster, so there is no rev to claim.
+  const older = bodyCapturingFetch();
+  const skipped = await invitePeer({ host: "old.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing"], accounts: ROSTER, fetchImpl: older.fn });
+  expect(skipped.accountsRev).toBeUndefined();
+
+  // Neither is there when no roster was supplied at all.
+  const none = bodyCapturingFetch();
+  const bare = await invitePeer({ host: "new.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], fetchImpl: none.fn });
+  expect(bare.accountsRev).toBeUndefined();
+});
+
+test("invitePeer claims no rev when the pair itself is rejected", async () => {
+  const reject = (async () =>
+    new Response(JSON.stringify({ ok: false, error: "wrong code" }), { status: 403, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+  const out = await invitePeer({ host: "new.ts.net", code: "000000", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], accounts: ROSTER, fetchImpl: reject });
+  expect(out.ok).toBe(false);
+  expect(out.accountsRev).toBeUndefined(); // a failed push must not read as "in sync"
+});

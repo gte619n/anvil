@@ -522,11 +522,17 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
         // breaks targeted token propagation (members are matched by serverId).
         const resolved = await resolveMember(host, opts.port, undefined, memberIp);
+        // Record the rev the joiner confirmed taking, exactly as `pushRosterToMembers` does after a
+        // rotation. Without it a freshly-paired member sits at an undefined rev and the Servers tab
+        // reports "out of date — press Sync now" about a member that is in fact perfectly in sync,
+        // until the next roster edit happens to paper over it. `invitePeer` reports what it actually
+        // sent, so this can't drift from the capability gate.
         const member: rest.FleetMember = {
           serverId: resolved.serverId || outcome.serverId || host,
           serverName: outcome.serverName || resolved.serverName || host,
           host,
           url: resolved.url,
+          ...(outcome.accountsRev !== undefined ? { accountsRev: outcome.accountsRev } : {}),
         };
         fleet.upsert(member);
         // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately

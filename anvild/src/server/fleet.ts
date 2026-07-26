@@ -393,6 +393,9 @@ interface PairOutcome {
   /** The route answered, but with "no such route" semantics (404/405, or a non-JSON error page). The
    *  caller treats this as "try the other destination", NOT as a hard failure — see {@link pushCredential}. */
   routeMissing?: boolean;
+  /** The account-roster `rev` this joiner confirmed accepting (multi-account §7.3). Set only when the
+   *  roster was actually sent AND the pair succeeded, so the hub never records a rev it didn't deliver. */
+  accountsRev?: number;
   /** The fetch never produced a response at all — connection refused, DNS failure, TLS-to-plain-HTTP
    *  mismatch, or timeout. The caller retries the next scheme/port rather than surfacing it as a real
    *  rejection (see {@link pushCredential}). Deliberately a FLAG set at the fetch boundary, not a
@@ -518,7 +521,10 @@ export async function invitePeer(opts: {
   fetchImpl?: typeof fetch;
 }): Promise<PairOutcome> {
   if (!opts.token) return { ok: false, error: "this server has no OAuth token to share" };
-  return pushCredential({
+  // ONE place decides whether the roster goes (§7.3) — the caller reads `accountsRev` off the result
+  // rather than re-deriving this condition, which would silently drift from what was actually sent.
+  const roster = opts.accounts && opts.capabilities?.includes("accounts") ? opts.accounts : undefined;
+  const outcome = await pushCredential({
     host: opts.host,
     capabilities: opts.capabilities,
     daemonPath: "/api/fleet/pair",
@@ -533,9 +539,11 @@ export async function invitePeer(opts: {
       ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
       ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
       ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
-      ...(opts.accounts && opts.capabilities?.includes("accounts") ? { accounts: opts.accounts } : {}),
+      ...(roster ? { accounts: roster } : {}),
     },
   });
+  // Only claim a rev the joiner actually accepted — a failed pair leaves it unset.
+  return roster && outcome.ok ? { ...outcome, accountsRev: roster.rev } : outcome;
 }
 
 /**
