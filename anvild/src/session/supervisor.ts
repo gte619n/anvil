@@ -156,6 +156,9 @@ export interface SupervisorConfig {
   /** This machine's paired-hub record, so a replica's `auth.accounts` broadcast can name the hub that
    *  owns it (§7.2). Read-only here — pairing itself is unaffected by the roster. */
   pairedHub?: PairedHubStore;
+  /** Replicate this hub's roster to its fleet members after a mutation (§7.3). Defined in http.ts,
+   *  where the FleetStore lives; omitted in unit tests and on a machine with no members. */
+  onRosterChanged?: (reason: string) => void;
   /** The tailnet-facing port (== ANVIL_PORT). Used to build this daemon's self-URL for deep links. */
   port?: number;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
@@ -265,6 +268,7 @@ export class Supervisor {
    *  `SupervisorConfig.accounts`. */
   readonly accounts: AccountStore;
   private readonly pairedHub?: PairedHubStore;
+  private readonly onRosterChanged?: (reason: string) => void;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
   readonly authDegrade!: AuthDegradeTracker;
@@ -283,6 +287,7 @@ export class Supervisor {
     this.stateDir = cfg.stateDir;
     this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
     this.pairedHub = cfg.pairedHub;
+    this.onRosterChanged = cfg.onRosterChanged;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
     // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
@@ -930,8 +935,9 @@ export class Supervisor {
    *  (adding a non-default account, or replacing a token no live session is pinned to, restarts no
    *  one). Fire-and-forget, like every other credential-change call site (http.ts's pair/rotate
    *  handlers). */
-  private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>): AuthAccountsEvent {
+  private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>, reason: string): AuthAccountsEvent {
     mirrorDefault(this.accounts); // the ONLY place a roster change is written to the launcher env file
+    this.onRosterChanged?.(reason); // replicate to fleet members (§7.3); fire-and-forget, no-op on a leaf
     void this.restartIdleSessionsForNewToken(before);
     const event = this.accountsEvent(cid);
     this.registry.toAll(cid ? { ...event, cid: undefined } : event);
@@ -945,7 +951,7 @@ export class Supervisor {
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    return this.afterAccountMutation(cid, before);
+    return this.afterAccountMutation(cid, before, "add");
   }
 
   accountRename(accountId: string, label: string, cid?: string): AuthAccountsEvent {
@@ -963,7 +969,7 @@ export class Supervisor {
       }
     }
     this.persist();
-    return this.afterAccountMutation(cid, before);
+    return this.afterAccountMutation(cid, before, "rename");
   }
 
   accountReplace(accountId: string, token: string, cid?: string): AuthAccountsEvent {
@@ -973,7 +979,7 @@ export class Supervisor {
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    return this.afterAccountMutation(cid, before);
+    return this.afterAccountMutation(cid, before, "replace");
   }
 
   accountSetDefault(accountId: string, cid?: string): AuthAccountsEvent {
@@ -983,7 +989,7 @@ export class Supervisor {
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    return this.afterAccountMutation(cid, before);
+    return this.afterAccountMutation(cid, before, "set-default");
   }
 
   accountRemove(accountId: string, cid?: string): AuthAccountsEvent {
@@ -1005,7 +1011,7 @@ export class Supervisor {
       this.broadcastUpdated(s.data);
     }
     this.persist();
-    return this.afterAccountMutation(cid, before);
+    return this.afterAccountMutation(cid, before, "remove");
   }
 
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */

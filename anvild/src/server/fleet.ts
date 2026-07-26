@@ -510,6 +510,9 @@ export async function invitePeer(opts: {
   fleetName?: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** The hub's account roster (multi-account §7.3), so a joiner arrives with every account rather
+   *  than waiting for the next rotation. Sent only to a joiner advertising "accounts". */
+  accounts?: rest.RosterPush;
   port?: number;
   pairingPort?: number;
   fetchImpl?: typeof fetch;
@@ -530,6 +533,7 @@ export async function invitePeer(opts: {
       ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
       ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
       ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+      ...(opts.accounts && opts.capabilities?.includes("accounts") ? { accounts: opts.accounts } : {}),
     },
   });
 }
@@ -640,11 +644,15 @@ export async function rotateToken(opts: {
   hubServerId: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** The hub's account roster (multi-account §7.3). Sent ONLY to members advertising "accounts" — an
+   *  older member would ignore the field, but not sending it keeps the wire honest and lets the caller
+   *  tell "didn't get it" from "got it and is on this rev" via the returned `accountsRev`. */
+  accounts?: rest.RosterPush;
   port?: number;
   pairingPort?: number;
   probe?: Probe;
   fetchImpl?: typeof fetch;
-}): Promise<{ host: string; ok: boolean; error?: string }[]> {
+}): Promise<{ host: string; ok: boolean; error?: string; accountsRev?: number }[]> {
   if (!opts.token) return opts.members.map((m) => ({ host: m.host, ok: false, error: "no token" }));
   const probe = opts.probe ?? defaultProbe;
   const port = opts.port ?? 7701;
@@ -661,6 +669,10 @@ export async function rotateToken(opts: {
           }
         }
       }
+      // Capability tiering (§7.3): only a member that speaks "accounts" is sent the roster. One that
+      // doesn't keeps working on the single mirrored token exactly as before — it just can't offer the
+      // per-session picker, which the Servers tab surfaces as "Update Anvil to use multiple accounts".
+      const sendsRoster = !!opts.accounts && (capabilities?.includes("accounts") ?? false);
       const r = await pushCredential({
         host,
         capabilities,
@@ -674,9 +686,12 @@ export async function rotateToken(opts: {
           hubServerId: opts.hubServerId,
           ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
           ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+          ...(sendsRoster ? { accounts: opts.accounts } : {}),
         },
       });
-      return { host: m.host, ok: r.ok, error: r.error };
+      // Only claim a rev the member actually confirmed taking — a failed push leaves it unset so the
+      // Servers tab keeps showing "out of date" and Sync now stays meaningful.
+      return { host: m.host, ok: r.ok, error: r.error, ...(sendsRoster && r.ok ? { accountsRev: opts.accounts!.rev } : {}) };
     }),
   );
 }

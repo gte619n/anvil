@@ -495,3 +495,67 @@ test("resolveMember: carries capabilities through, so the invite path can pick a
   expect(r.capabilities).toEqual(["pairing"]);
   expect(r.subscriptionAuthOk).toBe(false);
 });
+
+// ── Account-roster replication (multi-account §7.3) ──────────────────────────────────────────
+
+/** A fetch stub that also captures each request's parsed JSON body (fakeFetch only records urls). */
+function bodyCapturingFetch(): { fn: typeof fetch; bodies: Record<string, any> } {
+  const bodies: Record<string, any> = {};
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    try {
+      bodies[url] = JSON.parse(String(init?.body ?? "{}"));
+    } catch {
+      bodies[url] = null;
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return { fn, bodies };
+}
+
+const ROSTER = {
+  rev: 4,
+  defaultId: "acct_a",
+  entries: [{ id: "acct_a", label: "work", token: "sk-ant-oat01-work-1111", createdAt: 1 }],
+};
+
+test("rotateToken: sends the roster to a member advertising 'accounts' and reports its rev", async () => {
+  const probe = async (base: string): Promise<ProbeResult | null> =>
+    base === "https://new.ts.net:7701" ? { serverId: "srv_n", serverName: "N", version: "1", capabilities: ["pairing", "accounts"] } : null;
+  const { fn, bodies } = bodyCapturingFetch();
+  const [r] = await rotateToken({ members: [{ host: "new.ts.net" }], token: "tok", hubServerId: "h", accounts: ROSTER, probe, fetchImpl: fn });
+  expect(r!.ok).toBe(true);
+  expect(r!.accountsRev).toBe(4); // recorded so the Servers tab can show "in sync"
+  expect(bodies["https://new.ts.net:7701/api/fleet/token"].accounts).toEqual(ROSTER);
+});
+
+test("rotateToken: a member WITHOUT the accounts capability gets the token but no roster", async () => {
+  const probe = async (base: string): Promise<ProbeResult | null> =>
+    base === "https://old.ts.net:7701" ? { serverId: "srv_o", serverName: "O", version: "1", capabilities: ["pairing"] } : null;
+  const { fn, bodies } = bodyCapturingFetch();
+  const [r] = await rotateToken({ members: [{ host: "old.ts.net" }], token: "tok", hubServerId: "h", accounts: ROSTER, probe, fetchImpl: fn });
+  expect(r!.ok).toBe(true);
+  expect(r!.accountsRev).toBeUndefined(); // never pushed → stays "out of date"/unknown, not falsely in sync
+  const body = bodies["https://old.ts.net:7701/api/fleet/token"];
+  expect(body.token).toBe("tok"); // the credential still lands — tiering degrades, it doesn't break
+  expect(body.accounts).toBeUndefined();
+});
+
+test("rotateToken: no roster to push leaves the body exactly as it was before the feature", async () => {
+  const probe = async (base: string): Promise<ProbeResult | null> =>
+    base === "https://new.ts.net:7701" ? { serverId: "srv_n", serverName: "N", version: "1", capabilities: ["pairing", "accounts"] } : null;
+  const { fn, bodies } = bodyCapturingFetch();
+  const [r] = await rotateToken({ members: [{ host: "new.ts.net" }], token: "tok", hubServerId: "h", probe, fetchImpl: fn });
+  expect(r!.accountsRev).toBeUndefined();
+  expect(bodies["https://new.ts.net:7701/api/fleet/token"].accounts).toBeUndefined();
+});
+
+test("invitePeer: a first join carries the roster only when the joiner speaks 'accounts'", async () => {
+  const { fn, bodies } = bodyCapturingFetch();
+  await invitePeer({ host: "new.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], accounts: ROSTER, fetchImpl: fn });
+  expect(bodies["https://new.ts.net:7701/api/fleet/pair"].accounts).toEqual(ROSTER);
+
+  const older = bodyCapturingFetch();
+  await invitePeer({ host: "old.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing"], accounts: ROSTER, fetchImpl: older.fn });
+  expect(older.bodies["https://old.ts.net:7701/api/fleet/pair"].accounts).toBeUndefined();
+});

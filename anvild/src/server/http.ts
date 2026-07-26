@@ -190,6 +190,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
       port: opts.port,
       accounts,
       pairedHub,
+      // Lazy on purpose: `pushRosterInBackground` closes over `fleet`/`accounts`/`identity`, all of
+      // which exist by the time a mutation can fire, but the function itself is hoisted below this
+      // constructor call.
+      onRosterChanged: (reason) => pushRosterInBackground(reason),
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
@@ -257,6 +261,53 @@ export function createServer(opts: ServerOptions): ServerHandle {
         }
       }
     });
+  }
+
+  /**
+   * Push this hub's credential + account roster to every member (multi-account §7.3). One path for
+   * both the explicit "Sync now" button (/api/fleet/rotate) and the automatic push fired after every
+   * roster mutation, so a manual retry can't diverge from what the automatic one sends.
+   *
+   * Capabilities are re-probed per member inside `rotateToken` (not read from the stored record), so a
+   * member that upgraded after joining starts receiving rotation on :7701 — and the roster — without a
+   * re-pair. On success the confirmed `rev` is recorded on that member's FleetMember so the Servers tab
+   * can show in-sync / out-of-date per Mac.
+   */
+  async function pushRosterToMembers(): Promise<{ host: string; ok: boolean; error?: string; accountsRev?: number }[]> {
+    const members = fleet.list();
+    if (members.length === 0) return [];
+    const payload = accounts.payload();
+    const results = await rotateToken({
+      members,
+      token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
+      hubServerId: identity.serverId,
+      ...(payload ? { accounts: payload } : {}),
+      port: opts.port,
+    });
+    for (const r of results) {
+      if (r.accountsRev === undefined) continue;
+      const stored = fleet.list().find((m) => m.host === r.host); // re-read: a concurrent heal may have moved it
+      if (stored && stored.accountsRev !== r.accountsRev) fleet.upsert({ ...stored, accountsRev: r.accountsRev });
+    }
+    return results;
+  }
+
+  /** Fire-and-forget roster replication after a hub-side mutation. Logged, never thrown: a member being
+   *  offline must not fail the mutation the user just made — the Servers tab shows it out of date and
+   *  "Sync now" repairs it. No-op on a machine with no members (a leaf, or a standalone box). */
+  function pushRosterInBackground(reason: string): void {
+    if (fleet.list().length === 0) return;
+    void pushRosterToMembers()
+      .then((results) => {
+        const okN = results.filter((r) => r.ok).length;
+        if (okN < results.length) {
+          const failed = results.filter((r) => !r.ok).map((r) => `${r.host} (${r.error ?? "unknown"})`);
+          console.warn(`[fleet] roster push after ${reason}: ${okN}/${results.length} ok — failed: ${failed.join(", ")}`);
+        } else {
+          console.log(`[fleet] roster push after ${reason}: ${okN}/${results.length} ok`);
+        }
+      })
+      .catch((e: unknown) => console.warn(`[fleet] roster push after ${reason} failed: ${e instanceof Error ? e.message : e}`));
   }
 
   // Re-resolve member records that never got a real identity at invite time. A `serverId` that isn't a
@@ -458,6 +509,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
           // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
           ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
           ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+          // The whole roster rides the first join too, so a new member arrives with every account
+          // instead of only the mirrored default (§7.3).
+          ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
         });
         if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
         // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
@@ -667,14 +721,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       }
 
       if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
-        // Capabilities are re-probed per member inside rotateToken (not read from the stored record),
-        // so a member that upgraded after joining starts receiving rotation on :7701 without a re-pair.
-        const results = await rotateToken({
-          members: fleet.list(),
-          token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
-          hubServerId: identity.serverId,
-          port: opts.port,
-        });
+        const results = await pushRosterToMembers();
         return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
       }
       const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);
