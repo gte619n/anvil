@@ -53,7 +53,7 @@ bunx tsc --noEmit && bun run typecheck:web && bun run build:web && bun test
 
 | Task | Description | Status | Tested | Pushed |
 |------|-------------|--------|--------|--------|
-| 1 | **Spike:** cross-account `--resume` behaviour | pending | n/a | no |
+| 1 | **Spike:** cross-account `--resume` behaviour | done | n/a | no |
 | 2 | `AccountStore` — file, CRUD, `rev` | pending | no | no |
 | 3 | Validation & invariants (labels, metered key, last account, default) | pending | no | no |
 | 4 | Default mirroring through `setClaudeToken()` | pending | no | no |
@@ -129,6 +129,30 @@ cd ~/anvil/.claude/worktrees/multi-account-tokens/anvild
 | Resume succeeds, conversation intact | Divider is the rare error path; copy stays "couldn't carry the conversation across" |
 | Resume fails with an auth/ownership error | Fresh context becomes the **normal** path; reword the divider to state plainly that switching accounts starts a new context, and say so in the switch control's tooltip |
 | Resume succeeds but the model has no memory | Same as failure — treat as fresh context |
+
+**Result (2026-07-26): Resume succeeds, conversation intact.**
+
+Ran the spike against an isolated daemon instance (fresh `ANVIL_STATE_DIR`/`ANVIL_CLONES_DIR`,
+port 7799 — not the real `~/.config/anvil/env` or `~/.anvil`) using two real subscription OAuth
+tokens supplied by the user:
+
+1. Booted with token A, created a session (`sess_678fef2b…`, `existing-dir`), sent two turns
+   ("reply with exactly: pineapple", then "what word did you just say? also remember 42"). The
+   model correctly recalled "pineapple" within the same boot. `claudeSessionId` recorded:
+   `0b672287-eba9-48fb-af10-55209e0fe994`.
+2. Stopped the daemon cleanly (`SIGTERM`), restarted the **same state dir** with token B (a
+   different subscription account) — no `--resume`-affecting state was touched, only the token.
+3. Sent a third turn to the same session: "What word and number did I ask you to remember
+   earlier?" The SDK's `--resume` against token B succeeded with **no auth/ownership error**, the
+   `claudeSessionId` was unchanged, and the model answered "The word was **pineapple** and the
+   number was **42**" — full conversational memory carried across the account swap.
+
+**Consequence for Task 23:** cross-account `--resume` is not refused by the CLI/SDK (at least for
+these two accounts). The fresh-context fallback in Task 23 is genuinely the **rare error path**,
+not the normal case — keep the divider copy as "couldn't carry the conversation across accounts",
+implement the fallback defensively (some other pairing of accounts, an expired token, or a future
+CLI change could still hit it), and do not reword Task 25's tooltip to warn that switching always
+starts a new context.
 
 **Step 4: Commit the finding**
 
