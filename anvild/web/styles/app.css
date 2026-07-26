@@ -216,9 +216,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .tpc-members { margin: 0 0 8px; padding-left: 20px; font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
 .tpc-dep { color: var(--muted); font-size: 11px; }
 .tpc-actions { display: flex; gap: 8px; }
-/* new-session: "team lead" toggle */
-.ns-lead-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 8px 0 2px; cursor: pointer; }
-.ns-lead-row input { width: auto; margin: 0; }
+/* new-session: "team lead" toggle now shares the .cd-option row style with adversarial review */
 /* Settings → Servers: add-a-server card, discovered rows */
 .add-server input { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .discover-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; }
@@ -611,8 +609,9 @@ details.tool-result.error > summary { color: var(--danger); }
 .modal-box pre { background: var(--tool-bg); padding: 8px; border-radius: 8px; overflow-x: auto; max-height: 220px; }
 .modal-box label { display: block; margin: 10px 0; font-size: 13px; }
 .modal-box input, .modal-box select { width: 100%; padding: 7px; margin-top: 4px; border: 1px solid var(--border); border-radius: 8px; font: inherit; }
-.modal-box label.cd-option { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-.modal-box label.cd-option input { width: auto; margin: 0; flex: none; }
+.modal-box label.cd-option { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; cursor: pointer; }
+.modal-box label.cd-option input { width: auto; margin: 2px 0 0; flex: none; }
+.modal-box label.cd-option[hidden] { display: none; } /* [hidden] loses to display:flex without this */
 .pick-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; max-height: 320px; overflow-y: auto; }
 .pick-item { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font: inherit; text-align: left; }
 .pick-item:hover { background: var(--panel); border-color: var(--muted); }
