@@ -165,6 +165,10 @@ interface Server {
   version?: string; // anvild version (from server.hello)
   capabilities?: string[]; // feature flags from server.hello; undefined on pre-capability builds
   budget?: Budget; // last budget snapshot (aggregate gauge, §7)
+  /** This daemon's fleet position (multi-account §7.2). Undefined on a pre-role build. */
+  role?: "hub" | "member" | "standalone";
+  /** Set when role === "member": the serverId of the hub that owns this machine's account roster. */
+  hubServerId?: string;
 }
 /** Whether a server advertised support for a capability (e.g. "autopilot"). A pre-capability build
  *  omits the list → treated as unsupported, so we never send it a command it can't handle. */
@@ -289,6 +293,27 @@ function removeServer(url: string): void {
   if (document.getElementById("server-cards")) renderServerCards(); // drop the card from an open Settings view
 }
 const hub = (): Server => servers.get(HUB_URL)!;
+/**
+ * The server that OWNS the Claude account roster — where every `auth.account*` write must go
+ * (multi-account §7.2). Deliberately a NEW notion rather than a redefinition of `hub()`/`HUB_URL`,
+ * which keep meaning "the origin this page was served from", so nothing that legitimately means
+ * "the origin" changes behaviour.
+ *
+ * Resolution order: the connected server whose `serverId` matches this machine's paired hub (the
+ * origin is a member and we've also adopted its hub) → the connected server that reports
+ * `role: "hub"` → the origin. The last case covers a standalone daemon AND a member whose hub isn't
+ * adopted yet: writes go to the origin and its own replica refuses them with "change accounts on the
+ * hub", which is the honest answer until Task 27's adopt-your-hub card is taken up.
+ */
+function rosterServer(): Server {
+  const origin = hub();
+  const pairedHubId = origin?.hubServerId;
+  if (pairedHubId) {
+    for (const s of servers.values()) if (s.id === pairedHubId) return s;
+  }
+  for (const s of servers.values()) if (s.role === "hub") return s;
+  return origin;
+}
 /** Resolve a routing url to its live socket. The `servers` map is keyed by the url a server was
  *  adopted under, but a session/env's stored routing url can DRIFT from it (a member reconnects under
  *  a force-upgraded https:// while its rows were tagged http://, or a trailing-slash difference) — see
@@ -877,6 +902,8 @@ function onEvent(url: string, e: ServerEvent): void {
         srv.name = e.serverName || srv.name;
         srv.version = e.version;
         srv.capabilities = e.capabilities;
+        srv.role = e.role;
+        srv.hubServerId = e.hubServerId;
       }
       // Now that we know this server's capabilities, pull its autopilot state — but only if it's new
       // enough to handle these commands. An older member (no "autopilot" capability) is skipped, so it
@@ -940,8 +967,10 @@ function onEvent(url: string, e: ServerEvent): void {
       if (url === HUB_URL) onAuthStatus(e);
       return;
     case "auth.accounts":
-      // Same hub-scoping as auth.status for now — Task 26/27 route this by fleet role instead.
-      if (url === HUB_URL) onAuthAccounts(e);
+      // Roster-scoped, NOT origin-scoped (§7.2): the authoritative roster lives on whichever server
+      // owns it, which is the origin for a standalone/hub but the adopted hub for a member. Accepting
+      // a member's own replica broadcast here would let a stale copy clobber the hub's.
+      if (sameServerUrl(url, rosterServer()?.url ?? HUB_URL)) onAuthAccounts(e);
       return;
     case "autopilot.maintenance.result":
       return; // resolved via cidWaiter (resetAnvilTags / clearAutopilot)
@@ -2863,7 +2892,9 @@ function selectSettingsTab(tab: SettingsTab): void {
       hub().sock.send({ type: "auth.status", provider: "openrouter" });
       hub().sock.send({ type: "autopilot.pipeline.metrics" }); // §6.3 calibration card
     }
-    if (serverSupports(hub(), "accounts")) hub().sock.send({ type: "auth.accounts.get" }); // refresh the roster once per tab open
+    // Refresh the roster from whichever server owns it (§7.2), once per tab open.
+    const rs = rosterServer();
+    if (serverSupports(rs, "accounts")) rs.sock.send({ type: "auth.accounts.get" });
   }
 }
 
@@ -3359,7 +3390,7 @@ function renderModelsPanel(): void {
   // ── Claude (drives the Agent SDK) — the roster list when the hub supports it, else the single-token
   //    card an older daemon still understands. ──
   const claudeSection =
-    serverSupports(hub(), "accounts") && claudeAccounts ? accountsSection(claudeAccounts, persistWarn) : legacyClaudeSection(tokenForm, persistWarn);
+    serverSupports(rosterServer(), "accounts") && claudeAccounts ? accountsSection(claudeAccounts, persistWarn) : legacyClaudeSection(tokenForm, persistWarn);
   // ── OpenRouter (drives the adversarial multi-model planning panel) ──
   const orForm = (saveLabel: string): string => `<div class="todoist-connect">
       <input id="or-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenRouter API key (sk-or-…)" />
@@ -3383,7 +3414,7 @@ function renderModelsPanel(): void {
   host.innerHTML = `${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
 
   // Wire Claude controls: the roster's own row/menu/dialog handlers, or the legacy single-token form.
-  if (serverSupports(hub(), "accounts") && claudeAccounts) {
+  if (serverSupports(rosterServer(), "accounts") && claudeAccounts) {
     wireAccountsSection(claudeAccounts);
   } else {
     if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
@@ -3493,11 +3524,11 @@ function wireAccountsSection(acc: AuthAccountsEvent): void {
   void acc; // acc is read via the DOM data- attributes above; kept as a param for symmetry with the render call
 }
 
-/** Send one `auth.account.*` command to the hub and await its `auth.accounts` reply (or a
- *  `command.error`, surfaced as a toast). Returns true on success. */
+/** Send one `auth.account.*` command to the ROSTER-OWNING server (§7.2 — not necessarily the origin)
+ *  and await its `auth.accounts` reply (or a `command.error`, surfaced as a toast). True on success. */
 async function sendAccountCmd(cmd: Record<string, unknown> & { type: string }): Promise<boolean> {
   try {
-    const res = await sendAwait(hub(), { ...cmd, cid: newCid() }, 20_000);
+    const res = await sendAwait(rosterServer(), { ...cmd, cid: newCid() }, 20_000);
     if (res.type === "command.error") {
       toast(res.message);
       return false;
@@ -3571,7 +3602,7 @@ function showAccountDialog(opts: { mode: "add" } | { mode: "rename"; id: string;
     else if (opts.mode === "rename") cmd = { type: "auth.account.rename", accountId: opts.id, label };
     else cmd = { type: "auth.account.replace", accountId: opts.id, token };
     try {
-      const res = await sendAwait(hub(), { ...cmd, cid: newCid() }, 20_000);
+      const res = await sendAwait(rosterServer(), { ...cmd, cid: newCid() }, 20_000);
       if (res.type === "command.error") {
         // Rendered INLINE (dup label, metered key, …) rather than a toast, and the dialog stays open
         // with the input intact so the user can fix it without retyping everything (§9.1).
@@ -4516,6 +4547,7 @@ function renderServerCards(): void {
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   void maybeRenderRepairCard(host); // this-machine "get a join code" — only when it's already in a fleet
+  maybeRenderAdoptHubCard(host); // "this Mac is part of <hub>'s fleet" — offers to connect to the roster owner
   if (nativeBridge) {
     const bridge = nativeBridge; // local const so the non-undefined narrowing flows into the closures below
     const setOut = (t: string): void => {
@@ -4649,6 +4681,71 @@ async function maybeRenderRepairCard(host: HTMLElement): Promise<void> {
     </div>`,
   );
   document.getElementById("fleet-repair")?.addEventListener("click", () => showRepairDialog());
+}
+
+/**
+ * When the ORIGIN is a fleet member whose hub this client hasn't adopted, the account roster is
+ * read-only here and every write bounces with "change accounts on the hub" (§7.2). That's correct but
+ * unhelpful on its own, so offer the fix: connect this client to the hub as well, and the Models tab
+ * starts routing writes there (see {@link rosterServer}).
+ *
+ * Synchronous and idempotent — `renderServerCards` can run several times concurrently, so drop any
+ * prior copy first, exactly as `maybeRenderRepairCard` does.
+ */
+function maybeRenderAdoptHubCard(host: HTMLElement): void {
+  document.getElementById("fleet-adopt-hub-card")?.remove();
+  const origin = hub();
+  const hubId = origin?.hubServerId;
+  if (!hubId) return; // the origin is a hub or standalone — nothing to adopt
+  for (const s of servers.values()) if (s.id === hubId) return; // already connected to it
+  // We only have the hub's serverId: a member is told which hub owns it (PairedHubStore), but nothing
+  // a MEMBER serves carries that hub's display name or address — only the hub knows its members, not
+  // the reverse. So the card names the fleet by id and the dialog asks for the URL.
+  host.insertAdjacentHTML(
+    "beforeend",
+    `<div class="card" id="fleet-adopt-hub-card"><div class="card-main">${icon("hub")} <b>This Mac is part of another Mac's fleet</b></div>
+      <div class="small muted">Its Claude accounts are managed on the hub (<code>${esc(hubId)}</code>), so they're read-only here. Add the hub to manage them from this device.</div>
+      <div class="git-row" style="margin-top:10px"><button class="mini" id="fleet-adopt-hub">${icon("add")} Add the hub</button></div>
+    </div>`,
+  );
+  document.getElementById("fleet-adopt-hub")?.addEventListener("click", () => showAdoptHubDialog());
+}
+
+/** Prompt for the hub's URL and adopt it as another server, exactly as `showAddMac` does for a peer.
+ *  We can't discover it automatically: the hub's address isn't in anything a MEMBER serves — only the
+ *  hub knows its own members, not the other way round. */
+function showAdoptHubDialog(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("hub")} Add this fleet's hub</h3>
+    <p class="small muted">Enter the hub's Anvil address on your tailnet (e.g. <code>https://mac-mini.tailnet.ts.net:7701</code>). Once it's connected, its Claude accounts become manageable from this device.</p>
+    <label>Hub URL<input id="adopt-hub-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://host:7701" /></label>
+    <div id="adopt-hub-status" class="small muted"></div>
+    <div class="btns"><button type="button" id="adopt-hub-cancel">Cancel</button><button type="button" id="adopt-hub-ok" class="primary">Add</button></div>
+  </div>`;
+  showModal(m);
+  $<HTMLButtonElement>("#adopt-hub-cancel").onclick = closeModal;
+  const input = document.getElementById("adopt-hub-url") as HTMLInputElement | null;
+  input?.focus();
+  $<HTMLButtonElement>("#adopt-hub-ok").addEventListener("click", () => {
+    const raw = (input?.value ?? "").trim().replace(/\/+$/, "");
+    const status = document.getElementById("adopt-hub-status");
+    if (!raw) {
+      if (status) status.textContent = "Enter the hub's URL.";
+      return;
+    }
+    try {
+      new URL(raw);
+    } catch {
+      if (status) status.textContent = "That doesn't look like a URL.";
+      return;
+    }
+    saveExtraServers([...loadExtraServers(), raw]);
+    ensureServer(raw);
+    closeModal();
+    renderServerCards();
+    toast("Connecting to the hub…");
+  });
 }
 
 /** The "Get a join code" modal for THIS machine (Settings → Fleet). Arms the local daemon — apiFetch
