@@ -194,14 +194,16 @@ export class Supervisor {
   private readonly notified = new Set<string>();
   private readonly renderer: MarkdownRenderer;
   /** The §3 allow-list env for spawned agents/terminals. Built fresh per call (not cached) so a token
-   *  set/reset via the UI (auth.set) reaches the next session/run without a daemon restart. */
-  private agentEnv(): Record<string, string> {
-    return buildAgentEnv();
+   *  set/reset via the UI (auth.set), or a roster change, reaches the next session/run without a
+   *  daemon restart. `s` resolves the spawn's Claude account (multi-account §4.1); omitted for
+   *  short-lived utility spawns (icon/branch-kind), which use the roster default. */
+  private agentEnv(s?: Session, opts: { requireToken?: boolean } = {}): Record<string, string> {
+    return buildAgentEnv({ accounts: this.accounts, ...(s?.data.accountId ? { accountId: s.data.accountId } : {}), ...opts });
   }
   /** Same allow-list, but tolerant of a missing Claude token — for the session TERMINAL, which must keep
    *  working on a degraded machine (HJ-25/§8.3). Only agent turns are gated on the credential. */
-  private shellEnv(): Record<string, string> {
-    return buildAgentEnv({ requireToken: false });
+  private shellEnv(s?: Session): Record<string, string> {
+    return this.agentEnv(s, { requireToken: false });
   }
   /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
    *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
@@ -2440,7 +2442,7 @@ export class Supervisor {
       const s = this.require(sessionId);
       return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
     },
-    () => this.shellEnv(),
+    (sessionId) => this.shellEnv(this.sessions.get(sessionId)),
   );
 
   terminalOpen(sessionId: string, cols: number, rows: number): void {
@@ -2532,7 +2534,7 @@ export class Supervisor {
         this.renderer,
         this.broker,
         this.questionBroker,
-        this.agentEnv(),
+        this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
         isDefault
           ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }

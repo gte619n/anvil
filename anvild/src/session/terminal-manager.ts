@@ -49,8 +49,9 @@ export class TerminalManager {
   constructor(
     /** Resolve a session (throws if it doesn't exist — mirrors Supervisor.require). */
     private readonly resolve: (sessionId: string) => TerminalSession,
-    /** The agent env applied to the shell (minus TERM, which the factory sets). */
-    private readonly agentEnv: () => Record<string, string>,
+    /** The agent env applied to the shell (minus TERM, which the factory sets), resolved per session so
+     *  a session pinned to a non-default Claude account gets its OWN token (multi-account §4.1). */
+    private readonly agentEnv: (sessionId: string) => Record<string, string>,
     private readonly spawn: SpawnTerminal = defaultSpawnTerminal,
   ) {}
 
@@ -75,7 +76,7 @@ export class TerminalManager {
       cols,
       rows,
       cwd: s.cwd,
-      env: { ...this.agentEnv(), TERM: "xterm-256color" }, // TERM is a terminal concern, set here
+      env: { ...this.agentEnv(sessionId), TERM: "xterm-256color" }, // TERM is a terminal concern, set here
 
       onData: (bytes) => {
         const buf = Buffer.from(bytes);
