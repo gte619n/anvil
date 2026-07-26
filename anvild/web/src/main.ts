@@ -5819,7 +5819,7 @@ const selectedAutonomy = (): AutonomyPolicy =>
 // Opt-in adversarial plan review: when the session plans, competing models critique the plan before
 // it runs (the autopilot panel, in a session). Off by default; needs an OpenRouter key on the server.
 const ADVERSARIAL_PICKER = `<label class="cd-option"><input type="checkbox" id="ns-adv" />
-  <span>Adversarial plan review <span class="small muted">— competing models critique each plan (needs an OpenRouter key)</span></span></label>`;
+  <span><strong>Adversarial plan review</strong> <span class="small muted">— competing models critique each plan (needs an OpenRouter key)</span></span></label>`;
 /** Whether the open dialog's adversarial-review checkbox is ticked (false if it isn't present). */
 const selectedAdversarial = (): boolean =>
   (document.getElementById("ns-adv") as HTMLInputElement | null)?.checked ?? false;
@@ -5903,7 +5903,8 @@ function showNewSession(): void {
       <p class="small warn-text" id="ns-warn"></p>
       ${AUTONOMY_PICKER}
       ${ADVERSARIAL_PICKER}
-      <label class="ns-lead-row" id="ns-lead-row"><input type="checkbox" id="ns-lead" /> <span>Team lead — fans the goal out to member sessions and integrates their branches</span></label>
+      <label class="cd-option" id="ns-lead-row"><input type="checkbox" id="ns-lead" />
+        <span><strong>Team lead</strong> <span class="small muted">— fans the goal out to member sessions and integrates their branches</span></span></label>
       <div class="btns"><button type="button" id="ns-cancel">Cancel</button><button type="button" id="ns-create">Create</button></div>
       <p class="small muted"><a id="ns-manage" href="#">⚙ Manage environments…</a> · <a id="ns-oneoff" href="#">one-off folder…</a></p></div>`;
   }
