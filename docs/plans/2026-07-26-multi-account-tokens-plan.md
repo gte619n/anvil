@@ -54,38 +54,38 @@ bunx tsc --noEmit && bun run typecheck:web && bun run build:web && bun test
 | Task | Description | Status | Tested | Pushed |
 |------|-------------|--------|--------|--------|
 | 1 | **Spike:** cross-account `--resume` behaviour | done | n/a | no |
-| 2 | `AccountStore` — file, CRUD, `rev` | pending | no | no |
-| 3 | Validation & invariants (labels, metered key, last account, default) | pending | no | no |
-| 4 | Default mirroring through `setClaudeToken()` | pending | no | no |
-| 5 | Boot migration from the env token + wiring | pending | no | no |
-| 6 | `subscriptionAuthOk` considers a non-empty roster | pending | no | no |
-| 7 | Protocol: `auth.accounts.*` commands + `AuthAccountsEvent` | pending | no | no |
-| 8 | Protocol: `Session` / `Environment` / `server.hello` / fleet REST | pending | no | no |
-| 9 | `"accounts"` capability + `role` derivation in `server.hello` | pending | no | no |
-| 10 | Contract: bump `PROTOCOL_VERSION`, regen golden | pending | no | no |
-| 11 | Supervisor: roster command handlers + `auth.accounts` broadcast | pending | no | no |
-| 12 | WS routing for `auth.accounts.*` | pending | no | no |
-| 13 | Web: roster list in the Models tab | pending | no | no |
-| 14 | Web: Add-account dialog | pending | no | no |
-| 15 | Web: rename / replace / set-default / remove + in-use confirm | pending | no | no |
-| 16 | `buildAgentEnv({ accountId })` resolution | pending | no | no |
-| 17 | `agentEnv(s)` threading through the supervisor | pending | no | no |
-| 18 | `accountId` on `session.create`, stamped on the record | pending | no | no |
-| 19 | Web: account row in the new-session dialog | pending | no | no |
-| 20 | Web: account chip on the session header | pending | no | no |
-| 21 | Extract `restartDriverForNewToken()` + changed-token predicate | pending | no | no |
-| 22 | `session.account.set` command + supervisor method | pending | no | no |
-| 23 | Resume-failure → fresh context + persisted divider | pending | no | no |
-| 24 | Removal fallback + `accountMissing` badge | pending | no | no |
-| 25 | Web: header switch control | pending | no | no |
-| 26 | `role` / `hubServerId` derivation + test | pending | no | no |
-| 27 | Web: route roster writes by `serverId`; adopt-your-hub card | pending | no | no |
-| 28 | Web: replace the "Updated 0/0 Macs" toast | pending | no | no |
-| 29 | `accounts?` on pair/token payloads + `adoptCredentials()` branch | pending | no | no |
-| 30 | `GET /api/fleet/accounts` | pending | no | no |
-| 31 | Hub auto-push + per-member `rev` + capability tiering | pending | no | no |
-| 32 | Web: Servers-tab sync state + "Sync now" | pending | no | no |
-| 33 | `Environment.accountId` + dialog + autopilot resolution | pending | no | no |
+| 2 | `AccountStore` — file, CRUD, `rev` | done | yes | no |
+| 3 | Validation & invariants (labels, metered key, last account, default) | done | yes | no |
+| 4 | Default mirroring through `setClaudeToken()` | done | yes | no |
+| 5 | Boot migration from the env token + wiring | done | yes | no |
+| 6 | `subscriptionAuthOk` considers a non-empty roster | done | yes | no |
+| 7 | Protocol: `auth.accounts.*` commands + `AuthAccountsEvent` | done | yes | no |
+| 8 | Protocol: `Session` / `Environment` / `server.hello` / fleet REST | done | yes | no |
+| 9 | `"accounts"` capability + `role` derivation in `server.hello` | done | yes | no |
+| 10 | Contract: bump `PROTOCOL_VERSION`, regen golden | done | yes | no |
+| 11 | Supervisor: roster command handlers + `auth.accounts` broadcast | done | yes | no |
+| 12 | WS routing for `auth.accounts.*` | done | yes | no |
+| 13 | Web: roster list in the Models tab | done | yes | no |
+| 14 | Web: Add-account dialog | done | yes | no |
+| 15 | Web: rename / replace / set-default / remove + in-use confirm | done | yes | no |
+| 16 | `buildAgentEnv({ accountId })` resolution | done | yes | no |
+| 17 | `agentEnv(s)` threading through the supervisor | done | yes | no |
+| 18 | `accountId` on `session.create`, stamped on the record | done | yes | no |
+| 19 | Web: account row in the new-session dialog | done | yes | no |
+| 20 | Web: account chip on the session header | done | yes | no |
+| 21 | Extract `restartDriverForNewToken()` + changed-token predicate | done | yes | no |
+| 22 | `session.account.set` command + supervisor method | done | yes | no |
+| 23 | Resume-failure → fresh context + persisted divider | done | yes | no |
+| 24 | Removal fallback + `accountMissing` badge | done | yes | no |
+| 25 | Web: header switch control | done | yes | no |
+| 26 | `role` / `hubServerId` derivation + test | done | yes | no |
+| 27 | Web: route roster writes by `serverId`; adopt-your-hub card | done | yes | no |
+| 28 | Web: replace the "Updated 0/0 Macs" toast | done | yes | no |
+| 29 | `accounts?` on pair/token payloads + `adoptCredentials()` branch | done | yes | no |
+| 30 | `GET /api/fleet/accounts` | done | yes | no |
+| 31 | Hub auto-push + per-member `rev` + capability tiering | done | yes | no |
+| 32 | Web: Servers-tab sync state + "Sync now" | done | yes | no |
+| 33 | `Environment.accountId` + dialog + autopilot resolution | done | yes | no |
 | 34 | **User E2E acceptance — HARD PAUSE, the user drives a real daemon** | pending | no | no |
 | 35 | Fix everything Task 34 surfaced | pending | no | no |
 | 36 | Docs, final gates, PR | pending | no | no |
