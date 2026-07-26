@@ -720,22 +720,45 @@ export class Supervisor {
   }
 
   /**
-   * A new Claude credential just landed (a pair, a rotation, or a paste). Sessions build their agent
-   * env per spawn, so nothing needs a restart to pick it up — but a session whose DRIVER is already
-   * running holds the old env for the life of its `query()`. Drop the drivers of IDLE sessions so the
-   * next turn rebuilds with the new token; sessions mid-turn are left alone and flagged instead, since
-   * tearing down a running turn would lose its work (HJ-11).
+   * Drop one session's live driver so the next prompt rebuilds it with a fresh env. `claudeSessionId`
+   * is KEPT, so `ensureDriver()`'s `resume` rejoins the same conversation on the new token (§5.3).
+   * Returns false when the session is mid-turn and was left alone.
    */
-  async restartIdleSessionsForNewToken(): Promise<void> {
+  private async restartDriverForNewToken(id: string): Promise<boolean> {
+    const status = this.sessions.get(id)?.data.status;
+    if (status && status !== "idle") return false;
+    const driver = this.drivers.get(id);
+    if (!driver) return true;
+    this.drivers.delete(id);
+    await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+    return true;
+  }
+
+  /**
+   * A new Claude credential just landed (a pair, a rotation, a paste, or a roster mutation). Sessions
+   * build their agent env per spawn, so nothing needs a restart to pick it up — but a session whose
+   * DRIVER is already running holds the old env for the life of its `query()`. Drop the drivers of IDLE
+   * sessions so the next turn rebuilds with the new token; sessions mid-turn are left alone and flagged
+   * instead, since tearing down a running turn would lose its work (HJ-11).
+   *
+   * `before` — a per-session token snapshot from {@link tokensBySession} taken BEFORE the change —
+   * narrows this to only sessions whose OWN resolved token actually changed. With a roster, adding a
+   * non-default account (or replacing a token no live session is pinned to) changes nothing for anyone;
+   * restarting every driver anyway would drop perfectly good live sessions for no reason. Omit it to
+   * restart unconditionally (the pre-roster single-token call sites, where every session shares the one
+   * credential).
+   */
+  async restartIdleSessionsForNewToken(before?: Map<string, string | undefined>): Promise<void> {
     const busy: string[] = [];
-    for (const [id, driver] of [...this.drivers]) {
-      const status = this.sessions.get(id)?.data.status;
-      if (status && status !== "idle") {
-        busy.push(id);
-        continue;
+    for (const [id] of [...this.drivers]) {
+      const s = this.sessions.get(id);
+      if (!s) continue;
+      if (before) {
+        const prev = before.get(id);
+        const nowTok = this.accounts.token(s.data.accountId);
+        if (prev === nowTok) continue; // this session's resolved token is unchanged — leave it running
       }
-      this.drivers.delete(id);
-      await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+      if (!(await this.restartDriverForNewToken(id))) busy.push(id);
     }
     if (busy.length) {
       for (const id of busy) {
@@ -745,6 +768,12 @@ export class Supervisor {
       }
       console.log(`[fleet] token changed — ${busy.length} session(s) mid-turn kept on the old login until they settle`);
     }
+  }
+
+  /** Snapshot every live (driver-holding) session's CURRENTLY resolved token, to diff against after a
+   *  roster change — see {@link restartIdleSessionsForNewToken}. */
+  tokensBySession(): Map<string, string | undefined> {
+    return new Map([...this.drivers.keys()].map((id) => [id, this.accounts.token(this.sessions.get(id)?.data.accountId)]));
   }
 
   /**
@@ -896,21 +925,21 @@ export class Supervisor {
 
   /** Every mutator: apply → mirror the default → broadcast → return the same event to the caller. A
    *  mutation on a replica throws `AccountStore`'s "change accounts on the hub" message unchanged
-   *  (BadCommand via the caller's catch). */
-  private afterAccountMutation(cid: string | undefined, defaultTokenBefore: string | undefined): AuthAccountsEvent {
+   *  (BadCommand via the caller's catch). `before` — a snapshot from {@link tokensBySession} taken
+   *  BEFORE the mutation — narrows the restart to sessions whose OWN resolved token actually changed
+   *  (adding a non-default account, or replacing a token no live session is pinned to, restarts no
+   *  one). Fire-and-forget, like every other credential-change call site (http.ts's pair/rotate
+   *  handlers). */
+  private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>): AuthAccountsEvent {
     mirrorDefault(this.accounts); // the ONLY place a roster change is written to the launcher env file
-    // A mutation that changed the DEFAULT's resolved token invalidates every idle session's live driver
-    // env — restart them so the next turn picks it up (mirrors auth.set's existing behaviour; Task 21
-    // narrows this to only sessions whose OWN resolved token actually changed). Fire-and-forget, like
-    // every other credential-change call site (http.ts's pair/rotate handlers).
-    if (this.accounts.token(undefined) !== defaultTokenBefore) void this.restartIdleSessionsForNewToken();
+    void this.restartIdleSessionsForNewToken(before);
     const event = this.accountsEvent(cid);
     this.registry.toAll(cid ? { ...event, cid: undefined } : event);
     return event;
   }
 
   accountAdd(label: string, token: string, cid?: string): AuthAccountsEvent {
-    const before = this.accounts.token(undefined);
+    const before = this.tokensBySession();
     try {
       this.accounts.add(label, token);
     } catch (e) {
@@ -920,7 +949,7 @@ export class Supervisor {
   }
 
   accountRename(accountId: string, label: string, cid?: string): AuthAccountsEvent {
-    const before = this.accounts.token(undefined);
+    const before = this.tokensBySession();
     try {
       this.accounts.rename(accountId, label);
     } catch (e) {
@@ -938,7 +967,7 @@ export class Supervisor {
   }
 
   accountReplace(accountId: string, token: string, cid?: string): AuthAccountsEvent {
-    const before = this.accounts.token(undefined);
+    const before = this.tokensBySession();
     try {
       this.accounts.replace(accountId, token);
     } catch (e) {
@@ -948,7 +977,7 @@ export class Supervisor {
   }
 
   accountSetDefault(accountId: string, cid?: string): AuthAccountsEvent {
-    const before = this.accounts.token(undefined);
+    const before = this.tokensBySession();
     try {
       this.accounts.setDefault(accountId);
     } catch (e) {
@@ -958,7 +987,7 @@ export class Supervisor {
   }
 
   accountRemove(accountId: string, cid?: string): AuthAccountsEvent {
-    const before = this.accounts.token(undefined);
+    const before = this.tokensBySession();
     try {
       this.accounts.remove(accountId);
     } catch (e) {
