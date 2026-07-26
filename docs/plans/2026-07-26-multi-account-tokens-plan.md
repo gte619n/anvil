@@ -1961,7 +1961,63 @@ Post it in chat and stop. Each line is a thing only a human with two subscriptio
 
 **Step 3: Record the outcome**
 
-Paste the user's findings into this task, then commit:
+### Run 1 — 2026-07-26, live two-machine fleet
+
+Hub: WSL2 (`wsl-hub`, 100.109.254.54) · Member: Proxmox LXC (`lxc-member`, 100.65.227.81), both on
+port 7711, same tailnet, same Tailscale user. Two real subscription tokens (`work`, `personal`).
+
+**Verified working**
+
+- Boot migration seeded the env token as `default`, and was correctly idempotent across a restart.
+- Roster CRUD, masking, `rev` increments, persistence across restart.
+- Pair carries the roster: member went `rev 0 / role hub / 0 accounts` → `rev 3 / role replica /
+  2 accounts` with the right `hubServerId`, and `subscriptionAuthOk` flipped false → true.
+- Replica refuses local writes with AccountStore's message, verbatim.
+- Auto-push on mutation: a rename on the hub reached the member within seconds; both revs moved together.
+- Per-member `accountsRev` recorded after a rotation.
+
+**Bugs found and fixed** (neither reachable by unit tests)
+
+1. **The test suite overwrote the developer's real Claude credential.** `afterAccountMutation()`
+   called `mirrorDefault()` with no file argument, defaulting to the real `~/.config/anvil/env`, so
+   any test building a Supervisor and adding an account replaced a working token with a fixture
+   string. Would have hit CI and every contributor. Fixed by an `envFile` override on
+   `SupervisorConfig`/`ServerOptions`, pinned in every test; verified by deleting the real file and
+   confirming a full run no longer recreates it.
+2. **A freshly-paired member read as out of sync.** `/api/fleet/invite` sent the roster (the member
+   adopted it fine) but recorded the `FleetMember` with no `accountsRev` — only the rotation path set
+   it. The Servers tab therefore said "out of date — press Sync now" about a member that was fully in
+   sync. Fixed by having `invitePeer` report the rev it actually delivered, which also collapses a
+   duplicated capability gate into one place. Confirmed on the live fleet: `accountsRev: 4` now lands
+   at pair time.
+
+**Environment artifacts — NOT defects in this feature** (recorded so they aren't re-diagnosed)
+
+- Port 7701 was held by a VS Code port-forward on Windows; WSL2 mirrored networking shares Windows'
+  port space, so the bind collided. Moved the whole fleet to 7711 — hub and member must share a port
+  because the fleet dials `<member-host>:<hub's port>`.
+- Windows Firewall blocks inbound to a WSL tailnet-IP bind, so the hub needed `ANVIL_HOST=127.0.0.1`
+  (WSL loopback IS reachable from Windows). Pairing is unaffected — it is all hub→member outbound.
+- WSL cannot resolve MagicDNS, and the "Add a machine" picker only ever offers names
+  (`host: p.dnsName || p.ipv4`), so the invite had to be driven by IP. See the follow-up below.
+- The member's `Host` is a bare IP, so `tailnetDomainOf()` yields nothing and the WS origin gate 403s
+  a cross-origin hub page; needed `ANVIL_ALLOWED_ORIGINS`. A Mac hub with MagicDNS gets same-tailnet
+  trust for free. Gate confirmed still enforcing (a control Origin was rejected).
+
+**Still unverified**
+
+- That a session pinned to `personal` bills token B's subscription. The daemon demonstrably resolves
+  and spawns with the right token; only the Anthropic usage dashboard can confirm where the charge
+  lands.
+
+**Follow-up worth its own PR (pre-existing, outside this change)**
+
+`invitePeer`/`resolveMember` dial only the MagicDNS name when a peer has one, so on any hub where
+those names don't resolve, "Add a machine" fails against a peer that is perfectly reachable by IP.
+The codebase already cares about this class of failure (`healFleetUrlsByDiscovery` exists to recover
+members stranded when MagicDNS is switched off), so falling back to the tailnet IP looks right.
+
+Then commit:
 
 ```bash
 git commit -m "docs: record multi-account E2E acceptance findings (task 34)"
