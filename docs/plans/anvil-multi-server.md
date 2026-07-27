@@ -18,7 +18,7 @@ connects to each over Tailscale.
 | # | Decision | Choice |
 |---|---|---|
 | MS-1 | Topology | **One client, many servers** — client holds a server registry, opens one WS per server |
-| MS-2 | Auth across Macs | **One Max subscription** — the same `CLAUDE_CODE_OAUTH_TOKEN` on every server (⚠ see §8) |
+| MS-2 | Auth across Macs | ~~**One Max subscription** — the same `CLAUDE_CODE_OAUTH_TOKEN` on every server (⚠ see §8)~~ **Superseded** by `2026-07-25-multi-account-tokens-design.md`: the fleet now replicates a *roster* of labelled accounts, and a session or environment picks which one it spawns under. One account is still the default, so the single-subscription case is unchanged |
 | MS-3 | Client form (near-term) | **Hub web app** — one designated daemon serves the web client; it fans out to all servers (keeps the web app as the daily driver). Native multi-server client is the eventual ceiling. |
 
 ---
@@ -162,6 +162,9 @@ so the hub web app and a future native client are interchangeable front-ends.
 ---
 
 ## 7. Auth & the shared-budget problem (LOAD-BEARING)
+
+> **Superseded.** Multiple accounts are supported as of `2026-07-25-multi-account-tokens-design.md`;
+> the concern below is now a property of the *default* account rather than of the fleet as a whole.
 
 MS-2 reuses one `CLAUDE_CODE_OAUTH_TOKEN` on every server. Two consequences:
 

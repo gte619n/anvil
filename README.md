@@ -89,6 +89,8 @@ bun install
 
 # 2. Authenticate with your Claude subscription (one-time).
 #    This uses the subscription pool — NOT a metered API key (see "Auth & billing" below).
+#    On first start this token is migrated into the account roster as "default"; from then on you
+#    manage logins in Settings → Models, and can add more than one (see "Multiple accounts").
 export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"
 
 # 3. Run the daemon — serves the web client + WebSocket API on :7701

@@ -46,6 +46,18 @@ perimeter can't:
   previews are surfaced).
 - The daemon refuses to start if `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are set in its
   environment, so a metered key can't leak into agent subprocesses.
+- **Multiple Claude accounts.** A hub can hold several labelled subscription tokens in
+  `<stateDir>/accounts.json` (`0600`, written atomically). Understand the blast radius before adding
+  a second account:
+  - **Every member of a fleet holds every token.** The roster is replicated in full on the existing
+    credential push, so adding an account to the hub copies that token to every paired machine. A
+    machine you would not trust with a subscription should not be in the fleet.
+  - The push rides the same gate as the single-token rotation — same-user tailnet identity **and** a
+    matching `hubServerId` — and is only sent to peers advertising the `accounts` capability.
+  - **No raw token ever reaches a client.** Every read path (`auth.accounts`, `GET
+    /api/fleet/accounts`) returns `{ id, label, masked, createdAt }` only.
+  - Tokens are validated on the way in at every entry point — UI, replication and the boot migration
+    — so a metered `sk-ant-api…` key cannot enter the roster and reach a member.
 
 ## Reporting a vulnerability
 

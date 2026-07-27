@@ -812,19 +812,45 @@ exception, and the divider copy is adjusted to say so plainly.
 
 | Phase | Description | Status | Tested | Pushed |
 |-------|-------------|--------|--------|--------|
-| 0 | **Spike:** does the Claude Code CLI `--resume` a conversation across accounts? Gates phase 4's copy, not its existence | pending | no | no |
-| 1 | `AccountStore` + `accounts.json` + migration from the env token + default-mirroring **through `setClaudeToken()`** (§3.2, preserves degrade-marker clearing). *No guard work — already satisfied on `main` (§4.2).* Server-only, no UI | pending | no | no |
-| 2 | Protocol: `auth.accounts.*`, `session.account.set`, `Session`/`Environment`/`server.hello` additions, `"accounts"` capability, `PROTOCOL_VERSION` bump + golden regen | pending | no | no |
-| 3 | Hub-side roster CRUD + Settings → Models roster UI (add / rename / replace / remove / set default) | pending | no | no |
-| 4 | Session binding: `accountId` at create, `agentEnv(s)` threading, create-dialog picker, session-header display | pending | no | no |
-| 5 | Rebinding: extract `restartDriverForNewToken()` from `restartIdleSessionsForNewToken()` + the non-default-account predicate (§5.3), `session.account.set`, resume-failure divider, removal fallback + `accountMissing` badge | pending | no | no |
-| 6 | Hub identity, **client-side only**: derive `role`/`hubServerId` in `server.hello`, route roster writes by `serverId`, adopt-your-hub card from a member origin, replace the `0/0` toast. *(`PairedHubStore` already persists the hub — nothing new server-side)* | pending | no | no |
-| 7 | Replication: `accounts?` on `FleetPairRequest`/`FleetTokenRequest`, the `adoptCredentials()` branch, `GET /api/fleet/accounts`, auto-push on mutation and pair, per-member `rev`, Servers-tab sync state + Sync now, `accounts`-capability tiering. *(no new write endpoint; inherits the existing gate + transport routing)* | pending | no | no |
-| 8 | Environment `accountId` + autopilot resolution + autopilot report line | pending | no | no |
-| 9 | **User E2E acceptance** — a real second subscription, a real mid-session switch, a real member Mac. Hard pause; nothing below starts until it reports back | pending | no | no |
-| 10 | Fix everything phase 9 surfaced; amend this design in the same commit if a finding invalidates a decision | pending | no | no |
-| 11 | Docs: `SECURITY.md` blast-radius note, `anvil-multi-server.md` MS-2 superseded, `README`/`anvild/README` token setup | pending | no | no |
+| 0 | **Spike:** does the Claude Code CLI `--resume` a conversation across accounts? Gates phase 4's copy, not its existence | done | yes | yes |
+| 1 | `AccountStore` + `accounts.json` + migration from the env token + default-mirroring **through `setClaudeToken()`** (§3.2, preserves degrade-marker clearing). *No guard work — already satisfied on `main` (§4.2).* Server-only, no UI | done | yes | yes |
+| 2 | Protocol: `auth.accounts.*`, `session.account.set`, `Session`/`Environment`/`server.hello` additions, `"accounts"` capability, `PROTOCOL_VERSION` bump + golden regen | done | yes | yes |
+| 3 | Hub-side roster CRUD + Settings → Models roster UI (add / rename / replace / remove / set default) | done | yes | yes |
+| 4 | Session binding: `accountId` at create, `agentEnv(s)` threading, create-dialog picker, session-header display | done | yes | yes |
+| 5 | Rebinding: extract `restartDriverForNewToken()` from `restartIdleSessionsForNewToken()` + the non-default-account predicate (§5.3), `session.account.set`, resume-failure divider, removal fallback + `accountMissing` badge | done | yes | yes |
+| 6 | Hub identity, **client-side only**: derive `role`/`hubServerId` in `server.hello`, route roster writes by `serverId`, adopt-your-hub card from a member origin, replace the `0/0` toast. *(`PairedHubStore` already persists the hub — nothing new server-side)* | done | yes | yes |
+| 7 | Replication: `accounts?` on `FleetPairRequest`/`FleetTokenRequest`, the `adoptCredentials()` branch, `GET /api/fleet/accounts`, auto-push on mutation and pair, per-member `rev`, Servers-tab sync state + Sync now, `accounts`-capability tiering. *(no new write endpoint; inherits the existing gate + transport routing)* | done | yes | yes |
+| 8 | Environment `accountId` + autopilot resolution + autopilot report line | done | yes | yes |
+| 9 | **User E2E acceptance** — a real second subscription, a real mid-session switch, a real member Mac. Hard pause; nothing below starts until it reports back | done | yes | yes |
+| 10 | Fix everything phase 9 surfaced; amend this design in the same commit if a finding invalidates a decision | done | yes | yes |
+| 11 | Docs: `SECURITY.md` blast-radius note, `anvil-multi-server.md` MS-2 superseded, `README`/`anvild/README` token setup | done | yes | yes |
 
 Phases 1–5 are a complete, shippable single-server feature. Phases 6–8 layer the fleet on top.
 Phases 9–11 are acceptance and ship; **phase 9 is a hard pause** — no code gate can exercise a second
 real subscription, a real mid-session switch, or a real member Mac.
+
+### Outcome
+
+Phase 9 ran against a real two-machine fleet (WSL hub + Proxmox LXC member, two live subscriptions)
+and then an independent browser-driven audit. Between them they found **sixteen defects that the unit
+suite could not reach** — every one of them needing either two real daemons, an unreachable peer, or
+a real spawned process to observe. All were fixed in phase 10 and re-verified live; see
+`2026-07-26-multi-account-tokens-plan.md` Task 34 for the full record.
+
+The two worth carrying forward as design lessons:
+
+- **A snapshot of the default is not the default.** The removal fallback wrote `defaultId()` into the
+  session; the header rendered the *current* default. They agreed until the default moved, after
+  which the UI named a subscription that wasn't paying. Bindings that mean "follow the default" must
+  be stored as *absent*, not as a copy. Fixed; §5.4 now says so explicitly.
+- **"The origin that served this page" is not "the hub".** Three separate UI defects shared this one
+  root cause, exactly as §7.2 predicted. The client-side half of hub identity is the part of a fleet
+  feature most likely to be got wrong.
+
+Two deviations from this document, both deliberate:
+
+- §10 said a corrupt `accounts.json` should be "treated as empty", matching `FleetStore`. It now also
+  moves the file aside and logs loudly, because unlike a fleet list this file holds every token *and*
+  its `role` field — silently resetting it promoted a member's replica to a writable hub.
+- §10's "requires choosing a new default first, in the same dialog" is implemented as a refusal in
+  `AccountStore.remove()` rather than a picker inside the confirm. Same intent, far less UI.
