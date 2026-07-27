@@ -739,7 +739,16 @@ export function createServer(opts: ServerOptions): ServerHandle {
         }
       }
 
+      // "Sync now" — trigger an outbound roster push to this hub's own members. Identity-gated like the
+      // rest of the credential surface: a confirmed DIFFERENT tailnet user must not be able to drive a
+      // fleet credential operation, closing the asymmetry with /api/fleet/token (which ADOPTS a pushed
+      // token and so demands the stricter `sameUser`). Rotate only re-pushes tokens we already hold to
+      // members we already paired — it discloses nothing to the caller — so it takes /pair's posture
+      // instead: reject a proven `otherUser`, but stay permissive when identity is unprovable (`unknown`,
+      // e.g. whois momentarily down) rather than fail an operator's Sync now intermittently.
       if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
+        const who = await callerIdentity();
+        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
         const results = await pushRosterToMembers();
         return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
       }
