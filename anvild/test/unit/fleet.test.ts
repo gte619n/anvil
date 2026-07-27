@@ -589,3 +589,48 @@ test("invitePeer claims no rev when the pair itself is rejected", async () => {
   expect(out.ok).toBe(false);
   expect(out.accountsRev).toBeUndefined(); // a failed push must not read as "in sync"
 });
+
+// ── Reaching a peer whose MagicDNS name doesn't resolve, and failing fast (found live 2026-07-26) ──
+
+test("pushCredential falls back to the peer's IP when its NAME is unreachable", async () => {
+  // The name resolves nowhere (WSL can't resolve *.ts.net); only http://<ip> answers.
+  const seen: string[] = [];
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    seen.push(url);
+    if (!url.startsWith("http://100.64.0.9:")) throw new Error("Unable to connect. Is the computer able to access the url?");
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  const probe = async (b: string): Promise<ProbeResult | null> =>
+    b.includes("100.64.0.9") ? { serverId: "s", serverName: "n", version: "1", capabilities: ["pairing", "accounts"] } : null;
+
+  const [r] = await rotateToken({
+    members: [{ host: "sleepy.tail0.ts.net", capabilities: ["pairing"], url: "http://100.64.0.9:7711/" }],
+    token: "tok", hubServerId: "h", port: 7711, probe, fetchImpl: fn,
+  });
+  expect(r!.ok).toBe(true);
+  // It tried the name first, then healed over to the IP rather than giving up.
+  expect(seen.some((u) => u.includes("sleepy.tail0.ts.net"))).toBe(true);
+  expect(seen.some((u) => u.startsWith("http://100.64.0.9:7711/api/fleet/token"))).toBe(true);
+});
+
+test("rotateToken fails FAST against an offline member (background fan-out, not an interactive pair)", async () => {
+  // Never resolves — only the per-attempt timeout ends it. The default 12s per scheme is what made
+  // "Sync now" hang past Bun's 10s idleTimeout; rotation now uses a much shorter budget.
+  // Hangs until aborted — the ONLY thing that ends it is postPairing's AbortSignal.timeout, which is
+  // exactly the budget under test. (A stub that ignores the signal would hang forever, as real fetch
+  // would not.)
+  const fn = ((_u: unknown, init?: RequestInit) =>
+    new Promise<Response>((_res, rej) => {
+      init?.signal?.addEventListener("abort", () => rej(new DOMException("The operation timed out.", "TimeoutError")));
+    })) as unknown as typeof fetch;
+  const started = performance.now();
+  const [r] = await rotateToken({
+    members: [{ host: "gone.tail0.ts.net", capabilities: ["pairing"] }],
+    token: "tok", hubServerId: "h", timeoutMs: 150, probe: async () => null, fetchImpl: fn,
+  });
+  const elapsed = performance.now() - started;
+  expect(r!.ok).toBe(false);
+  // https + http + the :7702 fallback, each bounded by timeoutMs — comfortably under Bun's idleTimeout.
+  expect(elapsed).toBeLessThan(2000);
+});

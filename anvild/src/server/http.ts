@@ -513,6 +513,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         const preflight = await resolveMember(host, opts.port, undefined, memberIp);
         const outcome = await invitePeer({
           host,
+          ...(memberIp ? { ip: memberIp } : {}),
           code,
           token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
           hubServerId: identity.serverId,
