@@ -421,6 +421,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
         return Bun.serve<ConnState>({
           hostname: opts.host ?? "127.0.0.1",
           port: opts.port,
+          // Bun's default idleTimeout is 10s, but a fleet fan-out legitimately outlives that: a single
+          // UNREACHABLE member burns postPairing's 12s timeout per attempt, and each member is tried on
+          // two transports (:7701 then the :7702 fallback). The result was that /api/fleet/rotate could
+          // never answer while any member was offline — Bun closed the socket first, so "Sync now"
+          // returned an empty reply and the UI blamed the hub ("is the hub reachable?") when the hub was
+          // perfectly healthy. Pre-existing, but the Servers tab now actively tells people to press that
+          // button when a member is out of date, so it went from rare to routine.
+          idleTimeout: 120,
           async fetch(req, srv) {
             const url = new URL(req.url);
             const isApi = url.pathname.startsWith("/api/");

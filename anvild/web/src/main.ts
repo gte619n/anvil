@@ -4667,9 +4667,20 @@ async function rotateFleetToken(): Promise<void> {
       return;
     }
     const okN = r.results.filter((x) => x.ok).length;
-    toast(`Updated ${okN}/${r.results.length} Macs.`);
+    // Name who failed. "Updated 0/1 Macs." is technically true but useless when the answer is always
+    // "that one Mac is switched off" — and the old catch-all below blamed the HUB for it.
+    if (okN < r.results.length) {
+      const failed = r.results.filter((x) => !x.ok).map((x) => x.host);
+      toast(`Updated ${okN}/${r.results.length} Macs — couldn't reach ${failed.join(", ")}. It'll sync when it's back.`);
+    } else {
+      toast(`Updated ${okN}/${r.results.length} Macs.`);
+    }
     void loadFleetMembers(); // re-read each member's accountsRev so the per-card sync badges refresh
-  } catch { toast("Couldn't push the login — is the hub reachable?"); }
+  } catch {
+    // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
+    // failure above, not an exception, so this message must not be used for that case.
+    toast("Couldn't reach this machine's own daemon to start the sync.");
+  }
 }
 
 /** The "+ Add a machine" dialog: invite by join code (primary), or adopt a server that's already
