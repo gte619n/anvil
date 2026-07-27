@@ -4566,12 +4566,23 @@ function renderServerCards(): void {
   const list = orderedServers();
   // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
+  // Whether the ORIGIN owns the credentials it would be fanning out. A member holds a replica and has
+  // an empty member list, so "Sync now" there can only ever fail (it iterates nothing) and the blurb's
+  // "this server's Claude login" is simply false — the login is the hub's. Both are the positional
+  // `isHub === the origin` assumption the multi-account design §7.2 called out.
+  const originOwnsRoster = hub()?.role !== "member";
   host.innerHTML =
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
-    `<button id="fleet-rotate" class="mini" title="Push the current login and Claude accounts to every machine in the fleet">${icon("autorenew")} Sync now</button>` +
+    (originOwnsRoster
+      ? `<button id="fleet-rotate" class="mini" title="Push the current login and Claude accounts to every machine in the fleet">${icon("autorenew")} Sync now</button>`
+      : "") +
     `<button id="fleet-add" class="mini primary">${icon("add")} Add a machine</button>` +
     `</div></div>` +
-    `<p class="small muted">Every machine here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    `<p class="small muted">${
+      originOwnsRoster
+        ? "Every machine here shares this server's Claude login."
+        : "This machine is part of another Mac's fleet and shares <b>its</b> Claude login."
+    } Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
     list.map(serverCardHtml).join("");
   for (const srv of list) {
     wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
