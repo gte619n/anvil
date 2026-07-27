@@ -204,6 +204,23 @@ export interface Budget {
   updatedAt?: Iso8601; // when these numbers were last refreshed from the SDK
 }
 
+/** Ceiling on unmet stop attempts before a goal auto-clears (design D4). Shared with the web client. */
+export const GOAL_MAX_ITERATIONS = 10;
+
+/**
+ * A session's active goal (design 2026-07-25). Set with `/goal <condition>`, cleared with
+ * `/goal clear`, and enforced by a Stop hook that blocks the session from going idle until a judge
+ * says the condition is met. Display-only on the client — there is no goal command in the protocol;
+ * both `/goal` forms arrive as ordinary `prompt.send` text.
+ */
+export interface SessionGoal {
+  condition: string; // natural language, exactly as the user typed it
+  iterations: number; // unmet stop attempts since the last reset; auto-clears at GOAL_MAX_ITERATIONS
+  lastReason?: string; // the judge's most recent blocker, shown as the chip's tooltip
+  paused?: boolean; // restored from disk after a restart; re-arms on the next user prompt (D5)
+  setAt: Iso8601;
+}
+
 export interface Session {
   id: SessionId;
   title: string;
@@ -244,6 +261,9 @@ export interface Session {
   // enriched with SKILL.md descriptions — drives the composer's `/` autocomplete. Populated once the
   // driver starts (absent until the first turn); rides session.updated/session.list. (§skills)
   commands?: CommandInfo[];
+  // The session's active goal (design 2026-07-25). Absent when no goal is set. Drives the composer's
+  // goal chip; updated on every unmet stop attempt so the iteration count is live on every device.
+  goal?: SessionGoal;
 }
 
 /** A team's policy. Lives on the lead `Session`; a team is otherwise derived from `parentId`. */
