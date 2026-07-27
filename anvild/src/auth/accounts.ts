@@ -175,12 +175,19 @@ export class AccountStore {
 
   remove(id: string): void {
     this.assertWritable();
-    this.require(id);
+    const target = this.require(id);
     if (this.data.accounts.length === 1) {
       throw new Error("this is the last account — add another before removing it");
     }
+    // Design §10: removing the default requires choosing a new one FIRST. Silently repointing it at
+    // accounts[0] — arbitrary insertion order, not a choice — would move every default-following
+    // session onto a different subscription with no prompt and no badge. That matters more since the
+    // removal fallback started clearing `accountId` (so those sessions genuinely track the default),
+    // and it is the same "surprise about who paid" this feature exists to prevent.
+    if (this.data.defaultId === id) {
+      throw new Error(`"${target.label}" is the default account — make another account the default before removing it`);
+    }
     this.data.accounts = this.data.accounts.filter((a) => a.id !== id);
-    if (this.data.defaultId === id) this.data.defaultId = this.data.accounts[0]?.id;
     this.bump();
   }
 

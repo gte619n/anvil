@@ -198,3 +198,22 @@ test("saves are atomic — no .tmp is left behind", () => {
   expect(existsSync(join(dir, "accounts.json"))).toBe(true);
   expect(existsSync(join(dir, "accounts.json.tmp"))).toBe(false);
 });
+
+test("C3: removing the DEFAULT is refused — you must choose a new one first (design §10)", () => {
+  const s = tmpStore();
+  const work = s.add("work", "sk-ant-oat01-workworkwork-1111"); // first add becomes the default
+  const personal = s.add("personal", "sk-ant-oat01-personalpers-2222");
+  expect(s.defaultId()).toBe(work.id);
+
+  // Silently repointing the default at accounts[0] would move every default-following session onto
+  // a different subscription with no prompt and no badge.
+  expect(() => s.remove(work.id)).toThrow(/is the default account/);
+  expect(s.list()).toHaveLength(2); // nothing removed
+  expect(s.defaultId()).toBe(work.id);
+
+  // Choose first, then it's allowed — and the default is exactly what the user picked.
+  s.setDefault(personal.id);
+  s.remove(work.id);
+  expect(s.list().map((a) => a.label)).toEqual(["personal"]);
+  expect(s.defaultId()).toBe(personal.id);
+});

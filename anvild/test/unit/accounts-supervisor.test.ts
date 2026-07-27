@@ -96,7 +96,8 @@ test("a session bound to an account removed while the daemon was DOWN is reconci
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
-  accounts.add("personal", "sk-ant-oat01-personalpers-2222");
+  const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
+  accounts.setDefault(personal.id); // removing the DEFAULT is refused (§10) — choose another first
   const sup1 = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const s = sup1.create(createCmd(dir, work.id));
   const sessionId = s.data.id;
