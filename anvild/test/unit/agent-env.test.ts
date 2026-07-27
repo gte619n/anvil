@@ -1,6 +1,10 @@
 import { test, expect } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildAgentEnv, OPENROUTER_ANTHROPIC_BASE_URL } from "../../src/agent/env";
 import { checkAuth } from "../../src/auth/guard";
+import { AccountStore } from "../../src/auth/accounts";
 import { CLAUDE, GLM, roster, assertIndependent, PHASE_ASSIGNMENT } from "../../src/agent/model-roster";
 
 // The dual-model execution path is the pipeline's keystone: Claude runs on the subscription token, GLM
@@ -53,6 +57,47 @@ test("building a GLM child env does not disturb the daemon's §3 auth state", ()
   expect(checkAuth(DAEMON_ENV).subscriptionAuthOk).toBe(true);
 });
 
+// ── Account roster resolution (multi-account §4.1) ──
+
+test("resolves the token for an explicit accountId", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  const a = store.add("work", "sk-ant-oat01-workworkwork-1111");
+  const b = store.add("personal", "sk-ant-oat01-personalpers-2222");
+  expect(buildAgentEnv({ accounts: store, accountId: b.id }).CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-personalpers-2222");
+  expect(buildAgentEnv({ accounts: store, accountId: a.id }).CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-workworkwork-1111");
+});
+
+test("no accountId resolves the default", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  store.add("work", "sk-ant-oat01-workworkwork-1111");
+  expect(buildAgentEnv({ accounts: store }).CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-workworkwork-1111");
+});
+
+test("an unknown accountId throws rather than silently using another subscription", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  store.add("work", "sk-ant-oat01-workworkwork-1111");
+  expect(() => buildAgentEnv({ accounts: store, accountId: "acct_gone" })).toThrow(/acct_gone/);
+});
+
+test("no store at all falls back to the env var (dev run, pre-migration)", () => {
+  expect(buildAgentEnv({ src: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-fromenv-1111" } }).CLAUDE_CODE_OAUTH_TOKEN).toBe(
+    "sk-ant-oat01-fromenv-1111",
+  );
+});
+
+test("the glm profile still carries no Claude token even with a roster", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  store.add("work", "sk-ant-oat01-workworkwork-1111");
+  const env = buildAgentEnv({ accounts: store, profile: "glm", src: { OPENROUTER_API_KEY: "sk-or-x" } });
+  expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe("sk-or-x");
+});
+
+test("requireToken:false still yields a shell env on a tokenless box", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  expect(() => buildAgentEnv({ accounts: store, requireToken: false })).not.toThrow();
+});
+
 // ── Model roster + independence rule (spec §2.2, §3.2) ──
 
 test("the roster is exactly two decorrelated models on one execution path", () => {
@@ -80,4 +125,18 @@ test("every phase's default author≠adversary (independence holds where an adve
 test("assertIndependent throws only when author and adversary are the same model", () => {
   expect(() => assertIndependent("requirements", "glm", "claude")).not.toThrow();
   expect(() => assertIndependent("requirements", "claude", "claude")).toThrow(/independence violation/);
+});
+
+test("a REPLICA's unknown accountId points at Sync now, not at picking another account", () => {
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  store.adoptReplica({
+    rev: 5,
+    defaultId: "acct_hub",
+    entries: [{ id: "acct_hub", label: "hub-account", token: "sk-ant-oat01-hubpushed-9999", createdAt: 1 }],
+  });
+  expect(() => buildAgentEnv({ accounts: store, accountId: "acct_notyetpushed" })).toThrow(/sync now/i);
+  // ...whereas on a hub the same missing id really is gone.
+  const hub = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
+  hub.add("work", "sk-ant-oat01-workworkwork-1111");
+  expect(() => buildAgentEnv({ accounts: hub, accountId: "acct_gone" })).toThrow(/removed/i);
 });

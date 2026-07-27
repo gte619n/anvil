@@ -393,6 +393,9 @@ interface PairOutcome {
   /** The route answered, but with "no such route" semantics (404/405, or a non-JSON error page). The
    *  caller treats this as "try the other destination", NOT as a hard failure — see {@link pushCredential}. */
   routeMissing?: boolean;
+  /** The account-roster `rev` this joiner confirmed accepting (multi-account §7.3). Set only when the
+   *  roster was actually sent AND the pair succeeded, so the hub never records a rev it didn't deliver. */
+  accountsRev?: number;
   /** The fetch never produced a response at all — connection refused, DNS failure, TLS-to-plain-HTTP
    *  mismatch, or timeout. The caller retries the next scheme/port rather than surfacing it as a real
    *  rejection (see {@link pushCredential}). Deliberately a FLAG set at the fetch boundary, not a
@@ -458,6 +461,10 @@ export function speaksPairing(capabilities: string[] | undefined): boolean {
  */
 async function pushCredential(opts: {
   host: string;
+  /** The peer's tailnet IPv4, when known. Tried AFTER the host's own schemes, so an unresolvable
+   *  MagicDNS name (a hub whose resolver doesn't serve *.ts.net — e.g. WSL) still reaches a peer that
+   *  is perfectly available at `http://<ip>`. Ignored when it equals `host`. */
+  ip?: string;
   capabilities?: string[];
   /** The daemon route on :7701, e.g. "/api/fleet/pair". */
   daemonPath: string;
@@ -466,17 +473,23 @@ async function pushCredential(opts: {
   body: Record<string, unknown>;
   port?: number;
   pairingPort?: number;
+  /** Per-ATTEMPT timeout. An interactive pair can afford to wait; a background rotation cannot —
+   *  the default 12s is multiplied by every scheme and every offline member, which is what made
+   *  "Sync now" sit on a spinner for 14s+ against one sleeping Mac. */
+  timeoutMs?: number;
   fetchImpl?: typeof fetch;
 }): Promise<PairOutcome> {
   const host = bareHost(opts.host);
   const doFetch = opts.fetchImpl ?? fetch;
   const port = opts.port ?? 7701;
+  const t = opts.timeoutMs ?? 12_000;
   const legacyUrl = `http://${host}:${opts.pairingPort ?? 7702}${opts.legacyPath}`;
 
   if (speaksPairing(opts.capabilities)) {
     let last: PairOutcome = { ok: false, error: "no reachable transport" };
-    for (const base of daemonBases(host, port)) {
-      const r = await postPairing(`${base}${opts.daemonPath}`, opts.body, 12_000, doFetch);
+    const ipBase = opts.ip && bareHost(opts.ip) !== host ? [`http://${bareHost(opts.ip)}:${port}`] : [];
+    for (const base of [...daemonBases(host, port), ...ipBase]) {
+      const r = await postPairing(`${base}${opts.daemonPath}`, opts.body, t, doFetch);
       if (r.ok) return r;
       last = r;
       // A real rejection ("wrong code") is an ANSWER — stop, don't shop the credential around. Only a
@@ -488,11 +501,11 @@ async function pushCredential(opts: {
       if (!r.routeMissing && !r.transportError) return r;
       if (r.routeMissing) break; // it's a daemon, but an old one — go straight to :7702
     }
-    const legacy = await postPairing(legacyUrl, opts.body, 12_000, doFetch);
+    const legacy = await postPairing(legacyUrl, opts.body, t, doFetch);
     return legacy.ok ? legacy : { ...legacy, error: legacy.error ?? last.error };
   }
 
-  return postPairing(legacyUrl, opts.body, 12_000, doFetch);
+  return postPairing(legacyUrl, opts.body, t, doFetch);
 }
 
 /**
@@ -503,6 +516,9 @@ async function pushCredential(opts: {
  */
 export async function invitePeer(opts: {
   host: string;
+  /** The joiner's tailnet IPv4, when known — lets the pair land even if its MagicDNS name doesn't
+   *  resolve on THIS hub (see pushCredential.ip). */
+  ip?: string;
   code: string;
   token: string;
   hubServerId: string;
@@ -510,13 +526,20 @@ export async function invitePeer(opts: {
   fleetName?: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** The hub's account roster (multi-account §7.3), so a joiner arrives with every account rather
+   *  than waiting for the next rotation. Sent only to a joiner advertising "accounts". */
+  accounts?: rest.RosterPush;
   port?: number;
   pairingPort?: number;
   fetchImpl?: typeof fetch;
 }): Promise<PairOutcome> {
   if (!opts.token) return { ok: false, error: "this server has no OAuth token to share" };
-  return pushCredential({
+  // ONE place decides whether the roster goes (§7.3) — the caller reads `accountsRev` off the result
+  // rather than re-deriving this condition, which would silently drift from what was actually sent.
+  const roster = opts.accounts && opts.capabilities?.includes("accounts") ? opts.accounts : undefined;
+  const outcome = await pushCredential({
     host: opts.host,
+    ...(opts.ip ? { ip: opts.ip } : {}),
     capabilities: opts.capabilities,
     daemonPath: "/api/fleet/pair",
     legacyPath: "/anvil-pair",
@@ -530,8 +553,11 @@ export async function invitePeer(opts: {
       ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
       ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
       ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+      ...(roster ? { accounts: roster } : {}),
     },
   });
+  // Only claim a rev the joiner actually accepted — a failed pair leaves it unset.
+  return roster && outcome.ok ? { ...outcome, accountsRev: roster.rev } : outcome;
 }
 
 /**
@@ -635,16 +661,23 @@ export async function propagateTodoist(opts: {
  * getting the :7701 route without needing to be re-paired.
  */
 export async function rotateToken(opts: {
-  members: { host: string; capabilities?: string[] }[];
+  members: { host: string; capabilities?: string[]; url?: string }[];
   token: string;
   hubServerId: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** The hub's account roster (multi-account §7.3). Sent ONLY to members advertising "accounts" — an
+   *  older member would ignore the field, but not sending it keeps the wire honest and lets the caller
+   *  tell "didn't get it" from "got it and is on this rev" via the returned `accountsRev`. */
+  accounts?: rest.RosterPush;
   port?: number;
   pairingPort?: number;
+  /** Per-attempt timeout. Deliberately much shorter than a pair's: rotation is a background fan-out
+   *  over every member, so a sleeping Mac must fail fast rather than hold the whole response open. */
+  timeoutMs?: number;
   probe?: Probe;
   fetchImpl?: typeof fetch;
-}): Promise<{ host: string; ok: boolean; error?: string }[]> {
+}): Promise<{ host: string; ok: boolean; error?: string; accountsRev?: number }[]> {
   if (!opts.token) return opts.members.map((m) => ({ host: m.host, ok: false, error: "no token" }));
   const probe = opts.probe ?? defaultProbe;
   const port = opts.port ?? 7701;
@@ -661,8 +694,18 @@ export async function rotateToken(opts: {
           }
         }
       }
+      // Capability tiering (§7.3): only a member that speaks "accounts" is sent the roster. One that
+      // doesn't keeps working on the single mirrored token exactly as before — it just can't offer the
+      // per-session picker, which the Servers tab surfaces as "Update Anvil to use multiple accounts".
+      const sendsRoster = !!opts.accounts && (capabilities?.includes("accounts") ?? false);
+      // A member's stored url is often already healed to its raw tailnet IP; use it as the fallback
+      // transport so a hub that can't resolve MagicDNS still reaches it.
+      let ip: string | undefined;
+      try { const h = m.url ? new URL(m.url).hostname : ""; if (isBareIPv4(h)) ip = h; } catch { /* unparsable url */ }
       const r = await pushCredential({
         host,
+        ...(ip ? { ip } : {}),
+        timeoutMs: opts.timeoutMs ?? 4_000,
         capabilities,
         daemonPath: "/api/fleet/token",
         legacyPath: "/anvil-token",
@@ -674,9 +717,12 @@ export async function rotateToken(opts: {
           hubServerId: opts.hubServerId,
           ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
           ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+          ...(sendsRoster ? { accounts: opts.accounts } : {}),
         },
       });
-      return { host: m.host, ok: r.ok, error: r.error };
+      // Only claim a rev the member actually confirmed taking — a failed push leaves it unset so the
+      // Servers tab keeps showing "out of date" and Sync now stays meaningful.
+      return { host: m.host, ok: r.ok, error: r.error, ...(sendsRoster && r.ok ? { accountsRev: opts.accounts!.rev } : {}) };
     }),
   );
 }

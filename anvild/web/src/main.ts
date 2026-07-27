@@ -38,7 +38,9 @@ const b64ToBytes = (b64: string): Uint8Array => {
 };
 import { GOAL_MAX_ITERATIONS, MODELS, modelLabel, type Model } from "../../protocol";
 import type {
+  AccountInfo,
   AttachmentRef,
+  AuthAccountsEvent,
   AuthStatusEvent,
   AutopilotPlanInfo,
   PipelineTraceInfo,
@@ -163,6 +165,10 @@ interface Server {
   version?: string; // anvild version (from server.hello)
   capabilities?: string[]; // feature flags from server.hello; undefined on pre-capability builds
   budget?: Budget; // last budget snapshot (aggregate gauge, §7)
+  /** This daemon's fleet position (multi-account §7.2). Undefined on a pre-role build. */
+  role?: "hub" | "member" | "standalone";
+  /** Set when role === "member": the serverId of the hub that owns this machine's account roster. */
+  hubServerId?: string;
 }
 /** Whether a server advertised support for a capability (e.g. "autopilot"). A pre-capability build
  *  omits the list → treated as unsupported, so we never send it a command it can't handle. */
@@ -287,6 +293,27 @@ function removeServer(url: string): void {
   if (document.getElementById("server-cards")) renderServerCards(); // drop the card from an open Settings view
 }
 const hub = (): Server => servers.get(HUB_URL)!;
+/**
+ * The server that OWNS the Claude account roster — where every `auth.account*` write must go
+ * (multi-account §7.2). Deliberately a NEW notion rather than a redefinition of `hub()`/`HUB_URL`,
+ * which keep meaning "the origin this page was served from", so nothing that legitimately means
+ * "the origin" changes behaviour.
+ *
+ * Resolution order: the connected server whose `serverId` matches this machine's paired hub (the
+ * origin is a member and we've also adopted its hub) → the connected server that reports
+ * `role: "hub"` → the origin. The last case covers a standalone daemon AND a member whose hub isn't
+ * adopted yet: writes go to the origin and its own replica refuses them with "change accounts on the
+ * hub", which is the honest answer until Task 27's adopt-your-hub card is taken up.
+ */
+function rosterServer(): Server {
+  const origin = hub();
+  const pairedHubId = origin?.hubServerId;
+  if (pairedHubId) {
+    for (const s of servers.values()) if (s.id === pairedHubId) return s;
+  }
+  for (const s of servers.values()) if (s.role === "hub") return s;
+  return origin;
+}
 /** Resolve a routing url to its live socket. The `servers` map is keyed by the url a server was
  *  adopted under, but a session/env's stored routing url can DRIFT from it (a member reconnects under
  *  a force-upgraded https:// while its rows were tagged http://, or a trailing-slash difference) — see
@@ -836,6 +863,7 @@ function onEvent(url: string, e: ServerEvent): void {
       if (e.session.id === activeId) {
         updateGitPanelMeta();
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
+        updateHeaderAccount(e.session); // reflect an account switch + the idle/mid-turn tooltip
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
         updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
         updateGoalChip(e.session); // the goal's iteration count climbs on every unmet stop attempt
@@ -875,6 +903,8 @@ function onEvent(url: string, e: ServerEvent): void {
         srv.name = e.serverName || srv.name;
         srv.version = e.version;
         srv.capabilities = e.capabilities;
+        srv.role = e.role;
+        srv.hubServerId = e.hubServerId;
       }
       // Now that we know this server's capabilities, pull its autopilot state — but only if it's new
       // enough to handle these commands. An older member (no "autopilot" capability) is skipped, so it
@@ -936,6 +966,12 @@ function onEvent(url: string, e: ServerEvent): void {
       // Model-provider auth is hub-scoped (the token lives on the hub daemon; the Models card routes
       // to hub()). Ignore a fleet member's own status so it can't clobber the hub's.
       if (url === HUB_URL) onAuthStatus(e);
+      return;
+    case "auth.accounts":
+      // Roster-scoped, NOT origin-scoped (§7.2): the authoritative roster lives on whichever server
+      // owns it, which is the origin for a standalone/hub but the adopted hub for a member. Accepting
+      // a member's own replica broadcast here would let a stale copy clobber the hub's.
+      if (sameServerUrl(url, rosterServer()?.url ?? HUB_URL)) onAuthAccounts(e);
       return;
     case "autopilot.maintenance.result":
       return; // resolved via cidWaiter (resetAnvilTags / clearAutopilot)
@@ -1762,6 +1798,7 @@ function setStatus(status: string): void {
   if (s) {
     s.status = status as Session["status"];
     renderSessions();
+    updateHeaderAccount(s); // the account chip's switch tooltip depends on idle vs mid-turn
   }
 }
 
@@ -2419,6 +2456,7 @@ function setHeaderTitle(s: Session | undefined): void {
   document.title = s ? `Anvil: ${s.title}` : "Anvil";
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   updateHeaderBranch(s);
+  updateHeaderAccount(s);
   updateHeaderModel(s);
   updateContextMeter(s);
   updateGoalChip(s);
@@ -2440,6 +2478,44 @@ function updateHeaderBranch(s: Session | undefined): void {
   }
 }
 $("#header-branch").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
+
+/** Show the active session's Claude account as a chip in the header (multi-account §5). Omitted
+ *  entirely when the roster has ≤1 account — there's nothing to distinguish. When the session's bound
+ *  account no longer resolves (removed), the chip badges the fallback with the old label. */
+function updateHeaderAccount(s: Session | undefined): void {
+  const el = document.getElementById("header-account");
+  if (!el) return;
+  const list = claudeAccounts?.accounts ?? [];
+  // C4: the <=1 guard used to run BEFORE the accountMissing branch, so removing the second-to-last
+  // account rebound every session bound to it and then hid the only evidence that had happened. A
+  // session flagged as fallen-back must always be able to say so, however small the roster.
+  if (!s || s.isDefault || (list.length <= 1 && !s.accountMissing)) {
+    el.innerHTML = "";
+    el.hidden = true;
+    return;
+  }
+  if (s.accountMissing) {
+    // `s.accountLabel` deliberately still names the REMOVED account (see the protocol's comment); the
+    // current fallback's label comes from the roster snapshot the client already has.
+    const oldLabel = s.accountLabel ?? "a removed account";
+    const defaultId = claudeAccounts?.defaultId;
+    const nowLabel = claudeAccounts?.accounts.find((a) => a.id === defaultId)?.label ?? "the default";
+    el.innerHTML = `${icon("warning")}<span class="hb-name">${esc(nowLabel)} ⚠ was ${esc(oldLabel)}</span>`;
+    el.title = `“${oldLabel}” was removed — this session fell back to “${nowLabel}”`;
+    el.hidden = false;
+    return;
+  }
+  const label = s.accountLabel ?? claudeAccounts?.accounts.find((a) => a.id === s.accountId)?.label;
+  if (!label) {
+    el.innerHTML = "";
+    el.hidden = true;
+    return;
+  }
+  el.innerHTML = `<span class="hb-name">● ${esc(label)}</span>`;
+  // The daemon refuses a mid-turn switch (setSessionAccount), so say why before the click.
+  el.title = s.status === "idle" ? `Claude account: ${label} — tap to switch` : "finish or interrupt the current turn first";
+  el.hidden = false;
+}
 
 /** Show the active session's model as a pill in the composer (next to Attach); tap it to switch. */
 function updateHeaderModel(s: Session | undefined): void {
@@ -2512,6 +2588,31 @@ $("#btn-model").addEventListener("click", () => {
       run: () => {
         if (m.id === s.model) return;
         sendTo(activeId, { type: "session.set_model", sessionId: activeId, model: m.id });
+      },
+    })),
+  );
+});
+
+// Tapping the account chip switches this session's Claude account (multi-account §10). Only offered
+// while the session is IDLE: the daemon refuses mid-turn anyway (setSessionAccount), so the menu
+// explains why up front rather than letting the click fail. A ✓ marks the current account.
+$("#header-account").addEventListener("click", () => {
+  const s = activeId ? sessions.get(activeId) : undefined;
+  const list = claudeAccounts?.accounts ?? [];
+  if (!s || list.length <= 1) return;
+  if (s.status !== "idle") {
+    toast("Finish or interrupt the current turn first — the new login applies from the next one.");
+    return;
+  }
+  toggleHeaderMenu(
+    $("#header-account"),
+    list.map((a) => ({
+      icon: a.id === s.accountId ? "check" : "key",
+      label: a.label,
+      title: a.id === s.accountId ? `${a.label} (current)` : `Switch this session to ${a.label}`,
+      run: () => {
+        if (a.id === s.accountId) return;
+        sendTo(activeId, { type: "session.account.set", sessionId: activeId, accountId: a.id });
       },
     })),
   );
@@ -2815,6 +2916,9 @@ function selectSettingsTab(tab: SettingsTab): void {
       hub().sock.send({ type: "auth.status", provider: "openrouter" });
       hub().sock.send({ type: "autopilot.pipeline.metrics" }); // §6.3 calibration card
     }
+    // Refresh the roster from whichever server owns it (§7.2), once per tab open.
+    const rs = rosterServer();
+    if (serverSupports(rs, "accounts")) rs.sock.send({ type: "auth.accounts.get" });
   }
 }
 
@@ -3165,6 +3269,22 @@ function onAuthStatus(e: AuthStatusEvent): void {
   if (e.provider !== "openrouter") void refreshSetupState();
 }
 
+// The Claude account roster (Settings → Models; multi-account §9). Absent until the connect burst or
+// an explicit auth.accounts.get lands. A pre-roster daemon (no "accounts" capability) never sends
+// this, so renderModelsPanel falls back to the single-token card in that case.
+let claudeAccounts: AuthAccountsEvent | undefined;
+function onAuthAccounts(e: AuthAccountsEvent): void {
+  claudeAccounts = e;
+  if (document.getElementById("models-panel")) renderModelsPanel();
+  // The header chip appears/disappears at the 1↔2-account boundary and shows a label the roster owns,
+  // so a roster change has to repaint it even when no session.updated follows.
+  updateHeaderAccount(activeId ? sessions.get(activeId) : undefined);
+  // F2: the Servers tab's per-Mac sync lines are derived from this same roster, so without this they
+  // kept rendering a stale snapshot until a reload — including the actionable "out of date" warning,
+  // which is worse than a stale count because it prompts an action based on old state.
+  if (document.getElementById("server-cards")) renderServerCards();
+}
+
 /** Persist a new/replacement Claude OAuth token on the hub daemon. */
 async function saveClaudeToken(token: string, btn?: HTMLButtonElement): Promise<void> {
   const t = token.trim();
@@ -3295,17 +3415,10 @@ function renderModelsPanel(): void {
     persisted
       ? ""
       : `<p class="small muted" style="margin-top:8px">${icon("warning")} Not written to the launcher env file — it will revert on the next service restart.</p>`;
-  // ── Claude (drives the Agent SDK) ──
-  const claudeSection = !claudeAuth.connected
-    ? `<div class="card"><b>No Claude token set.</b>
-        <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
-        ${tokenForm("Save")}</div>`
-    : `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
-          <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
-          <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(claudeAuth.persisted)}</div>
-        <div class="card"><b>Replace token</b>
-          <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
-          ${tokenForm("Replace")}</div>`;
+  // ── Claude (drives the Agent SDK) — the roster list when the hub supports it, else the single-token
+  //    card an older daemon still understands. ──
+  const claudeSection =
+    serverSupports(rosterServer(), "accounts") && claudeAccounts ? accountsSection(claudeAccounts, persistWarn) : legacyClaudeSection(tokenForm, persistWarn);
   // ── OpenRouter (drives the adversarial multi-model planning panel) ──
   const orForm = (saveLabel: string): string => `<div class="todoist-connect">
       <input id="or-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenRouter API key (sk-or-…)" />
@@ -3328,14 +3441,18 @@ function renderModelsPanel(): void {
   }
   host.innerHTML = `${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
 
-  // Wire Claude controls.
-  if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
-  const cInput = $<HTMLInputElement>("#claude-token");
-  const cBtn = $<HTMLButtonElement>("#claude-save");
-  cBtn.addEventListener("click", () => void saveClaudeToken(cInput.value, cBtn));
-  cInput.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") void saveClaudeToken(cInput.value, cBtn);
-  });
+  // Wire Claude controls: the roster's own row/menu/dialog handlers, or the legacy single-token form.
+  if (serverSupports(rosterServer(), "accounts") && claudeAccounts) {
+    wireAccountsSection(claudeAccounts);
+  } else {
+    if (claudeAuth.connected) $("#claude-clear").addEventListener("click", () => void clearClaudeTokenUi());
+    const cInput = $<HTMLInputElement>("#claude-token");
+    const cBtn = $<HTMLButtonElement>("#claude-save");
+    cBtn.addEventListener("click", () => void saveClaudeToken(cInput.value, cBtn));
+    cInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") void saveClaudeToken(cInput.value, cBtn);
+    });
+  }
   // Wire OpenRouter controls (present unless its status is still loading).
   if (openRouterAuth) {
     if (openRouterAuth.connected) $("#or-clear").addEventListener("click", () => void clearOpenRouterKeyUi());
@@ -3347,6 +3464,189 @@ function renderModelsPanel(): void {
     });
   }
 }
+
+/** The pre-roster single-token card (an older daemon that doesn't advertise "accounts"). */
+function legacyClaudeSection(tokenForm: (saveLabel: string) => string, persistWarn: (persisted: boolean) => string): string {
+  if (!claudeAuth) return "";
+  return !claudeAuth.connected
+    ? `<div class="card"><b>No Claude token set.</b>
+        <p class="small muted">On the daemon host run <code>claude setup-token</code>, paste the token below, then save. Stored on the hub daemon (mode 0600) and applied to the next agent run.</p>
+        ${tokenForm("Save")}</div>`
+    : `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+          <span>Claude — connected${claudeAuth.masked ? ` · <code>${esc(claudeAuth.masked)}</code>` : ""}</span>
+          <button id="claude-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(claudeAuth.persisted)}</div>
+        <div class="card"><b>Replace token</b>
+          <p class="small muted">Rotated or expired? Paste a fresh token to replace the current one.</p>
+          ${tokenForm("Replace")}</div>`;
+}
+
+/** This server's display name, given its serverId — for the "managed on <hub>" replica note.
+ *  Falls back to the bare id when the hub isn't among the connected servers (Task 26/27 make this a
+ *  real lookup via rosterServer(); until then this is best-effort). */
+function serverNameById(id: string | undefined): string {
+  if (!id) return "the hub";
+  for (const s of servers.values()) if (s.id === id) return s.name;
+  return id;
+}
+
+/** The Claude account roster card (multi-account §9.1): a labelled list with a default marker, an
+ *  Add-account action on the hub, and — on a replica — a note pointing at the hub that manages it. */
+function accountsSection(acc: AuthAccountsEvent, persistWarn: (persisted: boolean) => string): string {
+  const isHub = acc.role === "hub";
+  const rows = acc.accounts
+    .map((a: AccountInfo) => {
+      const isDefault = a.id === acc.defaultId;
+      const defaultBtn = isHub
+        ? `<button class="mini acct-default" data-id="${esc(a.id)}" title="${isDefault ? "Default account" : "Make default"}" ${isDefault ? "disabled" : ""}>${icon(isDefault ? "radio_button_checked" : "radio_button_unchecked")}</button>`
+        : `<span class="mini" style="opacity:.6" title="${isDefault ? "Default account" : ""}">${icon(isDefault ? "radio_button_checked" : "radio_button_unchecked")}</span>`;
+      const menu = isHub
+        ? `<button class="mini acct-menu" data-id="${esc(a.id)}" data-label="${esc(a.label)}" title="More">${icon("more_vert")}</button>`
+        : "";
+      return `<div class="acct-row" id="acct-row-${cssId(a.id)}">
+          <div class="card-main">${defaultBtn}<span class="acct-label">${esc(a.label)}</span><code class="small muted">${esc(a.masked)}</code><span style="margin-left:auto"></span>${menu}</div>
+          <div class="acct-actions" id="acct-actions-${cssId(a.id)}" hidden></div>
+        </div>`;
+    })
+    .join("");
+  const replicaNote = isHub
+    ? ""
+    : `<p class="small muted" style="margin-top:8px">${icon("hub")} Managed on <b>${esc(serverNameById(acc.hubServerId))}</b> (the hub). Changes sync to every Mac.</p>`;
+  const addBtn = isHub ? `<div class="git-row" style="margin-top:10px"><button class="mini" id="acct-add">${icon("add")} Add account</button></div>` : "";
+  return `<div class="card"><b>Claude accounts</b>
+      <div class="acct-list" style="margin-top:8px">${rows}</div>
+      ${replicaNote}${persistWarn(acc.persisted)}${addBtn}
+    </div>`;
+}
+
+/** Toggle a roster row's inline action strip (Rename / Replace token / Set default / Remove) — the
+ *  "⋯" menu, implemented as an expand/collapse row rather than a floating popover (no popover
+ *  infrastructure exists elsewhere in this codebase, and this keeps focus/keyboard behaviour simple). */
+function toggleAccountActions(id: string, label: string): void {
+  const el = document.getElementById(`acct-actions-${cssId(id)}`);
+  if (!el) return;
+  const wasHidden = el.hidden;
+  // Only one row's actions open at a time.
+  document.querySelectorAll(".acct-actions").forEach((n) => ((n as HTMLElement).hidden = true));
+  if (!wasHidden) return;
+  el.hidden = false;
+  el.innerHTML = `<div class="git-row">
+      <button class="mini" data-act="rename">${icon("edit")} Rename</button>
+      <button class="mini" data-act="replace">${icon("key")} Replace token</button>
+      <button class="mini" data-act="default">${icon("radio_button_checked")} Set default</button>
+      <button class="mini danger" data-act="remove">${icon("delete")} Remove</button>
+    </div>`;
+  el.querySelector('[data-act="rename"]')?.addEventListener("click", () => showAccountDialog({ mode: "rename", id, label }));
+  el.querySelector('[data-act="replace"]')?.addEventListener("click", () => showAccountDialog({ mode: "replace", id, label }));
+  el.querySelector('[data-act="default"]')?.addEventListener("click", () => void setDefaultAccount(id));
+  el.querySelector('[data-act="remove"]')?.addEventListener("click", () => void removeAccountUi(id, label));
+}
+
+function wireAccountsSection(acc: AuthAccountsEvent): void {
+  document.getElementById("acct-add")?.addEventListener("click", () => showAccountDialog({ mode: "add" }));
+  document.querySelectorAll<HTMLButtonElement>(".acct-default").forEach((btn) => {
+    btn.addEventListener("click", () => void setDefaultAccount(btn.dataset.id!));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".acct-menu").forEach((btn) => {
+    btn.addEventListener("click", () => toggleAccountActions(btn.dataset.id!, btn.dataset.label ?? ""));
+  });
+  void acc; // acc is read via the DOM data- attributes above; kept as a param for symmetry with the render call
+}
+
+/** Send one `auth.account.*` command to the ROSTER-OWNING server (§7.2 — not necessarily the origin)
+ *  and await its `auth.accounts` reply (or a `command.error`, surfaced as a toast). True on success. */
+async function sendAccountCmd(cmd: Record<string, unknown> & { type: string }): Promise<boolean> {
+  try {
+    const res = await sendAwait(rosterServer(), { ...cmd, cid: newCid() }, 20_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    toast(`Couldn't reach the hub: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+async function setDefaultAccount(accountId: string): Promise<void> {
+  await sendAccountCmd({ type: "auth.account.default", accountId });
+}
+
+async function removeAccountUi(accountId: string, label: string): Promise<void> {
+  const inUse = claudeAccounts?.inUse?.[accountId] ?? [];
+  const body =
+    inUse.length === 0
+      ? `Remove “${label}”? Any session bound to it falls back to the default account.`
+      : `“${label}” is in use by ${inUse.length} session${inUse.length === 1 ? "" : "s"}: ${inUse.map((s) => s.title).join(", ")}. Removing it falls those sessions back to the default account.`;
+  const ok = await confirmDialog({ icon: "delete", title: `Remove “${label}”?`, body, confirmLabel: "Remove", danger: true });
+  if (!ok) return;
+  if (await sendAccountCmd({ type: "auth.account.remove", accountId })) toast(`Removed “${label}”.`);
+}
+
+/** The Add/Rename/Replace-token dialog (multi-account §9.1) — one dialog, three modes, since Rename
+ *  and Replace are each a single field of the same form Add uses. */
+function showAccountDialog(opts: { mode: "add" } | { mode: "rename"; id: string; label: string } | { mode: "replace"; id: string; label: string }): void {
+  const host = hub().name;
+  const setupHint = `<p class="small muted">On <code>${esc(host)}</code> run <code>claude setup-token</code>, then paste it below.</p>`;
+  const title = opts.mode === "add" ? "Add a Claude account" : opts.mode === "rename" ? `Rename “${opts.label}”` : `Replace “${opts.label}”'s token`;
+  const showLabel = opts.mode !== "replace";
+  const showToken = opts.mode !== "rename";
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon(opts.mode === "add" ? "add" : opts.mode === "rename" ? "edit" : "key")} ${esc(title)}</h3>
+    ${showLabel ? `<label>Label<input id="acct-dlg-label" type="text" maxlength="32" placeholder="e.g. work, personal" value="${opts.mode === "rename" ? esc(opts.label) : ""}" /></label>` : ""}
+    ${showToken ? `${setupHint}<label>Token<input id="acct-dlg-token" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-oat…" /></label>` : ""}
+    <div id="acct-dlg-status" class="small muted"></div>
+    <div class="btns"><button type="button" id="acct-dlg-cancel">Cancel</button><button type="button" id="acct-dlg-ok" class="primary">${opts.mode === "add" ? "Add" : "Save"}</button></div>
+  </div>`;
+  showModal(m);
+  const setStatus = (t: string): void => {
+    const el = document.getElementById("acct-dlg-status");
+    if (el) el.textContent = t;
+  };
+  $<HTMLButtonElement>("#acct-dlg-cancel").onclick = closeModal;
+  const labelInput = document.getElementById("acct-dlg-label") as HTMLInputElement | null;
+  const tokenInput = document.getElementById("acct-dlg-token") as HTMLInputElement | null;
+  labelInput?.focus();
+  tokenInput?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $<HTMLButtonElement>("#acct-dlg-ok").click();
+  });
+  $<HTMLButtonElement>("#acct-dlg-ok").addEventListener("click", async () => {
+    const label = labelInput?.value.trim() ?? "";
+    const token = tokenInput?.value.trim() ?? "";
+    if (showLabel && !label) {
+      setStatus("Enter a label.");
+      return;
+    }
+    if (showToken && !token) {
+      setStatus("Paste the token.");
+      return;
+    }
+    const btn = $<HTMLButtonElement>("#acct-dlg-ok");
+    btn.disabled = true;
+    setStatus("Saving…");
+    let cmd: Record<string, unknown> & { type: string };
+    if (opts.mode === "add") cmd = { type: "auth.account.add", label, token };
+    else if (opts.mode === "rename") cmd = { type: "auth.account.rename", accountId: opts.id, label };
+    else cmd = { type: "auth.account.replace", accountId: opts.id, token };
+    try {
+      const res = await sendAwait(rosterServer(), { ...cmd, cid: newCid() }, 20_000);
+      if (res.type === "command.error") {
+        // Rendered INLINE (dup label, metered key, …) rather than a toast, and the dialog stays open
+        // with the input intact so the user can fix it without retyping everything (§9.1).
+        setStatus(res.message);
+        btn.disabled = false;
+        return;
+      }
+      closeModal();
+      toast(opts.mode === "add" ? "Account added." : opts.mode === "rename" ? "Renamed." : "Token replaced.");
+    } catch (err) {
+      setStatus(`Couldn't reach the hub: ${err instanceof Error ? err.message : err}`);
+      btn.disabled = false;
+    }
+  });
+}
+
 // ── Autopilot (plan review & launch; anvil-autopilot-ui.md) ────────────────────────
 const autopilotLog: string[] = []; // streamed progress lines for the current/last run
 let openPlanId: string | null = null; // the plan open in the reader, if any (else the grid is shown)
@@ -4235,6 +4535,58 @@ async function saveSchedule(): Promise<void> {
 }
 
 /** One card per server in the fleet (hub first): live status, version, update & remove. */
+/**
+ * Per-Mac account-roster sync state (multi-account §7.3), shown under each server card. Compares the
+ * rev the HUB last confirmed pushing to that member against the hub's current rev.
+ *
+ * Rendered only once the roster is actually multi-account and we're looking at a fleet: on a
+ * standalone box, or with a single account, there's nothing to be out of sync about and the line is
+ * pure noise. A member that doesn't advertise "accounts" is called out separately — "Sync now" can
+ * never fix that one, only updating Anvil on that Mac can.
+ */
+function accountSyncLine(srv: Server, isOrigin: boolean): string {
+  const roster = claudeAccounts;
+  if (!roster || roster.accounts.length <= 1) return "";
+  const n = roster.accounts.length;
+  // `isOrigin` means "this card is the page's own daemon" — NOT "this daemon owns the roster". A
+  // MEMBER viewing its own UI is the origin while holding a read-only replica, so conflating the two
+  // made its card claim "managed here" directly above the card explaining the accounts are managed on
+  // the hub and read-only here. The roster's own `role` is the authority.
+  if (isOrigin) {
+    if (roster.role !== "replica") return `<div class="small muted">${icon("key")} ${n} Claude accounts · managed here</div>`;
+    const owner = roster.hubServerId ? serverNameById(roster.hubServerId) : "";
+    const named = owner && owner !== roster.hubServerId ? ` · managed on ${esc(owner)}` : "";
+    return `<div class="small muted">${icon("key")} ${n} Claude accounts · read-only replica${named}</div>`;
+  }
+  // Per-member sync state is only meaningful on the roster OWNER: the rev map is read from this
+  // origin's own /api/fleet/members, which a replica doesn't have. Showing a badge from a member's
+  // page would report "out of date" about servers it neither tracks nor pushes to.
+  if (roster.role === "replica") return "";
+  if (srv.capabilities && !serverSupports(srv, "accounts")) {
+    return `<div class="small warn-text">${icon("warning")} Update Anvil to use multiple accounts</div>`;
+  }
+  // F7: this used to read `fleetMemberAccountsRev.get(srv.id)`, but `srv.id` comes from `server.hello`
+  // — which an UNREACHABLE peer never sends, leaving it "". The lookup then missed for exactly the
+  // members whose state matters most, and every offline Mac reported "out of date — press Sync now"
+  // even when it held the current roster, pointing at a remedy that cannot work while it is down.
+  // The hub already knows: fleet.json carries serverId AND accountsRev, keyed by host.
+  const rev = memberAccountsRevFor(srv);
+  if (rev === roster.rev) return `<div class="small muted">${icon("check")} in sync · ${n} accounts</div>`;
+  if (rev === undefined && srv.status !== "connected") {
+    // Never pushed, or we simply can't tell — don't accuse an offline peer of being stale.
+    return `<div class="small muted">${icon("cloud_off")} offline — sync state unknown</div>`;
+  }
+  return `<div class="small warn-text">${icon("warning")} out of date — press Sync now</div>`;
+}
+
+/** The roster rev the hub last confirmed for this server, by live serverId when we have one and by
+ *  host otherwise — so an offline member (no `server.hello`, hence no `srv.id`) still resolves. */
+function memberAccountsRevFor(srv: Server): number | undefined {
+  if (srv.id && fleetMemberAccountsRev.has(srv.id)) return fleetMemberAccountsRev.get(srv.id);
+  const id = fleetMemberIdByHost.get(hostnameOf(srv.url));
+  return id ? fleetMemberAccountsRev.get(id) : undefined;
+}
+
 function serverCardHtml(srv: Server): string {
   const isHub = srv.url === HUB_URL;
   const id = cssId(srv.url);
@@ -4248,6 +4600,7 @@ function serverCardHtml(srv: Server): string {
     ${removeX}
     <div class="card-main"><span class="conn-dot ${srv.status}"></span><b>${esc(srv.name)}</b> ${tail}</div>
     <div class="small muted"><code>${esc(hostOf(srv.url))}</code>${ver}${state}</div>
+    ${accountSyncLine(srv, isHub)}
     <div class="git-row" style="margin-top:10px"><button class="mini" id="daemon-update-${id}">${icon("refresh")} Update Anvil</button></div>
     <pre class="git-output" id="daemon-update-output-${id}" hidden></pre>
   </div>`;
@@ -4258,12 +4611,23 @@ function renderServerCards(): void {
   const list = orderedServers();
   // One unified list: each card IS a Mac in the fleet (sharing this login). No separate members list —
   // it duplicated the cards. "Add a Mac" is a dialog behind the + button, not an always-on form.
+  // Whether the ORIGIN owns the credentials it would be fanning out. A member holds a replica and has
+  // an empty member list, so "Sync now" there can only ever fail (it iterates nothing) and the blurb's
+  // "this server's Claude login" is simply false — the login is the hub's. Both are the positional
+  // `isHub === the origin` assumption the multi-account design §7.2 called out.
+  const originOwnsRoster = hub()?.role !== "member";
   host.innerHTML =
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
-    `<button id="fleet-rotate" class="mini" title="Push the current login to every machine in the fleet">${icon("autorenew")} Update token</button>` +
+    (originOwnsRoster
+      ? `<button id="fleet-rotate" class="mini" title="Push the current login and Claude accounts to every machine in the fleet">${icon("autorenew")} Sync now</button>`
+      : "") +
     `<button id="fleet-add" class="mini primary">${icon("add")} Add a machine</button>` +
     `</div></div>` +
-    `<p class="small muted">Every machine here shares this server's Claude login. Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    `<p class="small muted">${
+      originOwnsRoster
+        ? "Every machine here shares this server's Claude login."
+        : "This machine is part of another Mac's fleet and shares <b>its</b> Claude login."
+    } Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
     list.map(serverCardHtml).join("");
   for (const srv of list) {
     wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
@@ -4275,6 +4639,7 @@ function renderServerCards(): void {
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   void maybeRenderRepairCard(host); // this-machine "get a join code" — only when it's already in a fleet
+  maybeRenderAdoptHubCard(host); // "this Mac is part of <hub>'s fleet" — offers to connect to the roster owner
   if (nativeBridge) {
     const bridge = nativeBridge; // local const so the non-undefined narrowing flows into the closures below
     const setOut = (t: string): void => {
@@ -4320,19 +4685,47 @@ function renderServerCards(): void {
 }
 // ── Fleet administration (manage from any client — anvil-server-app.md §6) ──────────────────────
 // All calls hit the HUB daemon (apiFetch); it distributes its own OAuth token and never returns it.
-interface FleetMember { serverId: string; serverName: string; host: string; url: string }
+interface FleetMember { serverId: string; serverName: string; host: string; url: string; accountsRev?: number }
 // host → serverId for every Mac the hub knows as a fleet member. Lets a server card's "Remove" also
 // eject that Mac from the fleet (the old separate "Forget" action), so there's one button, not two.
 const fleetMemberIdByHost = new Map<string, string>();
+/** Each member's last-confirmed account-roster `rev`, by serverId (multi-account §7.3). Absent ⇒ the
+ *  hub has never confirmed a roster push to it — either it predates the "accounts" capability, or
+ *  every push so far failed. Populated by {@link loadFleetMembers} from the hub's /api/fleet/members. */
+const fleetMemberAccountsRev = new Map<string, number | undefined>();
 
 /** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
 async function rotateFleetToken(): Promise<void> {
+  // /api/fleet/rotate fans out from THIS daemon to ITS members. On a machine that has none — a member,
+  // or a standalone box — it succeeds over an empty list and used to report "Updated 0/0 Macs.", which
+  // reads as "done" when in fact nothing was even attempted (§7.2). Say what actually happened.
+  const origin = hub();
+  if (origin?.role === "member") {
+    toast("This Mac isn't the hub — sync accounts from the hub instead.");
+    return;
+  }
   toast("Pushing the current login to every Mac…");
   try {
     const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    if (r.results.length === 0) {
+      toast("No other Macs in this fleet yet.");
+      return;
+    }
     const okN = r.results.filter((x) => x.ok).length;
-    toast(`Updated ${okN}/${r.results.length} Macs.`);
-  } catch { toast("Couldn't push the login — is the hub reachable?"); }
+    // Name who failed. "Updated 0/1 Macs." is technically true but useless when the answer is always
+    // "that one Mac is switched off" — and the old catch-all below blamed the HUB for it.
+    if (okN < r.results.length) {
+      const failed = r.results.filter((x) => !x.ok).map((x) => x.host);
+      toast(`Updated ${okN}/${r.results.length} Macs — couldn't reach ${failed.join(", ")}. It'll sync when it's back.`);
+    } else {
+      toast(`Updated ${okN}/${r.results.length} Macs.`);
+    }
+    void loadFleetMembers(); // re-read each member's accountsRev so the per-card sync badges refresh
+  } catch {
+    // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
+    // failure above, not an exception, so this message must not be used for that case.
+    toast("Couldn't reach this machine's own daemon to start the sync.");
+  }
 }
 
 /** The "+ Add a machine" dialog: invite by join code (primary), or adopt a server that's already
@@ -4410,6 +4803,71 @@ async function maybeRenderRepairCard(host: HTMLElement): Promise<void> {
   document.getElementById("fleet-repair")?.addEventListener("click", () => showRepairDialog());
 }
 
+/**
+ * When the ORIGIN is a fleet member whose hub this client hasn't adopted, the account roster is
+ * read-only here and every write bounces with "change accounts on the hub" (§7.2). That's correct but
+ * unhelpful on its own, so offer the fix: connect this client to the hub as well, and the Models tab
+ * starts routing writes there (see {@link rosterServer}).
+ *
+ * Synchronous and idempotent — `renderServerCards` can run several times concurrently, so drop any
+ * prior copy first, exactly as `maybeRenderRepairCard` does.
+ */
+function maybeRenderAdoptHubCard(host: HTMLElement): void {
+  document.getElementById("fleet-adopt-hub-card")?.remove();
+  const origin = hub();
+  const hubId = origin?.hubServerId;
+  if (!hubId) return; // the origin is a hub or standalone — nothing to adopt
+  for (const s of servers.values()) if (s.id === hubId) return; // already connected to it
+  // We only have the hub's serverId: a member is told which hub owns it (PairedHubStore), but nothing
+  // a MEMBER serves carries that hub's display name or address — only the hub knows its members, not
+  // the reverse. So the card names the fleet by id and the dialog asks for the URL.
+  host.insertAdjacentHTML(
+    "beforeend",
+    `<div class="card" id="fleet-adopt-hub-card"><div class="card-main">${icon("hub")} <b>This Mac is part of another Mac's fleet</b></div>
+      <div class="small muted">Its Claude accounts are managed on the hub (<code>${esc(hubId)}</code>), so they're read-only here. Add the hub to manage them from this device.</div>
+      <div class="git-row" style="margin-top:10px"><button class="mini" id="fleet-adopt-hub">${icon("add")} Add the hub</button></div>
+    </div>`,
+  );
+  document.getElementById("fleet-adopt-hub")?.addEventListener("click", () => showAdoptHubDialog());
+}
+
+/** Prompt for the hub's URL and adopt it as another server, exactly as `showAddMac` does for a peer.
+ *  We can't discover it automatically: the hub's address isn't in anything a MEMBER serves — only the
+ *  hub knows its own members, not the other way round. */
+function showAdoptHubDialog(): void {
+  const m = document.createElement("div");
+  m.className = "modal";
+  m.innerHTML = `<div class="modal-box"><h3>${icon("hub")} Add this fleet's hub</h3>
+    <p class="small muted">Enter the hub's Anvil address on your tailnet (e.g. <code>https://mac-mini.tailnet.ts.net:7701</code>). Once it's connected, its Claude accounts become manageable from this device.</p>
+    <label>Hub URL<input id="adopt-hub-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://host:7701" /></label>
+    <div id="adopt-hub-status" class="small muted"></div>
+    <div class="btns"><button type="button" id="adopt-hub-cancel">Cancel</button><button type="button" id="adopt-hub-ok" class="primary">Add</button></div>
+  </div>`;
+  showModal(m);
+  $<HTMLButtonElement>("#adopt-hub-cancel").onclick = closeModal;
+  const input = document.getElementById("adopt-hub-url") as HTMLInputElement | null;
+  input?.focus();
+  $<HTMLButtonElement>("#adopt-hub-ok").addEventListener("click", () => {
+    const raw = (input?.value ?? "").trim().replace(/\/+$/, "");
+    const status = document.getElementById("adopt-hub-status");
+    if (!raw) {
+      if (status) status.textContent = "Enter the hub's URL.";
+      return;
+    }
+    try {
+      new URL(raw);
+    } catch {
+      if (status) status.textContent = "That doesn't look like a URL.";
+      return;
+    }
+    saveExtraServers([...loadExtraServers(), raw]);
+    ensureServer(raw);
+    closeModal();
+    renderServerCards();
+    toast("Connecting to the hub…");
+  });
+}
+
 /** The "Get a join code" modal for THIS machine (Settings → Fleet). Arms the local daemon — apiFetch
  *  targets the page's own daemon — and shows a code to enter on the hub's "Add a machine". The
  *  standard-UI counterpart to the tokenless takeover's "Join a fleet", for an already-set-up machine. */
@@ -4466,8 +4924,11 @@ async function loadFleetMembers(): Promise<void> {
   try {
     const { members } = (await (await apiFetch("/api/fleet/members")).json()) as { members: FleetMember[] };
     fleetMemberIdByHost.clear();
+    const revsBefore = JSON.stringify([...fleetMemberAccountsRev]);
+    fleetMemberAccountsRev.clear();
     let adopted = false;
     for (const m of members) {
+      fleetMemberAccountsRev.set(m.serverId, m.accountsRev);
       // Index under the bare host AND the url's hostname: with MagicDNS off the url can be healed to a
       // raw tailnet IP while `host` stays the (now-unresolvable) name, so a card adopted under either
       // form still maps back to the member for Remove.
@@ -4487,7 +4948,10 @@ async function loadFleetMembers(): Promise<void> {
         adopted = true;
       }
     }
-    if (adopted && document.getElementById("server-cards")) renderServerCards();
+    // Re-render on a NEW member (adopted) or when any member's roster rev moved — the per-card sync
+    // badge is derived from those revs, so without this it stays stale until the next unrelated render.
+    const revsChanged = revsBefore !== JSON.stringify([...fleetMemberAccountsRev]);
+    if ((adopted || revsChanged) && document.getElementById("server-cards")) renderServerCards();
   } catch {
     /* hub unreachable — cards still render from the locally-known servers */
   }
@@ -5845,6 +6309,42 @@ const ADVERSARIAL_PICKER = `<label class="cd-option"><input type="checkbox" id="
 const selectedAdversarial = (): boolean =>
   (document.getElementById("ns-adv") as HTMLInputElement | null)?.checked ?? false;
 
+/** The Claude account picker for the ENVIRONMENT edit dialog (multi-account §6). Like the
+ *  new-session one, hidden entirely at ≤1 account. Offers an explicit "use the default" entry, since
+ *  an environment's account is genuinely optional — unset means "follow the roster default", which
+ *  keeps tracking it if the default later moves. */
+function envAccountPickerMarkup(selected?: string): string {
+  const list = claudeAccounts?.accounts ?? [];
+  if (list.length <= 1) return "";
+  const opts = [
+    `<option value=""${selected ? "" : " selected"}>Use the default account</option>`,
+    ...list.map((a) => `<option value="${esc(a.id)}"${a.id === selected ? " selected" : ""}>${esc(a.label)}</option>`),
+  ].join("");
+  return `<label>Claude account<div class="env-row"><select id="ee-account">${opts}</select></div>
+    <span class="small muted">Used for scheduled autopilot runs, and pre-selected for new sessions here.</span></label>`;
+}
+
+/** The Claude account picker for the new-session dialog (multi-account §5). Hidden entirely when the
+ *  roster has ≤1 account — there's nothing to choose. */
+function accountPickerMarkup(): string {
+  const list = claudeAccounts?.accounts ?? [];
+  if (list.length <= 1) return "";
+  const opts = list.map((a) => `<option value="${esc(a.id)}">${esc(a.label)}</option>`).join("");
+  return `<label>Account<div class="env-row"><select id="ns-account">${opts}</select></div></label>`;
+}
+/** Pre-select the picker to `envId`'s default account, else the roster default. No-op if the picker
+ *  isn't rendered (≤1 account). Called once on open and again on every environment change. */
+function reselectAccountFor(envId: string | undefined): void {
+  const sel = document.getElementById("ns-account") as HTMLSelectElement | null;
+  if (!sel) return;
+  const pick = (envId ? environments.get(envId)?.accountId : undefined) ?? claudeAccounts?.defaultId;
+  if (pick) sel.value = pick;
+  refreshSelect(sel);
+}
+/** The chosen account id from the open dialog's picker, or undefined if it isn't present (≤1 account —
+ *  the server resolves the roster default). */
+const selectedAccountId = (): string | undefined => (document.getElementById("ns-account") as HTMLSelectElement | null)?.value || undefined;
+
 /** A server picker for the browse-based modals (add-env, one-off). Hidden when there's one server. */
 function serverPickerMarkup(): string {
   const list = orderedServers();
@@ -5919,6 +6419,7 @@ function showNewSession(): void {
       : [...envs].sort(byEnvName).map(opt).join("");
     m.innerHTML = `<div class="modal-box" id="ns-modal"><h3>New session</h3>
       <label>Environment<div class="env-row"><select id="ns-env">${opts}</select></div></label>
+      ${accountPickerMarkup()}
       <label>Session name<input id="ns-name" placeholder="e.g. fix-login-bug" /></label>
       <p class="small muted" id="ns-note"></p>
       <p class="small warn-text" id="ns-warn"></p>
@@ -5973,6 +6474,7 @@ function showNewSession(): void {
     createBtn.disabled = !env || !name || dup;
   };
   envSel?.addEventListener("change", validate);
+  envSel?.addEventListener("change", () => reselectAccountFor(envSel.value));
   nameInp?.addEventListener("input", validate);
   // Enter in the name field creates the session (unless the form's still invalid — e.g. blank/dup name).
   nameInp?.addEventListener("keydown", (e) => {
@@ -5983,6 +6485,8 @@ function showNewSession(): void {
   });
   enhanceSelect(envSel, true); // searchable — environment lists can grow long
   enhanceSelect(document.getElementById("ns-auto") as HTMLSelectElement | null);
+  enhanceSelect(document.getElementById("ns-account") as HTMLSelectElement | null);
+  reselectAccountFor(envSel?.value);
   nameInp?.focus();
   validate();
 
@@ -5991,12 +6495,14 @@ function showNewSession(): void {
     const env = environments.get(envSel.value);
     const name = nameInp.value.trim();
     if (!env || !name) return;
+    const accountId = selectedAccountId();
     const common = {
       title: name,
       environmentId: env.id,
       model: DEFAULT_MODEL,
       autonomy: selectedAutonomy(),
       adversarialReview: selectedAdversarial(),
+      ...(accountId ? { accountId } : {}),
     };
     const cid = newCid();
     // Teams: a lead needs its own worktree/branch to merge members into, so it's a fresh-worktree option.
@@ -6182,12 +6688,14 @@ function showEditEnvironment(id: string): void {
       <select id="ee-todoist">${projectOptions}</select>
     </label>
     ${todoistConnected ? "" : `<p class="small muted">Connect Todoist (Settings → Todoist) to link a project.</p>`}
+    ${envAccountPickerMarkup(env.accountId)}
     <p class="small muted">repo: <code>${esc(env.repoRoot)}</code>${env.isRepo ? "" : " (not a git repo)"}</p>
     <div class="btns"><button type="button" class="danger" id="ee-remove">Remove</button><span class="spacer" style="flex:1"></span><button type="button" id="ee-back">Back</button><button type="button" id="ee-save">Save</button></div></div>`;
   showModal(m);
   wireSwatchPicker();
   wireIconPicker();
   enhanceSelect(document.getElementById("ee-todoist") as HTMLSelectElement | null, true);
+  enhanceSelect(document.getElementById("ee-account") as HTMLSelectElement | null);
   if (todoistConnected && !todoistProjectsLoaded) void loadTodoistProjects(); // names fill in on reopen
   $<HTMLButtonElement>("#ee-back").onclick = closeModal;
   $<HTMLButtonElement>("#ee-save").onclick = () => {
@@ -6209,6 +6717,9 @@ function showEditEnvironment(id: string): void {
       color: selectedSwatch(),
       icon: selectedIcon(), // "" resets to the default by repo kind
       todoistProjectId: $<HTMLSelectElement>("#ee-todoist").value, // "" unlinks
+      // Omitted entirely when the picker isn't rendered (<=1 account), so a single-account fleet can
+      // never accidentally clear a stored accountId. "" clears it back to the roster default.
+      ...(document.getElementById("ee-account") ? { accountId: $<HTMLSelectElement>("#ee-account").value } : {}),
       // validation gate omitted: autopilot doesn't auto-build/PR yet. Omitting the field preserves
       // any stored value (env.update only writes validation when it's present).
     });

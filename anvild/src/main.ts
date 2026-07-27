@@ -2,6 +2,8 @@ import { loadConfig } from "./config";
 import { assertSubscriptionAuth } from "./auth/guard";
 import { applyDegradeMarkerAtBoot } from "./auth/degrade";
 import { loadPersistedClaudeToken } from "./auth/store";
+import { AccountStore } from "./auth/accounts";
+import { seedFromEnv } from "./auth/account-mirror";
 import { loadPersistedOpenRouterKey } from "./auth/openrouter";
 import { createServer, VERSION } from "./server/http";
 import { createMarkdownRenderer } from "./render/markdown-pipeline";
@@ -35,6 +37,12 @@ if (degradeMarker) {
   );
 }
 
+// Multi-account (§3.3): an install predating the roster keeps its token only in the launcher env
+// file. Seed it as the "default" account so upgrading is zero-touch. Idempotent — a populated roster
+// is never re-seeded, and a replica is never written to.
+const accounts = new AccountStore(config.stateDir);
+if (seedFromEnv(accounts)) console.log('[anvild] migrated the existing Claude token into the account roster as "default"');
+
 // arch §3: refuse to start on a §3 VIOLATION (a metered key). A missing/dead token warns and boots
 // degraded instead — that's what lets a fresh headless box exist long enough to be paired (§4.1).
 assertSubscriptionAuth();
@@ -55,6 +63,7 @@ const server = ((): ReturnType<typeof createServer> => {
       adversarialModels: config.adversarialModels,
       adversarialProvider: config.adversarialProvider,
       renderer,
+      accounts,
       refreshModelLabelsOnBoot: true, // real daemon: pull live model labels shortly after boot
     });
   } catch (e) {

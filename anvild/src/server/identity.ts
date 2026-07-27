@@ -80,11 +80,33 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
  *    /api/health to pick the destination; absent ⇒ pre-capability daemon ⇒ fall back to :7702.
  *    This is exactly the "supports X but not Y across a partially-updated fleet" case PROTOCOL_VERSION
  *    can't express, which is why that number is deliberately NOT bumped for this feature (HJ-32).
+ *  - "accounts": the Claude account roster (auth.accounts.get/auth.account.add/rename/replace/
+ *    remove/default) — Settings → Models' roster list, multi-account §7.
  */
-export const SERVER_CAPABILITIES: readonly string[] = ["autopilot", "autopilot-maintenance", "auth", "prompts", "lapo", "pairing", "model-labels"];
+export const SERVER_CAPABILITIES: readonly string[] = [
+  "autopilot",
+  "autopilot-maintenance",
+  "auth",
+  "prompts",
+  "lapo",
+  "pairing",
+  "model-labels",
+  "accounts",
+];
+
+/** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */
+export interface FleetPosition {
+  /** `PairedHubStore.get()?.hubServerId ?? null`. */
+  pairedHubId: string | null;
+  /** `fleet.list().length`. */
+  memberCount: number;
+}
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
-export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {
+export function serverHelloEvent(id: ServerIdentity, pos: FleetPosition = { pairedHubId: null, memberCount: 0 }): ServerHelloEvent {
+  // `member` wins over `hub`: the client uses this to decide where roster WRITES go, and a paired
+  // machine is never the writer even if it has members of its own (§7.2).
+  const role = pos.pairedHubId ? "member" : pos.memberCount > 0 ? "hub" : "standalone";
   return {
     v: PROTOCOL_VERSION,
     type: "server.hello",
@@ -94,5 +116,7 @@ export function serverHelloEvent(id: ServerIdentity): ServerHelloEvent {
     version: VERSION,
     protocolVersion: PROTOCOL_VERSION,
     capabilities: [...SERVER_CAPABILITIES],
+    role,
+    ...(pos.pairedHubId ? { hubServerId: pos.pairedHubId } : {}),
   };
 }

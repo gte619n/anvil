@@ -19,6 +19,7 @@ Requires [Bun](https://bun.sh) ≥ 1.3.14 and a Claude **Max** subscription.
 bun install
 
 # Auth via your subscription — NOT a metered API key (see "Auth & billing" below).
+# Migrated into the account roster as "default" on first start; add more in Settings → Models.
 export CLAUDE_CODE_OAUTH_TOKEN="$(claude setup-token)"   # one-time
 
 bun run start          # http://localhost:7701   (ws: /ws · health: /api/health)
@@ -145,6 +146,20 @@ true, and the daemon enforces both at startup:
 1. **Always go through the Agent SDK / Claude Code** — never the raw Messages API.
 2. **Authenticate with `CLAUDE_CODE_OAUTH_TOKEN`** (from `claude setup-token`), and keep
    `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` out of the environment.
+
+### Multiple accounts
+
+The daemon holds a roster of labelled subscription tokens in `<stateDir>/accounts.json` (`0600`),
+managed from **Settings → Models**. One is the default; a session or an environment can pin a
+different one, and a session's account is switchable mid-conversation from its header chip.
+
+- The env token above is migrated in as `default` on first start, so upgrading needs no action, and
+  a single-account setup behaves exactly as before — the pickers stay hidden until there are two.
+- The default is mirrored back into `~/.config/anvil/env`, so anything reading the environment
+  (including a restart) still sees a working token.
+- In a fleet the roster is **replicated to every member** on the existing credential push. That
+  means every member holds every token — see [`SECURITY.md`](../SECURITY.md) before adding one.
+- Design: [`docs/plans/2026-07-25-multi-account-tokens-design.md`](../docs/plans/2026-07-25-multi-account-tokens-design.md).
 
 This is a hard constraint, not a preference — see
 [`anvil-native-architecture.md` §3](../docs/plans/anvil-native-architecture.md) for the

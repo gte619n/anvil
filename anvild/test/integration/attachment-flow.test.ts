@@ -41,6 +41,17 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
 
 const { createServer } = await import("../../src/server/http");
+const { AccountStore } = await import("../../src/auth/accounts");
+
+// Real boot (main.ts) seeds the roster from the env token before the server ever starts (multi-account
+// §3.3); a bare createServer() in a test doesn't run that migration. Do it explicitly so the agent
+// spawn path (Supervisor.agentEnv → buildAgentEnv({accounts})) resolves the placeholder token instead
+// of finding an empty roster and refusing with "no Claude OAuth token" (§4.3).
+function seededAccounts(dir: string): InstanceType<typeof AccountStore> {
+  const store = new AccountStore(dir);
+  store.add("default", process.env.CLAUDE_CODE_OAUTH_TOKEN!);
+  return store;
+}
 
 // 1×1 red PNG.
 const RED_PNG_B64 =
@@ -51,7 +62,7 @@ const stamp = (o: object): string => JSON.stringify({ v: PROTOCOL_VERSION, ts: "
 test("an uploaded image survives the wire: shows in message.user AND reaches Claude", async () => {
   captured.length = 0;
   const dir = mkdtempSync(join(tmpdir(), "anvil-att-"));
-  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir });
+  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir, accounts: seededAccounts(dir), envFile: join(dir, "env") });
   const base = `http://127.0.0.1:${srv.port}`;
 
   try {
@@ -119,7 +130,7 @@ test("an uploaded image survives the wire: shows in message.user AND reaches Cla
 test("a non-image file attachment lands in the chat AND its contents reach Claude as text", async () => {
   captured.length = 0;
   const dir = mkdtempSync(join(tmpdir(), "anvil-att-"));
-  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir });
+  const srv = createServer({ host: "127.0.0.1", port: 0, stateDir: dir, accounts: seededAccounts(dir), envFile: join(dir, "env") });
   const base = `http://127.0.0.1:${srv.port}`;
 
   try {

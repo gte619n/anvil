@@ -495,3 +495,142 @@ test("resolveMember: carries capabilities through, so the invite path can pick a
   expect(r.capabilities).toEqual(["pairing"]);
   expect(r.subscriptionAuthOk).toBe(false);
 });
+
+// ── Account-roster replication (multi-account §7.3) ──────────────────────────────────────────
+
+/** A fetch stub that also captures each request's parsed JSON body (fakeFetch only records urls). */
+function bodyCapturingFetch(): { fn: typeof fetch; bodies: Record<string, any> } {
+  const bodies: Record<string, any> = {};
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    try {
+      bodies[url] = JSON.parse(String(init?.body ?? "{}"));
+    } catch {
+      bodies[url] = null;
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return { fn, bodies };
+}
+
+const ROSTER = {
+  rev: 4,
+  defaultId: "acct_a",
+  entries: [{ id: "acct_a", label: "work", token: "sk-ant-oat01-work-1111", createdAt: 1 }],
+};
+
+test("rotateToken: sends the roster to a member advertising 'accounts' and reports its rev", async () => {
+  const probe = async (base: string): Promise<ProbeResult | null> =>
+    base === "https://new.ts.net:7701" ? { serverId: "srv_n", serverName: "N", version: "1", capabilities: ["pairing", "accounts"] } : null;
+  const { fn, bodies } = bodyCapturingFetch();
+  const [r] = await rotateToken({ members: [{ host: "new.ts.net" }], token: "tok", hubServerId: "h", accounts: ROSTER, probe, fetchImpl: fn });
+  expect(r!.ok).toBe(true);
+  expect(r!.accountsRev).toBe(4); // recorded so the Servers tab can show "in sync"
+  expect(bodies["https://new.ts.net:7701/api/fleet/token"].accounts).toEqual(ROSTER);
+});
+
+test("rotateToken: a member WITHOUT the accounts capability gets the token but no roster", async () => {
+  const probe = async (base: string): Promise<ProbeResult | null> =>
+    base === "https://old.ts.net:7701" ? { serverId: "srv_o", serverName: "O", version: "1", capabilities: ["pairing"] } : null;
+  const { fn, bodies } = bodyCapturingFetch();
+  const [r] = await rotateToken({ members: [{ host: "old.ts.net" }], token: "tok", hubServerId: "h", accounts: ROSTER, probe, fetchImpl: fn });
+  expect(r!.ok).toBe(true);
+  expect(r!.accountsRev).toBeUndefined(); // never pushed → stays "out of date"/unknown, not falsely in sync
+  const body = bodies["https://old.ts.net:7701/api/fleet/token"];
+  expect(body.token).toBe("tok"); // the credential still lands — tiering degrades, it doesn't break
+  expect(body.accounts).toBeUndefined();
+});
+
+test("rotateToken: no roster to push leaves the body exactly as it was before the feature", async () => {
+  const probe = async (base: string): Promise<ProbeResult | null> =>
+    base === "https://new.ts.net:7701" ? { serverId: "srv_n", serverName: "N", version: "1", capabilities: ["pairing", "accounts"] } : null;
+  const { fn, bodies } = bodyCapturingFetch();
+  const [r] = await rotateToken({ members: [{ host: "new.ts.net" }], token: "tok", hubServerId: "h", probe, fetchImpl: fn });
+  expect(r!.accountsRev).toBeUndefined();
+  expect(bodies["https://new.ts.net:7701/api/fleet/token"].accounts).toBeUndefined();
+});
+
+test("invitePeer: a first join carries the roster only when the joiner speaks 'accounts'", async () => {
+  const { fn, bodies } = bodyCapturingFetch();
+  await invitePeer({ host: "new.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], accounts: ROSTER, fetchImpl: fn });
+  expect(bodies["https://new.ts.net:7701/api/fleet/pair"].accounts).toEqual(ROSTER);
+
+  const older = bodyCapturingFetch();
+  await invitePeer({ host: "old.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing"], accounts: ROSTER, fetchImpl: older.fn });
+  expect(older.bodies["https://old.ts.net:7701/api/fleet/pair"].accounts).toBeUndefined();
+});
+
+// Regression (found on a live 2-machine fleet, 2026-07-26): the pair path replicated the roster
+// correctly but the hub recorded the member with NO accountsRev, so the Servers tab said "out of date
+// — press Sync now" about a member that was perfectly in sync, until the next roster edit papered
+// over it. invitePeer now REPORTS the rev it sent, so the hub records exactly what was delivered and
+// the capability gate lives in one place instead of being re-derived by the caller.
+test("invitePeer reports the accountsRev it actually sent, and only on success", async () => {
+  const { fn } = bodyCapturingFetch();
+  const sent = await invitePeer({ host: "new.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], accounts: ROSTER, fetchImpl: fn });
+  expect(sent.ok).toBe(true);
+  expect(sent.accountsRev).toBe(ROSTER.rev);
+
+  // A joiner without the capability got no roster, so there is no rev to claim.
+  const older = bodyCapturingFetch();
+  const skipped = await invitePeer({ host: "old.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing"], accounts: ROSTER, fetchImpl: older.fn });
+  expect(skipped.accountsRev).toBeUndefined();
+
+  // Neither is there when no roster was supplied at all.
+  const none = bodyCapturingFetch();
+  const bare = await invitePeer({ host: "new.ts.net", code: "123456", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], fetchImpl: none.fn });
+  expect(bare.accountsRev).toBeUndefined();
+});
+
+test("invitePeer claims no rev when the pair itself is rejected", async () => {
+  const reject = (async () =>
+    new Response(JSON.stringify({ ok: false, error: "wrong code" }), { status: 403, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+  const out = await invitePeer({ host: "new.ts.net", code: "000000", token: "tok", hubServerId: "h", capabilities: ["pairing", "accounts"], accounts: ROSTER, fetchImpl: reject });
+  expect(out.ok).toBe(false);
+  expect(out.accountsRev).toBeUndefined(); // a failed push must not read as "in sync"
+});
+
+// ── Reaching a peer whose MagicDNS name doesn't resolve, and failing fast (found live 2026-07-26) ──
+
+test("pushCredential falls back to the peer's IP when its NAME is unreachable", async () => {
+  // The name resolves nowhere (WSL can't resolve *.ts.net); only http://<ip> answers.
+  const seen: string[] = [];
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    seen.push(url);
+    if (!url.startsWith("http://100.64.0.9:")) throw new Error("Unable to connect. Is the computer able to access the url?");
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  const probe = async (b: string): Promise<ProbeResult | null> =>
+    b.includes("100.64.0.9") ? { serverId: "s", serverName: "n", version: "1", capabilities: ["pairing", "accounts"] } : null;
+
+  const [r] = await rotateToken({
+    members: [{ host: "sleepy.tail0.ts.net", capabilities: ["pairing"], url: "http://100.64.0.9:7711/" }],
+    token: "tok", hubServerId: "h", port: 7711, probe, fetchImpl: fn,
+  });
+  expect(r!.ok).toBe(true);
+  // It tried the name first, then healed over to the IP rather than giving up.
+  expect(seen.some((u) => u.includes("sleepy.tail0.ts.net"))).toBe(true);
+  expect(seen.some((u) => u.startsWith("http://100.64.0.9:7711/api/fleet/token"))).toBe(true);
+});
+
+test("rotateToken fails FAST against an offline member (background fan-out, not an interactive pair)", async () => {
+  // Never resolves — only the per-attempt timeout ends it. The default 12s per scheme is what made
+  // "Sync now" hang past Bun's 10s idleTimeout; rotation now uses a much shorter budget.
+  // Hangs until aborted — the ONLY thing that ends it is postPairing's AbortSignal.timeout, which is
+  // exactly the budget under test. (A stub that ignores the signal would hang forever, as real fetch
+  // would not.)
+  const fn = ((_u: unknown, init?: RequestInit) =>
+    new Promise<Response>((_res, rej) => {
+      init?.signal?.addEventListener("abort", () => rej(new DOMException("The operation timed out.", "TimeoutError")));
+    })) as unknown as typeof fetch;
+  const started = performance.now();
+  const [r] = await rotateToken({
+    members: [{ host: "gone.tail0.ts.net", capabilities: ["pairing"] }],
+    token: "tok", hubServerId: "h", timeoutMs: 150, probe: async () => null, fetchImpl: fn,
+  });
+  const elapsed = performance.now() - started;
+  expect(r!.ok).toBe(false);
+  // https + http + the :7702 fallback, each bounded by timeoutMs — comfortably under Bun's idleTimeout.
+  expect(elapsed).toBeLessThan(2000);
+});

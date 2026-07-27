@@ -36,6 +36,8 @@ import {
   type AutopilotMaintenanceResultEvent,
   type AuthProvider,
   type AuthStatusEvent,
+  type AuthAccountsEvent,
+  type AccountInfo,
   type CommandInfo,
   type GitCmd,
   type GitResultEvent,
@@ -92,6 +94,9 @@ import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type 
 import { resolveLapoConfig } from "../config";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
+import { AccountStore } from "../auth/accounts";
+import { mirrorDefault, defaultPersisted } from "../auth/account-mirror";
+import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
@@ -146,6 +151,21 @@ const RECONCILE_WINDOW_DAYS = 60;
 
 export interface SupervisorConfig {
   stateDir: string;
+  /** The Claude account roster (multi-account §3). Passed in from `createServer()` so there is exactly
+   *  one `AccountStore` instance per process; constructed over `stateDir` when omitted (unit tests that
+   *  don't exercise accounts). */
+  accounts?: AccountStore;
+  /** This machine's paired-hub record, so a replica's `auth.accounts` broadcast can name the hub that
+   *  owns it (§7.2). Read-only here — pairing itself is unaffected by the roster. */
+  pairedHub?: PairedHubStore;
+  /** Replicate this hub's roster to its fleet members after a mutation (§7.3). Defined in http.ts,
+   *  where the FleetStore lives; omitted in unit tests and on a machine with no members. */
+  onRosterChanged?: (reason: string) => void;
+  /** Where the roster's default account is mirrored (multi-account §3.2). Defaults to the launcher's
+   *  real `~/.config/anvil/env`. Tests MUST override this: a roster mutation mirrors unconditionally,
+   *  so without an override `bun test` overwrites the developer's own Claude credential with a
+   *  fixture token. */
+  envFile?: string;
   /** The tailnet-facing port (== ANVIL_PORT). Used to build this daemon's self-URL for deep links. */
   port?: number;
   /** Where repos added by git URL get cloned (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
@@ -184,14 +204,16 @@ export class Supervisor {
   private readonly notified = new Set<string>();
   private readonly renderer: MarkdownRenderer;
   /** The §3 allow-list env for spawned agents/terminals. Built fresh per call (not cached) so a token
-   *  set/reset via the UI (auth.set) reaches the next session/run without a daemon restart. */
-  private agentEnv(): Record<string, string> {
-    return buildAgentEnv();
+   *  set/reset via the UI (auth.set), or a roster change, reaches the next session/run without a
+   *  daemon restart. `s` resolves the spawn's Claude account (multi-account §4.1); omitted for
+   *  short-lived utility spawns (icon/branch-kind), which use the roster default. */
+  private agentEnv(s?: Session, opts: { requireToken?: boolean } = {}): Record<string, string> {
+    return buildAgentEnv({ accounts: this.accounts, ...(s?.data.accountId ? { accountId: s.data.accountId } : {}), ...opts });
   }
   /** Same allow-list, but tolerant of a missing Claude token — for the session TERMINAL, which must keep
    *  working on a degraded machine (HJ-25/§8.3). Only agent turns are gated on the credential. */
-  private shellEnv(): Record<string, string> {
-    return buildAgentEnv({ requireToken: false });
+  private shellEnv(s?: Session): Record<string, string> {
+    return this.agentEnv(s, { requireToken: false });
   }
   /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
    *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
@@ -249,6 +271,12 @@ export class Supervisor {
   /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
   private readonly devPipelineMetrics: AdversaryMetrics;
   private readonly stateDir: string;
+  /** The Claude account roster (multi-account §3). Exactly one instance per process — see
+   *  `SupervisorConfig.accounts`. */
+  readonly accounts: AccountStore;
+  private readonly pairedHub?: PairedHubStore;
+  private readonly onRosterChanged?: (reason: string) => void;
+  private readonly envFile?: string;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
   readonly authDegrade!: AuthDegradeTracker;
@@ -265,6 +293,10 @@ export class Supervisor {
       provider: cfg.adversarialProvider,
     };
     this.stateDir = cfg.stateDir;
+    this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
+    this.pairedHub = cfg.pairedHub;
+    this.onRosterChanged = cfg.onRosterChanged;
+    this.envFile = cfg.envFile;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
     // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
@@ -488,6 +520,7 @@ export class Supervisor {
       icon?: string;
       todoistProjectId?: string | null;
       validation?: EnvironmentValidation | null;
+      accountId?: string | null;
     },
   ): void {
     this.envStore.update(id, fields);
@@ -702,22 +735,45 @@ export class Supervisor {
   }
 
   /**
-   * A new Claude credential just landed (a pair, a rotation, or a paste). Sessions build their agent
-   * env per spawn, so nothing needs a restart to pick it up — but a session whose DRIVER is already
-   * running holds the old env for the life of its `query()`. Drop the drivers of IDLE sessions so the
-   * next turn rebuilds with the new token; sessions mid-turn are left alone and flagged instead, since
-   * tearing down a running turn would lose its work (HJ-11).
+   * Drop one session's live driver so the next prompt rebuilds it with a fresh env. `claudeSessionId`
+   * is KEPT, so `ensureDriver()`'s `resume` rejoins the same conversation on the new token (§5.3).
+   * Returns false when the session is mid-turn and was left alone.
    */
-  async restartIdleSessionsForNewToken(): Promise<void> {
+  private async restartDriverForNewToken(id: string): Promise<boolean> {
+    const status = this.sessions.get(id)?.data.status;
+    if (status && status !== "idle") return false;
+    const driver = this.drivers.get(id);
+    if (!driver) return true;
+    this.drivers.delete(id);
+    await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+    return true;
+  }
+
+  /**
+   * A new Claude credential just landed (a pair, a rotation, a paste, or a roster mutation). Sessions
+   * build their agent env per spawn, so nothing needs a restart to pick it up — but a session whose
+   * DRIVER is already running holds the old env for the life of its `query()`. Drop the drivers of IDLE
+   * sessions so the next turn rebuilds with the new token; sessions mid-turn are left alone and flagged
+   * instead, since tearing down a running turn would lose its work (HJ-11).
+   *
+   * `before` — a per-session token snapshot from {@link tokensBySession} taken BEFORE the change —
+   * narrows this to only sessions whose OWN resolved token actually changed. With a roster, adding a
+   * non-default account (or replacing a token no live session is pinned to) changes nothing for anyone;
+   * restarting every driver anyway would drop perfectly good live sessions for no reason. Omit it to
+   * restart unconditionally (the pre-roster single-token call sites, where every session shares the one
+   * credential).
+   */
+  async restartIdleSessionsForNewToken(before?: Map<string, string | undefined>): Promise<void> {
     const busy: string[] = [];
-    for (const [id, driver] of [...this.drivers]) {
-      const status = this.sessions.get(id)?.data.status;
-      if (status && status !== "idle") {
-        busy.push(id);
-        continue;
+    for (const [id] of [...this.drivers]) {
+      const s = this.sessions.get(id);
+      if (!s) continue;
+      if (before) {
+        const prev = before.get(id);
+        const nowTok = this.accounts.token(s.data.accountId);
+        if (prev === nowTok) continue; // this session's resolved token is unchanged — leave it running
       }
-      this.drivers.delete(id);
-      await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+      if (!(await this.restartDriverForNewToken(id))) busy.push(id);
     }
     if (busy.length) {
       for (const id of busy) {
@@ -727,6 +783,12 @@ export class Supervisor {
       }
       console.log(`[fleet] token changed — ${busy.length} session(s) mid-turn kept on the old login until they settle`);
     }
+  }
+
+  /** Snapshot every live (driver-holding) session's CURRENTLY resolved token, to diff against after a
+   *  roster change — see {@link restartIdleSessionsForNewToken}. */
+  tokensBySession(): Map<string, string | undefined> {
+    return new Map([...this.drivers.keys()].map((id) => [id, this.accounts.token(this.sessions.get(id)?.data.accountId)]));
   }
 
   /**
@@ -831,6 +893,152 @@ export class Supervisor {
     else clearClaudeToken();
     this.registry.toAll(this.authStatusEvent(provider));
     return this.authStatusEvent(provider, cid);
+  }
+
+  // ── Claude account roster (Settings → Models; multi-account §7/§9) ───────────────────────────
+  /** Active (non-terminal) sessions currently bound to `accountId` — drives the removal confirm
+   *  (§9.1/§10) without a second round trip. */
+  sessionsUsingAccount(accountId: string): { sessionId: string; title: string }[] {
+    return [...this.sessions.values()]
+      .filter((s) => !s.data.archived && s.data.accountId === accountId)
+      .map((s) => ({ sessionId: s.data.id, title: s.data.title }));
+  }
+
+  private accountsInUse(): Record<string, { sessionId: string; title: string }[]> {
+    const out: Record<string, { sessionId: string; title: string }[]> = {};
+    for (const s of this.sessions.values()) {
+      if (s.data.archived || !s.data.accountId) continue;
+      (out[s.data.accountId] ??= []).push({ sessionId: s.data.id, title: s.data.title });
+    }
+    return out;
+  }
+
+  /** Roster snapshot for clients — masked previews only (§11). */
+  accountsEvent(cid?: string): AuthAccountsEvent {
+    const snap = this.accounts.snapshot();
+    const accounts: AccountInfo[] = this.accounts.publicList();
+    const inUse = this.accountsInUse();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "auth.accounts",
+      ts: now(),
+      ...(cid ? { cid } : {}),
+      rev: snap.rev,
+      ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
+      role: snap.role,
+      ...(snap.role === "replica" && this.pairedHub?.get()?.hubServerId ? { hubServerId: this.pairedHub.get()!.hubServerId } : {}),
+      accounts,
+      persisted: defaultPersisted(this.accounts, this.envFile),
+      ...(Object.keys(inUse).length ? { inUse } : {}),
+    };
+  }
+
+  /** Broadcast the roster to every connected client, like `broadcastAuthState()`. */
+  broadcastAccounts(): void {
+    this.registry.toAll(this.accountsEvent());
+  }
+
+  /** Every mutator: apply → mirror the default → broadcast → return the same event to the caller. A
+   *  mutation on a replica throws `AccountStore`'s "change accounts on the hub" message unchanged
+   *  (BadCommand via the caller's catch). `before` — a snapshot from {@link tokensBySession} taken
+   *  BEFORE the mutation — narrows the restart to sessions whose OWN resolved token actually changed
+   *  (adding a non-default account, or replacing a token no live session is pinned to, restarts no
+   *  one). Fire-and-forget, like every other credential-change call site (http.ts's pair/rotate
+   *  handlers). */
+  private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>, reason: string): AuthAccountsEvent {
+    mirrorDefault(this.accounts, this.envFile); // the ONLY place a roster change is written to the launcher env file
+    this.onRosterChanged?.(reason); // replicate to fleet members (§7.3); fire-and-forget, no-op on a leaf
+    void this.restartIdleSessionsForNewToken(before);
+    const event = this.accountsEvent(cid);
+    this.registry.toAll(cid ? { ...event, cid: undefined } : event);
+    return event;
+  }
+
+  accountAdd(label: string, token: string, cid?: string): AuthAccountsEvent {
+    const before = this.tokensBySession();
+    try {
+      this.accounts.add(label, token);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    return this.afterAccountMutation(cid, before, "add");
+  }
+
+  accountRename(accountId: string, label: string, cid?: string): AuthAccountsEvent {
+    const before = this.tokensBySession();
+    try {
+      this.accounts.rename(accountId, label);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    // accountLabel is denormalised for display; refresh every session bound to this account.
+    for (const s of this.sessions.values()) {
+      if (s.data.accountId === accountId) {
+        s.data.accountLabel = label;
+        this.broadcastUpdated(s.data);
+      }
+    }
+    this.persist();
+    return this.afterAccountMutation(cid, before, "rename");
+  }
+
+  accountReplace(accountId: string, token: string, cid?: string): AuthAccountsEvent {
+    const before = this.tokensBySession();
+    try {
+      this.accounts.replace(accountId, token);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    return this.afterAccountMutation(cid, before, "replace");
+  }
+
+  accountSetDefault(accountId: string, cid?: string): AuthAccountsEvent {
+    const before = this.tokensBySession();
+    try {
+      this.accounts.setDefault(accountId);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    return this.afterAccountMutation(cid, before, "set-default");
+  }
+
+  accountRemove(accountId: string, cid?: string): AuthAccountsEvent {
+    const before = this.tokensBySession();
+    try {
+      this.accounts.remove(accountId);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    // §5.4 removal fallback: fall every session bound to the removed account back to the default,
+    // flagged so the client can render the "⚠ was <label>" badge (Task 24/20).
+    //
+    // `accountId` is CLEARED rather than set to a snapshot of `defaultId()`. Both resolve to the
+    // default today, but a snapshot silently stops tracking it: move the default afterwards and the
+    // session keeps spawning on the OLD one while the header chip — which renders the CURRENT
+    // default's label — names the new one. The chip then advertises a subscription that isn't paying,
+    // which is precisely the confusion this feature exists to prevent. `undefined` genuinely follows
+    // the default, because that is what `AccountStore.token(undefined)` resolves.
+    //
+    // `accountLabel` IS deliberately left holding the removed account's old name — it's the only
+    // place that survives the removal, and the badge needs it.
+    for (const s of this.sessions.values()) {
+      if (s.data.accountId !== accountId) continue;
+      delete s.data.accountId;
+      s.data.accountMissing = true;
+      this.broadcastUpdated(s.data);
+    }
+    // Environments bind to accounts too (§6), and were NOT being reconciled — a removed account left a
+    // dangling `env.accountId` that only surfaced later, unattended, as a failed autopilot spawn.
+    // Clearing it falls the environment back to the roster default, same as a session.
+    let envsCleared = 0;
+    for (const env of this.envStore.list()) {
+      if (env.accountId !== accountId) continue;
+      this.envStore.update(env.id, { accountId: null });
+      envsCleared++;
+    }
+    if (envsCleared) this.registry.toAll(this.environmentsEvent());
+    this.persist();
+    return this.afterAccountMutation(cid, before, "remove");
   }
 
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
@@ -1305,7 +1513,7 @@ export class Supervisor {
     const planned = await planUnit(
       { title: u.title, rationale: u.rationale ?? "", taskIds: tasks.map((t) => t.id) },
       tasks,
-      { repoRoot: env.repoRoot },
+      { repoRoot: env.repoRoot, accounts: this.accounts, ...(env.accountId ? { accountId: env.accountId } : {}) },
     );
     const updated = this.workUnits.update(u.id, {
       environmentId: env.id,
@@ -1596,8 +1804,12 @@ export class Supervisor {
     let started = 0;
     try {
       for (const env of envs) {
-        emit(`▸ ${env.name}`);
-        const res = await planAndTagProject(deps, {
+        // Name the Claude account the run bills to, so the report/log says whose subscription paid
+        // for an unattended run rather than leaving it to be inferred (§6).
+        const envAcct = this.accounts.labelOf(env.accountId ?? this.accounts.defaultId());
+        emit(`▸ ${env.name}${envAcct ? ` · account: ${envAcct}` : ""}`);
+        const res = await this.runEnvPlan(emit, env.name, () =>
+          planAndTagProject(deps, {
           environmentId: env.id,
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
@@ -1606,14 +1818,20 @@ export class Supervisor {
           signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
-        });
+          // Unattended runs bill to the environment's chosen account, else the roster default (§6).
+            accounts: this.accounts,
+            ...(env.accountId ? { accountId: env.accountId } : {}),
+          }),
+        );
+        if (!res) continue; // this environment failed; the others still run
         createdUnits.push(...res.created);
         skipped += res.skipped;
       }
       // Account-wide label pass: pull every @<label> task, drop those a linked project already covers
       // (coexist + dedup), and plan the rest against the catch-all env. These are review-only (below).
       if (labelPass && defaultEnv && schedule.label) {
-        emit(`▸ @${schedule.label} → ${defaultEnv.name}`);
+        const labelAcct = this.accounts.labelOf(defaultEnv.accountId ?? this.accounts.defaultId());
+        emit(`▸ @${schedule.label} → ${defaultEnv.name}${labelAcct ? ` · account: ${labelAcct}` : ""}`);
         const linkedProjectIds = new Set(
           this.envStore.list().map((e) => e.todoistProjectId).filter((id): id is string => !!id),
         );
@@ -1629,6 +1847,8 @@ export class Supervisor {
           signal: ac.signal,
           onProgress: emit,
           onUnitCreated,
+          accounts: this.accounts,
+          ...(defaultEnv.accountId ? { accountId: defaultEnv.accountId } : {}),
         });
         createdUnits.push(...res.created);
         skipped += res.skipped;
@@ -1895,6 +2115,14 @@ export class Supervisor {
       cwd = cmd.cwd;
     }
 
+    // Resolve the account this session spawns under (multi-account §5): the command's explicit choice,
+    // else the environment's default, else the roster default. An explicit accountId that doesn't
+    // resolve is rejected outright — silently falling back would bill another subscription.
+    const accountId = cmd.accountId ?? (cmd.environmentId ? this.envStore.get(cmd.environmentId)?.accountId : undefined) ?? this.accounts.defaultId();
+    if (accountId && !this.accounts.has(accountId)) {
+      throw new BadCommand(`unknown Claude account ${accountId} — it may have been removed; pick another in Settings → Models`);
+    }
+
     mkdirSync(this.store.sessionDir(id), { recursive: true });
     const data: SessionData = {
       id,
@@ -1911,6 +2139,7 @@ export class Supervisor {
       createdAt: now(),
       lastActivityAt: now(),
       usage: { inputTokens: 0, outputTokens: 0, turns: 0 },
+      ...(accountId ? { accountId, accountLabel: this.accounts.labelOf(accountId) } : {}),
     };
     // Teams: a session created as a lead carries its role + integration/concurrency policy (defaults
     // applied here). Members are never created via this command — the lead's MCP tools stamp them.
@@ -2297,7 +2526,7 @@ export class Supervisor {
       const s = this.require(sessionId);
       return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
     },
-    () => this.shellEnv(),
+    (sessionId) => this.shellEnv(this.sessions.get(sessionId)),
   );
 
   terminalOpen(sessionId: string, cols: number, rows: number): void {
@@ -2409,7 +2638,7 @@ export class Supervisor {
         this.renderer,
         this.broker,
         this.questionBroker,
-        this.agentEnv(),
+        this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
         isDefault
           ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
@@ -2541,6 +2770,26 @@ export class Supervisor {
     s.data.lastActivityAt = now();
     this.persist();
     this.broadcastUpdated(s.data);
+  }
+
+  /** Rebind an IDLE session to another Claude account (multi-account §5.3/§10). Refused mid-turn — the
+   *  wording deliberately mirrors `restartIdleSessionsForNewToken()`'s existing message so both paths
+   *  read as one behaviour. `claudeSessionId` is untouched, so the SDK's `--resume` (or the Task 23
+   *  fresh-context fallback if that's rejected) decides what happens to the conversation. */
+  async setSessionAccount(id: string, accountId: string): Promise<void> {
+    const s = this.require(id);
+    const acct = this.accounts.get(accountId);
+    if (!acct) throw new BadCommand(`unknown Claude account ${accountId}`);
+    if (s.data.status !== "idle") {
+      throw new BadCommand("this session is mid-turn — finish or interrupt the turn, and the new login applies from the next one");
+    }
+    s.data.accountId = accountId;
+    s.data.accountLabel = acct.label;
+    delete s.data.accountMissing;
+    await this.restartDriverForNewToken(id);
+    this.persist();
+    this.broadcastUpdated(s.data);
+    s.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(`🔑 _Switched to **${acct.label}**._`) }] });
   }
 
   /**
@@ -2993,6 +3242,7 @@ export class Supervisor {
         console.error(`[restore] quarantined session ${p?.data?.id ?? "<unknown>"}: ${e instanceof Error ? e.message : e}`);
       }
     }
+    this.reconcileSessionAccounts(); // §5.4: an account removed while this daemon was down
     this.persist(); // reconcile disk == memory after status resets / recovery (fixes drift)
     this.ensureDefaultSession(); // the concierge chat always exists (reused if persisted, else created)
     this.pruneFollowupBranches(); // reap merge-rollover branches the user never continued (best-effort)
@@ -3004,6 +3254,46 @@ export class Supervisor {
         ` · ${recovered} worktree(s) recovered · ${quarantined} quarantined` +
         (orphanDirs.length ? ` · ${orphanDirs.length} orphan state dir(s)` : ""),
     );
+  }
+
+  /**
+   * Run ONE environment's planning pass, isolated. The scheduled run used to have a `finally` but no
+   * `catch`, so a single failing environment — most easily one left pointing at a removed Claude
+   * account — aborted the whole nightly run, silently taking every environment after it with no
+   * report. An unattended run must degrade per-environment, not all-or-nothing.
+   */
+  private async runEnvPlan<T>(emit: (line: string) => void, envName: string, run: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await run();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      emit(`  ⚠ ${envName} failed: ${msg} — continuing with the remaining environments.`);
+      console.warn(`[autopilot] environment ${envName} failed: ${msg}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * §5.4, boot half: `accountRemove()` falls live sessions back the moment an account goes, but an
+   * account can also disappear while this daemon is DOWN — a hand-edited accounts.json, or (much more
+   * likely) a hub push that replaced this member's whole roster. Reconcile once on restore so those
+   * sessions carry the same `accountMissing` badge as the live path instead of failing at spawn time
+   * with an opaque "unknown Claude account".
+   *
+   * A REPLICA is deliberately left alone: on a member an unknown id usually means "the hub's push
+   * hasn't landed yet", and rewriting the binding would silently repoint the session at the wrong
+   * subscription — exactly what §5.4 exists to prevent. `buildAgentEnv` refuses that spawn with the
+   * "press Sync now" message instead, and the binding heals itself when the push arrives.
+   */
+  private reconcileSessionAccounts(): void {
+    if (this.accounts.isEmpty() || this.accounts.snapshot().role === "replica") return;
+    for (const s of this.sessions.values()) {
+      if (!s.data.accountId || this.accounts.has(s.data.accountId)) continue;
+      delete s.data.accountId; // follow the default LIVE, never a snapshot of it — see accountRemove
+      // accountLabel deliberately keeps the removed account's name, for the badge.
+      s.data.accountMissing = true;
+      console.log(`[restore] session ${s.data.id} was bound to a removed Claude account — fell back to the default`);
+    }
   }
 
   /**

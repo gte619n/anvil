@@ -22,6 +22,10 @@ describe("serverHelloEvent", () => {
     expect(hello.capabilities).toContain("autopilot");
   });
 
+  test("advertises the accounts capability", () => {
+    expect(SERVER_CAPABILITIES).toContain("accounts");
+  });
+
   test("the hello capabilities mirror SERVER_CAPABILITIES (the single source of truth)", () => {
     expect(hello.capabilities).toEqual([...SERVER_CAPABILITIES]);
   });
@@ -29,5 +33,25 @@ describe("serverHelloEvent", () => {
   test("emits a fresh capabilities array, not a shared reference to the constant", () => {
     // Defensive: clients/tests must not be able to mutate the module-level constant through a frame.
     expect(hello.capabilities).not.toBe(SERVER_CAPABILITIES);
+  });
+});
+
+describe("serverHelloEvent role derivation", () => {
+  const id = { serverId: "srv_test", serverName: "test-host" };
+
+  test("role is standalone with no hub and no members", () => {
+    const hello = serverHelloEvent(id, { pairedHubId: null, memberCount: 0 });
+    expect(hello.role).toBe("standalone");
+    expect(hello.hubServerId).toBeUndefined();
+  });
+
+  test("role is hub when it has members and no paired hub", () => {
+    expect(serverHelloEvent(id, { pairedHubId: null, memberCount: 2 }).role).toBe("hub");
+  });
+
+  test("role is member when paired — even if it also holds members", () => {
+    const hello = serverHelloEvent(id, { pairedHubId: "srv_hub", memberCount: 3 });
+    expect(hello.role).toBe("member");
+    expect(hello.hubServerId).toBe("srv_hub");
   });
 });

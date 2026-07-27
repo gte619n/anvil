@@ -2,6 +2,7 @@ import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { buildAgentEnv } from "./env";
 import { makePipelineGuardHook } from "./pipeline-guard";
 import type { ModelSpec } from "./model-roster";
+import type { AccountStore } from "../auth/accounts";
 
 /**
  * The dual-model Agent SDK primitive. Any pipeline phase drives EITHER model through this one path:
@@ -23,7 +24,17 @@ export type QueryLike = (args: { prompt: string; options: Record<string, unknown
 
 export async function runAgentQuery(
   prompt: string,
-  opts: { model: ModelSpec; cwd?: string; readonly?: boolean; signal?: AbortSignal; queryFn?: QueryLike },
+  opts: {
+    model: ModelSpec;
+    cwd?: string;
+    readonly?: boolean;
+    signal?: AbortSignal;
+    queryFn?: QueryLike;
+    /** The Claude account roster + which account this run bills to (multi-account §6). Absent ⇒ the
+     *  pre-roster env-var path. */
+    accounts?: AccountStore;
+    accountId?: string;
+  },
 ): Promise<AgentQueryResult> {
   // Bridge the run-level signal to the SDK's AbortController so a cancelled/timed-out run tears down the
   // subprocess instead of leaving it spinning.
@@ -51,7 +62,7 @@ export async function runAgentQuery(
       abortController: ac,
       // Built per-call from the model's profile so the right provider/token drives this spawn, and so a
       // key set/reset via the UI reaches the next run without a daemon restart.
-      env: buildAgentEnv({ profile: opts.model.profile }),
+      env: buildAgentEnv({ profile: opts.model.profile, accounts: opts.accounts, accountId: opts.accountId }),
     },
   });
 

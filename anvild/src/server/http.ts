@@ -1,6 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import type { rest, PermissionDecision } from "@protocol";
-import { checkAuth } from "../auth/guard";
+import { AccountStore, resolveAuthStatus } from "../auth/accounts";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
@@ -148,6 +148,13 @@ export interface ServerOptions {
   host?: string;
   port: number;
   stateDir: string;
+  /** The Claude account roster (multi-account §3). The real daemon (main.ts) constructs it before the
+   *  §3 guard so the boot migration runs first, and passes it in so there is exactly one instance per
+   *  process. Tests that don't care about accounts may omit it — one is constructed over `stateDir`. */
+  accounts?: AccountStore;
+  /** Where the roster's default account is mirrored. Defaults to the real `~/.config/anvil/env`;
+   *  override in tests so the suite can't overwrite a developer's own Claude credential. */
+  envFile?: string;
   /** Clone destination for repos added by git URL (see `Config.clonesDir`). Defaults to `<stateDir>/repos`. */
   clonesDir?: string;
   warnFraction?: number;
@@ -169,6 +176,7 @@ export interface ServerOptions {
  */
 export function createServer(opts: ServerOptions): ServerHandle {
   const identity = loadServerIdentity(opts.stateDir);
+  const accounts = opts.accounts ?? new AccountStore(opts.stateDir);
   const fleet = new FleetStore(opts.stateDir);
   // Bind the degrade marker's home so a credential write from ANY path (a direct paste via
   // `setClaudeToken`, a pair, a rotation) clears it without threading a state dir through (§4.6).
@@ -183,6 +191,13 @@ export function createServer(opts: ServerOptions): ServerHandle {
     {
       stateDir: opts.stateDir,
       port: opts.port,
+      accounts,
+      pairedHub,
+      // Lazy on purpose: `pushRosterInBackground` closes over `fleet`/`accounts`/`identity`, all of
+      // which exist by the time a mutation can fire, but the function itself is hoisted below this
+      // constructor call.
+      onRosterChanged: (reason) => pushRosterInBackground(reason),
+      envFile: opts.envFile,
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
@@ -252,6 +267,53 @@ export function createServer(opts: ServerOptions): ServerHandle {
     });
   }
 
+  /**
+   * Push this hub's credential + account roster to every member (multi-account §7.3). One path for
+   * both the explicit "Sync now" button (/api/fleet/rotate) and the automatic push fired after every
+   * roster mutation, so a manual retry can't diverge from what the automatic one sends.
+   *
+   * Capabilities are re-probed per member inside `rotateToken` (not read from the stored record), so a
+   * member that upgraded after joining starts receiving rotation on :7701 — and the roster — without a
+   * re-pair. On success the confirmed `rev` is recorded on that member's FleetMember so the Servers tab
+   * can show in-sync / out-of-date per Mac.
+   */
+  async function pushRosterToMembers(): Promise<{ host: string; ok: boolean; error?: string; accountsRev?: number }[]> {
+    const members = fleet.list();
+    if (members.length === 0) return [];
+    const payload = accounts.payload();
+    const results = await rotateToken({
+      members,
+      token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
+      hubServerId: identity.serverId,
+      ...(payload ? { accounts: payload } : {}),
+      port: opts.port,
+    });
+    for (const r of results) {
+      if (r.accountsRev === undefined) continue;
+      const stored = fleet.list().find((m) => m.host === r.host); // re-read: a concurrent heal may have moved it
+      if (stored && stored.accountsRev !== r.accountsRev) fleet.upsert({ ...stored, accountsRev: r.accountsRev });
+    }
+    return results;
+  }
+
+  /** Fire-and-forget roster replication after a hub-side mutation. Logged, never thrown: a member being
+   *  offline must not fail the mutation the user just made — the Servers tab shows it out of date and
+   *  "Sync now" repairs it. No-op on a machine with no members (a leaf, or a standalone box). */
+  function pushRosterInBackground(reason: string): void {
+    if (fleet.list().length === 0) return;
+    void pushRosterToMembers()
+      .then((results) => {
+        const okN = results.filter((r) => r.ok).length;
+        if (okN < results.length) {
+          const failed = results.filter((r) => !r.ok).map((r) => `${r.host} (${r.error ?? "unknown"})`);
+          console.warn(`[fleet] roster push after ${reason}: ${okN}/${results.length} ok — failed: ${failed.join(", ")}`);
+        } else {
+          console.log(`[fleet] roster push after ${reason}: ${okN}/${results.length} ok`);
+        }
+      })
+      .catch((e: unknown) => console.warn(`[fleet] roster push after ${reason} failed: ${e instanceof Error ? e.message : e}`));
+  }
+
   // Re-resolve member records that never got a real identity at invite time. A `serverId` that isn't a
   // `srv_…` id is a legacy/unresolved record (the :7702 pairing outcome can omit one, so we fell back to
   // the bare host) — and those records also tend to carry a stale `http://` url even though the member
@@ -312,13 +374,18 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const WS = {
     open(ws: ServerWebSocket<ConnState>) {
       registry.add(ws);
-      ws.send(JSON.stringify(serverHelloEvent(identity))); // who am I — first frame (fleet §3/§6)
+      ws.send(
+        JSON.stringify(
+          serverHelloEvent(identity, { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length }),
+        ),
+      ); // who am I — first frame (fleet §3/§6)
       ws.send(JSON.stringify(supervisor.sessionListEvent()));
       ws.send(JSON.stringify(supervisor.teamInfoEvent())); // derived team tree alongside the session list
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
+      ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
       const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state
@@ -354,6 +421,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
         return Bun.serve<ConnState>({
           hostname: opts.host ?? "127.0.0.1",
           port: opts.port,
+          // Bun's default idleTimeout is 10s, but a fleet fan-out legitimately outlives that: a single
+          // UNREACHABLE member burns postPairing's 12s timeout per attempt, and each member is tried on
+          // two transports (:7701 then the :7702 fallback). The result was that /api/fleet/rotate could
+          // never answer while any member was offline — Bun closed the socket first, so "Sync now"
+          // returned an empty reply and the UI blamed the hub ("is the hub reachable?") when the hub was
+          // perfectly healthy. Pre-existing, but the Servers tab now actively tells people to press that
+          // button when a member is out of date, so it went from rare to routine.
+          idleTimeout: 120,
           async fetch(req, srv) {
             const url = new URL(req.url);
             const isApi = url.pathname.startsWith("/api/");
@@ -374,7 +449,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
       if (req.method === "GET" && url.pathname === "/api/health") {
-        const auth = checkAuth();
+        const auth = resolveAuthStatus({ accounts });
         const body: rest.HealthResponse = {
           ok: true,
           // Honest now (§4.2): false for an absent token AND for an `sk-ant-api…` value. Note the daemon
@@ -408,6 +483,19 @@ export function createServer(opts: ServerOptions): ServerHandle {
         void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP; healed url lands on the next poll
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
       }
+      // Read-only roster for the session-start picker, readable from ANY origin so a member's client
+      // can render it. Masked previews only — never a raw token (§11).
+      if (url.pathname === "/api/fleet/accounts" && req.method === "GET") {
+        const snap = accounts.snapshot();
+        const paired = pairedHub.get();
+        return Response.json({
+          rev: snap.rev,
+          ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
+          role: snap.role,
+          ...(paired ? { hubServerId: paired.hubServerId } : {}),
+          accounts: accounts.publicList(),
+        } satisfies rest.FleetAccountsResponse);
+      }
       // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
       if (url.pathname === "/api/fleet/peers" && req.method === "GET") {
         return Response.json((await tailnetPeers()) satisfies rest.FleetPeersResponse);
@@ -425,6 +513,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         const preflight = await resolveMember(host, opts.port, undefined, memberIp);
         const outcome = await invitePeer({
           host,
+          ...(memberIp ? { ip: memberIp } : {}),
           code,
           token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
           hubServerId: identity.serverId,
@@ -433,17 +522,26 @@ export function createServer(opts: ServerOptions): ServerHandle {
           // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
           ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
           ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+          // The whole roster rides the first join too, so a new member arrives with every account
+          // instead of only the mirrored default (§7.3).
+          ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
         });
         if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
         // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
         // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
         // breaks targeted token propagation (members are matched by serverId).
         const resolved = await resolveMember(host, opts.port, undefined, memberIp);
+        // Record the rev the joiner confirmed taking, exactly as `pushRosterToMembers` does after a
+        // rotation. Without it a freshly-paired member sits at an undefined rev and the Servers tab
+        // reports "out of date — press Sync now" about a member that is in fact perfectly in sync,
+        // until the next roster edit happens to paper over it. `invitePeer` reports what it actually
+        // sent, so this can't drift from the capability gate.
         const member: rest.FleetMember = {
           serverId: resolved.serverId || outcome.serverId || host,
           serverName: outcome.serverName || resolved.serverName || host,
           host,
           url: resolved.url,
+          ...(outcome.accountsRev !== undefined ? { accountsRev: outcome.accountsRev } : {}),
         };
         fleet.upsert(member);
         // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately
@@ -470,7 +568,21 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
       /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
        *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-      const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string }): string | null => {
+      const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
+        // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
+        // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
+        // anything.
+        const before = supervisor.tokensBySession();
+        // Adopt the roster BEFORE setClaudeToken, so the token being set is already consistent with the
+        // roster those sessions will resolve against (§7.3). Absent `accounts` (an older hub) leaves
+        // today's behaviour bit-for-bit unchanged.
+        if (body.accounts) {
+          try {
+            accounts.adoptReplica(body.accounts);
+          } catch (e) {
+            return e instanceof Error ? e.message : String(e);
+          }
+        }
         try {
           setClaudeToken(String(body.token ?? "")); // also clears the degrade marker + failure counter
         } catch (e) {
@@ -490,7 +602,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
         }
         supervisor.authDegrade.recover();
         supervisor.broadcastAuthState();
-        void supervisor.restartIdleSessionsForNewToken();
+        if (body.accounts) supervisor.broadcastAccounts();
+        void supervisor.restartIdleSessionsForNewToken(before);
         return null;
       };
 
@@ -627,14 +740,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       }
 
       if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
-        // Capabilities are re-probed per member inside rotateToken (not read from the stored record),
-        // so a member that upgraded after joining starts receiving rotation on :7701 without a re-pair.
-        const results = await rotateToken({
-          members: fleet.list(),
-          token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
-          hubServerId: identity.serverId,
-          port: opts.port,
-        });
+        const results = await pushRosterToMembers();
         return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
       }
       const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);

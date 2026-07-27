@@ -28,6 +28,7 @@ const CONNECT_FRAMES = new Set([
   "environments",
   "prompts",
   "model.labels",
+  "auth.accounts",
   "todoist.status",
   "lapo.status",
   "autopilot.schedule",

@@ -137,6 +137,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "session.account.set":
+        deps.supervisor
+          .setSessionAccount(cmd.sessionId, cmd.accountId)
+          .then(() => {
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "session.set_autonomy":
         deps.supervisor.setAutonomy(cmd.sessionId, cmd.policy);
         if (cid) send(ack(cid));
@@ -237,6 +246,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           icon: cmd.icon,
           todoistProjectId: cmd.todoistProjectId,
           validation: cmd.validation,
+          accountId: cmd.accountId,
         });
         if (cid) send(ack(cid));
         return;
@@ -321,6 +331,30 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "auth.clear":
         send(deps.supervisor.clearAuthToken(cmd.provider ?? "claude", cid));
+        return;
+
+      case "auth.accounts.get":
+        send(deps.supervisor.accountsEvent(cid));
+        return;
+
+      case "auth.account.add":
+        send(deps.supervisor.accountAdd(cmd.label, cmd.token, cid)); // BadCommand (dup label/metered key) → command.error via the outer catch
+        return;
+
+      case "auth.account.rename":
+        send(deps.supervisor.accountRename(cmd.accountId, cmd.label, cid));
+        return;
+
+      case "auth.account.replace":
+        send(deps.supervisor.accountReplace(cmd.accountId, cmd.token, cid));
+        return;
+
+      case "auth.account.remove":
+        send(deps.supervisor.accountRemove(cmd.accountId, cid)); // BadCommand (last account) → command.error via the outer catch
+        return;
+
+      case "auth.account.default":
+        send(deps.supervisor.accountSetDefault(cmd.accountId, cid));
         return;
 
       case "autopilot.plans.list":

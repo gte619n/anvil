@@ -16,6 +16,8 @@
  *    and the value is an OpenRouter key, not a metered Anthropic one.
  */
 
+import type { AccountStore } from "../auth/accounts";
+
 export type ModelProfile = "claude" | "glm";
 
 /** OpenRouter's Anthropic-compatible base URL ("Anthropic Skin"): the Agent SDK speaks its native
@@ -49,6 +51,14 @@ export function buildAgentEnv(
     /** Set false for a NON-agent spawn (the session terminal / PTY) so a tokenless machine still gets a
      *  shell. Degraded mode restricts turns only — terminal, files, and git keep working (HJ-25/§8.3). */
     requireToken?: boolean;
+    /** The Claude account roster (multi-account §4.1). When present, the "claude" profile resolves its
+     *  token from here instead of `src.CLAUDE_CODE_OAUTH_TOKEN` — see `accountId` below. Absent ⇒ the
+     *  pre-roster env-var path (a dev run, or a spawn that predates the roster). */
+    accounts?: AccountStore;
+    /** Which roster account to spawn under; undefined resolves the roster default. PRESENT but unknown
+     *  (e.g. removed mid-flight) throws rather than silently falling back — a silent swap to another
+     *  subscription is exactly what this feature exists to prevent (§5.4). */
+    accountId?: string;
   } = {},
 ): Record<string, string> {
   const src = opts.src ?? process.env;
@@ -68,10 +78,27 @@ export function buildAgentEnv(
     out.ANTHROPIC_BASE_URL = OPENROUTER_ANTHROPIC_BASE_URL;
     out.ANTHROPIC_AUTH_TOKEN = key;
   } else {
-    // Mirror the glm branch's explicit precondition. Silently omitting the key here produced an opaque
-    // SDK failure several layers down — useless on a machine that is degraded on purpose and needs to
-    // be told to pair (headless-join §4.3).
-    const tok = (src.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim();
+    // Roster-aware resolution (§4.1). An accountId that is PRESENT but unknown throws — falling back
+    // would silently bill another subscription, the exact failure this feature exists to prevent.
+    let tok: string;
+    if (opts.accounts) {
+      if (opts.accountId && !opts.accounts.has(opts.accountId)) {
+        // The two §5.4 cases read very differently to the operator, so they get different messages.
+        // On a REPLICA an unknown id almost always means the hub's push hasn't landed here yet — the
+        // fix is "Sync now", not "pick another account". On a hub it really is gone.
+        throw new Error(
+          opts.accounts.snapshot().role === "replica"
+            ? "this Mac hasn't received that Claude login from its hub yet — open Settings → Servers on the hub and press Sync now"
+            : `unknown Claude account ${opts.accountId} — it may have been removed; pick another in Settings → Models`,
+        );
+      }
+      tok = (opts.accounts.token(opts.accountId) ?? "").trim();
+    } else {
+      // Mirror the glm branch's explicit precondition. Silently omitting the key here produced an
+      // opaque SDK failure several layers down — useless on a machine that is degraded on purpose and
+      // needs to be told to pair (headless-join §4.3).
+      tok = (src.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim();
+    }
     if (!tok && opts.requireToken !== false) throw new Error(NO_CLAUDE_TOKEN_ERROR);
     if (tok) out.CLAUDE_CODE_OAUTH_TOKEN = tok;
   }

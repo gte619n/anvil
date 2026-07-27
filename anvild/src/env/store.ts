@@ -56,6 +56,9 @@ export class EnvironmentStore {
       icon?: string;
       todoistProjectId?: string | null;
       validation?: EnvironmentValidation | null;
+      /** The Claude account new sessions here default to, and that scheduled autopilot runs bill to
+       *  (multi-account §6). null explicitly clears it back to "use the roster default". */
+      accountId?: string | null;
     },
   ): void {
     const env = this.environments.find((e) => e.id === id);
@@ -69,6 +72,7 @@ export class EnvironmentStore {
       env.todoistProjectId = fields.todoistProjectId?.trim() || undefined;
     if (fields.validation !== undefined)
       env.validation = fields.validation && fields.validation.commands.length ? fields.validation : undefined;
+    if (fields.accountId !== undefined) env.accountId = fields.accountId?.trim() || undefined;
     this.save();
   }
 

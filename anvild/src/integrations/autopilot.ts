@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
+import type { AccountStore } from "../auth/accounts";
 import { makePipelineGuardHook } from "../agent/pipeline-guard";
 import type { QueryLike } from "../agent/query";
 import type { TodoistClient, TodoistTask, TodoistSection, TodoistComment } from "./todoist";
@@ -64,7 +65,7 @@ State the expected passing outcome for each check so success is unambiguous. Gro
  */
 async function runQuery(
   prompt: string,
-  opts: { model: Model; cwd?: string; readonly?: boolean; signal?: AbortSignal; queryFn?: QueryLike },
+  opts: { model: Model; cwd?: string; readonly?: boolean; signal?: AbortSignal; queryFn?: QueryLike; accounts?: AccountStore; accountId?: string },
 ): Promise<{ text: string; plan?: string }> {
   // Bridge the run-level signal to the SDK's AbortController so a cancelled/timed-out run tears down the
   // planning subprocess instead of leaving it spinning (and the run — and its spinner — pinned open).
@@ -95,8 +96,9 @@ async function runQuery(
       executable: "bun",
       abortController: ac,
       // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
-      // effect for the next planning/refine run without restarting the daemon. See AuthStore.
-      env: buildAgentEnv(),
+      // effect for the next planning/refine run without restarting the daemon. See AuthStore. When the
+      // caller passes a roster, the run bills to the environment's chosen account (multi-account §6).
+      env: buildAgentEnv({ accounts: opts.accounts, accountId: opts.accountId }),
     },
   });
   let text = "";
@@ -198,7 +200,7 @@ async function fetchComments(
 export async function bundleTasks(
   tasks: TodoistTask[],
   sections: TodoistSection[],
-  opts: { model?: Model; repoName?: string; signal?: AbortSignal } = {},
+  opts: { model?: Model; repoName?: string; signal?: AbortSignal; accounts?: AccountStore; accountId?: string } = {},
 ): Promise<ProposedUnit[]> {
   if (tasks.length === 0) return [];
   const sectionName = (id?: string | null) => sections.find((s) => s.id === id)?.name;
@@ -216,7 +218,7 @@ ${list}
 Respond with ONLY a JSON array, no prose:
 [{"title": "...", "rationale": "...", "taskIds": ["id1","id2"]}]`;
 
-  const out = await runQuery(prompt, { model: opts.model ?? "sonnet", signal: opts.signal });
+  const out = await runQuery(prompt, { model: opts.model ?? "sonnet", signal: opts.signal, accounts: opts.accounts, accountId: opts.accountId });
   const units = extractJson<ProposedUnit[]>(out.text);
   // Defensive: keep only real candidate ids, drop empty units.
   const valid = new Set(tasks.map((t) => t.id));
@@ -232,7 +234,16 @@ Respond with ONLY a JSON array, no prose:
 export async function planUnit(
   unit: ProposedUnit,
   tasks: TodoistTask[],
-  opts: { model?: Model; repoRoot: string; signal?: AbortSignal; adversarial?: AdversarialOpts; comments?: Map<string, TodoistComment[]> },
+  opts: {
+    model?: Model;
+    repoRoot: string;
+    signal?: AbortSignal;
+    adversarial?: AdversarialOpts;
+    comments?: Map<string, TodoistComment[]>;
+    /** Bill this run to a specific Claude account (the environment's, multi-account §6). */
+    accounts?: AccountStore;
+    accountId?: string;
+  },
 ): Promise<PlannedUnit> {
   const members = tasks.filter((t) => unit.taskIds.includes(t.id));
   const taskBlock = members.map((t) => taskLine(t, { comments: opts.comments?.get(t.id) })).join("\n");
@@ -250,7 +261,14 @@ ${VALIDATION_INSTRUCTION}
 
 ${PLAN_META_INSTRUCTION}`;
 
-  const out = await runQuery(prompt, { model: opts.model ?? "opus", cwd: opts.repoRoot, readonly: true, signal: opts.signal });
+  const out = await runQuery(prompt, {
+    model: opts.model ?? "opus",
+    cwd: opts.repoRoot,
+    readonly: true,
+    signal: opts.signal,
+    accounts: opts.accounts,
+    accountId: opts.accountId,
+  });
   const resolved = resolvePlan(out);
   const { summary, effort, clarification } = resolved;
   let plan = resolved.plan;
@@ -287,7 +305,7 @@ ${PLAN_META_INSTRUCTION}`;
 export async function classifyIntake(
   unit: ProposedUnit,
   tasks: TodoistTask[],
-  opts: { model?: Model; signal?: AbortSignal; comments?: Map<string, TodoistComment[]> } = {},
+  opts: { model?: Model; signal?: AbortSignal; comments?: Map<string, TodoistComment[]>; accounts?: AccountStore; accountId?: string } = {},
 ): Promise<IntakeVerdict> {
   const taskBlock = tasks.map((t) => taskLine(t, { comments: opts.comments?.get(t.id) })).join("\n");
   const prompt = `You are the User Advocate at intake for an autonomous engineering autopilot. If you approve this, it will be implemented UNATTENDED — no human in the loop — and shipped as a pull request. Judge ONLY whether the request is specified well enough to build without inventing material product decisions. Do not plan or solve it.
@@ -307,7 +325,7 @@ Why bundled: ${unit.rationale}
 Tasks:
 ${taskBlock}`;
   try {
-    const out = await runQuery(prompt, { model: opts.model ?? "sonnet", signal: opts.signal });
+    const out = await runQuery(prompt, { model: opts.model ?? "sonnet", signal: opts.signal, accounts: opts.accounts, accountId: opts.accountId });
     return parseIntakeVerdict(extractJson<unknown>(out.text));
   } catch {
     // Never let a classifier hiccup (parse failure, transient SDK error) block planning — fail open.
@@ -349,6 +367,8 @@ async function processUnit(
     adversarial?: AdversarialOpts;
     signal?: AbortSignal;
     source?: "label";
+    accounts?: AccountStore;
+    accountId?: string;
   },
 ): Promise<WorkUnit> {
   const members = candidates.filter((t) => unit.taskIds.includes(t.id));
@@ -356,7 +376,7 @@ async function processUnit(
   // the missing spec as a comment after writing the task, so intake + planning must see it or they'll hold
   // an already-answered task for clarification.
   const comments = await fetchComments(deps.client, members, opts.signal);
-  const verdict = await classifyIntake(unit, members, { model: opts.intakeModel, signal: opts.signal, comments });
+  const verdict = await classifyIntake(unit, members, { model: opts.intakeModel, signal: opts.signal, comments, accounts: opts.accounts, accountId: opts.accountId });
 
   let clarification: { reason: string; questions: string[] } | undefined;
   let planned: PlannedUnit | undefined;
@@ -369,7 +389,15 @@ async function processUnit(
         : "This task is underspecified — it needs answers before it can be built.");
     clarification = { reason, questions: verdict.questions };
   } else {
-    planned = await planUnit(unit, candidates, { model: opts.planModel, repoRoot: opts.repoRoot, signal: opts.signal, adversarial: opts.adversarial, comments });
+    planned = await planUnit(unit, candidates, {
+      model: opts.planModel,
+      repoRoot: opts.repoRoot,
+      signal: opts.signal,
+      adversarial: opts.adversarial,
+      comments,
+      accounts: opts.accounts,
+      accountId: opts.accountId,
+    });
     if (planned.clarification) {
       clarification = {
         reason: planned.summary?.trim() || "Planning surfaced open questions that must be answered before this can be built.",
@@ -472,6 +500,9 @@ export async function planAndTagProject(
     signal?: AbortSignal; // run-level abort: a cancelled/timed-out run unwinds in-flight planning
     onProgress?: (msg: string) => void;
     onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
+    /** Bill this environment's runs to a specific Claude account (multi-account §6). */
+    accounts?: AccountStore;
+    accountId?: string;
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
   const log = opts.onProgress ?? (() => {});
@@ -481,7 +512,7 @@ export async function planAndTagProject(
   log(`${tasks.length} active tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
   if (candidates.length === 0) return { created: [], skipped };
 
-  const units = await bundleTasks(candidates, sections, { model: opts.bundleModel, repoName: opts.repoName, signal: opts.signal });
+  const units = await bundleTasks(candidates, sections, { model: opts.bundleModel, repoName: opts.repoName, signal: opts.signal, accounts: opts.accounts, accountId: opts.accountId });
   log(`Bundled into ${units.length} units. Planning + tagging…`);
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
@@ -493,6 +524,8 @@ export async function planAndTagProject(
       planModel: opts.planModel,
       adversarial: opts.adversarial,
       signal: opts.signal,
+      accounts: opts.accounts,
+      accountId: opts.accountId,
     });
     if (wu.status === "needs-clarification") log(`      ↳ held for clarification (underspecified).`);
     created.push(wu);
@@ -522,6 +555,9 @@ export async function planAndTagTasks(
     signal?: AbortSignal; // run-level abort: a cancelled/timed-out run unwinds in-flight planning
     onProgress?: (msg: string) => void;
     onUnitCreated?: (unit: WorkUnit) => void; // fires as each unit is persisted, so clients update the grid live
+    /** Bill this environment's runs to a specific Claude account (multi-account §6). */
+    accounts?: AccountStore;
+    accountId?: string;
   },
 ): Promise<{ created: WorkUnit[]; skipped: number }> {
   const log = opts.onProgress ?? (() => {});
@@ -530,7 +566,7 @@ export async function planAndTagTasks(
   log(`${opts.tasks.length} labelled tasks · ${candidates.length} candidates · ${skipped} already in pipeline.`);
   if (candidates.length === 0) return { created: [], skipped };
 
-  const units = await bundleTasks(candidates, [], { model: opts.bundleModel, repoName: opts.repoName, signal: opts.signal });
+  const units = await bundleTasks(candidates, [], { model: opts.bundleModel, repoName: opts.repoName, signal: opts.signal, accounts: opts.accounts, accountId: opts.accountId });
   log(`Bundled into ${units.length} units. Planning + tagging…`);
   const created: WorkUnit[] = [];
   for (const [i, unit] of units.entries()) {
@@ -543,6 +579,8 @@ export async function planAndTagTasks(
       adversarial: opts.adversarial,
       signal: opts.signal,
       source: "label",
+      accounts: opts.accounts,
+      accountId: opts.accountId,
     });
     if (wu.status === "needs-clarification") log(`      ↳ held for clarification (underspecified).`);
     created.push(wu);
