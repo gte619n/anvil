@@ -2010,6 +2010,31 @@ port 7711, same tailnet, same Tailscale user. Two real subscription tokens (`wor
   and spawns with the right token; only the Anthropic usage dashboard can confirm where the charge
   lands.
 
+### Run 2 — 2026-07-26, driven through a real browser
+
+Windows Chrome over CDP (WSLg's X surface is a 640x480 vestige that parks windows at -32730,-32709 —
+run the browser on the Windows side and reach it over mirrored networking).
+
+**Verified in the UI, end to end**
+
+- Models tab renders the roster: default marker, labels, masked previews, per-row menu, Add account.
+- Add-account dialog: host-specific `claude setup-token` hint naming the hub; a metered `sk-ant-api03-`
+  key is refused INLINE with the §3 message and the dialog stays open with values intact; a duplicate
+  label is refused case-insensitively ("an account called \"work\" already exists").
+- New-session dialog shows the Account row under Environment, pre-selected to the roster default.
+- Creating a session pinned to `personal` stamps `accountId`/`accountLabel` server-side; the header
+  chip reads `* personal` with a "tap to switch" tooltip.
+- The chip's menu switches the session (`* seiraiyu`), rebinds it server-side, and drops
+  "Switched to seiraiyu." into the transcript.
+- Removing an in-use account: the confirm names the session ("in use by 1 session: acct-demo") from
+  the event's `inUse` map with no extra round trip; afterwards the session falls back to the default
+  and the header shows `work ! was seiraiyu`, because `accountLabel` deliberately keeps the REMOVED
+  name (see bug 3 above — this is the payoff for that fix).
+
+**Bug 5, found here** — see the fix list above: `/api/fleet/rotate` could never answer while a member
+was offline (Bun's 10s `idleTimeout` vs postPairing's 12s), so "Sync now" hung and the UI blamed the
+hub. Confirmed fixed: with the member down it now returns `200` in ~14s with a real per-member error.
+
 **Follow-up worth its own PR (pre-existing, outside this change)**
 
 `invitePeer`/`resolveMember` dial only the MagicDNS name when a peer has one, so on any hub where
