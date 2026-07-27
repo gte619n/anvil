@@ -1,11 +1,12 @@
 import { test, expect } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
 import { Supervisor, BadCommand } from "../../src/session/supervisor";
 import { ConnectionRegistry } from "../../src/server/registry";
 import { AccountStore } from "../../src/auth/accounts";
+import type { EnvironmentStore } from "../../src/env/store";
 
 function tempState(): string {
   return mkdtempSync(join(tmpdir(), "anvil-sup-acct2-"));
@@ -56,8 +57,9 @@ test("removing an in-use account falls its sessions back to the default and PRES
 
   sup.accountRemove(work.id);
 
-  // Falls back to the (now sole remaining) default account...
-  expect(s.data.accountId).toBe(personal.id);
+  // Falls back to the default by CLEARING the binding, not by snapshotting the default's id — see
+  // the F1 regression below for why the difference is load-bearing.
+  expect(s.data.accountId).toBeUndefined();
   expect(s.data.accountMissing).toBe(true);
   // ...but the label field DELIBERATELY still names the removed account, not the fallback — the client
   // renders "<current default> ⚠ was <this>" and has no other way to recover the old name.
@@ -106,7 +108,7 @@ test("a session bound to an account removed while the daemon was DOWN is reconci
 
   const sup2 = new Supervisor({ stateDir: dir, accounts: accounts2 }, new ConnectionRegistry());
   const restored = sup2.get(sessionId)!;
-  expect(restored.data.accountId).toBe(accounts2.defaultId());
+  expect(restored.data.accountId).toBeUndefined(); // follows the default live
   expect(restored.data.accountMissing).toBe(true);
   expect(restored.data.accountLabel).toBe("work"); // the removed account's name still names itself
   rmSync(dir, { recursive: true, force: true });
@@ -151,5 +153,57 @@ test("a roster mutation mirrors into the CONFIGURED env file, never the real one
   expect(readFileSync(envFile, "utf8")).toContain("sk-ant-oat01-workworkwork-1111");
   // ...and the event's `persisted` flag reads back from that same file, not the real one.
   expect(sup.accountsEvent().persisted).toBe(true);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+
+// F1 (found by independent E2E, 2026-07-27): the removal fallback used to write a SNAPSHOT of
+// defaultId() into the session. Both resolve to the default at that instant, so it looked right —
+// but move the default afterwards and the session keeps spawning on the OLD account while the header
+// chip, which renders the CURRENT default's label, names the NEW one. The UI then advertises a
+// subscription that isn't being billed, which is the exact confusion this whole feature exists to
+// prevent. Clearing the binding makes it track the default for real.
+test("F1: a fallen-back session follows the default when the default LATER moves", () => {
+  const dir = tempState();
+  const accounts = new AccountStore(dir);
+  const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
+  const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
+  const third = accounts.add("third", "sk-ant-oat01-thirdthird-3333");
+  accounts.setDefault(personal.id);
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir, work.id));
+
+  sup.accountRemove(work.id); // falls back to the default, which is currently "personal"
+  expect(s.data.accountMissing).toBe(true);
+  expect(accounts.token(s.data.accountId)).toBe("sk-ant-oat01-personalpers-2222");
+
+  // Now move the default. The session must FOLLOW it — a snapshot would still resolve "personal"
+  // while the chip rendered "third".
+  sup.accountSetDefault(third.id);
+  expect(accounts.token(s.data.accountId)).toBe("sk-ant-oat01-thirdthird-3333");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// C2 (found by independent E2E, 2026-07-27): environments bind to accounts too, but removal only
+// reconciled SESSIONS. A removed account left a dangling env.accountId that surfaced later,
+// unattended, as a failed autopilot spawn — and because the run loop had `finally` but no `catch`,
+// that one environment aborted the whole nightly run including every environment after it.
+test("C2: removing an account clears it from ENVIRONMENTS too", () => {
+  const dir = tempState();
+  const accounts = new AccountStore(dir);
+  accounts.add("work", "sk-ant-oat01-workworkwork-1111");
+  const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
+  const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
+
+  const envStore = (sup as unknown as { envStore: EnvironmentStore }).envStore;
+  mkdirSync(join(dir, ".git"), { recursive: true });
+  const env = envStore.add("proj", dir);
+  sup.updateEnvironment(env.id, { accountId: personal.id });
+  expect(envStore.get(env.id)?.accountId).toBe(personal.id);
+
+  sup.accountRemove(personal.id);
+
+  // Cleared, not left dangling — the environment falls back to the roster default like a session.
+  expect(envStore.get(env.id)?.accountId).toBeUndefined();
   rmSync(dir, { recursive: true, force: true });
 });

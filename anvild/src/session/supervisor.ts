@@ -1007,17 +1007,34 @@ export class Supervisor {
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    // §5.4 removal fallback: fall every session bound to the removed account back to the new default,
-    // flagged so the client can render the "⚠ was <label>" badge (Task 24/20). `accountLabel` is
-    // DELIBERATELY left holding the removed account's OLD label (not overwritten with the fallback's) —
-    // the client already has the roster snapshot and looks up the current default's label itself; this
-    // field is the only place the old name survives the removal.
+    // §5.4 removal fallback: fall every session bound to the removed account back to the default,
+    // flagged so the client can render the "⚠ was <label>" badge (Task 24/20).
+    //
+    // `accountId` is CLEARED rather than set to a snapshot of `defaultId()`. Both resolve to the
+    // default today, but a snapshot silently stops tracking it: move the default afterwards and the
+    // session keeps spawning on the OLD one while the header chip — which renders the CURRENT
+    // default's label — names the new one. The chip then advertises a subscription that isn't paying,
+    // which is precisely the confusion this feature exists to prevent. `undefined` genuinely follows
+    // the default, because that is what `AccountStore.token(undefined)` resolves.
+    //
+    // `accountLabel` IS deliberately left holding the removed account's old name — it's the only
+    // place that survives the removal, and the badge needs it.
     for (const s of this.sessions.values()) {
       if (s.data.accountId !== accountId) continue;
-      s.data.accountId = this.accounts.defaultId();
+      delete s.data.accountId;
       s.data.accountMissing = true;
       this.broadcastUpdated(s.data);
     }
+    // Environments bind to accounts too (§6), and were NOT being reconciled — a removed account left a
+    // dangling `env.accountId` that only surfaced later, unattended, as a failed autopilot spawn.
+    // Clearing it falls the environment back to the roster default, same as a session.
+    let envsCleared = 0;
+    for (const env of this.envStore.list()) {
+      if (env.accountId !== accountId) continue;
+      this.envStore.update(env.id, { accountId: null });
+      envsCleared++;
+    }
+    if (envsCleared) this.registry.toAll(this.environmentsEvent());
     this.persist();
     return this.afterAccountMutation(cid, before, "remove");
   }
@@ -1789,7 +1806,8 @@ export class Supervisor {
         // for an unattended run rather than leaving it to be inferred (§6).
         const envAcct = this.accounts.labelOf(env.accountId ?? this.accounts.defaultId());
         emit(`▸ ${env.name}${envAcct ? ` · account: ${envAcct}` : ""}`);
-        const res = await planAndTagProject(deps, {
+        const res = await this.runEnvPlan(emit, env.name, () =>
+          planAndTagProject(deps, {
           environmentId: env.id,
           projectId: env.todoistProjectId!,
           repoRoot: env.repoRoot,
@@ -1799,9 +1817,11 @@ export class Supervisor {
           onProgress: emit,
           onUnitCreated,
           // Unattended runs bill to the environment's chosen account, else the roster default (§6).
-          accounts: this.accounts,
-          ...(env.accountId ? { accountId: env.accountId } : {}),
-        });
+            accounts: this.accounts,
+            ...(env.accountId ? { accountId: env.accountId } : {}),
+          }),
+        );
+        if (!res) continue; // this environment failed; the others still run
         createdUnits.push(...res.created);
         skipped += res.skipped;
       }
@@ -3124,6 +3144,23 @@ export class Supervisor {
   }
 
   /**
+   * Run ONE environment's planning pass, isolated. The scheduled run used to have a `finally` but no
+   * `catch`, so a single failing environment — most easily one left pointing at a removed Claude
+   * account — aborted the whole nightly run, silently taking every environment after it with no
+   * report. An unattended run must degrade per-environment, not all-or-nothing.
+   */
+  private async runEnvPlan<T>(emit: (line: string) => void, envName: string, run: () => Promise<T>): Promise<T | undefined> {
+    try {
+      return await run();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      emit(`  ⚠ ${envName} failed: ${msg} — continuing with the remaining environments.`);
+      console.warn(`[autopilot] environment ${envName} failed: ${msg}`);
+      return undefined;
+    }
+  }
+
+  /**
    * §5.4, boot half: `accountRemove()` falls live sessions back the moment an account goes, but an
    * account can also disappear while this daemon is DOWN — a hand-edited accounts.json, or (much more
    * likely) a hub push that replaced this member's whole roster. Reconcile once on restore so those
@@ -3137,10 +3174,10 @@ export class Supervisor {
    */
   private reconcileSessionAccounts(): void {
     if (this.accounts.isEmpty() || this.accounts.snapshot().role === "replica") return;
-    const fallback = this.accounts.defaultId();
     for (const s of this.sessions.values()) {
       if (!s.data.accountId || this.accounts.has(s.data.accountId)) continue;
-      s.data.accountId = fallback; // accountLabel deliberately keeps the removed account's name
+      delete s.data.accountId; // follow the default LIVE, never a snapshot of it — see accountRemove
+      // accountLabel deliberately keeps the removed account's name, for the badge.
       s.data.accountMissing = true;
       console.log(`[restore] session ${s.data.id} was bound to a removed Claude account — fell back to the default`);
     }

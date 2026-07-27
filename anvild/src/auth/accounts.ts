@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { looksLikeMeteredKey, mask } from "./env-file";
@@ -64,6 +64,14 @@ function cleanToken(token: string): string {
     throw new Error(
       "that looks like a metered ANTHROPIC_API_KEY, not a subscription OAuth token — run `claude setup-token` and paste that token instead (arch §3)",
     );
+  }
+  // Validation used to be negative-only: it rejected metered keys but accepted literally any other
+  // string, so "not-a-real-token" was persisted and replicated to every member, only failing much
+  // later as an opaque SDK error mid-turn. This is deliberately a LOOSE prefix check, matching the
+  // guard's "plausible" wording (auth/guard.ts) — it catches a pasted password or truncated copy
+  // without pretending to know the exact format of a token Anthropic may change.
+  if (!/^sk-ant-/.test(t)) {
+    throw new Error("that doesn't look like a Claude OAuth token — it should start with `sk-ant-`; run `claude setup-token` and paste the whole value");
   }
   return t;
 }
@@ -132,7 +140,9 @@ export class AccountStore {
   // ── writes (hub only) ────────────────────────────────────────────────────────
   add(label: string, token: string, id: string = newAccountId()): ClaudeAccount {
     this.assertWritable();
-    const clean = { label: this.cleanLabel(label), token: cleanToken(token) };
+    const cleanTok = cleanToken(token);
+    this.assertTokenUnused(cleanTok);
+    const clean = { label: this.cleanLabel(label), token: cleanTok };
     const account: ClaudeAccount = { id, ...clean, createdAt: Date.now() };
     this.data.accounts.push(account);
     this.data.defaultId ??= id; // the first account is the default; later ones never steal it
@@ -150,7 +160,9 @@ export class AccountStore {
   replace(id: string, token: string): void {
     this.assertWritable();
     const a = this.require(id);
-    a.token = cleanToken(token);
+    const cleanTok = cleanToken(token);
+    this.assertTokenUnused(cleanTok, id);
+    a.token = cleanTok;
     this.bump();
   }
 
@@ -172,10 +184,20 @@ export class AccountStore {
     this.bump();
   }
 
-  /** Replace this roster with one pushed by the hub (§7.3). Flips the store to replica mode. */
-  adoptReplica(payload: RosterPayload): void {
-    this.data = { rev: payload.rev, defaultId: payload.defaultId, role: "replica", accounts: payload.entries.map((e) => ({ ...e })) };
+  /**
+   * Replace this roster with one pushed by the hub (§7.3). Flips the store to replica mode.
+   *
+   * Returns false and changes NOTHING for a stale push. Rotation is a fan-out of concurrent HTTP
+   * requests with retries, so two pushes can land out of order; without this an older payload could
+   * silently move a member BACKWARDS — resurrecting a removed account, or restoring a rotated token —
+   * and the member would then sit at a rev the hub believes it has already passed.
+   */
+  adoptReplica(payload: RosterPayload): boolean {
+    if (this.data.role === "replica" && payload.rev < this.data.rev) return false;
+    const byId = new Map(payload.entries.map((e) => [e.id, { ...e }]));
+    this.data = { rev: payload.rev, defaultId: payload.defaultId, role: "replica", accounts: [...byId.values()] };
     this.save();
+    return true;
   }
 
   // ── internals ────────────────────────────────────────────────────────────────
@@ -183,6 +205,14 @@ export class AccountStore {
     if (this.data.role === "replica") {
       throw new Error("this machine holds a replica of its hub's account roster — change accounts on the hub");
     }
+  }
+
+  /** F6: labels dedup, tokens didn't — so one subscription could be added twice under two names, with
+   *  matching masked previews as the only cue. Every downstream count ("2 Claude accounts"), the
+   *  session picker and the per-account billing story then all lie. */
+  private assertTokenUnused(token: string, exceptId?: string): void {
+    const clash = this.data.accounts.find((a) => a.id !== exceptId && a.token === token);
+    if (clash) throw new Error(`that token is already on the roster as "${clash.label}"`);
   }
 
   private cleanLabel(label: string, exceptId?: string): string {
@@ -209,19 +239,44 @@ export class AccountStore {
     if (!existsSync(this.file)) return;
     try {
       const raw = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RosterFile>;
+      const accounts = Array.isArray(raw.accounts) ? raw.accounts.filter((a) => a && typeof a.id === "string" && typeof a.token === "string") : [];
+      // Drop duplicate ids (reachable via a malformed push) — last write wins, as adoptReplica implies.
+      const byId = new Map(accounts.map((a) => [a.id, a]));
+      const deduped = [...byId.values()];
+      // A defaultId pointing at nothing would make token(undefined) silently return undefined and every
+      // spawn fail with "no Claude OAuth token". Fall back to the first surviving account instead.
+      const defaultId = raw.defaultId && byId.has(raw.defaultId) ? raw.defaultId : deduped[0]?.id;
       this.data = {
         rev: typeof raw.rev === "number" ? raw.rev : 0,
-        ...(raw.defaultId ? { defaultId: raw.defaultId } : {}),
+        ...(defaultId ? { defaultId } : {}),
         role: raw.role === "replica" ? "replica" : "hub",
-        accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
+        accounts: deduped,
       };
-    } catch {
-      this.data = { rev: 0, role: "hub", accounts: [] }; // corrupt — behave as empty (FleetStore's rule)
+    } catch (e) {
+      // A truncated/corrupt roster must NOT be silently discarded: it holds every Claude token, and
+      // resetting to an empty `role: "hub"` would ALSO promote a member's replica to a writable hub,
+      // breaking the single-writer invariant. Preserve the bytes for recovery and say so loudly.
+      const backup = `${this.file}.corrupt-${Date.now()}`;
+      try {
+        renameSync(this.file, backup);
+      } catch {
+        /* best-effort — an unreadable file we also can't move still must not crash the daemon */
+      }
+      console.error(
+        `[accounts] ${this.file} was unreadable (${e instanceof Error ? e.message : e}); moved to ${backup}. ` +
+          `Starting with an EMPTY roster — if this machine is a fleet member, re-pair it or press Sync now on the hub.`,
+      );
+      this.data = { rev: 0, role: "hub", accounts: [] };
     }
   }
 
+  /** Atomic write (tmp + rename) so a crash mid-write can never truncate the roster — the same rule
+   *  SessionStore follows. A torn accounts.json loses every token AND silently reverts a replica to a
+   *  writable hub, so this is the more important of the two. */
   private save(): void {
-    writeFileSync(this.file, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, this.file);
   }
 }
 

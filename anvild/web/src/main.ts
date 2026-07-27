@@ -2484,7 +2484,10 @@ function updateHeaderAccount(s: Session | undefined): void {
   const el = document.getElementById("header-account");
   if (!el) return;
   const list = claudeAccounts?.accounts ?? [];
-  if (!s || s.isDefault || list.length <= 1) {
+  // C4: the <=1 guard used to run BEFORE the accountMissing branch, so removing the second-to-last
+  // account rebound every session bound to it and then hid the only evidence that had happened. A
+  // session flagged as fallen-back must always be able to say so, however small the roster.
+  if (!s || s.isDefault || (list.length <= 1 && !s.accountMissing)) {
     el.innerHTML = "";
     el.hidden = true;
     return;
@@ -3255,6 +3258,10 @@ function onAuthAccounts(e: AuthAccountsEvent): void {
   // The header chip appears/disappears at the 1↔2-account boundary and shows a label the roster owns,
   // so a roster change has to repaint it even when no session.updated follows.
   updateHeaderAccount(activeId ? sessions.get(activeId) : undefined);
+  // F2: the Servers tab's per-Mac sync lines are derived from this same roster, so without this they
+  // kept rendering a stale snapshot until a reload — including the actionable "out of date" warning,
+  // which is worse than a stale count because it prompts an action based on old state.
+  if (document.getElementById("server-cards")) renderServerCards();
 }
 
 /** Persist a new/replacement Claude OAuth token on the hub daemon. */
@@ -4537,9 +4544,26 @@ function accountSyncLine(srv: Server, isOrigin: boolean): string {
   if (srv.capabilities && !serverSupports(srv, "accounts")) {
     return `<div class="small warn-text">${icon("warning")} Update Anvil to use multiple accounts</div>`;
   }
-  const rev = srv.id ? fleetMemberAccountsRev.get(srv.id) : undefined;
+  // F7: this used to read `fleetMemberAccountsRev.get(srv.id)`, but `srv.id` comes from `server.hello`
+  // — which an UNREACHABLE peer never sends, leaving it "". The lookup then missed for exactly the
+  // members whose state matters most, and every offline Mac reported "out of date — press Sync now"
+  // even when it held the current roster, pointing at a remedy that cannot work while it is down.
+  // The hub already knows: fleet.json carries serverId AND accountsRev, keyed by host.
+  const rev = memberAccountsRevFor(srv);
   if (rev === roster.rev) return `<div class="small muted">${icon("check")} in sync · ${n} accounts</div>`;
+  if (rev === undefined && srv.status !== "connected") {
+    // Never pushed, or we simply can't tell — don't accuse an offline peer of being stale.
+    return `<div class="small muted">${icon("cloud_off")} offline — sync state unknown</div>`;
+  }
   return `<div class="small warn-text">${icon("warning")} out of date — press Sync now</div>`;
+}
+
+/** The roster rev the hub last confirmed for this server, by live serverId when we have one and by
+ *  host otherwise — so an offline member (no `server.hello`, hence no `srv.id`) still resolves. */
+function memberAccountsRevFor(srv: Server): number | undefined {
+  if (srv.id && fleetMemberAccountsRev.has(srv.id)) return fleetMemberAccountsRev.get(srv.id);
+  const id = fleetMemberIdByHost.get(hostnameOf(srv.url));
+  return id ? fleetMemberAccountsRev.get(id) : undefined;
 }
 
 function serverCardHtml(srv: Server): string {

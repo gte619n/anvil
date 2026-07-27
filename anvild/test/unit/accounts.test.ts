@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AccountStore } from "../../src/auth/accounts";
@@ -136,4 +136,65 @@ test("labels and tokens are trimmed", () => {
   const a = s.add("  work  ", "  sk-ant-oat01-workworkwork-1111  ");
   expect(a.label).toBe("work");
   expect(s.token(a.id)).toBe("sk-ant-oat01-workworkwork-1111");
+});
+
+// ── Hardening from the independent E2E pass (2026-07-27) ────────────────────────────────────
+
+test("F3: validation is no longer negative-only — junk is refused, not persisted", () => {
+  const s = tmpStore();
+  expect(() => s.add("junk", "not-a-real-token")).toThrow(/sk-ant-/);
+  expect(() => s.add("junk", "hunter2")).toThrow(/sk-ant-/);
+  expect(s.list()).toEqual([]); // nothing persisted, so nothing gets replicated to members either
+  s.add("ok", "sk-ant-oat01-realish-1111"); // a plausible token still sails through
+  expect(s.list()).toHaveLength(1);
+});
+
+test("F6: the same token cannot be added twice under two labels", () => {
+  const s = tmpStore();
+  s.add("work", "sk-ant-oat01-sametoken-1111");
+  expect(() => s.add("work-again", "sk-ant-oat01-sametoken-1111")).toThrow(/already on the roster as "work"/);
+  // ...nor smuggled in by rotating a second account onto the first's token.
+  const b = s.add("personal", "sk-ant-oat01-different-2222");
+  expect(() => s.replace(b.id, "sk-ant-oat01-sametoken-1111")).toThrow(/already on the roster/);
+  // Replacing an account with its OWN token is a no-op, not a self-collision.
+  expect(() => s.replace(b.id, "sk-ant-oat01-different-2222")).not.toThrow();
+});
+
+test("adoptReplica ignores a STALE push rather than moving the member backwards", () => {
+  const s = tmpStore();
+  s.adoptReplica({ rev: 5, defaultId: "a", entries: [{ id: "a", label: "work", token: "sk-ant-oat01-new-5555", createdAt: 1 }] });
+  // A retry of an older rotation lands late — it must not resurrect the old roster.
+  expect(s.adoptReplica({ rev: 3, defaultId: "a", entries: [{ id: "a", label: "old", token: "sk-ant-oat01-old-3333", createdAt: 1 }] })).toBe(false);
+  expect(s.snapshot().rev).toBe(5);
+  expect(s.token("a")).toBe("sk-ant-oat01-new-5555");
+  // A newer push still applies.
+  expect(s.adoptReplica({ rev: 6, defaultId: "a", entries: [{ id: "a", label: "newer", token: "sk-ant-oat01-newer-6666", createdAt: 1 }] })).toBe(true);
+  expect(s.snapshot().rev).toBe(6);
+});
+
+test("a dangling defaultId doesn't strand every spawn with 'no token'", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-accounts-"));
+  writeFileSync(
+    join(dir, "accounts.json"),
+    JSON.stringify({ rev: 4, defaultId: "acct_ghost", role: "hub", accounts: [{ id: "acct_real", label: "work", token: "sk-ant-oat01-real-1111", createdAt: 1 }] }),
+  );
+  const s = new AccountStore(dir);
+  expect(s.defaultId()).toBe("acct_real");          // repointed, not left dangling
+  expect(s.token(undefined)).toBe("sk-ant-oat01-real-1111");
+});
+
+test("a corrupt roster is preserved for recovery, not silently discarded", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-accounts-"));
+  writeFileSync(join(dir, "accounts.json"), "{ truncated mid-writ");
+  const s = new AccountStore(dir);
+  expect(s.list()).toEqual([]);
+  expect(readdirSync(dir).some((f) => f.startsWith("accounts.json.corrupt-"))).toBe(true);
+});
+
+test("saves are atomic — no .tmp is left behind", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-accounts-"));
+  const s = new AccountStore(dir);
+  s.add("work", "sk-ant-oat01-workworkwork-1111");
+  expect(existsSync(join(dir, "accounts.json"))).toBe(true);
+  expect(existsSync(join(dir, "accounts.json.tmp"))).toBe(false);
 });
