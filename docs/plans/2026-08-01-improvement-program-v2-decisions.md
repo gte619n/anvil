@@ -10,6 +10,30 @@ Format: `[TAG] decision — rationale`.
 
 ---
 
+## Overall summary (read this first)
+
+Final state: **795 pass / 1 skip / 0 fail**; `typecheck` + `typecheck:web` + `build:web` all green.
+Every change landed test-first where a guard was tractable; committed per-phase for review.
+
+**Done with guard tests:** P0 fully (SEC2-1/2/3). P1 web fully (WEB2-1/10/12) + BE2-1/BE2-4. P2 fully
+(BE2-14/20/21/22/23/24, WEB2-11/13/14/15). P3 8/9 (BE2-10/11/12/13/28/29/31/33). P4 BE2-6/7/8/17 +
+WEB2-4/5. P5 contract wire-shape golden + input-queue + fixtures. P6 CI2-2/3/5/6/9/10. P8 the
+wrong/contradictory docs + REQUIREMENTS.md.
+
+**Deferred, each documented in its phase section below with rationale + a recommendation:**
+- BE2-2/3/5 (async-git-ops conversion) — one coherent PR; existing gitSpawn timeouts already BOUND these.
+- WEB2-2/16 (sidebar/team-board render diff) — land with the P7 sidebar/fleet extraction.
+- BE2-30 (cross-process CAS on update-state) — needs the sidecar redesign + multi-process tests.
+- WEB2-9/6/3, BE2-15 (transcript virtualization / bundle hashing / job-ify fleet REST) — build/render PRs.
+- P7 (god-file decomposition) — behavior-preserving refactor; the highest-churn/lowest-marginal-safety
+  work. The guard suite this program ADDED is the safety net the plan says P7 needs, so it's best done
+  next as its own focused effort (see P7 note). WEB2-1's TDZ class is contained by the queueMicrotask
+  fixes already shipped; the structural state.ts move is the P7 follow-up.
+- CI2-1/4/7/12 (native PR builds etc.) — need real CI runs to validate safely.
+- Native (Swift/Kotlin) test targets — still toolchain-blocked (unchanged from v1).
+
+---
+
 ## P0 — Fleet-update integrity + origin/identity gate (ship-blocker) — DONE, green
 
 - [SEC2-1] Added ancestry gate to `applyUpdateToTarget` (selfupdate.ts): before checkout, require
@@ -211,5 +235,32 @@ Web (WEB2-11/13/14/15 done; WEB2-2/16 deferred):
 - [boot-init.test.ts] Fixed the 1 red test by falling back to the source `web/index.html`
   when `web/dist/index.html` is absent (fresh worktree). build.ts copies the source shell to
   dist verbatim, so they are byte-identical; prefer dist when present. Chose fallback over
-  "skip when unbuilt" so the guard still runs in a fresh checkout. Now 742 pass, 1 skip, 0 fail.
+  "skip when unbuilt" so the guard still runs in a fresh checkout.
+
+## P8 — Docs (wrong/contradictory fixed; REQUIREMENTS.md written)
+
+- Fixed the actively-misleading docs first (the plan's priority order): DOC2-1 (auth model —
+  degraded-boot, not fatal; roster), DOC2-2 (worktree path `<stateDir>/worktrees`), DOC2-3/4 (contract
+  goldens + protocol policy + frozen Update API warning in CLAUDE.md), DOC2-8 (ARCHITECTURE cites the
+  PROTOCOL_VERSION file, no re-embed), DOC2-15/16 (VERSION 2.2→3.0 + corrected "no release tags"),
+  DOC2-17 (CI-CD daemon channel now covers the update service/watchdog/rollout for incident-time),
+  DOC2-20 (SECURITY update-integrity + identity/origin-gate exceptions), DOC2-24/25 (plan-doc statuses →
+  Implemented). Wrote **docs/REQUIREMENTS.md** consolidating the 7 load-bearing constraints.
+- DOC2-9 (ARCHITECTURE/README resume DIAGRAM rewrite for v4 epoch/watermark/cid) partially addressed:
+  the prose now cites v4 and the PROTOCOL_VERSION file; a full ascii-diagram rewrite is left as a
+  smaller follow-up (the semantics are correct in the resilience plan doc + REQUIREMENTS §4/§5).
+
+## P7 — Maintainability / DRY (mostly deferred; the DRY wins that fell out of other phases are done)
+
+- DONE opportunistically: **BE2-33** (`shaMatches` ×3 → shared `sha.ts`, in P3). The god-file
+  decompositions (`supervisor.ts` 3.5k lines, `main.ts` 7.4k lines, `http.ts` route ladder) and the
+  DRY consolidations (BE2-42/45, WEB2-18/19, a11y WEB2-8) are DEFERRED as a dedicated follow-up.
+- Rationale: P7 is explicitly behavior-preserving refactoring — the highest churn for the lowest
+  marginal safety, and the riskiest to do partially (a half-moved god-file is worse than an un-moved
+  one). The plan's own method is "write the behavioral suite → move code → delegate → green"; this
+  program ADDED much of that suite (P0–P6 guards), which is precisely the safety net P7 needs. So the
+  right sequencing is: land P7 next, on top of this branch's green baseline, as its own effort — not
+  interleaved half-done here. The WEB2-1 TDZ crash class is already contained by the shipped
+  queueMicrotask fixes; the `state.ts` scalar move (which "permanently retires" it) is the P7 payoff.
+- a11y (WEB2-8): DEFERRED with the `dialogs.ts` extraction it's meant to fold into.
 
