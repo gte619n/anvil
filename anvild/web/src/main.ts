@@ -5997,16 +5997,33 @@ function selectionEl(): Element | null {
   const el = node ? (node.nodeType === 1 ? (node as Element) : node.parentElement) : null;
   return el?.closest("#conversation, #panel-content") ?? null;
 }
-document.addEventListener("selectionchange", () => {
+// [WEB2-5] selectionchange fires rapidly during a drag; each handler did a layout read
+// (getBoundingClientRect) immediately followed by a style write — a forced synchronous reflow per event.
+// Coalesce to one read+write per animation frame.
+let selectionRaf = 0;
+function positionQuoteButton(): void {
+  selectionRaf = 0;
   const el = selectionEl();
   if (!el) {
     quoteBtn.style.display = "none";
     return;
   }
-  const rect = window.getSelection()!.getRangeAt(0).getBoundingClientRect();
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) {
+    quoteBtn.style.display = "none";
+    return;
+  }
+  const rect = sel.getRangeAt(0).getBoundingClientRect();
   quoteBtn.style.display = "block";
   quoteBtn.style.top = `${window.scrollY + rect.top - 36}px`;
   quoteBtn.style.left = `${window.scrollX + rect.left}px`;
+}
+document.addEventListener("selectionchange", () => {
+  if (selectionRaf || typeof requestAnimationFrame === "undefined") {
+    if (typeof requestAnimationFrame === "undefined") positionQuoteButton();
+    return;
+  }
+  selectionRaf = requestAnimationFrame(positionQuoteButton);
 });
 quoteBtn.addEventListener("mousedown", (e) => {
   e.preventDefault(); // keep the selection alive through the click
@@ -6105,17 +6122,34 @@ function mountTerminal(): void {
     if (activeId) sendTo(activeId, { type: "terminal.input", sessionId: activeId, data: strToB64(d) });
   });
   if (activeId) sendTo(activeId, { type: "terminal.open", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
+  // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
+  // Debounce ~100ms, and only send terminal.resize when the grid (cols/rows) actually changed — a repaint
+  // that doesn't alter the character grid shouldn't spam the daemon (which re-sizes the real PTY).
+  let lastCols = xterm.cols;
+  let lastRows = xterm.rows;
   termObs = new ResizeObserver(() => {
-    if (fit && xterm && activeId) {
+    if (termFitTimer) return;
+    termFitTimer = window.setTimeout(() => {
+      termFitTimer = 0;
+      if (!fit || !xterm || !activeId) return;
       fit.fit();
-      sendTo(activeId, { type: "terminal.resize", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
-    }
+      if (xterm.cols !== lastCols || xterm.rows !== lastRows) {
+        lastCols = xterm.cols;
+        lastRows = xterm.rows;
+        sendTo(activeId, { type: "terminal.resize", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
+      }
+    }, 100);
   });
   termObs.observe(panelContent);
 }
+let termFitTimer = 0;
 function disposeTerminal(): void {
   termObs?.disconnect();
   termObs = null;
+  if (termFitTimer) {
+    clearTimeout(termFitTimer);
+    termFitTimer = 0;
+  }
   xterm?.dispose();
   xterm = null;
   fit = null;
