@@ -114,6 +114,8 @@ import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside, writeFile } from "../fs/session-fs";
 import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
+import { UpdateStateStore } from "../daemon/update-state";
+import { updateApply, updateCheck, type UpdateApiDeps } from "../daemon/update-api";
 import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
 import { classifyBranchKind, heuristicKind } from "../agent/branch-kind";
@@ -236,6 +238,7 @@ export class Supervisor {
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
+  private readonly updateState: UpdateStateStore;
   /** Live model-tier labels (hub-refreshed from the Models API); empty until the first refresh lands. */
   private readonly modelLabels: ModelLabelStore;
   private modelLabelTimer?: ReturnType<typeof setInterval>;
@@ -306,6 +309,7 @@ export class Supervisor {
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
     this.promptStore = new PromptStore(cfg.stateDir);
+    this.updateState = new UpdateStateStore(cfg.stateDir);
     this.modelLabels = new ModelLabelStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
     this.workUnits = new WorkUnitStore(cfg.stateDir);
@@ -447,53 +451,43 @@ export class Supervisor {
 
   private updating = false; // guards against concurrent applyUpdate (double-click → racing builds)
 
+  /** Deps for the frozen update-API layer (stable-update-service spec §4.3). The legacy `daemon.update`
+   *  command now delegates here so it shares ONE code path with `/api/update/v1/*` — crucially, it
+   *  records the pre-pull SHA so the watchdog can roll a bad legacy-triggered update back too. */
+  private updateDeps(): UpdateApiDeps {
+    return { state: this.updateState, isManaged: selfupdate.isManaged, scheduleRestart: selfupdate.scheduleRestart };
+  }
+
   /** Update the daemon itself (arch §5): pull its source, rebuild web, and restart to apply.
-   *  `checkOnly` just fetches and reports whether an update is available. */
+   *  `checkOnly` just fetches and reports whether an update is available. Kept for back-compat (the
+   *  macOS menu command + native clients speak this); it delegates to the frozen v1 apply, mapping the
+   *  richer v1 phases back onto the legacy check|up-to-date|updated|error shape (spec §4.3). */
   async daemonUpdate(checkOnly: boolean): Promise<DaemonUpdateResultEvent> {
     const base = { v: PROTOCOL_VERSION, type: "daemon.update.result" as const, ts: now(), currentVersion: VERSION };
-    if (!checkOnly && this.updating) {
-      return { ...base, ok: false, phase: "error", output: "an update is already in progress" };
+    const deps = this.updateDeps();
+    if (checkOnly) {
+      const c = await updateCheck(deps);
+      if (!c.ok) return { ...base, ok: false, phase: "error", output: c.error ?? "update check failed" };
+      return { ...base, ok: true, phase: "check", output: c.output, behind: c.behind };
     }
+    if (this.updating) return { ...base, ok: false, phase: "error", output: "an update is already in progress" };
+    this.updating = true;
     try {
-      const chk = await selfupdate.checkForUpdate();
-      if (checkOnly) {
-        return { ...base, ok: true, phase: "check", output: chk.output, behind: chk.behind };
+      // No pinned SHA → resolve the upstream tip (the legacy "latest on branch" behaviour).
+      const r = await updateApply({}, deps);
+      // v1 "restarting" ⇒ an update (or stale-process restart) is being applied; a restart is now
+      // SCHEDULED (a ~1s setTimeout), so DELIBERATELY keep `updating` set — clearing it here would let a
+      // second daemon.update slip in during that window and schedule a redundant second kickstart. The
+      // guard is released for free when the process dies on restart.
+      if (r.ok && r.phase === "restarting") {
+        return { ...base, ok: true, phase: "updated", output: r.output, willRestart: r.willRestart };
       }
-      // The on-disk checkout is already current with the remote, but the LIVE process is stale (a prior
-      // update pulled new source and its restart never landed). No pull/rebuild needed — just restart
-      // onto the code already on disk. Without this, "up to date" would no-op forever on a stale process.
-      if (chk.behind === 0 && chk.needsRestart) {
-        if (selfupdate.isManaged()) {
-          selfupdate.scheduleRestart();
-          return { ...base, ok: true, phase: "updated", output: chk.output, willRestart: true };
-        }
-        return {
-          ...base,
-          ok: true,
-          phase: "updated",
-          output: `${chk.output}\n\nNot running under the launchd/systemd service — restart the daemon manually to apply.`,
-          willRestart: false,
-        };
-      }
-      if (chk.behind === 0) {
-        return { ...base, ok: true, phase: "up-to-date", output: chk.output, behind: 0 };
-      }
-      this.updating = true;
-      const upd = await selfupdate.applyUpdate();
-      if (selfupdate.isManaged()) {
-        selfupdate.scheduleRestart();
-        return { ...base, ok: true, phase: "updated", output: upd.output, willRestart: true };
-      }
-      this.updating = false; // no restart coming — allow another attempt
-      return {
-        ...base,
-        ok: true,
-        phase: "updated",
-        output: `${upd.output}\n\nNot running under the launchd service — restart the daemon manually to apply.`,
-        willRestart: false,
-      };
-    } catch (e) {
+      // No restart coming (up-to-date, error, or unmanaged) — release the guard so another attempt works.
       this.updating = false;
+      if (!r.ok) return { ...base, ok: false, phase: "error", output: r.error ?? r.output };
+      return { ...base, ok: true, phase: "up-to-date", output: r.output, behind: 0 };
+    } catch (e) {
+      this.updating = false; // updateApply shouldn't reject, but never leave the guard stuck on a throw
       return { ...base, ok: false, phase: "error", output: e instanceof Error ? e.message : String(e) };
     }
   }

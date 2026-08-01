@@ -13,6 +13,7 @@
  *   • systemd  — `systemctl --user restart`: deterministic kill + respawn (Restart=always would
  *     also respawn a clean exit, but the explicit restart matches launchd's semantics).
  */
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { GIT_ENV } from "../git/spawn";
 import { VERSION } from "../version";
@@ -22,7 +23,7 @@ const SERVICE_LABEL = "com.anvil.anvild";
 
 /** The short SHA the RUNNING process was built from — captured once at startup in version.ts (the part
  *  after `+` in VERSION). Empty when git wasn't reachable at startup. */
-function runningSha(): string {
+export function runningSha(): string {
   const i = VERSION.indexOf("+");
   return i >= 0 ? VERSION.slice(i + 1) : "";
 }
@@ -189,6 +190,121 @@ export async function applyUpdate(run: CommandRunner = runDefault): Promise<{ ou
   if (typecheck.code !== 0) throw new Error(`typecheck failed — refusing to restart onto a broken tree:\n${typecheck.out}`);
 
   return { output: log.join("\n\n") };
+}
+
+// ── Frozen update API v1 building blocks (stable-update-service spec §4.3) ─────────────────────────
+// These are the pinned-target + rollback primitives the frozen `/api/update/v1/*` surface and the
+// watchdog are built from. They reuse the same injectable CommandRunner as the flow above so they're
+// unit-testable without spawning real git.
+
+/** The current on-disk HEAD short SHA (what a fresh boot would report as its running SHA). */
+export async function headSha(run: CommandRunner = runDefault): Promise<string> {
+  const root = await repoRoot(run);
+  return (await run(["git", "log", "-1", "--format=%h"], root)).out.trim();
+}
+
+/** Resolve the SHA the daemon should converge to: the commit the upstream ref (@{u} → origin/HEAD)
+ *  currently points at. This is what a hub pins ONCE and hands to every member so the whole fleet lands
+ *  on the identical build even if new commits arrive mid-rollout (spec D13). */
+export async function resolveTargetSha(run: CommandRunner = runDefault): Promise<string> {
+  const root = await repoRoot(run);
+  await run(["git", "fetch", "--quiet"], root);
+  const ref = await resolveUpdateRef(run, root);
+  const r = await run(["git", "rev-parse", "--short", ref], root);
+  if (r.code !== 0) throw new Error(`could not resolve target ${ref}: ${r.out || `exit ${r.code}`}`);
+  return r.out.trim();
+}
+
+/**
+ * Update the checkout to an EXPLICIT target SHA (spec D13), capturing the pre-pull SHA first so a
+ * failed boot can be rolled back (spec D8). Mirrors {@link applyUpdate}'s pull→install→build→typecheck
+ * safety, but checks out a pinned commit rather than fast-forwarding to a moving branch tip — so every
+ * member a hub fans out to lands on the same build. `recordPrePull(sha)` is invoked with the captured
+ * HEAD before anything mutates the tree; the caller persists it (UpdateStateStore).
+ *
+ * Refuses to move to a target that isn't an ancestor-or-descendant fast-forward from HEAD unless
+ * `allowNonFastForward` (used only by rollback, which resets backwards). Local commits / a dirty tree
+ * make `git checkout` fail loudly and are never clobbered.
+ */
+export async function applyUpdateToTarget(
+  targetSha: string,
+  opts: { run?: CommandRunner; recordPrePull?: (sha: string) => void } = {},
+): Promise<{ output: string; prePullSha: string; targetSha: string }> {
+  const run = opts.run ?? runDefault;
+  const root = await repoRoot(run);
+  const log: string[] = [];
+
+  const before = (await run(["git", "rev-parse", "--short", "HEAD"], root)).out.trim();
+  opts.recordPrePull?.(before);
+
+  await run(["git", "fetch", "--quiet"], root);
+  // Reset to the exact target. --hard so a partially-applied prior attempt (e.g. a build that swapped
+  // some files) can't wedge the checkout; local commits are surfaced by the pre-flight guard below.
+  const dirty = (await run(["git", "status", "--porcelain"], root)).out.trim();
+  if (dirty) throw new Error(`refusing to update onto a dirty working tree:\n${dirty}`);
+  const checkout = await run(["git", "checkout", "--detach", targetSha], root);
+  log.push(`$ git checkout --detach ${targetSha}\n${checkout.out}`);
+  if (checkout.code !== 0) throw new Error(`git checkout ${targetSha} failed:\n${checkout.out}`);
+
+  // Past this point HEAD has MOVED to the target. Unlike applyUpdate's `pull --ff-only` (which fails
+  // atomically before moving HEAD), a failed install/build/typecheck here would otherwise leave the
+  // broken target checked out on disk with nothing armed to roll it back — a later restart would then
+  // boot the broken build. So restore the pre-pull SHA on ANY post-checkout failure before rethrowing.
+  try {
+    const after = (await run(["git", "rev-parse", "--short", "HEAD"], root)).out.trim();
+    const changed = before ? (await run(["git", "diff", "--name-only", `${before}..${after}`], root)).out : "";
+    const depsChanged = !before || /(^|\/)(package\.json|bun\.lockb?)$/m.test(changed);
+    if (depsChanged) {
+      const install = await run(["bun", "install"], anvildDir);
+      log.push(`$ bun install\n${install.out}`);
+      if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
+    } else {
+      log.push("(dependencies unchanged — skipping bun install)");
+    }
+
+    let build = await run(["bun", "run", "build:web"], anvildDir);
+    log.push(`$ bun run build:web\n${build.out}`);
+    if (build.code !== 0 && !depsChanged) {
+      const install = await run(["bun", "install"], anvildDir);
+      log.push(`(build failed — running bun install and retrying)\n$ bun install\n${install.out}`);
+      if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
+      build = await run(["bun", "run", "build:web"], anvildDir);
+      log.push(`$ bun run build:web\n${build.out}`);
+    }
+    if (build.code !== 0) throw new Error(`web build failed:\n${build.out}`);
+
+    const typecheck = await run(["bun", "run", "typecheck"], anvildDir);
+    log.push(`$ bun run typecheck\n${typecheck.out}`);
+    if (typecheck.code !== 0) throw new Error(`typecheck failed — refusing to restart onto a broken tree:\n${typecheck.out}`);
+  } catch (e) {
+    if (before) await run(["git", "reset", "--hard", before], root); // leave disk on the known-good SHA
+    throw e;
+  }
+
+  return { output: log.join("\n\n"), prePullSha: before, targetSha };
+}
+
+/** Roll the checkout back to a known-good SHA and rebuild (spec D4/D8). Used by the watchdog when a
+ *  freshly-updated daemon fails its health/smoke gate. Best-effort rebuild: even if the rebuild fails
+ *  we've at least restored the good SOURCE, which the next boot re-reads; the caller restarts after. */
+export async function rollbackTo(sha: string, run: CommandRunner = runDefault): Promise<{ output: string }> {
+  const root = await repoRoot(run);
+  const log: string[] = [];
+  const reset = await run(["git", "reset", "--hard", sha], root);
+  log.push(`$ git reset --hard ${sha}\n${reset.out}`);
+  if (reset.code !== 0) throw new Error(`rollback git reset --hard ${sha} failed:\n${reset.out}`);
+  const install = await run(["bun", "install"], anvildDir);
+  log.push(`$ bun install\n${install.out}`);
+  const build = await run(["bun", "run", "build:web"], anvildDir);
+  log.push(`$ bun run build:web\n${build.out}`);
+  return { output: log.join("\n\n") };
+}
+
+/** Boot smoke (spec D14): is the built web bundle present and servable? A daemon that's up but can't
+ *  serve the app is NOT healthy and must be rolled back. `webDir` defaults to the packaged/dev location
+ *  the http server serves from. */
+export function webBundleOk(webDir: string = process.env.ANVIL_WEB_DIR || join(anvildDir, "web", "dist")): boolean {
+  return existsSync(join(webDir, "index.html"));
 }
 
 /** Restart via the host's service manager after a short delay (so the result event flushes first).
