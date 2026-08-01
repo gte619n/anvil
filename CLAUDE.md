@@ -16,6 +16,16 @@ Tailscale. Start with [`README.md`](README.md) for the product overview and
 | `docs/` | `ARCHITECTURE.md`, `plans/` (design docs + the wire protocol `anvil-protocol.ts`), and the improvement program (`plans/anvil-improvement-program.md`). |
 | `scripts/`, `anvild/scripts/` | Build/release/signing + service management (`service.sh`, `merge-session.sh`). |
 
+**Session supervisor (`anvild/src/session/supervisor.ts`) is being decomposed into domain services**
+(behavior-preserving; see the P7 section of `docs/plans/2026-08-01-improvement-program-v2-decisions.md`).
+The supervisor still owns session lifecycle + the WS event fan-out, but delegates cohesive domains to
+injected-deps modules in `src/session/`: `integrations-facade.ts` (Todoist/lapo), `account-roster-service.ts`
+(multi-account roster), `environment-service.ts` (project CRUD/clone/README), `git-projection-service.ts`
+(git status + PR badges/sweep). Each has a `*Deps` interface documenting exactly what supervisor state it
+touches, and a `*-service.test.ts` guard. `BadCommand` lives in `src/session/errors.ts`. Teams and
+autopilot remain in `supervisor.ts` (next to be extracted). When adding to one of these domains, edit the
+service, not the supervisor's thin delegation.
+
 The wire protocol is the source of truth for daemon↔client contracts:
 `docs/plans/anvil-protocol.ts` (symlinked as `anvild/protocol.ts`, imported as `@protocol`;
 `PROTOCOL_VERSION` is currently **4**). Two contract tests in `anvild/test/contract/` guard it:

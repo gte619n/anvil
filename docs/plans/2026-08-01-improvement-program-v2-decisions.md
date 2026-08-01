@@ -3,6 +3,19 @@
 Running log of decisions made during autonomous implementation of
 `2026-08-01-improvement-program-v2.md`. Reviewed after implementation.
 
+## Current status (2026-08-01)
+
+- **P0–P6 + P8: merged to `main`.** The main program shipped as PR #168 (squash `26218c4`); the
+  post-merge interview decisions (SEC2-3 loopback allowance, BE2-31 always-restart) shipped as PR #174
+  (squash `875a524`). Full detail in the per-phase sections below + the "Post-merge interview outcomes".
+- **P7 (god-file decomposition): IN PROGRESS on branch `refactor/godfile-decomp` (not yet merged).**
+  Four Supervisor domains extracted into injected-deps modules, each behavior-preserving with the full
+  suite green + a new guard test: `IntegrationsFacade`, `AccountRosterService`, `EnvironmentService`,
+  `GitProjectionService`. `supervisor.ts` 3604 → 3213 (−391). Remaining: TeamCoordinator, AutopilotService,
+  the `http.ts` route table, and the web `main.ts` seams. See the P7 section immediately below.
+- **Documented deferrals** (own follow-up PRs, each with rationale): async-git-ops (BE2-2/3/5/15),
+  BE2-30 cross-process CAS, WEB2-2/3/6/9/16, CI2-1/4/7/12, and native Swift/Kotlin test targets.
+
 ## P7 — God-file decomposition (in progress, branch `refactor/godfile-decomp`)
 
 Method (proven from v1 Phase 3): move a cohesive domain into its own module with its Supervisor deps
