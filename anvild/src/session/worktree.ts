@@ -312,7 +312,15 @@ export function gitStatus(cwd: string): GitStatus | undefined {
     ahead = parts[1] ?? 0;
   }
 
-  const diffstat = git(["diff", "--stat"], cwd).stdout.split("\n").filter((l) => l.trim().length > 0);
+  // [BE2-22] Cap the diffstat: a huge tree (thousands of changed files, e.g. a lockfile/generated-code
+  // churn) otherwise rode every session.updated broadcast AND every debounced full-registry write. Keep
+  // the first ~200 lines and append a one-line summary of the remainder rather than the whole array.
+  const DIFFSTAT_CAP = 200;
+  const allStat = git(["diff", "--stat"], cwd).stdout.split("\n").filter((l) => l.trim().length > 0);
+  const diffstat =
+    allStat.length > DIFFSTAT_CAP
+      ? [...allStat.slice(0, DIFFSTAT_CAP), `… (+${allStat.length - DIFFSTAT_CAP} more files)`]
+      : allStat;
 
   return { branch: branch.stdout.trim(), ahead, behind, dirtyFileCount: dirty.length, diffstat };
 }

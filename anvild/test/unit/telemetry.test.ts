@@ -43,3 +43,36 @@ test("noteServerCounter + recordClientTelemetry aggregate into the snapshot", ()
   expect(snap.clients.client_B).toEqual({ reconnects: 1 });
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("[BE2-23/SEC2-4] the client-telemetry map is LRU-capped at 50 (no unbounded growth / DoS)", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  for (let i = 0; i < 5000; i++) sup.recordClientTelemetry(`client_${i}`, { reconnects: i });
+  const snap = sup.telemetrySnapshotEvent();
+  expect(Object.keys(snap.clients).length).toBeLessThanOrEqual(50);
+  // LRU: the most-recent ids survive, the oldest were evicted.
+  expect(snap.clients.client_4999).toEqual({ reconnects: 4999 });
+  expect(snap.clients.client_0).toBeUndefined();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("[BE2-23/SEC2-4] malformed reports are ignored (bad id, non-object, non-finite, key flood)", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  sup.recordClientTelemetry("", { a: 1 }); // empty id → rejected
+  sup.recordClientTelemetry("x".repeat(500), { a: 1 }); // oversized id → rejected
+  sup.recordClientTelemetry("bad_shape", [] as unknown as Record<string, number>); // array → rejected
+  sup.recordClientTelemetry("bad_shape", 42 as unknown as Record<string, number>); // non-object → rejected
+  const flood: Record<string, number> = {};
+  for (let i = 0; i < 100; i++) flood[`k${i}`] = i;
+  sup.recordClientTelemetry("flooder", flood); // >32 keys → whole report ignored
+  // A valid report with some junk values keeps only the finite numbers.
+  sup.recordClientTelemetry("client_ok", { good: 3, bad: NaN as number, inf: Infinity as number, s: "no" as unknown as number });
+
+  const snap = sup.telemetrySnapshotEvent();
+  expect(snap.clients[""]).toBeUndefined();
+  expect(snap.clients.bad_shape).toBeUndefined();
+  expect(snap.clients.flooder).toBeUndefined();
+  expect(snap.clients.client_ok).toEqual({ good: 3 }); // NaN/Infinity/string dropped
+  rmSync(dir, { recursive: true, force: true });
+});

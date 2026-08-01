@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { rest } from "@protocol";
+import { writeFileAtomic } from "../util/atomic";
 
 /**
  * The hub's record of the Macs it has paired into the fleet (anvil-server-app.md §6), persisted to
@@ -43,6 +44,8 @@ export class FleetStore {
     }
   }
   private save(): void {
-    writeFileSync(this.file, JSON.stringify({ members: this.members }, null, 2));
+    // [BE2-14] Atomic write: a torn `fleet.json` on the documented restart-storm box would zero the
+    // fleet roster (fleet amnesia). rename-over-target is all-or-nothing.
+    writeFileAtomic(this.file, JSON.stringify({ members: this.members }, null, 2));
   }
 }
