@@ -22,9 +22,16 @@ environment fallback on removal). Wide but EXPLICIT `AccountRosterDeps` interfac
 **Slice 3 — DONE:** `EnvironmentService` (`src/session/environment-service.ts`). Environment CRUD + git-URL
 clone + README render. Low-coupling. supervisor.ts 3358 → 3339. Guard: `environment-service.test.ts`.
 
-All three: full suite green (804 tests, 0 fail), pushed to `refactor/godfile-decomp`.
+**Slice 4 — DONE:** `GitProjectionService` (`src/session/git-projection-service.ts`). Git projection +
+PR-badge domain (gitOp status/diff/commit/push/create-pr/merge-pr, remote-branch resolution, refreshGit,
+refreshPrState + refreshAllPrStates sweep). Deps injected (require/getSession/sessions + persist +
+broadcastUpdated). Natural home for the deferred BE2-2/3/5 async-git conversion. supervisor.ts 3339 →
+3213. Guard: `git-projection-service.test.ts`.
 
-**Remaining slices (the higher-coupling / higher-value beasts — each deserves its own focused slice):**
+All four: full suite green (807 tests, 0 fail), pushed to `refactor/godfile-decomp`.
+**supervisor.ts 3604 → 3213 (-391) across four named, independently-tested modules.**
+
+**Remaining slices (the two tightly session-coupled beasts — each deserves its own focused slice):**
 1. **TeamCoordinator** — team orchestration (buildTeamServer/buildMemberServer MCP tool closures,
    teamMessage relay, plan lifecycle, spawnMember/teamCreateMember which CREATE sessions,
    drainQueuedMembers called from kill(), integrateTeam). Owns supervisor fields (queuedMembers,
@@ -32,17 +39,16 @@ All three: full suite green (804 tests, 0 fail), pushed to `refactor/godfile-dec
    most delicate injection surface. Safety net: team-gate + team integration tests.
 2. **AutopilotService** (+ its 5-min scheduler) — the largest domain (~1000 lines: plans, runAutopilot,
    runDevPipeline, schedule, reconcile, postAutopilotReport). Biggest win, highest care.
-3. **GitProjection/PrSweeper** — refreshGit/refreshPrState/gitOp/startPrStateSweeper; natural home for the
-   deferred BE2-2/3/5 async-git conversion, so pair those.
-4. **http.ts** route ladder → method+prefix route table + top-level try/catch→500 (kills the BE2-10
+3. **http.ts** route ladder → method+prefix route table + top-level try/catch→500 (kills the BE2-10
    crash-500 class) + a `withJsonBody` helper. DRY: BE2-45 `ackWhenDone`.
-5. **Web** (`main.ts` 7600 lines): extract `fleet.ts`/`sidebar.ts`/`conversation.ts`/`autopilot.ts`/etc.
+4. **Web** (`main.ts` 7600 lines): extract `fleet.ts`/`sidebar.ts`/`conversation.ts`/`autopilot.ts`/etc.
    in dependency order, each carrying its shared scalars into `state.ts` — permanently retires the WEB2-1
    TDZ class. Fold WEB2-2/16 render-diffs + WEB2-8 a11y into the relevant seams.
 
-The three easy/clean peripheral domains are now done. The remainder are the tightly session-coupled
-domains; each is a substantial slice best landed + reviewed on its own (create/kill/prompt injection for
-teams; the scheduler + report posting for autopilot). Pattern is proven — continue one careful slice at a time.
+The clean/medium-coupling domains are now done (integrations, accounts, environments, git-projection).
+Teams + autopilot are the deeply session-coupled remainder — each a substantial slice with a wide
+injection surface (create/kill/prompt for teams; scheduler + report posting for autopilot). Pattern is
+proven; continue one careful slice at a time.
 
 RATIONALE for pacing: this is behavior-preserving refactoring of critical infrastructure. Each slice is
 landed and verified independently rather than batched, so a subtle regression is caught (and reviewable)
