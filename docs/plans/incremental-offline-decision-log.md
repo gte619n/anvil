@@ -234,3 +234,32 @@ A skeptical review of the full diff surfaced three triggerable defects, all now 
 Everything the review checked and passed (delta-onto-empty-pane guard, cache-before-deltas ordering,
 dual-order cid reconcile, server dedupe placement, epoch round-trip, convoCache index/IDB divergence)
 is recorded as correct. Post-fix: **700 pass / 0 fail**, both typechecks + web build green.
+
+---
+
+## HOTFIX (post-deploy) — 3.0.33 "dead app" for returning users
+
+**Symptom:** 3.0.33 came up but showed no servers/environments and the wrong theme.
+
+**Root cause:** the skeleton-first change made the top-level "instant restore" call
+`loadConversation(activeId)` → `clearConversation()`, which touches `permCards`/`questionCards` — consts
+declared ~6300 lines below and therefore in their **temporal dead zone** during synchronous module init.
+Init threw for **every returning user (activeId set)**, aborting before theme/socket/server-load. This is
+the exact "declare-up-top rule" the codebase documents (memory: web-early-init-decl-order-crash).
+
+**Why every gate was green:** typecheck/build never *execute* init, and all tests + my Chrome/jsdom
+repros used a FRESH profile (no `activeId`) → they took the `renderEmptyState` branch and never reached
+the crashing path. The bug only triggers with a persisted open session.
+
+**Fixes:**
+- **[H1] Defer the init conversation load** — `queueMicrotask(() => loadConversation(activeId))` so it runs
+  after synchronous module init completes and every const it reaches is initialized.
+- **[H2] Quota safety** — an upgraded app can have localStorage near full of old `anvil.convo.*` blobs;
+  moved `migrateLegacyConvoCache()` to run FIRST (frees that quota) and wrapped the new `clientId`
+  `localStorage.setItem` in try/catch so a full quota can never abort init.
+- **[H3] Regression test** — `test/web/boot-init.test.ts` builds the real bundle and boots it under node+
+  jsdom with a returning user's state (saved theme + activeId); asserts no init throw + theme applied.
+  Verified it FAILS with the fix reverted and PASSES with it — closing the fresh-install-only test gap.
+
+**Lesson:** any code added to the top-level init chain must obey the declare-up-top rule; the boot test
+now guards the returning-user path that all prior coverage missed.
