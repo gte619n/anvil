@@ -1,5 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import type { rest, PermissionDecision } from "@protocol";
+import { UPDATE_API_VERSION } from "@protocol";
 import { AccountStore, resolveAuthStatus } from "../auth/accounts";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
@@ -22,6 +23,11 @@ import { setOpenRouterKey } from "../auth/openrouter";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
+import { UpdateStateStore } from "../daemon/update-state";
+import { updateApply, updateCheck, updateStatus, settleAfterBoot, type UpdateApiDeps } from "../daemon/update-api";
+import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
+import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } from "./fleet-rollout";
+import { resolveTargetSha } from "../daemon/selfupdate";
 import { FileExists } from "../fs/session-fs";
 import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
@@ -208,6 +214,29 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     registry,
   );
+
+  // Frozen update API v1 (stable-update-service spec §4.3). The state store persists the pre-pull SHA +
+  // phase across the very restart it coordinates; `settleAfterBoot` is the in-daemon half of the
+  // resilience model — if we just came up on the target build with a servable bundle, mark the update
+  // healthy and adopt this SHA as the new known-good.
+  const updateState = new UpdateStateStore(opts.stateDir);
+  const updateDeps: UpdateApiDeps = { state: updateState, webDir: WEB_DIR, isManaged, scheduleRestart };
+  settleAfterBoot(updateDeps);
+
+  // Hub-orchestrated fleet rollout (spec §4.4): pins one SHA, fans it out to reachable members over the
+  // frozen API, updates the hub itself last. The desired target persists so a member that was offline is
+  // reconciled when it reconnects.
+  const fleetRollout = new FleetRolloutCoordinator({
+    self: { serverId: identity.serverId, serverName: identity.serverName },
+    members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName, url: m.url })),
+    resolveTargetSha: () => resolveTargetSha(),
+    applySelf: async (targetSha) => {
+      const r = await updateApply({ targetSha }, updateDeps);
+      return { ok: r.ok, error: r.error };
+    },
+    client: httpMemberUpdateClient(),
+    desired: new DesiredTargetStore(opts.stateDir),
+  });
 
   // The bundled native clients serve their UI from a local origin and call the daemon's REST API
   // cross-origin, so /api/* needs permissive CORS. (The daemon is Tailscale-gated; no cookies are
@@ -465,8 +494,27 @@ export function createServer(opts: ServerOptions): ServerHandle {
           // Deliberately NOT included: this window's arm-state, which would broadcast an open
           // credential window to the whole tailnet (HJ-9).
           capabilities: [...SERVER_CAPABILITIES],
+          // Frozen update API version + boot smoke result. A hub reads updateApiVersion off health
+          // (discovery is REST) to route this member through the stable path; the watchdog polls
+          // health and treats webBundleOk:false as NOT-healthy (spec §4.3/D14).
+          updateApiVersion: UPDATE_API_VERSION,
+          webBundleOk: webBundleOk(WEB_DIR),
         };
         return Response.json(body);
+      }
+
+      // ── Frozen update API v1 (stable-update-service spec §4.3) ────────────────────────────────────
+      // GET check (no mutation), POST apply (pull to a pinned target + restart), GET status (observe).
+      if (url.pathname === "/api/update/v1/check" && req.method === "GET") {
+        return Response.json(await updateCheck(updateDeps));
+      }
+      if (url.pathname === "/api/update/v1/apply" && req.method === "POST") {
+        const bodyReq = (await req.json().catch(() => ({}))) as rest.update.ApplyRequest;
+        const result = await updateApply({ targetSha: bodyReq.targetSha }, updateDeps);
+        return Response.json(result, { status: result.ok ? 200 : 500 });
+      }
+      if (url.pathname === "/api/update/v1/status" && req.method === "GET") {
+        return Response.json(updateStatus(updateDeps));
       }
 
       // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
@@ -752,6 +800,20 @@ export function createServer(opts: ServerOptions): ServerHandle {
         const results = await pushRosterToMembers();
         return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
       }
+      // Hub-orchestrated fleet update (spec §4.4). Same identity posture as /api/fleet/rotate — a
+      // fleet-wide mutating action, so reject a PROVEN other tailnet user but stay permissive when
+      // identity is unprovable (whois momentarily down) rather than fail an operator intermittently.
+      if (url.pathname === "/api/fleet/update" && req.method === "POST") {
+        const who = await callerIdentity();
+        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+        const bodyReq = (await req.json().catch(() => ({}))) as rest.FleetUpdateRequest;
+        const result = await fleetRollout.start({ targetSha: bodyReq.targetSha });
+        return Response.json(result satisfies rest.FleetUpdateResponse, { status: result.ok ? 200 : 409 });
+      }
+      if (url.pathname === "/api/fleet/update/status" && req.method === "GET") {
+        return Response.json(fleetRollout.status() satisfies rest.FleetUpdateStatusResponse);
+      }
+
       const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);
       if (memberMatch && req.method === "DELETE") {
         fleet.remove(decodeURIComponent(memberMatch[1]!));

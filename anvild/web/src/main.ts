@@ -67,6 +67,7 @@ import type {
   TeamInfo,
   TeamPlan,
   TodoistProjectInfo,
+  rest,
 } from "../../protocol";
 import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
@@ -4619,7 +4620,8 @@ function renderServerCards(): void {
   host.innerHTML =
     `<div class="section-head"><h3>${icon("hub")} Fleet</h3><div class="git-row">` +
     (originOwnsRoster
-      ? `<button id="fleet-rotate" class="mini" title="Push the current login and Claude accounts to every machine in the fleet">${icon("autorenew")} Sync now</button>`
+      ? `<button id="fleet-rotate" class="mini" title="Push the current login and Claude accounts to every machine in the fleet">${icon("autorenew")} Sync now</button>` +
+        `<button id="fleet-update" class="mini" title="Update every machine in the fleet to one pinned build (members first, this hub last)">${icon("system_update_alt")} Update fleet</button>`
       : "") +
     `<button id="fleet-add" class="mini primary">${icon("add")} Add a machine</button>` +
     `</div></div>` +
@@ -4628,6 +4630,7 @@ function renderServerCards(): void {
         ? "Every machine here shares this server's Claude login."
         : "This machine is part of another Mac's fleet and shares <b>its</b> Claude login."
     } Update each one's Anvil on its own card; remove one to stop using it from this device.</p>` +
+    `<div id="fleet-rollout-status"></div>` +
     list.map(serverCardHtml).join("");
   for (const srv of list) {
     wireDaemonUpdate(srv); // each card's "Update Anvil" targets that server's own daemon
@@ -4637,6 +4640,8 @@ function renderServerCards(): void {
   }
   document.getElementById("fleet-add")?.addEventListener("click", () => showAddMac());
   document.getElementById("fleet-rotate")?.addEventListener("click", () => void rotateFleetToken());
+  document.getElementById("fleet-update")?.addEventListener("click", () => void startFleetUpdate());
+  if (fleetRolloutPoll !== null) void pollFleetRolloutOnce(); // re-hydrate an in-flight rollout into the freshly rendered container
   void loadFleetMembers(); // cache host→serverId (so Remove also ejects from the fleet) + adopt any member this device hasn't connected to
   void maybeRenderRepairCard(host); // this-machine "get a join code" — only when it's already in a fleet
   maybeRenderAdoptHubCard(host); // "this Mac is part of <hub>'s fleet" — offers to connect to the roster owner
@@ -4725,6 +4730,101 @@ async function rotateFleetToken(): Promise<void> {
     // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
     // failure above, not an exception, so this message must not be used for that case.
     toast("Couldn't reach this machine's own daemon to start the sync.");
+  }
+}
+
+// ── Fleet update (pinned rollout) ────────────────────────────────────────────
+// One pinned build fans out to every member first, then this hub updates itself last. All calls hit
+// the HUB daemon (apiFetch). Progress is polled from /api/fleet/update/status until the rollout ends.
+let fleetRolloutPoll: ReturnType<typeof setInterval> | null = null;
+
+/** Human labels + presentation class for each member rollout state (protocol `rest.FleetRolloutMemberState`). */
+function rolloutStateLabel(state: rest.FleetRolloutMemberState): string {
+  switch (state) {
+    case "pending":
+      return "pending";
+    case "pending-offline":
+      return "offline — will reconcile";
+    case "legacy":
+      return "updating (legacy)";
+    case "updating":
+      return "updating…";
+    case "healthy":
+      return "healthy";
+    case "rolled-back":
+      return "rolled back";
+    case "error":
+      return "error";
+    default:
+      return String(state);
+  }
+}
+
+/** Render one rollout status snapshot into #fleet-rollout-status. `rolled-back` is called out as a warning. */
+function renderRolloutStatus(status: rest.FleetUpdateStatusResponse): void {
+  const host = document.getElementById("fleet-rollout-status");
+  if (!host) return;
+  const shortSha = status.targetSha ? esc(status.targetSha.slice(0, 8)) : "(pending)";
+  const rows = status.members
+    .map((m) => {
+      const rolledBack = m.state === "rolled-back";
+      const healthy = m.state === "healthy";
+      const failed = m.state === "error";
+      const dotIcon = rolledBack || failed ? icon("warning") : healthy ? icon("check") : icon("sync");
+      const rowClass = rolledBack || failed ? " warn-text" : "";
+      const hubTag = m.isHub ? ` <span class="small muted">(this hub — last)</span>` : "";
+      const detail = m.detail ? ` <span class="small muted">— ${esc(m.detail)}</span>` : "";
+      return `<div class="git-row${rowClass}" style="gap:6px;align-items:center">${dotIcon}<b>${esc(m.serverName)}</b>${hubTag} <span class="small">${esc(rolloutStateLabel(m.state))}</span>${detail}</div>`;
+    })
+    .join("");
+  let footer = "";
+  if (!status.active) {
+    const healthyN = status.members.filter((m) => m.state === "healthy").length;
+    const rolledN = status.members.filter((m) => m.state === "rolled-back").length;
+    footer = `<div class="small muted" style="margin-top:6px">Fleet update complete — ${healthyN} healthy, ${rolledN} rolled back.</div>`;
+  }
+  host.innerHTML = `<div class="card" style="margin-bottom:10px">
+    <div class="card-main">${icon("system_update_alt")} <b>Fleet update</b> <span class="small muted">→ <code>${shortSha}</code></span></div>
+    ${rows}
+    ${footer}
+  </div>`;
+}
+
+/** One poll tick: read the rollout status, render it, and stop the poller once the rollout is no longer active. */
+async function pollFleetRolloutOnce(): Promise<void> {
+  try {
+    const status = (await (await apiFetch("/api/fleet/update/status")).json()) as rest.FleetUpdateStatusResponse;
+    renderRolloutStatus(status);
+    if (!status.active && fleetRolloutPoll !== null) {
+      clearInterval(fleetRolloutPoll);
+      fleetRolloutPoll = null;
+    }
+  } catch {
+    // Transient hub hiccup — keep the interval alive; the next tick retries.
+  }
+}
+
+/** Kick off a pinned fleet rollout (members first, this hub last), then poll progress until it ends. */
+async function startFleetUpdate(): Promise<void> {
+  const origin = hub();
+  if (origin?.role === "member") {
+    toast("This Mac isn't the hub — start a fleet update from the hub instead.");
+    return;
+  }
+  if (!confirm("Update every machine in the fleet to one pinned build? Members update first, then this hub last.")) return;
+  toast("Starting fleet update…");
+  try {
+    const r = (await (await apiFetch("/api/fleet/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) })).json()) as rest.FleetUpdateResponse;
+    if (!r.ok) {
+      toast(`Couldn't start the fleet update${r.error ? ` — ${r.error}` : ""}.`);
+      return;
+    }
+    // Paint the initial snapshot immediately, then poll for progress. Guard against overlapping pollers.
+    renderRolloutStatus({ ok: true, active: true, targetSha: r.targetSha, members: r.members });
+    if (fleetRolloutPoll !== null) clearInterval(fleetRolloutPoll);
+    fleetRolloutPoll = setInterval(() => void pollFleetRolloutOnce(), 2000);
+  } catch {
+    toast("Couldn't reach this machine's own daemon to start the fleet update.");
   }
 }
 

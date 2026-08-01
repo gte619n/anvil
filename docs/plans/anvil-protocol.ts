@@ -49,6 +49,18 @@
 export const PROTOCOL_VERSION = 3 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
+/**
+ * Version of the FROZEN update API surface (`/api/update/v1/*`), on its OWN axis independent of
+ * PROTOCOL_VERSION (stable-update-service spec §4.3, D12). This surface is the one a hub and a
+ * partially-updated fleet call to coordinate updates, so it must stay stable across daemon releases
+ * that freely change everything else. Compatibility rule: fields are only ever ADDED, never
+ * renamed/removed/retyped; a genuinely breaking change ships under a new path namespace (`/v2/`) and
+ * bumps this number. Advertised on `server.hello` + `/api/health` so a hub can tell a stable-updater
+ * member from a legacy one (absent ⇒ pre-frozen-API daemon ⇒ drive it via the legacy `daemon.update`).
+ */
+export const UPDATE_API_VERSION = 1 as const;
+export type UpdateApiVersion = typeof UPDATE_API_VERSION;
+
 /** ISO 8601 timestamp, always UTC, e.g. "2026-06-19T14:03:00.000Z". */
 export type Iso8601 = string;
 
@@ -517,6 +529,9 @@ export interface ServerHelloEvent extends Envelope {
   serverName: string; // display name, default: hostname
   version: string; // anvild version
   protocolVersion: ProtocolVersion;
+  /** Version of the frozen update API this daemon serves (`/api/update/v1/*`). Absent ⇒ a
+   *  pre-frozen-API daemon → a hub drives it via the legacy `daemon.update` path instead (spec §4.3). */
+  updateApiVersion?: UpdateApiVersion;
   // Coarse feature flags this build supports (e.g. "autopilot"). Lets a newer client skip commands a
   // member is too old to handle instead of getting `unknown command type` back. Absent on pre-capability
   // builds → the client treats every capability as unsupported for that server (graceful degradation).
@@ -1536,6 +1551,74 @@ export namespace rest {
      * (headless-join §3.5). Absent ⇒ a pre-capability daemon ⇒ treat every capability as unsupported.
      */
     capabilities?: string[];
+    /** Version of the frozen update API this daemon serves. Read by a hub over REST (discovery is
+     *  REST) to route a member through the stable path vs the legacy `daemon.update` (spec §4.3).
+     *  Absent ⇒ pre-frozen-API daemon. */
+    updateApiVersion?: UpdateApiVersion;
+    /** Part of the boot smoke self-check (spec D14): the built web bundle (web/dist/index.html) is
+     *  present and being served. False ⇒ this process is up but can't serve the app — the watchdog
+     *  treats a health probe with `webBundleOk:false` as NOT-healthy and will roll back. Absent on a
+     *  daemon predating the smoke check. */
+    webBundleOk?: boolean;
+  }
+  /**
+   * The FROZEN update API v1 (`/api/update/v1/*`) — stable-update-service spec §4.3. Additive-only:
+   * every field here is guaranteed to keep its name+type across daemon releases (enforced by the
+   * OpenAPI contract test). A hub and a partially-updated fleet coordinate updates over this surface.
+   */
+  export namespace update {
+    /** Phase of an in-flight (or last) update on a single daemon, reported by `/api/update/v1/status`. */
+    export type UpdatePhase =
+      | "idle"
+      | "checking"
+      | "pulling"
+      | "building"
+      | "restarting"
+      | "healthy"
+      | "rolled-back"
+      | "error";
+    /** GET /api/update/v1/check → how far behind + stale-process detection, without mutating anything. */
+    export interface CheckResponse {
+      ok: boolean;
+      updateApiVersion: UpdateApiVersion;
+      currentSha: string; // the git short SHA the running process was built from ("" if git-less)
+      targetSha: string; // the SHA the resolved upstream ref points at ("" when it can't be resolved)
+      behind: number; // commits HEAD is behind the resolved upstream ref
+      needsRestart: boolean; // on-disk build is newer than the running process (a prior restart never landed)
+      output: string; // human-readable summary
+      error?: string; // present when ok === false
+    }
+    /** POST /api/update/v1/apply — update to an EXPLICIT target SHA (spec D13: deterministic fleet
+     *  convergence). Omitting `targetSha` means "resolve the upstream tip and use that" (the legacy
+     *  latest-on-branch behaviour), so scripts and the macOS menu keep working. */
+    export interface ApplyRequest {
+      targetSha?: string;
+    }
+    export interface ApplyResponse {
+      ok: boolean;
+      updateApiVersion: UpdateApiVersion;
+      phase: UpdatePhase; // "restarting" (willRestart), "healthy"/"idle" (up-to-date), or "error"
+      willRestart: boolean; // true → the daemon is about to restart to apply
+      currentVersion: string; // VERSION currently running (pre-restart)
+      prePullSha: string; // the SHA recorded before pulling — what a failed boot rolls back to
+      targetSha: string; // the SHA this apply moved (or is moving) the checkout to
+      output: string; // combined pull/build/typecheck log, or the error
+      error?: string;
+    }
+    /** GET /api/update/v1/status → the live phase, for a hub to OBSERVE a member's rollout (spec D10).
+     *  Read-only; never mutates. */
+    export interface StatusResponse {
+      ok: boolean;
+      updateApiVersion: UpdateApiVersion;
+      phase: UpdatePhase;
+      currentSha: string; // running process's short SHA
+      currentVersion: string; // full VERSION string
+      targetSha: string; // desired target if an update is in flight/last-attempted ("" if none)
+      prePullSha: string; // known-good SHA to roll back to ("" if none recorded)
+      webBundleOk: boolean; // smoke: is the web bundle being served
+      reason?: string; // why, when phase is "rolled-back" or "error"
+      updatedAt?: number; // ms epoch of the last phase transition
+    }
   }
   /** An Anvil server found on the tailnet by discovery (anvil-multi-server.md §4.1). */
   export interface DiscoveredServer {
@@ -1603,6 +1686,48 @@ export namespace rest {
   export interface FleetRotateResponse {
     ok: boolean;
     results: { host: string; ok: boolean; error?: string }[];
+  }
+
+  /**
+   * Hub-orchestrated fleet update (stable-update-service spec §4.4). The hub pins ONE target SHA and
+   * fans it out to every reachable member (each self-updates + self-heals locally via its frozen
+   * update API); the hub updates itself LAST. Unreachable members are skipped and reconciled on
+   * reconnect. `POST /api/fleet/update` kicks it off; `GET /api/fleet/update/status` polls progress.
+   */
+  export type FleetRolloutMemberState =
+    | "pending" // queued, not yet contacted
+    | "pending-offline" // unreachable at fan-out time; will reconcile on reconnect
+    | "legacy" // no updateApiVersion → driven via the legacy daemon.update path
+    | "updating" // apply accepted, member self-updating
+    | "healthy" // reached target and passed its smoke gate
+    | "rolled-back" // failed its gate; self-healed to the prior build
+    | "error"; // could not be updated (apply rejected / failed)
+  export interface FleetRolloutMember {
+    serverId: string;
+    serverName: string;
+    isHub: boolean; // the hub updates itself last
+    state: FleetRolloutMemberState;
+    fromSha?: string;
+    toSha?: string;
+    detail?: string; // human-readable note (error text, "offline", …)
+  }
+  export interface FleetUpdateRequest {
+    /** Pin to this exact SHA. Omit ⇒ the hub resolves the upstream tip once and pins that (spec D13). */
+    targetSha?: string;
+  }
+  export interface FleetUpdateResponse {
+    ok: boolean;
+    targetSha: string; // the pinned SHA the whole fleet is converging to
+    members: FleetRolloutMember[]; // initial snapshot (hub last)
+    error?: string;
+  }
+  export interface FleetUpdateStatusResponse {
+    ok: boolean;
+    active: boolean; // a rollout is in progress
+    targetSha: string; // last/current pinned target ("" if never run)
+    startedAt?: number;
+    finishedAt?: number;
+    members: FleetRolloutMember[];
   }
 
   // ── Joiner-side pairing on :7701 (anvil-headless-join.md §5.3) ───────────────────────────────

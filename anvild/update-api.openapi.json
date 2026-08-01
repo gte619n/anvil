@@ -1,0 +1,152 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Anvil Frozen Update API",
+    "version": "1",
+    "description": "The FROZEN update surface (stable-update-service spec §4.3). This document is the contract. Compatibility rule: fields may only ever be ADDED — never renamed, removed, or retyped. Any breaking change ships under a new path namespace (/api/update/v2/*) and bumps updateApiVersion. The `required` arrays + property `type`s here are enforced by test/unit/update-api-contract.test.ts (static shape gate + live-server runtime assertions). Do NOT hand-edit to make a failing test pass — a failure means a breaking change to a frozen surface."
+  },
+  "x-updateApiVersion": 1,
+  "paths": {
+    "/api/health": {
+      "get": {
+        "summary": "Liveness + update routing + boot smoke",
+        "responses": { "200": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } } } }
+      }
+    },
+    "/api/update/v1/check": {
+      "get": {
+        "summary": "How far behind + stale-process detection (no mutation)",
+        "responses": { "200": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CheckResponse" } } } } }
+      }
+    },
+    "/api/update/v1/apply": {
+      "post": {
+        "summary": "Update to a pinned target SHA (or the resolved tip) and restart",
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApplyRequest" } } } },
+        "responses": { "200": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApplyResponse" } } } } }
+      }
+    },
+    "/api/update/v1/status": {
+      "get": {
+        "summary": "Live phase for a hub to observe (no mutation)",
+        "responses": { "200": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } } } } }
+      }
+    },
+    "/api/fleet/update": {
+      "post": {
+        "summary": "Hub-orchestrated fleet rollout: pin one SHA, fan out, hub last",
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FleetUpdateRequest" } } } },
+        "responses": { "200": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FleetUpdateResponse" } } } } }
+      }
+    },
+    "/api/fleet/update/status": {
+      "get": {
+        "summary": "Fleet rollout progress",
+        "responses": { "200": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FleetUpdateStatusResponse" } } } } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "description": "Only the update-relevant fields of /api/health are frozen HERE; the rest of health is governed by protocol.ts.",
+        "required": ["ok", "version", "updateApiVersion", "webBundleOk"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "version": { "type": "string" },
+          "updateApiVersion": { "type": "integer" },
+          "webBundleOk": { "type": "boolean" }
+        }
+      },
+      "CheckResponse": {
+        "type": "object",
+        "required": ["ok", "updateApiVersion", "currentSha", "targetSha", "behind", "needsRestart", "output"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "updateApiVersion": { "type": "integer" },
+          "currentSha": { "type": "string" },
+          "targetSha": { "type": "string" },
+          "behind": { "type": "integer" },
+          "needsRestart": { "type": "boolean" },
+          "output": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "ApplyRequest": {
+        "type": "object",
+        "properties": { "targetSha": { "type": "string" } }
+      },
+      "ApplyResponse": {
+        "type": "object",
+        "required": ["ok", "updateApiVersion", "phase", "willRestart", "currentVersion", "prePullSha", "targetSha", "output"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "updateApiVersion": { "type": "integer" },
+          "phase": { "type": "string" },
+          "willRestart": { "type": "boolean" },
+          "currentVersion": { "type": "string" },
+          "prePullSha": { "type": "string" },
+          "targetSha": { "type": "string" },
+          "output": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "required": ["ok", "updateApiVersion", "phase", "currentSha", "currentVersion", "targetSha", "prePullSha", "webBundleOk"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "updateApiVersion": { "type": "integer" },
+          "phase": { "type": "string" },
+          "currentSha": { "type": "string" },
+          "currentVersion": { "type": "string" },
+          "targetSha": { "type": "string" },
+          "prePullSha": { "type": "string" },
+          "webBundleOk": { "type": "boolean" },
+          "reason": { "type": "string" },
+          "updatedAt": { "type": "integer" }
+        }
+      },
+      "FleetUpdateRequest": {
+        "type": "object",
+        "properties": { "targetSha": { "type": "string" } }
+      },
+      "FleetUpdateResponse": {
+        "type": "object",
+        "required": ["ok", "targetSha", "members"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "targetSha": { "type": "string" },
+          "members": { "type": "array", "items": { "$ref": "#/components/schemas/FleetRolloutMember" } },
+          "error": { "type": "string" }
+        }
+      },
+      "FleetUpdateStatusResponse": {
+        "type": "object",
+        "required": ["ok", "active", "targetSha", "members"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "active": { "type": "boolean" },
+          "targetSha": { "type": "string" },
+          "startedAt": { "type": "integer" },
+          "finishedAt": { "type": "integer" },
+          "members": { "type": "array", "items": { "$ref": "#/components/schemas/FleetRolloutMember" } }
+        }
+      },
+      "FleetRolloutMember": {
+        "type": "object",
+        "required": ["serverId", "serverName", "isHub", "state"],
+        "properties": {
+          "serverId": { "type": "string" },
+          "serverName": { "type": "string" },
+          "isHub": { "type": "boolean" },
+          "state": { "type": "string" },
+          "fromSha": { "type": "string" },
+          "toSha": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

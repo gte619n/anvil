@@ -8,6 +8,7 @@ import { loadPersistedOpenRouterKey } from "./auth/openrouter";
 import { createServer, VERSION } from "./server/http";
 import { createMarkdownRenderer } from "./render/markdown-pipeline";
 import { installTimestampedConsole, recordExit, recordStart } from "./daemon/lifecycle";
+import { armWatchdog } from "./daemon/updater/arm";
 
 // Timestamp every log line before anything logs (so restart cadence + event timing are legible in the
 // launchd log). Must run first — earlier bare lines couldn't be correlated in time.
@@ -78,6 +79,14 @@ console.log(
   `[anvild ${VERSION}] listening on http://localhost:${server.port}  ` +
     `(ws: /ws · health: /api/health)`,
 );
+
+// Self-bootstrapping migration (stable-update-service spec §4.5/D15): if we're managed and the update
+// watchdog isn't installed yet, arm it once. Best-effort + detached — never blocks or crashes boot.
+try {
+  armWatchdog();
+} catch (e) {
+  console.warn(`[anvild] watchdog arm skipped: ${e instanceof Error ? e.message : String(e)}`);
+}
 
 // Graceful shutdown (arch §5): launchd sends SIGTERM on `kickstart -k` (service.sh restart) and on
 // bootout. Reap agent/terminal child processes (so they don't orphan across restarts) and flush a
