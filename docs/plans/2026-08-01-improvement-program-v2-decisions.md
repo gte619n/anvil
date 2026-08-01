@@ -3,6 +3,42 @@
 Running log of decisions made during autonomous implementation of
 `2026-08-01-improvement-program-v2.md`. Reviewed after implementation.
 
+## P7 — God-file decomposition (in progress, branch `refactor/godfile-decomp`)
+
+Method (proven from v1 Phase 3): move a cohesive domain into its own module with its Supervisor deps
+INJECTED, delegate the public methods from the god-file, keep the full suite green as the safety net
+(behavior-preserving), and add a focused unit test for the new module's API.
+
+**Slice 1 — DONE (committed + pushed):** `IntegrationsFacade` (`src/session/integrations-facade.ts`).
+Moved the Todoist + lapo domain (status/connect/disconnect, the lapo OAuth2 handshake, token refresh,
+project listing) out of supervisor.ts; deps injected (IntegrationStore, registry, self-base-URL
+providers). Also moved `BadCommand` → `src/session/errors.ts` (re-exported) to avoid a circular import.
+supervisor.ts 3604 → 3463. Full suite green (799). Guard: `integrations-facade.test.ts`.
+
+**Remaining slices (ordered by cleanliness/risk, each its own commit, each must keep the suite green):**
+1. **AccountRosterService** — CONTIGUOUS block (authStatus/setAuthToken/account CRUD/broadcastAccounts/
+   afterAccountMutation) with the STRONGEST existing coverage (4 account test files = ideal safety net).
+   Wider dep surface (needs `sessions()`, `restartIdleSessionsForNewToken`, `broadcastAuthState`
+   injected) — do next, carefully.
+2. **TeamCoordinator** — team orchestration (buildTeamServer … integrateTeam, spawnMember,
+   drainQueuedMembers). Cohesive but coupled to create/kill/prompt (inject those).
+3. **AutopilotService** (+ its 5-min scheduler) — the largest domain (~1000 lines: plans, runAutopilot,
+   runDevPipeline, schedule, reconcile). Biggest win, highest care; extract last on the backend.
+4. **GitProjection/PrSweeper** — refreshGit/refreshPrState/gitOp/startPrStateSweeper; natural home for the
+   deferred BE2-2/3/5 async-git conversion, so pair those.
+5. **http.ts** route ladder → a method+prefix route table with one top-level try/catch→500 (also kills the
+   BE2-10 crash-500 class) + a `withJsonBody` helper (5× copy-pasted push handlers). DRY: BE2-45
+   `ackWhenDone`.
+6. **Web** (`main.ts` 7600 lines): extract `fleet.ts`/`sidebar.ts`/`conversation.ts`/`autopilot.ts`/etc.
+   in dependency order, each carrying its shared scalars into `state.ts` — this is what permanently
+   retires the WEB2-1 TDZ crash class. Fold WEB2-2/16 render-diffs + WEB2-8 a11y into the relevant seams.
+
+RATIONALE for pacing: this is behavior-preserving refactoring of critical infrastructure. Each slice is
+landed and verified independently rather than batched, so a subtle regression is caught (and reviewable)
+at the smallest granularity. The full test suite (+ the coverage each extraction adds) is the safety net.
+
+---
+
 Baseline at start: `bun test` → 741 pass, 1 skip, 1 fail (the known
 `boot-init.test.ts` red — reads absent `web/dist/index.html`). HEAD `2059142`.
 
