@@ -10,6 +10,28 @@ Format: `[TAG] decision — rationale`.
 
 ---
 
+## Post-merge interview outcomes (2026-08-01, after PR #168 merged)
+
+The author reviewed this log and decided the open points. Actioned on branch
+`followup/interview-sec2-3-be2-31`:
+
+1. **SEC2-3 → "Allow loopback on update routes."** Loosened the identity gate on `/api/update/v1/apply`
+   and POST `/api/daemon/update`: a purely-local caller (loopback peer, NO `Tailscale-User-Login` header)
+   is now permitted, since it's a process already on the box (e.g. the native macOS updater hitting the
+   REST route directly, not via `tailscale serve`). A serve-proxied request from a DIFFERENT tailnet user
+   is loopback WITH a header → still rejected. Extracted `isLocalNoIdentityCaller` (pure, unit-tested in
+   `pairing.test.ts`). Removed the old integration assertion — with the loosening it would have driven a
+   REAL `git` apply against the checkout; the decision is unit-tested instead.
+2. **BE2-30 → "Leave deferred (low priority)."** No change; the atomic write already prevents the severe
+   (torn-file) failure. Sidecar remains the recommended fix if it's ever revisited.
+3. **Follow-up order → "Async-git-ops (BE2-2/3/5/15) first."** That's the next PR: convert
+   worktree-fetch / team-integration / per-turn refreshGit / fleet rotate+invite to async subprocess
+   spawns, with a fake-slow-binary responsiveness harness (pre-doctor PATH before importing the git module).
+4. **BE2-31 → "Restart to known-good anyway."** Reverted the re-probe/skip-restart logic: after the gate
+   elapses unhealthy and rollback runs, the watchdog now ALWAYS restarts to prePullSha, so disk/process/
+   state converge immediately (one deterministic restart). A target that recovers *across ticks* (before
+   rollback is committed) is still adopted by the top-of-tick health probe. Guard test updated.
+
 ## Overall summary (read this first)
 
 Final state: **795 pass / 1 skip / 0 fail**; `typecheck` + `typecheck:web` + `build:web` all green.

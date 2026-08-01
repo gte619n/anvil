@@ -10,6 +10,7 @@ import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./ide
 import { ackPair, discoverFleet, invitePeer, peerIPv4, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import {
   DEFAULT_ARM_TTL_MS,
+  isLocalNoIdentityCaller,
   PairedHubStore,
   PairingWindow,
   resolveCallerIdentity,
@@ -536,6 +537,15 @@ export function createServer(opts: ServerOptions): ServerHandle {
           whois: tailscaleWhois,
         });
 
+      // [SEC2-3 refinement] A purely-LOCAL process on the box — loopback peer with NO injected
+      // `Tailscale-User-Login` header — is inside the trust boundary already (e.g. the native macOS
+      // updater hitting the REST route directly on localhost, not via `tailscale serve`). It's classified
+      // `otherUser` ("local caller without a Tailscale identity") only because it presents no identity, so
+      // the update routes permit it. NB: a loopback caller WITH a header is a serve-proxied tailnet user —
+      // if that header resolves to a DIFFERENT user, callerIdentity still returns otherUser and we still
+      // reject (this exception requires the ABSENCE of a header, so it can't wave a foreign user through).
+      const localNoIdentityCaller = isLocalNoIdentityCaller(srv.requestIP(req)?.address, req.headers.get("Tailscale-User-Login"));
+
       if (req.method === "GET" && url.pathname === "/api/health") {
         const auth = resolveAuthStatus({ accounts });
         const body: rest.HealthResponse = {
@@ -574,10 +584,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
         const ct = (req.headers.get("content-type") || "").toLowerCase();
         if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
         // [SEC2-3] Identity gate — parity with /api/fleet/*: a PROVEN different tailnet user must not be
-        // able to pin this member's checkout + force a restart onto it. sameUser/unknown proceed (whois
-        // may be momentarily down, and unattended local triggers arrive via serve with the header).
+        // able to pin this member's checkout + force a restart onto it. sameUser/unknown proceed; a purely
+        // local process on the box (loopback, no header — e.g. the native macOS updater) is also allowed.
         const who = await callerIdentity();
-        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+        if (who.trust === "otherUser" && !localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
         const bodyReq = (await req.json().catch(() => ({}))) as rest.update.ApplyRequest;
         const result = await updateApply({ targetSha: bodyReq.targetSha }, updateDeps);
         return Response.json(result, { status: result.ok ? 200 : 500 });
@@ -917,7 +927,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // Parity with /api/fleet/* and /api/update/v1/apply — reject a proven different tailnet user.
         if (req.method === "POST") {
           const who = await callerIdentity();
-          if (who.trust === "otherUser") {
+          if (who.trust === "otherUser" && !localNoIdentityCaller) {
             return Response.json({ ok: false, phase: "error", output: who.reject ?? "different tailnet user", currentVersion: VERSION } satisfies rest.DaemonUpdateResponse, { status: 403 });
           }
         }

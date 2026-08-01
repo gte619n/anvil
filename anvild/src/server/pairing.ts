@@ -216,6 +216,19 @@ export function isLoopbackAddress(ip: string): boolean {
   return LOOPBACK.has(ip.replace(/%.*$/, "").toLowerCase());
 }
 
+/**
+ * [SEC2-3] A purely-LOCAL process on the box: a loopback peer that presents NO `Tailscale-User-Login`
+ * header. Such a caller bypassed `tailscale serve` and is a process already running on the daemon's own
+ * machine — inside the trust boundary. `resolveCallerIdentity` classifies it `otherUser` ("local caller
+ * without a Tailscale identity") purely because it presents no identity, so the update routes use this to
+ * permit it (e.g. the native macOS updater hitting the REST route directly on localhost). Crucially it
+ * requires the ABSENCE of a header: a serve-proxied request from a DIFFERENT tailnet user is loopback
+ * WITH a header, so it is NOT covered here and stays rejected.
+ */
+export function isLocalNoIdentityCaller(peerAddress: string | undefined, headerLogin: string | null): boolean {
+  return !!peerAddress && isLoopbackAddress(peerAddress) && !headerLogin?.trim();
+}
+
 export interface IdentityOpts {
   /** The socket's real peer address (`Bun.serve`'s `requestIP`). Undefined ⇒ we can't tell ⇒ reject. */
   peerAddress: string | undefined;
