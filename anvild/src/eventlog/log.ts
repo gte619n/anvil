@@ -68,8 +68,21 @@ export class EventLog {
     });
   }
 
+  /** Every `cid` recorded on a persisted `message.user`, in log order (v4 exactly-once dedupe seed).
+   *  Read once at session load so a re-flushed offline send is recognised as a duplicate even across a
+   *  daemon restart that dropped the in-memory applied-cid set. */
+  promptCids(): string[] {
+    const out: string[] = [];
+    for (const e of this.readAll()) {
+      if (e.type !== "message.user") continue;
+      const cid = (e as { cid?: unknown }).cid;
+      if (typeof cid === "string") out.push(cid);
+    }
+    return out;
+  }
+
   /** Compacted snapshot for a cold attach (no/stale lastSeq), arch §6.4. */
-  snapshot(sessionId: string, lastSeq: number): ConversationSnapshotEvent {
+  snapshot(sessionId: string, lastSeq: number, epoch: string): ConversationSnapshotEvent {
     const events: ConversationEvent[] = [];
     for (const e of this.readAll()) {
       const a = e as any;
@@ -93,6 +106,6 @@ export class EventLog {
           break; // status / usage / tool.use / permission.request|resolved / error are not part of the snapshot
       }
     }
-    return { v: PROTOCOL_VERSION, type: "conversation.snapshot", ts: now(), sessionId, seq: lastSeq, events, lastSeq };
+    return { v: PROTOCOL_VERSION, type: "conversation.snapshot", ts: now(), sessionId, seq: lastSeq, events, lastSeq, epoch };
   }
 }

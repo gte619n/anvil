@@ -46,7 +46,10 @@
 // 0. Primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const PROTOCOL_VERSION = 3 as const;
+// v4 (incremental-offline-resilience.md): adds the resume watermark (`resume.watermarks`), per-session
+// `epoch` on the snapshot, and `cid` on `message.user` (exactly-once send dedupe). A hard cutover —
+// parseCommandFrame rejects any other version, so a mixed-version fleet must upgrade together (spec D9).
+export const PROTOCOL_VERSION = 4 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
 /**
@@ -71,6 +74,7 @@ export type RequestId = string; // permission request id
 export type ToolUseId = string; // matches a tool_use block to its result
 export type AttachmentId = string; // returned by the REST upload endpoint
 export type Cid = string; // client-chosen correlation id for a command
+export type Epoch = string; // per-session resume lineage token; changes only if the log lineage resets (v4)
 
 /** Base envelope shared by every message in both directions. */
 export interface Envelope {
@@ -818,15 +822,44 @@ export interface CommandErrorEvent extends Envelope {
 
 // 4b. Conversation (session-scoped)
 
+/** One session's resume watermark: the client compares its cached `{epoch,lastSeq}` against this to
+ *  decide whether it can delta-resume (epoch match) or must take a full snapshot (v4, §6.4). */
+export interface ResumeWatermark {
+  sessionId: SessionId;
+  epoch: Epoch;
+  lastSeq: Seq;
+}
+/** Cheap per-session resume watermarks, broadcast on connect (before `session.list`) so a
+ *  cold-opening client can verify its cached transcript without pulling a full snapshot. O(sessions),
+ *  no event-log reads. Not session-scoped — it's a single global frame covering every session. */
+export interface ResumeWatermarksEvent extends Envelope {
+  type: "resume.watermarks";
+  watermarks: ResumeWatermark[];
+}
+/** Resilience telemetry (v4, incremental-offline-resilience.md §5.7 / spec D11). Free-form counter
+ *  maps so new metrics can be added without a protocol bump. `server` is the daemon's own view (resume
+ *  served delta-vs-snapshot, prompts deduped); `clients` is the latest report from each connected
+ *  client keyed by its stable clientId. Broadcast on connect and whenever a client reports. */
+export interface TelemetrySnapshotEvent extends Envelope {
+  type: "telemetry.snapshot";
+  server: Record<string, number>;
+  clients: Record<string, Record<string, number>>;
+}
+
 export interface ConversationSnapshotEvent extends Envelope, SessionScoped {
   type: "conversation.snapshot";
   events: ConversationEvent[];
   lastSeq: Seq; // highest seq represented by this snapshot
+  epoch: Epoch; // resume lineage token — the client caches it and only delta-resumes while it matches (v4)
 }
 export interface MessageUserEvent extends Envelope, SessionScoped {
   type: "message.user";
   rendered: RenderedMarkdown;
   attachments: AttachmentRef[];
+  /** The `cid` of the `prompt.send` that produced this message, when it carried one (v4). Persisted so
+   *  the server can dedupe a re-flushed offline send (exactly-once), and echoed so the client can retire
+   *  the matching optimistic bubble instead of rendering a duplicate. */
+  cid?: Cid;
 }
 /** Streaming token chunk. Raw markdown text; client renders incrementally (Streamdown-style). */
 export interface AssistantDeltaEvent extends Envelope, SessionScoped {
@@ -984,6 +1017,8 @@ export type ServerEvent =
   | PongEvent
   | CommandErrorEvent
   // conversation
+  | ResumeWatermarksEvent
+  | TelemetrySnapshotEvent
   | ConversationSnapshotEvent
   | MessageUserEvent
   | AssistantDeltaEvent
@@ -1428,6 +1463,16 @@ export interface PingCmd extends Envelope {
   type: "ping";
 }
 
+// 5h. Telemetry (v4, §5.7)
+
+/** A client reports its resilience counters; the daemon aggregates them and rebroadcasts a
+ *  `telemetry.snapshot`. Free-form counter map so metrics can evolve without a protocol bump. */
+export interface TelemetryReportCmd extends Envelope, Correlated {
+  type: "telemetry.report";
+  clientId: string; // stable per-device id so the daemon keys the latest report per client
+  counters: Record<string, number>;
+}
+
 /** The full set of messages a client may send. */
 export type ClientCommand =
   // session
@@ -1508,7 +1553,9 @@ export type ClientCommand =
   | PushRegisterCmd
   | PushUnregisterCmd
   // liveness
-  | PingCmd;
+  | PingCmd
+  // telemetry
+  | TelemetryReportCmd;
 
 // Convenience maps for exhaustive switch handlers.
 export type ServerEventType = ServerEvent["type"];

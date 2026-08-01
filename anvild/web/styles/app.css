@@ -418,6 +418,27 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .queued-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--muted); margin-top: 4px; }
 .queued-badge .msym { font-size: 13px; }
 
+/* Skeleton-first conversation load: structural shimmer shown while the resume watermark verifies the
+   cached transcript (incremental-offline-resilience.md D3/D4). Never persisted. */
+.convo-skeleton { display: flex; flex-direction: column; gap: 12px; padding: 8px 0; width: 100%; }
+.skel-bubble { height: 44px; border-radius: 14px; max-width: min(760px, 82%);
+  background: linear-gradient(100deg, color-mix(in srgb, var(--muted) 12%, transparent) 30%, color-mix(in srgb, var(--muted) 22%, transparent) 50%, color-mix(in srgb, var(--muted) 12%, transparent) 70%);
+  background-size: 200% 100%; animation: skel-shimmer 1.3s infinite linear; }
+.skel-bubble.user { align-self: flex-end; width: 44%; }
+.skel-bubble.asst { align-self: flex-start; width: 66%; }
+.skel-bubble.asst.wide { width: 80%; height: 72px; }
+@keyframes skel-shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .skel-bubble { animation: none; } }
+
+/* Resilience diagnostics panel (#diag or Ctrl/Cmd+Shift+D) — §5.7 telemetry readout. */
+#diag-panel { position: fixed; right: 12px; bottom: 12px; z-index: 9999; max-width: 460px; background: var(--panel, var(--bg)); color: var(--fg); border: 1px solid var(--border, var(--muted)); border-radius: 10px; padding: 10px 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.28); font-size: 12px; }
+#diag-panel .diag-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; margin-bottom: 6px; }
+#diag-panel .diag-cols { display: flex; gap: 18px; }
+#diag-panel h4 { margin: 0 0 4px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+#diag-panel table { border-collapse: collapse; }
+#diag-panel td { padding: 1px 8px 1px 0; font-variant-numeric: tabular-nums; }
+#diag-panel td:last-child { text-align: right; }
+
 #conversation { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
 /* Chat text is selectable/copyable — on Android this is what surfaces the selection handles. */
 #conversation, #conversation * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }

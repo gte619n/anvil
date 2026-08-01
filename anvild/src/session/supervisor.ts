@@ -51,6 +51,8 @@ import {
   type SessionListEvent,
   type SessionSource,
   type SessionGoal,
+  type ResumeWatermarksEvent,
+  type TelemetrySnapshotEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
@@ -197,6 +199,9 @@ export class Supervisor {
   private readonly sessions = new Map<string, Session>();
   private readonly drivers = new Map<string, AgentDriver>();
   private readonly logs = new Map<string, EventLog>();
+  /** Resilience telemetry (v4, §5.7): the daemon's own counters + the latest report from each client. */
+  private readonly serverCounters: Record<string, number> = { resumeDelta: 0, resumeSnapshot: 0, promptDeduped: 0 };
+  private readonly clientTelemetry = new Map<string, Record<string, number>>();
   private readonly broker = new PermissionBroker();
   private readonly questionBroker = new QuestionBroker();
   /** Sessions whose awaiting_permission state has been announced to the whole fleet (list badge). */
@@ -2058,7 +2063,8 @@ export class Supervisor {
     const s = this.require(id);
     const log = this.logs.get(id);
     if (!log) return [];
-    const events = lastSeq === undefined ? [log.snapshot(id, s.lastSeq)] : log.since(lastSeq);
+    this.noteServerCounter(lastSeq === undefined ? "resumeSnapshot" : "resumeDelta"); // §5.7: what we served
+    const events = lastSeq === undefined ? [log.snapshot(id, s.lastSeq, s.epoch)] : log.since(lastSeq);
     // Always end with the live status so a re-attaching client's thinking indicator reflects
     // reality (the per-turn `status` events it missed while detached aren't replayed).
     events.push({ v: PROTOCOL_VERSION, type: "status", ts: now(), sessionId: id, seq: s.lastSeq, status: s.data.status });
@@ -2085,6 +2091,45 @@ export class Supervisor {
   }
   sessionListEvent(): SessionListEvent {
     return { v: PROTOCOL_VERSION, type: "session.list", ts: now(), sessions: this.list() };
+  }
+  /** Cheap per-session resume watermarks (v4, §6.4) — sent on connect so a cold-opening client can
+   *  verify its cached transcript (epoch + lastSeq) without pulling a full snapshot. In-memory only:
+   *  O(sessions), no event-log reads. */
+  resumeWatermarksEvent(): ResumeWatermarksEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "resume.watermarks",
+      ts: now(),
+      watermarks: [...this.sessions.values()].map((s) => ({ sessionId: s.id, epoch: s.epoch, lastSeq: s.lastSeq })),
+    };
+  }
+  /** Whether a prompt with this `cid` was already applied to the session (v4 exactly-once dedupe). */
+  isPromptApplied(id: string, cid: string): boolean {
+    return this.sessions.get(id)?.isPromptApplied(cid) ?? false;
+  }
+
+  // ── Telemetry (v4, §5.7) ──────────────────────────────────────────────────
+  /** Bump a daemon-side counter (e.g. a deduped prompt). */
+  noteServerCounter(key: string): void {
+    this.serverCounters[key] = (this.serverCounters[key] ?? 0) + 1;
+  }
+  /** Record a client's latest counter report (keyed by its stable clientId). */
+  recordClientTelemetry(clientId: string, counters: Record<string, number>): void {
+    this.clientTelemetry.set(clientId, counters);
+  }
+  /** The aggregated telemetry snapshot broadcast on connect + whenever a client reports (spec D11). */
+  telemetrySnapshotEvent(): TelemetrySnapshotEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "telemetry.snapshot",
+      ts: now(),
+      server: { ...this.serverCounters },
+      clients: Object.fromEntries(this.clientTelemetry),
+    };
+  }
+  /** Broadcast the current telemetry snapshot to every connected client. */
+  broadcastTelemetry(): void {
+    this.registry.toAll(this.telemetrySnapshotEvent());
   }
 
   create(cmd: SessionCreateCmd): Session {
@@ -2543,8 +2588,11 @@ export class Supervisor {
   }
 
   /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
-  prompt(id: string, text: string, attachmentIds: string[] = []): void {
+  prompt(id: string, text: string, attachmentIds: string[] = [], cid?: string): void {
     const s = this.require(id);
+    // Exactly-once (v4, spec A5): a re-flushed offline send carries the same cid. If we've already
+    // applied it, record nothing new and don't run the turn again — the dispatcher re-acks it.
+    if (cid && s.isPromptApplied(cid)) return;
     // Degraded machine (no usable Claude token): stop here with the explicit §4.3 message instead of
     // letting `buildAgentEnv` throw out through the dispatcher as an opaque command error. The user's
     // text is deliberately NOT echoed — nothing consumed it, so a bubble with no reply would be a lie.
@@ -2559,11 +2607,17 @@ export class Supervisor {
 
     // Built-in context controls are handled by the daemon, not passed through as prose (§context). They
     // must be the WHOLE message (matching Claude Code's slash-command rule) and carry no attachments.
+    // These daemon-handled commands apply a real side effect (new topic / compact / goal change) but
+    // emit no `message.user`, so they early-return before the record below. Record the cid HERE so a
+    // re-flushed offline copy is deduped and the side effect doesn't run twice (v4 exactly-once, A5).
+    // (The degraded branch above deliberately does NOT record — nothing was applied, so a re-flush once
+    // the token is fixed SHOULD run.)
     const trimmed = text.trim();
     if (trimmed === "/clear") {
       // Same effect as the "New topic" action: null the resume id, reset the context meter, drop a
       // divider. SDK-native /clear would do none of that (the daemon would still resume the old topic
       // on restart), so we route to newTopic instead of forwarding the command.
+      if (cid) s.recordPromptCid(cid);
       void this.newTopic(id);
       return;
     }
@@ -2571,6 +2625,7 @@ export class Supervisor {
       // Forward to the SDK so it actually summarizes the context. We suppress the user-echo (the
       // compact_boundary divider the driver emits is the visible marker) and let the refreshed context
       // meter ride the turn's result. Any `/compact <instructions>` guidance passes through verbatim.
+      if (cid) s.recordPromptCid(cid);
       this.ensureDriver(id).prompt(text);
       return;
     }
@@ -2579,6 +2634,7 @@ export class Supervisor {
     // session's goal without consuming a turn; the Stop hook registered in the driver enforces it.
     const goalCmd = parseGoalCommand(text);
     if (goalCmd) {
+      if (cid) s.recordPromptCid(cid);
       this.handleGoalCommand(s, goalCmd);
       return;
     }
@@ -2606,8 +2662,11 @@ export class Supervisor {
     // from what the user actually asked for (arch §8) — the local slug alone is too terse.
     if (!s.data.worktree?.remoteBranch && text.trim()) s.openingPrompt ??= text.trim();
 
-    // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4)
-    s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
+    // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4).
+    // Persist the cid (v4) so a re-flushed offline send is deduped even across a daemon restart, and so
+    // the client can retire its optimistic bubble instead of double-rendering (spec A5/A6).
+    if (cid) s.recordPromptCid(cid);
+    s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments, ...(cid ? { cid } : {}) });
     this.ensureDriver(id).prompt(text, inline);
   }
 
@@ -3080,12 +3139,12 @@ export class Supervisor {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
-  private wrap(data: SessionData, lastSeq: number): Session {
+  private wrap(data: SessionData, lastSeq: number, epoch: string = newId("ep")): Session {
     const dir = this.store.sessionDir(data.id);
     ensureDir(dir, { recursive: true });
     const log = new EventLog(dir);
     this.logs.set(data.id, log);
-    return new Session(
+    const session = new Session(
       data,
       lastSeq,
       (sessionId, event) => {
@@ -3096,7 +3155,12 @@ export class Supervisor {
       },
       () => this.persistSoon(), // [BE-1] high-frequency emit path is debounced; lifecycle ops flush now
       (event) => log.append(event),
+      epoch,
     );
+    // Seed exactly-once dedupe from the durable log so a re-flushed offline send is recognised as a
+    // duplicate even across the daemon restart that dropped the in-memory set (v4, spec A5).
+    for (const cid of log.promptCids()) session.recordPromptCid(cid);
+    return session;
   }
 
   /**
@@ -3215,7 +3279,9 @@ export class Supervisor {
         // A restored goal is re-armed PAUSED (design D5): a self-update must never resume an
         // unattended loop. The next user prompt un-pauses it (see prompt()).
         if (p.data.goal) p.data.goal.paused = true;
-        const session = this.wrap(p.data, p.lastSeq);
+        // Reuse the persisted epoch so a client's cached transcript stays delta-resumable across a
+        // daemon restart; a pre-v4 row has none → wrap mints one (forces one harmless full snapshot).
+        const session = this.wrap(p.data, p.lastSeq, p.epoch);
         this.sessions.set(p.data.id, session);
 
         const notice = this.recoverWorktreeOnRestore(p.data); // returns a notice if anything happened
@@ -3349,7 +3415,7 @@ export class Supervisor {
       this.persistTimer = undefined;
     }
     this.persistDirty = false;
-    this.store.saveAll([...this.sessions.values()].map((s) => ({ data: s.data, lastSeq: s.lastSeq })));
+    this.store.saveAll([...this.sessions.values()].map((s) => ({ data: s.data, lastSeq: s.lastSeq, epoch: s.epoch })));
   }
 
   /** Debounced flush for the high-frequency emit path. */

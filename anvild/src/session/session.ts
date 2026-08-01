@@ -61,6 +61,14 @@ export class Session {
   /** Once disposed (killed/archived/shutdown) `emit` is a no-op — a late-draining agent turn must
    *  not write into a dead session (would target a removed dir/connection and crash the daemon). */
   private disposed = false;
+  /** Resume lineage token (v4). Stable for the session's life; the client caches it and only
+   *  delta-resumes while it matches, so it must survive a daemon restart (persisted in sessions.json). */
+  readonly epoch: string;
+  /** Prompt `cid`s already applied (v4 exactly-once). Bounded ring — a re-flushed offline send with a
+   *  known cid is re-acked without running the turn again. Seeded from the durable log at load. */
+  private readonly appliedPromptCids = new Set<string>();
+  private readonly appliedPromptOrder: string[] = [];
+  private static readonly APPLIED_CID_CAP = 1000;
 
   constructor(
     public data: SessionData,
@@ -68,8 +76,10 @@ export class Session {
     private readonly sink: EventSink,
     private readonly onChange: () => void,
     private readonly append: (event: ServerEvent) => void = () => {},
+    epoch: string = "",
   ) {
     this.nextSeq = lastSeq + 1;
+    this.epoch = epoch;
   }
 
   get id(): string {
@@ -77,6 +87,22 @@ export class Session {
   }
   get lastSeq(): number {
     return this.nextSeq - 1;
+  }
+
+  /** Whether a prompt with this `cid` has already been applied (v4 exactly-once dedupe). */
+  isPromptApplied(cid: string): boolean {
+    return this.appliedPromptCids.has(cid);
+  }
+  /** Record a freshly-applied prompt `cid`, evicting the oldest past the cap. Also used to seed the
+   *  set from the durable log at load. Idempotent. */
+  recordPromptCid(cid: string): void {
+    if (!cid || this.appliedPromptCids.has(cid)) return;
+    this.appliedPromptCids.add(cid);
+    this.appliedPromptOrder.push(cid);
+    if (this.appliedPromptOrder.length > Session.APPLIED_CID_CAP) {
+      const evicted = this.appliedPromptOrder.shift();
+      if (evicted !== undefined) this.appliedPromptCids.delete(evicted);
+    }
   }
 
   get isDisposed(): boolean {

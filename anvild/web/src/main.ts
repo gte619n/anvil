@@ -71,6 +71,10 @@ import type {
 } from "../../protocol";
 import { PALETTE, envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
+import { telemetry } from "./telemetry";
+import { canDeltaResume } from "./resume";
+import { convoCache, migrateLegacyConvoCache } from "./convoCache";
+import { reconcileOptimistic, isDaemonHandledCommand } from "./sendReconcile";
 
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
@@ -491,6 +495,178 @@ const seqStore = {
   get: (id: string): number => Number(localStorage.getItem(`anvil.seq.${id}`) ?? 0),
   set: (id: string, seq: number): void => localStorage.setItem(`anvil.seq.${id}`, String(seq)),
 };
+// v4 resume (incremental-offline-resilience.md §5): the client caches each session's `epoch` alongside
+// its `seq`. On (re)connect the daemon sends `resume.watermarks` (per-session {epoch,lastSeq}); if the
+// cached epoch still matches, the cached transcript is current and we pull ONLY deltas (seq>lastSeq)
+// instead of a full snapshot — the cross-reload win that makes flaky links feel instant (spec A1/A3).
+const epochStore = {
+  get: (id: string): string => localStorage.getItem(`anvil.epoch.${id}`) ?? "",
+  set: (id: string, epoch: string): void => localStorage.setItem(`anvil.epoch.${id}`, epoch),
+};
+const serverWatermarks = new Map<string, { epoch: string; lastSeq: number }>();
+/** Whether the cached transcript for `id` can be delta-resumed: the server's epoch still matches ours
+ *  and it has at least as many events as we've cached. Because the log is append-only and never pruned,
+ *  an epoch match guarantees `since(lastSeq)` returns every event we're missing (spec A3). */
+function canResumeIncrementally(id: string): boolean {
+  return canDeltaResume(serverWatermarks.get(id), epochStore.get(id), seqStore.get(id));
+}
+
+// Skeleton-first paint (spec D3/D4/A7): on a cold open we show a structural skeleton and defer the
+// cached transcript (now durable in IndexedDB, spec D8) until the watermark confirms it's current — so
+// we never flash a stale frame online. Offline, availability of the last-viewed conversation is the
+// whole point (D1), so we paint the cache immediately once it loads.
+let pendingCache: { id: string; html: string } | null = null;
+let pendingLoadId: string | null = null; // a fresh load whose async cache read is still resolving
+/** Paint the deferred cached transcript for `id` (validated online, or shown offline). */
+function fillCache(id: string): void {
+  if (!pendingCache || pendingCache.id !== id || id !== activeId) return;
+  conversation.innerHTML = pendingCache.html;
+  scrollDown(true);
+  snapshotLoaded.add(id); // we have content on screen — suppress the "no history" diagnostic
+  pendingCache = null;
+}
+/** Forget everything cached for a session that's gone (killed/purged): transcript + resume watermark.
+ *  Prevents a recreated id from ever delta-resuming against stale state. */
+function forgetConvoState(id: string): void {
+  void convoCache.delete(id);
+  serverWatermarks.delete(id);
+  snapshotLoaded.delete(id);
+  localStorage.removeItem(`anvil.epoch.${id}`);
+  localStorage.removeItem(`anvil.seq.${id}`);
+}
+/** Fill the cache the moment the watermark validates it (called from the resume.watermarks handler). */
+function maybeFillValidatedCache(id: string | null): void {
+  if (!id || id !== activeId) return;
+  if (pendingCache?.id === id && canResumeIncrementally(id)) fillCache(id);
+}
+/** A lightweight shimmer skeleton shown while we verify the cache (never persisted). */
+function renderSkeleton(): void {
+  conversation.innerHTML =
+    `<div class="convo-skeleton" aria-hidden="true">` +
+    `<div class="skel-bubble user"></div><div class="skel-bubble asst"></div>` +
+    `<div class="skel-bubble asst wide"></div><div class="skel-bubble user"></div>` +
+    `</div>`;
+}
+/**
+ * Full fresh load of a conversation (cold boot / session switch): skeleton → async cache read → decide
+ * paint + attach. IDB is async, so the attach decision waits for the cache to be in hand — that ordering
+ * guarantees a validated cache paints BEFORE the deltas that append on top of it (no lost events).
+ */
+async function loadConversation(id: string): Promise<void> {
+  pendingLoadId = id; // a load is in flight for `id` — session.list must not start a competing one
+  clearConversation();
+  snapshotLoaded.delete(id); // a fresh load — re-derive "content shown" below
+  pendingCache = null;
+  if (convoCache.has(id)) renderSkeleton();
+  else maybeShowSessionHero(); // no cache → straight to the title card (no skeleton flash)
+  const html = await convoCache.get(id).catch(() => null);
+  if (id !== activeId) {
+    if (pendingLoadId === id) pendingLoadId = null;
+    return; // switched away mid-load
+  }
+  pendingCache = html ? { id, html } : null;
+  attachConversation(id);
+  if (pendingLoadId === id) pendingLoadId = null;
+}
+/** Decide paint + attach once the cache is known. Delta-resume when the cache is current, else snapshot;
+ *  offline, show the last-known cache and let the reconnect re-attach re-sync. */
+function attachConversation(id: string): void {
+  const online = serverOf(id)?.sock.isOpen() ?? false;
+  if (canResumeIncrementally(id) && pendingCache?.id === id) {
+    fillCache(id); // paint the validated cache FIRST, then request only what we're missing
+    telemetry.mark("resumeDelta");
+    sendTo(id, { type: "session.attach", sessionId: id, lastSeq: seqStore.get(id) });
+  } else if (!online && pendingCache?.id === id) {
+    telemetry.mark("offlineReloads");
+    fillCache(id); // offline: last-known content now; session.list on reconnect re-runs the attach
+  } else {
+    telemetry.mark("resumeSnapshot");
+    sendTo(id, { type: "session.attach", sessionId: id }); // cold → the snapshot repaints the skeleton
+  }
+}
+/** Re-attach a session that already has content on screen (reconnect mid-session): delta-resume without
+ *  wiping the pane. If the epoch changed under us (rare), fall back to a full reload. */
+function attachReconnect(id: string): void {
+  if (canResumeIncrementally(id)) {
+    telemetry.mark("resumeDelta");
+    sendTo(id, { type: "session.attach", sessionId: id, lastSeq: seqStore.get(id) });
+  } else {
+    void loadConversation(id); // lineage reset → re-skeleton + snapshot
+  }
+}
+
+// ── Telemetry sync + debug surface (incremental-offline-resilience.md §5.7 / Phase 6, spec D11) ────
+// A stable per-device id so the daemon keys this client's latest counter report.
+const clientId = (() => {
+  let id = localStorage.getItem("anvil.clientId");
+  if (!id) {
+    id = newCid();
+    localStorage.setItem("anvil.clientId", id);
+  }
+  return id;
+})();
+let connectStartedAt = 0; // set when a socket starts connecting — TTI/verify are measured from here
+let serverTelemetry: { server: Record<string, number>; clients: Record<string, Record<string, number>> } = { server: {}, clients: {} };
+let telemetryReportTimer = 0;
+/** The full client counter bag we ship to the daemon (counters + the timing gauges). */
+function clientTelemetryBag(): Record<string, number> {
+  return { ...telemetry.snapshot(), timeToInteractiveMs: telemetry.timeToInteractiveMs, verifyMs: telemetry.verifyMs };
+}
+/** Post this client's counters to the daemon (throttled) so it can aggregate + rebroadcast (D11). */
+function scheduleTelemetryReport(): void {
+  clearTimeout(telemetryReportTimer);
+  telemetryReportTimer = window.setTimeout(() => {
+    const h = hub();
+    if (h.sock.isOpen()) h.sock.send({ type: "telemetry.report", clientId, counters: clientTelemetryBag() });
+  }, 4000);
+}
+telemetry.onReport(() => scheduleTelemetryReport()); // any counter change queues a coalesced report
+// Flush a final report when the tab is backgrounded/closed so short sessions aren't lost.
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      const h = hub();
+      if (h.sock.isOpen()) h.sock.send({ type: "telemetry.report", clientId, counters: clientTelemetryBag() });
+    }
+  });
+}
+/** Render the diagnostics panel (toggled with #diag or Ctrl/Cmd+Shift+D) — client + daemon counters. */
+function renderDiagnostics(): void {
+  const el = document.getElementById("diag-panel");
+  if (!el) return;
+  const c = clientTelemetryBag();
+  const row = (k: string, v: unknown) => `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`;
+  const clientRows = Object.entries(c).map(([k, v]) => row(k, v)).join("");
+  const serverRows = Object.entries(serverTelemetry.server).map(([k, v]) => row(k, v)).join("");
+  el.innerHTML =
+    `<div class="diag-head">Resilience diagnostics <button id="diag-close" class="mini">${icon("close")}</button></div>` +
+    `<div class="diag-cols"><div><h4>This client</h4><table>${clientRows}</table></div>` +
+    `<div><h4>Daemon</h4><table>${serverRows || "<tr><td>—</td></tr>"}</table></div></div>`;
+  document.getElementById("diag-close")?.addEventListener("click", () => toggleDiagnostics(false));
+}
+function toggleDiagnostics(show?: boolean): void {
+  let el = document.getElementById("diag-panel");
+  const wantShow = show ?? !el;
+  if (wantShow && !el) {
+    el = document.createElement("div");
+    el.id = "diag-panel";
+    document.body.appendChild(el);
+    telemetry.subscribe(() => { if (document.getElementById("diag-panel")) renderDiagnostics(); });
+    renderDiagnostics();
+  } else if (!wantShow && el) {
+    el.remove();
+  }
+}
+if (typeof window !== "undefined") {
+  (window as unknown as { __anvilDiag?: () => void }).__anvilDiag = () => toggleDiagnostics(true);
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "D" || e.key === "d")) {
+      e.preventDefault();
+      toggleDiagnostics();
+    }
+  });
+  if (location.hash === "#diag") toggleDiagnostics(true);
+}
 
 // Cache the rendered conversation per session so it shows instantly on reload, before the WS
 // even connects. Best-effort (skipped if it exceeds the localStorage quota).
@@ -501,6 +677,10 @@ function saveConvoCache(): void {
   clearTimeout(cacheTimer);
   cacheTimer = window.setTimeout(() => {
     try {
+      // The pane is shared: if we've since switched sessions (or are mid-load showing a skeleton), the
+      // DOM no longer belongs to `id` — writing it would clobber `id`'s cache with the wrong content
+      // (or a skeleton that would repaint as a frozen shimmer). Bail in both cases.
+      if (activeId !== id || conversation.querySelector(".convo-skeleton")) return;
       // Don't persist transient UI (the thinking indicator / empty state) — it would
       // re-paint as a frozen "stuck" status on return.
       const clone = conversation.cloneNode(true) as HTMLElement;
@@ -514,11 +694,11 @@ function saveConvoCache(): void {
         const title = a.querySelector(".activity-title");
         if (title) title.textContent = "Worked";
       });
-      const html = clone.innerHTML;
-      if (html.length < 1_500_000) localStorage.setItem(`anvil.convo.${id}`, html);
-      else localStorage.removeItem(`anvil.convo.${id}`);
+      // Persist to IndexedDB (spec D8) — no 1.5MB cliff, so a long transcript stays cached and
+      // delta-resumable instead of silently dropping to a full snapshot on the next reload.
+      void convoCache.set(id, clone.innerHTML);
     } catch {
-      /* quota exceeded — the snapshot still loads from the daemon */
+      /* best-effort — the snapshot still loads from the daemon */
     }
   }, 600);
 }
@@ -527,18 +707,16 @@ function saveConvoCache(): void {
 // (themePref/resolveTheme are hoisted function declarations, defined in the Theme section below.)
 document.documentElement.dataset.theme = resolveTheme(themePref());
 
-// instant restore: paint the hydrated sidebar + cached conversation immediately on load (works
-// fully offline; the daemon refreshes everything once the WS connects).
+// instant restore: paint the hydrated sidebar immediately on load. The conversation is skeleton-first
+// (spec D3/A7): we defer painting the cached transcript until the resume watermark verifies it's
+// current, or — if no server is reachable within the budget — paint it as the offline fallback.
 renderSessions();
 refreshPromptsButton();
 applyActiveTint();
+migrateLegacyConvoCache(); // one-time: drop pre-Phase-3 anvil.convo.* localStorage blobs (now in IDB)
 if (activeId) {
   if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
-  const cached = localStorage.getItem(`anvil.convo.${activeId}`);
-  if (cached) {
-    conversation.innerHTML = cached;
-    conversation.scrollTop = conversation.scrollHeight;
-  }
+  void loadConversation(activeId);
 } else {
   renderEmptyState();
 }
@@ -638,6 +816,7 @@ async function flushOutbox(): Promise<void> {
       if (item.cmd.sessionId === activeId) touchedActive = true;
       try {
         const res = await sendAwait(srv, { ...item.cmd, cid: item.cid });
+        telemetry.mark(res.type === "command.error" ? "flushFail" : "flushOk");
         if (res.type === "command.error") {
           toast(`Queued ${item.cmd.type} failed: ${res.message}`);
           if (item.tempId) {
@@ -659,18 +838,22 @@ async function flushOutbox(): Promise<void> {
     outboxQueue.replace(remaining);
     flushing = false;
     updateOutboxBadge();
-    // re-pull authoritative history for the active session so optimistic bubbles are replaced
+    // Reconcile the active session with a DELTA re-attach, not a full snapshot (spec A6): the daemon
+    // already broadcast the authoritative message.user (carrying each item's cid) as we flushed, which
+    // retired the optimistic bubbles in appendUser — so we only need to re-sync any tail we missed.
     if (touchedActive && activeId && serverOf(activeId)?.sock.isOpen()) {
-      snapshotLoaded.delete(activeId);
-      sendTo(activeId, { type: "session.attach", sessionId: activeId });
+      attachReconnect(activeId);
     }
   }
 }
 /** A created-offline session was realized on the daemon: migrate its cache + active selection. */
 function reconcileTemp(tempId: string, realId: string): void {
-  const conv = localStorage.getItem(`anvil.convo.${tempId}`);
-  if (conv) localStorage.setItem(`anvil.convo.${realId}`, conv);
-  localStorage.removeItem(`anvil.convo.${tempId}`);
+  void convoCache.move(tempId, realId); // carry the optimistic transcript over to the real session id
+  // Carry the resume watermark/seq too, so the reconciled session stays delta-resumable.
+  const ep = epochStore.get(tempId);
+  if (ep) epochStore.set(realId, ep);
+  const sq = seqStore.get(tempId);
+  if (sq) seqStore.set(realId, sq);
   sessions.delete(tempId);
   if (activeId === tempId) {
     activeId = realId;
@@ -684,7 +867,7 @@ function reconcileTemp(tempId: string, realId: string): void {
 /** A queued create was rejected: drop the pending session + its queued prompts. */
 function failTemp(tempId: string): void {
   sessions.delete(tempId);
-  localStorage.removeItem(`anvil.convo.${tempId}`);
+  void convoCache.delete(tempId);
   outboxQueue.removeWhere((i) => i.cmd.sessionId === tempId || i.tempId === tempId);
   persistSessions();
   if (activeId === tempId) deselectSession();
@@ -756,13 +939,17 @@ function setUpdateStatus(text: string): void {
 }
 function onStatus(url: string, status: "connecting" | "connected" | "disconnected"): void {
   const srv = servers.get(url);
+  const prev = srv?.status;
   if (srv) srv.status = status;
+  // Start the TTI/verify stopwatch when the hub begins (re)connecting (§5.7 timing gauges).
+  if (status === "connecting" && url === HUB_URL) connectStartedAt = Date.now();
   // The header dot reflects the ACTIVE session's server; per-server dots live in the sidebar groups.
   refreshConnDot();
   updateOutboxBadge();
   renderSessions(); // per-server status dots in the group headers
   if (document.querySelector(".settings-view")) renderServerCards(); // live status in Settings
   if (status === "connected") {
+    if (prev === "disconnected") telemetry.mark("reconnects"); // recovered from a real drop (spec §5.7)
     void flushOutbox(); // push anything queued while offline (routed per server)
     // The autopilot probes are sent from the server.hello handler instead — hello is the first frame
     // after open and carries the server's capabilities, so we only probe servers that support autopilot.
@@ -828,14 +1015,13 @@ function onEvent(url: string, e: ServerEvent): void {
       persistSessions();
       persistRouting();
       renderSessions();
-      // (re)attach the active session only if it lives on THIS server.
+      // (re)attach the active session only if it lives on THIS server. If it's already on screen this
+      // page-load, delta-resume without wiping the pane; otherwise run a full skeleton→cache→attach load.
       if (activeId && sessions.has(activeId) && sessionServer.get(activeId) === url) {
         setHeaderTitle(sessions.get(activeId));
-        if (snapshotLoaded.has(activeId)) {
-          sendTo(activeId, { type: "session.attach", sessionId: activeId, lastSeq: seqStore.get(activeId) });
-        } else {
-          sendTo(activeId, { type: "session.attach", sessionId: activeId });
-        }
+        if (snapshotLoaded.has(activeId)) attachReconnect(activeId);
+        else if (pendingLoadId === activeId) { /* a fresh load is already resolving; it will attach itself */ }
+        else void loadConversation(activeId);
       } else if (activeId && !sessions.has(activeId) && sessionServer.get(activeId) === url) {
         activeId = null; // the remembered session was on this server and is gone
         localStorage.removeItem("anvil.active");
@@ -897,6 +1083,8 @@ function onEvent(url: string, e: ServerEvent): void {
       if (e.sessionId === activeId) renderTeamBoard(sessions.get(activeId)!);
       return;
     case "server.hello": {
+      // First frame after open: time-to-interactive proxy (§5.7).
+      if (url === HUB_URL && connectStartedAt) telemetry.timeToInteractiveMs = Date.now() - connectStartedAt;
       // identify the server on this socket as soon as it opens (fleet §3/§6).
       const srv = servers.get(url);
       if (srv) {
@@ -1047,8 +1235,21 @@ function handleSessionEvent(e: ServerEvent): void {
     }
   }
   switch (e.type) {
+    case "resume.watermarks":
+      // v4 (§6.4): cache the per-session {epoch,lastSeq} this connection reports, then — if we were
+      // holding a skeleton waiting to verify the active session's cache — paint it now that it's valid.
+      if (connectStartedAt) telemetry.verifyMs = Date.now() - connectStartedAt; // §5.7 verify latency
+      for (const w of e.watermarks) serverWatermarks.set(w.sessionId, { epoch: w.epoch, lastSeq: w.lastSeq });
+      maybeFillValidatedCache(activeId);
+      return;
+    case "telemetry.snapshot":
+      serverTelemetry = { server: e.server, clients: e.clients }; // §5.7: daemon's aggregate view
+      if (document.getElementById("diag-panel")) renderDiagnostics();
+      return;
     case "conversation.snapshot":
       if (e.sessionId === activeId) clearAttachDiagnostic(); // history arrived — retire the blank-pane note
+      // A snapshot supersedes any deferred cache for this session — we're repainting authoritative state.
+      if (pendingCache?.id === e.sessionId) pendingCache = null;
       clearConversation();
       replayingSnapshot = true;
       renderSnapshotEvents(e.events);
@@ -1058,11 +1259,15 @@ function handleSessionEvent(e: ServerEvent): void {
       // session is actually mid-turn, the live status/message events that follow re-light it.
       finalizeActivity();
       snapshotLoaded.add(e.sessionId);
+      // Cache the resume lineage token + watermark so the NEXT reload can delta-resume instead of
+      // re-snapshotting (spec A1/A3) — this is the cross-reload win.
+      epochStore.set(e.sessionId, e.epoch);
+      serverWatermarks.set(e.sessionId, { epoch: e.epoch, lastSeq: e.lastSeq });
       if (e.sessionId === activeId) maybeShowSessionHero(); // no messages yet → show the session title card
       saveConvoCache();
       return;
     case "message.user":
-      appendUser(e.rendered.html, e.attachments, e.ts);
+      appendUser(e.rendered.html, e.attachments, e.ts, e.cid); // cid retires the matching optimistic bubble
       return;
     case "assistant.delta":
       appendDelta(e.text);
@@ -1224,11 +1429,18 @@ function timeEl(ts?: string): HTMLElement | null {
   return el;
 }
 
-function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string): void {
+function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string, cid?: string): void {
+  // Exactly-once reconciliation (v4, spec A6): the authoritative echo carries the send's cid — retire
+  // the matching optimistic bubble, and drop a true duplicate echo so exactly-once holds in the UI too.
+  if (cid && reconcileOptimistic(conversation, cid) === "duplicate") {
+    telemetry.mark("sendDuplicates");
+    return;
+  }
   resetActivity(); // a new user turn closes off the previous turn's activity block
   turnCanceled = false; // a fresh user turn starts clean
   pendingAnswerRefs = []; // don't carry a prior turn's un-committed links across
   const b = bubble("user");
+  if (cid) b.dataset.cid = cid; // tag so a later duplicate echo is recognised
   const md = document.createElement("div");
   md.className = "md";
   md.innerHTML = html; // daemon-sanitized (arch §8.3)
@@ -1258,14 +1470,15 @@ function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string
   scrollDown();
   saveConvoCache();
 }
-/** Optimistically render a queued (offline) user message; the authoritative copy replaces it
- *  when the outbox flushes and the session re-snapshots. */
-function appendOptimisticUser(text: string): void {
+/** Optimistically render a queued (offline) user message; the authoritative copy (delivered on flush,
+ *  carrying the same cid) retires this bubble — see appendUser's cid reconciliation (spec A6). */
+function appendOptimisticUser(text: string, cid: string): void {
   resetActivity();
   turnCanceled = false;
   pendingAnswerRefs = [];
   const b = bubble("user");
   b.classList.add("queued");
+  b.dataset.cid = cid; // matched against the authoritative message.user's cid on flush
   const md = document.createElement("div");
   md.className = "md";
   md.textContent = text; // plain text is safe; full markdown render comes from the daemon on flush
@@ -5238,14 +5451,6 @@ export function selectSession(id: string, push = true): void {
   restoreDraft(id); // bring in the incoming session's own draft (usually blank)
   setSessionHash(id, push && !reuseSidebarEntry); // reflect in the URL (history entry unless restoring via Back/Forward)
   stickToBottom = true; // a freshly opened session starts pinned to the latest
-  clearConversation();
-  const cached = localStorage.getItem(`anvil.convo.${id}`);
-  if (cached) {
-    conversation.innerHTML = cached; // instant, replaced by the snapshot below
-    scrollDown();
-  } else {
-    maybeShowSessionHero(); // fresh/empty session: show its title card now (no flash before the snapshot)
-  }
   renderSessions();
   // Bring the freshly-selected row into view in the sidebar so starting a project
   // from Autopilot (or any cross-view jump) lands you on its row, not just its
@@ -5256,12 +5461,12 @@ export function selectSession(id: string, push = true): void {
   const s = sessions.get(id);
   setHeaderTitle(s);
   applyActiveTint();
-  snapshotLoaded.delete(id);
   // Opening a session is acting on it — clear its push reminder on this device immediately (the
   // daemon also clears it everywhere when we attach below). (UI refinement §1)
   navigator.serviceWorker?.controller?.postMessage({ type: "close-notifications", sessionId: id });
   ensureOwningServer(id); // wake/adopt the owning daemon so a member session's history actually loads
-  sendTo(id, { type: "session.attach", sessionId: id }); // full snapshot (always show history)
+  // Skeleton-first load: skeleton → async cache → delta-resume when current, else a full snapshot.
+  void loadConversation(id);
   armAttachDiagnostic(id); // if no history arrives, replace the blank pane with a legible reason
   if (isNarrow() && !ui.sidebarCollapsed) {
     ui.sidebarCollapsed = true;
@@ -5374,13 +5579,20 @@ async function sendComposer(): Promise<void> {
   const text = input.value;
   if (!activeId || (!text.trim() && pendingAttachments.length === 0)) return;
   const s = sessions.get(activeId);
+  // Every send carries a stable cid (v4 exactly-once, spec A5/A6): online it lets the daemon dedupe a
+  // retry and lets us match the authoritative echo to any optimistic bubble; offline it's the outbox
+  // idempotency key the server dedupes on flush.
+  const cid = newCid();
   if (serverOf(activeId)?.sock.isOpen() && !s?.pending) {
-    sendTo(activeId, { type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id) });
+    sendTo(activeId, { type: "prompt.send", sessionId: activeId, text, attachmentIds: pendingAttachments.map((a) => a.id), cid });
   } else {
-    // offline, or a session that itself hasn't been created yet → queue + show optimistically
+    // offline, or a session that itself hasn't been created yet → queue it.
     if (pendingAttachments.length) toast("Attachments need a connection — sent text only");
-    enqueue({ cid: newCid(), cmd: { type: "prompt.send", sessionId: activeId, text } });
-    appendOptimisticUser(text);
+    enqueue({ cid, cmd: { type: "prompt.send", sessionId: activeId, text } });
+    // Only show an optimistic bubble for an ORDINARY prompt. Daemon-handled commands (/clear, /compact,
+    // /goal) emit no message.user, so an optimistic bubble would never be retired — an eternal orphan.
+    // They also produce no user bubble online, so skipping it is the consistent behaviour.
+    if (!isDaemonHandledCommand(text)) appendOptimisticUser(text, cid);
   }
   saveDraft(activeId, ""); // the draft was just sent — drop the stored copy
   pushHistory(activeId, text); // remember it for ArrowUp/ArrowDown recall
@@ -6169,7 +6381,7 @@ function purgeSessionLocally(id: string): void {
   sessions.delete(id);
   sessionServer.delete(id);
   removingSessions.delete(id); // cleanup finished (or never existed) — the row goes for good now
-  localStorage.removeItem(`anvil.convo.${id}`);
+  forgetConvoState(id); // drop the cached transcript + resume watermark for a session that's gone
   localStorage.removeItem(`anvil.draft.${id}`); // its unsent draft has nowhere to go now
   persistSessions();
   persistRouting();
@@ -6197,7 +6409,7 @@ function killSession(id: string): void {
     .catch(() => {
       /* offline / timeout — keep the row; a reachable daemon never confirmed it's gone */
     });
-  localStorage.removeItem(`anvil.convo.${id}`);
+  forgetConvoState(id); // drop the cached transcript + resume watermark for the abandoned session
   localStorage.removeItem(`anvil.draft.${id}`); // abandoning the session — its draft goes with it
   if (panelView) closePanel();
   if (activeId === id) {

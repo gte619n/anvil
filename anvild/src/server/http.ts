@@ -408,6 +408,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
           serverHelloEvent(identity, { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length }),
         ),
       ); // who am I — first frame (fleet §3/§6)
+      // Resume watermarks BEFORE session.list (v4, §6.4): the client's session.list handler drives the
+      // (re)attach, so the per-session {epoch,lastSeq} it verifies against must already be in hand.
+      ws.send(JSON.stringify(supervisor.resumeWatermarksEvent()));
       ws.send(JSON.stringify(supervisor.sessionListEvent()));
       ws.send(JSON.stringify(supervisor.teamInfoEvent())); // derived team tree alongside the session list
       ws.send(JSON.stringify(supervisor.budgetEvent()));
@@ -417,6 +420,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
+      ws.send(JSON.stringify(supervisor.telemetrySnapshotEvent())); // §5.7 resilience counters
       const sched = supervisor.autopilotScheduleEvent(); // schedule + live `running` state
       ws.send(JSON.stringify(sched));
       if (sched.running) ws.send(JSON.stringify(supervisor.autopilotRunSnapshotEvent())); // replay the in-flight run's log

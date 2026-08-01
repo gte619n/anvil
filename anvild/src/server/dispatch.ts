@@ -174,6 +174,14 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       case "prompt.send": {
         // attach so this connection receives the streamed turn (arch §6.4)
         conn.attached.add(cmd.sessionId);
+        // Exactly-once (v4, spec A5): a re-flushed offline send repeats its cid. If we already applied
+        // it, re-ack WITHOUT running the turn again — the client's 20s ack may have been lost to a drop,
+        // so the ack (not silence) is what lets it dequeue. Deliberately before any side effect.
+        if (cid && deps.supervisor.isPromptApplied(cmd.sessionId, cid)) {
+          deps.supervisor.noteServerCounter("promptDeduped"); // §5.7: exactly-once caught a re-flush
+          send(ack(cid));
+          return;
+        }
         let text = cmd.text;
         if (cmd.cites?.length) {
           const ctx = cmd.cites
@@ -181,7 +189,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
             .join("\n\n");
           text = `${ctx}\n\n${text}`;
         }
-        deps.supervisor.prompt(cmd.sessionId, text, cmd.attachmentIds ?? []);
+        deps.supervisor.prompt(cmd.sessionId, text, cmd.attachmentIds ?? [], cid);
         deps.supervisor.noteHumanPrompt(cmd.sessionId); // a human in the loop resets the team relay guard
         if (cid) send(ack(cid));
         return;
@@ -488,6 +496,14 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         // Heartbeat (§6.4): echo pong so the client can prove the socket is still alive and
         // detect a half-open connection. Deliberately not correlated — no cid, no ack.
         send({ v: PROTOCOL_VERSION, type: "pong", ts: now() });
+        return;
+
+      case "telemetry.report":
+        // §5.7: record this client's counters and rebroadcast the aggregate so every device (and the
+        // debug panel) sees the fleet-wide resilience picture. Best-effort — never fails a client.
+        deps.supervisor.recordClientTelemetry(cmd.clientId, cmd.counters);
+        deps.supervisor.broadcastTelemetry();
+        if (cid) send(ack(cid));
         return;
 
       default:

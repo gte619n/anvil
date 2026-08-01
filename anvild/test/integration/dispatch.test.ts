@@ -22,6 +22,7 @@ afterAll(() => {
 // run is actually in flight (never in these tests), so it's listed for completeness.
 const CONNECT_FRAMES = new Set([
   "server.hello",
+  "resume.watermarks", // v4 (§6.4): per-session {epoch,lastSeq}, sent on connect before session.list
   "session.list",
   "team.info",
   "budget",
@@ -33,6 +34,7 @@ const CONNECT_FRAMES = new Set([
   "lapo.status",
   "autopilot.schedule",
   "autopilot.run.snapshot",
+  "telemetry.snapshot", // v4 (§5.7): resilience counters, sent on connect
 ]);
 
 /**
@@ -92,14 +94,14 @@ test("session.create (existing-dir) → session.created with cid", async () => {
   expect(r.session.autonomy).toBe("mostly-autonomous");
 });
 
-test("on open: server.hello is the first frame, followed by session.list", async () => {
+test("on open: server.hello first, then resume.watermarks, then session.list", async () => {
   const frames = await new Promise<any[]>((resolve, reject) => {
     const ws = new WebSocket(`ws://localhost:${srv.port}/ws`);
     const got: any[] = [];
     const timer = setTimeout(() => reject(new Error("timeout")), 2000);
     ws.onmessage = (ev) => {
       got.push(JSON.parse(String(ev.data)));
-      if (got.length >= 2) {
+      if (got.length >= 3) {
         clearTimeout(timer);
         resolve(got);
         ws.close();
@@ -109,8 +111,11 @@ test("on open: server.hello is the first frame, followed by session.list", async
   expect(frames[0].type).toBe("server.hello"); // identifies the server before anything else (fleet §6)
   expect(frames[0].serverId).toMatch(/^srv_/);
   expect(typeof frames[0].serverName).toBe("string");
-  expect(frames[1].type).toBe("session.list");
-  expect(Array.isArray(frames[1].sessions)).toBe(true);
+  // v4 (§6.4): watermarks land BEFORE the session list, so the list handler can verify cached transcripts.
+  expect(frames[1].type).toBe("resume.watermarks");
+  expect(Array.isArray(frames[1].watermarks)).toBe(true);
+  expect(frames[2].type).toBe("session.list");
+  expect(Array.isArray(frames[2].sessions)).toBe(true);
 });
 
 test("env.add rejects a nonexistent path", async () => {

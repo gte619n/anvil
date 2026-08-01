@@ -5,6 +5,9 @@ import type { Session as SessionData } from "@protocol";
 export interface PersistedSession {
   data: SessionData;
   lastSeq: number;
+  /** Resume lineage token (v4). Absent on rows written by a pre-v4 daemon → the supervisor mints a
+   *  fresh one on load, which harmlessly forces one full snapshot on the next client attach. */
+  epoch?: string;
 }
 
 /**
