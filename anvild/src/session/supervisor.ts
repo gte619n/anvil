@@ -85,6 +85,7 @@ import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
+import { EnvironmentService } from "./environment-service";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildPlanningBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
@@ -259,6 +260,8 @@ export class Supervisor {
   private readonly integrationsFacade: IntegrationsFacade;
   /** Claude multi-account roster domain (P7 extraction). Constructed in the ctor once its deps exist. */
   private readonly accountRoster: AccountRosterService;
+  /** Environment (project) CRUD + clone + README domain (P7 extraction). */
+  private readonly environments: EnvironmentService;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
   // The live run is tracked by a START TIMESTAMP, not a boolean — `running` is DERIVED from it (below),
@@ -324,6 +327,12 @@ export class Supervisor {
     this.devPipelineMetrics = loadMetrics(cfg.stateDir);
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
+    this.environments = new EnvironmentService({
+      envStore: this.envStore,
+      registry: this.registry,
+      clonesDir: this.clonesDir,
+      renderer: this.renderer,
+    });
     this.promptStore = new PromptStore(cfg.stateDir);
     this.updateState = new UpdateStateStore(cfg.stateDir);
     this.modelLabels = new ModelLabelStore(cfg.stateDir);
@@ -455,34 +464,19 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.rateLimits.snapshot() };
   }
 
+  // ── Environments (projects) — delegated to EnvironmentService (P7 extraction). environmentsEvent is
+  // kept here as a thin delegation because several other Supervisor domains + AccountRosterService read it.
   environmentsEvent(): EnvironmentsEvent {
-    return { v: PROTOCOL_VERSION, type: "environments", ts: now(), environments: this.envStore.list() };
+    return this.environments.environmentsEvent();
   }
   getEnvironment(id: string): Environment | undefined {
-    return this.envStore.get(id);
+    return this.environments.getEnvironment(id);
   }
   addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string, icon?: string): void {
-    try {
-      this.envStore.add(name, repoRoot, defaultBase, color, icon);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.addEnvironment(name, repoRoot, defaultBase, color, icon);
   }
-  /** Clone a git URL into `clonesDir` (host git auth) and register it as an environment. */
   cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string, icon?: string): void {
-    let dest: string;
-    try {
-      dest = git.cloneRepo(url, this.clonesDir).dest;
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    try {
-      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color, icon);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.cloneEnvironment(url, name, defaultBase, color, icon);
   }
 
   private updating = false; // guards against concurrent applyUpdate (double-click → racing builds)
@@ -527,19 +521,8 @@ export class Supervisor {
       return { ...base, ok: false, phase: "error", output: e instanceof Error ? e.message : String(e) };
     }
   }
-  /** Read & render an environment repo's README (arch §8). */
   envReadme(id: string): { markdown?: ReturnType<MarkdownRenderer["render"]>; text?: string; missing?: boolean } {
-    const env = this.envStore.get(id);
-    if (!env) throw new BadCommand(`no such environment: ${id}`);
-    for (const name of ["README.md", "README.markdown", "Readme.md", "readme.md", "README", "README.txt"]) {
-      const p = join(env.repoRoot, name);
-      if (existsSync(p)) {
-        const raw = readFileSync(p, "utf8").slice(0, 256 * 1024);
-        const isMd = /\.(md|markdown)$/i.test(name) || name === "README";
-        return isMd ? { markdown: this.renderer.render(raw) } : { text: raw };
-      }
-    }
-    return { missing: true };
+    return this.environments.envReadme(id);
   }
   updateEnvironment(
     id: string,
@@ -553,8 +536,7 @@ export class Supervisor {
       accountId?: string | null;
     },
   ): void {
-    this.envStore.update(id, fields);
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.updateEnvironment(id, fields);
   }
 
   // ── Prompt library (saved composer snippets, synced across a user's devices) ───
@@ -1835,8 +1817,7 @@ export class Supervisor {
   }
 
   removeEnvironment(id: string): void {
-    this.envStore.remove(id);
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.removeEnvironment(id);
   }
 
   /** Events to send a (re)attaching connection (arch §6.4): replay seq > lastSeq, else snapshot. */
