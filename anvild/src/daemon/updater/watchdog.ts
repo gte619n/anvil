@@ -107,16 +107,24 @@ export class UpdateWatchdog {
       this.deps.state.set({ phase: "error", reason: `${reason}; rollback FAILED: ${e instanceof Error ? e.message : String(e)}` });
       return "rollback-failed";
     }
-    // [BE2-31] rollback() spends minutes resetting + rebuilding. The gate is a deadline, not proof of
+    // [BE2-31] rollback() spends minutes resetting + rebuilding; the gate is a deadline, not proof of
     // failure — the original boot may have finally gone healthy on the target DURING those minutes.
-    // Re-probe before the (previously UNCONDITIONAL) restart: if the target is now healthy, adopt it and
-    // skip the backwards restart, which would otherwise reset a now-healthy daemon and manufacture the
-    // very restart-storm class this backstop exists to prevent.
+    // Re-probe before the (previously UNCONDITIONAL) restart: if the target is now healthy, DON'T restart
+    // it backwards — that reset of a now-healthy daemon is the restart-storm class this backstop exists
+    // to prevent. But note rollback() has ALREADY reset the checkout to prePullSha, so disk == prePullSha
+    // is the known-good; we must NOT record the target as known-good (that would make a future failed
+    // update "roll back" to the un-reverted target, and the next restart reverts this process anyway).
+    // So record the truthful rolled-back-to-prePullSha state and just leave the healthy process running;
+    // it boots the reverted (safe) source on its next natural restart, with no forced backwards restart now.
     const after = await this.deps.health().catch(() => null);
     if (after && after.ok && after.webBundleOk && shaMatches(shaOf(after.version), rec.targetSha)) {
-      this.deps.state.set({ phase: "healthy", prePullSha: shaOf(after.version), reason: undefined });
-      this.log(`[watchdog] ${rec.targetSha} became healthy during rollback — adopting, restart skipped`);
-      return "healthy";
+      this.deps.state.set({
+        phase: "rolled-back",
+        targetSha: rec.prePullSha,
+        reason: `${reason}; ${rec.targetSha} became healthy during rollback but disk was already reverted — left the healthy process running instead of restarting it backwards`,
+      });
+      this.log(`[watchdog] ${rec.targetSha} became healthy during rollback; disk reverted to ${rec.prePullSha}, skipping the backwards restart`);
+      return "rolled-back";
     }
     this.deps.state.set({ phase: "rolled-back", targetSha: rec.prePullSha, reason });
     this.deps.restartDaemon();

@@ -569,6 +569,9 @@ if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flushSeq();
   });
+  // Also flush on pagehide (bfcache/teardown may fire it without a reliable visibilitychange:hidden),
+  // mirroring flushPersistSessions — so the last throttled seq isn't lost on a hard close.
+  if (typeof window !== "undefined") window.addEventListener("pagehide", flushSeq);
 }
 // v4 resume (incremental-offline-resilience.md §5): the client caches each session's `epoch` alongside
 // its `seq`. On (re)connect the daemon sends `resume.watermarks` (per-session {epoch,lastSeq}); if the

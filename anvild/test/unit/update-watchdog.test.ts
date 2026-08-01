@@ -110,7 +110,7 @@ test("[BE2-29] does NOT roll back a live daemon still legitimately building past
   expect(h.calls.rollback.length).toBe(0);
 });
 
-test("[BE2-31] a target that becomes healthy DURING rollback is adopted, not restarted backwards", async () => {
+test("[BE2-31] a target that becomes healthy DURING rollback is NOT restarted backwards, and disk stays consistent", async () => {
   const state = new UpdateStateStore(tmp());
   let clock = 0;
   let health: HealthProbe | null = null; // unreachable through the gate
@@ -119,8 +119,8 @@ test("[BE2-31] a target that becomes healthy DURING rollback is adopted, not res
     state,
     health: async () => health,
     rollback: async (sha) => {
-      calls.rollback.push(sha);
-      health = { ok: true, version: "0.2.1+newsha", webBundleOk: true }; // recovered during the rebuild
+      calls.rollback.push(sha); // rollback resets the CHECKOUT to prePullSha (oldsha)
+      health = { ok: true, version: "0.2.1+newsha", webBundleOk: true }; // process recovered during the rebuild
     },
     restartDaemon: () => calls.restart++,
     now: () => clock,
@@ -130,10 +130,13 @@ test("[BE2-31] a target that becomes healthy DURING rollback is adopted, not res
   expect(await wd.tick()).toBe("waiting"); // arm (health null)
   clock += 180_001; // gate elapses
   const r = await wd.tick();
-  expect(calls.rollback).toEqual(["oldsha"]); // rollback WAS attempted
-  expect(r).toBe("healthy"); // …but the re-probe found the target healthy → adopt
-  expect(calls.restart).toBe(0); // and the backwards restart was SKIPPED (no restart storm)
-  expect(state.get().phase).toBe("healthy");
+  expect(calls.rollback).toEqual(["oldsha"]); // rollback ran → disk is now oldsha
+  expect(r).toBe("rolled-back");
+  expect(calls.restart).toBe(0); // the now-healthy process is NOT restarted backwards (no restart storm)
+  // Known-good MUST stay the on-disk SHA (oldsha), NOT the target — else a future failed update would
+  // "roll back" to the un-reverted target and the next restart would silently revert this process.
+  expect(state.get().phase).toBe("rolled-back");
+  expect(state.get().targetSha).toBe("oldsha");
 });
 
 test("fails safe (no rollback attempt) when there is no pre-pull SHA to revert to", async () => {

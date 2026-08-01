@@ -1121,6 +1121,7 @@ export class Supervisor {
       this.lastTeamInfoJson = json;
       this.registry.toAll(ev);
     }, 250);
+    this.teamInfoTimer.unref?.(); // never hold the process/test open for a coalesced broadcast
   }
 
   /** Build the lead-only orchestration MCP server, closed over this lead's session id. */
@@ -2182,6 +2183,7 @@ export class Supervisor {
       this.telemetryBroadcastTimer = null;
       this.registry.toAll(this.telemetrySnapshotEvent());
     }, 250);
+    this.telemetryBroadcastTimer.unref?.(); // never hold the process/test open for a coalesced broadcast
   }
 
   create(cmd: SessionCreateCmd): Session {
