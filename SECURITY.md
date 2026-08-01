@@ -12,9 +12,15 @@ public interface, port-forward it, or place it behind a reverse proxy that termi
 tailnet. Restrict access with Tailscale ACLs so only the intended devices/users can reach it. If you
 need to narrow access further, use tailnet ACLs — not an app-layer password.
 
-Because there is no app-layer auth, anyone who can route to `host:7701` can drive the full API
-(create/reset sessions, read worktree files, answer permission prompts, trigger a self-update).
-That is acceptable **only** under the tailnet boundary above.
+Because there is (deliberately) no app-layer password, anyone who can route to `host:7701` can drive
+most of the API. That is acceptable **only** under the tailnet boundary above. Two **narrow exceptions**
+exist as defense-in-depth — they are NOT app-layer auth, they gate specific abuse vectors the network
+boundary can't:
+- **Identity gate** on the fleet-credential + update-apply routes: a caller `whois` proves is a
+  *different* tailnet user is rejected even on-tailnet (`resolveCallerIdentity`, `src/server/pairing.ts`);
+  a `sameUser`/`unknown` caller proceeds. The `Tailscale-User-Login` header is trusted only from loopback.
+- **Origin gate** on `/ws` **and every state-mutating `/api/*` route**: a foreign browser Origin is
+  rejected, closing the cross-site-from-a-trusted-browser vector (below).
 
 ## What the daemon still defends against (independent of the network boundary)
 
@@ -28,10 +34,18 @@ perimeter can't:
 - **`git clone` argument injection.** Clone URLs are allowlisted to `https://` / `ssh://` / scp-form
   and the `ext::` remote-helper transport is disabled, so a crafted URL can't run a shell command
   (`src/git/ops.ts` `assertSafeCloneUrl`).
-- **Cross-site WebSocket hijack.** The `/ws` upgrade checks the browser `Origin` and rejects foreign
-  origins, so a malicious website loaded in a *trusted device's* browser can't drive the daemon
-  (`src/server/origin.ts`). Native clients and the same-origin PWA are allowlisted; set
-  `ANVIL_ALLOWED_ORIGINS` (comma-separated) to permit additional first-party origins.
+- **Cross-site WebSocket / REST hijack.** The `/ws` upgrade **and every state-mutating `/api/*` route**
+  check the browser `Origin` and reject foreign origins, so a malicious website loaded in a *trusted
+  device's* browser can't drive the daemon (`src/server/origin.ts`; the REST gate also requires
+  `application/json` on `/api/update/v1/apply` to defeat the CORS simple-request bypass). Native clients
+  and the same-origin PWA are allowlisted; set `ANVIL_ALLOWED_ORIGINS` (comma-separated) to permit
+  additional first-party origins.
+- **Update integrity.** Self-update / fleet-rollout is unattended, so the daemon anchors trust in git:
+  a target SHA must be an **ancestor of the trusted upstream tip** before checkout
+  (`applyUpdateToTarget`), so a fleet-update route can only move the checkout to a commit reachable from
+  the release track — never an arbitrary attacker commit. The out-of-process watchdog's rollback is a
+  **health** guarantee (a bad build is reverted), NOT an **authenticity** one — authenticity is the
+  ancestry gate. See [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) §5.
 - **Path containment.** Attachment and worktree file access is confined to the session directory;
   client-supplied filenames/ids can't traverse out (`src/attach/store.ts`, `src/fs/session-fs.ts`).
 - **Local file permissions.** Files holding secrets (env file, push registries, VAPID key) are

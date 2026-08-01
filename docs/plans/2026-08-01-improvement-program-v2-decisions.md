@@ -170,6 +170,29 @@ Web (WEB2-11/13/14/15 done; WEB2-2/16 deferred):
 
 ## P5 (baseline fix — done first to get a clean baseline)
 
+## P6 — CI/CD hardening (CI2-2/3/5/6/9/10 done; CI2-1/4/7/12 deferred)
+
+- [CI2-6] Pinned Bun 1.3.14 in all release.yml ship jobs + a `workflow-lint` CI job that greps for and
+  fails on `bun-version: latest`.
+- [CI2-9] `version.ts` derives MAJOR.MINOR from the repo `VERSION` file (was reading the frozen
+  package.json 0.2.0). Guard: `version.test.ts` pins MAJOR.MINOR == VERSION.
+- [CI2-5] `meta` job now `needs:[verify]` — a red verify no longer mints a tag+assetless Release.
+  Version number still computed from the run number, early enough for all consumers.
+- [CI2-3] Appcast seed distinguishes 404 (legit first release → start fresh) from any other HTTP code
+  (fail, don't rebuild the feed and drop 20-item rollback history on a transient Pages error).
+- [CI2-2] Assert the Sparkle `edSignature` matches `^[A-Za-z0-9+/=]{80,120}$` + numeric length before
+  trusting it (sed echoes input unchanged on no-match → would silently ship a garbage EdDSA signature).
+- [CI2-10] Added Dependabot `swift` ecosystem for `/apple` + `/anvil-server` (Sparkle was unmonitored).
+- DEFERRED (need CI runs to validate safely, or larger surface):
+  - CI2-1 (path-filtered native PR builds: `:app:assembleDebug`, `swift build`, `xcodegen` lint) —
+    high value but I can't validate a green Android/Swift build run from here; the debug keystore + secrets
+    wiring must be exercised in CI. Pair with the E2E `headless-smoke` promotion (P5).
+  - CI2-4 (composite `apple-signing` action + matrix the two mac jobs) — behavior-preserving refactor,
+    best verified by a real signing run.
+  - CI2-7 (signed-tag/commit verification) — overlaps SEC2-1's ancestry gate (done); the full
+    `git verify-commit` against an allowed-signers file is a separate keying decision.
+  - CI2-12 (per-platform rollback docs + optional `release_ref` dispatch) — folded into P8 docs backlog.
+
 ## P5 — Test coverage (runs with P0–P4; standalone additions)
 
 - Baseline red fixed (below). Each P0–P4 item shipped with its named guard (see those sections).

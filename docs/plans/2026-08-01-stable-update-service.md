@@ -1,6 +1,11 @@
 # Stable Update Service & Deterministic Fleet Rollout
 
-- **Status:** Draft — approved for interview-locked design, implementation not started
+- **Status:** **Implemented** (shipped 2026-08). The frozen Update API v1 (`src/daemon/update-api.ts`),
+  the out-of-process watchdog (`src/daemon/updater/*`), the pinned-target rollout coordinator
+  (`src/server/fleet-rollout.ts`), and the persisted update/desired-target stores all landed and are
+  under test (`update-api*.test.ts`, `update-watchdog.test.ts`, `fleet-rollout.test.ts`,
+  `fleet-sim.test.ts`). Improvement-program v2 (2026-08-01) hardened it further (BE2-28/29/30/31/33 —
+  see that decision log). Original interview-locked design preserved below for reference.
 - **Date:** 2026-08-01
 - **Branch:** `update-service` (worktree)
 - **Owner:** Evan Ruff

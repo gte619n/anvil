@@ -122,7 +122,9 @@ One **WebSocket** per client connection carries a typed, versioned, **sequenced*
 stream. A small REST plane handles health and bulk uploads (attachments). Per session there
 are two logical channels: `conversation` (structured) and `terminal` (raw PTY bytes, opened
 lazily). The full type definitions are in
-[`plans/anvil-protocol.ts`](plans/anvil-protocol.ts) (`PROTOCOL_VERSION = 1`).
+[`plans/anvil-protocol.ts`](plans/anvil-protocol.ts) — the `PROTOCOL_VERSION` constant at the head of
+that file is the single source of truth (it is currently **4**; the resume/watermark/epoch machinery in
+this section is v4). Do not re-embed the number here — it has rotted before; cite the file.
 
 Every server→client session event carries a **per-session monotonic `seq`**. That single
 field is the backbone of resume:
