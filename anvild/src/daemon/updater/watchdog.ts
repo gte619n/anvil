@@ -15,6 +15,7 @@
  * multi-daemon fleet-sim.
  */
 import type { UpdateStateStore } from "../update-state";
+import { shaMatches, shaOf } from "../sha"; // [BE2-33] shared, min-length-guarded
 
 /** What the daemon's /api/health tells the watchdog. null ⇒ unreachable this poll (mid-restart, or the
  *  new build won't boot). */
@@ -40,17 +41,7 @@ export interface WatchdogDeps {
 export type TickResult = "idle" | "waiting" | "healthy" | "rolled-back" | "rollback-failed";
 
 const DEFAULT_GATE_MS = 180_000;
-
-/** The short SHA embedded in a VERSION string ("0.2.1+abc1234" → "abc1234"). */
-function shaOf(version: string | undefined): string {
-  if (!version) return "";
-  const i = version.indexOf("+");
-  return i >= 0 ? version.slice(i + 1) : version;
-}
-/** Two abbreviated SHAs referring to the same commit (either may be the shorter abbreviation). */
-function shaMatches(a: string, b: string): boolean {
-  return !!a && !!b && (a.startsWith(b) || b.startsWith(a));
-}
+// [BE2-33] shaOf/shaMatches are shared (min-length-guarded) — see ../sha.ts.
 
 export class UpdateWatchdog {
   private armedTarget: string | null = null;
@@ -66,7 +57,12 @@ export class UpdateWatchdog {
   /** One evaluation step. Returns what it decided so tests can assert the state machine directly. */
   async tick(): Promise<TickResult> {
     const rec = this.deps.state.get();
-    if (rec.phase !== "restarting" || !rec.targetSha) {
+    // [BE2-29] Arm across the WHOLE mutating window, not just "restarting". A crash mid-`bun install`/
+    // build leaves the phase at "pulling"/"building" with the checkout already moved to the target; the
+    // old guard (restarting-only) left the watchdog idle, so launchd respawned broken source with nothing
+    // armed to roll it back — the longest hole in the "survives a bricked release" backstop.
+    const inFlight = rec.phase === "pulling" || rec.phase === "building" || rec.phase === "restarting";
+    if (!inFlight || !rec.targetSha) {
       this.armedTarget = null; // not mid-update — disarm
       return "idle";
     }
@@ -88,6 +84,15 @@ export class UpdateWatchdog {
 
     if (this.deps.now() < this.deadline) return "waiting";
 
+    // [BE2-29] During pulling/building the daemon is still UP doing the work (install/build are async
+    // spawns; the old bundle keeps serving). A live, healthy daemon that simply hasn't restarted yet is
+    // NOT a failure — only a crash (unreachable) is. So past the gate in these phases, keep waiting while
+    // the daemon is alive; roll back only once it goes unreachable/unhealthy. ("restarting" keeps its
+    // original semantics: a live-but-not-on-target daemon there means the restart never landed → roll back.)
+    if ((rec.phase === "pulling" || rec.phase === "building") && h && h.ok) {
+      return "waiting";
+    }
+
     // Gate elapsed — the update failed to come up. Roll back to the pre-pull SHA and restart.
     this.armedTarget = null;
     const reason = `health gate timed out after ${Math.round(this.gateMs / 1000)}s (daemon did not become healthy on ${rec.targetSha})`;
@@ -101,6 +106,17 @@ export class UpdateWatchdog {
     } catch (e) {
       this.deps.state.set({ phase: "error", reason: `${reason}; rollback FAILED: ${e instanceof Error ? e.message : String(e)}` });
       return "rollback-failed";
+    }
+    // [BE2-31] rollback() spends minutes resetting + rebuilding. The gate is a deadline, not proof of
+    // failure — the original boot may have finally gone healthy on the target DURING those minutes.
+    // Re-probe before the (previously UNCONDITIONAL) restart: if the target is now healthy, adopt it and
+    // skip the backwards restart, which would otherwise reset a now-healthy daemon and manufacture the
+    // very restart-storm class this backstop exists to prevent.
+    const after = await this.deps.health().catch(() => null);
+    if (after && after.ok && after.webBundleOk && shaMatches(shaOf(after.version), rec.targetSha)) {
+      this.deps.state.set({ phase: "healthy", prePullSha: shaOf(after.version), reason: undefined });
+      this.log(`[watchdog] ${rec.targetSha} became healthy during rollback — adopting, restart skipped`);
+      return "healthy";
     }
     this.deps.state.set({ phase: "rolled-back", targetSha: rec.prePullSha, reason });
     this.deps.restartDaemon();

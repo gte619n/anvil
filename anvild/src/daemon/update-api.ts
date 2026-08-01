@@ -17,6 +17,7 @@ import { VERSION } from "../version";
 import * as selfupdate from "./selfupdate";
 import type { CommandRunner } from "./selfupdate";
 import type { UpdateStateStore } from "./update-state";
+import { shaMatches as shaEq } from "./sha"; // [BE2-33] shared, min-length-guarded
 
 export interface UpdateApiDeps {
   state: UpdateStateStore;
@@ -28,11 +29,6 @@ export interface UpdateApiDeps {
   isManaged?: () => boolean;
   /** Ask the service manager to restart (applies the pulled code). */
   scheduleRestart?: () => void;
-}
-
-/** Two abbreviated SHAs referring to the same commit (either may be the shorter abbreviation). */
-function shaEq(a: string, b: string): boolean {
-  return !!a && !!b && (a.startsWith(b) || b.startsWith(a));
 }
 
 /** GET /api/update/v1/check — fetch + report how far behind + whether a restart alone would apply a
@@ -55,7 +51,36 @@ export async function updateCheck(deps: UpdateApiDeps): Promise<rest.update.Chec
  * watchdog can roll back a bad boot. Phase transitions are persisted so `/status` (and a hub observing
  * the rollout) can follow along across the restart.
  */
+// [BE2-28] Cross-transport concurrency guard. The legacy WS `private updating` flag only protected that
+// one path; the v1 `/apply` route AND the fleet-rollout `applySelf` both delegate here and could
+// interleave two applies — corrupting the checkout mid-`bun install`/build and poisoning `prePullSha`.
+// A single module-level in-flight promise serializes ALL of them: a second apply while one is running
+// gets a clean "already in progress" instead of racing the tree.
+let applyInFlight: Promise<rest.update.ApplyResponse> | null = null;
+
 export async function updateApply(req: rest.update.ApplyRequest, deps: UpdateApiDeps): Promise<rest.update.ApplyResponse> {
+  if (applyInFlight) {
+    return {
+      ok: false,
+      updateApiVersion: UPDATE_API_VERSION,
+      currentVersion: VERSION,
+      phase: "error",
+      willRestart: false,
+      prePullSha: deps.state.get().prePullSha,
+      targetSha: deps.state.get().targetSha,
+      output: "",
+      error: "an update is already in progress",
+    };
+  }
+  applyInFlight = doUpdateApply(req, deps);
+  try {
+    return await applyInFlight;
+  } finally {
+    applyInFlight = null;
+  }
+}
+
+async function doUpdateApply(req: rest.update.ApplyRequest, deps: UpdateApiDeps): Promise<rest.update.ApplyResponse> {
   const run = deps.run;
   const currentVersion = VERSION;
   const running = selfupdate.runningSha();

@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { GIT_ENV } from "../git/spawn";
 import { VERSION } from "../version";
+import { shaMatches } from "./sha";
 
 /** Service label — must match LABEL in scripts/service.sh (launchd) / the systemd unit name. */
 const SERVICE_LABEL = "com.anvil.anvild";
@@ -28,10 +29,7 @@ export function runningSha(): string {
   return i >= 0 ? VERSION.slice(i + 1) : "";
 }
 
-/** Whether two abbreviated SHAs refer to the same commit (either may be the shorter abbreviation). */
-function shaMatches(a: string, b: string): boolean {
-  return !!a && !!b && (a.startsWith(b) || b.startsWith(a));
-}
+// [BE2-33] shaMatches is shared (min-length-guarded) — see ./sha.ts.
 
 /** The anvild package dir (where package.json + build:web live): .../anvild */
 const anvildDir = join(import.meta.dir, "..", "..");

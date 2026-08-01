@@ -354,20 +354,38 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // http-only member stays http) and heal url + serverId so every client, on any page protocol, gets the
   // scheme the member actually answers on. Cheap: only unresolved records are probed, and once healed to a
   // real `srv_…` id they're skipped forever.
+  // [BE2-10] Throttled + fully defensive. This used to be `await`ed on every GET /api/fleet/members with
+  // no throttle, and a single malformed stored `m.url` made `new URL(...)` throw THROUGH `Promise.all`,
+  // so the endpoint 500'd forever (until fleet.json was hand-edited). Now it is fire-and-forget
+  // (`void`ed at the call site), throttled like healFleetUrlsByDiscovery, and every per-member step is
+  // wrapped so one bad record can never reject the whole pass.
+  let lastStaleHealAt = 0;
   async function healStaleFleetRecords(): Promise<void> {
     const stale = fleet.list().filter((m) => !m.serverId.startsWith("srv_"));
     if (stale.length === 0) return;
+    const nowMs = Date.now();
+    if (nowMs - lastStaleHealAt < 20_000) return; // bound the probe cost across a client's polling
+    lastStaleHealAt = nowMs;
     await Promise.all(
       stale.map(async (m) => {
-        const port = Number(new URL(m.url).port) || opts.port;
-        const r = await resolveMember(m.host, port);
-        const healedUrl = r.url || m.url;
-        const healedServerId = r.serverId ?? m.serverId;
-        const healedServerName = r.serverName || m.serverName;
-        if (healedUrl === m.url && healedServerId === m.serverId && healedServerName === m.serverName) return;
-        fleet.upsert({ ...m, url: healedUrl, serverId: healedServerId, serverName: healedServerName });
-        if (healedUrl !== m.url) console.log(`[fleet] healed member URL ${m.url} → ${healedUrl}`);
-        if (healedServerId !== m.serverId) console.log(`[fleet] healed member serverId ${m.serverId} → ${healedServerId}`);
+        try {
+          let port = opts.port;
+          try {
+            port = Number(new URL(m.url).port) || opts.port; // a torn/legacy url must not throw the pass
+          } catch {
+            /* malformed stored url — fall back to the default port and still try to heal */
+          }
+          const r = await resolveMember(m.host, port);
+          const healedUrl = r.url || m.url;
+          const healedServerId = r.serverId ?? m.serverId;
+          const healedServerName = r.serverName || m.serverName;
+          if (healedUrl === m.url && healedServerId === m.serverId && healedServerName === m.serverName) return;
+          fleet.upsert({ ...m, url: healedUrl, serverId: healedServerId, serverName: healedServerName });
+          if (healedUrl !== m.url) console.log(`[fleet] healed member URL ${m.url} → ${healedUrl}`);
+          if (healedServerId !== m.serverId) console.log(`[fleet] healed member serverId ${m.serverId} → ${healedServerId}`);
+        } catch (e) {
+          console.warn(`[fleet] heal of ${m.host} failed (ignored): ${e instanceof Error ? e.message : e}`);
+        }
       }),
     );
   }
@@ -397,6 +415,21 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (!stored || stored.url === heal.url) continue; // re-read: a concurrent upsert may have moved it
       fleet.upsert({ ...stored, url: heal.url });
       console.log(`[fleet] healed member URL ${stored.url} → ${heal.url} (via discovery)`);
+    }
+  }
+
+  // [BE2-12] Wire the previously-DEAD reconcile() off the members path. A member that was offline at
+  // rollout time is marked pending-offline and must be nudged to the pinned desired target when it
+  // reappears (spec D18/D19) — without a call site those members stayed stranded on an old SHA forever.
+  // Throttled + fire-and-forget; reconcile() is a no-op when there's no desired target or the member is
+  // already converged, so the common case costs one cheap probe per member at most every 30s.
+  let lastReconcileAt = 0;
+  async function reconcileFleetMembers(): Promise<void> {
+    const nowMs = Date.now();
+    if (nowMs - lastReconcileAt < 30_000) return;
+    lastReconcileAt = nowMs;
+    for (const m of fleet.list()) {
+      await fleetRollout.reconcile({ serverId: m.serverId, serverName: m.serverName, url: m.url }).catch(() => {});
     }
   }
 
@@ -563,8 +596,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
       // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
       if (url.pathname === "/api/fleet/members" && req.method === "GET") {
-        await healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
-        void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP; healed url lands on the next poll
+        // [BE2-10] Both heals are fire-and-forget so a slow/failed probe never blocks (or 500s) this GET;
+        // the healed url/serverId lands on the next poll. The endpoint must always answer fast with the
+        // current roster.
+        void healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
+        void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP
+        void reconcileFleetMembers(); // [BE2-12] converge any pending-offline member to the pinned target
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
       }
       // Read-only roster for the session-start picker, readable from ANY origin so a member's client

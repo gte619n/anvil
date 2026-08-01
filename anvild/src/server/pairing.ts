@@ -20,6 +20,10 @@ import { join } from "node:path";
 export const DEFAULT_ARM_TTL_MS = 10 * 60_000;
 /** Hard ceiling on a client-requested TTL — the window is a credential-accepting hole (§8.2). */
 export const MAX_ARM_TTL_MS = 30 * 60_000;
+/** [BE2-13] Brute-force cap: after this many rejected attempts the window disarms itself, so the ~10⁶
+ *  code space can't be walked during a 30-min armed window (the prize being the hub's OAuth token). A
+ *  legitimate operator mistypes once or twice; five wrong attempts is unambiguously an attack. */
+export const MAX_PAIR_ATTEMPTS = 5;
 
 export type PairRejection = "not accepting pairings" | "wrong code" | "expired" | "different tailnet user" | "locked to another hub";
 
@@ -101,6 +105,9 @@ export class PairingWindow {
     }
     if (!codesMatch(w.code, code ?? "")) {
       this.countRejection();
+      // [BE2-13] Disarm once the attempt cap is reached so a subsequent guess (even a correct one) is
+      // turned away — closes the brute-force window on the ~10⁶ code space.
+      if (w.rejections >= MAX_PAIR_ATTEMPTS) this.armed = null;
       return "wrong code";
     }
     w.lockedHubServerId = hubServerId;
