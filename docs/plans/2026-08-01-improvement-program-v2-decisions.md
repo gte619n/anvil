@@ -38,6 +38,48 @@ Format: `[TAG] decision — rationale`.
 
 ---
 
+## P1 — Deterministic crashes & event-loop freezes
+
+Web (all tested, green):
+- [WEB2-1] Deferred the cold deep-link init calls (`openPlanDeepLink`/`openAutopilot`) to
+  `queueMicrotask` so they run after the module body finishes — the same fix `2059142` applied to
+  `loadConversation`. Guard: extended `boot-init.test.ts` — build once, run 3 scenarios (returning
+  user with a matching persisted session for the setHeaderTitle branch, `#autopilot`, `#p/<id>`),
+  assert `initErr === null`. Seeded a *complete* Session in the returning-user case (partial objects
+  crash setHeaderTitle on a missing field — itself a latent boot-crash class, but out of WEB2-1 scope).
+- [WEB2-10] Added `safeLocalSet` (try/catch) and routed epoch + seq persistence through it; seq is now
+  throttled (in-memory, flushed ≤1/s and on tab-hide) off the delta hot path. Wrapped `onEvent` in
+  ws.ts in try/catch + console.error. Guard: `ws.test.ts` — a throwing onEvent is caught, socket stays
+  OPEN, subsequent frames still delivered.
+- [WEB2-12] Stored the window `online` / document `visibilitychange` handler refs and remove them in
+  `close()`. Guard: `ws.test.ts` asserts add/remove counts (dispatch-based check dropped — earlier
+  tests in the shared jsdom process leak un-closed sockets that confound it; the count is precise).
+
+Backend sync-network family (BE2-1, BE2-4 done+contained; BE2-2/3/5 deferred — see rationale):
+- [BE2-1] Routed the `gitOp("status")` PR-state probe off the request path via the existing async twin
+  (`refreshPrState` → `prStatusAsync`). The immediate response carries local status + last-known badge;
+  the network `gh pr view` result broadcasts when it resolves.
+- [BE2-4] Added `deleteRemoteBranchAsync` (Bun.spawn) and `await` it in the background `teardownSession`
+  — the sync `git push --delete` blocked the loop even inside an async teardown (async runs sync until
+  the first await). `removeWorktree` stays sync (local/bounded, not a network hang).
+- [BE2-2 / BE2-3 / BE2-5] DEFERRED to a separate reviewed PR, documented here for the review:
+  - BE2-2 (worktree-create `git fetch`), BE2-3 (team-integration merge→push→PR chain), and BE2-5
+    (per-turn `refreshGit`) each require converting a synchronous, deeply-embedded git contract into an
+    async chain (createWorktree must return a ready cwd; the integrate chain feeds a tool-handler return
+    value; refreshGit is called from ~5 sites). Wrapping them in a promise does NOT remove the freeze —
+    `Bun.spawnSync` blocks the loop whenever the microtask runs — so the real fix is async subprocess
+    spawns throughout, a large surface with real regression risk.
+  - The plan itself flags this family as needing care ("the delicate mergePr worktree-rollover stays a
+    separate reviewed PR"). The existing `gitSpawn` hard timeout (NET_TIMEOUT_MS=60s) + SSH keepalive
+    (~30s dead-connection reap) already BOUND these stalls — they're bad latency, not unbounded hangs.
+  - Guard-test friction reinforced the split: `GIT_ENV` is captured at import (frozen PATH), so the
+    canonical "fake-slow-`gh` on PATH + assert concurrent ping <100ms" harness can't be built reliably
+    without booting the full server+SDK+real-git-repo per case. BE2-1/BE2-4 were done because they're
+    contained; the rest are logged as a coherent follow-up rather than shipped half-verified.
+  - RECOMMENDATION for review: schedule the async-git-ops conversion (mergeBranch/push/createPr/fetch
+    async twins + createWorktree/integrateTeam/refreshGit rewiring) as its own PR with a responsiveness
+    harness that pre-doctors PATH before importing the git module.
+
 ## P5 (baseline fix — done first to get a clean baseline)
 
 - [boot-init.test.ts] Fixed the 1 red test by falling back to the source `web/index.html`

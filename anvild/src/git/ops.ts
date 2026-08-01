@@ -322,3 +322,22 @@ export async function prStatusAsync(cwd: string): Promise<{ state?: "open" | "me
 export function deleteRemoteBranch(cwd: string, branch: string): void {
   run(["git", "push", "origin", "--delete", branch], cwd, NET_TIMEOUT_MS);
 }
+
+/** [BE2-4] Async best-effort delete of the remote branch — non-blocking so a background session
+ *  teardown never freezes the single-threaded daemon on the network `git push --delete` (up to
+ *  NET_TIMEOUT_MS on a stalled connection). Same env + hard timeout as the sync path. */
+export async function deleteRemoteBranchAsync(cwd: string, branch: string): Promise<void> {
+  try {
+    const proc = Bun.spawn(["git", "push", "origin", "--delete", branch], {
+      cwd,
+      stdout: "ignore",
+      stderr: "ignore",
+      env: GIT_ENV,
+      timeout: NET_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    await proc.exited;
+  } catch {
+    /* best-effort: the remote branch may already be gone, or the network is down */
+  }
+}

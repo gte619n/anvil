@@ -2398,11 +2398,12 @@ export class Supervisor {
       case "status": {
         this.refreshGit(s);
         if (s.data.git) {
-          const pr = git.prStatus(cwd); // network: gh pr view
-          const badge = prBadgeFor(pr.state, pr.url, s.data.git.branch, s.data.git.dirtyFileCount);
-          applyPrBadge(s.data.git, badge); // badge is branch-scoped, and merged hides on a dirty tree
-          this.persist();
-          this.broadcastUpdated(s.data);
+          // [BE2-1] The PR-state probe (`gh pr view`, network) used to run SYNCHRONOUSLY here — a single
+          // "git status" click could freeze the whole single-threaded daemon for up to NET_TIMEOUT_MS
+          // (60s) on a stalled connection. Kick it off the request path via refreshPrState (the async
+          // twin, which does the same `gh` probe with Bun.spawn and broadcasts the badge when it
+          // resolves). The immediate response carries the local status + last-known PR badge.
+          void this.refreshPrState(cmd.sessionId);
           output = `${s.data.git.branch} — ${s.data.git.dirtyFileCount} changed, ${s.data.git.ahead} ahead / ${s.data.git.behind} behind${s.data.git.prState ? ` · PR ${s.data.git.prState}` : ""}`;
         } else {
           output = "(not a git repo)";
@@ -2935,7 +2936,9 @@ export class Supervisor {
       this.terminalMgr.kill(id);
       await s.stop(); // reap any attached process group (PTY in Phase 3)
       if (s.data.source === "fresh-worktree" && s.data.worktree) {
-        git.deleteRemoteBranch(s.data.cwd, s.data.worktree.branch); // best-effort, before the worktree goes
+        // [BE2-4] Async so this background teardown never freezes the event loop on the network
+        // `git push --delete` (removeWorktree below is local/bounded). Best-effort, before the worktree goes.
+        await git.deleteRemoteBranchAsync(s.data.cwd, s.data.worktree.branch);
         removeWorktree(s.data.worktree.repoRoot, s.data.cwd, s.data.worktree.branch);
       }
       rmSync(this.store.sessionDir(id), { recursive: true, force: true });

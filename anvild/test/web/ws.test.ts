@@ -240,3 +240,71 @@ test("close() stops the heartbeat (no ping after close)", () => {
   fireIntervals(); // the interval was cleared — nothing should fire
   expect(ws.sent).toEqual([]);
 });
+
+test("[WEB2-10] a throwing onEvent handler is caught and does not freeze the socket", () => {
+  // The 3.0.33 incident class: a handler throw (e.g. a quota-full localStorage.setItem deep in event
+  // handling) escaping onmessage would kill the callback and freeze all further WS processing. The
+  // socket must swallow it, stay OPEN, and keep delivering subsequent frames.
+  const status: string[] = [];
+  let calls = 0;
+  const sock = new AnvilSocket(
+    "wss://host/ws",
+    () => {
+      calls++;
+      throw new Error("handler blew up");
+    },
+    (s) => status.push(s),
+  );
+  sock.connect();
+  const ws = FakeWS.instances[0]!;
+  ws.open();
+  expect(() => ws.message(JSON.stringify({ type: "assistant.delta" }))).not.toThrow();
+  expect(() => ws.message(JSON.stringify({ type: "assistant.message" }))).not.toThrow();
+  expect(calls).toBe(2); // both frames reached the handler despite the first throwing
+  expect(sock.isOpen()).toBe(true); // socket never torn down
+});
+
+test("[WEB2-12] close() removes the window/document reconnect listeners", () => {
+  const win = (globalThis as any).window;
+  const doc = (globalThis as any).document;
+  let winAdds = 0,
+    winRemoves = 0,
+    docAdds = 0,
+    docRemoves = 0;
+  const origWinAdd = win.addEventListener.bind(win);
+  const origWinRemove = win.removeEventListener.bind(win);
+  const origDocAdd = doc.addEventListener.bind(doc);
+  const origDocRemove = doc.removeEventListener.bind(doc);
+  win.addEventListener = (t: string, h: any, o: any) => {
+    if (t === "online") winAdds++;
+    return origWinAdd(t, h, o);
+  };
+  win.removeEventListener = (t: string, h: any, o: any) => {
+    if (t === "online") winRemoves++;
+    return origWinRemove(t, h, o);
+  };
+  doc.addEventListener = (t: string, h: any, o: any) => {
+    if (t === "visibilitychange") docAdds++;
+    return origDocAdd(t, h, o);
+  };
+  doc.removeEventListener = (t: string, h: any, o: any) => {
+    if (t === "visibilitychange") docRemoves++;
+    return origDocRemove(t, h, o);
+  };
+  try {
+    const sock = new AnvilSocket("wss://host/ws", () => {}, () => {});
+    expect(winAdds).toBe(1);
+    expect(docAdds).toBe(1);
+    sock.close();
+    expect(winRemoves).toBe(1); // the online listener was removed (was leaked before WEB2-12)
+    expect(docRemoves).toBe(1); // the visibilitychange listener was removed
+    // NB: we assert the add/remove *counts* rather than dispatching `online`, because earlier tests in
+    // this shared-process file create sockets they never close — those leaked listeners (the exact bug)
+    // would fire on a dispatched event and confound an isolated check. The count is the precise guard.
+  } finally {
+    win.addEventListener = origWinAdd;
+    win.removeEventListener = origWinRemove;
+    doc.addEventListener = origDocAdd;
+    doc.removeEventListener = origDocRemove;
+  }
+});

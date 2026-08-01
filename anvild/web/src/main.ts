@@ -491,17 +491,46 @@ let streaming: HTMLElement | null = null;
 let turnCanceled = false;
 const snapshotLoaded = new Set<string>(); // sessions with a full snapshot loaded this page-load
 
+// [WEB2-10] localStorage.setItem can throw synchronously (QuotaExceededError on a full device — the
+// 3.0.33 freeze class). Route EVERY persistence call through this so one throw can never escape the WS
+// event path and freeze all further processing. Losing a persisted key is harmless: seq/epoch/history
+// are re-derivable from the server on the next resume.
+function safeLocalSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    console.warn(`[storage] setItem(${key}) failed (ignored):`, e);
+  }
+}
+// Seq is persisted per `assistant.delta` (many times per turn), so it's throttled off the hot path: the
+// latest value is held in memory and flushed at most once/second (and on tab-hide). `get` reads the
+// pending value first so an attach/resume still sends the freshest lastSeq.
+const pendingSeq = new Map<string, number>();
+let seqFlushTimer = 0;
+function flushSeq(): void {
+  seqFlushTimer = 0;
+  for (const [id, seq] of pendingSeq) safeLocalSet(`anvil.seq.${id}`, String(seq));
+  pendingSeq.clear();
+}
 const seqStore = {
-  get: (id: string): number => Number(localStorage.getItem(`anvil.seq.${id}`) ?? 0),
-  set: (id: string, seq: number): void => localStorage.setItem(`anvil.seq.${id}`, String(seq)),
+  get: (id: string): number => pendingSeq.get(id) ?? Number(localStorage.getItem(`anvil.seq.${id}`) ?? 0),
+  set: (id: string, seq: number): void => {
+    pendingSeq.set(id, seq);
+    if (!seqFlushTimer && typeof window !== "undefined") seqFlushTimer = window.setTimeout(flushSeq, 1000);
+  },
 };
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushSeq();
+  });
+}
 // v4 resume (incremental-offline-resilience.md §5): the client caches each session's `epoch` alongside
 // its `seq`. On (re)connect the daemon sends `resume.watermarks` (per-session {epoch,lastSeq}); if the
 // cached epoch still matches, the cached transcript is current and we pull ONLY deltas (seq>lastSeq)
 // instead of a full snapshot — the cross-reload win that makes flaky links feel instant (spec A1/A3).
 const epochStore = {
   get: (id: string): string => localStorage.getItem(`anvil.epoch.${id}`) ?? "",
-  set: (id: string, epoch: string): void => localStorage.setItem(`anvil.epoch.${id}`, epoch),
+  set: (id: string, epoch: string): void => safeLocalSet(`anvil.epoch.${id}`, epoch), // [WEB2-10] quota-safe
 };
 const serverWatermarks = new Map<string, { epoch: string; lastSeq: number }>();
 /** Whether the cached transcript for `id` can be delta-resumed: the server's epoch still matches ours
@@ -916,8 +945,14 @@ for (const u of loadExtraServers()) ensureServer(u);
 void loadFleetMembers();
 // Cold deep link into a plan (Todoist "Review in Anvil" link): open the Autopilot view now; the
 // reader follows as soon as the plan syncs in (each server pulls its plans on connect → onAutopilotPlans).
-if (deepLinkedPlan) openPlanDeepLink(deepLinkedPlan);
-else if (deepLinkedAutopilot) openAutopilot(); // bare #autopilot deep link → open the grid
+// [WEB2-1] Deferred to a microtask: openAutopilot → renderScheduleBar → scheduleSummaryHtml reads
+// serverSchedule/autopilotLog/runState, which are `let`/`const` declared ~3000 lines below and thus in
+// their temporal dead zone during module init. Calling them synchronously here aborts the whole module
+// init (dead app) for any cold deep-link boot — the exact class 3.0.33 shipped for `loadConversation`.
+// A microtask runs after the module body finishes, by which point every declaration is live. (P7 fixes
+// this structurally by moving those scalars into state.ts.)
+if (deepLinkedPlan) queueMicrotask(() => openPlanDeepLink(deepLinkedPlan));
+else if (deepLinkedAutopilot) queueMicrotask(() => openAutopilot()); // bare #autopilot deep link → open the grid
 
 // A daemon with no Claude login can't run a single turn, so the session list would be a lie — take the
 // screen over with the pairing/setup flow instead (headless-join §5.1). No-op on a healthy daemon.
