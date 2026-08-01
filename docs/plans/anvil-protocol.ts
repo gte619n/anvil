@@ -889,6 +889,12 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   tool: string;
   input: unknown;
   suggestions: PermissionSuggestion[];
+  /** [BE2-8] Set when this event is RE-SURFACED on resume (not a fresh prompt). Its `seq` is the
+   *  session's current lastSeq — equal to a delta-resuming client's watermark — so a client that drops
+   *  events with `seq <= watermark` would otherwise silently discard a pending permission prompt (the
+   *  invisible-prompt / stuck-session failure v4 exists to prevent). A replay:true event must be applied
+   *  regardless of its seq. Absent on a fresh prompt. */
+  replay?: boolean;
 }
 /** A parked permission prompt was answered or superseded (reset/kill). Clients retire EXACTLY
  *  that card by requestId — a session can have several prompts parked at once (sub-agent fan-out),
@@ -902,6 +908,8 @@ export interface QuestionRequestEvent extends Envelope, SessionScoped {
   type: "question.request";
   requestId: RequestId;
   questions: Question[];
+  /** [BE2-8] Set when re-surfaced on resume — see PermissionRequestEvent.replay. Apply regardless of seq. */
+  replay?: boolean;
 }
 /** A parked AskUserQuestion was answered or superseded — clients retire EXACTLY that card by
  *  requestId (sub-agents can fan out several at once, like permissions). (§6.6) */

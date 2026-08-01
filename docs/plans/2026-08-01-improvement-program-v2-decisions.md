@@ -117,6 +117,35 @@ Web (WEB2-11/13/14/15 done; WEB2-2/16 deferred):
   diff, so the render + its state move together. The per-row `localStorage.getItem` and O(N²) sort are
   the measurable cost; deferring keeps correctness intact (renders are just more frequent than optimal).
 
+## P3 — Update-service robustness + fleet correctness (8/9 done, all tested)
+
+- [BE2-33] New `src/daemon/sha.ts` (`shaMatches`/`shaOf`) with a MIN_SHA_LEN=7 guard (a shorter value
+  only matches exactly, never as a prefix). Wired the 3 call sites. Guard: `sha.test.ts`.
+- [BE2-28] Module-level in-flight promise in update-api serializes all three apply transports; a second
+  concurrent apply gets "already in progress". Guard in `update-api.test.ts`.
+- [BE2-10] `/api/fleet/members` heals are now `void`+throttled(20s)+per-member try/catch (malformed
+  `new URL` can't reject the pass). Guard: `fleet-members-heal.test.ts` (bad url → 200; fast GET).
+- [BE2-11] try/finally in `FleetRolloutCoordinator.run` clears `active` even on a thrown body. Guard in
+  `fleet-rollout.test.ts`.
+- [BE2-12] Wired `reconcile()` (was dead) off a throttled(30s) members-GET pass. Uses the existing
+  reconcile D19 unit test for behavior; the wiring is fire-and-forget.
+- [BE2-13] `MAX_PAIR_ATTEMPTS=5` → the pairing window disarms after 5 wrong codes. Guard in
+  `pairing.test.ts`.
+- [BE2-29] Watchdog arms across `pulling|building|restarting` (crash mid-build now rolls back). To
+  avoid a false positive, a LIVE healthy daemon still building past the gate is NOT rolled back (only a
+  crashed/unreachable one is); "restarting" keeps its original stuck-on-old-sha rollback. Guards in
+  `update-watchdog.test.ts`.
+- [BE2-31] Re-probe health after `rollback()` resolves; if the target went healthy during the
+  minutes-long rebuild, adopt it and SKIP the backwards restart (the restart-storm class). Guard added.
+- [BE2-30] DEFERRED (documented). `UpdateStateStore.set` is a cross-process read-modify-write shared by
+  daemon + watchdog; atomic write ≠ atomic RMW, so a tight interleave can lose a field. A correct fix
+  (updatedAt/seq CAS with file locking, or the sidecar redesign) is a subtle change to the MOST
+  safety-critical store and needs its own focused PR with multi-process tests — shipping it
+  half-verified here would risk the very reliability it protects. The already-atomic write prevents the
+  worse failure (a torn/zeroed file); BE2-30 is about rarer lost-updates between two cooperating
+  processes. RECOMMENDATION: implement via a `.watchdog.json` sidecar (each process sole-writes its own
+  file; `get()` overlays the newer) — no lock needed, and it matches the plan's second suggestion.
+
 ## P5 (baseline fix — done first to get a clean baseline)
 
 - [boot-init.test.ts] Fixed the 1 red test by falling back to the source `web/index.html`

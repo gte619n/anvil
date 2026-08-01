@@ -70,6 +70,27 @@ test("resume re-surfaces an unanswered permission prompt (the 'lost dialog' fix)
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("[BE2-8] a DELTA resume re-surfaces the pending prompt marked replay so a seq filter can't drop it", () => {
+  const dir = tempState();
+  const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = sup.create(createCmd(dir));
+  s.requestPermission("perm-1", "Edit", { file_path: "a.ts" }, [{ decision: "allow", label: "Allow once" }]);
+
+  // Delta resume at the session's OWN watermark — the re-surfaced permission.request carries
+  // seq === lastSeq, which a client filtering `seq > watermark` would drop. It must be marked replay.
+  const watermark = s.lastSeq;
+  const delta = sup.resume(s.id, watermark);
+  const perm = delta.find((e) => e.type === "permission.request") as any;
+  expect(perm).toBeDefined();
+  expect(perm.replay).toBe(true);
+
+  // Simulate the client's seq filter: keep events with seq > watermark OR marked replay. The prompt
+  // survives ONLY because of the replay flag (its seq is not > the watermark).
+  const kept = delta.filter((e) => (typeof (e as any).seq === "number" && (e as any).seq > watermark) || (e as any).replay);
+  expect(kept.some((e) => e.type === "permission.request" && (e as any).requestId === "perm-1")).toBe(true);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("concurrent permission prompts (sub-agent fan-out) each re-surface and clear independently", () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
