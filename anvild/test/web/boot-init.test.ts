@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,12 +33,19 @@ test("the built client boots for a returning user (activeId set) — no init cra
     // It lives in the anvild root (not the tmpdir) so node resolves `jsdom` by the normal node_modules
     // walk — NODE_PATH doesn't apply to ESM imports.
     const anvildRoot = join(import.meta.dir, "../..");
+    // The daemon serves web/dist/index.html, but build.ts copies web/index.html to it verbatim — so the
+    // source shell is byte-identical to the served one. Prefer dist (matches production exactly) but fall
+    // back to the source shell when dist is absent (fresh worktree, before `bun run build:web`). This is
+    // what unbroke the "1 red test in a fresh worktree" baseline: the test no longer requires a prior build.
+    const distHtml = join(import.meta.dir, "../../web/dist/index.html");
+    const srcHtml = join(import.meta.dir, "../../web/index.html");
+    const htmlPath = existsSync(distHtml) ? distHtml : srcHtml;
     const harness = join(anvildRoot, `.boot-harness-${process.pid}.mjs`);
     writeFileSync(
       harness,
       `import { JSDOM } from "jsdom";
 import { readFileSync } from "node:fs";
-const html = readFileSync(${JSON.stringify(join(import.meta.dir, "../../web/dist/index.html"))}, "utf8");
+const html = readFileSync(${JSON.stringify(htmlPath)}, "utf8");
 const dom = new JSDOM(html, { url: "https://appassets.androidplatform.net/", runScripts: "dangerously", pretendToBeVisual: true });
 const w = dom.window;
 w.WebSocket = class { constructor(){ this.readyState = 0; } send(){ return true; } close(){} addEventListener(){} };

@@ -481,6 +481,28 @@ export function createServer(opts: ServerOptions): ServerHandle {
   })();
 
   async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
+      // [SEC2-2] Origin gate on every state-mutating /api route (defense-in-depth on the browser vector).
+      // WS is gated at /ws; the REST mutating routes were reachable via a CORS "simple request" (a
+      // no-preflight text/plain POST still carries Origin). Reject a foreign browser origin here so a page
+      // in a trusted device's browser can't drive update/fleet/daemon/permission/session/push mutations.
+      // Native clients (no Origin), the same-origin PWA, and same-tailnet fleet peers are all allowed.
+      if (url.pathname.startsWith("/api/") && (req.method === "POST" || req.method === "PUT" || req.method === "DELETE")) {
+        if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
+          return new Response("forbidden origin", { status: 403 });
+        }
+      }
+
+      /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback.
+       *  Hoisted to the top of the handler so the update/daemon routes (which precede the fleet block in
+       *  the ladder) can reuse it for their [SEC2-3] identity gate. */
+      const callerIdentity = async (): Promise<{ trust: PeerTrust; reject?: string }> =>
+        resolveCallerIdentity({
+          peerAddress: srv.requestIP(req)?.address,
+          headerLogin: req.headers.get("Tailscale-User-Login"),
+          selfLogin: tailscaleSelfLogin,
+          whois: tailscaleWhois,
+        });
+
       if (req.method === "GET" && url.pathname === "/api/health") {
         const auth = resolveAuthStatus({ accounts });
         const body: rest.HealthResponse = {
@@ -513,6 +535,16 @@ export function createServer(opts: ServerOptions): ServerHandle {
         return Response.json(await updateCheck(updateDeps));
       }
       if (url.pathname === "/api/update/v1/apply" && req.method === "POST") {
+        // [SEC2-2] Require a JSON content-type. A cross-origin CORS "simple request" (text/plain, no
+        // preflight) can't set this, so a no-cors drive-by can't reach the apply path even if the Origin
+        // check were somehow bypassed; a body-less/wrong-type POST is rejected before we mutate anything.
+        const ct = (req.headers.get("content-type") || "").toLowerCase();
+        if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
+        // [SEC2-3] Identity gate — parity with /api/fleet/*: a PROVEN different tailnet user must not be
+        // able to pin this member's checkout + force a restart onto it. sameUser/unknown proceed (whois
+        // may be momentarily down, and unattended local triggers arrive via serve with the header).
+        const who = await callerIdentity();
+        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
         const bodyReq = (await req.json().catch(() => ({}))) as rest.update.ApplyRequest;
         const result = await updateApply({ targetSha: bodyReq.targetSha }, updateDeps);
         return Response.json(result, { status: result.ok ? 200 : 500 });
@@ -608,15 +640,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // These are what let a NON-Mac machine be added to a fleet at all: the macOS Server.app's :7702
       // listener has no Linux equivalent, and until Phase 1 a tokenless machine had no running daemon
       // to host one anyway. Default closed, code + tailnet identity gated; see §8.2 for the full list.
-
-      /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback. */
-      const callerIdentity = async (): Promise<{ trust: PeerTrust; reject?: string }> =>
-        resolveCallerIdentity({
-          peerAddress: srv.requestIP(req)?.address,
-          headerLogin: req.headers.get("Tailscale-User-Login"),
-          selfLogin: tailscaleSelfLogin,
-          whois: tailscaleWhois,
-        });
+      // (`callerIdentity` is hoisted to the top of the handler now — the update/daemon routes reuse it.)
 
       /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
        *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
@@ -852,6 +876,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // (pull + rebuild + restart). Mirrors the `daemon.update` WS command for native clients
       // (the macOS menu command) and scripts that have no open WebSocket.
       if (url.pathname === "/api/daemon/update" && (req.method === "GET" || req.method === "POST")) {
+        // [SEC2-3] Identity gate on the mutating (POST = apply) path only; GET is a read-only check.
+        // Parity with /api/fleet/* and /api/update/v1/apply — reject a proven different tailnet user.
+        if (req.method === "POST") {
+          const who = await callerIdentity();
+          if (who.trust === "otherUser") {
+            return Response.json({ ok: false, phase: "error", output: who.reject ?? "different tailnet user", currentVersion: VERSION } satisfies rest.DaemonUpdateResponse, { status: 403 });
+          }
+        }
         const result = await supervisor.daemonUpdate(req.method === "GET");
         const body: rest.DaemonUpdateResponse = {
           ok: result.ok,
