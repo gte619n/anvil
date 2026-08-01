@@ -102,6 +102,12 @@ export const convoCache = {
     }
   },
 
+  /** [WEB2-11] The ids that currently have a cached transcript (from the sync index) — lets a boot
+   *  sweep drop cache entries for sessions no longer known. */
+  keys(): string[] {
+    return [...loadIndex()];
+  },
+
   /** Migrate an optimistic (offline-created) session's cache to its real id once the server realizes it. */
   async move(from: string, to: string): Promise<void> {
     const html = await this.get(from);

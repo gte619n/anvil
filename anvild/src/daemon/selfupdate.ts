@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { GIT_ENV } from "../git/spawn";
 import { VERSION } from "../version";
+import { shaMatches } from "./sha";
 
 /** Service label — must match LABEL in scripts/service.sh (launchd) / the systemd unit name. */
 const SERVICE_LABEL = "com.anvil.anvild";
@@ -28,10 +29,7 @@ export function runningSha(): string {
   return i >= 0 ? VERSION.slice(i + 1) : "";
 }
 
-/** Whether two abbreviated SHAs refer to the same commit (either may be the shorter abbreviation). */
-function shaMatches(a: string, b: string): boolean {
-  return !!a && !!b && (a.startsWith(b) || b.startsWith(a));
-}
+// [BE2-33] shaMatches is shared (min-length-guarded) — see ./sha.ts.
 
 /** The anvild package dir (where package.json + build:web live): .../anvild */
 const anvildDir = join(import.meta.dir, "..", "..");
@@ -222,13 +220,16 @@ export async function resolveTargetSha(run: CommandRunner = runDefault): Promise
  * member a hub fans out to lands on the same build. `recordPrePull(sha)` is invoked with the captured
  * HEAD before anything mutates the tree; the caller persists it (UpdateStateStore).
  *
- * Refuses to move to a target that isn't an ancestor-or-descendant fast-forward from HEAD unless
- * `allowNonFastForward` (used only by rollback, which resets backwards). Local commits / a dirty tree
- * make `git checkout` fail loudly and are never clobbered.
+ * [SEC2-1] Supply-chain integrity: before checkout we require the target to be an ancestor of the
+ * trusted upstream tip (`git merge-base --is-ancestor <target> <resolvedUpstreamRef>`), so a
+ * fleet-update route can only pin the checkout to a commit actually reachable from origin's release
+ * track — never an arbitrary side-branch/attacker commit. `allowNonFastForward` bypasses the gate for
+ * the rollback path only (which deliberately resets backwards to a known-good prePullSha). Local
+ * commits / a dirty tree make `git checkout` fail loudly and are never clobbered.
  */
 export async function applyUpdateToTarget(
   targetSha: string,
-  opts: { run?: CommandRunner; recordPrePull?: (sha: string) => void } = {},
+  opts: { run?: CommandRunner; recordPrePull?: (sha: string) => void; allowNonFastForward?: boolean } = {},
 ): Promise<{ output: string; prePullSha: string; targetSha: string }> {
   const run = opts.run ?? runDefault;
   const root = await repoRoot(run);
@@ -238,6 +239,22 @@ export async function applyUpdateToTarget(
   opts.recordPrePull?.(before);
 
   await run(["git", "fetch", "--quiet"], root);
+
+  // [SEC2-1] Ancestry gate. Skipped only for rollback (allowNonFastForward), which moves backwards to a
+  // known-good SHA that is by construction behind the upstream tip. For a forward update, reject any
+  // target not reachable from the trusted upstream ref — the integrity check the doc-comment above used
+  // to (falsely) claim existed. `--is-ancestor` exits 0 when target IS an ancestor, non-zero when not.
+  if (!opts.allowNonFastForward) {
+    const upstreamRef = await resolveUpdateRef(run, root);
+    const anc = await run(["git", "merge-base", "--is-ancestor", targetSha, upstreamRef], root);
+    if (anc.code !== 0) {
+      throw new Error(
+        `refusing to update to ${targetSha}: it is not an ancestor of the trusted upstream tip ` +
+          `(${upstreamRef}) — only commits reachable from the release track can be applied.`,
+      );
+    }
+  }
+
   // Reset to the exact target. --hard so a partially-applied prior attempt (e.g. a build that swapped
   // some files) can't wedge the checkout; local commits are surfaced by the pre-flight guard below.
   const dirty = (await run(["git", "status", "--porcelain"], root)).out.trim();

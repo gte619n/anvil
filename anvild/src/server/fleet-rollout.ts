@@ -120,20 +120,27 @@ export class FleetRolloutCoordinator {
   /** The rollout body (awaitable for tests). Fans out to reachable members in PARALLEL, waits for the
    *  reachable set to settle, then updates the hub last. */
   async run(targetSha: string): Promise<void> {
-    const targets = this.deps.members();
-    await Promise.all(targets.map((m) => this.rollMember(m, targetSha)));
-    // Hub last (spec D6): only after every reachable member has settled.
-    this.setMember(this.deps.self.serverId, { state: "updating" });
     try {
-      const r = await this.deps.applySelf(targetSha);
-      this.setMember(this.deps.self.serverId, { state: r.ok ? "updating" : "error", detail: r.ok ? "restarting" : r.error });
-      // On success the hub restarts; the record on disk carries the rest. Mark finished so a poll before
-      // the process dies reflects that the hub was reached last.
-    } catch (e) {
-      this.setMember(this.deps.self.serverId, { state: "error", detail: e instanceof Error ? e.message : String(e) });
+      const targets = this.deps.members();
+      await Promise.all(targets.map((m) => this.rollMember(m, targetSha)));
+      // Hub last (spec D6): only after every reachable member has settled.
+      this.setMember(this.deps.self.serverId, { state: "updating" });
+      try {
+        const r = await this.deps.applySelf(targetSha);
+        this.setMember(this.deps.self.serverId, { state: r.ok ? "updating" : "error", detail: r.ok ? "restarting" : r.error });
+        // On success the hub restarts; the record on disk carries the rest.
+      } catch (e) {
+        this.setMember(this.deps.self.serverId, { state: "error", detail: e instanceof Error ? e.message : String(e) });
+      }
+    } finally {
+      // [BE2-11] ALWAYS release the in-flight lock, even if members()/rollMember throws before the hub
+      // step. Without this a swallowed throw left `active:true` forever, so every future rollout was
+      // rejected "already in progress" until the daemon restarted.
+      if (this.state) {
+        this.state.finishedAt = this.now();
+        this.state.active = false;
+      }
     }
-    if (this.state) this.state.finishedAt = this.now();
-    if (this.state) this.state.active = false;
   }
 
   /** Drive one member to a terminal state (healthy / rolled-back / error / pending-offline / legacy). */

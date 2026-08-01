@@ -48,3 +48,23 @@ test("promptCids returns message.user cids in log order (exactly-once seed)", ()
   expect(log.promptCids()).toEqual(["c1", "c2"]);
   rmSync(d, { recursive: true, force: true });
 });
+
+test("[BE2-6] after hydration, reads are served from the in-memory tail (no re-parse of the file)", () => {
+  const d = tmp();
+  const log = new EventLog(d);
+  log.append(ev(1, "message.user", { rendered: { source: "a", html: "a" }, attachments: [], cid: "c1" }));
+  log.append(ev(2, "assistant.message", { blocks: [] }));
+  log.snapshot("s1", 2, "ep"); // first read → hydrates the cache from disk
+
+  // Delete the on-disk log. If reads still re-parsed the file, they'd now return nothing; served from
+  // the in-memory tail, they must still reflect every persisted event.
+  rmSync(join(d, "events.ndjson"), { force: true });
+  expect(log.since(0).map((e) => e.type)).toEqual(["message.user", "assistant.message"]);
+  expect(log.promptCids()).toEqual(["c1"]);
+  expect(log.snapshot("s1", 2, "ep").events.map((e) => e.kind)).toEqual(["user", "assistant"]);
+
+  // A new append after hydration is reflected without touching disk on the read.
+  log.append(ev(3, "result", { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, turns: 1 } }));
+  expect(log.since(2).map((e) => (e as any).seq)).toEqual([3]);
+  rmSync(d, { recursive: true, force: true });
+});

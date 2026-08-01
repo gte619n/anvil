@@ -218,3 +218,31 @@ test("reconcile nudges a behind member to the pinned target, and no-ops when alr
   expect(order).not.toContain("apply:atTarget");
   expect(order).not.toContain("apply:offline");
 });
+
+test("[BE2-11] a throw during the rollout body still releases the active lock (no permanent wedge)", async () => {
+  const order: string[] = [];
+  const targets: RolloutTarget[] = [{ serverId: "m1", serverName: "m1", url: "m1" }];
+  let calls = 0;
+  const coord = new FleetRolloutCoordinator({
+    self: { serverId: "hub", serverName: "hub" },
+    // Succeeds for start()'s enumeration, throws on run()'s second call — the "throw after active:true"
+    // case that used to strand `active` forever (start-time throws are handled before state is set).
+    members: () => {
+      calls++;
+      if (calls === 2) throw new Error("members enumeration blew up");
+      return targets;
+    },
+    resolveTargetSha: async () => "target1",
+    applySelf: async () => ({ ok: true }),
+    client: makeClient({ m1: { probe: { reachable: true, updateApiVersion: 1, currentSha: "old" } } }, order),
+    desired: new DesiredTargetStore(tmp()),
+    now: () => 0,
+    sleep: async () => {},
+  });
+  const r1 = await coord.start({} as rest.FleetUpdateRequest);
+  expect(r1.ok).toBe(true);
+  await coord.settled();
+  expect(coord.status().active).toBe(false); // lock released despite the thrown run() body
+  const r2 = await coord.start({} as rest.FleetUpdateRequest); // NOT rejected "already in progress"
+  expect(r2.ok).toBe(true);
+});

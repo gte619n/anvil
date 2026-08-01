@@ -23,13 +23,13 @@ stays documented so a public launch is a config change away, but no workflow inv
 
 ## Versioning (single source of truth)
 
-`MAJOR.MINOR` lives in **one** place — the repo-root **`VERSION`** file (currently `2.2`) — read by
+`MAJOR.MINOR` lives in **one** place — the repo-root **`VERSION`** file (currently `3.0`) — read by
 all four build paths (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`,
 `anvil-server/make-app.sh`), so every artifact reports the same number. The full version is
-**`MAJOR.MINOR.<run_number>`** (e.g. `2.2.47`); every job in a run shares the run number, so all four
+**`MAJOR.MINOR.<run_number>`** (e.g. `3.0.47`); every job in a run shares the run number, so all four
 apps match.
 
-**To start a new line, edit `VERSION`** (e.g. `2.2` → `2.3`) and merge — the next full release is
+**To start a new line, edit `VERSION`** (e.g. `3.0` → `3.1`) and merge — the next full release is
 `2.3.<run_number>`. The static `MARKETING_VERSION` in `apple/project.yml` is only for raw Xcode dev
 builds — keep its MAJOR.MINOR in sync by hand.
 

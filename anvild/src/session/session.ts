@@ -235,6 +235,10 @@ export class Session {
           ts: now(),
           sessionId: this.data.id,
           seq: this.lastSeq,
+          // [BE2-8] Re-surfaced (not a fresh prompt): its seq equals a delta-resuming client's watermark,
+          // so mark it replay so a `seq <= watermark` client applies it instead of dropping the pending
+          // prompt (the invisible-prompt / stuck-session failure). Never a substitute for a real seq.
+          replay: true,
           requestId: p.requestId,
           tool: p.tool,
           input: p.input,
@@ -285,6 +289,7 @@ export class Session {
           ts: now(),
           sessionId: this.data.id,
           seq: this.lastSeq,
+          replay: true, // [BE2-8] re-surfaced on resume — apply regardless of seq (see permissionRequestEvents)
           requestId: q.requestId,
           questions: q.questions,
         }) as ServerEvent,

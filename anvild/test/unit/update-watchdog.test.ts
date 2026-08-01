@@ -87,6 +87,58 @@ test("a broken bundle (webBundleOk:false) never counts as healthy and eventually
   expect(h.calls.rollback).toEqual(["oldsha"]);
 });
 
+test("[BE2-29] arms during 'building' and rolls back if the daemon crashes mid-build", async () => {
+  const h = harness();
+  // A crash mid-`bun install`/build leaves the phase at "building" with the checkout already on target.
+  h.state.set({ phase: "building", targetSha: "newsha", prePullSha: "oldsha" });
+  h.setHealth(null); // the daemon crashed during the build → unreachable
+  expect(await h.wd.tick()).toBe("waiting"); // ARMED even though phase isn't "restarting"
+  h.advance(180_001);
+  expect(await h.wd.tick()).toBe("rolled-back");
+  expect(h.calls.rollback).toEqual(["oldsha"]);
+  expect(h.calls.restart).toBe(1);
+});
+
+test("[BE2-29] does NOT roll back a live daemon still legitimately building past the gate", async () => {
+  const h = harness();
+  h.state.set({ phase: "building", targetSha: "newsha", prePullSha: "oldsha" });
+  // Daemon is alive and serving the OLD bundle while a slow build runs — normal, not a failure.
+  h.setHealth({ ok: true, version: "0.2.1+oldsha", webBundleOk: true });
+  expect(await h.wd.tick()).toBe("waiting");
+  h.advance(180_001); // gate elapses, but the daemon is still up building
+  expect(await h.wd.tick()).toBe("waiting"); // must NOT roll back a healthy building daemon
+  expect(h.calls.rollback.length).toBe(0);
+});
+
+test("[BE2-31] a target that becomes healthy DURING rollback is NOT restarted backwards, and disk stays consistent", async () => {
+  const state = new UpdateStateStore(tmp());
+  let clock = 0;
+  let health: HealthProbe | null = null; // unreachable through the gate
+  const calls = { restart: 0, rollback: [] as string[] };
+  const wd = new UpdateWatchdog({
+    state,
+    health: async () => health,
+    rollback: async (sha) => {
+      calls.rollback.push(sha); // rollback resets the CHECKOUT to prePullSha (oldsha)
+      health = { ok: true, version: "0.2.1+newsha", webBundleOk: true }; // process recovered during the rebuild
+    },
+    restartDaemon: () => calls.restart++,
+    now: () => clock,
+    gateMs: 180_000,
+  });
+  state.set({ phase: "restarting", targetSha: "newsha", prePullSha: "oldsha" });
+  expect(await wd.tick()).toBe("waiting"); // arm (health null)
+  clock += 180_001; // gate elapses
+  const r = await wd.tick();
+  expect(calls.rollback).toEqual(["oldsha"]); // rollback ran → disk is now oldsha
+  expect(r).toBe("rolled-back");
+  expect(calls.restart).toBe(0); // the now-healthy process is NOT restarted backwards (no restart storm)
+  // Known-good MUST stay the on-disk SHA (oldsha), NOT the target — else a future failed update would
+  // "roll back" to the un-reverted target and the next restart would silently revert this process.
+  expect(state.get().phase).toBe("rolled-back");
+  expect(state.get().targetSha).toBe("oldsha");
+});
+
 test("fails safe (no rollback attempt) when there is no pre-pull SHA to revert to", async () => {
   const h = harness();
   h.state.set({ phase: "restarting", targetSha: "newsha", prePullSha: "" });

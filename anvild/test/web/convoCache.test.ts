@@ -29,6 +29,16 @@ test("delete removes content and the index hint", async () => {
   expect(await convoCache.get("s3")).toBeNull();
 });
 
+test("[WEB2-11] keys() lists cached ids so a boot sweep can drop orphans", async () => {
+  await convoCache.set("live_1", "a");
+  await convoCache.set("orphan_1", "b");
+  expect(convoCache.keys().sort()).toEqual(expect.arrayContaining(["live_1", "orphan_1"]));
+  // simulate the boot sweep: forget an id no longer in the session list
+  for (const id of convoCache.keys()) if (id === "orphan_1") await convoCache.delete(id);
+  expect(convoCache.keys()).not.toContain("orphan_1");
+  expect(convoCache.keys()).toContain("live_1");
+});
+
 test("move migrates an optimistic session's cache to its real id", async () => {
   await convoCache.set("temp_1", "optimistic");
   await convoCache.move("temp_1", "sess_real");

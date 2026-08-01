@@ -201,7 +201,14 @@ export class Supervisor {
   private readonly logs = new Map<string, EventLog>();
   /** Resilience telemetry (v4, §5.7): the daemon's own counters + the latest report from each client. */
   private readonly serverCounters: Record<string, number> = { resumeDelta: 0, resumeSnapshot: 0, promptDeduped: 0 };
-  private readonly clientTelemetry = new Map<string, Record<string, number>>();
+  // [BE2-23/SEC2-4] Bounded, TTL'd, and validated: keyed by an UNvalidated client-supplied id, this map
+  // otherwise grows forever (a leak + a trivial DoS — flood unique ids) and the whole thing is
+  // re-serialized into a broadcast on every report. Insertion-ordered LRU (re-set moves to newest);
+  // evict oldest past the cap; drop entries past the TTL on read/write.
+  private readonly clientTelemetry = new Map<string, { counters: Record<string, number>; at: number }>();
+  private static readonly MAX_TELEMETRY_CLIENTS = 50;
+  private static readonly TELEMETRY_TTL_MS = 30 * 60_000;
+  private telemetryBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly broker = new PermissionBroker();
   private readonly questionBroker = new QuestionBroker();
   /** Sessions whose awaiting_permission state has been announced to the whole fleet (list badge). */
@@ -1094,7 +1101,27 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "team.info", ts: now(), teams: deriveTeams(this.list()) };
   }
   private broadcastTeamInfo(): void {
-    this.registry.toAll(this.teamInfoEvent());
+    const ev = this.teamInfoEvent();
+    this.registry.toAll(ev);
+    this.lastTeamInfoJson = JSON.stringify(ev.teams); // keep the coalesced path from re-sending an identical tree
+  }
+  // [BE2-21] The full team tree was re-derived and broadcast to EVERY connection on every
+  // session.updated (which fires several times per turn, for team and non-team sessions alike). Coalesce
+  // (250ms) and skip when the derived tree hasn't actually changed, so ordinary status flaps don't fan
+  // out an O(sessions) rollup to the whole fleet.
+  private teamInfoTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastTeamInfoJson = "";
+  private scheduleTeamInfoBroadcast(): void {
+    if (this.teamInfoTimer) return;
+    this.teamInfoTimer = setTimeout(() => {
+      this.teamInfoTimer = null;
+      const ev = this.teamInfoEvent();
+      const json = JSON.stringify(ev.teams);
+      if (json === this.lastTeamInfoJson) return; // nothing changed → no broadcast
+      this.lastTeamInfoJson = json;
+      this.registry.toAll(ev);
+    }, 250);
+    this.teamInfoTimer.unref?.(); // never hold the process/test open for a coalesced broadcast
   }
 
   /** Build the lead-only orchestration MCP server, closed over this lead's session id. */
@@ -2113,23 +2140,50 @@ export class Supervisor {
   noteServerCounter(key: string): void {
     this.serverCounters[key] = (this.serverCounters[key] ?? 0) + 1;
   }
-  /** Record a client's latest counter report (keyed by its stable clientId). */
+  /** Record a client's latest counter report (keyed by its stable clientId). [BE2-23/SEC2-4] The id and
+   *  counters are client-supplied, so both are validated; the map is an LRU capped at MAX_TELEMETRY_CLIENTS. */
   recordClientTelemetry(clientId: string, counters: Record<string, number>): void {
-    this.clientTelemetry.set(clientId, counters);
+    if (typeof clientId !== "string" || !clientId || clientId.length > 200) return; // reject junk/oversized ids
+    const clean = sanitizeCounters(counters);
+    if (!clean) return; // not a plain object, or too many keys → ignore the report entirely
+    this.clientTelemetry.delete(clientId); // re-insert at the end so this id becomes the newest (LRU)
+    this.clientTelemetry.set(clientId, { counters: clean, at: Date.now() });
+    // Evict the oldest entries past the cap (Map preserves insertion order → first key is the oldest).
+    while (this.clientTelemetry.size > Supervisor.MAX_TELEMETRY_CLIENTS) {
+      const oldest = this.clientTelemetry.keys().next().value;
+      if (oldest === undefined) break;
+      this.clientTelemetry.delete(oldest);
+    }
   }
   /** The aggregated telemetry snapshot broadcast on connect + whenever a client reports (spec D11). */
   telemetrySnapshotEvent(): TelemetrySnapshotEvent {
+    const cutoff = Date.now() - Supervisor.TELEMETRY_TTL_MS;
+    const clients: Record<string, Record<string, number>> = {};
+    for (const [id, rec] of this.clientTelemetry) {
+      if (rec.at < cutoff) {
+        this.clientTelemetry.delete(id); // stale — prune lazily on read
+        continue;
+      }
+      clients[id] = rec.counters;
+    }
     return {
       v: PROTOCOL_VERSION,
       type: "telemetry.snapshot",
       ts: now(),
       server: { ...this.serverCounters },
-      clients: Object.fromEntries(this.clientTelemetry),
+      clients,
     };
   }
-  /** Broadcast the current telemetry snapshot to every connected client. */
+  /** Broadcast the current telemetry snapshot to every connected client. [BE2-23] Coalesced: a burst of
+   *  reports (or a reconnect storm) collapses into at most one broadcast per 250ms instead of
+   *  re-serializing + fanning out the whole map on every single report. */
   broadcastTelemetry(): void {
-    this.registry.toAll(this.telemetrySnapshotEvent());
+    if (this.telemetryBroadcastTimer) return;
+    this.telemetryBroadcastTimer = setTimeout(() => {
+      this.telemetryBroadcastTimer = null;
+      this.registry.toAll(this.telemetrySnapshotEvent());
+    }, 250);
+    this.telemetryBroadcastTimer.unref?.(); // never hold the process/test open for a coalesced broadcast
   }
 
   create(cmd: SessionCreateCmd): Session {
@@ -2398,11 +2452,12 @@ export class Supervisor {
       case "status": {
         this.refreshGit(s);
         if (s.data.git) {
-          const pr = git.prStatus(cwd); // network: gh pr view
-          const badge = prBadgeFor(pr.state, pr.url, s.data.git.branch, s.data.git.dirtyFileCount);
-          applyPrBadge(s.data.git, badge); // badge is branch-scoped, and merged hides on a dirty tree
-          this.persist();
-          this.broadcastUpdated(s.data);
+          // [BE2-1] The PR-state probe (`gh pr view`, network) used to run SYNCHRONOUSLY here — a single
+          // "git status" click could freeze the whole single-threaded daemon for up to NET_TIMEOUT_MS
+          // (60s) on a stalled connection. Kick it off the request path via refreshPrState (the async
+          // twin, which does the same `gh` probe with Bun.spawn and broadcasts the badge when it
+          // resolves). The immediate response carries the local status + last-known PR badge.
+          void this.refreshPrState(cmd.sessionId);
           output = `${s.data.git.branch} — ${s.data.git.dirtyFileCount} changed, ${s.data.git.ahead} ahead / ${s.data.git.behind} behind${s.data.git.prState ? ` · PR ${s.data.git.prState}` : ""}`;
         } else {
           output = "(not a git repo)";
@@ -2904,6 +2959,10 @@ export class Supervisor {
     this.clearNotifications(id); // dismiss any lingering "your turn" reminder for the gone session
     this.sessions.delete(id);
     this.logs.delete(id);
+    // [BE2-24] These per-session Sets were never cleaned on kill — they'd retain a dead session id for
+    // the daemon's lifetime (a slow leak keyed by every session ever killed).
+    this.awaitingAnnounced.delete(id);
+    this.goalPushSuppressed.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
@@ -2935,7 +2994,9 @@ export class Supervisor {
       this.terminalMgr.kill(id);
       await s.stop(); // reap any attached process group (PTY in Phase 3)
       if (s.data.source === "fresh-worktree" && s.data.worktree) {
-        git.deleteRemoteBranch(s.data.cwd, s.data.worktree.branch); // best-effort, before the worktree goes
+        // [BE2-4] Async so this background teardown never freezes the event loop on the network
+        // `git push --delete` (removeWorktree below is local/bounded). Best-effort, before the worktree goes.
+        await git.deleteRemoteBranchAsync(s.data.cwd, s.data.worktree.branch);
         removeWorktree(s.data.worktree.repoRoot, s.data.cwd, s.data.worktree.branch);
       }
       rmSync(this.store.sessionDir(id), { recursive: true, force: true });
@@ -3444,11 +3505,25 @@ export class Supervisor {
 
   private broadcastUpdated(data: SessionData): void {
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.updated", ts: now(), session: data });
-    // Teams are derived from the session list, so any session change can shift a team's rollup.
-    this.broadcastTeamInfo();
+    // [BE2-21] A team's derived rollup can only shift when the changed session is part of a team. For a
+    // plain session, skip the team-tree re-derive/broadcast entirely; for a team session, coalesce it.
+    if (data.teamRole || data.parentId) this.scheduleTeamInfoBroadcast();
   }
 }
 
+/** [BE2-23/SEC2-4] Validate a client-supplied telemetry counters object: a plain object with ≤32 keys
+ *  mapping short string names to FINITE numbers. Non-finite/non-number values are dropped; a non-object
+ *  or an over-large map returns null (the whole report is ignored). Never trust the wire shape. */
+function sanitizeCounters(counters: unknown): Record<string, number> | null {
+  if (!counters || typeof counters !== "object" || Array.isArray(counters)) return null;
+  const entries = Object.entries(counters as Record<string, unknown>);
+  if (entries.length > 32) return null; // a client flooding keys is a DoS vector, not a real report
+  const clean: Record<string, number> = {};
+  for (const [k, v] of entries) {
+    if (typeof k === "string" && k.length <= 64 && typeof v === "number" && Number.isFinite(v)) clean[k] = v;
+  }
+  return clean;
+}
 function slugify(s: string): string {
   return (
     s

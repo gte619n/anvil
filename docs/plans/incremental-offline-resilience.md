@@ -1,6 +1,10 @@
 # Incremental Conversation & Flaky-Connection Resilience
 
-**Status:** Draft — approved for phased execution
+**Status:** **Implemented** (protocol v4 shipped 2026-08). Resume watermarks, per-session epoch/lastSeq,
+delta-vs-snapshot resume, durable IndexedDB transcript cache, and resilience telemetry all landed; see
+`resume-wire.test.ts`, `resume-watermark.test.ts`, `telemetry.test.ts`, `test/web/resume.test.ts`. The
+improvement-program v2 (2026-08-01) fixed a replay-seq drop (BE2-8) and added an EventLog tail cache
+(BE2-6). Original phased spec preserved below.
 **Branch:** `incremental-offline` (based on `origin/main`)
 **Author:** PM + senior dev (interview-driven spec)
 **Created:** 2026-08-01

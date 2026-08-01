@@ -354,20 +354,38 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // http-only member stays http) and heal url + serverId so every client, on any page protocol, gets the
   // scheme the member actually answers on. Cheap: only unresolved records are probed, and once healed to a
   // real `srv_…` id they're skipped forever.
+  // [BE2-10] Throttled + fully defensive. This used to be `await`ed on every GET /api/fleet/members with
+  // no throttle, and a single malformed stored `m.url` made `new URL(...)` throw THROUGH `Promise.all`,
+  // so the endpoint 500'd forever (until fleet.json was hand-edited). Now it is fire-and-forget
+  // (`void`ed at the call site), throttled like healFleetUrlsByDiscovery, and every per-member step is
+  // wrapped so one bad record can never reject the whole pass.
+  let lastStaleHealAt = 0;
   async function healStaleFleetRecords(): Promise<void> {
     const stale = fleet.list().filter((m) => !m.serverId.startsWith("srv_"));
     if (stale.length === 0) return;
+    const nowMs = Date.now();
+    if (nowMs - lastStaleHealAt < 20_000) return; // bound the probe cost across a client's polling
+    lastStaleHealAt = nowMs;
     await Promise.all(
       stale.map(async (m) => {
-        const port = Number(new URL(m.url).port) || opts.port;
-        const r = await resolveMember(m.host, port);
-        const healedUrl = r.url || m.url;
-        const healedServerId = r.serverId ?? m.serverId;
-        const healedServerName = r.serverName || m.serverName;
-        if (healedUrl === m.url && healedServerId === m.serverId && healedServerName === m.serverName) return;
-        fleet.upsert({ ...m, url: healedUrl, serverId: healedServerId, serverName: healedServerName });
-        if (healedUrl !== m.url) console.log(`[fleet] healed member URL ${m.url} → ${healedUrl}`);
-        if (healedServerId !== m.serverId) console.log(`[fleet] healed member serverId ${m.serverId} → ${healedServerId}`);
+        try {
+          let port = opts.port;
+          try {
+            port = Number(new URL(m.url).port) || opts.port; // a torn/legacy url must not throw the pass
+          } catch {
+            /* malformed stored url — fall back to the default port and still try to heal */
+          }
+          const r = await resolveMember(m.host, port);
+          const healedUrl = r.url || m.url;
+          const healedServerId = r.serverId ?? m.serverId;
+          const healedServerName = r.serverName || m.serverName;
+          if (healedUrl === m.url && healedServerId === m.serverId && healedServerName === m.serverName) return;
+          fleet.upsert({ ...m, url: healedUrl, serverId: healedServerId, serverName: healedServerName });
+          if (healedUrl !== m.url) console.log(`[fleet] healed member URL ${m.url} → ${healedUrl}`);
+          if (healedServerId !== m.serverId) console.log(`[fleet] healed member serverId ${m.serverId} → ${healedServerId}`);
+        } catch (e) {
+          console.warn(`[fleet] heal of ${m.host} failed (ignored): ${e instanceof Error ? e.message : e}`);
+        }
       }),
     );
   }
@@ -397,6 +415,21 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (!stored || stored.url === heal.url) continue; // re-read: a concurrent upsert may have moved it
       fleet.upsert({ ...stored, url: heal.url });
       console.log(`[fleet] healed member URL ${stored.url} → ${heal.url} (via discovery)`);
+    }
+  }
+
+  // [BE2-12] Wire the previously-DEAD reconcile() off the members path. A member that was offline at
+  // rollout time is marked pending-offline and must be nudged to the pinned desired target when it
+  // reappears (spec D18/D19) — without a call site those members stayed stranded on an old SHA forever.
+  // Throttled + fire-and-forget; reconcile() is a no-op when there's no desired target or the member is
+  // already converged, so the common case costs one cheap probe per member at most every 30s.
+  let lastReconcileAt = 0;
+  async function reconcileFleetMembers(): Promise<void> {
+    const nowMs = Date.now();
+    if (nowMs - lastReconcileAt < 30_000) return;
+    lastReconcileAt = nowMs;
+    for (const m of fleet.list()) {
+      await fleetRollout.reconcile({ serverId: m.serverId, serverName: m.serverName, url: m.url }).catch(() => {});
     }
   }
 
@@ -481,6 +514,28 @@ export function createServer(opts: ServerOptions): ServerHandle {
   })();
 
   async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
+      // [SEC2-2] Origin gate on every state-mutating /api route (defense-in-depth on the browser vector).
+      // WS is gated at /ws; the REST mutating routes were reachable via a CORS "simple request" (a
+      // no-preflight text/plain POST still carries Origin). Reject a foreign browser origin here so a page
+      // in a trusted device's browser can't drive update/fleet/daemon/permission/session/push mutations.
+      // Native clients (no Origin), the same-origin PWA, and same-tailnet fleet peers are all allowed.
+      if (url.pathname.startsWith("/api/") && (req.method === "POST" || req.method === "PUT" || req.method === "DELETE")) {
+        if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
+          return new Response("forbidden origin", { status: 403 });
+        }
+      }
+
+      /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback.
+       *  Hoisted to the top of the handler so the update/daemon routes (which precede the fleet block in
+       *  the ladder) can reuse it for their [SEC2-3] identity gate. */
+      const callerIdentity = async (): Promise<{ trust: PeerTrust; reject?: string }> =>
+        resolveCallerIdentity({
+          peerAddress: srv.requestIP(req)?.address,
+          headerLogin: req.headers.get("Tailscale-User-Login"),
+          selfLogin: tailscaleSelfLogin,
+          whois: tailscaleWhois,
+        });
+
       if (req.method === "GET" && url.pathname === "/api/health") {
         const auth = resolveAuthStatus({ accounts });
         const body: rest.HealthResponse = {
@@ -513,6 +568,16 @@ export function createServer(opts: ServerOptions): ServerHandle {
         return Response.json(await updateCheck(updateDeps));
       }
       if (url.pathname === "/api/update/v1/apply" && req.method === "POST") {
+        // [SEC2-2] Require a JSON content-type. A cross-origin CORS "simple request" (text/plain, no
+        // preflight) can't set this, so a no-cors drive-by can't reach the apply path even if the Origin
+        // check were somehow bypassed; a body-less/wrong-type POST is rejected before we mutate anything.
+        const ct = (req.headers.get("content-type") || "").toLowerCase();
+        if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
+        // [SEC2-3] Identity gate — parity with /api/fleet/*: a PROVEN different tailnet user must not be
+        // able to pin this member's checkout + force a restart onto it. sameUser/unknown proceed (whois
+        // may be momentarily down, and unattended local triggers arrive via serve with the header).
+        const who = await callerIdentity();
+        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
         const bodyReq = (await req.json().catch(() => ({}))) as rest.update.ApplyRequest;
         const result = await updateApply({ targetSha: bodyReq.targetSha }, updateDeps);
         return Response.json(result, { status: result.ok ? 200 : 500 });
@@ -531,8 +596,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
       // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
       if (url.pathname === "/api/fleet/members" && req.method === "GET") {
-        await healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
-        void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP; healed url lands on the next poll
+        // [BE2-10] Both heals are fire-and-forget so a slow/failed probe never blocks (or 500s) this GET;
+        // the healed url/serverId lands on the next poll. The endpoint must always answer fast with the
+        // current roster.
+        void healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
+        void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP
+        void reconcileFleetMembers(); // [BE2-12] converge any pending-offline member to the pinned target
         return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
       }
       // Read-only roster for the session-start picker, readable from ANY origin so a member's client
@@ -608,15 +677,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // These are what let a NON-Mac machine be added to a fleet at all: the macOS Server.app's :7702
       // listener has no Linux equivalent, and until Phase 1 a tokenless machine had no running daemon
       // to host one anyway. Default closed, code + tailnet identity gated; see §8.2 for the full list.
-
-      /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback. */
-      const callerIdentity = async (): Promise<{ trust: PeerTrust; reject?: string }> =>
-        resolveCallerIdentity({
-          peerAddress: srv.requestIP(req)?.address,
-          headerLogin: req.headers.get("Tailscale-User-Login"),
-          selfLogin: tailscaleSelfLogin,
-          whois: tailscaleWhois,
-        });
+      // (`callerIdentity` is hoisted to the top of the handler now — the update/daemon routes reuse it.)
 
       /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
        *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
@@ -852,6 +913,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // (pull + rebuild + restart). Mirrors the `daemon.update` WS command for native clients
       // (the macOS menu command) and scripts that have no open WebSocket.
       if (url.pathname === "/api/daemon/update" && (req.method === "GET" || req.method === "POST")) {
+        // [SEC2-3] Identity gate on the mutating (POST = apply) path only; GET is a read-only check.
+        // Parity with /api/fleet/* and /api/update/v1/apply — reject a proven different tailnet user.
+        if (req.method === "POST") {
+          const who = await callerIdentity();
+          if (who.trust === "otherUser") {
+            return Response.json({ ok: false, phase: "error", output: who.reject ?? "different tailnet user", currentVersion: VERSION } satisfies rest.DaemonUpdateResponse, { status: 403 });
+          }
+        }
         const result = await supervisor.daemonUpdate(req.method === "GET");
         const body: rest.DaemonUpdateResponse = {
           ok: result.ok,

@@ -11,6 +11,14 @@ export class AnvilSocket {
   private closed = false; // set by close() — stops auto-reconnect (server removed from the fleet)
   private heartbeatTimer = 0; // periodic ping while open (§6.4 liveness)
   private pongDeadline = 0; // armed after a ping; any inbound frame clears it, else we force-reconnect
+  // [WEB2-12] Bound references to the window/document listeners so close() can remove them. Without
+  // this, every AnvilSocket (one per fleet member, re-created on the URL-drift heal path) leaks an
+  // `online` + `visibilitychange` listener pair that fires connectNow() on a socket that's meant to
+  // be permanently closed.
+  private readonly onOnline = () => this.connectNow();
+  private readonly onVisible = () => {
+    if (document.visibilityState === "visible") this.connectNow();
+  };
 
   // Heartbeat cadence + how long we wait for any reply before declaring the socket half-open. Tuned
   // to notice a silently-dropped transport (e.g. a Tailscale tunnel bounce) within ~HEARTBEAT+GRACE
@@ -26,10 +34,8 @@ export class AnvilSocket {
   ) {
     // Reconnect promptly when the device/network comes back, instead of waiting out the backoff.
     if (typeof window !== "undefined") {
-      window.addEventListener("online", () => this.connectNow());
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") this.connectNow();
-      });
+      window.addEventListener("online", this.onOnline);
+      document.addEventListener("visibilitychange", this.onVisible);
     }
   }
 
@@ -69,7 +75,14 @@ export class AnvilSocket {
         return; // ignore malformed frame
       }
       if ((event as { type?: string }).type === "pong") return; // heartbeat ack — not an app event
-      this.onEvent(event);
+      // [WEB2-10] Never let an app-side handler throw escape the socket callback. A single throw here
+      // (e.g. a quota-full localStorage.setItem deep in event handling — the 3.0.33 incident class)
+      // would otherwise kill the onmessage handler and silently freeze ALL further WS processing.
+      try {
+        this.onEvent(event);
+      } catch (e) {
+        console.error("[ws] onEvent handler threw (frame dropped, socket stays live):", e);
+      }
     };
     ws.onclose = () => {
       this.stopHeartbeat();
@@ -161,6 +174,12 @@ export class AnvilSocket {
     this.closed = true;
     this.stopHeartbeat();
     clearTimeout(this.reconnectTimer);
+    // [WEB2-12] Remove the listeners added in the constructor so a permanently-closed socket (member
+    // removed / URL-drift re-create) doesn't leak a handler pair that keeps firing connectNow().
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", this.onOnline);
+      document.removeEventListener("visibilitychange", this.onVisible);
+    }
     try {
       this.ws?.close();
     } catch {

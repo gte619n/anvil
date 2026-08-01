@@ -28,6 +28,12 @@ const SKIP_PERSIST: ReadonlySet<string> = new Set([
  */
 export class EventLog {
   private readonly file: string;
+  // [BE2-6/BE-11] In-memory tail cache of the persisted events. `readAll` used to re-parse the WHOLE
+  // events.ndjson on every since()/snapshot()/promptCids() — and protocol v4 fires since() on every
+  // reconnect, so after a daemon restart a reconnect storm meant back-to-back full-file parses of a
+  // 5–10MB log (~30–150ms each) blocking the single-threaded loop. `append` already sees every event,
+  // so we hold the parsed tail in memory (hydrated ONCE from disk on first read) and serve reads from it.
+  private cache: ServerEvent[] | null = null;
 
   constructor(sessionDir: string) {
     this.file = join(sessionDir, "events.ndjson");
@@ -43,20 +49,26 @@ export class EventLog {
       // dropping it is correct (the session is dead). MUST NOT throw: this runs inside emit(), off
       // the async turn loop, so an uncaught ENOENT here would crash the whole daemon (all sessions).
       if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") throw e;
+      return; // write failed — don't mirror a dropped event into the cache
     }
+    if (this.cache) this.cache.push(event); // keep the in-memory tail in step (once hydrated)
   }
 
+  /** Parse the file ONCE on first read; subsequent reads (the common path) touch memory, not disk. */
   private readAll(): ServerEvent[] {
-    if (!existsSync(this.file)) return [];
+    if (this.cache) return this.cache;
     const out: ServerEvent[] = [];
-    for (const line of readFileSync(this.file, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        out.push(JSON.parse(line) as ServerEvent);
-      } catch {
-        /* skip a torn final line */
+    if (existsSync(this.file)) {
+      for (const line of readFileSync(this.file, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          out.push(JSON.parse(line) as ServerEvent);
+        } catch {
+          /* skip a torn final line */
+        }
       }
     }
+    this.cache = out;
     return out;
   }
 

@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { writeFileAtomic } from "../util/atomic";
 
 /**
  * Shared primitives for reading/writing the launcher's env file — the single file the launcher sources
@@ -71,7 +72,9 @@ export function upsertEnvLine(file: string, key: string, value: string): void {
   // Drop a trailing empty line so we don't accumulate blank lines on repeated writes.
   while (kept.length && kept[kept.length - 1]!.trim() === "") kept.pop();
   kept.push(`${key}=${value}`);
-  writeFileSync(file, `${kept.join("\n")}\n`, { mode: 0o600 });
+  // [BE2-14] Atomic write: a torn env file on the restart-storm box would drop CLAUDE_CODE_OAUTH_TOKEN
+  // and degrade every boot until re-entered. rename-over-target is all-or-nothing; keep the 0600 mode.
+  writeFileAtomic(file, `${kept.join("\n")}\n`, { mode: 0o600 });
 }
 
 /** Remove any `KEY=…` line from `file` (no-op if the file or line is absent). */
@@ -79,5 +82,5 @@ export function removeEnvLine(file: string, key: string): void {
   if (!existsSync(file)) return;
   const lines = readFileSync(file, "utf8").split("\n");
   const kept = lines.filter((l) => !l.replace(/^export\s+/, "").startsWith(`${key}=`));
-  writeFileSync(file, kept.join("\n"), { mode: 0o600 });
+  writeFileAtomic(file, kept.join("\n"), { mode: 0o600 }); // [BE2-14] atomic (see upsertEnvLine)
 }

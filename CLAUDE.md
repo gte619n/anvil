@@ -17,8 +17,12 @@ Tailscale. Start with [`README.md`](README.md) for the product overview and
 | `scripts/`, `anvild/scripts/` | Build/release/signing + service management (`service.sh`, `merge-session.sh`). |
 
 The wire protocol is the source of truth for daemon↔client contracts:
-`docs/plans/anvil-protocol.ts` (symlinked as `anvild/protocol.ts`, imported as `@protocol`). A
-contract test (`anvild/test/contract/`) pins its `PROTOCOL_VERSION` + event set against a golden.
+`docs/plans/anvil-protocol.ts` (symlinked as `anvild/protocol.ts`, imported as `@protocol`;
+`PROTOCOL_VERSION` is currently **4**). Two contract tests in `anvild/test/contract/` guard it:
+`protocol-surface.test.ts` pins the version + the set of `type` literals, and `wire-shape.test.ts` pins
+the required fields + types of the critical v4/hello/permission envelopes. Changes are **additive-or-bump**
+— a field rename/retype/drop is breaking; bump `PROTOCOL_VERSION` and update all four clients together.
+See [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) §4 for the policy.
 
 ## Build, test, run
 
@@ -37,10 +41,23 @@ bun run start            # run the daemon (src/main.ts)
 CI (`.github/workflows/ci.yml`) gates every PR on `typecheck` + `typecheck:web` + `build:web` +
 `bun test`; the release workflows re-run the same checks before shipping. Keep all four green.
 
-**Running the daemon needs `CLAUDE_CODE_OAUTH_TOKEN`, and it refuses to start if `ANTHROPIC_API_KEY`
-or `ANTHROPIC_AUTH_TOKEN` are set** — those outrank the OAuth token and would meter per-token billing
-(the §3 guard in `src/auth/guard.ts`). This is the single most surprising local-run failure. The
-daemon's security boundary is Tailscale itself — see [`SECURITY.md`](SECURITY.md).
+**Auth model (read carefully — the docs used to overstate this).** A missing `CLAUDE_CODE_OAUTH_TOKEN`
+is NOT fatal: the daemon boots **degraded** (it serves the UI + pairing/takeover flow so a headless
+member can be joined into a fleet), it just can't run a turn until a subscription token is present. What
+IS fatal is a **metered key**: the daemon refuses to start if `ANTHROPIC_API_KEY` or
+`ANTHROPIC_AUTH_TOKEN` are set — those outrank the OAuth token and would meter per-token billing (the §3
+guard in `src/auth/guard.ts`). For local dev you'll want a real `CLAUDE_CODE_OAUTH_TOKEN` so turns
+actually run. Tokens now live in the **account roster** (`src/auth/accounts.ts`, multi-account §3); the
+env var is the migration seed + the mirror for the default account, not the only home. The daemon's
+security boundary is Tailscale itself — see [`SECURITY.md`](SECURITY.md) and
+[`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
+
+**The frozen Update API v1 is load-bearing — do not casually refactor it.** `src/daemon/update-api.ts`
+and `src/daemon/updater/*` (watchdog) implement a STABLE contract (`UPDATE_API_VERSION`) that a hub and a
+partially-updated fleet coordinate over, and that the out-of-process watchdog reads to roll a bricked
+release back. Response SHAPES are additive-only (guarded by `test/unit/update-api-contract.test.ts`);
+breaking them silently strands members mid-rollout. Bump to `/v2` + `UPDATE_API_VERSION` instead of
+changing v1. See `docs/plans/2026-08-01-stable-update-service.md`.
 
 ## Common pitfalls
 
@@ -76,8 +93,9 @@ branch in two worktrees); ending on `<branch>_followup` is correct and expected,
 
 ## Verifying before merge
 
-Sessions run inside a **git worktree** under `~/.anvil/worktrees/<session-id>` (or
-`.claude/worktrees/...`), branched off `main`. New worktrees get `node_modules` symlinked in from the
+Sessions run inside a **git worktree** under `<stateDir>/worktrees/<session-id>` — `stateDir` defaults
+to `~/.anvil` (override with `ANVIL_STATE_DIR`), so the default path is `~/.anvil/worktrees/<session-id>`
+(there is no `.claude/worktrees`). Branched off `main`. New worktrees get `node_modules` symlinked in from the
 canonical checkout (`createWorktree`/`linkDeps` in `anvild/src/session/worktree.ts`), so you **can**
 run a real typecheck in-worktree:
 

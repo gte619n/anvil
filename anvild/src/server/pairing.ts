@@ -20,6 +20,10 @@ import { join } from "node:path";
 export const DEFAULT_ARM_TTL_MS = 10 * 60_000;
 /** Hard ceiling on a client-requested TTL — the window is a credential-accepting hole (§8.2). */
 export const MAX_ARM_TTL_MS = 30 * 60_000;
+/** [BE2-13] Brute-force cap: after this many rejected attempts the window disarms itself, so the ~10⁶
+ *  code space can't be walked during a 30-min armed window (the prize being the hub's OAuth token). A
+ *  legitimate operator mistypes once or twice; five wrong attempts is unambiguously an attack. */
+export const MAX_PAIR_ATTEMPTS = 5;
 
 export type PairRejection = "not accepting pairings" | "wrong code" | "expired" | "different tailnet user" | "locked to another hub";
 
@@ -101,6 +105,9 @@ export class PairingWindow {
     }
     if (!codesMatch(w.code, code ?? "")) {
       this.countRejection();
+      // [BE2-13] Disarm once the attempt cap is reached so a subsequent guess (even a correct one) is
+      // turned away — closes the brute-force window on the ~10⁶ code space.
+      if (w.rejections >= MAX_PAIR_ATTEMPTS) this.armed = null;
       return "wrong code";
     }
     w.lockedHubServerId = hubServerId;
@@ -267,6 +274,10 @@ export async function resolveCallerIdentity(opts: IdentityOpts): Promise<Identit
 }
 
 // ─── Tailscale identity lookups (the production seams) ─────────────────────────────────────────
+// [BE2-17] The identity gate runs on EVERY request (including static assets) and used to spawn up to
+// two uncached `tailscale` subprocesses each time, re-probing the binary path every call. That's a
+// per-request fork storm. Now: the resolved binary path is cached, `selfLogin` is memoized (5min TTL —
+// this node's own login effectively never changes), and `whois` is a small LRU (60s TTL) keyed by IP.
 
 const TAILSCALE_BINS = [
   "tailscale",
@@ -276,13 +287,19 @@ const TAILSCALE_BINS = [
   "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
 ];
 
+let cachedTailscaleBin: string | null = null;
 async function runTailscale(args: string[]): Promise<string | null> {
-  for (const bin of TAILSCALE_BINS) {
+  // Try the cached binary first; only fall back to the full probe if it's gone/failing.
+  const order = cachedTailscaleBin ? [cachedTailscaleBin, ...TAILSCALE_BINS.filter((b) => b !== cachedTailscaleBin)] : TAILSCALE_BINS;
+  for (const bin of order) {
     try {
       const p = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "ignore" });
       const out = await new Response(p.stdout).text();
       await p.exited;
-      if (p.exitCode === 0 && out.trim()) return out;
+      if (p.exitCode === 0 && out.trim()) {
+        cachedTailscaleBin = bin; // remember what worked so the next call doesn't re-probe every path
+        return out;
+      }
     } catch {
       /* not at this path / not runnable — try the next */
     }
@@ -290,27 +307,68 @@ async function runTailscale(args: string[]): Promise<string | null> {
   return null;
 }
 
-/** This node's own tailnet login (`Self.UserID` → `User[id].LoginName`). */
-export async function tailscaleSelfLogin(): Promise<string | null> {
-  const json = await runTailscale(["status", "--json"]);
-  if (!json) return null;
-  try {
-    const s = JSON.parse(json) as { Self?: { UserID?: number }; User?: Record<string, { LoginName?: string }> };
-    const uid = s.Self?.UserID;
-    if (uid === undefined) return null;
-    return s.User?.[String(uid)]?.LoginName ?? null;
-  } catch {
-    return null;
+const SELF_LOGIN_TTL_MS = 5 * 60_000;
+let selfLoginCache: { at: number; value: string | null } | null = null;
+
+/** This node's own tailnet login (`Self.UserID` → `User[id].LoginName`), memoized 5min. Injectable
+ *  clock/runner for tests; production uses the real ones. */
+export async function tailscaleSelfLogin(
+  inject: { now?: () => number; run?: (args: string[]) => Promise<string | null> } = {},
+): Promise<string | null> {
+  const now = inject.now ?? Date.now;
+  const run = inject.run ?? runTailscale;
+  if (selfLoginCache && now() - selfLoginCache.at < SELF_LOGIN_TTL_MS) return selfLoginCache.value;
+  const json = await run(["status", "--json"]);
+  let value: string | null = null;
+  if (json) {
+    try {
+      const s = JSON.parse(json) as { Self?: { UserID?: number }; User?: Record<string, { LoginName?: string }> };
+      const uid = s.Self?.UserID;
+      value = uid === undefined ? null : (s.User?.[String(uid)]?.LoginName ?? null);
+    } catch {
+      value = null;
+    }
   }
+  selfLoginCache = { at: now(), value };
+  return value;
 }
 
-/** `tailscale whois --json <ip>` → the peer's login, or null when it can't be resolved. */
-export async function tailscaleWhois(ip: string): Promise<string | null> {
-  const json = await runTailscale(["whois", "--json", ip]);
-  if (!json) return null;
-  try {
-    return (JSON.parse(json) as { UserProfile?: { LoginName?: string } }).UserProfile?.LoginName ?? null;
-  } catch {
-    return null;
+const WHOIS_TTL_MS = 60_000;
+const WHOIS_CACHE_MAX = 256;
+const whoisCache = new Map<string, { at: number; value: string | null }>();
+
+/** `tailscale whois --json <ip>` → the peer's login, or null when it can't be resolved. LRU-cached 60s
+ *  by IP so a client's request burst doesn't spawn a whois per request. */
+export async function tailscaleWhois(
+  ip: string,
+  inject: { now?: () => number; run?: (args: string[]) => Promise<string | null> } = {},
+): Promise<string | null> {
+  const now = inject.now ?? Date.now;
+  const run = inject.run ?? runTailscale;
+  const hit = whoisCache.get(ip);
+  if (hit && now() - hit.at < WHOIS_TTL_MS) return hit.value;
+  const json = await run(["whois", "--json", ip]);
+  let value: string | null = null;
+  if (json) {
+    try {
+      value = (JSON.parse(json) as { UserProfile?: { LoginName?: string } }).UserProfile?.LoginName ?? null;
+    } catch {
+      value = null;
+    }
   }
+  whoisCache.delete(ip); // re-insert at the end (LRU)
+  whoisCache.set(ip, { at: now(), value });
+  while (whoisCache.size > WHOIS_CACHE_MAX) {
+    const oldest = whoisCache.keys().next().value;
+    if (oldest === undefined) break;
+    whoisCache.delete(oldest);
+  }
+  return value;
+}
+
+/** Test seam: clear the identity caches so a test starts from a cold state. */
+export function __resetIdentityCaches(): void {
+  cachedTailscaleBin = null;
+  selfLoginCache = null;
+  whoisCache.clear();
 }

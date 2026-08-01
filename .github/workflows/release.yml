@@ -42,6 +42,12 @@ jobs:
   # and Release here. That Release is the stable, public download URL the Sparkle appcast enclosures
   # point at; the mobile jobs don't need it.
   meta:
+    # [CI2-5] Gate the public tag + GitHub Release on `verify`. Previously meta ran unconditionally, so a
+    # RED verify still minted a `v<version>` tag + an assetless Release, polluting the only
+    # commit↔version audit trail with builds that never shipped. Every ship job already needs both meta
+    # AND verify, so requiring verify here only delays the tag until the tree is known-good — the version
+    # number itself is still computed from the stable run number, early enough for all consumers.
+    needs: [verify]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -105,7 +111,7 @@ jobs:
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
+        with: { bun-version: 1.3.14 }
 
       # gradle bundleWebAssets runs `bun` via a login shell (`bash -lc`) whose PATH may miss Bun's
       # install dir; symlink it onto a dir that's always on PATH.
@@ -172,7 +178,7 @@ jobs:
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
+        with: { bun-version: 1.3.14 }
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -256,7 +262,7 @@ jobs:
           sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
+        with: { bun-version: 1.3.14 }
       - name: Install web client deps (anvild)
         working-directory: anvild
         run: bun install --frozen-lockfile
@@ -315,8 +321,20 @@ jobs:
           printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEYFILE"
           OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil.zip" --ed-key-file "$KEYFILE")"
           echo "sign_update: $OUT"
-          echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
-          echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+          ED_SIG="$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')"
+          LEN="$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')"
+          # [CI2-2] `sed` echoes its input UNCHANGED on a no-match (exit 0), so a Sparkle output-format
+          # shift (already happened once with 2.9) would silently emit a garbage signature and every
+          # Mac's EdDSA update check would fail. Assert the shape before trusting it: a base64 ed25519
+          # signature (~88 chars) and a numeric byte length. Fail loudly instead of shipping junk.
+          if ! printf '%s' "$ED_SIG" | grep -Eq '^[A-Za-z0-9+/=]{80,120}$'; then
+            echo "::error::sign_update edSignature didn't match the expected base64 shape — raw output: $OUT"; exit 1
+          fi
+          if ! printf '%s' "$LEN" | grep -Eq '^[0-9]+$'; then
+            echo "::error::sign_update length wasn't numeric — raw output: $OUT"; exit 1
+          fi
+          echo "ed_signature=$ED_SIG" >> "$GITHUB_OUTPUT"
+          echo "length=$LEN" >> "$GITHUB_OUTPUT"
           gh release upload "${{ needs.meta.outputs.tag }}" "$RUNNER_TEMP/Anvil.zip" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Clean up keychain
@@ -342,7 +360,7 @@ jobs:
           sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
+        with: { bun-version: 1.3.14 }
       - name: Install + prebuild web client (anvild)
         working-directory: anvild
         run: |
@@ -404,8 +422,20 @@ jobs:
           printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEYFILE"
           OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil-Server.zip" --ed-key-file "$KEYFILE")"
           echo "sign_update: $OUT"
-          echo "ed_signature=$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
-          echo "length=$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+          ED_SIG="$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')"
+          LEN="$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')"
+          # [CI2-2] `sed` echoes its input UNCHANGED on a no-match (exit 0), so a Sparkle output-format
+          # shift (already happened once with 2.9) would silently emit a garbage signature and every
+          # Mac's EdDSA update check would fail. Assert the shape before trusting it: a base64 ed25519
+          # signature (~88 chars) and a numeric byte length. Fail loudly instead of shipping junk.
+          if ! printf '%s' "$ED_SIG" | grep -Eq '^[A-Za-z0-9+/=]{80,120}$'; then
+            echo "::error::sign_update edSignature didn't match the expected base64 shape — raw output: $OUT"; exit 1
+          fi
+          if ! printf '%s' "$LEN" | grep -Eq '^[0-9]+$'; then
+            echo "::error::sign_update length wasn't numeric — raw output: $OUT"; exit 1
+          fi
+          echo "ed_signature=$ED_SIG" >> "$GITHUB_OUTPUT"
+          echo "length=$LEN" >> "$GITHUB_OUTPUT"
           gh release upload "${{ needs.meta.outputs.tag }}" "$RUNNER_TEMP/Anvil-Server.zip" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Clean up keychain
@@ -425,15 +455,32 @@ jobs:
       - uses: actions/checkout@v7
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
+        with: { bun-version: 1.3.14 }
 
       # Start from the currently-published appcasts so history accumulates across releases.
+      # [CI2-3] Distinguish a 404 (legit: no appcast published yet → start fresh) from any other failure
+      # (5xx / transient Pages fetch error). The old `curl -f … || echo` treated EVERY failure like a
+      # first release, so one flaky fetch rebuilt the feed with a single item and DROPPED the 20-item
+      # rollback history. On a non-404 error we fail the job instead of silently truncating history.
       - name: Seed from the live appcasts
         run: |
+          set -euo pipefail
           mkdir -p _site
           base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
-          curl -fsSL "$base/appcast.xml"        -o _site/appcast.xml        || echo "(no existing client appcast yet)"
-          curl -fsSL "$base/appcast-server.xml" -o _site/appcast-server.xml || echo "(no existing server appcast yet)"
+          seed() {
+            local url="$1" out="$2" name="$3" code
+            code="$(curl -sS -o "$out" -w '%{http_code}' "$url" || echo 000)"
+            if [ "$code" = "200" ]; then
+              echo "seeded $name from the live feed"
+            elif [ "$code" = "404" ]; then
+              rm -f "$out"; echo "(no existing $name yet — first release)"
+            else
+              echo "::error::failed to fetch $name ($url): HTTP $code — refusing to rebuild the feed and drop rollback history"
+              exit 1
+            fi
+          }
+          seed "$base/appcast.xml"        _site/appcast.xml        "client appcast"
+          seed "$base/appcast-server.xml" _site/appcast-server.xml "server appcast"
 
       - name: Update client appcast
         env:

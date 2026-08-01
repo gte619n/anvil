@@ -101,6 +101,30 @@ test("apply that fails typecheck refuses to restart (never onto a broken tree)",
   expect(ran(calls, "run build:web")).toBe(true); // build ran; typecheck gate came after
 });
 
+test("[BE2-28] a second concurrent apply is rejected 'already in progress' (no interleaved applies)", async () => {
+  const dir = tmp();
+  // Gate the first apply at the checkout so it's provably still in flight when the second call arrives.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const run: CommandRunner = async (cmd) => {
+    const key = cmd.join(" ");
+    if (key.includes("checkout --detach")) await gate; // hold the first apply here
+    for (const [pat, res] of Object.entries(HAPPY)) if (key.includes(pat)) return res;
+    return { code: 0, out: "ok" };
+  };
+  const d = deps(dir, run, { isManaged: () => true, scheduleRestart: () => {} });
+  const p1 = updateApply({}, d); // suspends at the gated checkout, holding the in-flight lock
+  const r2 = await updateApply({}, d); // must hit the concurrency guard
+  expect(r2.ok).toBe(false);
+  expect(r2.error).toMatch(/already in progress/);
+  release();
+  const r1 = await p1;
+  expect(r1.ok).toBe(true); // the first apply still completes normally
+  // And once it's done, a fresh apply is accepted again (the lock cleared).
+  const r3 = await updateApply({}, deps(tmp(), fakeRunner(HAPPY).run, { isManaged: () => true, scheduleRestart: () => {} }));
+  expect(r3.ok).toBe(true);
+});
+
 test("status derives 'healthy' once the running process matches the target and the bundle is servable", async () => {
   const rs = runningSha();
   const dir = tmp();

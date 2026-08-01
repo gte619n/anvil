@@ -57,6 +57,16 @@ test("armed: the shown code is accepted; a wrong one is rejected and the window 
   expect(w.accept(code, HUB)).toBeNull();
 });
 
+test("[BE2-13] the window disarms after MAX_PAIR_ATTEMPTS wrong codes (brute-force cap)", () => {
+  const { w } = windowAt();
+  const { code } = w.arm();
+  const wrong = code === "000000" ? "111111" : "000000";
+  for (let i = 0; i < 5; i++) expect(w.accept(wrong, HUB)).toBe("wrong code");
+  // Past the cap the window is closed — even the CORRECT code is now turned away.
+  expect(w.isArmed()).toBe(false);
+  expect(w.accept(code, HUB)).toBe("not accepting pairings");
+});
+
 test("armed: rejections coalesce to ONE notification per window, with a count (HJ-33)", () => {
   const { w } = windowAt();
   w.arm();
