@@ -52,3 +52,19 @@ jobs:
 
       - name: Test
         run: bun test
+
+  workflow-lint:
+    name: workflow lint — pinned Bun everywhere
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # [CI2-6] The gate pins Bun, but the ship jobs in release.yml used `bun-version: latest`, so the
+      # web bundle that actually SHIPS was built by an unvalidated Bun. Fail if any workflow uses an
+      # unpinned Bun, so the shipped artifact is always built by the same interpreter the gate validated.
+      - name: No unpinned bun-version in any workflow
+        run: |
+          if grep -rn "bun-version:[[:space:]]*latest" .github/workflows/; then
+            echo "::error::bun-version: latest found — pin it to the engines floor (1.3.14)"
+            exit 1
+          fi
+          echo "all workflows pin bun-version"

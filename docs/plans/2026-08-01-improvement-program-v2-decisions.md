@@ -170,6 +170,21 @@ Web (WEB2-11/13/14/15 done; WEB2-2/16 deferred):
 
 ## P5 (baseline fix — done first to get a clean baseline)
 
+## P5 — Test coverage (runs with P0–P4; standalone additions)
+
+- Baseline red fixed (below). Each P0–P4 item shipped with its named guard (see those sections).
+- Contract golden EXTENDED (`wire-shape.test.ts`) — the plan's "single most leveraged gap": pins
+  required fields + declared types + optionality of the v4 resume envelopes + `server.hello` +
+  `permission.request` + `Envelope`/`SessionScoped`. Parses protocol.ts and diffs against an inline
+  golden; a field rename/retype/drop/optionality-flip fails here (the type-literal golden misses them).
+- Zero-coverage module `src/agent/input-queue.ts` now covered (`input-queue.test.ts`). `src/auth/env-file.ts`
+  gained atomic-write coverage in P2 (`atomic-write.test.ts`).
+- `test/helpers/index.ts` created (`tmpDir`, `webDirOk`, `bootServer`) as the fixture-debt foundation.
+  Retrofitting the 55 existing hand-rolled `mkdtempSync` files is deferred (pure churn, no behavior change).
+- STILL DEFERRED (documented, no toolchain/time this pass): watchdog-entrypoint (`updater/main.ts`),
+  `push/apns.ts`+`fcm.ts` (fake-endpoint tests), `web/src/main.ts` permission-dialog/offline-banner
+  behaviors, and the E2E promotion of `headless-smoke.ts` into CI (paired with the CI2-1 native-PR job).
+
 - [boot-init.test.ts] Fixed the 1 red test by falling back to the source `web/index.html`
   when `web/dist/index.html` is absent (fresh worktree). build.ts copies the source shell to
   dist verbatim, so they are byte-identical; prefer dist when present. Chose fallback over
