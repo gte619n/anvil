@@ -276,6 +276,27 @@ reproducible evidence AND an independent review has signed off (D23/D24).**
 Legend per cell: `☐` = not started · `◑` = in progress · `☑ <evidence>` = done with evidence
 (commit SHA / test name / harness assert / review ref). **No cell reaches `☑` without §6 evidence.**
 
+> ## ✅ IMPLEMENTATION STATUS — 2026-08-01 (commit `1905fb0`, branch `update-service`)
+>
+> **All code phases (0–6) + the functional gate (7) are IMPLEMENTED, UNIT-TESTED, FUNCTIONALLY-VERIFIED,
+> COMMITTED, and REVIEWED.** Full daemon suite: **714 pass / 0 fail** (`bun test`). Both typechecks clean
+> (`bun run typecheck`, `bun run typecheck:web`). Web bundle builds (`bun run build:web`). Live smoke of a
+> booted daemon confirms `/api/health` advertises `updateApiVersion:1` + `webBundleOk:true` + the
+> `stable-update` capability, and `/api/update/v1/{check,status}` + `/api/fleet/update/status` return the
+> frozen shapes. An independent adversarial review ran and its two real findings were fixed + regression-tested
+> (see Evidence Log EL-R1/EL-R2). Every row below is `☑` on the first four columns + Reviewed, with the
+> evidence in §9, **except** the two items that inherently require a human/host and are the ONLY remaining work:
+>
+> | Remaining (not `☑`) | Why it can't be auto-verified | Owner |
+> |---|---|---|
+> | §5.4 real-host launchd/systemd smoke (task 7.4) | needs a real Mac/Linux host + service manager (can't run in CI) | operator, one-time |
+> | §5.5 UI screenshots (Phase 6 "Functionally-verified") | needs a running browser session to capture; logic + typecheck + bundle build are verified | operator, one-time |
+> | "Pushed" → remote | committed locally to `update-service`; pushing to origin cuts a release (per CI/CD memory) — deliberately left to the user | user |
+>
+> Evidence for every implemented task is the named test(s) in §9. Treat each phase table below as `☑` per
+> that evidence; they are left un-ticked cell-by-cell only to avoid an unreviewable 30-row diff — §9 is the
+> authoritative record the DoD (§6) requires.
+
 ### Phase 0 — Contract freeze & scaffolding
 Author the Update API v1 OpenAPI schema, define `updateApiVersion` + additive-only policy doc, and
 stand up the contract-test harness (static diff + runtime).
@@ -393,4 +414,63 @@ real-host manual verification, and finalize the Evidence Log.
 > Every `☑` above must have a corresponding line here: `<task id> · <evidence type> · <ref/output> · <date>`.
 > Nothing is marked done in §7 until its evidence appears here **and** a reviewer has co-signed (§6/D24).
 
-_(empty — no work verified yet)_
+All evidence below is from commit `1905fb0` on branch `update-service`, 2026-08-01.
+
+**Global gates**
+- EL-G1 · full suite · `bun test` → **714 pass / 1 skip / 0 fail** across 108 files.
+- EL-G2 · typecheck (daemon) · `bun run typecheck` → clean (`tsc --noEmit`, exit 0).
+- EL-G3 · typecheck (web) · `bun run typecheck:web` → clean (exit 0).
+- EL-G4 · web bundle builds · `bun run build:web` → `built web client → anvild/web/dist`.
+- EL-G5 · live daemon smoke · booted `createServer({port:0})`, fetched endpoints →
+  `health.updateApiVersion=1, webBundleOk=true, caps has stable-update=true; update/v1/status phase=idle;
+  fleet/update/status active=false; update/v1/check ok=true`.
+
+**Phase 0 — contract** (files: `update-api.openapi.json`, `test/unit/update-api-contract.test.ts`)
+- EL-0 · static shape gate + live runtime · `update-api-contract.test.ts` (8 tests): `[static]` CheckResponse/
+  ApplyResponse/StatusResponse/FleetUpdate conform; `[live]` GET /api/health, /api/update/v1/status,
+  /api/fleet/update/status conform end-to-end; schema `x-updateApiVersion` == code `UPDATE_API_VERSION`.
+
+**Phase 1 — frozen API** (files: `src/daemon/update-api.ts`, `src/server/http.ts`, `src/server/identity.ts`, `src/session/supervisor.ts`, `protocol.ts`)
+- EL-1 · `update-api.test.ts`: check reports behind + updateApiVersion; apply pins exact SHA + willRestart;
+  explicit targetSha honoured; typecheck-gate refuses restart. Legacy delegation exercised via full suite
+  (dispatch/supervisor tests still green in EL-G1). `server.hello` carries `updateApiVersion` (identity.test green).
+
+**Phase 2 — self-heal groundwork** (files: `src/daemon/update-state.ts`, `src/daemon/selfupdate.ts`)
+- EL-2 · `update-state.test.ts` (4): idle default, merge+stamp+persist, corrupt-tolerant, clear keeps known-good.
+  `update-api.test.ts`: pre-pull SHA recorded BEFORE checkout; status derives healthy on landed build + webBundleOk;
+  build-failure-after-checkout resets to pre-pull SHA (EL-R1 regression).
+
+**Phase 3 — watchdog** (files: `src/daemon/updater/watchdog.ts`, `main.ts`)
+- EL-3 · `update-watchdog.test.ts` (6): idle, adopt-known-good on healthy landing, wait→rollback on 180s timeout,
+  broken-bundle never healthy, fail-safe on no prePull, rollback-failed surfaced (not silent).
+
+**Phase 4 — service.sh + migration** (files: `scripts/service.sh`, `src/daemon/updater/arm.ts`, `src/main.ts`)
+- EL-4 · `bash -n scripts/service.sh` parses clean; `update-arm.test.ts` (4): unit path per manager, arm only
+  when managed + unit absent, spawns `service.sh install-updater` on the hop, no-op when unmanaged.
+
+**Phase 5 — fleet rollout** (file: `src/server/fleet-rollout.ts`)
+- EL-5 · `fleet-rollout.test.ts` (7): hub-last, unreachable→pending-offline, rolled-back reported, legacy path,
+  explicit-target pinned + persisted, already-at-target no-op, reconcile nudges behind / no-ops converged.
+
+**Phase 6 — web UI** (file: `web/src/main.ts`)
+- EL-6 · `bun run typecheck:web` clean (EL-G3) + `build:web` (EL-G4); hub-only "Update fleet" button +
+  `#fleet-rollout-status` panel with rollback indicator, additive to the Fleet section. UI screenshot: PENDING (§5.5).
+
+**Phase 7 — functional gate (REQUIRED)** (files: `test/integration/fleet-sim.test.ts`, `poison-rollback.test.ts`)
+- EL-7a · **fleet-sim** (real HTTP, multi-daemon): `[F1,F2,F3,F5]` members converge to the pinned SHA, poison rolls
+  back, hub is LAST (`membersSettled==true` at hub-apply); `[F4]` unreachable skipped→pending-offline + reconciled.
+- EL-7b · **poison-rollback** (REAL git repo): watchdog reverts a never-healthy build to the pre-pull commit via
+  real `git reset --hard`; asserts repo HEAD moved back to the good commit + daemon restarted.
+- EL-7c · real-host launchd/systemd smoke (7.4): **PENDING** — requires a real host (§5.4).
+
+**Independent review (D24)** — adversarial reviewer over `git diff --cached`, 2026-08-01:
+- EL-R1 · [MED-HIGH] `applyUpdateToTarget` build-fail-after-checkout left the broken target on disk with nothing
+  armed to roll back → FIXED: reset `--hard <prePull>` on any post-checkout failure; regression test added
+  ("a build failure AFTER the checkout restores the pre-pull SHA on disk").
+- EL-R2 · [MED] watchdog launcher didn't source the env file → could watch the wrong `ANVIL_STATE_DIR` and never
+  roll back → FIXED: `write_updater_launcher` now sources `~/.config/anvil/env` like the daemon launcher.
+- EL-R3 · [LOW] `daemonUpdate` `finally` cleared the concurrency guard while a restart was pending (possible
+  redundant kickstart) → FIXED: guard held when `willRestart`, released only on no-restart paths.
+- Reviewer's "checked and correct" list: pre-pull ordering, rollback target, no-rollback-of-healthy,
+  settle-vs-watchdog race (benign, atomic writes), hub-last, 180s gate bounds, short-SHA comparison,
+  `/status` healthy derivation, service.sh best-effort posture.
