@@ -378,12 +378,36 @@ function orderedServers(): Server[] {
 
 // Offline cache (arch §8): persist the session + environment lists so they're browsable with no
 // connection. Hydrated synchronously below, kept in sync on every change.
+// [WEB2-14] Persisting the whole session list stringified every session on every session.updated/status
+// churn (several times per turn). Debounced 1s-trailing; flushed on tab-hide/pagehide so a close never
+// loses the latest state. persistSessionsNow is the immediate writer (used by the flush + any caller
+// that needs a synchronous write).
+function persistSessionsNow(): void {
+  safeLocalSet("anvil.sessions", JSON.stringify([...sessions.values()]));
+}
+let persistSessionsTimer = 0;
 function persistSessions(): void {
-  try {
-    localStorage.setItem("anvil.sessions", JSON.stringify([...sessions.values()]));
-  } catch {
-    /* quota */
+  if (persistSessionsTimer || typeof window === "undefined") {
+    if (typeof window === "undefined") persistSessionsNow();
+    return;
   }
+  persistSessionsTimer = window.setTimeout(() => {
+    persistSessionsTimer = 0;
+    persistSessionsNow();
+  }, 1000);
+}
+function flushPersistSessions(): void {
+  if (persistSessionsTimer) {
+    clearTimeout(persistSessionsTimer);
+    persistSessionsTimer = 0;
+  }
+  persistSessionsNow();
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPersistSessions();
+  });
+  window.addEventListener("pagehide", flushPersistSessions);
 }
 function persistEnvironments(): void {
   try {
@@ -398,6 +422,28 @@ function persistEnvironments(): void {
     for (const e of JSON.parse(localStorage.getItem("anvil.environments") ?? "[]") as Environment[]) environments.set(e.id, e);
   } catch {
     /* corrupt cache — start empty, the daemon repopulates on connect */
+  }
+})();
+// [WEB2-11] Boot sweep: reclaim per-session state (seq/epoch/history + cached transcripts) orphaned by
+// sessions deleted while we were away — the accumulation that eventually hits the storage quota. Only
+// the re-derivable keys are swept (never anvil.draft.*, which holds unsent text); and only when the
+// hydrated session list is non-empty, so a corrupt/empty cache can't trigger a wholesale wipe.
+(function sweepOrphanedConvoState() {
+  if (typeof localStorage === "undefined" || sessions.size === 0) return;
+  try {
+    const known = new Set(sessions.keys());
+    const prefixes = ["anvil.seq.", "anvil.epoch.", "anvil.history."];
+    const stale: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      const p = prefixes.find((px) => k.startsWith(px));
+      if (p && !known.has(k.slice(p.length))) stale.push(k);
+    }
+    for (const k of stale) localStorage.removeItem(k);
+    for (const id of convoCache.keys()) if (!known.has(id)) void convoCache.delete(id);
+  } catch {
+    /* best-effort — quota reclamation must never block boot */
   }
 })();
 // URL routing + the soft-layer back-stack (overlays, openOverlay/dismissOverlay, hash helpers) live
@@ -560,8 +606,13 @@ function forgetConvoState(id: string): void {
   void convoCache.delete(id);
   serverWatermarks.delete(id);
   snapshotLoaded.delete(id);
+  pendingSeq.delete(id); // [WEB2-11] the throttled in-memory seq (WEB2-10) must go too
   localStorage.removeItem(`anvil.epoch.${id}`);
   localStorage.removeItem(`anvil.seq.${id}`);
+  // [WEB2-11] anvil.history.<id> had NO removal path anywhere — a permanent per-session leak (the 3.0.33
+  // quota class). Drop it (and the draft) here so a single call fully forgets a gone session.
+  localStorage.removeItem(`anvil.history.${id}`);
+  localStorage.removeItem(`anvil.draft.${id}`);
 }
 /** Fill the cache the moment the watermark validates it (called from the resume.watermarks handler). */
 function maybeFillValidatedCache(id: string | null): void {
@@ -682,6 +733,7 @@ function renderDiagnostics(): void {
     `<div><h4>Daemon</h4><table>${serverRows || "<tr><td>—</td></tr>"}</table></div></div>`;
   document.getElementById("diag-close")?.addEventListener("click", () => toggleDiagnostics(false));
 }
+let diagUnsubscribe: (() => void) | null = null;
 function toggleDiagnostics(show?: boolean): void {
   let el = document.getElementById("diag-panel");
   const wantShow = show ?? !el;
@@ -689,10 +741,17 @@ function toggleDiagnostics(show?: boolean): void {
     el = document.createElement("div");
     el.id = "diag-panel";
     document.body.appendChild(el);
-    telemetry.subscribe(() => { if (document.getElementById("diag-panel")) renderDiagnostics(); });
+    // [WEB2-13] Keep the unsubscribe and call it on close — each open used to add a NEW telemetry
+    // listener that was never removed, so repeatedly opening the panel leaked a listener each time.
+    diagUnsubscribe?.();
+    diagUnsubscribe = telemetry.subscribe(() => {
+      if (document.getElementById("diag-panel")) renderDiagnostics();
+    });
     renderDiagnostics();
   } else if (!wantShow && el) {
     el.remove();
+    diagUnsubscribe?.();
+    diagUnsubscribe = null;
   }
 }
 if (typeof window !== "undefined") {
@@ -1053,6 +1112,10 @@ function onEvent(url: string, e: ServerEvent): void {
         if (sameServerUrl(sessionServer.get(id), url) && !sessions.get(id)?.pending) {
           sessions.delete(id);
           sessionServer.delete(id);
+          // [WEB2-11] A session this server owned and no longer lists was deleted (possibly while we were
+          // disconnected). Forget its cached transcript + seq/epoch/history/draft here — otherwise those
+          // keys are orphaned forever, directly the 3.0.33 quota-exhaustion class.
+          forgetConvoState(id);
         }
       }
       e.sessions.forEach((s) => {
@@ -4030,20 +4093,34 @@ function onAutopilotRunSnapshot(log: string[]): void {
   runState.lastLine = log[log.length - 1] ?? "";
   const el = document.getElementById("autopilot-log");
   if (el) {
-    el.textContent = autopilotLog.join("\n");
+    el.textContent = autopilotLog.join("\n"); // one full rebuild per reconnect is fine (O(n), not per-line)
     applyAutopilotLogVisibility();
-    if (!el.hidden) el.scrollTop = el.scrollHeight;
+    scrollAutopilotLogSoon(el);
   }
   reflectAutopilotRunning();
+}
+let autopilotLogScrollRaf = 0;
+function scrollAutopilotLogSoon(el: HTMLElement): void {
+  if (autopilotLogScrollRaf || typeof requestAnimationFrame === "undefined") {
+    if (typeof requestAnimationFrame === "undefined" && !el.hidden) el.scrollTop = el.scrollHeight;
+    return;
+  }
+  autopilotLogScrollRaf = requestAnimationFrame(() => {
+    autopilotLogScrollRaf = 0;
+    if (!el.hidden) el.scrollTop = el.scrollHeight;
+  });
 }
 function onAutopilotProgress(line: string): void {
   autopilotLog.push(line);
   runState.lastLine = line;
   const log = document.getElementById("autopilot-log");
   if (log) {
-    log.textContent = autopilotLog.join("\n");
+    // [WEB2-15] Append only. The old code re-joined the WHOLE array and replaced textContent per line —
+    // O(n²) over a run — and forced a synchronous scroll (layout) each time. Append a text node (leaves
+    // existing content untouched) and coalesce the scroll to one per frame.
+    log.append(document.createTextNode((log.childNodes.length ? "\n" : "") + line));
     applyAutopilotLogVisibility();
-    if (!log.hidden) log.scrollTop = log.scrollHeight;
+    scrollAutopilotLogSoon(log);
   }
   reflectAutopilotRunning();
 }

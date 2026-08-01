@@ -80,6 +80,43 @@ Backend sync-network family (BE2-1, BE2-4 done+contained; BE2-2/3/5 deferred —
     async twins + createWorktree/integrateTeam/refreshGit rewiring) as its own PR with a responsiveness
     harness that pre-doctors PATH before importing the git module.
 
+## P2 — Memory growth & broadcast amplification
+
+Backend (all tested, green):
+- [BE2-14] `writeFileAtomic` at `fleet/store.ts` save + both `env-file.ts` writers. Guard added to
+  `atomic-write.test.ts`: a failed write leaves the target intact, no stray `.tmp`, env keeps 0600.
+- [BE2-20] Backpressure in `ConnectionRegistry`: soft cap 1 MiB → drop droppable (`assistant.delta`,
+  re-derivable via v4 resume), hard cap 8 MiB → close the wedged socket. Guard:
+  `registry-backpressure.test.ts`. Only `assistant.delta` is classed droppable (conservative).
+- [BE2-21] `broadcastUpdated` now only touches the team tree for `teamRole||parentId` sessions, and the
+  team-info broadcast is coalesced (250ms) + deduped (skip identical tree). Structural changes
+  (member add / kill) still call `broadcastTeamInfo` immediately. Full suite stayed green (no test
+  depended on a synchronous team.info after a non-team update).
+- [BE2-22] diffstat capped at 200 lines + a "+N more files" summary line.
+- [BE2-23/SEC2-4] `clientTelemetry` → LRU(50)+30min TTL, `sanitizeCounters` (plain object, ≤32 keys,
+  finite numbers, ≤64-char keys), id validated (≤200 chars), broadcast coalesced 250ms. Guards in
+  `telemetry.test.ts` (5000 ids → ≤50; malformed ignored).
+- [BE2-24] Added the two missing deletes in `kill()`.
+
+Web (WEB2-11/13/14/15 done; WEB2-2/16 deferred):
+- [WEB2-14] `persistSessions` debounced 1s-trailing, flushed on `visibilitychange:hidden` + `pagehide`;
+  `persistSessionsNow` is the immediate writer (via safeLocalSet).
+- [WEB2-11] `forgetConvoState` now also drops `pendingSeq`, `anvil.history.*`, and `anvil.draft.*`
+  (history had NO removal path). Added `forgetConvoState(id)` to the `session.list` prune loop, plus a
+  conservative boot sweep of orphaned `seq/epoch/history` keys + convoCache entries (skips drafts;
+  skips when the hydrated list is empty). Added `convoCache.keys()`. Guard in `convoCache.test.ts`.
+- [WEB2-13] Diagnostics panel keeps + calls the telemetry unsubscribe on close (was leaking a listener
+  per open).
+- [WEB2-15] Autopilot progress log appends a text node per line + rAF-coalesces scroll (was O(n²):
+  re-join whole array + textContent replace + forced scroll per line). Snapshot rebuild stays O(n).
+- [WEB2-2 / WEB2-16] DEFERRED (documented): the sidebar full-`innerHTML` rebuild and team-board rebuild
+  are M-effort render-diff rewrites (rAF-coalesced dirty flag + keyed `li.dataset.id` diff + hoisted
+  `envOrdinal` map + cached `orderedServers`). High regression risk in the most-used UI path; the plan
+  itself couples this with the P7 web decomposition ("each seam carries its scalars into state.ts").
+  Recommend doing WEB2-2/16 as part of the P7 `sidebar.ts`/`fleet.ts` extraction, not as a bare in-place
+  diff, so the render + its state move together. The per-row `localStorage.getItem` and O(N²) sort are
+  the measurable cost; deferring keeps correctness intact (renders are just more frequent than optimal).
+
 ## P5 (baseline fix — done first to get a clean baseline)
 
 - [boot-init.test.ts] Fixed the 1 red test by falling back to the source `web/index.html`
