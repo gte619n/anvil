@@ -594,15 +594,24 @@ function attachReconnect(id: string): void {
   }
 }
 
+// Reclaim quota FIRST: an app upgraded from a pre-Phase-3 build can have localStorage near full of old
+// `anvil.convo.*` HTML blobs (up to 1.5MB each). Clearing them before any new write below prevents a
+// QuotaExceededError from aborting init on a returning user's device.
+migrateLegacyConvoCache();
+
 // ── Telemetry sync + debug surface (incremental-offline-resilience.md §5.7 / Phase 6, spec D11) ────
 // A stable per-device id so the daemon keys this client's latest counter report.
 const clientId = (() => {
-  let id = localStorage.getItem("anvil.clientId");
-  if (!id) {
-    id = newCid();
-    localStorage.setItem("anvil.clientId", id);
+  try {
+    let id = localStorage.getItem("anvil.clientId");
+    if (!id) {
+      id = newCid();
+      localStorage.setItem("anvil.clientId", id); // guarded: a full quota must never abort init
+    }
+    return id;
+  } catch {
+    return newCid(); // ephemeral id for this session — telemetry keying degrades, the app still boots
   }
-  return id;
 })();
 let connectStartedAt = 0; // set when a socket starts connecting — TTI/verify are measured from here
 let serverTelemetry: { server: Record<string, number>; clients: Record<string, Record<string, number>> } = { server: {}, clients: {} };
@@ -712,10 +721,14 @@ document.documentElement.dataset.theme = resolveTheme(themePref());
 renderSessions();
 refreshPromptsButton();
 applyActiveTint();
-migrateLegacyConvoCache(); // one-time: drop pre-Phase-3 anvil.convo.* localStorage blobs (now in IDB)
 if (activeId) {
   if (sessions.has(activeId)) setHeaderTitle(sessions.get(activeId));
-  void loadConversation(activeId);
+  // DEFER the conversation load by a microtask (declare-up-top rule, see §Early-init above):
+  // loadConversation → clearConversation touches `permCards`/`questionCards`, which are declared far
+  // below and are still in their temporal dead zone during synchronous module init. Running it after
+  // init completes guarantees every const it reaches is initialized. Bit every returning user (activeId
+  // set) in 3.0.33; fresh installs (no activeId) took the renderEmptyState branch and never hit it.
+  queueMicrotask(() => void loadConversation(activeId!));
 } else {
   renderEmptyState();
 }
