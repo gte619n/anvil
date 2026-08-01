@@ -146,6 +146,28 @@ Web (WEB2-11/13/14/15 done; WEB2-2/16 deferred):
   processes. RECOMMENDATION: implement via a `.watchdog.json` sidecar (each process sole-writes its own
   file; `get()` overlays the newer) — no lock needed, and it matches the plan's second suggestion.
 
+## P4 — Scalability (BE2-6/7/8/17, WEB2-4/5 done; WEB2-9/6/3, BE2-15 deferred)
+
+- [BE2-6/BE2-7] EventLog in-memory tail cache; hydrate once, serve since/snapshot/promptCids from
+  memory; append keeps it in step. Guard: `eventlog.test.ts` (reads survive file deletion).
+- [BE2-8] `replay?:boolean` (additive protocol field) on re-surfaced permission/question events so a
+  `seq > watermark` client can't drop a pending prompt. Guard: `session.test.ts`.
+- [BE2-17] Cached tailscale bin path + selfLogin memo (5min) + whois LRU (60s). Injectable clock/runner
+  for tests. Guard: `identity-cache.test.ts`. (Did not chase the "dedupe duplicated TAILSCALE_BINS"
+  note — the array exists only in pairing.ts in this tree.)
+- [WEB2-4] Terminal ResizeObserver debounced 100ms + resize frame only on cols/rows change.
+- [WEB2-5] rAF-coalesced select-to-cite positioning. (WEB2-4/5 verified via typecheck; DOM-timing
+  behavior isn't cleanly unit-testable in jsdom.)
+- [WEB2-9 / WEB2-6 / WEB2-3 / BE2-15] DEFERRED (documented):
+  - WEB2-9 (snapshot DocumentFragment batching / virtualization) and WEB2-6 (incremental
+    saveConvoCache) are transcript-render refactors best landed with the P7 `conversation.ts` extraction.
+  - WEB2-3 (content-hash bundle + lazy chunks + gated sourcemaps + SW precache prune) touches the
+    build/deploy + service-worker path; the code-splitting half needs static→dynamic import conversion
+    in main.ts (risk to the served bundle). Recommend a dedicated build PR with a post-build assertion
+    (`dist/index.html` references the hashed name; no `.map` when RELEASE=1) rather than bundling it here.
+  - BE2-15 (job-ify fleet rotate/invite) is the same async-conversion shape as the deferred BE2-3 team
+    integration; group it with that PR.
+
 ## P5 (baseline fix — done first to get a clean baseline)
 
 - [boot-init.test.ts] Fixed the 1 red test by falling back to the source `web/index.html`
