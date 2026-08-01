@@ -61,7 +61,7 @@ import { Session } from "./session";
 import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
-import { applyPrBadge, carryPrBadge, createWorktree, gitStatus, isPrSweepEligible, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
+import { createWorktree, gitStatus, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
@@ -86,6 +86,7 @@ import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
+import { GitProjectionService } from "./git-projection-service";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildPlanningBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
@@ -119,7 +120,7 @@ import { UpdateStateStore } from "../daemon/update-state";
 import { updateApply, updateCheck, type UpdateApiDeps } from "../daemon/update-api";
 import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
-import { classifyBranchKind, heuristicKind } from "../agent/branch-kind";
+import { classifyBranchKind } from "../agent/branch-kind";
 import { AuthDegradeTracker, type DegradeMarker } from "../auth/degrade";
 import { WebPush, type PushPayload } from "../push/webpush";
 import { Fcm } from "../push/fcm";
@@ -262,6 +263,8 @@ export class Supervisor {
   private readonly accountRoster: AccountRosterService;
   /** Environment (project) CRUD + clone + README domain (P7 extraction). */
   private readonly environments: EnvironmentService;
+  /** Git projection + PR-badge/sweep domain (P7 extraction). */
+  private readonly gitProjection: GitProjectionService;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
   // The live run is tracked by a START TIMESTAMP, not a boolean — `running` is DERIVED from it (below),
@@ -332,6 +335,13 @@ export class Supervisor {
       registry: this.registry,
       clonesDir: this.clonesDir,
       renderer: this.renderer,
+    });
+    this.gitProjection = new GitProjectionService({
+      require: (id) => this.require(id),
+      getSession: (id) => this.sessions.get(id),
+      sessions: () => this.sessions.values(),
+      persist: () => this.persist(),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
     });
     this.promptStore = new PromptStore(cfg.stateDir);
     this.updateState = new UpdateStateStore(cfg.stateDir);
@@ -2121,17 +2131,6 @@ export class Supervisor {
    * prefix from the keyword heuristic on the spot so we never push a bare, unprefixed remote. The
    * result is persisted so it stays stable. Returns undefined for non-worktree sessions.
    */
-  private resolveRemoteBranch(s: Session): string | undefined {
-    const wt = s.data.worktree;
-    if (!wt) return undefined;
-    if (wt.remoteBranch) return wt.remoteBranch;
-    const existing = git.upstreamRemoteBranch(s.data.cwd);
-    wt.remoteBranch = existing ?? `${heuristicKind(s.openingPrompt ?? s.data.title ?? "")}/${wt.branch}`;
-    this.persist();
-    this.broadcastUpdated(s.data);
-    return wt.remoteBranch;
-  }
-
   // File browser & reader (arch §8.1/§8.2), scoped to the session worktree. Change-watching is
   // extracted to FileWatchManager (unit-tested); the Supervisor injects locate/read/session access.
   private readonly fileWatchMgr = new FileWatchManager(
@@ -2175,140 +2174,15 @@ export class Supervisor {
     return `/api/sessions/${sessionId}/files?path=${encodeURIComponent(relPath)}`;
   }
 
-  // Git lifecycle (arch §8): operate on the session worktree, return combined output.
+  // Git lifecycle + PR projection (arch §8) — delegated to GitProjectionService (P7 extraction).
   gitOp(cmd: GitCmd): GitResultEvent {
-    const s = this.require(cmd.sessionId);
-    const cwd = s.data.cwd;
-    const branch = s.data.worktree?.branch ?? "HEAD";
-    let ok = true;
-    let output = "";
-    let url: string | undefined;
-    switch (cmd.op) {
-      case "status": {
-        this.refreshGit(s);
-        if (s.data.git) {
-          // [BE2-1] The PR-state probe (`gh pr view`, network) used to run SYNCHRONOUSLY here — a single
-          // "git status" click could freeze the whole single-threaded daemon for up to NET_TIMEOUT_MS
-          // (60s) on a stalled connection. Kick it off the request path via refreshPrState (the async
-          // twin, which does the same `gh` probe with Bun.spawn and broadcasts the badge when it
-          // resolves). The immediate response carries the local status + last-known PR badge.
-          void this.refreshPrState(cmd.sessionId);
-          output = `${s.data.git.branch} — ${s.data.git.dirtyFileCount} changed, ${s.data.git.ahead} ahead / ${s.data.git.behind} behind${s.data.git.prState ? ` · PR ${s.data.git.prState}` : ""}`;
-        } else {
-          output = "(not a git repo)";
-        }
-        break;
-      }
-      case "diff": {
-        const r = git.diff(cwd);
-        ok = r.ok;
-        output = r.output;
-        break;
-      }
-      case "commit": {
-        const r = git.commit(cwd, cmd.message?.trim() || "update");
-        ok = r.ok;
-        output = r.output;
-        this.refreshGit(s);
-        break;
-      }
-      case "push": {
-        const r = git.push(cwd, branch, this.resolveRemoteBranch(s));
-        ok = r.ok;
-        output = r.output;
-        this.refreshGit(s);
-        break;
-      }
-      case "create-pr": {
-        const r = git.createPr(cwd, cmd.title?.trim() || s.data.title, cmd.body ?? "");
-        ok = r.ok;
-        output = r.output;
-        url = r.url;
-        break;
-      }
-      case "merge-pr": {
-        const r = git.mergePr(cwd, cmd.method ?? "squash", s.data.worktree?.branch, s.data.worktree?.remoteBranch);
-        ok = r.ok;
-        output = r.output;
-        if (r.ok) {
-          // The worktree rolled onto a fresh follow-up branch — track it so the restart health
-          // check (which compares against worktree.branch) stays happy and work can continue here.
-          if (r.newBranch && s.data.worktree) s.data.worktree.branch = r.newBranch;
-          this.refreshGit(s); // refresh dirty/ahead and pick up the new current branch (the follow-up)
-          if (s.data.git) {
-            // Show the merged badge scoped to the current branch (the follow-up after a rollover) so
-            // it clears once new work starts — a dirty tree, or another branch switch. See prBadgeFor.
-            const badge = prBadgeFor("merged", s.data.git.prUrl, s.data.git.branch, s.data.git.dirtyFileCount);
-            applyPrBadge(s.data.git, badge);
-          }
-          this.persist();
-          this.broadcastUpdated(s.data);
-        }
-        break;
-      }
-    }
-    return { v: PROTOCOL_VERSION, type: "git.result", ts: now(), sessionId: cmd.sessionId, op: cmd.op, ok, output, url };
+    return this.gitProjection.gitOp(cmd);
   }
-  private refreshGit(s: Session): void {
-    const g = gitStatus(s.data.cwd);
-    if (g) {
-      // gitStatus() is local-only; carry the PR badge learned from gh across refreshes — but it
-      // clears once work moves to a new branch, or (for a merged PR) once the tree is dirty again.
-      Object.assign(g, carryPrBadge(s.data.git, g));
-      const changed = JSON.stringify(s.data.git) !== JSON.stringify(g);
-      s.data.git = g;
-      if (changed) {
-        this.persist();
-        this.broadcastUpdated(s.data);
-      }
-    }
+  refreshPrState(id: string): Promise<void> {
+    return this.gitProjection.refreshPrState(id);
   }
-  /** Best-effort, non-blocking PR-state refresh (network via gh), called on attach so a PR merged
-   *  outside the app surfaces its badge without opening the git panel. Skips sessions already known
-   *  merged (terminal) or without a branch, so the common case costs nothing. */
-  async refreshPrState(id: string): Promise<void> {
-    const s = this.sessions.get(id);
-    if (!s) return;
-    this.refreshGit(s); // local: pick up a branch switch / new changes and clear a stale badge first
-    const g = s.data.git;
-    // Skip the gh probe for sessions with no branch or already terminal-merged (shared with the sweep).
-    if (!g || !isPrSweepEligible(g, s.data.worktree?.branch)) return;
-    const pr = await git.prStatusAsync(s.data.cwd);
-    const cur = this.sessions.get(id); // may have changed/closed during the await
-    if (!cur?.data.git) return;
-    const badge = prBadgeFor(pr.state, pr.url, cur.data.git.branch, cur.data.git.dirtyFileCount);
-    if (!applyPrBadge(cur.data.git, badge)) return; // nothing changed → no persist/broadcast
-    this.persist();
-    this.broadcastUpdated(cur.data);
-  }
-
-  private prSweepRunning = false; // a sweep is in flight — don't stack `gh` storms
-  private lastPrSweepAt = 0; // throttle: at most one sweep per PR_SWEEP_THROTTLE_MS
-  /** Refresh PR badges for EVERY eligible session, not just the one a client has open. The per-session
-   *  attach refresh (`refreshPrState`) only covers the session you click into, so a PR merged on
-   *  GitHub, from another device, or in another session left the rest of the sidebar's merge badges
-   *  frozen at their last-known state. This reconciles the whole list. Bounded concurrency keeps us
-   *  from spawning a `gh` per session at once on the single-threaded daemon; `refreshPrState` already
-   *  skips terminal-merged and branchless sessions cheaply (no network). */
-  async refreshAllPrStates(force = false): Promise<void> {
-    if (this.prSweepRunning) return;
-    const t = Date.now();
-    if (!force && t - this.lastPrSweepAt < 30_000) return; // coalesce bursts (e.g. many clients reconnecting)
-    this.prSweepRunning = true;
-    this.lastPrSweepAt = t;
-    try {
-      // Only sessions that could have a live PR worth a network probe: on a branch, and not already
-      // terminal-merged on that same branch. Mirrors refreshPrState's own guards to avoid the work.
-      const ids = [...this.sessions.values()]
-        .filter((s) => isPrSweepEligible(s.data.git, s.data.worktree?.branch))
-        .map((s) => s.id);
-      const LIMIT = 4;
-      for (let i = 0; i < ids.length; i += LIMIT) {
-        await Promise.all(ids.slice(i, i + LIMIT).map((id) => this.refreshPrState(id).catch(() => {})));
-      }
-    } finally {
-      this.prSweepRunning = false;
-    }
+  refreshAllPrStates(force = false): Promise<void> {
+    return this.gitProjection.refreshAllPrStates(force);
   }
 
   /** Archive: stop the agent + terminal/watchers, keep the worktree/branch/history. */
@@ -3036,7 +2910,7 @@ export class Supervisor {
     // refresh git so the worktree panel and session-list badge stay current without a manual
     // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
     const s = this.sessions.get(sessionId);
-    if (s) this.refreshGit(s);
+    if (s) this.gitProjection.refreshGit(s);
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
     if (s?.data.parentId) this.drainQueuedMembers(s.data.parentId, sessionId);
