@@ -36,7 +36,6 @@ import {
   type AuthProvider,
   type AuthStatusEvent,
   type AuthAccountsEvent,
-  type AccountInfo,
   type CommandInfo,
   type GitCmd,
   type GitResultEvent,
@@ -85,6 +84,7 @@ import { EnvironmentStore } from "../env/store";
 import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
+import { AccountRosterService } from "./account-roster-service";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildPlanningBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
@@ -96,7 +96,6 @@ import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type 
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { AccountStore } from "../auth/accounts";
-import { mirrorDefault, defaultPersisted } from "../auth/account-mirror";
 import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
@@ -258,6 +257,8 @@ export class Supervisor {
   private readonly integrations: IntegrationStore;
   /** Todoist + lapo integration domain (P7 extraction). Constructed in the ctor once `integrations` exists. */
   private readonly integrationsFacade: IntegrationsFacade;
+  /** Claude multi-account roster domain (P7 extraction). Constructed in the ctor once its deps exist. */
+  private readonly accountRoster: AccountRosterService;
   private readonly workUnits: WorkUnitStore;
   private readonly autopilotSchedule: AutopilotScheduleStore;
   // The live run is tracked by a START TIMESTAMP, not a boolean — `running` is DERIVED from it (below),
@@ -332,6 +333,20 @@ export class Supervisor {
       registry: this.registry,
       selfBaseUrl: () => this.selfBaseUrl(),
       cachedSelfBaseUrl: () => this.selfBaseUrlCache?.url,
+    });
+    this.accountRoster = new AccountRosterService({
+      accounts: this.accounts,
+      registry: this.registry,
+      envFile: this.envFile,
+      envStore: this.envStore,
+      pairedHub: this.pairedHub,
+      sessions: () => this.sessions.values(),
+      tokensBySession: () => this.tokensBySession(),
+      restartIdleSessionsForNewToken: (before) => this.restartIdleSessionsForNewToken(before),
+      ...(this.onRosterChanged ? { onRosterChanged: this.onRosterChanged } : {}),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+      environmentsEvent: () => this.environmentsEvent(),
+      persist: () => this.persist(),
     });
     this.workUnits = new WorkUnitStore(cfg.stateDir);
     this.autopilotSchedule = new AutopilotScheduleStore(cfg.stateDir);
@@ -774,150 +789,30 @@ export class Supervisor {
     return this.authStatusEvent(provider, cid);
   }
 
-  // ── Claude account roster (Settings → Models; multi-account §7/§9) ───────────────────────────
-  /** Active (non-terminal) sessions currently bound to `accountId` — drives the removal confirm
-   *  (§9.1/§10) without a second round trip. */
+  // ── Claude account roster (multi-account §7/§9) — delegated to AccountRosterService (P7 extraction) ──
   sessionsUsingAccount(accountId: string): { sessionId: string; title: string }[] {
-    return [...this.sessions.values()]
-      .filter((s) => !s.data.archived && s.data.accountId === accountId)
-      .map((s) => ({ sessionId: s.data.id, title: s.data.title }));
+    return this.accountRoster.sessionsUsingAccount(accountId);
   }
-
-  private accountsInUse(): Record<string, { sessionId: string; title: string }[]> {
-    const out: Record<string, { sessionId: string; title: string }[]> = {};
-    for (const s of this.sessions.values()) {
-      if (s.data.archived || !s.data.accountId) continue;
-      (out[s.data.accountId] ??= []).push({ sessionId: s.data.id, title: s.data.title });
-    }
-    return out;
-  }
-
-  /** Roster snapshot for clients — masked previews only (§11). */
   accountsEvent(cid?: string): AuthAccountsEvent {
-    const snap = this.accounts.snapshot();
-    const accounts: AccountInfo[] = this.accounts.publicList();
-    const inUse = this.accountsInUse();
-    return {
-      v: PROTOCOL_VERSION,
-      type: "auth.accounts",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      rev: snap.rev,
-      ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
-      role: snap.role,
-      ...(snap.role === "replica" && this.pairedHub?.get()?.hubServerId ? { hubServerId: this.pairedHub.get()!.hubServerId } : {}),
-      accounts,
-      persisted: defaultPersisted(this.accounts, this.envFile),
-      ...(Object.keys(inUse).length ? { inUse } : {}),
-    };
+    return this.accountRoster.accountsEvent(cid);
   }
-
-  /** Broadcast the roster to every connected client, like `broadcastAuthState()`. */
   broadcastAccounts(): void {
-    this.registry.toAll(this.accountsEvent());
+    this.accountRoster.broadcastAccounts();
   }
-
-  /** Every mutator: apply → mirror the default → broadcast → return the same event to the caller. A
-   *  mutation on a replica throws `AccountStore`'s "change accounts on the hub" message unchanged
-   *  (BadCommand via the caller's catch). `before` — a snapshot from {@link tokensBySession} taken
-   *  BEFORE the mutation — narrows the restart to sessions whose OWN resolved token actually changed
-   *  (adding a non-default account, or replacing a token no live session is pinned to, restarts no
-   *  one). Fire-and-forget, like every other credential-change call site (http.ts's pair/rotate
-   *  handlers). */
-  private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>, reason: string): AuthAccountsEvent {
-    mirrorDefault(this.accounts, this.envFile); // the ONLY place a roster change is written to the launcher env file
-    this.onRosterChanged?.(reason); // replicate to fleet members (§7.3); fire-and-forget, no-op on a leaf
-    void this.restartIdleSessionsForNewToken(before);
-    const event = this.accountsEvent(cid);
-    this.registry.toAll(cid ? { ...event, cid: undefined } : event);
-    return event;
-  }
-
   accountAdd(label: string, token: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.add(label, token);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    return this.afterAccountMutation(cid, before, "add");
+    return this.accountRoster.accountAdd(label, token, cid);
   }
-
   accountRename(accountId: string, label: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.rename(accountId, label);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    // accountLabel is denormalised for display; refresh every session bound to this account.
-    for (const s of this.sessions.values()) {
-      if (s.data.accountId === accountId) {
-        s.data.accountLabel = label;
-        this.broadcastUpdated(s.data);
-      }
-    }
-    this.persist();
-    return this.afterAccountMutation(cid, before, "rename");
+    return this.accountRoster.accountRename(accountId, label, cid);
   }
-
   accountReplace(accountId: string, token: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.replace(accountId, token);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    return this.afterAccountMutation(cid, before, "replace");
+    return this.accountRoster.accountReplace(accountId, token, cid);
   }
-
   accountSetDefault(accountId: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.setDefault(accountId);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    return this.afterAccountMutation(cid, before, "set-default");
+    return this.accountRoster.accountSetDefault(accountId, cid);
   }
-
   accountRemove(accountId: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.remove(accountId);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    // §5.4 removal fallback: fall every session bound to the removed account back to the default,
-    // flagged so the client can render the "⚠ was <label>" badge (Task 24/20).
-    //
-    // `accountId` is CLEARED rather than set to a snapshot of `defaultId()`. Both resolve to the
-    // default today, but a snapshot silently stops tracking it: move the default afterwards and the
-    // session keeps spawning on the OLD one while the header chip — which renders the CURRENT
-    // default's label — names the new one. The chip then advertises a subscription that isn't paying,
-    // which is precisely the confusion this feature exists to prevent. `undefined` genuinely follows
-    // the default, because that is what `AccountStore.token(undefined)` resolves.
-    //
-    // `accountLabel` IS deliberately left holding the removed account's old name — it's the only
-    // place that survives the removal, and the badge needs it.
-    for (const s of this.sessions.values()) {
-      if (s.data.accountId !== accountId) continue;
-      delete s.data.accountId;
-      s.data.accountMissing = true;
-      this.broadcastUpdated(s.data);
-    }
-    // Environments bind to accounts too (§6), and were NOT being reconciled — a removed account left a
-    // dangling `env.accountId` that only surfaced later, unattended, as a failed autopilot spawn.
-    // Clearing it falls the environment back to the roster default, same as a session.
-    let envsCleared = 0;
-    for (const env of this.envStore.list()) {
-      if (env.accountId !== accountId) continue;
-      this.envStore.update(env.id, { accountId: null });
-      envsCleared++;
-    }
-    if (envsCleared) this.registry.toAll(this.environmentsEvent());
-    this.persist();
-    return this.afterAccountMutation(cid, before, "remove");
+    return this.accountRoster.accountRemove(accountId, cid);
   }
 
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
