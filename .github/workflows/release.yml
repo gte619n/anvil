@@ -24,6 +24,11 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# [WEB2-3] Every `build:web` in this workflow builds SHIPPING artifacts: RELEASE=1 makes build.ts
+# skip sourcemaps entirely (dev/self-update builds keep linked external maps for debugging).
+env:
+  RELEASE: "1"
+
 concurrency:
   # Serialize full releases on main so builds never upload out of order (each still gets a unique
   # run number). We do NOT cancel in-flight runs — a half-finished notarization/TestFlight upload is

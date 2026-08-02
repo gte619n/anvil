@@ -103,15 +103,18 @@ async function runAdb(args: string[]): Promise<{ ok: boolean; output: string }> 
 }
 
 /**
- * Cache-Control for a served web asset. The mutable app shell — index.html, main.js, app.css, sw.js,
- * manifest, vendored css — lives at STABLE, unhashed URLs, so it MUST revalidate on every load: with
- * no directive the browser heuristically caches it and a new deploy is invisible (the daemon serves
- * fresh bytes but the browser keeps the old main.js across git pull / restart / hard refresh — and,
- * because the service worker's fetch reads through the HTTP cache, the stale bundle is sticky). Only
- * Bun's content-hashed split chunks and binary font/image assets are safe to cache hard.
+ * Cache-Control for a served web asset. The mutable app shell — index.html, sw.js, manifest,
+ * vendored css — lives at STABLE, unhashed URLs, so it MUST revalidate on every load: with no
+ * directive the browser heuristically caches it and a new deploy is invisible (the daemon serves
+ * fresh bytes but the browser keeps the old bundle across git pull / restart / hard refresh — and,
+ * because the service worker's fetch reads through the HTTP cache, the stale bundle is sticky).
+ * Content-hashed names — Bun's split chunks (chunk-<hash>.js) and, since WEB2-3, the entry
+ * (main-<hash>.js) and app stylesheet (app-<hash>.css) — plus binary font/image assets are the
+ * only things safe to cache hard: their content can never change under the same URL.
  */
 export function webCacheControl(rel: string): string {
-  if (/(^|\/)chunk-[A-Za-z0-9]+\.js$/.test(rel)) return "public, max-age=31536000, immutable";
+  if (/(^|\/)(chunk|main)-[a-z0-9]+\.js$/.test(rel)) return "public, max-age=31536000, immutable";
+  if (/(^|\/)app-[a-z0-9]+\.css$/.test(rel)) return "public, max-age=31536000, immutable";
   if (/\.(woff2?|ttf|otf|svg|png|ico)$/.test(rel)) return "public, max-age=604800";
   return "no-cache"; // revalidate every load — never serve a stale app shell
 }

@@ -37,9 +37,10 @@ afterAll(() => rmSync(sharedDir, { recursive: true, force: true }));
 /** Boot the real bundle in node+jsdom at `url`, with the given localStorage seeds; report init outcome. */
 function runBoot(bundle: string, url: string, seeds: Record<string, string>): { theme: string | null; initErr: string | null } {
   const anvildRoot = join(import.meta.dir, "../..");
-  // The daemon serves web/dist/index.html, but build.ts copies web/index.html to it verbatim — so the
-  // source shell is byte-identical. Prefer dist (matches production) but fall back to source when dist is
-  // absent (fresh worktree, before `bun run build:web`) so the guard runs without a prior build.
+  // The daemon serves web/dist/index.html — web/index.html plus build-time rewrites (WEB2-3 swaps the
+  // script/css tags to the hashed names; jsdom doesn't fetch external scripts, so the hashed module tag
+  // is inert here — we inject the freshly-built bundle below). Prefer dist (matches production) but fall
+  // back to source when dist is absent (fresh worktree, before `bun run build:web`).
   const distHtml = join(anvildRoot, "web/dist/index.html");
   const srcHtml = join(anvildRoot, "web/index.html");
   const htmlPath = existsSync(distHtml) ? distHtml : srcHtml;
