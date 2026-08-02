@@ -66,7 +66,7 @@ import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSid
 // decomposition). Importing it here makes its module body — including the sidebar-owned early-init
 // scalars — evaluate before this one, preserving the declare-up-top guarantee for the instant-restore
 // render below. Its deps are injected via initSidebar(...) next to initFleet(...).
-import { initSidebar, initSortables, removingSessions, renderSessions, renderTeamBoard, setFavicon } from "./sidebar";
+import { flushRenderSessions, initSidebar, initSortables, removingSessions, renderSessions, renderTeamBoard, setFavicon } from "./sidebar";
 
 const strToB64 = (s: string): string => {
   const bytes = new TextEncoder().encode(s);
@@ -4640,6 +4640,7 @@ export function selectSession(id: string, push = true): void {
   setSessionHash(id, push && !reuseSidebarEntry); // reflect in the URL (history entry unless restoring via Back/Forward)
   stickToBottom = true; // a freshly opened session starts pinned to the latest
   renderSessions();
+  flushRenderSessions(); // [WEB2-2] renders are rAF-coalesced — the scroll below reads the DOM now
   // Bring the freshly-selected row into view in the sidebar so starting a project
   // from Autopilot (or any cross-view jump) lands you on its row, not just its
   // conversation. `block: "nearest"` is a no-op when the row is already visible,

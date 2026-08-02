@@ -20,7 +20,7 @@
 import Sortable from "sortablejs";
 import { $, esc, icon, sessIcon } from "./dom";
 import { currentTheme } from "./theme";
-import { envOrdinal, sessionBg, stripeColor } from "./sessionColor";
+import { sessionBg, stripeColor } from "./sessionColor";
 import { sessionHref } from "./overlays";
 import { newCid } from "./outbox";
 import { orderedServers, pendingTeamPlans, sendTo, serverOf, servers, sessionServer } from "./fleet";
@@ -64,45 +64,172 @@ let dragging = false; // true while a SortableJS drag is in progress (suppresses
 let justDragged = false; // set briefly after a drop so the row's click doesn't also navigate
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
+// [WEB2-2] The sidebar used to rebuild all three lists' innerHTML on EVERY event (several times per
+// turn), with a per-row envOrdinal() re-sorting the whole session map (O(N² log N) across a pass)
+// and a localStorage read per row (orderedServers). Now: renderSessions() is a rAF-coalesced
+// request — any synchronous burst of events collapses into ONE DOM pass at the next frame — and the
+// pass itself is a keyed diff by li.dataset.id: a row whose render inputs (rowSig) are unchanged is
+// left entirely alone (same <li>, same children, same listeners), a changed row is morphed in place
+// (node identity preserved), and rows are only created/removed when sessions appear/disappear.
+// envOrdinal is hoisted to one precomputed Map per pass; orderedServers()/currentTheme() are read
+// once per pass instead of once per row.
+let renderPending = false; // the rAF-coalescing dirty flag: many requests per frame → one DOM pass
 export function renderSessions(): void {
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    renderSessionsNow(); // no frame scheduler (non-browser) — render synchronously, as before
+    return;
+  }
+  if (renderPending) return;
+  renderPending = true;
+  window.requestAnimationFrame(() => {
+    if (!renderPending) return; // flushed synchronously in the meantime (flushRenderSessions)
+    renderPending = false;
+    renderSessionsNow();
+  });
+}
+/** Run a pending render NOW. For callers that read the freshly rendered sidebar DOM synchronously
+ *  (selectSession scrolls the newly-active row into view). No-op when nothing is pending. */
+export function flushRenderSessions(): void {
+  if (!renderPending) return;
+  renderPending = false;
+  renderSessionsNow();
+}
+
+// Everything the row renderer needs precomputed once per pass (WEB2-2): the env ordinals (was an
+// O(N log N) sort per row), the resolved theme, and whether more than one server is in play (was a
+// localStorage read + parse per row via orderedServers()).
+interface RenderCtx {
+  ordinals: Map<string, number>; // sessionId → its ordinal within its environment
+  theme: "light" | "dark";
+  multiServer: boolean;
+}
+function renderCtx(): RenderCtx {
+  return { ordinals: computeEnvOrdinals(), theme: currentTheme(), multiServer: orderedServers().length > 1 };
+}
+/** One-pass equivalent of sessionColor's per-row envOrdinal(): group by environment, sort each group
+ *  by (createdAt, id) exactly as envOrdinal does, and record every session's index. Sessions without
+ *  an environment aren't entered — the map's miss default (0) matches envOrdinal's return for them. */
+function computeEnvOrdinals(): Map<string, number> {
+  const byEnv = new Map<string, Session[]>();
+  for (const s of sessions.values()) {
+    if (!s.environmentId) continue;
+    const g = byEnv.get(s.environmentId);
+    if (g) g.push(s);
+    else byEnv.set(s.environmentId, [s]);
+  }
+  const ordinals = new Map<string, number>();
+  for (const peers of byEnv.values()) {
+    peers.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1));
+    peers.forEach((s, i) => ordinals.set(s.id, i));
+  }
+  return ordinals;
+}
+
+const ordKey = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
+const sortFn = (a: Session, b: Session): number =>
+  Number(!!b.isDefault) - Number(!!a.isDefault) ||
+  Number(!!a.archived) - Number(!!b.archived) ||
+  ordKey(a) - ordKey(b);
+
+/** Everything renderSessionItem bakes into a row's DOM, as one comparable string. A row is
+ *  re-rendered (morphed in place) only when this changes — an unrelated event leaves it untouched. */
+function rowSig(s: Session, isMember: boolean, ctx: RenderCtx): string {
+  const env = s.environmentId ? environments.get(s.environmentId) : undefined;
+  const srv = serverOf(s.id);
+  return JSON.stringify([
+    s.id, s.title, s.status, s.model, s.source, !!s.archived, !!s.pending, !!s.isDefault,
+    s.icon, // sessIcon: the row glyph Sonnet picks from the title, delivered by a later session.updated
+    s.environmentId, env?.name, env?.color, ctx.ordinals.get(s.id) ?? 0, ctx.theme, // name/color/ordinal/theme feed the tint hue
+    s.git?.branch, s.git?.prState,
+    s.teamRole, s.memberTask, isMember,
+    s.id === activeId(),
+    removingSessions.has(s.id),
+    ctx.multiServer && srv ? srv.name : "",
+    s.teamRole === "lead" ? leadRollup(s.id) : 0,
+  ]);
+}
+const rowSigs = new WeakMap<HTMLLIElement, string>(); // li → the signature it was last rendered from
+
+/** Swap a row's rendered content for a freshly built one while KEEPING the <li> node itself (and any
+ *  nested team-member list, which syncMembers diffs separately) — so other code holding the node, its
+ *  scroll anchoring, and CSS transitions on the row all survive a re-render. */
+function morphRow(li: HTMLLIElement, fresh: HTMLLIElement): void {
+  const members = li.querySelector<HTMLUListElement>(":scope > ul.team-members");
+  li.className = fresh.className;
+  li.style.cssText = fresh.style.cssText;
+  li.replaceChildren(...fresh.childNodes);
+  if (members) li.append(members);
+}
+
+/** Keyed diff of one list's rows against the desired session order: reuse a row by data-id (moving
+ *  it from wherever it currently lives — including another list, for active ⇄ finished), morph it
+ *  only when its signature changed, and drop rows whose sessions are gone. */
+function syncList(ul: HTMLElement, desired: Session[], isMember: boolean, ctx: RenderCtx, keyed: Map<string, HTMLLIElement>): void {
+  for (let i = 0; i < desired.length; i++) {
+    const s = desired[i]!;
+    const sig = rowSig(s, isMember, ctx);
+    let li = keyed.get(s.id);
+    if (!li) {
+      li = renderSessionItem(s, isMember, ctx);
+      keyed.set(s.id, li);
+    } else if (rowSigs.get(li) !== sig) {
+      morphRow(li, renderSessionItem(s, isMember, ctx));
+    }
+    rowSigs.set(li, sig);
+    if (ul.children[i] !== li) ul.insertBefore(li, ul.children[i] ?? null);
+  }
+  // Everything the loop above didn't claim has been pushed past the desired rows — drop it. (A row
+  // that merely moved lists was already re-parented by the other list's insertBefore, not dropped.)
+  while (ul.children.length > desired.length) ul.lastElementChild!.remove();
+}
+
+/** Keep a lead row's nested member list (teams §5) in step: create/remove the <ul.team-members>
+ *  and keyed-diff its rows like any other list. */
+function syncMembers(li: HTMLLIElement, s: Session, ctx: RenderCtx, keyed: Map<string, HTMLLIElement>): void {
+  const members = s.teamRole === "lead" ? membersOfLead(s.id).sort(sortFn) : [];
+  let mul = li.querySelector<HTMLUListElement>(":scope > ul.team-members");
+  if (members.length === 0) {
+    mul?.remove();
+    li.classList.remove("has-members");
+    return;
+  }
+  li.classList.add("has-members"); // stack the member list BELOW the lead row (not beside it)
+  if (!mul) {
+    mul = document.createElement("ul");
+    mul.className = "team-members";
+    li.appendChild(mul);
+  }
+  syncList(mul, members, true, ctx, keyed);
+}
+
+function renderSessionsNow(): void {
   if (dragging) return; // don't yank a row out from under an in-progress drag
   const conciergeUl = $("#concierge-list");
   const activeUl = $("#session-list");
   const finishedUl = $("#finished-list");
-  conciergeUl.innerHTML = "";
-  activeUl.innerHTML = "";
-  finishedUl.innerHTML = "";
-  const ord = (s: Session): number => s.order ?? -1; // server sort key; unset (new) sessions sort to the top
-  const sortFn = (a: Session, b: Session): number =>
-    Number(!!b.isDefault) - Number(!!a.isDefault) ||
-    Number(!!a.archived) - Number(!!b.archived) ||
-    ord(a) - ord(b);
+  const ctx = renderCtx();
+  // Existing rows by data-id, across all lists (incl. nested member rows) — rebuilt from the live DOM
+  // each pass, so the diff is stateless and survives anything else having reset the lists.
+  const keyed = new Map<string, HTMLLIElement>();
+  for (const ul of [conciergeUl, activeUl, finishedUl])
+    for (const li of ul.querySelectorAll<HTMLLIElement>("li.session")) if (li.dataset.id) keyed.set(li.dataset.id, li);
   const all = [...sessions.values()];
-  // The concierge (isDefault) is pinned at the top, OUTSIDE the sortable/grouped lists (#26).
-  for (const s of all.filter((s) => s.isDefault)) conciergeUl.appendChild(renderSessionItem(s));
   const rest = all.filter((s) => !s.isDefault);
   const anyFinished = rest.some((s) => s.finished);
-
   // Teams: a member (parentId → a lead we know) is NOT rendered at the top level — it appears nested
   // under its lead's row instead (anvil-team-support.md §5).
   const isNestedMember = (s: Session): boolean => !!s.parentId && sessions.has(s.parentId);
-
+  // The concierge (isDefault) is pinned at the top, OUTSIDE the sortable/grouped lists (#26).
+  syncList(conciergeUl, all.filter((s) => s.isDefault), false, ctx, keyed);
   // One flat list across every server — no per-machine grouping. Sessions interleave by their
   // server-synced order; which machine a session lives on is shown subtly in its row meta when
   // there's more than one server. (fleet — anvil-multi-server.md §4)
-  for (const s of rest.filter((s) => !isNestedMember(s)).sort(sortFn)) {
-    const li = renderSessionItem(s);
-    (s.finished ? finishedUl : activeUl).appendChild(li);
-    if (s.teamRole === "lead") {
-      const members = membersOfLead(s.id).sort(sortFn);
-      if (members.length) {
-        li.classList.add("has-members"); // stack the member list BELOW the lead row (not beside it)
-        const mul = document.createElement("ul");
-        mul.className = "team-members";
-        for (const m of members) mul.appendChild(renderSessionItem(m, true));
-        li.appendChild(mul);
-      }
-    }
+  const top = rest.filter((s) => !isNestedMember(s)).sort(sortFn);
+  syncList(activeUl, top.filter((s) => !s.finished), false, ctx, keyed);
+  syncList(finishedUl, top.filter((s) => s.finished), false, ctx, keyed);
+  for (const s of top) {
+    const li = keyed.get(s.id);
+    if (li) syncMembers(li, s, ctx, keyed);
   }
   $("#finished-section").hidden = !anyFinished; // hide the group when nothing is finished
 }
@@ -141,12 +268,35 @@ function teamRollupChip(r: { total: number; running: number; awaiting: number; d
 /** The lead's member board + plan-gate card, rendered above its conversation (anvil-team-support.md
  *  §5). A member row deep-links to that member (selecting it makes its cards routable). Hidden unless
  *  the active session is a lead. */
+// [WEB2-16] The board used to rebuild its innerHTML and re-wire every listener on each member
+// session.updated (several per turn across a team). Now requests are rAF-coalesced (the latest lead
+// argument wins, sharing a frame with the sidebar's own pass), and the pass skips the rebuild
+// entirely when the rendered markup is unchanged — unrelated churn leaves the board's DOM, node
+// identities, and wired listeners alone.
+let teamBoardPending = false;
+let teamBoardLead: Session | undefined; // latest requested lead — coalesced requests keep the last
+let teamBoardHtml: string | null = null; // markup of the last applied rebuild; null = hidden/cleared
 export function renderTeamBoard(lead: Session | undefined): void {
+  teamBoardLead = lead;
+  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    renderTeamBoardNow();
+    return;
+  }
+  if (teamBoardPending) return;
+  teamBoardPending = true;
+  window.requestAnimationFrame(() => {
+    teamBoardPending = false;
+    renderTeamBoardNow();
+  });
+}
+function renderTeamBoardNow(): void {
+  const lead = teamBoardLead;
   const el = document.getElementById("team-board");
   if (!el) return;
   if (!lead || lead.teamRole !== "lead" || lead.id !== activeId()) {
     el.hidden = true;
     el.innerHTML = "";
+    teamBoardHtml = null;
     return;
   }
   el.hidden = false;
@@ -186,12 +336,15 @@ export function renderTeamBoard(lead: Session | undefined): void {
   // lead conversationally ("integrate now", "dismiss the docs member").
   // Collapsible so a big team (10+ members) doesn't take over the pane; the choice persists.
   const collapsed = localStorage.getItem("anvil.teamBoardCollapsed") === "1";
-  el.innerHTML = `${planCard}
+  const html = `${planCard}
     <div class="team-board-head">
       <button class="tmb-collapse" title="${collapsed ? "Expand team" : "Collapse team"}">${icon(collapsed ? "chevron_right" : "expand_more")}</button>
       <span class="tmb-title">${icon("groups")} Team · ${members.length} member(s) · ${esc(policy)}</span>
     </div>
     ${collapsed ? "" : `<div class="tmb-rows">${rows || `<div class="tmb-empty">No members yet.</div>`}</div>`}`;
+  if (html === teamBoardHtml) return; // [WEB2-16] unchanged — keep the DOM and its listeners as-is
+  el.innerHTML = html;
+  teamBoardHtml = html;
 
   // Collapse/expand the member list (persisted). Clicking anywhere on the header toggles it.
   el.querySelector(".team-board-head")?.addEventListener("click", () => {
@@ -220,7 +373,7 @@ function statusDotClass(status: Session["status"]): string {
   return "idle";
 }
 
-function renderSessionItem(s: Session, isMember = false): HTMLLIElement {
+function renderSessionItem(s: Session, isMember: boolean, ctx: RenderCtx): HTMLLIElement {
   const removing = removingSessions.has(s.id);
   const awaiting = !removing && !s.pending && !s.archived && (s.status === "awaiting_permission" || s.status === "awaiting_question");
   const li = document.createElement("li");
@@ -228,8 +381,8 @@ function renderSessionItem(s: Session, isMember = false): HTMLLIElement {
   li.dataset.id = s.id;
   if (s.environmentId && !removing) {
     const env = environments.get(s.environmentId);
-    const ord = envOrdinal(s, sessions.values());
-    const theme = currentTheme();
+    const ord = ctx.ordinals.get(s.id) ?? 0; // [WEB2-2] hoisted: one Map pass, not an O(N log N) sort per row
+    const theme = ctx.theme;
     li.classList.add("tinted");
     li.style.setProperty("--session-bg", sessionBg(env, ord, theme));
     li.style.setProperty("--session-stripe", stripeColor(env, ord, theme));
@@ -239,7 +392,7 @@ function renderSessionItem(s: Session, isMember = false): HTMLLIElement {
   const tag = removing ? "cleaning up…" : s.pending ? "pending sync" : s.archived ? "archived" : awaiting ? "needs approval" : esc(s.status);
   // With a fleet, the list is flat (no per-machine sections), so name the owning server inline.
   const srv = serverOf(s.id);
-  const machine = orderedServers().length > 1 && srv ? ` · ${icon("dns")}${esc(srv.name)}` : "";
+  const machine = ctx.multiServer && srv ? ` · ${icon("dns")}${esc(srv.name)}` : ""; // [WEB2-2] hoisted per pass
   const a = document.createElement("a");
   a.className = "srow";
   a.href = sessionHref(s.id);
