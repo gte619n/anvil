@@ -32,8 +32,8 @@ import { ui } from "./state";
 // they used to arrive via initConversation(deps).
 import { clearCardMaps, toast } from "./dialogs";
 import { envOrdinal, sessionBg, stripeColor } from "./sessionColor";
-import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, type Server } from "./fleet";
-import { isAndroidApp } from "./push";
+import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, wireSessionId, type Server } from "./fleet";
+import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
 import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session } from "../../protocol";
@@ -86,6 +86,11 @@ export const conversation = $("#conversation");
 // `ui.stickToBottom` lives in state.ts — main's selectSession also re-pins it on session open.
 export const scrollDown = (force = false): void => {
   if (force) ui.stickToBottom = true;
+  // [WEB2-9] Snapshot replay is batched: every appended message used to scroll here, and each scroll
+  // is a forced layout (scrollHeight read + scrollTop write) over an ever-growing pane — O(n²), which
+  // froze large transcripts. During replay the appends skip the scroll entirely; main's
+  // conversation.snapshot handler issues ONE scrollDown after clearing the flag.
+  if (ui.replayingSnapshot) return;
   if (ui.stickToBottom) conversation.scrollTop = conversation.scrollHeight;
 };
 
@@ -197,7 +202,8 @@ export function appendUser(html: string, attachments: AttachmentRef[] = [], ts?:
   b.appendChild(md);
   for (const att of attachments) {
     if (!activeId()) continue;
-    const href = serverApiUrl(activeServer().url, `/api/sessions/${activeId()}/attachments/${att.id}`);
+    // wireSessionId: the OWNING daemon's id in the path (#158 — a member's default chat is namespaced client-side)
+    const href = serverApiUrl(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/attachments/${att.id}`);
     if (att.kind === "image") {
       const img = document.createElement("img");
       img.className = "att-img";
@@ -587,6 +593,34 @@ export function appendFileOffer(file: FileOffer): void {
   scrollDown();
   saveConvoCache();
 }
+// ── Transcript serialization for the durable convo cache (WEB2-6) ────────────────
+/**
+ * Serialize the rendered transcript for the convo cache, bounded to the last `maxNodes` top-level
+ * blocks (bubbles / activity blocks / dividers). Cloning + serializing the ENTIRE pane on every
+ * turn cost 30–150ms on long sessions — the cache is an instant-paint snapshot, not an archive, so
+ * each save only touches a bounded amount of DOM. The clone is cache-shaped, the live pane is never
+ * mutated:
+ *   - transient UI (the thinking indicator / empty-state & hero cards) is stripped — it would
+ *     re-paint as a frozen "stuck" status on return;
+ *   - a still-"live" activity block is frozen to "Worked" — the cache is a snapshot, not a running
+ *     turn, and must never restore as an animated "Working" that can't stop (no WS yet on reload).
+ */
+export function serializeTranscript(maxNodes: number): string {
+  const kids = conversation.children;
+  const start = Math.max(0, kids.length - maxNodes);
+  const clone = document.createElement("div");
+  for (let i = start; i < kids.length; i++) clone.appendChild(kids[i]!.cloneNode(true));
+  clone.querySelectorAll(".thinking, .empty-state").forEach((e) => e.remove());
+  clone.querySelectorAll(".activity.live").forEach((a) => {
+    a.classList.remove("live");
+    const ind = a.querySelector(".activity-ind");
+    if (ind) ind.innerHTML = `<span class="msym">check</span>`;
+    const title = a.querySelector(".activity-title");
+    if (title) title.textContent = "Worked";
+  });
+  return clone.innerHTML;
+}
+
 export function clearConversation(): void {
   conversation.innerHTML = "";
   ui.streaming = null;

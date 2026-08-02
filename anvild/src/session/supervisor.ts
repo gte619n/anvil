@@ -57,7 +57,7 @@ import { Session } from "./session";
 import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
-import { createWorktree, gitStatus, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
+import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
@@ -700,7 +700,7 @@ export class Supervisor {
   clearAutopilot(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
     return this.autopilot.clearAutopilot(cid);
   }
-  startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): AutopilotStartedEvent {
+  startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     return this.autopilot.startPlan(workUnitId, model, autonomy, cid);
   }
   linkPlan(workUnitId: string, sessionId: string, cid?: string): AutopilotStartedEvent {
@@ -748,13 +748,13 @@ export class Supervisor {
   noteHumanPrompt(sessionId: string): void {
     this.teams.noteHumanPrompt(sessionId);
   }
-  approveTeamPlan(leadId: string, plan?: TeamPlan): void {
-    this.teams.approveTeamPlan(leadId, plan);
+  approveTeamPlan(leadId: string, plan?: TeamPlan): Promise<void> {
+    return this.teams.approveTeamPlan(leadId, plan);
   }
   rejectTeamPlan(leadId: string): void {
     this.teams.rejectTeamPlan(leadId);
   }
-  integrateTeam(leadId: string): string {
+  integrateTeam(leadId: string): Promise<string> {
     return this.teams.integrateTeam(leadId);
   }
 
@@ -863,7 +863,10 @@ export class Supervisor {
     this.telemetryBroadcastTimer.unref?.(); // never hold the process/test open for a coalesced broadcast
   }
 
-  create(cmd: SessionCreateCmd): Session {
+  // [BE2-2] Async: a fresh-worktree create runs a network `git fetch` (base sync) plus the worktree
+  // add — those now park this create instead of freezing the daemon, so every other session/client
+  // stays live while it runs. Failures still surface as BadCommand to the dispatcher.
+  async create(cmd: SessionCreateCmd): Promise<Session> {
     const id = newId("sess");
     let cwd: string;
     let worktree: SessionData["worktree"];
@@ -872,7 +875,7 @@ export class Supervisor {
       if (!cmd.repoRoot) throw new BadCommand("repoRoot is required for a fresh-worktree session");
       const branch = slugify(cmd.title ?? "session");
       try {
-        const created = createWorktree(cmd.repoRoot, cmd.base ?? "HEAD", branch, this.store.worktreeRoot(), id);
+        const created = await createWorktree(cmd.repoRoot, cmd.base ?? "HEAD", branch, this.store.worktreeRoot(), id);
         cwd = created.cwd;
         worktree = created.worktree;
       } catch (e) {
@@ -901,7 +904,7 @@ export class Supervisor {
       cwd,
       source: cmd.source,
       worktree,
-      git: gitStatus(cwd),
+      git: await gitStatusAsync(cwd),
       model: cmd.model ?? "opus",
       autonomy: cmd.autonomy ?? "mostly-autonomous",
       adversarialReview: cmd.adversarialReview ?? false,
@@ -935,7 +938,7 @@ export class Supervisor {
    * frame, so this broadcasts `session.created` itself. `prompt()` emits the brief as `message.user`,
    * so it appears in the new session's history and starts the first turn.
    */
-  private handoffCreate(a: {
+  private async handoffCreate(a: {
     environmentId?: string;
     source: SessionSource;
     cwd?: string;
@@ -952,7 +955,7 @@ export class Supervisor {
     // ── Autopilot: mark a "Plan with Claude" planning session and link it to its work unit ──
     workUnitId?: string;
     workUnitRole?: "planner";
-  }): { id: string; title: string; cwd: string } {
+  }): Promise<{ id: string; title: string; cwd: string }> {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
       const env = a.environmentId ? this.envStore.get(a.environmentId) : undefined;
@@ -988,7 +991,7 @@ export class Supervisor {
         autonomy: a.autonomy,
       };
     }
-    const session = this.create(cmd);
+    const session = await this.create(cmd);
     // Teams: stamp the parent link BEFORE the session.created broadcast so members arrive labeled.
     if (a.parentId || a.teamRole || a.memberTask) {
       session.data.parentId = a.parentId;
@@ -1506,7 +1509,7 @@ export class Supervisor {
     this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
     // Teams (#5): a killed member frees a concurrency slot — start a queued member (no-op if the lead
     // is also being torn down, since its queue was cleared above).
-    if (parentId && !isLead) this.teams.drainQueuedMembers(parentId);
+    if (parentId && !isLead) void this.teams.drainQueuedMembers(parentId);
     this.trackTeardown(this.teardownSession(id, s));
   }
 
@@ -1575,11 +1578,11 @@ export class Supervisor {
     if (s.data.source === "fresh-worktree" && s.data.worktree) {
       const { repoRoot, branch, base } = s.data.worktree;
       if (worktreeHealth(s.data.cwd, branch) !== "ok") {
-        const r = recreateWorktree(repoRoot, s.data.cwd, branch, base);
+        const r = await recreateWorktree(repoRoot, s.data.cwd, branch, base);
         recovered = r.ok ? `restored worktree from \`${branch}\`` : `worktree could not be restored (${r.error})`;
       }
     }
-    const g = gitStatus(s.data.cwd);
+    const g = await gitStatusAsync(s.data.cwd);
     if (g) s.data.git = g;
     s.data.status = "idle";
     s.data.lastActivityAt = now();
@@ -1837,12 +1840,14 @@ export class Supervisor {
     this.authDegrade.recordTurnSuccess();
     // The agent may have committed, switched/created a branch, or left new changes this turn —
     // refresh git so the worktree panel and session-list badge stay current without a manual
-    // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
+    // "status" press. Local-only and a no-op (no broadcast) when nothing changed. [BE2-5] Async +
+    // per-session coalescing: a burst of turns collapses into at most one subprocess batch per
+    // window instead of 4-5 sync spawns blocking the event loop after every turn.
     const s = this.sessions.get(sessionId);
-    if (s) this.gitProjection.refreshGit(s);
+    if (s) this.gitProjection.scheduleRefreshGit(sessionId);
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
-    if (s?.data.parentId) this.teams.drainQueuedMembers(s.data.parentId, sessionId);
+    if (s?.data.parentId) void this.teams.drainQueuedMembers(s.data.parentId, sessionId);
     // Refresh the live context-window meter from this turn's reading (§context). Broadcast so every
     // device's composer gauge updates; skip the push when the SDK didn't report (keep the last value).
     if (s && usage.contextUsage) {
@@ -1865,10 +1870,14 @@ export class Supervisor {
     }
   }
 
+  /** [BE2-2] Settles when every restore-time worktree recovery (background, async git) has finished.
+   *  Restore itself no longer blocks on git — this is the deterministic hook for tests/shutdown. */
+  worktreeRecoveriesSettled: Promise<void> = Promise.resolve();
+
   private restore(): void {
     const transient: SessionData["status"][] = ["thinking", "running_tool", "awaiting_permission", "awaiting_question"];
-    let recovered = 0;
     let quarantined = 0;
+    const recoveries: Promise<unknown>[] = [];
     for (const p of this.store.loadAll()) {
       try {
         // a daemon restart/crash means no live agent process; a session caught mid-turn had its
@@ -1883,17 +1892,29 @@ export class Supervisor {
         const session = this.wrap(p.data, p.lastSeq, p.epoch);
         this.sessions.set(p.data.id, session);
 
-        const notice = this.recoverWorktreeOnRestore(p.data); // returns a notice if anything happened
-        if (notice?.recovered) recovered++;
         if (interrupted) {
           session.emit({
             type: "assistant.message",
             blocks: [{ kind: "markdown", rendered: this.renderer.render("⚠️ _The previous turn was interrupted by a daemon restart. Re-send your message to continue._") }],
           });
         }
-        if (notice) {
-          session.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(notice.message) }] });
-        }
+        // [BE2-2] Worktree recovery shells out to (now async) git — fire-and-forget so one repo with a
+        // wedged/slow git can't stall the whole restore (and thereby daemon startup). The recovery
+        // notice lands in the conversation when it completes; the healed git state is persisted +
+        // broadcast then (clients may already be connected by that point).
+        recoveries.push(
+          this.recoverWorktreeOnRestore(p.data)
+            .then((notice) => {
+              if (!notice) return;
+              if (notice.recovered) {
+                console.log(`[restore] recovered worktree for session ${p.data.id}`);
+                this.persist();
+                this.broadcastUpdated(p.data);
+              }
+              session.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(notice.message) }] });
+            })
+            .catch((e) => console.error(`[restore] worktree recovery failed for ${p.data.id}: ${e instanceof Error ? e.message : e}`)),
+        );
       } catch (e) {
         // One unloadable session must not crash the daemon (no startup crash-loop). Skip it; its
         // state stays on disk for inspection and the rest of the fleet loads normally.
@@ -1901,6 +1922,7 @@ export class Supervisor {
         console.error(`[restore] quarantined session ${p?.data?.id ?? "<unknown>"}: ${e instanceof Error ? e.message : e}`);
       }
     }
+    this.worktreeRecoveriesSettled = Promise.allSettled(recoveries).then(() => {});
     this.reconcileSessionAccounts(); // §5.4: an account removed while this daemon was down
     this.persist(); // reconcile disk == memory after status resets / recovery (fixes drift)
     this.ensureDefaultSession(); // the concierge chat always exists (reused if persisted, else created)
@@ -1910,9 +1932,9 @@ export class Supervisor {
     const orphanDirs = this.store.listSessionDirs().filter((d) => !known.has(d));
     console.log(
       `[restore] ${this.sessions.size} session(s) loaded` +
-        ` · ${recovered} worktree(s) recovered · ${quarantined} quarantined` +
+        ` · ${quarantined} quarantined` +
         (orphanDirs.length ? ` · ${orphanDirs.length} orphan state dir(s)` : ""),
-    );
+    ); // worktree recoveries log individually when their (async) git ops complete
   }
 
 
@@ -1945,7 +1967,7 @@ export class Supervisor {
    * alone (it may hold uncommitted work) but flagged for the user to Reset. Returns a notice to
    * surface in the conversation, or undefined if the worktree was already healthy.
    */
-  private recoverWorktreeOnRestore(data: SessionData): { message: string; recovered: boolean } | undefined {
+  private async recoverWorktreeOnRestore(data: SessionData): Promise<{ message: string; recovered: boolean } | undefined> {
     if (data.source !== "fresh-worktree" || !data.worktree) return undefined;
     const { repoRoot, branch, base } = data.worktree;
     const health = worktreeHealth(data.cwd, branch);
@@ -1953,9 +1975,9 @@ export class Supervisor {
     if (health === "wrong-branch") {
       return { message: `⚠️ _This worktree is checked out on the wrong branch (expected \`${branch}\`). Use **Reset** to restore it._`, recovered: false };
     }
-    const r = recreateWorktree(repoRoot, data.cwd, branch, base);
+    const r = await recreateWorktree(repoRoot, data.cwd, branch, base);
     if (r.ok) {
-      data.git = gitStatus(data.cwd);
+      data.git = await gitStatusAsync(data.cwd);
       return { message: `🔧 _Worktree was ${health} after a restart and has been restored from branch \`${branch}\`._`, recovered: true };
     }
     return { message: `⚠️ _This session's worktree was ${health} and could not be auto-restored (${r.error}). Use **Reset** to retry._`, recovered: false };

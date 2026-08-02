@@ -22,7 +22,6 @@ import { $, enhanceSelect, esc, icon, refreshSelect } from "./dom";
 // imports — they used to arrive via initFleet(deps).
 import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { armJoinWindow } from "./setup";
-import { newCid } from "./outbox";
 import { ui } from "./state";
 import type { AutopilotPlanInfo, Budget, Environment, ServerEvent, Session, TeamInfo, TeamPlan, rest } from "../../protocol";
 
@@ -50,8 +49,6 @@ export interface FleetDeps {
   renderSessions(): void;
   /** The Settings → Fleet card list (stays in main next to the roster/ADB card helpers). */
   renderServerCards(): void;
-  /** cid-tracked request/response over a server's socket (main's `sendAwait`). */
-  sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
   /** Write into the hub card's update-output pane (the restart-reload flow). */
   setUpdateStatus(text: string): void;
 }
@@ -70,7 +67,6 @@ let persistSessions: FleetDeps["persistSessions"];
 let persistEnvironments: FleetDeps["persistEnvironments"];
 let renderSessions: FleetDeps["renderSessions"];
 let renderServerCards: FleetDeps["renderServerCards"];
-let sendAwait: FleetDeps["sendAwait"];
 let setUpdateStatus: FleetDeps["setUpdateStatus"];
 export function initFleet(deps: FleetDeps): void {
   ({
@@ -86,7 +82,6 @@ export function initFleet(deps: FleetDeps): void {
     persistEnvironments,
     renderSessions,
     renderServerCards,
-    sendAwait,
     setUpdateStatus,
   } = deps);
 }
@@ -145,10 +140,79 @@ export const planServer = new Map<string, string>(); // workUnitId → server ur
 // serverPlans so the sidebar rollup + the lead's member board stay live off `team.info`.
 export const serverTeams = new Map<string, TeamInfo[]>(); // server url → its teams
 export const pendingTeamPlans = new Map<string, TeamPlan>(); // lead sessionId → a plan awaiting approval
+
+// ── Default-chat id namespacing (#158) ───────────────────────────────────────────────────────────
+// Every daemon's concierge chat has the SAME hard-coded id (DEFAULT_SESSION_ID in
+// src/session/supervisor.ts) — the one session id that is NOT globally unique. The client keys
+// sessions/routing by id alone, so in a fleet the hub's and each member's default chats collided
+// into one sidebar row whose routing flipped to whichever `session.list` landed last, and a prompt
+// could be delivered to the wrong daemon. Rather than re-keying every map by (server, id), the id is
+// namespaced AT THIS BOUNDARY: inbound frames from a NON-origin server rewrite "sess_default" →
+// "sess_default@<serverId>" (namespaceInbound, applied before main's onEvent ever sees the frame),
+// and outbound frames strip it back to the wire id on exactly the socket that owns the session
+// (wireOutbound, the AnvilSocket mapOut hook). The origin's own frames pass through untouched, so
+// single-server behaviour — including all pre-existing per-session state keyed by the plain id
+// (drafts, seq/epoch, cached transcript, deep links) — is bit-for-bit unchanged.
+export const DEFAULT_SESSION_ID = "sess_default"; // mirrors the daemon literal; the client never receives it from a non-origin server past this seam
+const DEFAULT_NS = `${DEFAULT_SESSION_ID}@`;
+export const isNamespacedDefaultId = (id: string): boolean => id.startsWith(DEFAULT_NS);
+/** The id a session is known by ON ITS DAEMON — what session-scoped REST paths must embed. */
+export const wireSessionId = (id: string): string => (isNamespacedDefaultId(id) ? DEFAULT_SESSION_ID : id);
+/** Stable per-server namespace key: the serverId once `server.hello` has identified it (survives a
+ *  member's http→https url drift, so the row keeps its identity across reloads), else the url.
+ *  hello is the first frame on every connection, so by the time any session frame arrives the
+ *  serverId is known. */
+const serverKeyOf = (url: string): string => servers.get(url)?.id || url;
+const nsId = (url: string, id: string): string => (id === DEFAULT_SESSION_ID ? DEFAULT_NS + serverKeyOf(url) : id);
+function nsSession(url: string, s: Session): void {
+  s.id = nsId(url, s.id);
+  if (s.parentId) s.parentId = nsId(url, s.parentId);
+}
+/** Rewrite a non-origin server's inbound frame so its default chat carries the namespaced id —
+ *  covering every field a session id arrives in: `sessionId` (all session-scoped events),
+ *  `session`/`sessions` (created/updated/list), resume `watermarks`, and `teams`. Mutates the
+ *  freshly-parsed frame in place (this client owns it). Origin frames return untouched. */
+export function namespaceInbound(url: string, e: ServerEvent): ServerEvent {
+  if (sameServerUrl(url, HUB_URL)) return e;
+  const f = e as ServerEvent & {
+    sessionId?: string;
+    session?: Session;
+    sessions?: Session[];
+    watermarks?: { sessionId: string }[];
+    teams?: TeamInfo[];
+  };
+  if (typeof f.sessionId === "string") f.sessionId = nsId(url, f.sessionId);
+  if (f.session) nsSession(url, f.session);
+  if (Array.isArray(f.sessions)) for (const s of f.sessions) nsSession(url, s);
+  if (Array.isArray(f.watermarks)) for (const w of f.watermarks) w.sessionId = nsId(url, w.sessionId);
+  if (Array.isArray(f.teams))
+    for (const t of f.teams) {
+      t.leadId = nsId(url, t.leadId);
+      for (const m of t.members) m.sessionId = nsId(url, m.sessionId);
+    }
+  return e;
+}
+/** Outbound half: strip the namespace back to the wire id — but ONLY when the id actually routes to
+ *  this socket's server. A namespaced id that reached a socket it doesn't route to (e.g. sendTo's
+ *  hub fallback after lost routing) stays namespaced, so that daemon answers "no such session"
+ *  instead of acting on its OWN default chat — the exact wrong-daemon delivery this seam prevents. */
+export function wireOutbound(url: string, cmd: Record<string, unknown> & { type: string }): Record<string, unknown> & { type: string } {
+  const sid = cmd.sessionId;
+  if (typeof sid === "string" && isNamespacedDefaultId(sid) && sameServerUrl(sessionServer.get(sid), url)) return { ...cmd, sessionId: DEFAULT_SESSION_ID };
+  return cmd;
+}
+
 (function hydrateRouting() {
   try {
     for (const [k, v] of JSON.parse(localStorage.getItem("anvil.sessionServer") ?? "[]") as [string, string][]) sessionServer.set(k, v);
     for (const [k, v] of JSON.parse(localStorage.getItem("anvil.envServer") ?? "[]") as [string, string][]) envServer.set(k, v);
+    // [#158] One-time fixup for pre-namespacing state: the shared plain id could be left routed at
+    // whichever fleet server's session.list landed last. Post-fix the plain id ALWAYS means the
+    // origin's own default chat — and a stale non-origin route would let that member's next
+    // session.list prune the row and wipe the origin concierge's cached transcript/seq/draft.
+    // Re-point it; each member's default now arrives under its namespaced id.
+    const du = sessionServer.get(DEFAULT_SESSION_ID);
+    if (du !== undefined && !sameServerUrl(du, HUB_URL)) sessionServer.set(DEFAULT_SESSION_ID, HUB_URL);
   } catch {
     /* corrupt — repopulated on connect */
   }
@@ -201,8 +265,9 @@ export function ensureServer(url: string): Server {
   if (existing) return existing;
   const sock = new AnvilSocket(
     serverWsUrl(clean),
-    (e) => onEvent(clean, e),
+    (e) => onEvent(clean, namespaceInbound(clean, e)), // [#158] a member's "sess_default" never reaches app state un-namespaced
     (st) => onStatus(clean, st),
+    (cmd) => wireOutbound(clean, cmd), // [#158] …and the namespaced id never reaches the wire
   );
   const s: Server = { url: clean, id: "", name: hostOf(clean), sock, status: "disconnected" };
   servers.set(clean, s);
@@ -321,6 +386,29 @@ export const fleetMemberIdByHost = new Map<string, string>();
  *  every push so far failed. Populated by {@link loadFleetMembers} from the hub's /api/fleet/members. */
 export const fleetMemberAccountsRev = new Map<string, number | undefined>();
 
+/**
+ * [BE2-15] Await an async fleet job (rotate/invite). The POST answers immediately with a jobId — the
+ * fan-out runs as a daemon-side job (an offline member used to pin the request open for ~14s of
+ * pairing timeouts) — and completion is read by polling GET /api/fleet/jobs/<id>. Resolves with the
+ * job's result: the exact body the old synchronous POST returned. A transient poll failure is retried
+ * until the deadline; an unknown id (the daemon restarted mid-job) or a timeout rejects.
+ */
+async function awaitFleetJob<R>(jobId: string, timeoutMs = 120_000): Promise<R> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1_000));
+    let st: rest.FleetJobStatusResponse | null = null;
+    try {
+      st = (await (await apiFetch(`/api/fleet/jobs/${encodeURIComponent(jobId)}`)).json()) as rest.FleetJobStatusResponse;
+    } catch {
+      /* network blip — keep polling until the deadline */
+    }
+    if (st && !st.ok) throw new Error(st.error ?? "the daemon no longer knows this job");
+    if (st?.state === "done") return st.result as R;
+    if (Date.now() >= deadline) throw new Error("timed out waiting for the fleet operation");
+  }
+}
+
 /** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
 export async function rotateFleetToken(): Promise<void> {
   // /api/fleet/rotate fans out from THIS daemon to ITS members. On a machine that has none — a member,
@@ -332,10 +420,22 @@ export async function rotateFleetToken(): Promise<void> {
     return;
   }
   toast("Pushing the current login to every Mac…");
+  // [BE2-15] ?async=1 → the POST answers immediately with a jobId and the fan-out runs daemon-side;
+  // we poll for the same {ok,results} the synchronous route used to return. A pre-job daemon ignores
+  // the query and answers the legacy shape directly (no jobId) — use it as-is.
+  let started: rest.FleetJobStartResponse & rest.FleetRotateResponse;
   try {
-    const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    started = (await (await apiFetch("/api/fleet/rotate?async=1", { method: "POST" })).json()) as typeof started;
+  } catch {
+    // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
+    // failure below, not an exception, so this message must not be used for that case.
+    toast("Couldn't reach this machine's own daemon to start the sync.");
+    return;
+  }
+  try {
+    const r = started.jobId ? await awaitFleetJob<rest.FleetRotateResponse>(started.jobId) : started;
     if (r.results.length === 0) {
-      toast("No other Macs in this fleet yet.");
+      toast(r.error ? `Couldn't sync: ${r.error}` : "No other Macs in this fleet yet.");
       return;
     }
     const okN = r.results.filter((x) => x.ok).length;
@@ -349,9 +449,8 @@ export async function rotateFleetToken(): Promise<void> {
     }
     void loadFleetMembers(); // re-read each member's accountsRev so the per-card sync badges refresh
   } catch {
-    // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
-    // failure above, not an exception, so this message must not be used for that case.
-    toast("Couldn't reach this machine's own daemon to start the sync.");
+    // The job was started but its outcome couldn't be read (poll timeout / daemon restarted mid-job).
+    toast("Lost track of the sync — check the Servers tab for each Mac's status and try again.");
   }
 }
 
@@ -485,8 +584,18 @@ export function showAddMac(): void {
     if (!host) { setStatus("Pick the machine you're adding."); return; }
     if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that machine is showing."); return; }
     setStatus(`Sending the login to ${host} over the tailnet…`);
+    // [BE2-15] ?async=1 → the POST answers immediately with a jobId (the pairing push runs as a
+    // daemon-side job); poll for the same {ok,member,error} the synchronous route used to return.
+    // A pre-job daemon ignores the query and answers the legacy shape directly (no jobId).
+    let started: rest.FleetJobStartResponse & rest.FleetInviteResponse;
     try {
-      const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; member?: { url: string }; error?: string };
+      started = (await (await apiFetch("/api/fleet/invite?async=1", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as typeof started;
+    } catch {
+      setStatus("Couldn't reach the hub daemon.");
+      return;
+    }
+    try {
+      const r = started.jobId ? await awaitFleetJob<rest.FleetInviteResponse>(started.jobId) : started;
       if (r.ok) {
         // Onboarded → also connect this client to it so its sessions show up (one step, not two).
         if (r.member?.url) { saveExtraServers([...loadExtraServers(), r.member.url]); ensureServer(r.member.url); }
@@ -754,16 +863,20 @@ export function wireDaemonUpdate(srv: Server): void {
     out.hidden = false;
     out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
-      const res = await sendAwait(srv, { type: "daemon.update", cid: newCid() }, 180_000);
-      if (res.type === "command.error") {
-        out.textContent = `Update failed: ${res.message}`;
-        toast("Update failed — see Settings.");
-        reset();
-        return;
-      }
-      if (res.type !== "daemon.update.result") {
-        reset();
-        return;
+      // Issue #162: the update rides version-independent REST, NOT the versioned WS channel. A
+      // version-skewed daemon rejects every WS command frame — including the very `daemon.update`
+      // that would repair the skew (the bootstrap paradox). POST /api/daemon/update is identity-
+      // gated but carries no protocol version, so this button works exactly when it's needed most.
+      // Native clients keep the `daemon.update` WS command; only this button switched transport.
+      const resp = await serverFetch(srv.url, "/api/daemon/update", {
+        method: "POST",
+        signal: AbortSignal.timeout(180_000),
+      });
+      let res: rest.DaemonUpdateResponse;
+      try {
+        res = (await resp.json()) as rest.DaemonUpdateResponse;
+      } catch {
+        throw new Error(`HTTP ${resp.status}`); // non-JSON body (proxy error page etc.)
       }
       out.textContent = res.output;
       if (res.phase === "up-to-date") {

@@ -47,8 +47,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // v4 (incremental-offline-resilience.md): adds the resume watermark (`resume.watermarks`), per-session
-// `epoch` on the snapshot, and `cid` on `message.user` (exactly-once send dedupe). A hard cutover —
-// parseCommandFrame rejects any other version, so a mixed-version fleet must upgrade together (spec D9).
+// `epoch` on the snapshot, and `cid` on `message.user` (exactly-once send dedupe).
+//
+// Gate semantics (issue #162): the daemon's parseCommandFrame treats this constant as a FLOOR, not an
+// equality. Frames from OLDER clients are accepted — the protocol is additive-or-bump, so an older
+// envelope still parses — and only frames NEWER than the daemon speaks are rejected (they may rely on
+// semantics the daemon predates). Strict equality turned every bump into a fleet-wide outage where a
+// one-release-behind peer was unreachable from the UI. Corollary: daemon self-update must never depend
+// on the versioned WS channel — the web client's "Update Anvil" rides POST /api/daemon/update (rest.
+// DaemonUpdateResponse), which carries no protocol version, so recovery can't be blocked by the very
+// skew it exists to repair. The `daemon.update` WS command remains for native clients.
 export const PROTOCOL_VERSION = 4 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
@@ -1741,6 +1749,38 @@ export namespace rest {
   export interface FleetRotateResponse {
     ok: boolean;
     results: { host: string; ok: boolean; error?: string }[];
+    /** Set when the fan-out itself failed to run (as opposed to per-member failures in `results`). */
+    error?: string;
+  }
+
+  /**
+   * [BE2-15] Async fleet-job envelope. `POST /api/fleet/rotate|invite` accept `?async=1` to start (or
+   * join) the fan-out as a background JOB and answer immediately with this envelope, instead of holding
+   * the request open for the whole fan-out (one sleeping Mac used to pin the POST for ~14s of pairing
+   * timeouts per member — the reason the server's idleTimeout had to be raised to 120s). Progress is
+   * polled from `GET /api/fleet/jobs/<jobId>`. WITHOUT `?async=1` both POSTs keep their original
+   * synchronous response shapes — bundled native web UIs (Android/iOS ship their own copy) predate the
+   * job model and must keep working against a newer daemon.
+   */
+  export interface FleetJobStartResponse {
+    ok: boolean;
+    jobId: string;
+    kind: "rotate" | "invite";
+    state: "running" | "done";
+  }
+  /** GET /api/fleet/jobs/:id → job progress. Once `state` is "done", `result` carries EXACTLY the body
+   *  the synchronous POST would have returned: a {@link FleetRotateResponse} for kind "rotate", a
+   *  {@link FleetInviteResponse} for kind "invite" — same information content, just delivered async.
+   *  An unknown/expired id answers 404 with `ok:false` (e.g. the daemon restarted mid-job). */
+  export interface FleetJobStatusResponse {
+    ok: boolean;
+    jobId?: string;
+    kind?: "rotate" | "invite";
+    state?: "running" | "done";
+    startedAt?: number;
+    finishedAt?: number;
+    result?: FleetRotateResponse | FleetInviteResponse;
+    error?: string;
   }
 
   /**

@@ -14,30 +14,30 @@ function tempState(): string {
 const createCmd = (cwd: string, extra: Record<string, unknown> = {}) =>
   ({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd, ...extra }) as const;
 
-test("a new session stamps the roster default's id and label", () => {
+test("a new session stamps the roster default's id and label", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
   expect(s.data.accountId).toBe(a.id);
   expect(s.data.accountLabel).toBe("work");
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("an explicit accountId on the command wins over the default", () => {
+test("an explicit accountId on the command wins over the default", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, { accountId: b.id }));
+  const s = await sup.create(createCmd(dir, { accountId: b.id }));
   expect(s.data.accountId).toBe(b.id);
   expect(s.data.accountLabel).toBe("personal");
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("an unresolvable accountId is rejected rather than silently defaulted", () => {
+test("an unresolvable accountId is rejected rather than silently defaulted", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111");
@@ -46,16 +46,16 @@ test("an unresolvable accountId is rejected rather than silently defaulted", () 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("an empty roster leaves accountId/accountLabel unset (pre-migration/dev)", () => {
+test("an empty roster leaves accountId/accountLabel unset (pre-migration/dev)", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir, accounts: new AccountStore(dir), envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
   expect(s.data.accountId).toBeUndefined();
   expect(s.data.accountLabel).toBeUndefined();
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a new session inherits the ENVIRONMENT's account over the roster default (§6)", () => {
+test("a new session inherits the ENVIRONMENT's account over the roster default (§6)", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // roster default
@@ -69,17 +69,17 @@ test("a new session inherits the ENVIRONMENT's account over the roster default (
   const env = envStore.add("proj", dir);
   sup.updateEnvironment(env.id, { accountId: personal.id });
 
-  const s = sup.create(createCmd(dir, { environmentId: env.id }));
+  const s = await sup.create(createCmd(dir, { environmentId: env.id }));
   expect(s.data.accountId).toBe(personal.id);
   expect(s.data.accountLabel).toBe("personal");
 
   // ...and an explicit command accountId still wins over the environment's.
-  const s2 = sup.create(createCmd(dir, { environmentId: env.id, accountId: accounts.defaultId() }));
+  const s2 = await sup.create(createCmd(dir, { environmentId: env.id, accountId: accounts.defaultId() }));
   expect(s2.data.accountId).toBe(accounts.defaultId());
 
   // Clearing it falls back to the roster default again.
   sup.updateEnvironment(env.id, { accountId: null });
-  const s3 = sup.create(createCmd(dir, { environmentId: env.id }));
+  const s3 = await sup.create(createCmd(dir, { environmentId: env.id }));
   expect(s3.data.accountId).toBe(accounts.defaultId());
   rmSync(dir, { recursive: true, force: true });
 });

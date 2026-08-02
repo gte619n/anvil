@@ -23,11 +23,21 @@ export function parseCommandFrame(raw: string): ParsedFrame {
   const record = msg as Record<string, unknown>;
   const cid = typeof record.cid === "string" ? record.cid : undefined;
 
-  if (record.v !== PROTOCOL_VERSION) {
-    return { ok: false, message: `unsupported protocol version: ${String(record.v)} (expected ${PROTOCOL_VERSION})`, cid };
-  }
   if (typeof record.type !== "string") {
     return { ok: false, message: "missing command type", cid };
+  }
+  // The version gate is a FLOOR, not an equality (issue #162). The protocol is additive-or-bump
+  // (protocol.ts changelog), so a frame from an OLDER client still parses; strict equality turned
+  // every bump into a fleet-wide outage where a one-release-behind peer was unreachable from the
+  // UI — and the "Update Anvil" recovery command was rejected by this very check. Only frames
+  // NEWER than this daemon speaks are refused (they may rely on semantics this daemon predates).
+  // Runs AFTER the `type` check so the command is inspected first and the error can name it.
+  if (typeof record.v !== "number" || record.v > PROTOCOL_VERSION) {
+    return {
+      ok: false,
+      message: `unsupported protocol version: ${String(record.v)} for ${record.type} (this daemon speaks ≤ ${PROTOCOL_VERSION})`,
+      cid,
+    };
   }
   return { ok: true, cmd: msg as ClientCommand, cid };
 }

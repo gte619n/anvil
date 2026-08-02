@@ -71,57 +71,57 @@ const plan = (members: string[]): TeamPlan => ({
   members: members.map((title) => ({ title, task: `do ${title}`, source: "existing-dir" as const })),
 });
 
-test("[P7] approveTeamPlan spawns members up to the cap and queues the overflow", () => {
+test("[P7] approveTeamPlan spawns members up to the cap and queues the overflow", async () => {
   const h = harness({ cap: 2 });
-  h.svc.approveTeamPlan("lead1", plan(["a", "b", "c"]));
+  await h.svc.approveTeamPlan("lead1", plan(["a", "b", "c"]));
   expect(h.spawned.map((s) => s.title)).toEqual(["a", "b"]); // cap 2 — "c" queued
   expect(h.spawned.every((s) => s.parentId === "lead1")).toBe(true);
   expect(h.events).toContain("team.plan.resolved");
 });
 
-test("[P7] drainQueuedMembers starts a queued member when a slot frees (justFinished excluded)", () => {
+test("[P7] drainQueuedMembers starts a queued member when a slot frees (justFinished excluded)", async () => {
   const h = harness({ cap: 2 });
-  h.svc.approveTeamPlan("lead1", plan(["a", "b", "c"]));
+  await h.svc.approveTeamPlan("lead1", plan(["a", "b", "c"]));
   expect(h.spawned).toHaveLength(2);
   // m1 finished its turn — the driver reports BEFORE the status flips to idle, so it must be
   // excluded from the active count for the drain to see the free slot.
-  h.svc.drainQueuedMembers("lead1", "m1");
+  await h.svc.drainQueuedMembers("lead1", "m1");
   expect(h.spawned.map((s) => s.title)).toEqual(["a", "b", "c"]);
 });
 
-test("[P7] budget warn queues every member (spawn pause) and the drain respects it too", () => {
+test("[P7] budget warn queues every member (spawn pause) and the drain respects it too", async () => {
   const h = harness({ cap: 2, warn: true });
-  h.svc.approveTeamPlan("lead1", plan(["a", "b"]));
+  await h.svc.approveTeamPlan("lead1", plan(["a", "b"]));
   expect(h.spawned).toHaveLength(0); // all queued under budget pressure
-  h.svc.drainQueuedMembers("lead1");
+  await h.svc.drainQueuedMembers("lead1");
   expect(h.spawned).toHaveLength(0); // still paused
 });
 
-test("[P7] onLeadKilled clears the queue so a dying lead cannot re-spawn members", () => {
+test("[P7] onLeadKilled clears the queue so a dying lead cannot re-spawn members", async () => {
   const h = harness({ cap: 1 });
-  h.svc.approveTeamPlan("lead1", plan(["a", "b"]));
+  await h.svc.approveTeamPlan("lead1", plan(["a", "b"]));
   expect(h.spawned).toHaveLength(1);
   h.svc.onLeadKilled("lead1");
-  h.svc.drainQueuedMembers("lead1", "m1");
+  await h.svc.drainQueuedMembers("lead1", "m1");
   expect(h.spawned).toHaveLength(1); // queue was dropped with the lead
 });
 
-test("[P7] approve/reject/integrate guard the lead role (a non-lead session throws)", () => {
+test("[P7] approve/reject/integrate guard the lead role (a non-lead session throws)", async () => {
   const h = harness();
   h.lead.data.teamRole = undefined; // e.g. the concierge — never created as a lead
-  expect(() => h.svc.approveTeamPlan("lead1", plan(["a"]))).toThrow(BadCommand);
-  expect(() => h.svc.integrateTeam("lead1")).toThrow(BadCommand);
-  expect(() => h.svc.approveTeamPlan("nope")).toThrow(BadCommand);
+  await expect(h.svc.approveTeamPlan("lead1", plan(["a"]))).rejects.toThrow(BadCommand);
+  await expect(h.svc.integrateTeam("lead1")).rejects.toThrow(BadCommand);
+  await expect(h.svc.approveTeamPlan("nope")).rejects.toThrow(BadCommand);
 });
 
-test("[P7] approving an empty plan throws instead of resolving the card", () => {
+test("[P7] approving an empty plan throws instead of resolving the card", async () => {
   const h = harness();
-  expect(() => h.svc.approveTeamPlan("lead1", plan([]))).toThrow(BadCommand);
+  await expect(h.svc.approveTeamPlan("lead1", plan([]))).rejects.toThrow(BadCommand);
 });
 
-test("[P7] teamInfoEvent derives the team tree from the flat session list", () => {
+test("[P7] teamInfoEvent derives the team tree from the flat session list", async () => {
   const h = harness({ cap: 3 });
-  h.svc.approveTeamPlan("lead1", plan(["a", "b"]));
+  await h.svc.approveTeamPlan("lead1", plan(["a", "b"]));
   const ev = h.svc.teamInfoEvent();
   expect(ev.type).toBe("team.info");
   const team = ev.teams.find((t) => t.leadId === "lead1");

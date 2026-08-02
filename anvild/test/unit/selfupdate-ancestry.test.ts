@@ -36,14 +36,19 @@ test("[SEC2-1] an on-branch SHA (ancestor of the upstream tip) is accepted and c
   expect(res.targetSha).toBe("abc1234");
 });
 
-test("[SEC2-1] rollback path (allowNonFastForward) resets backwards without the ancestry gate", async () => {
-  // A rollback target is deliberately behind the upstream tip; the ancestry gate must be bypassed so the
-  // watchdog/rollback can still move the checkout backwards to a known-good prePullSha.
-  const { run, calls } = fakeRunner({ "merge-base --is-ancestor": { code: 1, out: "" }, "status --porcelain": { code: 0, out: "" } });
+test("[SEC2-1] rollback path (allowNonFastForward) still resets backwards to a SHA in our own history", async () => {
+  // A rollback target is deliberately behind the upstream tip (e.g. after a pin-backwards update it may
+  // not even be an ancestor of it) — the STRICT forward gate must not block it. [CI2-7] replaced the
+  // old skip-the-gate-entirely behavior with a relaxed one: reachable from the upstream track OR from
+  // the current checkout's HEAD. Here the target fails the upstream check but is in local history.
+  const { run, calls } = fakeRunner({
+    "merge-base --is-ancestor 0old000 HEAD": { code: 0, out: "" },
+    "merge-base --is-ancestor 0old000": { code: 1, out: "" }, // not an ancestor of the upstream ref
+    "status --porcelain": { code: 0, out: "" },
+  });
   const res = await applyUpdateToTarget("0old000", { run, allowNonFastForward: true });
   expect(res.targetSha).toBe("0old000");
   expect(ran(calls, "checkout --detach 0old000")).toBe(true);
-  expect(ran(calls, "merge-base --is-ancestor")).toBe(false); // gate skipped on the rollback path
 });
 
 test("[SEC2-1] records the pre-pull SHA before rejecting a bad target (caller may need it)", async () => {

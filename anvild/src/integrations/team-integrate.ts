@@ -17,11 +17,14 @@ export interface IntegrateMember {
   branch?: string;
 }
 
+/** The injected git surface. [BE2-3] Each op may resolve asynchronously (the daemon injects the
+ *  Bun.spawn-backed `*Async` twins so N merges + push + PR can't freeze the event loop); the
+ *  orchestrator awaits either shape, so synchronous test fakes keep working unchanged. */
 export interface IntegrateGit {
-  isAncestor(cwd: string, ref: string): boolean;
-  mergeBranch(cwd: string, branch: string, message?: string): { ok: boolean; conflicted: boolean; output: string };
-  push(cwd: string, branch: string, remoteBranch?: string): { ok: boolean; output: string };
-  createPr(cwd: string, title: string, body: string): { ok: boolean; output: string; url?: string };
+  isAncestor(cwd: string, ref: string): boolean | Promise<boolean>;
+  mergeBranch(cwd: string, branch: string, message?: string): { ok: boolean; conflicted: boolean; output: string } | Promise<{ ok: boolean; conflicted: boolean; output: string }>;
+  push(cwd: string, branch: string, remoteBranch?: string): { ok: boolean; output: string } | Promise<{ ok: boolean; output: string }>;
+  createPr(cwd: string, title: string, body: string): { ok: boolean; output: string; url?: string } | Promise<{ ok: boolean; output: string; url?: string }>;
 }
 
 export interface IntegrateInput {
@@ -54,7 +57,7 @@ export function safeRemoteBranch(remoteBranch: string | undefined, baseName: str
   return remoteBranch;
 }
 
-export function integrateTeam(input: IntegrateInput): IntegrateResult {
+export async function integrateTeam(input: IntegrateInput): Promise<IntegrateResult> {
   if (input.integration === "pr-per-member") {
     return {
       ok: true,
@@ -67,11 +70,11 @@ export function integrateTeam(input: IntegrateInput): IntegrateResult {
   const merged: string[] = [];
   for (const m of input.members) {
     if (!m.branch) continue; // no worktree to merge (research/read-only member)
-    if (input.git.isAncestor(input.leadCwd, m.branch)) {
+    if (await input.git.isAncestor(input.leadCwd, m.branch)) {
       merged.push(m.title); // already merged in an earlier run — skip, but count it
       continue;
     }
-    const r = input.git.mergeBranch(input.leadCwd, m.branch, `Merge team member ${m.title} (${m.branch})`);
+    const r = await input.git.mergeBranch(input.leadCwd, m.branch, `Merge team member ${m.title} (${m.branch})`);
     if (!r.ok) {
       // A real conflict leaves markers the lead can resolve; any other failure (dirty tree, missing
       // branch, detached HEAD) is NOT resolvable by "fix the conflicts" — report it differently.
@@ -85,11 +88,11 @@ export function integrateTeam(input: IntegrateInput): IntegrateResult {
     merged.push(m.title);
   }
 
-  const pushed = input.git.push(input.leadCwd, input.leadBranch, input.leadRemoteBranch);
+  const pushed = await input.git.push(input.leadCwd, input.leadBranch, input.leadRemoteBranch);
   if (!pushed.ok) {
     return { ok: false, mode: "combined-pr", merged, output: `Merged ${merged.length} member(s), but push failed: ${pushed.output}` };
   }
-  const pr = input.git.createPr(input.leadCwd, input.prTitle, input.prBody);
+  const pr = await input.git.createPr(input.leadCwd, input.prTitle, input.prBody);
   return {
     ok: pr.ok,
     mode: "combined-pr",

@@ -70,6 +70,7 @@ import {
   maybeShowSessionHero,
   renderEmptyState,
   scrollDown,
+  serializeTranscript,
   showThinking,
   streamMd,
   updateComposerMode,
@@ -277,7 +278,6 @@ initFleet({
   persistEnvironments,
   renderSessions,
   renderServerCards,
-  sendAwait,
   setUpdateStatus,
 });
 // Sidebar deps (P7 — see sidebar.ts). Same timing contract as initFleet above: this runs during
@@ -716,6 +716,16 @@ if (typeof window !== "undefined") {
 
 // Cache the rendered conversation per session so it shows instantly on reload, before the WS
 // even connects. Best-effort (skipped if it exceeds the localStorage quota).
+//
+// [WEB2-6] The cache is bounded: cloning + serializing the ENTIRE transcript on every turn cost
+// 30–150ms on long sessions (per debounced save, on the main thread). The cache exists for one
+// thing — an instant paint on reload — so serializeTranscript (conversation.ts) only clones the
+// last CONVO_CACHE_MAX_NODES top-level blocks, keeping the per-save DOM work constant. Restore is
+// unchanged for the common case (sessions under the cap serialize in full, byte-identical to the
+// old whole-pane clone); a very long session restores its most recent blocks instantly and resume
+// replays the live tail on top — older scrollback comes back with the next full snapshot rather
+// than living in the cache.
+const CONVO_CACHE_MAX_NODES = 200;
 let cacheTimer = 0;
 function saveConvoCache(): void {
   const id = activeId;
@@ -727,22 +737,11 @@ function saveConvoCache(): void {
       // DOM no longer belongs to `id` — writing it would clobber `id`'s cache with the wrong content
       // (or a skeleton that would repaint as a frozen shimmer). Bail in both cases.
       if (activeId !== id || conversation.querySelector(".convo-skeleton")) return;
-      // Don't persist transient UI (the thinking indicator / empty state) — it would
-      // re-paint as a frozen "stuck" status on return.
-      const clone = conversation.cloneNode(true) as HTMLElement;
-      clone.querySelectorAll(".thinking, .empty-state").forEach((e) => e.remove());
-      // Freeze any still-"live" activity block: the cache is a snapshot, not a running turn, so it
-      // must restore as "Worked" — never an animated "Working" that can't stop (no WS yet on reload).
-      clone.querySelectorAll(".activity.live").forEach((a) => {
-        a.classList.remove("live");
-        const ind = a.querySelector(".activity-ind");
-        if (ind) ind.innerHTML = `<span class="msym">check</span>`;
-        const title = a.querySelector(".activity-title");
-        if (title) title.textContent = "Worked";
-      });
       // Persist to IndexedDB (spec D8) — no 1.5MB cliff, so a long transcript stays cached and
       // delta-resumable instead of silently dropping to a full snapshot on the next reload.
-      void convoCache.set(id, clone.innerHTML);
+      // serializeTranscript strips transient UI (thinking / empty state) and freezes any live
+      // activity block to "Worked" — the cache is a snapshot, not a running turn.
+      void convoCache.set(id, serializeTranscript(CONVO_CACHE_MAX_NODES));
     } catch {
       /* best-effort — the snapshot still loads from the daemon */
     }
@@ -1327,6 +1326,10 @@ function handleSessionEvent(e: ServerEvent): void {
       ui.replayingSnapshot = true;
       renderSnapshotEvents(e.events);
       ui.replayingSnapshot = false;
+      // [WEB2-9] Replay is batched: scrollDown is a no-op while `replayingSnapshot` is set (each call
+      // forces a layout — O(n²) on large transcripts), so issue the ONE scroll for the whole snapshot
+      // here. Unforced: it follows the bottom exactly as the per-message calls used to.
+      scrollDown();
       // A replayed history has no `result` event, so the last turn's activity block was rebuilt
       // "live" — finalize it so it shows "Worked" instead of an eternally spinning "Working". If the
       // session is actually mid-turn, the live status/message events that follow re-light it.

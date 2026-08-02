@@ -21,16 +21,19 @@
 // main's `activeId` and touches the persistence/caches — and is reached via the injected
 // `killSession`. `panelView`/`readerPath`/`xterm` are exported live bindings: panel.ts is their
 // sole writer, main (the WS event router) only reads them.
-import { Terminal as XTerm } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { sendTo, serverApiUrl, serverFetch, type Server } from "./fleet";
+// [WEB2-3] xterm + its fit addon are the heaviest non-boot dependencies of this seam, and the
+// terminal only exists after an explicit user action (the Terminal tab/button) — so they load as a
+// lazy chunk inside mountTerminal(), not in the boot bundle. Only their TYPES are imported here.
+import type { Terminal as XTerm } from "@xterm/xterm";
+import type { FitAddon } from "@xterm/addon-fit";
+import { sendTo, serverApiUrl, serverFetch, wireSessionId, type Server } from "./fleet";
 import { $, esc, icon, linkifyUrls } from "./dom";
 // dialogs.ts is a leaf, so the modal/toast helpers are direct imports — they used to arrive via
 // initPanel(deps).
 import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { currentTheme } from "./theme";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
-import { isAndroidApp } from "./push";
+import { isAndroidApp } from "./platform";
 import { conversation, copyText, humanSize, references, relTime, runMermaid } from "./conversation";
 import type { DirEntry, FileContent, GitResultEvent, GitStatus, Session } from "../../protocol";
 
@@ -166,43 +169,53 @@ export const closePanel = (): void => dismissOverlay("panel"); // programmatic c
 function mountTerminal(): void {
   disposeTerminal();
   panelContent.innerHTML = '<div id="term-host" style="height:100%;width:100%"></div>';
-  const dark = currentTheme() === "dark";
-  xterm = new XTerm({
-    fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
-    fontSize: 13,
-    cursorBlink: true,
-    theme: dark ? { background: "#1a1b1e", foreground: "#e6e7e9" } : { background: "#ffffff", foreground: "#1c2024" },
-  });
-  fit = new FitAddon();
-  xterm.loadAddon(fit);
-  xterm.open($("#term-host"));
-  fit.fit();
-  xterm.onData((d) => {
-    if (activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(d) });
-  });
-  if (activeId()) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
-  // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
-  // Debounce ~100ms, and only send terminal.resize when the grid (cols/rows) actually changed — a repaint
-  // that doesn't alter the character grid shouldn't spam the daemon (which re-sizes the real PTY).
-  let lastCols = xterm.cols;
-  let lastRows = xterm.rows;
-  termObs = new ResizeObserver(() => {
-    if (termFitTimer) return;
-    termFitTimer = window.setTimeout(() => {
-      termFitTimer = 0;
-      if (!fit || !xterm || !activeId()) return;
-      fit.fit();
-      if (xterm.cols !== lastCols || xterm.rows !== lastRows) {
-        lastCols = xterm.cols;
-        lastRows = xterm.rows;
-        sendTo(activeId()!, { type: "terminal.resize", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
-      }
-    }, 100);
-  });
-  termObs.observe(panelContent);
+  // Lazy chunk: awaited once per page (subsequent opens hit the module cache). The token guards the
+  // await gap — if the user closes the panel or switches tabs before the chunk lands (disposeTerminal
+  // bumps the token), the stale mount must not resurrect a terminal over the new view.
+  const token = ++termMountToken;
+  void (async () => {
+    const [{ Terminal }, { FitAddon }] = await Promise.all([import("@xterm/xterm"), import("@xterm/addon-fit")]);
+    if (token !== termMountToken || panelView !== "terminal") return;
+    const dark = currentTheme() === "dark";
+    xterm = new Terminal({
+      fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+      fontSize: 13,
+      cursorBlink: true,
+      theme: dark ? { background: "#1a1b1e", foreground: "#e6e7e9" } : { background: "#ffffff", foreground: "#1c2024" },
+    });
+    fit = new FitAddon();
+    xterm.loadAddon(fit);
+    xterm.open($("#term-host"));
+    fit.fit();
+    xterm.onData((d) => {
+      if (activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(d) });
+    });
+    if (activeId()) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
+    // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
+    // Debounce ~100ms, and only send terminal.resize when the grid (cols/rows) actually changed — a repaint
+    // that doesn't alter the character grid shouldn't spam the daemon (which re-sizes the real PTY).
+    let lastCols = xterm.cols;
+    let lastRows = xterm.rows;
+    termObs = new ResizeObserver(() => {
+      if (termFitTimer) return;
+      termFitTimer = window.setTimeout(() => {
+        termFitTimer = 0;
+        if (!fit || !xterm || !activeId()) return;
+        fit.fit();
+        if (xterm.cols !== lastCols || xterm.rows !== lastRows) {
+          lastCols = xterm.cols;
+          lastRows = xterm.rows;
+          sendTo(activeId()!, { type: "terminal.resize", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
+        }
+      }, 100);
+    });
+    termObs.observe(panelContent);
+  })();
 }
 let termFitTimer = 0;
+let termMountToken = 0; // invalidates an in-flight lazy mount (chunk still loading) on dispose
 function disposeTerminal(): void {
+  termMountToken++; // a mount awaiting its chunk must not land after this teardown
   termObs?.disconnect();
   termObs = null;
   if (termFitTimer) {
@@ -262,7 +275,8 @@ export function renderFiles(entries: DirEntry[]): void {
  *  forces a save-as). Routed to the active session's server so it works across a federated fleet. */
 function downloadFile(path: string, name: string): void {
   if (!activeId()) return;
-  const url = serverApiUrl(activeServer().url, `/api/sessions/${activeId()}/files?path=${encodeURIComponent(path)}&download=1`);
+  // wireSessionId: the OWNING daemon's id in the path (#158 — a member's default chat is namespaced client-side)
+  const url = serverApiUrl(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/files?path=${encodeURIComponent(path)}&download=1`);
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
@@ -293,7 +307,7 @@ async function uploadToBrowser(files: File[], dir: string): Promise<void> {
   for (const file of files) {
     const rel = (dir ? `${dir}/` : "") + file.name;
     try {
-      const res = await serverFetch(activeServer().url, `/api/sessions/${activeId()}/files?path=${encodeURIComponent(rel)}`, {
+      const res = await serverFetch(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/files?path=${encodeURIComponent(rel)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/octet-stream" },
         body: await file.arrayBuffer(),

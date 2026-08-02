@@ -98,10 +98,10 @@ test("[P7] autopilotPlansEvent lists the seeded planned units with their env nam
   }
 });
 
-test("[P7] startPlan (Go) hands off a build session and flips the unit to building", () => {
+test("[P7] startPlan (Go) hands off a build session and flips the unit to building", async () => {
   const h = harness();
   try {
-    const ev = h.svc.startPlan(h.unit.id, undefined, undefined, "c2");
+    const ev = await h.svc.startPlan(h.unit.id, undefined, undefined, "c2");
     expect(ev.type).toBe("autopilot.started");
     expect(ev.workUnitId).toBe(h.unit.id);
     expect(h.handoffs).toHaveLength(1);
@@ -109,18 +109,18 @@ test("[P7] startPlan (Go) hands off a build session and flips the unit to buildi
     expect(h.events).toContain("autopilot.plans"); // the grid refreshes everywhere
     // the card leaves the pending grid: building units are no longer "pending plans"
     expect(h.svc.autopilotPlansEvent().plans.map((p) => p.id)).not.toContain(h.unit.id);
-    // a second Go on the now-live unit refuses
-    expect(() => h.svc.startPlan(h.unit.id)).toThrow(BadCommand);
+    // a second Go on the now-live unit refuses ([BE2-2] startPlan is async → rejects)
+    await expect(h.svc.startPlan(h.unit.id)).rejects.toThrow(BadCommand);
   } finally {
     h.cleanup();
   }
 });
 
-test("[P7] startPlan refuses a needs-clarification unit and an unknown unit", () => {
+test("[P7] startPlan refuses a needs-clarification unit and an unknown unit", async () => {
   const h = harness();
   try {
-    expect(() => h.svc.startPlan(h.held.id)).toThrow(/needs clarification/);
-    expect(() => h.svc.startPlan("wu_nope")).toThrow(BadCommand);
+    await expect(h.svc.startPlan(h.held.id)).rejects.toThrow(/needs clarification/);
+    await expect(h.svc.startPlan("wu_nope")).rejects.toThrow(BadCommand);
   } finally {
     h.cleanup();
   }

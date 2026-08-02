@@ -1,8 +1,10 @@
 /**
  * [Phase 3 / BE-7] parseCommandFrame is the pure protocol-conformance gate extracted from dispatch.ts
  * (the 435-line WS router). It validates the envelope before any command runs: JSON, object shape,
- * PROTOCOL_VERSION, and a string `type`, preserving the correlation id for the error reply. Pinning
- * it as a unit makes the malformed/unsupported cases fast to test without spinning a server.
+ * a string `type`, and the protocol-version FLOOR (issue #162: older-version frames are accepted —
+ * the protocol is additive-or-bump — only newer-than-this-daemon frames are refused), preserving the
+ * correlation id for the error reply. Pinning it as a unit makes the malformed/unsupported cases
+ * fast to test without spinning a server.
  */
 import { test, expect } from "bun:test";
 import { PROTOCOL_VERSION } from "@protocol";
@@ -28,12 +30,35 @@ test("rejects non-object frames", () => {
   }
 });
 
-test("rejects an unsupported protocol version and preserves the cid", () => {
-  const r = parseCommandFrame(JSON.stringify({ v: 999, type: "session.list", cid: "c1" }));
+test("rejects a NEWER protocol version and preserves the cid (gate is a floor, #162)", () => {
+  const r = parseCommandFrame(JSON.stringify({ v: PROTOCOL_VERSION + 1, type: "session.list", cid: "c1" }));
   expect(r.ok).toBe(false);
   if (!r.ok) {
     expect(r.message).toMatch(/unsupported protocol version/);
+    expect(r.message).toContain("session.list"); // per-command: the type check runs first
     expect(r.cid).toBe("c1");
+  }
+});
+
+test("accepts an OLDER protocol version — additive-or-bump means older frames still parse (#162)", () => {
+  for (const v of [1, PROTOCOL_VERSION - 1, PROTOCOL_VERSION]) {
+    const r = parseCommandFrame(JSON.stringify({ v, type: "daemon.update", cid: "c1" }));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.cmd.type).toBe("daemon.update");
+      expect(r.cid).toBe("c1");
+    }
+  }
+});
+
+test("rejects a missing or non-numeric protocol version with the same error shape", () => {
+  for (const raw of [{ type: "session.list", cid: "c1" }, { v: "4", type: "session.list", cid: "c1" }]) {
+    const r = parseCommandFrame(JSON.stringify(raw));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toMatch(/unsupported protocol version/);
+      expect(r.cid).toBe("c1");
+    }
   }
 });
 

@@ -97,7 +97,9 @@ export interface AutopilotDeps {
   /** Resolve a session or throw BadCommand (mirrors Supervisor.require). */
   require: (id: string) => Session;
   budget: () => Budget;
-  /** Create-and-brief a new session (Supervisor.handoffCreate) — Go build + planning sessions. */
+  /** Create-and-brief a new session (Supervisor.handoffCreate) — Go build + planning sessions.
+   *  [BE2-2] May resolve asynchronously (fresh-worktree creation runs async git); callers await
+   *  either shape, so synchronous test fakes keep working. */
   handoffCreate: (a: {
     environmentId?: string | undefined;
     source: "fresh-worktree";
@@ -107,7 +109,7 @@ export interface AutopilotDeps {
     brief: string;
     workUnitId?: string | undefined;
     workUnitRole?: "planner" | undefined;
-  }) => { id: string; title: string; cwd: string };
+  }) => { id: string; title: string; cwd: string } | Promise<{ id: string; title: string; cwd: string }>;
   /** Degraded-machine read model (§4.6) — suppresses the scheduled run with one alert per episode. */
   authDegraded: () => boolean;
   claimDegradeEpisodeAlert: () => boolean;
@@ -315,7 +317,7 @@ export class AutopilotService {
         /* Todoist unreachable — plan on the derived plan alone */
       }
     }
-    const { id } = this.deps.handoffCreate({
+    const { id } = await this.deps.handoffCreate({
       environmentId: env.id,
       source: "fresh-worktree",
       title: u.title,
@@ -575,7 +577,8 @@ export class AutopilotService {
   /** Go: create a fresh-worktree session seeded with the plan and start it. Autonomy defaults to
    *  `bypass` so the work runs without stalling on a permission prompt. The card then leaves the
    *  pending grid (sessionId set + status building). */
-  startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): AutopilotStartedEvent {
+  // [BE2-2] Async: Go spawns a fresh-worktree session whose creation runs async git (base-sync fetch).
+  async startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a running session");
@@ -585,7 +588,7 @@ export class AutopilotService {
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
     const brief = this.autopilotBrief(u);
-    const { id } = this.deps.handoffCreate({
+    const { id } = await this.deps.handoffCreate({
       environmentId: env.id,
       source: "fresh-worktree",
       title: u.title,
@@ -773,7 +776,7 @@ export class AutopilotService {
                   .then((o) => emit(`  “${u.title}” → ${o.status} (reached ${o.phaseReached}).`))
                   .catch((e) => emit(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`));
               } else {
-                this.startPlan(u.id);
+                await this.startPlan(u.id);
                 emit(`🚀 Started “${u.title}”.`);
               }
               started++;
@@ -836,7 +839,7 @@ export class AutopilotService {
     const runId = newId("pipe");
     const branch = `${slugify(u.title)}-pipeline`;
     // One worktree for the whole run: read-only phases inspect it, P3/P4 write, P6 opens the PR from it.
-    const { cwd } = createWorktree(env.repoRoot, env.defaultBase ?? "HEAD", branch, this.deps.worktreeRoot(), runId);
+    const { cwd } = await createWorktree(env.repoRoot, env.defaultBase ?? "HEAD", branch, this.deps.worktreeRoot(), runId);
     try {
       const glmSlug = this.deps.adversarial.models.find((m) => /glm/i.test(m));
       const deps: PhaseDeps = {

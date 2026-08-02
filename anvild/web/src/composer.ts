@@ -28,7 +28,7 @@ import { $, esc } from "./dom";
 // dialogs.ts is a leaf, so toast is a direct import — it used to arrive via initComposer(deps).
 import { toast } from "./dialogs";
 import { newCid, type OutboxItem } from "./outbox";
-import { sendTo, serverOf, serverFetch, type Server } from "./fleet";
+import { sendTo, serverOf, serverFetch, wireSessionId, type Server } from "./fleet";
 import { appendOptimisticUser } from "./conversation";
 import { isDaemonHandledCommand } from "./sendReconcile";
 import type { AttachmentRef, CommandInfo, Session } from "../../protocol";
@@ -330,7 +330,9 @@ async function uploadAttachment(file: File): Promise<void> {
       r.readAsDataURL(file);
     });
     const base64 = dataUrl.split(",")[1] ?? "";
-    const res = await serverFetch(activeServer().url, `/api/sessions/${activeId()}/attachments`, {
+    // wireSessionId: session-scoped REST embeds the id the OWNING daemon knows (#158 — a fleet
+    // member's default chat is namespaced client-side).
+    const res = await serverFetch(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/attachments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // mediaType may be empty (Android picker) — the daemon infers it from the filename.

@@ -75,8 +75,14 @@ const server = ((): ReturnType<typeof createServer> => {
   }
 })();
 
+// Log the REAL bind host (issue #160): the default bind is the tailnet IPv4 (config.ts), so claiming
+// `localhost` misdirects tailnet-reachability debugging (e.g. `tailscale serve` proxying :7701 to a
+// loopback nothing listens on). IPv6 literals are bracketed so the URL stays copy-pasteable, and a
+// wildcard bind is annotated since its URL host isn't itself dialable.
+const displayHost = config.host.includes(":") ? `[${config.host}]` : config.host;
+const bindNote = config.host === "0.0.0.0" || config.host === "::" ? " (all interfaces)" : "";
 console.log(
-  `[anvild ${VERSION}] listening on http://localhost:${server.port}  ` +
+  `[anvild ${VERSION}] listening on http://${displayHost}:${server.port}${bindNote}  ` +
     `(ws: /ws · health: /api/health)`,
 );
 

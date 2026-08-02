@@ -42,7 +42,11 @@ let html = readFileSync(indexPath, "utf8");
 html = html
   .replace(/\s*<link[^>]*fonts\.googleapis\.com[^>]*>/g, "")
   .replace(/\s*<link[^>]*rel="preconnect"[^>]*fonts\.g[^>]*>/g, "")
-  .replace(/(<link rel="stylesheet" href="\/app\.css" \/>)/, '<link rel="stylesheet" href="/fonts.css" />\n    $1');
+  .replace(/(<link rel="stylesheet" href="\/app(?:-[a-z0-9]+)?\.css" \/>)/, '<link rel="stylesheet" href="/fonts.css" />\n    $1');
+if (!html.includes("/fonts.css")) {
+  console.error("bundle-native: failed to inject the local font stylesheet — index.html's app css tag no longer matches");
+  process.exit(1);
+}
 writeFileSync(indexPath, html);
 
 console.log(`bundled native web assets → ${target} (local Material Symbols font)`);

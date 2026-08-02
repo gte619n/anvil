@@ -21,11 +21,11 @@ function makeRepo(): string {
   return repo;
 }
 
-test("create + remove a fresh worktree off HEAD", () => {
+test("create + remove a fresh worktree off HEAD", async () => {
   const repo = makeRepo();
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
 
-  const created = createWorktree(repo, "HEAD", "my-task", wtRoot, "sess_abcd1234");
+  const created = await createWorktree(repo, "HEAD", "my-task", wtRoot, "sess_abcd1234");
   expect(existsSync(created.cwd)).toBe(true);
   expect(existsSync(join(created.cwd, "README.md"))).toBe(true);
   expect(created.worktree.branch).toBe("my-task");
@@ -43,7 +43,7 @@ test("create + remove a fresh worktree off HEAD", () => {
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
-test("createWorktree branches off the fresh remote tip when the local default branch is stale", () => {
+test("createWorktree branches off the fresh remote tip when the local default branch is stale", async () => {
   // Simulate the real bug: a session's work merges into the remote default, but the canonical
   // checkout's local `main` never fast-forwards (a fetch only moves origin/main; a GitHub-side merge
   // teaches the local repo nothing). A new worktree based on HEAD/main must still start from the
@@ -71,7 +71,7 @@ test("createWorktree branches off the fresh remote tip when the local default br
   git(["push", "-q", "origin", "main"], other);
 
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
-  const created = createWorktree(repo, "HEAD", "fresh-task", wtRoot, "sess_fresh1");
+  const created = await createWorktree(repo, "HEAD", "fresh-task", wtRoot, "sess_fresh1");
 
   // The new worktree sees the just-merged file even though the local `main` ref had never advanced.
   expect(existsSync(join(created.cwd, "merged.txt"))).toBe(true);
@@ -88,7 +88,7 @@ test("createWorktree branches off the fresh remote tip when the local default br
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
-test("createWorktree leaves a dirty canonical checkout's local branch untouched but still bases off the fresh tip", () => {
+test("createWorktree leaves a dirty canonical checkout's local branch untouched but still bases off the fresh tip", async () => {
   // The fast-forward must never disturb in-progress work: when the canonical checkout has uncommitted
   // tracked changes, local `main` stays where it is — yet the new worktree still starts from the
   // freshly-fetched remote tip (via origin/main) so it isn't stale.
@@ -117,7 +117,7 @@ test("createWorktree leaves a dirty canonical checkout's local branch untouched 
   writeFileSync(join(repo, "README.md"), "uncommitted local edit\n"); // dirty tracked change
 
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
-  const created = createWorktree(repo, "HEAD", "dirty-task", wtRoot, "sess_dirty1");
+  const created = await createWorktree(repo, "HEAD", "dirty-task", wtRoot, "sess_dirty1");
 
   // Worktree still got the fresh remote work...
   expect(existsSync(join(created.cwd, "merged.txt"))).toBe(true);
@@ -132,7 +132,7 @@ test("createWorktree leaves a dirty canonical checkout's local branch untouched 
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
-test("createWorktree symlinks the canonical node_modules into the worktree (root + subdir)", () => {
+test("createWorktree symlinks the canonical node_modules into the worktree (root + subdir)", async () => {
   const repo = makeRepo();
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
 
@@ -147,7 +147,7 @@ test("createWorktree symlinks the canonical node_modules into the worktree (root
   git(["add", "pkg/keep.txt"], repo);
   git(["commit", "-q", "-m", "add pkg"], repo);
 
-  const created = createWorktree(repo, "HEAD", "deps-task", wtRoot, "sess_deps1");
+  const created = await createWorktree(repo, "HEAD", "deps-task", wtRoot, "sess_deps1");
 
   // Both node_modules are symlinks in the worktree, and reading through them hits the canonical deps.
   expect(lstatSync(join(created.cwd, "node_modules")).isSymbolicLink()).toBe(true);
@@ -160,7 +160,7 @@ test("createWorktree symlinks the canonical node_modules into the worktree (root
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
-test("gitStatus ignores the linked node_modules even when .gitignore uses a dir-only pattern", () => {
+test("gitStatus ignores the linked node_modules even when .gitignore uses a dir-only pattern", async () => {
   // The classic merge-indicator bug: a managed repo whose .gitignore uses `node_modules/` (trailing
   // slash → directories only) doesn't match the *symlink* linkDeps creates, so git reports it as
   // untracked. Without filtering, dirtyFileCount > 0 keeps the git buttons live and hides the merged
@@ -178,7 +178,7 @@ test("gitStatus ignores the linked node_modules even when .gitignore uses a dir-
   git(["add", ".gitignore", "web/keep.txt"], repo);
   git(["commit", "-q", "-m", "add gitignore + web"], repo);
 
-  const created = createWorktree(repo, "HEAD", "ignore-task", wtRoot, "sess_ignore1");
+  const created = await createWorktree(repo, "HEAD", "ignore-task", wtRoot, "sess_ignore1");
 
   // The worktree has node_modules symlinks at root + web/, yet the tree reads clean.
   expect(lstatSync(join(created.cwd, "node_modules")).isSymbolicLink()).toBe(true);
@@ -194,11 +194,11 @@ test("gitStatus ignores the linked node_modules even when .gitignore uses a dir-
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
-test("createWorktree is fine when the repo has no deps to link", () => {
+test("createWorktree is fine when the repo has no deps to link", async () => {
   const repo = makeRepo(); // no node_modules anywhere
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
 
-  const created = createWorktree(repo, "HEAD", "no-deps", wtRoot, "sess_nodeps1");
+  const created = await createWorktree(repo, "HEAD", "no-deps", wtRoot, "sess_nodeps1");
   expect(existsSync(created.cwd)).toBe(true);
   expect(existsSync(join(created.cwd, "node_modules"))).toBe(false);
 
@@ -215,15 +215,15 @@ function makeEmptyRepo(): string {
   return repo; // unborn HEAD — no commits
 }
 
-test("createWorktree on an empty repo throws an actionable error", () => {
+test("createWorktree on an empty repo throws an actionable error", async () => {
   const repo = makeEmptyRepo();
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
-  expect(() => createWorktree(repo, "HEAD", "my-task", wtRoot, "sess_empty1")).toThrow(/no commits yet/);
+  await expect(createWorktree(repo, "HEAD", "my-task", wtRoot, "sess_empty1")).rejects.toThrow(/no commits yet/);
   rmSync(repo, { recursive: true, force: true });
   rmSync(wtRoot, { recursive: true, force: true });
 });
 
-test("ensureInitialCommit seeds a commit so a worktree can branch off HEAD", () => {
+test("ensureInitialCommit seeds a commit so a worktree can branch off HEAD", async () => {
   const repo = makeEmptyRepo();
   const wtRoot = mkdtempSync(join(tmpdir(), "anvil-wt-"));
 
@@ -233,7 +233,7 @@ test("ensureInitialCommit seeds a commit so a worktree can branch off HEAD", () 
   expect(git(["rev-parse", "--verify", "HEAD"], repo).exitCode).toBe(0);
 
   // and now a session worktree can be created
-  const created = createWorktree(repo, "HEAD", "my-task", wtRoot, "sess_seeded1");
+  const created = await createWorktree(repo, "HEAD", "my-task", wtRoot, "sess_seeded1");
   expect(existsSync(created.cwd)).toBe(true);
 
   // idempotent: a second call is a no-op once commits exist

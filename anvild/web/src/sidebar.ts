@@ -17,7 +17,10 @@
 // from main (the merged session/environment maps, the active-session id, navigation, persistence) is
 // injected once via initSidebar(deps) — mirroring fleet.ts's initFleet — before main's instant
 // restore calls renderSessions().
-import Sortable from "sortablejs";
+// [WEB2-3] SortableJS is only needed once drag-to-reorder is wired (initSortables, called from main
+// after the instant restore) — it loads as a lazy chunk there, keeping it out of the boot bundle.
+// Only its TYPES are imported here.
+import type Sortable from "sortablejs";
 import { $, esc, icon, sessIcon } from "./dom";
 import { currentTheme } from "./theme";
 import { sessionBg, stripeColor } from "./sessionColor";
@@ -435,8 +438,17 @@ function renderSessionItem(s: Session, isMember: boolean, ctx: RenderCtx): HTMLL
 // reordered or dropped into Finished. `dragging`/`justDragged` are declared in the early-init cluster.
 let sortablesReady = false;
 export function initSortables(): void {
-  if (sortablesReady) return;
+  if (sortablesReady) return; // also guards the double-import race: the flag flips before the await
   sortablesReady = true;
+  // Lazy chunk: the drag wiring is enhancement-only (the list renders and navigates fine without
+  // it), so a fire-and-forget import keeps SortableJS out of the boot bundle; drags simply become
+  // possible the moment the chunk lands.
+  void (async () => {
+    const { default: SortableJs } = await import("sortablejs");
+    wireSortables(SortableJs);
+  })();
+}
+function wireSortables(SortableJs: typeof Sortable): void {
   const opts: Sortable.Options = {
     group: "sessions",
     draggable: ".session",
@@ -465,8 +477,8 @@ export function initSortables(): void {
       commitOrderFromDom(); // read the settled DOM order, sync to the daemon, and re-render
     },
   };
-  Sortable.create($("#session-list"), opts);
-  Sortable.create($("#finished-list"), opts);
+  SortableJs.create($("#session-list"), opts);
+  SortableJs.create($("#finished-list"), opts);
 }
 /** Read both lists' DOM order → order + Finished membership, apply optimistically, sync to the daemon. */
 function commitOrderFromDom(): void {
