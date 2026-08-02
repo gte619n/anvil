@@ -6,8 +6,7 @@ name: Full release
 #   • android     → Firebase App Distribution (signed debug APK to the testers)
 #   • ios         → TestFlight (App Store Connect)
 #   • mac-client  → Developer-ID-notarized Anvil.app on a GitHub Release + Sparkle appcast
-#   • mac-server  → Developer-ID-notarized "Anvil Server.app" on a GitHub Release + Sparkle appcast
-#   • pages       → publishes the two Sparkle appcasts to GitHub Pages so installed apps auto-update
+#   • pages       → publishes the Sparkle appcast to GitHub Pages so the installed client auto-updates
 #
 # The web client is NOT a separate target: `build:web` runs inside every job, so the current UI is
 # bundled into each native shell. The browser-facing web is served by the daemon and updates on a
@@ -348,96 +347,9 @@ jobs:
           security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
           rm -rf "$RUNNER_TEMP/private_keys"
 
-  # ── macOS server → Developer-ID-notarized "Anvil Server.app" + Sparkle ────────────────────────
-  mac-server:
-    needs: [meta, verify]
-    runs-on: macos-15
-    outputs:
-      ed_signature: ${{ steps.sign.outputs.ed_signature }}
-      length: ${{ steps.sign.outputs.length }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.release_ref }}
-      - name: Select Xcode
-        run: |
-          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
-          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with: { bun-version: 1.3.14 }
-      - name: Install + prebuild web client (anvild)
-        working-directory: anvild
-        run: |
-          bun install --frozen-lockfile
-          bun run build:web   # the server bundles anvild source with web/dist prebuilt
-
-      # [CI2-4] Same shared signing setup as mac-client (the two jobs stay separate rather than a
-      # matrix: `pages` consumes needs.mac-client/… and needs.mac-server/… OUTPUTS individually, and
-      # matrix-job outputs clobber each other — a matrix would break the per-app appcast signatures).
-      - name: Set up signing (Developer ID keychain + App Store Connect key)
-        uses: ./.github/actions/apple-signing
-        with:
-          p12-base64: ${{ secrets.MAC_DEVELOPER_ID_P12_BASE64 }}
-          p12-password: ${{ secrets.MAC_DEVELOPER_ID_P12_PASSWORD }}
-          p12-secret-name: MAC_DEVELOPER_ID_P12_BASE64
-          keychain-file: anvil-mac.keychain-db
-          identity-pattern: Developer ID Application
-          api-key-base64: ${{ secrets.APPLE_API_KEY_BASE64 }}
-
-      - name: Build, notarize & sign Anvil Server.app
-        working-directory: anvil-server
-        env:
-          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey.p8
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
-          ANVIL_MARKETING_VERSION: ${{ needs.meta.outputs.version }}
-          ANVIL_BUILD_NUMBER: ${{ github.run_number }}
-          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
-          BUNDLE_ANVILD: ../anvild
-        run: ./make-app.sh
-
-      - name: Package, sign update & upload to the Release
-        id: sign
-        working-directory: anvil-server
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          ditto -c -k --keepParent "Anvil Server.app" "$RUNNER_TEMP/Anvil-Server.zip"
-          SIGN_UPDATE="$(find .build -path '*/Sparkle/bin/sign_update' | head -1)"
-          # Sparkle 2.9+ removed `-s <key>`; feed the key via a temp file with --ed-key-file.
-          KEYFILE="$(mktemp)"; trap 'rm -f "$KEYFILE"' EXIT
-          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" > "$KEYFILE"
-          OUT="$("$SIGN_UPDATE" "$RUNNER_TEMP/Anvil-Server.zip" --ed-key-file "$KEYFILE")"
-          echo "sign_update: $OUT"
-          ED_SIG="$(echo "$OUT" | sed -E 's/.*sparkle:edSignature="([^"]+)".*/\1/')"
-          LEN="$(echo "$OUT" | sed -E 's/.*length="([^"]+)".*/\1/')"
-          # [CI2-2] `sed` echoes its input UNCHANGED on a no-match (exit 0), so a Sparkle output-format
-          # shift (already happened once with 2.9) would silently emit a garbage signature and every
-          # Mac's EdDSA update check would fail. Assert the shape before trusting it: a base64 ed25519
-          # signature (~88 chars) and a numeric byte length. Fail loudly instead of shipping junk.
-          if ! printf '%s' "$ED_SIG" | grep -Eq '^[A-Za-z0-9+/=]{80,120}$'; then
-            echo "::error::sign_update edSignature didn't match the expected base64 shape — raw output: $OUT"; exit 1
-          fi
-          if ! printf '%s' "$LEN" | grep -Eq '^[0-9]+$'; then
-            echo "::error::sign_update length wasn't numeric — raw output: $OUT"; exit 1
-          fi
-          echo "ed_signature=$ED_SIG" >> "$GITHUB_OUTPUT"
-          echo "length=$LEN" >> "$GITHUB_OUTPUT"
-          gh release upload "${{ needs.meta.outputs.tag }}" "$RUNNER_TEMP/Anvil-Server.zip" --repo "$GITHUB_REPOSITORY" --clobber
-
-      - name: Clean up keychain
-        if: always()
-        run: |
-          security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true
-          rm -rf "$RUNNER_TEMP/private_keys"
-
-  # ── publish both Sparkle appcasts to GitHub Pages (so installed macOS apps auto-update) ───────
+  # ── publish the Sparkle appcast to GitHub Pages (so the installed macOS client auto-updates) ──
   pages:
-    needs: [meta, mac-client, mac-server]
+    needs: [meta, mac-client]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -473,7 +385,6 @@ jobs:
             fi
           }
           seed "$base/appcast.xml"        _site/appcast.xml        "client appcast"
-          seed "$base/appcast-server.xml" _site/appcast-server.xml "server appcast"
 
       - name: Update client appcast
         env:
@@ -485,19 +396,6 @@ jobs:
           ED_SIGNATURE: ${{ needs.mac-client.outputs.ed_signature }}
           LENGTH: ${{ needs.mac-client.outputs.length }}
           MIN_SYSTEM: '13.0'
-          RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.meta.outputs.tag }}
-        run: bun scripts/mac-signing/update-appcast.ts
-
-      - name: Update server appcast
-        env:
-          APPCAST_FILE: _site/appcast-server.xml
-          APP_TITLE: Anvil Server
-          SHORT_VERSION: ${{ needs.meta.outputs.version }}
-          BUILD_VERSION: ${{ github.run_number }}
-          ENCLOSURE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.meta.outputs.tag }}/Anvil-Server.zip
-          ED_SIGNATURE: ${{ needs.mac-server.outputs.ed_signature }}
-          LENGTH: ${{ needs.mac-server.outputs.length }}
-          MIN_SYSTEM: '14.0'
           RELEASE_NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.meta.outputs.tag }}
         run: bun scripts/mac-signing/update-appcast.ts
 

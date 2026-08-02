@@ -1,6 +1,6 @@
 name: Apple signing setup
-# [CI2-4] The one copy of the keychain/cert/API-key setup that was pasted three times across
-# release.yml (ios, mac-client, mac-server). Imports a .p12 signing certificate into an ephemeral
+# [CI2-4] The one copy of the keychain/cert/API-key setup, shared across the signing jobs in
+# release.yml (ios, mac-client). Imports a .p12 signing certificate into an ephemeral
 # keychain, optionally resolves a signing identity from it, and writes the App Store Connect API
 # key to $RUNNER_TEMP/private_keys/AuthKey.p8. Exports via GITHUB_ENV:
 #   SIGNING_KEYCHAIN — path of the ephemeral keychain (consumed by the job's cleanup step)

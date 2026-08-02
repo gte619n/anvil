@@ -17,7 +17,7 @@ The deep specs. They are the source of truth for *why* the system is shaped the 
 | [anvil-impl-INDEX.md](plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans (daemon, render, clients, terminal, push). |
 | [anvil-impl-1-daemon-core.md](plans/anvil-impl-1-daemon-core.md) … [6](plans/anvil-impl-6-push-tailscale-ops.md) | The component-by-component build plans. |
 | [anvil-multi-server.md](plans/anvil-multi-server.md) | Multi-server fleet: one client, many Macs, one Max plan. |
-| [anvil-server-app.md](plans/anvil-server-app.md) | The macOS menu-bar control panel. |
+| [anvil-server-app.md](plans/anvil-server-app.md) | The macOS menu-bar control panel (⚠️ superseded — the app was removed; setup is now `service.sh install` + the browser). |
 | [anvil-autopilot-ui.md](plans/anvil-autopilot-ui.md) · [anvil-todoist-integration.md](plans/anvil-todoist-integration.md) | The Todoist autopilot and its plan-review UI. |
 | [anvil-adversarial-pipeline.md](plans/anvil-adversarial-pipeline.md) | The OpenRouter/GLM integration, the adversarial planning panel + auto-start gates, and the 7-phase adversarial dev pipeline. |
 | [anvil-improvement-program.md](plans/anvil-improvement-program.md) | The test-first improvement program (audit + phased plan) this repo is executing. |
@@ -35,5 +35,4 @@ Each component keeps its own build/run notes:
 - [anvild/README.md](../anvild/README.md) — the daemon + web client
 - [app/README.md](../app/README.md) — Android (Kotlin WebView + FCM) shell
 - [apple/README.md](../apple/README.md) — Apple (macOS-first) shell
-- [anvil-server/README.md](../anvil-server/README.md) — the menu-bar control panel
 - [scripts/README.md](../scripts/README.md) — build/release utilities (CI release notes, Apple signing)

@@ -1,8 +1,16 @@
 # Anvil Server.app — macOS setup & fleet control panel
 
+> ⚠️ **SUPERSEDED (2026-08-02).** The native `Anvil Server.app` menu-bar app has been **removed**. Web
+> pairing reached parity: the daemon's own `:7701` API + the web UI now handle token setup, fleet join
+> (`/api/fleet/pair`), token rotation (`/api/fleet/token`), fleet management, health, and restart —
+> and `scripts/service.sh install` handles the one-time bootstrap (Bun install, web build, LaunchAgent
+> / systemd, `tailscale serve`). The `:7702` listener this doc describes survives only as a sender-side
+> fallback in the daemon for legacy Macs still running the old app. This doc is kept for historical
+> context; see [`anvil-headless-join.md`](anvil-headless-join.md) for the current flow.
+
 **Version:** 0.1-draft
 **Created:** 2026-06-23
-**Status:** DESIGN — not started
+**Status:** SUPERSEDED — app removed 2026-08-02 (was: shipped)
 **Extends:** `anvil-multi-server.md` (§4.1 discovery, §7 auth, §8 security, §9 packaging),
 `anvil-native-architecture.md` (§3 auth — load-bearing), `anvil-impl-6-push-tailscale-ops.md`
 (LaunchAgent, `tailscale serve`, env injection), `anvild/scripts/service.sh`.

@@ -21,7 +21,6 @@ surface at one shared version**:
 | **Android** | signed debug APK → Firebase App Distribution | testers (emails in `app/build.gradle`) |
 | **iOS/iPadOS** | archive + upload → TestFlight | testers via TestFlight |
 | **macOS client** (`Anvil.app`) | Developer-ID-notarized, Sparkle-signed | GitHub Release zip + appcast → auto-update |
-| **macOS server** (`Anvil Server.app`) | Developer-ID-notarized, Sparkle-signed | GitHub Release zip + appcast → auto-update |
 | **web PWA** | bundled into every shell above; served by the daemon | rides along — not a separate job |
 
 **Public app stores are deliberately not part of this.** No Play Store production, no App Store
@@ -74,14 +73,12 @@ Runs on merge to `main`, in dependency order:
   upload to **TestFlight**.
 - **mac-client** *(macos-15)* — builds, Developer-ID-signs, notarizes, staples `Anvil.app`; attaches
   `Anvil.zip` to the Release; signs it with the Sparkle key.
-- **mac-server** *(macos-15)* — same for `Anvil Server.app` → `Anvil-Server.zip`.
-- **pages** *(ubuntu)* — updates both Sparkle appcasts and deploys them to GitHub Pages.
+- **pages** *(ubuntu)* — updates the Sparkle appcast and deploys it to GitHub Pages.
 
 **When each goes live:**
 
-- **macOS** — installed apps auto-update via Sparkle **as soon as `pages` finishes**. Appcast URLs
-  (embedded at build time): client `https://gte619n.github.io/anvil/appcast.xml`, server
-  `https://gte619n.github.io/anvil/appcast-server.xml`.
+- **macOS** — the installed client auto-updates via Sparkle **as soon as `pages` finishes**. Appcast
+  URL (embedded at build time): `https://gte619n.github.io/anvil/appcast.xml`.
 - **Android / iOS** — available to testers once Firebase/TestFlight finish processing (minutes).
 
 ---
@@ -93,7 +90,7 @@ Everything builds in **GitHub Actions** — nothing ships from a laptop in the n
 | Runner | Jobs |
 |--------|------|
 | `ubuntu-latest` | `meta`, `verify`, `android` (Firebase), `pages` (appcast deploy); also `ci.yml`, `codeql.yml` |
-| `macos-15` | `ios` (TestFlight), `mac-client`, `mac-server` (needs full Xcode + Developer-ID signing) |
+| `macos-15` | `ios` (TestFlight), `mac-client` (needs full Xcode + Developer-ID signing) |
 
 Bun is pinned to **1.3.14** in the gate; other jobs use `latest`. Android needs **JDK 21 + Android
 SDK**; Apple needs **Xcode 16.x** (why the Apple jobs pin `macos-15`).
@@ -106,9 +103,9 @@ daemon/web (Kotlin/Swift shells are covered by review, by design).
 ## Versioning (single source of truth)
 
 `MAJOR.MINOR` lives in **one** file: repo-root [`VERSION`](../VERSION) (currently **`3.0`**). All
-build paths read it (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`,
-`anvil-server/make-app.sh`). The full version is **`MAJOR.MINOR.<run_number>`** (e.g. `3.0.47`),
-shared by every job in a run so all four apps report the same number.
+build paths read it (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`). The full version
+is **`MAJOR.MINOR.<run_number>`** (e.g. `3.0.47`), shared by every job in a run so all shipped apps
+report the same number.
 
 **To start a new line, bump `VERSION`** (e.g. `3.0` → `3.1`) and merge it — the next full release is
 `2.3.<run_number>`. Nothing else to push. (`apple/project.yml`'s static `MARKETING_VERSION` is only
@@ -147,7 +144,7 @@ Per platform, what rollback actually means today:
 | Surface | Automatic? | Manual rollback today |
 |---------|-----------|------------------------|
 | **daemon** | **Yes** — the out-of-process watchdog health-gates every update for 180s and auto-rolls back to `prePullSha`, then re-restarts (see [the update service](#the-stable-update-service--fleet-rollout-what-to-do-during-an-incident)). Rollback targets are ancestry-gated (CI2-7): only commits on the release track / the checkout's own history can be applied. | Pin an older SHA: `POST /api/update/v1/apply` with `targetSha`, or on the host `git reset --hard <sha> && ./scripts/service.sh restart`. |
-| **macOS client + server (Sparkle)** | No — Sparkle only ever offers the highest version in the appcast (the feed keeps ~20 items of history, so past zips stay downloadable). | Cut a `release_ref` release (above). Stopgap for one machine: download the older `Anvil.zip` / `Anvil-Server.zip` from its `v<version>` GitHub Release and replace the app by hand. |
+| **macOS client (Sparkle)** | No — Sparkle only ever offers the highest version in the appcast (the feed keeps ~20 items of history, so past zips stay downloadable). | Cut a `release_ref` release (above). Stopgap for one machine: download the older `Anvil.zip` from its `v<version>` GitHub Release and replace the app by hand. |
 | **Android (Firebase App Distribution)** | No. | Cut a `release_ref` release (new build gets a higher `versionCode`, testers are emailed). Stopgap: Firebase console → App Distribution → re-distribute an older build, or grab the `anvil-debug-apk` artifact from the old workflow run — but an APK with a *lower* versionCode needs uninstall/reinstall on the device. |
 | **iOS (TestFlight)** | No. | Cut a `release_ref` release (new, higher build number). Stopgap: older processed builds stay installable in the TestFlight app for ~90 days — testers can pick a previous build manually. Uploaded builds can be *expired* in App Store Connect to stop new installs, never un-shipped. |
 | **web (browser)** | n/a — rides the daemon deploy. | Roll the daemon back (above); `service.sh restart` rebuilds `web/dist` from the restored source. |
@@ -238,9 +235,9 @@ and Sparkle key generation are in [`RELEASING.md`](../RELEASING.md). Which secre
 |---------|-------------|
 | `FIREBASE_SERVICE_ACCOUNT` | `android` (Firebase distribution) |
 | `IOS_DIST_P12_BASE64`, `IOS_DIST_P12_PASSWORD`, `IOS_PROVISIONING_PROFILE_BASE64` | `ios` (TestFlight) |
-| `APPLE_TEAM_ID`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | `ios` + both macOS jobs |
-| `MAC_DEVELOPER_ID_P12_BASE64`, `MAC_DEVELOPER_ID_P12_PASSWORD` | `mac-client`, `mac-server` |
-| `SPARKLE_ED_PRIVATE_KEY`, `SPARKLE_PUBLIC_ED_KEY` | `mac-client`, `mac-server`, `pages` |
+| `APPLE_TEAM_ID`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | `ios`, `mac-client` |
+| `MAC_DEVELOPER_ID_P12_BASE64`, `MAC_DEVELOPER_ID_P12_PASSWORD` | `mac-client` |
+| `SPARKLE_ED_PRIVATE_KEY`, `SPARKLE_PUBLIC_ED_KEY` | `mac-client`, `pages` |
 
 The **Android upload key / Play service account** and **App Store Connect submission** secrets in
 `RELEASING.md` are only needed if the public-store path is ever wired — the full release doesn't use

@@ -104,16 +104,15 @@ login and restarts on crash.
 > ```
 >
 > This also requires **HTTPS Certificates** enabled for your tailnet (admin console → Settings →
-> Features). The macOS [Anvil Server](../anvil-server/) app already holds this permission, so Macs
-> don't hit it — it's specific to a headless/CLI Linux join. `install` prints exactly this hint if it
-> detects the denial.
+> Features). `install` prints exactly this hint if it detects the denial.
 
 > The daemon runs with `settingSources: []`, so it does **not** inherit your ambient Claude
 > Code allow-rules — the daemon is the permission authority. Trade-off: the repo's
 > `CLAUDE.md` isn't auto-loaded; project-context injection is a later item.
 
-For a terminal-free install + multi-Mac fleet setup, use the menu-bar
-[Anvil Server](../anvil-server/) app, which shells out to `service.sh`.
+After `install`, the Claude login and multi-Mac fleet setup happen in the browser — open the machine's
+web UI over Tailscale and either paste a token or join a fleet (a 6-digit code). No terminal needed
+past the one-time install.
 
 ---
 

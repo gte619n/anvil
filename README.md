@@ -250,7 +250,6 @@ Full reasoning in [`anvil-native-architecture.md` §8.3](docs/plans/anvil-native
 | **Web client** | [`anvild/web/`](anvild/web/) | Vanilla TS | The daily-driver UI and the reusable render surface, served by the daemon at `/`. Also bundled into the native shells. |
 | **Android app** | [`app/`](app/) | Kotlin | A WebView shell hosting the web client over Tailscale + native FCM push, ADB-over-Tailscale, offline app-shell. `com.gte619n.anvil`. |
 | **Apple app** | [`apple/`](apple/) | SwiftUI · WKWebView | macOS-first hybrid shell (same model as Android); iOS + APNs gated on an Apple Developer account. |
-| **Server control panel** | [`anvil-server/`](anvil-server/) | SwiftUI | A macOS menu-bar app that stands up and manages `anvild` and joins Macs into a fleet — terminal-free setup. Non-Mac machines join from the daemon's own web UI instead. |
 | **Build & release scripts** | [`scripts/`](scripts/) | Bash · TS | CI release notes + Apple Developer ID signing. |
 
 ---
@@ -271,11 +270,12 @@ It installs a launcher that sources `~/.config/anvil/env`, strips any
 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment, runs at login, and
 restarts on crash. No secrets live in the plist. See [`anvild/README.md`](anvild/README.md).
 
-For a **terminal-free** setup on a Mac — install Bun, capture the OAuth token, wire Tailscale, and
-join several Macs into a fleet from a menu-bar UI — use the **Anvil Server** app in
-[`anvil-server/`](anvil-server/).
+`service.sh install` handles the one-time bootstrap on any host: it installs Bun if it's missing
+(pinned), builds the web bundle, loads the LaunchAgent (macOS) or systemd unit (Linux), and wires
+`tailscale serve`. Everything after that — the Claude login and joining a fleet — happens in the
+browser (see below); there's no separate native setup app.
 
-### Headless / Linux machines
+### Setup & joining a fleet (any machine)
 
 `service.sh install` no longer requires a Claude login up front. With no token the daemon starts
 **degraded**: it serves its API and web UI and reports `subscriptionAuthOk: false`, but refuses agent
@@ -328,7 +328,6 @@ anvil/
 │   └── scripts/         #    service.sh (LaunchAgent), merge-session.sh
 ├── app/                 # 🤖 Android WebView shell (Kotlin) — com.gte619n.anvil
 ├── apple/               # 🍎 Apple SwiftUI WebView shell (macOS first)
-├── anvil-server/        # 🖥️  macOS menu-bar control panel for anvild + fleet
 ├── docs/
 │   ├── ARCHITECTURE.md  #    approachable overview with diagrams (start here)
 │   ├── assets/          #    brand assets (logo, banners)
@@ -349,13 +348,12 @@ anvil/
 | [`docs/plans/anvil-impl-INDEX.md`](docs/plans/anvil-impl-INDEX.md) | Index of the per-component implementation plans. |
 | [`docs/plans/anvil-multi-server.md`](docs/plans/anvil-multi-server.md) | Multi-server fleet design (one client, many Macs, one Max plan). |
 | [`docs/plans/anvil-headless-join.md`](docs/plans/anvil-headless-join.md) | Tokenless boot + joining a fleet from a headless (non-Mac) machine. |
-| [`docs/plans/anvil-server-app.md`](docs/plans/anvil-server-app.md) | The menu-bar control panel design. |
 | [`docs/plans/anvil-autopilot-ui.md`](docs/plans/anvil-autopilot-ui.md) · [`anvil-todoist-integration.md`](docs/plans/anvil-todoist-integration.md) | Todoist autopilot + the plan-review UI. |
 | [`docs/plans/anvil-adversarial-pipeline.md`](docs/plans/anvil-adversarial-pipeline.md) | The OpenRouter/GLM adversarial planning panel + the unattended dev pipeline. |
 | [`docs/lapo-integration.md`](docs/lapo-integration.md) | Posting autopilot run reports to a lapo/Logseq journal over OAuth2. |
 | [`docs/CI-CD.md`](docs/CI-CD.md) | The build & release pipeline — every target, what to push to ship it. |
 | [`anvild/README.md`](anvild/README.md) | Running, building, and developing the daemon + web client. |
-| [`app/README.md`](app/README.md) · [`apple/README.md`](apple/README.md) · [`anvil-server/README.md`](anvil-server/README.md) | Android + Apple clients and the control-panel build notes. |
+| [`app/README.md`](app/README.md) · [`apple/README.md`](apple/README.md) | Android + Apple client build notes. |
 
 ---
 

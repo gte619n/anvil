@@ -64,6 +64,21 @@ find_bun() {
   return 1
 }
 
+# The daemon requires Bun (pinned — see BUN_VERSION_PIN, kept in step with anvild/package.json's
+# engines.bun). This used to be the native Anvil Server.app's job (Deps.swift ran the same one-liner);
+# folding it into the installer is what lets a fresh Mac come up from a plain shell with no native app.
+# Idempotent: if a usable bun is already resolvable we leave it alone (never clobber a newer one the
+# user manages themselves). Only when none is found do we fetch the pinned build into ~/.bun.
+BUN_VERSION_PIN="1.3.14"
+ensure_bun() {
+  find_bun >/dev/null 2>&1 && return 0
+  echo "installing Bun v$BUN_VERSION_PIN (not found on PATH or ~/.bun/bin)…"
+  command -v curl >/dev/null 2>&1 || { echo "error: curl is required to install Bun"; exit 1; }
+  curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION_PIN" \
+    || { echo "error: Bun install failed"; exit 1; }
+  find_bun >/dev/null 2>&1 || { echo "error: Bun still not found after install (looked on PATH and ~/.bun/bin)"; exit 1; }
+}
+
 # Rebuild the web client into web/dist. Both `install` and `restart` call this so the bundle the
 # daemon serves can never lag the source (see the DEPLOY NOTE at the top of this file). We run
 # `bun install` first: a `git pull` can add a new dependency (e.g. sortablejs in #26), and
@@ -420,6 +435,7 @@ launcher_is_serve_mode() {
 }
 
 do_install() {
+  ensure_bun
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
   svc_preflight
   # A missing env file is NO LONGER fatal (anvil-headless-join.md §4.4). The daemon boots degraded
