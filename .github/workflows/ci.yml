@@ -13,7 +13,6 @@ name: CI
 #   • android    — `:app:assembleDebug` (committed debug keystore; no Firebase upload)
 #   • apple      — `swift build` of the macOS shell (exactly what make-app.sh compiles) + xcodegen
 #                  project lint + an unsigned `xcodebuild build` of the iOS target
-#   • mac-server — `swift build` of the SwiftPM menu-bar app (what its make-app.sh compiles)
 on:
   pull_request:
   push:
@@ -74,7 +73,6 @@ jobs:
     outputs:
       android: ${{ steps.filter.outputs.android }}
       apple: ${{ steps.filter.outputs.apple }}
-      mac-server: ${{ steps.filter.outputs.mac-server }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -92,9 +90,6 @@ jobs:
               - '.github/workflows/ci.yml'
             apple:
               - 'apple/**'
-              - '.github/workflows/ci.yml'
-            mac-server:
-              - 'anvil-server/**'
               - '.github/workflows/ci.yml'
 
   # [CI2-1] Secrets-free Android PR build — mirrors release.yml's android job (same JDK/SDK/Bun/gradle
@@ -206,26 +201,6 @@ jobs:
             -project Anvil.xcodeproj -scheme Anvil-iOS -configuration Release \
             -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
-
-  # [CI2-1] Secrets-free menu-bar-app PR build — release.yml's mac-server job compiles with plain
-  # `swift build` inside anvil-server/make-app.sh (SwiftPM, Command-Line-Tools only); the web bundle /
-  # BUNDLE_ANVILD packaging happens after the compile and needs no validation here.
-  mac-server:
-    name: mac-server — swift build
-    needs: changes
-    if: needs.changes.outputs.mac-server == 'true'
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Select Xcode
-        run: |
-          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
-          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
-
-      - name: Build Anvil Server (the exact compile make-app.sh runs)
-        working-directory: anvil-server
-        run: swift build -c release
 
   workflow-lint:
     name: workflow lint — pinned Bun everywhere

@@ -24,10 +24,9 @@ stays documented so a public launch is a config change away, but no workflow inv
 ## Versioning (single source of truth)
 
 `MAJOR.MINOR` lives in **one** place — the repo-root **`VERSION`** file (currently `3.0`) — read by
-all four build paths (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`,
-`anvil-server/make-app.sh`), so every artifact reports the same number. The full version is
-**`MAJOR.MINOR.<run_number>`** (e.g. `3.0.47`); every job in a run shares the run number, so all four
-apps match.
+all build paths (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`), so every artifact
+reports the same number. The full version is **`MAJOR.MINOR.<run_number>`** (e.g. `3.0.47`); every job
+in a run shares the run number, so all shipped apps match.
 
 **To start a new line, edit `VERSION`** (e.g. `3.0` → `3.1`) and merge — the next full release is
 `2.3.<run_number>`. The static `MARKETING_VERSION` in `apple/project.yml` is only for raw Xcode dev
@@ -37,14 +36,14 @@ builds — keep its MAJOR.MINOR in sync by hand.
 
 **Merge to `main`.** That's it — no tag to push. Watch the run in the repo's **Actions** tab
 (workflow **"Full release"**). After `meta` (mint the version + a `v<version>` GitHub Release to host
-the macOS zips) and `verify` (the merge gate), the four ship jobs run in parallel, then `pages`:
+the macOS zip) and `verify` (the merge gate), the ship jobs run in parallel, then `pages`:
 
 - **android** — builds the debug APK and distributes it to **Firebase App Distribution**.
 - **ios** — archives and uploads to **TestFlight** (`make-ios.sh`).
-- **mac-client** / **mac-server** — build, Developer-ID-sign, notarize, staple, attach the `.zip` to
-  the build's GitHub Release, and sign the update with the Sparkle key.
-- **pages** — updates the two Sparkle appcasts and deploys them to GitHub Pages so installed macOS
-  apps auto-update.
+- **mac-client** — builds, Developer-ID-signs, notarizes, staples, attaches the `.zip` to the build's
+  GitHub Release, and signs the update with the Sparkle key.
+- **pages** — updates the Sparkle appcast and deploys it to GitHub Pages so the installed macOS
+  client auto-updates.
 
 To re-fire without a new commit, use **Actions → Full release → Run workflow** (`workflow_dispatch`).
 
@@ -90,9 +89,9 @@ The GitHub secrets the release workflow consumes:
 | Secret | Used by |
 |--------|---------|
 | `IOS_DIST_P12_BASE64`, `IOS_DIST_P12_PASSWORD`, `IOS_PROVISIONING_PROFILE_BASE64` | ios |
-| `APPLE_TEAM_ID`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | ios, mac-client, mac-server |
-| `MAC_DEVELOPER_ID_P12_BASE64`, `MAC_DEVELOPER_ID_P12_PASSWORD` | mac-client, mac-server |
-| `SPARKLE_ED_PRIVATE_KEY`, `SPARKLE_PUBLIC_ED_KEY` | mac-client, mac-server |
+| `APPLE_TEAM_ID`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | ios, mac-client |
+| `MAC_DEVELOPER_ID_P12_BASE64`, `MAC_DEVELOPER_ID_P12_PASSWORD` | mac-client |
+| `SPARKLE_ED_PRIVATE_KEY`, `SPARKLE_PUBLIC_ED_KEY` | mac-client |
 | `ANDROID_UPLOAD_KEYSTORE_BASE64`, `ANDROID_UPLOAD_KEYSTORE_PASSWORD`, `ANDROID_UPLOAD_KEY_ALIAS`, `ANDROID_UPLOAD_KEY_PASSWORD` | android |
 | `PLAY_SERVICE_ACCOUNT_JSON` | android |
 
@@ -101,10 +100,9 @@ The GitHub secrets the release workflow consumes:
 Repo **Settings → Pages → Build and deployment → Source = GitHub Actions**. The appcasts then publish to:
 
 - client: `https://gte619n.github.io/anvil/appcast.xml`  (embedded as `SUFeedURL` in `Anvil.app`)
-- server: `https://gte619n.github.io/anvil/appcast-server.xml`  (embedded in `Anvil Server.app`)
 
-These URLs are hard-coded in `apple/make-app.sh` and `anvil-server/make-app.sh` (override with
-`SPARKLE_FEED_URL` if the repo/owner changes).
+This URL is hard-coded in `apple/make-app.sh` (override with `SPARKLE_FEED_URL` if the repo/owner
+changes).
 
 ### 3. App Store & Play Console listings *(only for a future public-store launch — not used today)*
 
@@ -136,10 +134,10 @@ update in CI (`sign_update`). Keep the private key safe — losing it breaks aut
 
 ## Verifying before a real release
 
-- **macOS build scripts** (no secrets needed): `ANVIL_MARKETING_VERSION=9.9.9 ANVIL_BUILD_NUMBER=999
-  apple/make-app.sh` and `… anvil-server/make-app.sh` produce ad-hoc bundles; check
-  `codesign --verify --deep --strict` and `spctl -a -vv`. With `SIGN_ID` + `APPLE_API_KEY_PATH` +
-  `SPARKLE_PUBLIC_ED_KEY` set, they notarize and embed the feed.
+- **macOS build script** (no secrets needed): `ANVIL_MARKETING_VERSION=9.9.9 ANVIL_BUILD_NUMBER=999
+  apple/make-app.sh` produces an ad-hoc bundle; check `codesign --verify --deep --strict` and
+  `spctl -a -vv`. With `SIGN_ID` + `APPLE_API_KEY_PATH` + `SPARKLE_PUBLIC_ED_KEY` set, it notarizes
+  and embeds the feed.
 - **Android (Firebase):** `./gradlew :app:assembleDebug` builds the APK that CI distributes; the
   debug keystore is committed, so no secret is needed to reproduce the build locally.
 - **iOS (TestFlight):** the `ios` job in the full release drives `make-ios.sh`. To rehearse the whole

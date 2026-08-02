@@ -50,7 +50,7 @@ flowchart TB
         drv <--> ccode
     end
 
-    server["Anvil Server.app<br/>(menu-bar control panel)"] -.->|"installs · manages · fleet"| d
+    server["scripts/service.sh<br/>(LaunchAgent / systemd installer)"] -.->|"installs · manages"| d
 
     subgraph net["Tailscale tailnet (private)"]
         ws(["WebSocket /ws  +  REST /api"])
@@ -83,8 +83,9 @@ flowchart TB
 - **Native shells** — thin [Android](../app/) (Kotlin WebView) and [Apple](../apple/)
   (SwiftUI WKWebView) apps. They host the web client and add platform-native push and
   device integration.
-- **Anvil Server** — a [macOS menu-bar app](../anvil-server/) that installs and manages the
-  daemon and joins Macs into a fleet, so setup needs no terminal. Non-Mac machines join from the daemon's own web UI instead.
+- **Setup & fleet** — [`scripts/service.sh`](../anvild/scripts/service.sh) does the one-time install
+  (Bun, web build, LaunchAgent / systemd, `tailscale serve`); the Claude login and joining a fleet
+  happen in the browser on every platform.
 
 ---
 
@@ -308,9 +309,9 @@ Members do **not** have to be Macs. A machine with no login boots degraded and i
 over with a setup screen: *Join a fleet* shows a 6-digit code, the hub's **Settings → Servers → Add a
 machine** lists it as *needs setup*, and entering the code pushes the fleet's credentials to the
 joiner's own `:7701` API. The hub picks that destination from the `pairing` capability on the peer's
-`/api/health`, falling back to the macOS **Anvil Server** app's `:7702` listener for daemons that
-predate it. (That setup screen is browser-only for now — the native shells bundle their own copy of
-the web UI.)
+`/api/health`, falling back to a `:7702` listener only for legacy Macs still running the retired
+**Anvil Server** menu-bar app (setup is now `service.sh install` + the browser on every platform).
+(That setup screen is browser-only for now — the native shells bundle their own copy of the web UI.)
 
 ```mermaid
 flowchart LR
@@ -331,9 +332,10 @@ flowchart LR
     class hub h;
 ```
 
-Design: [`plans/anvil-multi-server.md`](plans/anvil-multi-server.md),
-[`plans/anvil-server-app.md`](plans/anvil-server-app.md), and
+Design: [`plans/anvil-multi-server.md`](plans/anvil-multi-server.md) and
 [`plans/anvil-headless-join.md`](plans/anvil-headless-join.md) (tokenless boot + non-Mac joiners).
+The retired menu-bar setup app is documented in [`plans/anvil-server-app.md`](plans/anvil-server-app.md)
+(⚠️ superseded).
 
 ---
 

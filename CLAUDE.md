@@ -12,7 +12,6 @@ Tailscale. Start with [`README.md`](README.md) for the product overview and
 | `anvild/` | The daemon (Bun/TS). `src/` = server + session supervisor + agent driver + pipeline + integrations; `web/` = the PWA web client (its own `tsconfig`, bundled by `web/build.ts`). |
 | `app/` | Android client (Kotlin WebView shell + FCM). Bundles the web UI into the APK. |
 | `apple/` | iOS + macOS client (Swift WebView shell + APNs, `anvil-app://` custom scheme). |
-| `anvil-server/` | macOS menu-bar app that provisions Tailscale and manages the `anvild` lifecycle. |
 | `docs/` | `ARCHITECTURE.md`, `plans/` (design docs + the wire protocol `anvil-protocol.ts`), and the improvement program (`plans/anvil-improvement-program.md`). |
 | `scripts/`, `anvild/scripts/` | Build/release/signing + service management (`service.sh`, `merge-session.sh`). |
 
