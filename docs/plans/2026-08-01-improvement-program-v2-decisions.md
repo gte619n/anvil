@@ -8,11 +8,15 @@ Running log of decisions made during autonomous implementation of
 - **P0–P6 + P8: merged to `main`.** The main program shipped as PR #168 (squash `26218c4`); the
   post-merge interview decisions (SEC2-3 loopback allowance, BE2-31 always-restart) shipped as PR #174
   (squash `875a524`). Full detail in the per-phase sections below + the "Post-merge interview outcomes".
-- **P7 (god-file decomposition): IN PROGRESS on branch `refactor/godfile-decomp` (not yet merged).**
-  Four Supervisor domains extracted into injected-deps modules, each behavior-preserving with the full
-  suite green + a new guard test: `IntegrationsFacade`, `AccountRosterService`, `EnvironmentService`,
-  `GitProjectionService`. `supervisor.ts` 3604 → 3213 (−391). Remaining: TeamCoordinator, AutopilotService,
-  the `http.ts` route table, and the web `main.ts` seams. See the P7 section immediately below.
+- **P7 (god-file decomposition): COMPLETE on branch `refactor/godfile-decomp` (not yet merged).**
+  All eight slices done, each behavior-preserving with the full suite green + a new guard test.
+  Backend: six Supervisor domains extracted into injected-deps modules (`IntegrationsFacade`,
+  `AccountRosterService`, `EnvironmentService`, `GitProjectionService`, `TeamCoordinator`,
+  `AutopilotService`) — `supervisor.ts` 3604 → 2117 (−1487); `http.ts` if-ladder → route table
+  (+ withJsonBody, top-level try/catch→500) and dispatch `ackWhenDone` (BE2-45). Web: `main.ts`
+  7600 → 2040 (−5560) across eight seams (`fleet/sidebar/conversation/autopilot/settings/composer/
+  panel/dialogs.ts`), with WEB2-2/16 render diffs, WEB2-18 `modalPromise`, WEB2-8 dialog a11y, and
+  WEB2-19 `busy()` folded into their seams. Suite 795 → 827 pass. See the P7 section below.
 - **Documented deferrals** (own follow-up PRs, each with rationale): async-git-ops (BE2-2/3/5/15),
   BE2-30 cross-process CAS, WEB2-2/3/6/9/16, CI2-1/4/7/12, and native Swift/Kotlin test targets.
 
@@ -44,24 +48,44 @@ broadcastUpdated). Natural home for the deferred BE2-2/3/5 async-git conversion.
 All four: full suite green (807 tests, 0 fail), pushed to `refactor/godfile-decomp`.
 **supervisor.ts 3604 → 3213 (-391) across four named, independently-tested modules.**
 
-**Remaining slices (the two tightly session-coupled beasts — each deserves its own focused slice):**
-1. **TeamCoordinator** — team orchestration (buildTeamServer/buildMemberServer MCP tool closures,
-   teamMessage relay, plan lifecycle, spawnMember/teamCreateMember which CREATE sessions,
-   drainQueuedMembers called from kill(), integrateTeam). Owns supervisor fields (queuedMembers,
-   pendingTeamPlans, activeTeamPlans, teamRelayHops). Deeply coupled to create/kill/prompt — the widest,
-   most delicate injection surface. Safety net: team-gate + team integration tests.
-2. **AutopilotService** (+ its 5-min scheduler) — the largest domain (~1000 lines: plans, runAutopilot,
-   runDevPipeline, schedule, reconcile, postAutopilotReport). Biggest win, highest care.
-3. **http.ts** route ladder → method+prefix route table + top-level try/catch→500 (kills the BE2-10
-   crash-500 class) + a `withJsonBody` helper. DRY: BE2-45 `ackWhenDone`.
-4. **Web** (`main.ts` 7600 lines): extract `fleet.ts`/`sidebar.ts`/`conversation.ts`/`autopilot.ts`/etc.
-   in dependency order, each carrying its shared scalars into `state.ts` — permanently retires the WEB2-1
-   TDZ class. Fold WEB2-2/16 render-diffs + WEB2-8 a11y into the relevant seams.
+**Slice 5 — DONE:** `TeamCoordinator` (`src/session/team-coordinator.ts`). Team orchestration: plan
+lifecycle (propose/approve/reject/start), member spawn/queue/drain against the concurrency cap + budget
+pause, lead↔member relay loop guard, the derived team.info broadcast (immediate + BE2-21 coalescer), and
+branch integration. The widest injection surface of the backend slices — it CREATES sessions (via
+handoffCreate), KILLS them, and PROMPTS them. `slugify` moved to `src/session/slug.ts` (shared).
+supervisor.ts 3213 → 2890. Guard: `team-coordinator.test.ts` (cap/queue/drain, budget pause,
+onLeadKilled, lead-role guards).
 
-The clean/medium-coupling domains are now done (integrations, accounts, environments, git-projection).
-Teams + autopilot are the deeply session-coupled remainder — each a substantial slice with a wide
-injection surface (create/kill/prompt for teams; scheduler + report posting for autopilot). Pattern is
-proven; continue one careful slice at a time.
+**Slice 6 — DONE:** `AutopilotService` (`src/session/autopilot-service.ts`). The largest domain (~800
+lines): work-unit plan lifecycle (cards, Go/link/dismiss/resolve, planning sessions + MCP tools),
+runAutopilot with its watchdog/abort/run-log, the dev pipeline + §6.3 adversary metrics, the 5-min
+scheduler, inbound Todoist completion sync, anvil:* label maintenance, the lapo run report. The
+WorkUnitStore + AutopilotScheduleStore are now OWNED by the service. supervisor.ts 2890 → 2117.
+Guard: `autopilot-service.test.ts` (plans/schedule events, Go/link lifecycle, offline guards,
+clarification hold).
+
+**Slice 7 — DONE:** `http.ts` if-ladder → method+path route table (exact map + ordered pattern routes;
+method "*" preserves the attachments 405). Route dispatch wrapped in a top-level try/catch → logged 500
+with CORS (kills the BE2-10 crash-500 class). `withJsonBody` collapses the 7× strict-body push/adb
+handlers; `jsonBody` is the tolerant twin. dispatch.ts: 7× `.then(ack).catch(cmdError)` → `ackWhenDone`
+(BE2-45). Guard: `http-routes.test.ts` (dispatch semantics, 405-vs-404, strict-body 400, preflight,
+SEC2-2 gate ordering).
+
+**Slice 8 — DONE:** web `main.ts` 7600 → 2040 across eight seams extracted in dependency order, each
+behavior-preserving with an `initX(deps)` injection (no seam imports main.ts; shared reassigned scalars
+live in `state.ts`'s `ui`, in-place containers as `const` in their owning module — the structural fix
+that retires the WEB2-1 TDZ class): `fleet.ts` (multi-server connection layer + fleet admin/rollout),
+`sidebar.ts` (+ WEB2-2/16 keyed-diff + rAF-coalesced sidebar/team-board renders, guard-tested),
+`conversation.ts` (rendering/activity/links model/copy/menus/mermaid), `autopilot.ts` (the WEB2-1 crash
+set — plan grid/reader/run log/schedule), `settings.ts` (settings/servers/lapo/Todoist/providers),
+`composer.ts` (input/drafts/history/slash/attach/quote), `panel.ts` (files/reader/terminal/git panel),
+`dialogs.ts` (menus/modals/pickers/question cards/toast — now a low-level leaf every module imports
+directly). Folded in as their own commits: WEB2-18 (`modalPromise` primitive), WEB2-8 (role=dialog +
+aria-modal + focus trap + card `role="alert"` + valid tablist; guarded in `test/web/dialogs.test.ts`),
+WEB2-19 (`busy()` helper, 9 sites).
+
+Final: suite 828 tests / 827 pass / 1 skip / 0 fail; typecheck + typecheck:web + build:web green.
+P7 is COMPLETE — every remaining item from this list has landed on the branch.
 
 RATIONALE for pacing: this is behavior-preserving refactoring of critical infrastructure. Each slice is
 landed and verified independently rather than batched, so a subtle regression is caught (and reviewable)
