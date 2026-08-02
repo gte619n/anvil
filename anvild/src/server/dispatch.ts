@@ -158,8 +158,9 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "team.integrate":
-        deps.supervisor.integrateTeam(cmd.sessionId);
-        if (cid) send(ack(cid));
+        // [BE2-3] N merges + push + `gh pr create` now run async — ack when the integration settles
+        // (like session.kill); a failure (BadCommand or git error) arrives as command.error.
+        ackWhenDone(deps.supervisor.integrateTeam(cmd.sessionId), send, cid);
         return;
 
       case "prompt.send": {

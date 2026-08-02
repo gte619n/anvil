@@ -33,7 +33,7 @@ import { deriveTeams } from "../integrations/team-tree";
 import { integrationOrder } from "../integrations/team-plan";
 import { integrateTeam as runTeamIntegration, safeRemoteBranch, type IntegrateMember } from "../integrations/team-integrate";
 import * as git from "../git/ops";
-import { gitStatus } from "./worktree";
+import { gitStatusAsync } from "./worktree";
 import { slugify } from "./slug";
 import { BadCommand } from "./errors";
 import type { Session } from "./session";
@@ -381,8 +381,11 @@ export class TeamCoordinator {
 
   /** Integrate member branches per the team policy (combined-pr merges into the lead's worktree in
    *  dependency order → one PR; pr-per-member is a no-op merge). Idempotent + resumable: on a merge
-   *  conflict it prompts the lead to resolve as an agent turn, then a re-run continues. */
-  integrateTeam(leadId: string): string {
+   *  conflict it prompts the lead to resolve as an agent turn, then a re-run continues.
+   *  [BE2-3] Async: the N merges + push + `gh pr create` run via the Bun.spawn git twins, so a slow
+   *  network can't freeze the daemon for the whole integration. The result string still reaches the
+   *  MCP `integrate` tool caller (its handler awaits), and BadCommand still rejects to the wire. */
+  async integrateTeam(leadId: string): Promise<string> {
     const lead = this.deps.require(leadId);
     if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can integrate");
     const team = deriveTeams(this.deps.list()).find((t) => t.leadId === leadId);
@@ -426,7 +429,7 @@ export class TeamCoordinator {
     // would try to shove team work straight onto main — fall back to the branch's own name instead.
     const baseName = lead.data.worktree?.base?.replace(/^origin\//, "");
     const leadRemoteBranch = safeRemoteBranch(lead.data.worktree?.remoteBranch, baseName);
-    const result = runTeamIntegration({
+    const result = await runTeamIntegration({
       integration,
       leadCwd: lead.data.cwd,
       leadBranch: lead.data.worktree?.branch ?? lead.data.git?.branch ?? "HEAD",
@@ -434,11 +437,14 @@ export class TeamCoordinator {
       members,
       prTitle: `${lead.data.title}: team integration`,
       prBody: `Combined PR integrating ${members.length} team member(s):\n${members.map((m) => `- ${m.title}${m.branch ? ` (${m.branch})` : ""}`).join("\n")}`,
-      git,
+      // [BE2-3] The Bun.spawn twins — same semantics as the sync ops, but non-blocking.
+      git: { isAncestor: git.isAncestorAsync, mergeBranch: git.mergeBranchAsync, push: git.pushAsync, createPr: git.createPrAsync },
     });
 
-    // Refresh the lead's git projection (branch/PR badge) and the derived team rollup.
-    lead.data.git = gitStatus(lead.data.cwd);
+    // Refresh the lead's git projection (branch/PR badge) and the derived team rollup. The lead may
+    // have been killed while the integration ran — skip the projection/prompt for a gone session.
+    if (!this.deps.getSession(leadId)) return result.output;
+    lead.data.git = await gitStatusAsync(lead.data.cwd);
     this.deps.persist();
     this.deps.broadcastUpdated(lead.data);
 

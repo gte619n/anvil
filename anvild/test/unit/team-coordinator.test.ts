@@ -110,7 +110,7 @@ test("[P7] approve/reject/integrate guard the lead role (a non-lead session thro
   const h = harness();
   h.lead.data.teamRole = undefined; // e.g. the concierge — never created as a lead
   await expect(h.svc.approveTeamPlan("lead1", plan(["a"]))).rejects.toThrow(BadCommand);
-  expect(() => h.svc.integrateTeam("lead1")).toThrow(BadCommand);
+  await expect(h.svc.integrateTeam("lead1")).rejects.toThrow(BadCommand);
   await expect(h.svc.approveTeamPlan("nope")).rejects.toThrow(BadCommand);
 });
 

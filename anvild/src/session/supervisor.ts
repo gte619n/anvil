@@ -754,7 +754,7 @@ export class Supervisor {
   rejectTeamPlan(leadId: string): void {
     this.teams.rejectTeamPlan(leadId);
   }
-  integrateTeam(leadId: string): string {
+  integrateTeam(leadId: string): Promise<string> {
     return this.teams.integrateTeam(leadId);
   }
 
@@ -1840,9 +1840,11 @@ export class Supervisor {
     this.authDegrade.recordTurnSuccess();
     // The agent may have committed, switched/created a branch, or left new changes this turn —
     // refresh git so the worktree panel and session-list badge stay current without a manual
-    // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
+    // "status" press. Local-only and a no-op (no broadcast) when nothing changed. [BE2-5] Async +
+    // per-session coalescing: a burst of turns collapses into at most one subprocess batch per
+    // window instead of 4-5 sync spawns blocking the event loop after every turn.
     const s = this.sessions.get(sessionId);
-    if (s) this.gitProjection.refreshGit(s);
+    if (s) this.gitProjection.scheduleRefreshGit(sessionId);
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
     if (s?.data.parentId) void this.teams.drainQueuedMembers(s.data.parentId, sessionId);
