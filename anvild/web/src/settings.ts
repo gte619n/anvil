@@ -25,7 +25,7 @@
 // token-propagation check) live on `ui` in state.ts; in-place containers (`todoistProjects`,
 // `readmeLoaded`) stay `const` here.
 import { apiFetch } from "./api";
-import { $, byEnvName, envIcon, esc, icon } from "./dom";
+import { $, busy, byEnvName, envIcon, esc, icon } from "./dom";
 // dialogs.ts is a leaf, so the modal/toast helpers and the environment modals are direct imports —
 // they used to arrive via initSettings(deps).
 import { closeModal, confirmDialog, showAddEnvironment, showEditEnvironment, showModal, toast } from "./dialogs";
@@ -238,33 +238,26 @@ async function connectLapo(btn?: HTMLButtonElement): Promise<void> {
   // browser, use a popup so the app page stays put.
   const nativeShell = location.protocol === "anvil-app:" || location.hostname === "appassets.androidplatform.net";
   const popup = nativeShell ? null : window.open("about:blank", "lapo-oauth", "width=560,height=720");
-  const label = btn?.textContent ?? "";
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Connecting…";
-  }
-  try {
-    const res = await sendAwait(hub(), { type: "lapo.connect", redirectBase: window.location.origin, cid: newCid() }, 20_000);
-    if (res.type === "command.error") {
+  // [WEB2-19] busy() owns the disable → "Connecting…" → restore lifecycle around the request.
+  await busy(btn, "Connecting…", async () => {
+    try {
+      const res = await sendAwait(hub(), { type: "lapo.connect", redirectBase: window.location.origin, cid: newCid() }, 20_000);
+      if (res.type === "command.error") {
+        popup?.close();
+        toast(res.message);
+        return;
+      }
+      if (res.type !== "lapo.authorize") {
+        popup?.close();
+        return;
+      }
+      if (popup) popup.location.href = res.url;
+      else window.location.href = res.url; // popup blocked → fall back to a full-page redirect
+    } catch (err) {
       popup?.close();
-      toast(res.message);
-      return;
+      toast(`Couldn't start Lapo authorization: ${err instanceof Error ? err.message : err}`);
     }
-    if (res.type !== "lapo.authorize") {
-      popup?.close();
-      return;
-    }
-    if (popup) popup.location.href = res.url;
-    else window.location.href = res.url; // popup blocked → fall back to a full-page redirect
-  } catch (err) {
-    popup?.close();
-    toast(`Couldn't start Lapo authorization: ${err instanceof Error ? err.message : err}`);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-  }
+  });
 }
 
 function renderLapoPanel(): void {
@@ -375,33 +368,26 @@ async function connectTodoistToken(token: string, btn?: HTMLButtonElement): Prom
     toast("Paste your Todoist API token first.");
     return;
   }
-  const label = btn?.textContent ?? "";
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Connecting…";
-  }
-  try {
-    const res = await sendAwait(hub(), { type: "todoist.connect", token: t, cid: newCid() }, 20_000);
-    if (res.type === "command.error") {
-      toast(res.message);
-      return; // onTodoistStatus only fires on success → stay on the entry form
+  // [WEB2-19] busy() owns the disable → "Connecting…" → restore lifecycle around the request.
+  await busy(btn, "Connecting…", async () => {
+    try {
+      const res = await sendAwait(hub(), { type: "todoist.connect", token: t, cid: newCid() }, 20_000);
+      if (res.type === "command.error") {
+        toast(res.message);
+        return; // onTodoistStatus only fires on success → stay on the entry form
+      }
+      ui.todoistProjectsLoaded = false; // a (possibly new) account → refetch projects
+      // The connected `todoist.status` arrives via onTodoistStatus and re-renders the panel.
+      // Replicate the token to every fleet member (hub-side, server→server) so autopilot can run
+      // wherever a linked environment lives. Fire-and-forget; members also self-heal on reconnect.
+      if (orderedServers().some((s) => s.url !== HUB_URL)) {
+        hub().sock.send({ type: "todoist.propagate", cid: newCid() });
+        toast("Sharing the Todoist token across your fleet…");
+      }
+    } catch (err) {
+      toast(`Couldn't connect Todoist: ${err instanceof Error ? err.message : err}`);
     }
-    ui.todoistProjectsLoaded = false; // a (possibly new) account → refetch projects
-    // The connected `todoist.status` arrives via onTodoistStatus and re-renders the panel.
-    // Replicate the token to every fleet member (hub-side, server→server) so autopilot can run
-    // wherever a linked environment lives. Fire-and-forget; members also self-heal on reconnect.
-    if (orderedServers().some((s) => s.url !== HUB_URL)) {
-      hub().sock.send({ type: "todoist.propagate", cid: newCid() });
-      toast("Sharing the Todoist token across your fleet…");
-    }
-  } catch (err) {
-    toast(`Couldn't connect Todoist: ${err instanceof Error ? err.message : err}`);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-  }
+  });
 }
 
 export function renderTodoistPanel(): void {
@@ -583,26 +569,19 @@ async function saveClaudeToken(token: string, btn?: HTMLButtonElement): Promise<
     toast("Paste your Claude OAuth token first.");
     return;
   }
-  const label = btn?.textContent ?? "";
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Saving…";
-  }
-  try {
-    const res = await sendAwait(hub(), { type: "auth.set", token: t, cid: newCid() }, 20_000);
-    if (res.type === "command.error") {
-      toast(res.message); // e.g. "that looks like a metered API key…"
-      return;
+  // [WEB2-19] busy() owns the disable → "Saving…" → restore lifecycle around the request.
+  await busy(btn, "Saving…", async () => {
+    try {
+      const res = await sendAwait(hub(), { type: "auth.set", token: t, cid: newCid() }, 20_000);
+      if (res.type === "command.error") {
+        toast(res.message); // e.g. "that looks like a metered API key…"
+        return;
+      }
+      toast("Claude token saved — it applies to the next run."); // the auth.status reply/broadcast re-renders
+    } catch (err) {
+      toast(`Couldn't save the token: ${err instanceof Error ? err.message : err}`);
     }
-    toast("Claude token saved — it applies to the next run."); // the auth.status reply/broadcast re-renders
-  } catch (err) {
-    toast(`Couldn't save the token: ${err instanceof Error ? err.message : err}`);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-  }
+  });
 }
 
 async function clearClaudeTokenUi(): Promise<void> {
@@ -625,26 +604,19 @@ async function saveOpenRouterKey(key: string, btn?: HTMLButtonElement): Promise<
     toast("Paste your OpenRouter API key first.");
     return;
   }
-  const label = btn?.textContent ?? "";
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Saving…";
-  }
-  try {
-    const res = await sendAwait(hub(), { type: "auth.set", provider: "openrouter", token: k, cid: newCid() }, 20_000);
-    if (res.type === "command.error") {
-      toast(res.message);
-      return;
+  // [WEB2-19] busy() owns the disable → "Saving…" → restore lifecycle around the request.
+  await busy(btn, "Saving…", async () => {
+    try {
+      const res = await sendAwait(hub(), { type: "auth.set", provider: "openrouter", token: k, cid: newCid() }, 20_000);
+      if (res.type === "command.error") {
+        toast(res.message);
+        return;
+      }
+      toast("OpenRouter key saved — the adversarial panel applies it on the next autopilot run.");
+    } catch (err) {
+      toast(`Couldn't save the key: ${err instanceof Error ? err.message : err}`);
     }
-    toast("OpenRouter key saved — the adversarial panel applies it on the next autopilot run.");
-  } catch (err) {
-    toast(`Couldn't save the key: ${err instanceof Error ? err.message : err}`);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-  }
+  });
 }
 
 async function clearOpenRouterKeyUi(): Promise<void> {

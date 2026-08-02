@@ -27,7 +27,7 @@
 // in panel.ts). Cross-module REASSIGNED scalars (`pendingCreateCid`, written here on create and
 // read/cleared by main's event router) live on `ui` in state.ts; in-place containers
 // (`permCards`/`questionCards`/`browse`) stay `const` here, the module that owns them.
-import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, refreshSelect, slugify } from "./dom";
+import { $, busy, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, refreshSelect, slugify } from "./dom";
 import { currentTheme } from "./theme";
 import { ui } from "./state";
 import { dismissOverlay, openOverlay, overlayOpen, overlays } from "./overlays";
@@ -626,27 +626,23 @@ export function showAddEnvironment(): void {
     const color = selectedSwatch();
     const iconName = selectedIcon();
     if (url) {
-      const btn = $<HTMLButtonElement>("#ae-save");
-      btn.disabled = true;
-      btn.textContent = "Cloning…";
-      try {
-        const res = await sendAwait(
-          browseServer(),
-          { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), ...(iconName ? { icon: iconName } : {}), cid: newCid() },
-          120_000,
-        );
-        if (res.type === "command.error") {
-          toast(`Clone failed: ${res.message}`);
-          btn.disabled = false;
-          btn.textContent = "Add";
-          return;
+      // [WEB2-19] busy() owns the disable → "Cloning…" → restore lifecycle around the request.
+      await busy($<HTMLButtonElement>("#ae-save"), "Cloning…", async () => {
+        try {
+          const res = await sendAwait(
+            browseServer(),
+            { type: "env.clone", url, ...(name ? { name } : {}), ...(defaultBase ? { defaultBase } : {}), ...(color ? { color } : {}), ...(iconName ? { icon: iconName } : {}), cid: newCid() },
+            120_000,
+          );
+          if (res.type === "command.error") {
+            toast(`Clone failed: ${res.message}`);
+            return;
+          }
+          closeModal(); // the environments broadcast refreshes Settings / the new-session list
+        } catch (e) {
+          toast(`Clone failed: ${e instanceof Error ? e.message : String(e)}`);
         }
-        closeModal(); // the environments broadcast refreshes Settings / the new-session list
-      } catch (e) {
-        toast(`Clone failed: ${e instanceof Error ? e.message : String(e)}`);
-        btn.disabled = false;
-        btn.textContent = "Add";
-      }
+      });
       return;
     }
     if (!browse.path) return;

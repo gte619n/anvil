@@ -20,7 +20,7 @@
 // fleet/sidebar/conversation — during main's module init, before any socket connects or deep link
 // fires. Cross-module state that main still reaches (`serverSchedule` in onStatus; the plan routing
 // maps live in fleet.ts) is an in-place container, so it stays an exported `const` here.
-import { $, esc, icon } from "./dom";
+import { $, busy, esc, icon } from "./dom";
 // dialogs.ts is a leaf, so the modal/dialog/toast helpers are direct imports — they used to arrive
 // via initAutopilot(deps).
 import { closeModal, confirmDialog, confirmDialogWithOption, pickListDialog, showModal, toast } from "./dialogs";
@@ -537,34 +537,23 @@ async function openPlanningSession(id: string): Promise<void> {
     return;
   }
   const btn = document.getElementById("plan-plan") as HTMLButtonElement | null;
-  const reset = (): void => {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `${icon("auto_awesome")} Plan with Claude`;
+  // [WEB2-19] busy() owns the disable → "Opening…" → restore lifecycle (on success the restore is
+  // invisible — the overlay is dismissed in the same continuation).
+  await busy(btn, "Opening…", async () => {
+    try {
+      const res = await sendAwait(srv, { type: "autopilot.plan.session", workUnitId: id, cid: newCid() }, 60_000);
+      if (res.type === "command.error") {
+        toast(res.message);
+        return;
+      }
+      if (res.type !== "autopilot.started") return;
+      // The session.created broadcast arrives before this reply, so the session is already registered.
+      dismissOverlay("autopilot");
+      selectSession(res.sessionId);
+    } catch (err) {
+      toast(`Couldn't open a planning session: ${err instanceof Error ? err.message : String(err)}`);
     }
-  };
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = `${icon("hourglass_empty")} Opening…`;
-  }
-  try {
-    const res = await sendAwait(srv, { type: "autopilot.plan.session", workUnitId: id, cid: newCid() }, 60_000);
-    if (res.type === "command.error") {
-      toast(res.message);
-      reset();
-      return;
-    }
-    if (res.type !== "autopilot.started") {
-      reset();
-      return;
-    }
-    // The session.created broadcast arrives before this reply, so the session is already registered.
-    dismissOverlay("autopilot");
-    selectSession(res.sessionId);
-  } catch (err) {
-    toast(`Couldn't open a planning session: ${err instanceof Error ? err.message : String(err)}`);
-    reset();
-  }
+  });
 }
 
 async function dismissPlan(id: string): Promise<void> {
@@ -634,34 +623,23 @@ async function startPlan(id: string): Promise<void> {
     return;
   }
   const btn = document.getElementById("plan-start") as HTMLButtonElement | null;
-  const reset = (): void => {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `${icon("rocket_launch")} Create session & start`;
+  // [WEB2-19] busy() owns the disable → "Starting…" → restore lifecycle (on success the restore is
+  // invisible — the overlay is dismissed in the same continuation).
+  await busy(btn, "Starting…", async () => {
+    try {
+      const res = await sendAwait(srv, { type: "autopilot.start", workUnitId: id, cid: newCid() }, 60_000);
+      if (res.type === "command.error") {
+        toast(res.message);
+        return;
+      }
+      if (res.type !== "autopilot.started") return;
+      // The session.created broadcast arrives before this reply, so the session is already registered.
+      dismissOverlay("autopilot");
+      selectSession(res.sessionId);
+    } catch (err) {
+      toast(`Couldn't start: ${err instanceof Error ? err.message : String(err)}`);
     }
-  };
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = `${icon("hourglass_empty")} Starting…`;
-  }
-  try {
-    const res = await sendAwait(srv, { type: "autopilot.start", workUnitId: id, cid: newCid() }, 60_000);
-    if (res.type === "command.error") {
-      toast(res.message);
-      reset();
-      return;
-    }
-    if (res.type !== "autopilot.started") {
-      reset();
-      return;
-    }
-    // The session.created broadcast arrives before this reply, so the session is already registered.
-    dismissOverlay("autopilot");
-    selectSession(res.sessionId);
-  } catch (err) {
-    toast(`Couldn't start: ${err instanceof Error ? err.message : String(err)}`);
-    reset();
-  }
+  });
 }
 
 /** Kick off the autonomous multi-model dev pipeline for a plan (opt-in). Long-running (many model
@@ -747,30 +725,26 @@ async function reassignPlan(id: string): Promise<void> {
   if (!envId) return;
   const doc = document.getElementById("plan-doc");
   const btn = document.getElementById("plan-reassign") as HTMLButtonElement | null;
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = `${icon("hourglass_empty")} Re-evaluating…`;
-  }
   doc?.classList.add("dim");
   try {
-    // A reassign re-plans the unit against the new repo (read-only Opus) — allow a generous budget
-    // (a full planning pass over the repo) rather than the default short cap.
-    const res = await sendAwait(srv, { type: "autopilot.reassign", workUnitId: id, environmentId: envId, cid: newCid() }, 600_000);
-    if (res.type === "command.error") {
-      toast(res.message);
-      return;
-    }
-    if (res.type !== "autopilot.plan") return;
-    toast("Plan re-evaluated");
-    if (doc && res.plan.plan) doc.innerHTML = res.plan.plan.html; // refresh the reader in place (grid re-flows via broadcast)
+    // [WEB2-19] busy() owns the disable → "Re-evaluating…" → restore lifecycle; the doc dim (not a
+    // button concern) stays in this outer finally.
+    await busy(btn, "Re-evaluating…", async () => {
+      // A reassign re-plans the unit against the new repo (read-only Opus) — allow a generous budget
+      // (a full planning pass over the repo) rather than the default short cap.
+      const res = await sendAwait(srv, { type: "autopilot.reassign", workUnitId: id, environmentId: envId, cid: newCid() }, 600_000);
+      if (res.type === "command.error") {
+        toast(res.message);
+        return;
+      }
+      if (res.type !== "autopilot.plan") return;
+      toast("Plan re-evaluated");
+      if (doc && res.plan.plan) doc.innerHTML = res.plan.plan.html; // refresh the reader in place (grid re-flows via broadcast)
+    });
   } catch (err) {
     toast(`Reassign failed: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     doc?.classList.remove("dim");
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = `${icon("swap_horiz")} Reassign env`;
-    }
   }
 }
 
@@ -789,36 +763,35 @@ async function runAutopilot(): Promise<void> {
   runState.results = [];
   reflectAutopilotRunning();
   onAutopilotProgress("Running autopilot…");
-  const btn = $<HTMLButtonElement>("#autopilot-run");
-  btn.disabled = true;
-  btn.innerHTML = `${icon("hourglass_empty")} Running…`;
-  let created = 0;
+  // [WEB2-19] busy() owns the disable → "Running…" → restore lifecycle; the runState flip (not a
+  // button concern) stays in this outer finally.
   try {
-    for (const srv of targets) {
-      try {
-        const res = await sendAwait(srv, { type: "autopilot.run", cid: newCid() }, 600_000);
-        if (res.type === "autopilot.run.result") {
-          created += res.created;
-          runState.results.push({ name: srv.name, ok: res.ok, created: res.created, skipped: res.skipped, error: res.ok ? undefined : res.output });
-          onAutopilotProgress(res.ok ? `✓ ${srv.name}: ${res.created} new · ${res.skipped} already in pipeline` : `⚠ ${srv.name}: ${res.output}`);
-        } else if (res.type === "command.error") {
-          // e.g. "an autopilot run is already in progress" — record it per-server (the global
-          // command.error toast no longer fires for awaited commands).
-          runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: res.message });
-          onAutopilotProgress(`⚠ ${srv.name}: ${res.message}`);
+    await busy($<HTMLButtonElement>("#autopilot-run"), "Running…", async () => {
+      let created = 0;
+      for (const srv of targets) {
+        try {
+          const res = await sendAwait(srv, { type: "autopilot.run", cid: newCid() }, 600_000);
+          if (res.type === "autopilot.run.result") {
+            created += res.created;
+            runState.results.push({ name: srv.name, ok: res.ok, created: res.created, skipped: res.skipped, error: res.ok ? undefined : res.output });
+            onAutopilotProgress(res.ok ? `✓ ${srv.name}: ${res.created} new · ${res.skipped} already in pipeline` : `⚠ ${srv.name}: ${res.output}`);
+          } else if (res.type === "command.error") {
+            // e.g. "an autopilot run is already in progress" — record it per-server (the global
+            // command.error toast no longer fires for awaited commands).
+            runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: res.message });
+            onAutopilotProgress(`⚠ ${srv.name}: ${res.message}`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: msg });
+          onAutopilotProgress(`⚠ ${srv.name}: ${msg}`);
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        runState.results.push({ name: srv.name, ok: false, created: 0, skipped: 0, error: msg });
-        onAutopilotProgress(`⚠ ${srv.name}: ${msg}`);
       }
-    }
-    toast(created ? `${created} new plan${created === 1 ? "" : "s"}` : "No new plans");
+      toast(created ? `${created} new plan${created === 1 ? "" : "s"}` : "No new plans");
+    });
   } finally {
     runState.running = false;
     reflectAutopilotRunning();
-    btn.disabled = false;
-    btn.innerHTML = `${icon("play_arrow")} Run autopilot`;
   }
 }
 
