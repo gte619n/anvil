@@ -16,7 +16,10 @@ import { UpdateWatchdog, type HealthProbe } from "./watchdog";
 installTimestampedConsole();
 
 const config = loadConfig();
-const state = new UpdateStateStore(config.stateDir);
+// [BE2-30] The watchdog writes through its own sidecar file, never the daemon's update-state.json —
+// the two processes' read-modify-writes used to race on one file and silently erase each other's
+// fields (atomic write ≠ atomic RMW). Readers merge; see UpdateStateStore.
+const state = new UpdateStateStore(config.stateDir, { role: "watchdog" });
 const healthUrl = `http://localhost:${config.port}/api/health`;
 const POLL_MS = 3_000;
 

@@ -107,25 +107,13 @@ export class UpdateWatchdog {
       this.deps.state.set({ phase: "error", reason: `${reason}; rollback FAILED: ${e instanceof Error ? e.message : String(e)}` });
       return "rollback-failed";
     }
-    // [BE2-31] rollback() spends minutes resetting + rebuilding; the gate is a deadline, not proof of
-    // failure — the original boot may have finally gone healthy on the target DURING those minutes.
-    // Re-probe before the (previously UNCONDITIONAL) restart: if the target is now healthy, DON'T restart
-    // it backwards — that reset of a now-healthy daemon is the restart-storm class this backstop exists
-    // to prevent. But note rollback() has ALREADY reset the checkout to prePullSha, so disk == prePullSha
-    // is the known-good; we must NOT record the target as known-good (that would make a future failed
-    // update "roll back" to the un-reverted target, and the next restart reverts this process anyway).
-    // So record the truthful rolled-back-to-prePullSha state and just leave the healthy process running;
-    // it boots the reverted (safe) source on its next natural restart, with no forced backwards restart now.
-    const after = await this.deps.health().catch(() => null);
-    if (after && after.ok && after.webBundleOk && shaMatches(shaOf(after.version), rec.targetSha)) {
-      this.deps.state.set({
-        phase: "rolled-back",
-        targetSha: rec.prePullSha,
-        reason: `${reason}; ${rec.targetSha} became healthy during rollback but disk was already reverted — left the healthy process running instead of restarting it backwards`,
-      });
-      this.log(`[watchdog] ${rec.targetSha} became healthy during rollback; disk reverted to ${rec.prePullSha}, skipping the backwards restart`);
-      return "rolled-back";
-    }
+    // [BE2-31] rollback() reset the checkout to prePullSha; complete the rollback with the restart so
+    // disk, process, and recorded state are ALL immediately consistent at prePullSha (the known-good).
+    // (Interview decision 2026-08-01: prefer this one deterministic restart-to-known-good over leaving a
+    // late-healthy target process running against a reverted disk — the latter is transiently
+    // inconsistent and silently reverts on the next boot. A target that recovers ACROSS ticks, before we
+    // ever commit to rollback, is still adopted by the top-of-tick health probe above; this path is only
+    // reached once the gate has already elapsed with the daemon unhealthy.)
     this.deps.state.set({ phase: "rolled-back", targetSha: rec.prePullSha, reason });
     this.deps.restartDaemon();
     return "rolled-back";

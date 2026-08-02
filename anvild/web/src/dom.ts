@@ -40,6 +40,25 @@ export const byEnvName = (a: Environment, b: Environment): number => a.name.loca
 
 export const clampN = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
 
+// [WEB2-19] The busy-button helper. The disable → spinner-label → restore dance around an awaited
+// request was hand-rolled at 9+ call sites (plan actions, settings token/connect buttons, the
+// env-clone dialog), each with its own snapshot/reset code. `busy` owns the whole lifecycle: it
+// snapshots the button's markup, disables it with an hourglass label while `fn` runs, and ALWAYS
+// restores it (finally) — so an error path can just return/throw without leaking a dead button.
+// A null/undefined button (an optional anchor that isn't rendered) simply runs `fn`.
+export async function busy<T>(btn: HTMLButtonElement | null | undefined, label: string, fn: () => Promise<T>): Promise<T> {
+  if (!btn) return fn();
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `${icon("hourglass_empty")} ${esc(label)}`;
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
 // ── Stylized selectors (Tom Select) ──────────────────────────────────────────
 // Native <select>s are upgraded to themed Tom Select dropdowns so options can carry a Material
 // Symbol icon and a color dot. Each <option> may set data-icon / data-color; the render below

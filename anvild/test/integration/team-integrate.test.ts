@@ -42,29 +42,30 @@ function makeTeamRepo(): string {
   return repo;
 }
 
-/** Real git merge/ancestor; faked push + createPr (record calls). */
+/** Real git merge/ancestor — through the [BE2-3] ASYNC twins the daemon actually injects — with
+ *  faked push + createPr (record calls). */
 function gitSurface(): { git: IntegrateGit; pushes: number; prs: number } {
   const state = { pushes: 0, prs: 0 };
   const g: IntegrateGit = {
-    isAncestor: (cwd, ref) => git.isAncestor(cwd, ref),
-    mergeBranch: (cwd, branch, message) => git.mergeBranch(cwd, branch, message),
+    isAncestor: (cwd, ref) => git.isAncestorAsync(cwd, ref),
+    mergeBranch: (cwd, branch, message) => git.mergeBranchAsync(cwd, branch, message),
     push: () => { state.pushes++; return { ok: true, output: "pushed" }; },
     createPr: () => { state.prs++; return { ok: true, output: "created", url: "https://gh/pr/7" }; },
   };
   return { git: g, get pushes() { return state.pushes; }, get prs() { return state.prs; } } as any;
 }
 
-test("#1: branchExists detects a taken slug (the auto-suffix collision check)", () => {
+test("#1: branchExists detects a taken slug (the auto-suffix collision check)", async () => {
   const repo = makeTeamRepo(); // has branches lead, m1, m2
   expect(git.branchExists(repo, "m1")).toBe(true);
   expect(git.branchExists(repo, "lead")).toBe(true);
   expect(git.branchExists(repo, "does-not-exist")).toBe(false);
 });
 
-test("combined-pr merges both member branches into the lead branch and opens one PR", () => {
+test("combined-pr merges both member branches into the lead branch and opens one PR", async () => {
   const repo = makeTeamRepo();
   const s = gitSurface();
-  const r = integrateTeam({
+  const r = await integrateTeam({
     integration: "combined-pr",
     leadCwd: repo,
     leadBranch: "lead",
@@ -85,10 +86,10 @@ test("combined-pr merges both member branches into the lead branch and opens one
   expect(r.prUrl).toBe("https://gh/pr/7");
 });
 
-test("pr-per-member merges nothing into the lead branch and opens no combined PR", () => {
+test("pr-per-member merges nothing into the lead branch and opens no combined PR", async () => {
   const repo = makeTeamRepo();
   const s = gitSurface();
-  const r = integrateTeam({
+  const r = await integrateTeam({
     integration: "pr-per-member",
     leadCwd: repo,
     leadBranch: "lead",
