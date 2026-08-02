@@ -32,7 +32,7 @@ import { ui } from "./state";
 // they used to arrive via initConversation(deps).
 import { clearCardMaps, toast } from "./dialogs";
 import { envOrdinal, sessionBg, stripeColor } from "./sessionColor";
-import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, type Server } from "./fleet";
+import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, wireSessionId, type Server } from "./fleet";
 import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
@@ -202,7 +202,8 @@ export function appendUser(html: string, attachments: AttachmentRef[] = [], ts?:
   b.appendChild(md);
   for (const att of attachments) {
     if (!activeId()) continue;
-    const href = serverApiUrl(activeServer().url, `/api/sessions/${activeId()}/attachments/${att.id}`);
+    // wireSessionId: the OWNING daemon's id in the path (#158 — a member's default chat is namespaced client-side)
+    const href = serverApiUrl(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/attachments/${att.id}`);
     if (att.kind === "image") {
       const img = document.createElement("img");
       img.className = "att-img";

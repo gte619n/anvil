@@ -26,7 +26,7 @@
 // lazy chunk inside mountTerminal(), not in the boot bundle. Only their TYPES are imported here.
 import type { Terminal as XTerm } from "@xterm/xterm";
 import type { FitAddon } from "@xterm/addon-fit";
-import { sendTo, serverApiUrl, serverFetch, type Server } from "./fleet";
+import { sendTo, serverApiUrl, serverFetch, wireSessionId, type Server } from "./fleet";
 import { $, esc, icon, linkifyUrls } from "./dom";
 // dialogs.ts is a leaf, so the modal/toast helpers are direct imports — they used to arrive via
 // initPanel(deps).
@@ -275,7 +275,8 @@ export function renderFiles(entries: DirEntry[]): void {
  *  forces a save-as). Routed to the active session's server so it works across a federated fleet. */
 function downloadFile(path: string, name: string): void {
   if (!activeId()) return;
-  const url = serverApiUrl(activeServer().url, `/api/sessions/${activeId()}/files?path=${encodeURIComponent(path)}&download=1`);
+  // wireSessionId: the OWNING daemon's id in the path (#158 — a member's default chat is namespaced client-side)
+  const url = serverApiUrl(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/files?path=${encodeURIComponent(path)}&download=1`);
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
@@ -306,7 +307,7 @@ async function uploadToBrowser(files: File[], dir: string): Promise<void> {
   for (const file of files) {
     const rel = (dir ? `${dir}/` : "") + file.name;
     try {
-      const res = await serverFetch(activeServer().url, `/api/sessions/${activeId()}/files?path=${encodeURIComponent(rel)}`, {
+      const res = await serverFetch(activeServer().url, `/api/sessions/${wireSessionId(activeId()!)}/files?path=${encodeURIComponent(rel)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/octet-stream" },
         body: await file.arrayBuffer(),

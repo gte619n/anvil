@@ -140,10 +140,79 @@ export const planServer = new Map<string, string>(); // workUnitId → server ur
 // serverPlans so the sidebar rollup + the lead's member board stay live off `team.info`.
 export const serverTeams = new Map<string, TeamInfo[]>(); // server url → its teams
 export const pendingTeamPlans = new Map<string, TeamPlan>(); // lead sessionId → a plan awaiting approval
+
+// ── Default-chat id namespacing (#158) ───────────────────────────────────────────────────────────
+// Every daemon's concierge chat has the SAME hard-coded id (DEFAULT_SESSION_ID in
+// src/session/supervisor.ts) — the one session id that is NOT globally unique. The client keys
+// sessions/routing by id alone, so in a fleet the hub's and each member's default chats collided
+// into one sidebar row whose routing flipped to whichever `session.list` landed last, and a prompt
+// could be delivered to the wrong daemon. Rather than re-keying every map by (server, id), the id is
+// namespaced AT THIS BOUNDARY: inbound frames from a NON-origin server rewrite "sess_default" →
+// "sess_default@<serverId>" (namespaceInbound, applied before main's onEvent ever sees the frame),
+// and outbound frames strip it back to the wire id on exactly the socket that owns the session
+// (wireOutbound, the AnvilSocket mapOut hook). The origin's own frames pass through untouched, so
+// single-server behaviour — including all pre-existing per-session state keyed by the plain id
+// (drafts, seq/epoch, cached transcript, deep links) — is bit-for-bit unchanged.
+export const DEFAULT_SESSION_ID = "sess_default"; // mirrors the daemon literal; the client never receives it from a non-origin server past this seam
+const DEFAULT_NS = `${DEFAULT_SESSION_ID}@`;
+export const isNamespacedDefaultId = (id: string): boolean => id.startsWith(DEFAULT_NS);
+/** The id a session is known by ON ITS DAEMON — what session-scoped REST paths must embed. */
+export const wireSessionId = (id: string): string => (isNamespacedDefaultId(id) ? DEFAULT_SESSION_ID : id);
+/** Stable per-server namespace key: the serverId once `server.hello` has identified it (survives a
+ *  member's http→https url drift, so the row keeps its identity across reloads), else the url.
+ *  hello is the first frame on every connection, so by the time any session frame arrives the
+ *  serverId is known. */
+const serverKeyOf = (url: string): string => servers.get(url)?.id || url;
+const nsId = (url: string, id: string): string => (id === DEFAULT_SESSION_ID ? DEFAULT_NS + serverKeyOf(url) : id);
+function nsSession(url: string, s: Session): void {
+  s.id = nsId(url, s.id);
+  if (s.parentId) s.parentId = nsId(url, s.parentId);
+}
+/** Rewrite a non-origin server's inbound frame so its default chat carries the namespaced id —
+ *  covering every field a session id arrives in: `sessionId` (all session-scoped events),
+ *  `session`/`sessions` (created/updated/list), resume `watermarks`, and `teams`. Mutates the
+ *  freshly-parsed frame in place (this client owns it). Origin frames return untouched. */
+export function namespaceInbound(url: string, e: ServerEvent): ServerEvent {
+  if (sameServerUrl(url, HUB_URL)) return e;
+  const f = e as ServerEvent & {
+    sessionId?: string;
+    session?: Session;
+    sessions?: Session[];
+    watermarks?: { sessionId: string }[];
+    teams?: TeamInfo[];
+  };
+  if (typeof f.sessionId === "string") f.sessionId = nsId(url, f.sessionId);
+  if (f.session) nsSession(url, f.session);
+  if (Array.isArray(f.sessions)) for (const s of f.sessions) nsSession(url, s);
+  if (Array.isArray(f.watermarks)) for (const w of f.watermarks) w.sessionId = nsId(url, w.sessionId);
+  if (Array.isArray(f.teams))
+    for (const t of f.teams) {
+      t.leadId = nsId(url, t.leadId);
+      for (const m of t.members) m.sessionId = nsId(url, m.sessionId);
+    }
+  return e;
+}
+/** Outbound half: strip the namespace back to the wire id — but ONLY when the id actually routes to
+ *  this socket's server. A namespaced id that reached a socket it doesn't route to (e.g. sendTo's
+ *  hub fallback after lost routing) stays namespaced, so that daemon answers "no such session"
+ *  instead of acting on its OWN default chat — the exact wrong-daemon delivery this seam prevents. */
+export function wireOutbound(url: string, cmd: Record<string, unknown> & { type: string }): Record<string, unknown> & { type: string } {
+  const sid = cmd.sessionId;
+  if (typeof sid === "string" && isNamespacedDefaultId(sid) && sameServerUrl(sessionServer.get(sid), url)) return { ...cmd, sessionId: DEFAULT_SESSION_ID };
+  return cmd;
+}
+
 (function hydrateRouting() {
   try {
     for (const [k, v] of JSON.parse(localStorage.getItem("anvil.sessionServer") ?? "[]") as [string, string][]) sessionServer.set(k, v);
     for (const [k, v] of JSON.parse(localStorage.getItem("anvil.envServer") ?? "[]") as [string, string][]) envServer.set(k, v);
+    // [#158] One-time fixup for pre-namespacing state: the shared plain id could be left routed at
+    // whichever fleet server's session.list landed last. Post-fix the plain id ALWAYS means the
+    // origin's own default chat — and a stale non-origin route would let that member's next
+    // session.list prune the row and wipe the origin concierge's cached transcript/seq/draft.
+    // Re-point it; each member's default now arrives under its namespaced id.
+    const du = sessionServer.get(DEFAULT_SESSION_ID);
+    if (du !== undefined && !sameServerUrl(du, HUB_URL)) sessionServer.set(DEFAULT_SESSION_ID, HUB_URL);
   } catch {
     /* corrupt — repopulated on connect */
   }
@@ -196,8 +265,9 @@ export function ensureServer(url: string): Server {
   if (existing) return existing;
   const sock = new AnvilSocket(
     serverWsUrl(clean),
-    (e) => onEvent(clean, e),
+    (e) => onEvent(clean, namespaceInbound(clean, e)), // [#158] a member's "sess_default" never reaches app state un-namespaced
     (st) => onStatus(clean, st),
+    (cmd) => wireOutbound(clean, cmd), // [#158] …and the namespaced id never reaches the wire
   );
   const s: Server = { url: clean, id: "", name: hostOf(clean), sock, status: "disconnected" };
   servers.set(clean, s);

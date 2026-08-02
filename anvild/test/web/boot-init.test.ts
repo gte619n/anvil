@@ -1,7 +1,7 @@
-import { test, expect, beforeAll, afterAll } from "bun:test";
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, beforeAll } from "bun:test";
+import { existsSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { buildBootBundle } from "./boot-bundle";
 
 // Regression for the 3.0.33 "dead app" bug and its WEB2-1 siblings: the skeleton-first change made the
 // top-level "instant restore" call loadConversation → clearConversation, which touches
@@ -15,24 +15,13 @@ import { join } from "node:path";
 // Runs under node (not bun) because bun's jsdom can't execute page scripts ("Proxy is not allowed in the
 // global prototype chain"); node's jsdom runs them fine. We bundle main.ts to a single IIFE first.
 
-// Build the bundle ONCE into a shared dir (a full esbuild pass per test would be wasteful) and reuse it.
-let sharedDir = "";
+// Build the bundle ONCE per test process (a full bundling pass per test would be wasteful) and
+// reuse it. Shared with fleet-default-collision.test.ts via boot-bundle.ts — a SECOND in-process
+// Bun.build of the same graph intermittently corrupts the bundler's resolution cache (see there).
 let bundle = "";
 beforeAll(async () => {
-  sharedDir = mkdtempSync(join(tmpdir(), "anvil-boot-"));
-  const built = await Bun.build({
-    entrypoints: [join(import.meta.dir, "../../web/src/main.ts")],
-    target: "browser",
-    format: "iife",
-    define: { __APP_VERSION__: '"test"' },
-  });
-  expect(built.success).toBe(true);
-  const artifact = built.outputs[0];
-  expect(artifact).toBeDefined();
-  bundle = join(sharedDir, "main.iife.js");
-  writeFileSync(bundle, await artifact!.text());
+  bundle = await buildBootBundle();
 });
-afterAll(() => rmSync(sharedDir, { recursive: true, force: true }));
 
 /** Boot the real bundle in node+jsdom at `url`, with the given localStorage seeds; report init outcome. */
 function runBoot(bundle: string, url: string, seeds: Record<string, string>): { theme: string | null; initErr: string | null } {
