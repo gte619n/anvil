@@ -225,12 +225,46 @@ export function handleDirsResult(e: DirsListResultEvent): void {
 const browse = { path: "", parent: undefined as string | undefined, serverUrl: "" };
 const browseServer = (): Server => servers.get(browse.serverUrl) ?? hub();
 
+// [WEB2-8] Modal focus management: remember the element that opened the dialog, move focus into it,
+// trap Tab inside it (wrap last → first, Shift+Tab first → last), and restore focus on close.
+let modalRestoreFocus: HTMLElement | null = null;
+const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+function trapModalFocus(el: HTMLElement, box: HTMLElement): void {
+  box.tabIndex = -1; // focusable fallback so a dialog with no interactive elements still takes focus
+  const focusables = (): HTMLElement[] => [...box.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((f) => !f.hasAttribute("disabled"));
+  (focusables()[0] ?? box).focus();
+  el.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    const f = focusables();
+    if (!f.length) return;
+    const first = f[0]!;
+    const last = f[f.length - 1]!;
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === box)) {
+      e.preventDefault();
+      last.focus(); // Shift+Tab off the first focusable wraps to the last
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus(); // Tab off the last focusable wraps back to the first
+    }
+  });
+}
+
 /** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so
  *  Back/Cancel dismisses it. Swapping one modal's contents for another reuses the same layer. */
 export function showModal(el: HTMLElement): void {
+  // [WEB2-8] Remember the opener only for a genuinely new modal layer — an in-place content swap
+  // keeps the ORIGINAL opener, so closing the swapped dialog still restores where the user was.
+  if (!overlayOpen("modal")) modalRestoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const root = $("#modal-root");
   root.innerHTML = "";
   root.appendChild(el);
+  // [WEB2-8] The dialog surface (the .modal-box, or the mounted element itself) announces itself to
+  // assistive tech and traps keyboard focus while it's open.
+  const box = el.querySelector<HTMLElement>(".modal-box") ?? el;
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-modal", "true");
+  trapModalFocus(el, box);
   openOverlay("modal", closeModalDom); // no-op if a modal layer is already open (content swap)
 }
 /** Tear down the modal (DOM/state only). Reached via Back (popstate) or closeModal(). */
@@ -238,6 +272,8 @@ function closeModalDom(): void {
   onDirs = null;
   destroyModalSelects(); // drop Tom Select instances (and their document listeners) before the DOM goes
   $("#modal-root").innerHTML = "";
+  modalRestoreFocus?.focus(); // [WEB2-8] hand focus back to the dialog's opener (no-op if it's gone)
+  modalRestoreFocus = null;
 }
 export const closeModal = (): void => dismissOverlay("modal"); // programmatic close → unwind the back-stack
 // New sessions start on Opus; the header model chip switches models mid-session (session.set_model).
@@ -734,6 +770,7 @@ export function showPermission(requestId: string, tool: string, inputObj: unknow
   hideThinking(); // the turn is parked on this decision, not working
   const card = document.createElement("div");
   card.className = "bubble permission";
+  card.setAttribute("role", "alert"); // [WEB2-8] announce the pending decision to assistive tech
   card.dataset.req = requestId;
   const json = esc(JSON.stringify(inputObj, null, 2)).slice(0, 800);
   card.innerHTML =
@@ -794,6 +831,7 @@ export function showQuestion(requestId: string, questions: Question[]): void {
   hideThinking(); // the turn is parked on the answer, not working
   const card = document.createElement("div");
   card.className = "bubble question";
+  card.setAttribute("role", "alert"); // [WEB2-8] announce the pending question to assistive tech
   card.dataset.req = requestId;
 
   const head = document.createElement("div");
@@ -953,19 +991,21 @@ export function toast(msg: string): void {
   toastTimer = setTimeout(() => el.classList.remove("show"), 4000);
 }
 
-/** Themed replacement for window.confirm — resolves true if confirmed. */
-export function confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean> {
+// [WEB2-18] The one modal-promise primitive. confirmDialog / confirmDialogWithOption /
+// pickListDialog used to hand-roll this whole skeleton three times over: build the backdrop +
+// mount it, guard a one-shot `done` that resolves BEFORE teardown (so an explicit choice wins over
+// the cancel-on-close below), augment the modal layer's teardown so any other dismissal (Escape,
+// device Back, backdrop tap) still resolves with the cancel value (the awaiting caller must never
+// hang), and wire the backdrop-click cancel. Now they're thin wrappers: `wire` attaches the
+// dialog-specific buttons/focus onto the mounted markup and calls `done(value)`.
+function modalPromise<T>(boxHtml: string, cancelValue: T, wire: (m: HTMLElement, done: (v: T) => void) => void): Promise<T> {
   return new Promise((resolve) => {
     const m = document.createElement("div");
     m.className = "modal";
-    m.innerHTML = `<div class="modal-box">
-      <h3>${opts.icon ? icon(opts.icon) + " " : ""}${esc(opts.title)}</h3>
-      ${opts.body ? `<p class="small muted">${esc(opts.body)}</p>` : ""}
-      <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
-    </div>`;
+    m.innerHTML = boxHtml;
     showModal(m);
     let settled = false;
-    const done = (v: boolean): void => {
+    const done = (v: T): void => {
       if (settled) return;
       settled = true;
       resolve(v); // resolve BEFORE teardown so the explicit choice wins over the cancel-on-close below
@@ -973,7 +1013,7 @@ export function confirmDialog(opts: { title: string; body?: string; confirmLabel
     };
     // Dismissing the dialog any other way (Escape, device Back, backdrop tap) counts as Cancel — and,
     // crucially, must resolve the promise so the awaiting caller doesn't hang. Augment this modal
-    // layer's teardown to resolve(false); whichever resolve runs first wins (Promise is one-shot).
+    // layer's teardown to resolve the cancel value; whichever resolve runs first wins (one-shot).
     const top = overlays[overlays.length - 1];
     if (top && top.name === "modal") {
       const origClose = top.close;
@@ -981,18 +1021,33 @@ export function confirmDialog(opts: { title: string; body?: string; confirmLabel
         origClose();
         if (!settled) {
           settled = true;
-          resolve(false);
+          resolve(cancelValue);
         }
       };
     }
-    $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
-    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
     m.addEventListener("click", (e) => {
-      if (e.target === m) done(false); // click backdrop to cancel
+      if (e.target === m) done(cancelValue); // click backdrop to cancel
     });
-    // Focus a default button so Enter confirms; a destructive dialog defaults to the safe Cancel.
-    (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+    wire(m, done);
   });
+}
+
+/** Themed replacement for window.confirm — resolves true if confirmed. */
+export function confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean> {
+  return modalPromise(
+    `<div class="modal-box">
+      <h3>${opts.icon ? icon(opts.icon) + " " : ""}${esc(opts.title)}</h3>
+      ${opts.body ? `<p class="small muted">${esc(opts.body)}</p>` : ""}
+      <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
+    </div>`,
+    false,
+    (_m, done) => {
+      $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
+      $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
+      // Focus a default button so Enter confirms; a destructive dialog defaults to the safe Cancel.
+      (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+    },
+  );
 }
 
 /** Like confirmDialog, but with one extra checkbox toggle. Resolves { ok, checked }; cancelling
@@ -1006,82 +1061,38 @@ export function confirmDialogWithOption(opts: {
   optionLabel: string;
   optionChecked?: boolean;
 }): Promise<{ ok: boolean; checked: boolean }> {
-  return new Promise((resolve) => {
-    const m = document.createElement("div");
-    m.className = "modal";
-    m.innerHTML = `<div class="modal-box">
+  return modalPromise<{ ok: boolean; checked: boolean }>(
+    `<div class="modal-box">
       <h3>${opts.icon ? icon(opts.icon) + " " : ""}${esc(opts.title)}</h3>
       ${opts.body ? `<p class="small muted">${esc(opts.body)}</p>` : ""}
       <label class="cd-option"><input type="checkbox" id="cd-option"${opts.optionChecked ? " checked" : ""}> ${esc(opts.optionLabel)}</label>
       <div class="btns"><button type="button" id="cd-cancel">Cancel</button><button type="button" id="cd-ok" class="${opts.danger ? "danger" : "primary"}">${esc(opts.confirmLabel ?? "OK")}</button></div>
-    </div>`;
-    showModal(m);
-    const checked = (): boolean => $<HTMLInputElement>("#cd-option").checked;
-    let settled = false;
-    const done = (ok: boolean): void => {
-      if (settled) return;
-      settled = true;
-      resolve({ ok, checked: ok && checked() }); // resolve BEFORE teardown so the explicit choice wins
-      closeModal();
-    };
-    // Any other dismissal (Escape, device Back, backdrop tap) counts as Cancel and must resolve so the
-    // awaiting caller doesn't hang — mirror confirmDialog's overlay-close augmentation.
-    const top = overlays[overlays.length - 1];
-    if (top && top.name === "modal") {
-      const origClose = top.close;
-      top.close = () => {
-        origClose();
-        if (!settled) {
-          settled = true;
-          resolve({ ok: false, checked: false });
-        }
-      };
-    }
-    $<HTMLButtonElement>("#cd-ok").onclick = () => done(true);
-    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(false);
-    m.addEventListener("click", (e) => {
-      if (e.target === m) done(false); // click backdrop to cancel
-    });
-    (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
-  });
+    </div>`,
+    { ok: false, checked: false },
+    (_m, done) => {
+      const checked = (): boolean => $<HTMLInputElement>("#cd-option").checked;
+      $<HTMLButtonElement>("#cd-ok").onclick = () => done({ ok: true, checked: checked() }); // checkbox read at confirm time
+      $<HTMLButtonElement>("#cd-cancel").onclick = () => done({ ok: false, checked: false });
+      (opts.danger ? $<HTMLButtonElement>("#cd-cancel") : $<HTMLButtonElement>("#cd-ok")).focus();
+    },
+  );
 }
 
 /** Pick one item from a list (link a plan to a session, reassign a plan's environment, …). Resolves the
  *  chosen id, or null if cancelled (button, Escape, Back, backdrop). */
 export function pickListDialog(title: string, items: { id: string; label: string; icon?: string }[], headIcon = "link"): Promise<string | null> {
-  return new Promise((resolve) => {
-    const m = document.createElement("div");
-    m.className = "modal";
-    m.innerHTML = `<div class="modal-box">
+  return modalPromise<string | null>(
+    `<div class="modal-box">
       <h3>${icon(headIcon)} ${esc(title)}</h3>
       <div class="pick-list">${items
         .map((it) => `<button type="button" class="pick-item" data-id="${esc(it.id)}">${icon(it.icon ?? "terminal")} ${esc(it.label || it.id)}</button>`)
         .join("")}</div>
       <div class="btns"><button type="button" id="cd-cancel">Cancel</button></div>
-    </div>`;
-    showModal(m);
-    let settled = false;
-    const done = (v: string | null): void => {
-      if (settled) return;
-      settled = true;
-      resolve(v); // resolve BEFORE teardown so the explicit choice wins over cancel-on-close
-      closeModal();
-    };
-    const top = overlays[overlays.length - 1];
-    if (top && top.name === "modal") {
-      const origClose = top.close;
-      top.close = () => {
-        origClose();
-        if (!settled) {
-          settled = true;
-          resolve(null);
-        }
-      };
-    }
-    m.querySelectorAll<HTMLElement>(".pick-item").forEach((b) => (b.onclick = () => done(b.dataset.id!)));
-    $<HTMLButtonElement>("#cd-cancel").onclick = () => done(null);
-    m.addEventListener("click", (e) => {
-      if (e.target === m) done(null); // click backdrop to cancel
-    });
-  });
+    </div>`,
+    null,
+    (m, done) => {
+      m.querySelectorAll<HTMLElement>(".pick-item").forEach((b) => (b.onclick = () => done(b.dataset.id!)));
+      $<HTMLButtonElement>("#cd-cancel").onclick = () => done(null);
+    },
+  );
 }

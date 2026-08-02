@@ -123,12 +123,12 @@ export function openSettings(): void {
       <button id="settings-close" class="icon-btn" title="Close">${icon("close")}</button>
     </div>
     <div class="settings-tabs" role="tablist">
-      <button class="stab" data-tab="environments">${icon("folder")} Environments</button>
-      <button class="stab" data-tab="servers">${icon("dns")} Servers</button>
-      <button class="stab" data-tab="integrations">${icon("extension")} Integrations</button>
-      <button class="stab" data-tab="models">${icon("smart_toy")} Models</button>
-      <button class="stab" data-tab="prompts">${icon("bookmark")} Prompts</button>
-      <button class="stab" data-tab="appearance">${icon("palette")} Appearance</button>
+      <button class="stab" role="tab" data-tab="environments">${icon("folder")} Environments</button>
+      <button class="stab" role="tab" data-tab="servers">${icon("dns")} Servers</button>
+      <button class="stab" role="tab" data-tab="integrations">${icon("extension")} Integrations</button>
+      <button class="stab" role="tab" data-tab="models">${icon("smart_toy")} Models</button>
+      <button class="stab" role="tab" data-tab="prompts">${icon("bookmark")} Prompts</button>
+      <button class="stab" role="tab" data-tab="appearance">${icon("palette")} Appearance</button>
     </div>
     <div class="settings-body">
       <section class="settings-panel" data-tab="environments">
@@ -186,7 +186,10 @@ export function openSettings(): void {
 }
 function selectSettingsTab(tab: SettingsTab): void {
   settingsTab = tab;
-  document.querySelectorAll<HTMLElement>(".settings-view .stab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+  document.querySelectorAll<HTMLElement>(".settings-view .stab").forEach((t) => {
+    t.classList.toggle("active", t.dataset.tab === tab);
+    t.setAttribute("aria-selected", String(t.dataset.tab === tab)); // [WEB2-8] the tablist's buttons are real tabs
+  });
   document.querySelectorAll<HTMLElement>(".settings-view .settings-panel").forEach((p) => (p.hidden = p.dataset.tab !== tab));
   if (tab === "integrations") {
     // Lapo (top) then Todoist (below) share the one Integrations tab.
