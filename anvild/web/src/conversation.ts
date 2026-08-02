@@ -5,7 +5,7 @@
 //      indicator, assistant commit (incl. linkified .md paths), and the scroll lock.
 //   2. The consolidated per-turn activity block (§5) + tool results.
 //   3. The links MODEL (§links): `references` / `pendingAnswerRefs`, extraction/commit, and the
-//      header badge. The links side-PANEL chrome (renderLinks) deliberately stays in main.ts with
+//      header badge. The links side-PANEL chrome (renderLinks) deliberately lives in panel.ts with
 //      the rest of the side panel — it writes panelView/panelContent/setPanelTabs, which are
 //      side-panel state — and is injected back here so addRefs/clearReferences can refresh it.
 //   4. File-offer cards (§download), the session hero, the attach diagnostic, Stop (§stop),
@@ -37,7 +37,8 @@ import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session } fro
 
 // ── Injected dependencies (initConversation) ─────────────────────────────────────────────────────
 // What conversation code calls back into main.ts for. Each field documents the main.ts state it
-// reaches. Reassigned scalars (`activeId`, `panelView`) are injected as lazy reads, not values.
+// reaches (or panel.ts state, routed through main — this module can't import panel.ts, which
+// imports this one). Reassigned scalars (`activeId`, `panelView`) are injected as lazy reads.
 export interface ConversationDeps {
   /** The currently-open session's id (main's `activeId` — a reassigned scalar, read at call time). */
   activeId(): string | null;
@@ -59,9 +60,9 @@ export interface ConversationDeps {
   /** Forget the per-request permission/question card maps (main's `permCards`/`questionCards`) when
    *  the pane is cleared — the cards themselves are detached by the innerHTML reset. */
   clearCardMaps(): void;
-  /** The open side panel, if any (main's `panelView` — a reassigned scalar, read at call time). */
+  /** The open side panel, if any (panel.ts's `panelView` — a reassigned scalar, read at call time). */
   panelView(): string | null;
-  /** The links side-panel chrome (stays in main.ts; refreshed when the reference set changes). */
+  /** The links side-panel chrome (lives in panel.ts; refreshed when the reference set changes). */
   renderLinks(): void;
 }
 // Module-local mirrors of the injected deps, named exactly as in main.ts so the moved code below
@@ -474,7 +475,7 @@ export function appendToolResult(content: string, isError: boolean): void {
   appendActivityStep(preview, full);
 }
 
-// ── Links panel (§links) — the reference MODEL; the panel chrome (renderLinks) stays in main ──────
+// ── Links panel (§links) — the reference MODEL; the panel chrome (renderLinks) lives in panel.ts ──
 // Surface only the links/addresses that appear in Claude's ANSWERS — the URLs and server
 // addresses it hands you — not the noise from your pasted prompts or the transitional tool/
 // thinking churn mid-turn. References are buffered from each assistant message (`pendingAnswerRefs`)

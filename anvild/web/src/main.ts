@@ -1,5 +1,3 @@
-import { Terminal as XTerm } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 import { sameServerUrl } from "./api";
 import {
   HUB_URL,
@@ -17,8 +15,6 @@ import {
   persistRouting,
   rosterServer,
   sendTo,
-  serverApiUrl,
-  serverFetch,
   serverOf,
   serverOfEnv,
   serverSupports,
@@ -27,7 +23,7 @@ import {
   sessionServer,
   type Server,
 } from "./fleet";
-import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, linkifyUrls, refreshSelect, sessIcon, slugify } from "./dom";
+import { $, byEnvName, destroyModalSelects, enhanceSelect, envIcon, esc, icon, refreshSelect, sessIcon, slugify } from "./dom";
 import { currentTheme, resolveTheme, themePref, updateThemeControls } from "./theme";
 import type { ThemePref } from "./theme";
 import { ui } from "./state";
@@ -43,7 +39,7 @@ import {
   sessionHref,
   setSessionHash,
 } from "./overlays";
-import { initPush, isAndroidApp } from "./push";
+import { initPush } from "./push";
 import { initSetupTakeover } from "./setup";
 import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 // The sidebar seam (session list + team board + drag-to-reorder + favicon) lives in sidebar.ts (P7
@@ -67,17 +63,12 @@ import {
   commitAnswerRefs,
   commitAssistant,
   conversation,
-  copyText,
   dropSessionHero,
   finalizeActivity,
   hideThinking,
-  humanSize,
   initConversation,
   maybeShowSessionHero,
-  references,
-  relTime,
   renderEmptyState,
-  runMermaid,
   scrollDown,
   showThinking,
   streamMd,
@@ -130,13 +121,31 @@ import {
 // `input`/`saveDraft`/`restoreDraft`/`autoGrow`/`updateSendState` for the session-switch draft
 // stash, the prompt-library insert, and the Escape blur.
 import { autoGrow, initComposer, input, restoreDraft, saveDraft, updateSendState } from "./composer";
+// The side-panel seam (panel chrome, file browser + reader, the XTerm terminal, the Git panel, and
+// the links-panel chrome renderLinks) lives in panel.ts (P7 decomposition). Importing it here makes
+// its module body — including the panel-owned early-init scalars (`panelView`/`readerPath`/`xterm`,
+// exported live bindings this module only reads) — evaluate before this one, preserving the
+// declare-up-top guarantee for the instant-restore render below (clearReferences() reads panelView
+// at load). Its deps are injected via initPanel(...), called below at the original side-panel
+// wiring point; session lifecycle (killSession/purgeSessionLocally) stays HERE and is handed in.
+import {
+  closePanel,
+  initPanel,
+  openPanel,
+  panel,
+  panelView,
+  readerPath,
+  renderFiles,
+  renderLinks,
+  renderReader,
+  requestGitStatus,
+  resetPanelForSession,
+  showGitResult,
+  updateGitPanelMeta,
+  wirePanelOutsideDismiss,
+  xterm,
+} from "./panel";
 
-const strToB64 = (s: string): string => {
-  const bytes = new TextEncoder().encode(s);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin);
-};
 const b64ToBytes = (b64: string): Uint8Array => {
   const bin = atob(b64);
   const a = new Uint8Array(bin.length);
@@ -148,13 +157,9 @@ import type {
   AutonomyPolicy,
   ContentBlock,
   ConversationEvent,
-  DirEntry,
   DirsListResultEvent,
   Environment,
-  FileContent,
   FileOffer,
-  GitResultEvent,
-  GitStatus,
   PermissionSuggestion,
   Prompt,
   Question,
@@ -221,11 +226,10 @@ const modelLabelOf = (m: Model): string => modelLabelOverrides[m] ?? modelLabel(
 // runs at module load, so touching it throws and aborts the rest of module init → a totally dead
 // app (no list, no buttons). Bites worst on the no-activeId path (fresh device / reinstalled
 // Android, empty localStorage). See memory: web-early-init-decl-order-crash.
-// (`dragging`/`justDragged` live in sidebar.ts, and the conversation-owned scalars —
-// `thinkingEl`/`activity*`/`references`/`pendingAnswerRefs` — live in conversation.ts, each with
-// the code that owns them; both modules are imported above, so they still initialize before this
-// module's body runs.)
-let panelView: "files" | "reader" | "git" | "terminal" | "links" | null = null; // open side panel, if any
+// (`dragging`/`justDragged` live in sidebar.ts, the conversation-owned scalars —
+// `thinkingEl`/`activity*`/`references`/`pendingAnswerRefs` — live in conversation.ts, and the
+// panel-owned `panelView`/`readerPath` live in panel.ts, each with the code that owns them; all
+// three modules are imported above, so they still initialize before this module's body runs.)
 
 // ── Multi-server connection layer (fleet — anvil-multi-server.md §4) ──────────────────────
 // The whole layer now lives in fleet.ts (P7 decomposition) — the Server registry, the per-server
@@ -742,9 +746,11 @@ function saveConvoCache(): void {
 
 // Conversation deps (P7 — see conversation.ts). Same timing contract as initFleet/initSidebar:
 // this runs during module init, BEFORE the instant-restore renderEmptyState()/loadConversation()
-// calls below, so every conversation entry point sees its deps assigned. Reassigned scalars
-// (`activeId`, `panelView`) are injected as lazy reads; `permCards`/`questionCards` are declared
-// far below, so clearCardMaps only dereferences them at call time (never during this call → no TDZ).
+// calls below, so every conversation entry point sees its deps assigned. The reassigned scalar
+// `activeId` is injected as a lazy read; `panelView`/`renderLinks` are panel.ts exports (its module
+// evaluated above, so the live binding/function are initialized); `permCards`/`questionCards` are
+// declared far below, so clearCardMaps only dereferences them at call time (never during this call
+// → no TDZ).
 initConversation({
   activeId: () => activeId,
   activeServer,
@@ -1391,14 +1397,8 @@ function handleSessionEvent(e: ServerEvent): void {
   }
 }
 
-// file links in the conversation (Read/Edit/… tool calls) open the reader
-conversation.addEventListener("click", (e) => {
-  const link = (e.target as HTMLElement).closest(".file-link") as HTMLElement | null;
-  if (!link) return;
-  e.preventDefault();
-  const path = link.dataset.path;
-  if (path && activeId) openFile(path);
-});
+// (The in-conversation file-link click listener that opens the reader moved to panel.ts — wired
+// via initPanel below.)
 
 // replay/snapshot events fold into the same renderers
 function renderConversationEvent(ev: ConversationEvent): void {
@@ -1443,37 +1443,10 @@ function renderSnapshotEvents(events: ConversationEvent[]): void {
 // activity block (§5), the links MODEL (§links), file-offer cards (§download), the session hero,
 // the attach diagnostic, Stop (§stop), copy-to-clipboard, the link/attachment copy-download
 // actions, and lazy Mermaid — lives in conversation.ts. Its deps are injected via
-// initConversation(...) above. The links side-PANEL chrome below stays here with the rest of the
-// side panel: it writes panelView/panelContent/setPanelTabs (side-panel state) and is handed back
-// to conversation.ts as the `renderLinks` dep so a reference-set change refreshes an open panel.
-function renderLinks(): void {
-  panelView = "links";
-  setPanelTabs();
-  if (references.size === 0) {
-    panelContent.innerHTML =
-      `<p class="muted small links-empty">No links yet. URLs and server addresses (e.g. <code>http://localhost:3000</code>) Claude mentions show up here.</p>`;
-    return;
-  }
-  const rows = [...references.entries()]
-    .reverse() // most-recent first
-    .map(
-      ([url, label]) =>
-        `<li class="link-row"><a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(url)}">${icon("open_in_new")}<span class="link-label">${esc(label)}</span></a>` +
-        `<button type="button" class="ref-copy" data-url="${esc(url)}" title="Copy">${icon("content_copy")}</button></li>`,
-    )
-    .join("");
-  panelContent.innerHTML = `<ul class="link-list">${rows}</ul>`;
-  panelContent.querySelectorAll<HTMLElement>(".ref-copy").forEach((b) =>
-    b.addEventListener("click", (e) => {
-      e.preventDefault();
-      const url = b.dataset.url ?? "";
-      void copyText(url).then((ok) => {
-        b.innerHTML = icon(ok ? "check" : "error");
-        setTimeout(() => (b.innerHTML = icon("content_copy")), 1400);
-      });
-    }),
-  );
-}
+// initConversation(...) above. The links side-PANEL chrome (renderLinks) lives in panel.ts with
+// the rest of the side panel — it writes panelView/panelContent/setPanelTabs (side-panel state) —
+// and is handed to conversation.ts as the `renderLinks` dep so a reference-set change refreshes an
+// open panel.
 
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
@@ -1902,9 +1875,7 @@ export function selectSession(id: string, push = true): void {
     applySidebar(); // on a phone, get out of the way once you've picked a session
   }
   // reset the side panel for the new session's worktree
-  filesPath = "";
-  readerPath = "";
-  readerWatch = "";
+  resetPanelForSession();
   if (panelView) openPanel("files");
 }
 
@@ -1914,8 +1885,8 @@ export function selectSession(id: string, push = true): void {
 // select-to-quote, and the copied-markdown anchor strip all live in composer.ts. Its deps are
 // injected HERE — at the original composer wiring point in module init — so the DOM listeners and
 // the boot-time restoreDraft(activeId) run exactly when they always did. `activeId`/`readerPath`
-// are reassigned scalars, injected as lazy reads (`readerPath` is declared in the side-panel
-// section below — the arrow only dereferences it at call time, never during this call → no TDZ).
+// are reassigned scalars, injected as lazy reads (`readerPath` is panel.ts's exported live
+// binding — the arrow only dereferences it at call time).
 // The outbox flush/reconcile machinery stays above with the sockets; the composer's offline send
 // path calls back into it via the injected `enqueue`.
 initComposer({
@@ -1927,481 +1898,28 @@ initComposer({
   readerPath: () => readerPath,
 });
 
-// ── Side panel: files + reader (terminal lands next) ──────────────────────────────
-const panel = $("#side-panel");
-const panelContent = $("#panel-content");
-// `panelView` is declared in the early-init cluster up top — clearReferences() reads it at load.
-let filesPath = "";
-let readerPath = "";
-let readerWatch = "";
-let xterm: XTerm | null = null;
-let fit: FitAddon | null = null;
-let termObs: ResizeObserver | null = null;
+// ── Side panel: files + reader + terminal + git + links (moved to panel.ts — P7 decomposition) ──
+// The panel chrome (open/close/tabs), the file browser + drag-drop upload, the reader (pop-out +
+// Android full-screen), the embedded XTerm terminal, the Git panel, and the links-panel chrome all
+// live in panel.ts. Its deps are injected HERE — at the original side-panel wiring point in module
+// init — so the moved DOM listeners (panel/tab buttons, the in-conversation file-link opener) run
+// exactly when they always did; the click-outside-closes-panel pointerdown is wired separately
+// below (wirePanelOutsideDismiss, after the menu-dismiss listener — that order is load-bearing).
+// `toast`/`showModal`/`confirmDialog`/`killSession` are hoisted declarations; the late-declared
+// `closeModal` const is wrapped in an arrow so it's only read at call time (never during this call
+// → no TDZ). Session lifecycle (killSession + purgeSessionLocally below) stays here: it reassigns
+// `activeId` and owns the persistence/caches.
+initPanel({
+  activeId: () => activeId,
+  activeServer,
+  sessions,
+  toast,
+  showModal,
+  closeModal: () => closeModal(),
+  confirmDialog,
+  killSession,
+});
 
-function setPanelTabs(): void {
-  document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.classList.toggle("active", t.dataset.view === panelView));
-  $("#btn-files").classList.toggle("active", panelView === "files" || panelView === "reader");
-  $("#btn-git").classList.toggle("active", panelView === "git");
-  $("#btn-terminal").classList.toggle("active", panelView === "terminal");
-  $("#btn-links").classList.toggle("active", panelView === "links");
-  // On phone the Files/Links buttons collapse into ⋮ More — light it up when either owns the panel.
-  $("#btn-more").classList.toggle("active", panelView === "files" || panelView === "reader" || panelView === "links");
-}
-function openPanel(view: "files" | "reader" | "git" | "terminal" | "links"): void {
-  if (!activeId) {
-    toast("Open a session first");
-    return;
-  }
-  if (view !== "terminal") disposeTerminal();
-  panelView = view;
-  panel.classList.add("open");
-  openOverlay("panel", closePanelDom); // Back closes the panel (no-op if it's already a layer)
-  setPanelTabs();
-  if (view === "files") requestFiles(filesPath);
-  else if (view === "reader" && !readerPath) requestFiles(filesPath);
-  else if (view === "git") renderGit();
-  else if (view === "terminal") mountTerminal();
-  else if (view === "links") renderLinks();
-}
-/** Tear down the panel (DOM/state only). Reached via Back (popstate) or closePanel(). */
-function closePanelDom(): void {
-  if (readerWatch && activeId) sendTo(activeId, { type: "fs.unwatch", sessionId: activeId, path: readerWatch });
-  readerWatch = "";
-  disposeTerminal();
-  panelView = null;
-  panel.classList.remove("open");
-  setPanelTabs();
-}
-const closePanel = (): void => dismissOverlay("panel"); // programmatic close → unwind the back-stack
-function mountTerminal(): void {
-  disposeTerminal();
-  panelContent.innerHTML = '<div id="term-host" style="height:100%;width:100%"></div>';
-  const dark = currentTheme() === "dark";
-  xterm = new XTerm({
-    fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
-    fontSize: 13,
-    cursorBlink: true,
-    theme: dark ? { background: "#1a1b1e", foreground: "#e6e7e9" } : { background: "#ffffff", foreground: "#1c2024" },
-  });
-  fit = new FitAddon();
-  xterm.loadAddon(fit);
-  xterm.open($("#term-host"));
-  fit.fit();
-  xterm.onData((d) => {
-    if (activeId) sendTo(activeId, { type: "terminal.input", sessionId: activeId, data: strToB64(d) });
-  });
-  if (activeId) sendTo(activeId, { type: "terminal.open", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
-  // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
-  // Debounce ~100ms, and only send terminal.resize when the grid (cols/rows) actually changed — a repaint
-  // that doesn't alter the character grid shouldn't spam the daemon (which re-sizes the real PTY).
-  let lastCols = xterm.cols;
-  let lastRows = xterm.rows;
-  termObs = new ResizeObserver(() => {
-    if (termFitTimer) return;
-    termFitTimer = window.setTimeout(() => {
-      termFitTimer = 0;
-      if (!fit || !xterm || !activeId) return;
-      fit.fit();
-      if (xterm.cols !== lastCols || xterm.rows !== lastRows) {
-        lastCols = xterm.cols;
-        lastRows = xterm.rows;
-        sendTo(activeId, { type: "terminal.resize", sessionId: activeId, cols: xterm.cols, rows: xterm.rows });
-      }
-    }, 100);
-  });
-  termObs.observe(panelContent);
-}
-let termFitTimer = 0;
-function disposeTerminal(): void {
-  termObs?.disconnect();
-  termObs = null;
-  if (termFitTimer) {
-    clearTimeout(termFitTimer);
-    termFitTimer = 0;
-  }
-  xterm?.dispose();
-  xterm = null;
-  fit = null;
-}
-function requestFiles(path: string): void {
-  if (!activeId) return;
-  filesPath = path;
-  sendTo(activeId, { type: "fs.list", sessionId: activeId, path });
-}
-function renderFiles(entries: DirEntry[]): void {
-  panelView = "files";
-  setPanelTabs();
-  const wrap = document.createElement("div");
-  wrap.className = "file-browser";
-  const ul = document.createElement("ul");
-  ul.className = "file-list";
-  if (filesPath) {
-    const up = document.createElement("li");
-    up.className = "dir";
-    up.innerHTML = `<span class="fb-name">📁 ..</span>`;
-    up.onclick = () => requestFiles(filesPath.split("/").slice(0, -1).join("/"));
-    ul.appendChild(up);
-  }
-  for (const e of entries) {
-    const li = document.createElement("li");
-    li.className = e.isDir ? "dir" : "";
-    const detail = [e.size !== undefined ? humanSize(e.size) : "", e.mtime !== undefined ? relTime(e.mtime) : ""].filter(Boolean).join(" · ");
-    li.innerHTML =
-      `<span class="fb-name">${e.isDir ? "📁" : "📄"} ${esc(e.name)}</span>` +
-      `<span class="fb-detail">${esc(detail)}</span>` +
-      (e.isDir ? "" : `<button type="button" class="fb-dl" title="Download">${icon("download")}</button>`);
-    li.onclick = () => (e.isDir ? requestFiles(e.path) : openFile(e.path));
-    const dl = li.querySelector<HTMLButtonElement>(".fb-dl");
-    if (dl)
-      dl.onclick = (ev) => {
-        ev.stopPropagation(); // don't also open the file in the reader
-        downloadFile(e.path, e.name);
-      };
-    ul.appendChild(li);
-  }
-  wrap.appendChild(ul);
-  const hint = document.createElement("p");
-  hint.className = "fb-drop-hint muted small";
-  hint.textContent = "Drop files here to upload";
-  wrap.appendChild(hint);
-  wireBrowserDrop(wrap);
-  panelContent.innerHTML = "";
-  panelContent.appendChild(wrap);
-}
-/** Stream a worktree file to the client via the daemon's download endpoint (Content-Disposition
- *  forces a save-as). Routed to the active session's server so it works across a federated fleet. */
-function downloadFile(path: string, name: string): void {
-  if (!activeId) return;
-  const url = serverApiUrl(activeServer().url, `/api/sessions/${activeId}/files?path=${encodeURIComponent(path)}&download=1`);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  a.rel = "noopener";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-/** Drag-and-drop upload into the currently-browsed worktree directory (`filesPath`). Uploads the
- *  raw bytes via PUT; the daemon refuses to overwrite an existing name (409 → "already exists"). */
-function wireBrowserDrop(wrap: HTMLElement): void {
-  wrap.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    wrap.classList.add("drag-over");
-  });
-  wrap.addEventListener("dragleave", (e) => {
-    if (e.target === wrap) wrap.classList.remove("drag-over");
-  });
-  wrap.addEventListener("drop", (e) => {
-    e.preventDefault();
-    wrap.classList.remove("drag-over");
-    void uploadToBrowser(Array.from((e as DragEvent).dataTransfer?.files ?? []), filesPath);
-  });
-}
-async function uploadToBrowser(files: File[], dir: string): Promise<void> {
-  if (!activeId || files.length === 0) return;
-  let ok = 0;
-  for (const file of files) {
-    const rel = (dir ? `${dir}/` : "") + file.name;
-    try {
-      const res = await serverFetch(activeServer().url, `/api/sessions/${activeId}/files?path=${encodeURIComponent(rel)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: await file.arrayBuffer(),
-      });
-      if (res.status === 409) {
-        toast(`"${file.name}" already exists — rename it or remove the old one first`);
-        continue;
-      }
-      if (!res.ok) {
-        toast(`Upload of "${file.name}" failed`);
-        continue;
-      }
-      ok++;
-    } catch {
-      toast(`Upload of "${file.name}" failed`);
-    }
-  }
-  if (ok > 0) {
-    toast(ok === 1 ? "Uploaded 1 file" : `Uploaded ${ok} files`);
-    if (panelView === "files" && filesPath === dir) requestFiles(dir); // refresh to show the new files
-  }
-}
-function openFile(path: string): void {
-  if (!activeId) return;
-  disposeTerminal();
-  panel.classList.add("open"); // a file link may open the reader while the panel is closed
-  openOverlay("panel", closePanelDom); // Back closes it (no-op if the panel is already a layer)
-  readerPath = path;
-  panelView = "reader";
-  setPanelTabs();
-  if (readerWatch && readerWatch !== path) sendTo(activeId, { type: "fs.unwatch", sessionId: activeId, path: readerWatch });
-  sendTo(activeId, { type: "fs.read", sessionId: activeId, path });
-  sendTo(activeId, { type: "fs.watch", sessionId: activeId, path });
-  readerWatch = path;
-  panelContent.innerHTML = `<p class="muted small">Loading ${esc(path)}…</p>`;
-}
-function renderReader(content: FileContent): void {
-  if (content.path !== readerPath) return;
-  panelView = "reader";
-  setPanelTabs();
-  // A picker has nothing to pop out yet. Otherwise: on the Android shell (no real second window)
-  // the button opens an in-app full-screen overlay; on Mac/web it pops out a standalone window.
-  const popoutBtn = content.choices
-    ? ""
-    : isAndroidApp
-      ? `<button type="button" id="reader-popout" class="reader-act" title="Full screen">${icon("fullscreen")}</button>`
-      : `<button type="button" id="reader-popout" class="reader-act" title="Open in its own window">${icon("open_in_new")}</button>`;
-  const head =
-    `<div class="reader-head"><b>${esc(content.path)}</b>` +
-    `<span class="reader-head-actions">${popoutBtn}` +
-    `<a href="#" id="reader-back">← files</a></span></div>`;
-  if (content.choices) {
-    // A prose-named file (e.g. "design.md") matched several paths — let the user pick which to open.
-    const items = content.choices
-      .map((p) => `<li><a href="#" class="file-link reader-choice" data-path="${esc(p)}">${esc(p)}</a></li>`)
-      .join("");
-    panelContent.innerHTML = head + `<div class="reader-choices"><p class="muted small">${esc(content.path)} matches several files — pick one:</p><ul>${items}</ul></div>`;
-    for (const a of panelContent.querySelectorAll<HTMLElement>(".reader-choice")) {
-      a.onclick = (e) => {
-        e.preventDefault();
-        const p = a.dataset.path;
-        if (p) openFile(p);
-      };
-    }
-  } else if (content.markdown) {
-    panelContent.innerHTML = head + `<div class="md reader-md">${content.markdown.html}</div>`;
-    void runMermaid(panelContent.querySelector(".reader-md") as HTMLElement);
-  } else if (content.text !== undefined) {
-    panelContent.innerHTML = head + `<pre class="reader-text">${esc(content.text)}</pre>` + (content.truncated ? '<p class="muted small">(truncated)</p>' : "");
-  } else if (content.binaryUrl) {
-    const burl = serverApiUrl(activeServer().url, content.binaryUrl); // daemon-relative → absolute, routed to the session's server
-    panelContent.innerHTML =
-      head + (content.mime.startsWith("image/") ? `<img src="${burl}" style="max-width:100%" />` : `<a href="${burl}" target="_blank" rel="noopener noreferrer">Open ${esc(content.path)}</a>`);
-  }
-  const back = document.getElementById("reader-back");
-  if (back) back.onclick = (e) => { e.preventDefault(); openPanel("files"); };
-  const popout = document.getElementById("reader-popout");
-  if (popout) popout.onclick = () => (isAndroidApp ? openFullScreenReader(content.path) : popOutReader(content.path));
-}
-/** Open the currently-rendered reader content in a standalone window (Mac + Web). Reuses the page's
- *  stylesheets + theme and the already-rendered DOM (Mermaid/KaTeX/code highlighting intact), minus
- *  the in-app chrome, so the file reads as its own clean document you can park beside the chat. */
-function popOutReader(path: string): void {
-  const clone = panelContent.cloneNode(true) as HTMLElement;
-  clone.querySelector(".reader-head")?.remove(); // in-app header + back link don't belong in the window
-  clone.querySelectorAll(".copy-btn").forEach((b) => b.remove()); // their click handlers don't survive the copy
-  const styles = [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')]
-    .map((l) => `<link rel="stylesheet" href="${esc(l.href)}" />`)
-    .join("");
-  const theme = document.documentElement.dataset.theme ?? "light";
-  const title = path.split("/").pop() || path;
-  // NB: no "noopener" here — with it, window.open() returns null (the opener link is severed), so we
-  // could never write into the window and were left with a blank about:blank pop-up. We need the
-  // handle to document.write our own content; it's same-origin self-authored markup, so this is safe.
-  const win = window.open("", "_blank", "width=860,height=920");
-  if (!win) {
-    toast("Allow pop-ups to open the reader in its own window");
-    return;
-  }
-  win.document.write(
-    `<!doctype html><html lang="en" data-theme="${esc(theme)}"><head><meta charset="utf-8" />` +
-      `<meta name="viewport" content="width=device-width, initial-scale=1" />` +
-      `<title>${esc(title)}</title>${styles}` +
-      // The shared app stylesheets pin html/body to height:100%;overflow:hidden so the in-app
-      // shell never scrolls — but in this standalone window that traps the content and kills the
-      // scrollbar. Reset both back to a normal, scrollable document.
-      `<style>html,body{margin:0;height:auto;overflow:auto;background:var(--bg);color:var(--text)}` +
-      `.popout-wrap{max-width:880px;margin:0 auto;padding:28px clamp(16px,4vw,40px)}` +
-      `.popout-head{font:600 12px/1.4 ui-monospace,Menlo,monospace;color:var(--muted);margin-bottom:16px;word-break:break-all}</style>` +
-      `</head><body><div class="popout-wrap"><div class="popout-head">${esc(path)}</div>${clone.innerHTML}</div></body></html>`,
-  );
-  win.document.close();
-}
-/** Android in-app full-screen reader. The WebView shell can't make a real second window, so instead of
- *  popOutReader's standalone window we overlay the whole document with a clean, full-bleed, scrollable
- *  copy of the already-rendered file (Mermaid/KaTeX/highlighting intact), minus the in-app chrome. It's
- *  a back-stack layer, so the device Back button and the on-screen ✕ both close it. */
-function openFullScreenReader(path: string): void {
-  const clone = panelContent.cloneNode(true) as HTMLElement;
-  clone.querySelector(".reader-head")?.remove(); // the panel's header + back link don't belong full-screen
-  clone.querySelectorAll(".copy-btn").forEach((b) => b.remove()); // their click handlers don't survive the clone
-  document.getElementById("reader-fs")?.remove(); // never stack two
-  const title = path.split("/").pop() || path;
-  const fs = document.createElement("div");
-  fs.className = "reader-fs";
-  fs.id = "reader-fs";
-  fs.innerHTML =
-    `<div class="reader-fs-head"><span class="reader-fs-title" title="${esc(path)}">${esc(title)}</span>` +
-    `<button type="button" class="reader-fs-close" aria-label="Close" title="Close">${icon("close")}</button></div>` +
-    `<div class="reader-fs-body">${clone.innerHTML}</div>`;
-  document.body.appendChild(fs);
-  fs.querySelector(".reader-fs-close")?.addEventListener("click", () => dismissOverlay("reader"));
-  openOverlay("reader", () => document.getElementById("reader-fs")?.remove());
-}
-// ── Git panel ──────────────────────────────────────────────────────────────────
-function askClaude(instruction: string): void {
-  if (!activeId) return;
-  sendTo(activeId, { type: "prompt.send", sessionId: activeId, text: instruction });
-  toast("Asked Claude →");
-  closePanel(); // jump to the conversation to watch it work
-}
-type Stage = "commit" | "push" | "pr" | "merge";
-// Each stage tells Claude to do EVERYTHING up to and including that stage.
-const STAGE_PROMPT: Record<Stage, string> = {
-  commit: "In this worktree, stage and commit all current changes with a clear, conventional commit message based on what changed. If there's nothing to commit, say so.",
-  push: "In this worktree: commit all current changes with a clear conventional message (if any are uncommitted), then push the branch to its origin remote (set the upstream with -u if needed).",
-  pr: "In this worktree, take the branch to an open PR: commit any uncommitted changes (good conventional message), push to origin, then create a GitHub pull request with the gh CLI (concise title + summary) if one doesn't already exist. Give me the PR URL.",
-  merge: "In this worktree, take the branch all the way to merged: commit any uncommitted changes (good message), push to origin, create a GitHub PR with gh if none exists, then merge it with `gh pr merge --squash` (NOT `--delete-branch`). IMPORTANT: this is a git worktree and the repo's default branch is checked out by another worktree, so do NOT try to switch this worktree to the default branch and do NOT use `--delete-branch` — it switches the checkout before deleting the remote branch, fails on the occupied default, and aborts, leaving the worktree stranded and the remote branch undeleted. After the merge succeeds, delete the remote branch yourself with `git push origin --delete <branch>` (a plain push that never touches the checkout), and leave this worktree on its current branch — staying on the merged branch is expected and correct. Report each step and confirm when it's merged.",
-};
-const STAGE_META: { key: Stage; icon: string; label: string }[] = [
-  { key: "commit", icon: "commit", label: "Commit" },
-  { key: "push", icon: "cloud_upload", label: "Push" },
-  { key: "pr", icon: "call_merge", label: "PR" },
-  { key: "merge", icon: "merge", label: "Merge" },
-];
-/** Which stages still have work to do, given the current source-control state. */
-function gitStageEnabled(g: GitStatus | undefined): Record<Stage, boolean> {
-  const dirty = g?.dirtyFileCount ?? 0;
-  const ahead = g?.ahead ?? 0;
-  const pr = g?.prState;
-  return {
-    commit: dirty > 0, // something uncommitted
-    push: dirty > 0 || ahead > 0, // something not on the remote
-    pr: pr !== "open" && pr !== "merged", // no PR yet
-    merge: pr !== "merged", // not already merged
-  };
-}
-function applyGitButtons(): void {
-  const en = gitStageEnabled(activeId ? sessions.get(activeId)?.git : undefined);
-  for (const { key } of STAGE_META) {
-    const btn = document.getElementById(`ga-${key}`) as HTMLButtonElement | null;
-    if (btn) btn.disabled = !en[key];
-  }
-}
-function requestGitStatus(): void {
-  if (activeId) sendTo(activeId, { type: "git", sessionId: activeId, op: "status" });
-}
-function renderGit(): void {
-  panelView = "git";
-  setPanelTabs();
-  const s = activeId ? sessions.get(activeId) : undefined;
-  const wt = s?.worktree;
-  const stageBtns = STAGE_META.map((m) => `<button type="button" id="ga-${m.key}">${icon(m.icon)} ${m.label}</button>`).join("");
-  panelContent.innerHTML = `<div class="git-panel">
-    <div class="git-status"><span id="git-status-text">${gitStatusLine(s)}</span>
-      <button type="button" class="mini" id="git-refresh" title="Refresh">${icon("refresh")}</button>
-      <button type="button" class="mini" id="git-view-diff" title="View diff">${icon("difference")}</button></div>
-    <div class="small muted git-worktree">${wt ? `worktree at <code>${esc(s!.cwd)}</code><br/>off <code>${esc(wt.base)}</code>` : esc(s?.cwd ?? "")}</div>
-    <hr />
-    <div class="git-row git-stages">${stageBtns}</div>
-    <hr />
-    <div class="git-row">
-      <button type="button" id="ga-reset" title="Un-stick: recover the worktree, clear a parked permission, reset to idle">${icon("restart_alt")} Reset</button>
-      <button type="button" id="ga-cleanup">${icon("cleaning_services")} Cleanup</button>
-      <button type="button" class="danger" id="ga-abandon">${icon("delete_forever")} Abandon</button>
-    </div>
-    <pre class="git-output" id="git-output"></pre>
-  </div>`;
-
-  $("#git-refresh").onclick = () => {
-    setGitOutput("refreshing…");
-    requestGitStatus();
-  };
-  $("#git-view-diff").onclick = () => {
-    if (!activeId) return;
-    setGitOutput("loading diff…");
-    sendTo(activeId, { type: "git", sessionId: activeId, op: "diff" });
-  };
-  for (const m of STAGE_META) {
-    const btn = document.getElementById(`ga-${m.key}`) as HTMLButtonElement | null;
-    if (btn) btn.onclick = () => runStage(m.key, m.label);
-  }
-  $("#ga-reset").onclick = resetSession;
-  $("#ga-cleanup").onclick = cleanupSession;
-  $("#ga-abandon").onclick = abandonSession;
-  applyGitButtons();
-  requestGitStatus(); // sync status + PR state on open
-}
-/** Run all stages up to `key`: lock the buttons immediately, refresh when the turn ends. */
-function runStage(key: Stage, label: string): void {
-  if (!activeId) return;
-  for (const m of STAGE_META) {
-    const b = document.getElementById(`ga-${m.key}`) as HTMLButtonElement | null;
-    if (b) b.disabled = true; // immediate response; re-evaluated on the next status
-  }
-  setGitOutput(`Working… asked Claude to ${label.toLowerCase()}.`);
-  sendTo(activeId, { type: "prompt.send", sessionId: activeId, text: STAGE_PROMPT[key] });
-  toast(`${label} →`);
-  closePanel(); // get out of the way and jump to the conversation to watch it work
-}
-function gitStatusLine(s: Session | undefined): string {
-  const g = s?.git;
-  if (!g) return "(no git info)";
-  const pr = g.prState ? ` · PR ${g.prState}` : "";
-  return `${esc(g.branch)} · ${g.dirtyFileCount} changed · ${g.ahead}↑ ${g.behind}↓${pr}`;
-}
-function updateGitPanelMeta(): void {
-  if (panelView !== "git") return;
-  const s = activeId ? sessions.get(activeId) : undefined;
-  const txt = document.getElementById("git-status-text");
-  if (txt) txt.innerHTML = gitStatusLine(s);
-  applyGitButtons();
-}
-/** Outstanding work that removing the session would lose. */
-function outstandingWork(s: Session | undefined): string[] {
-  const g = s?.git;
-  const out: string[] = [];
-  if (!g) return out;
-  if (g.dirtyFileCount > 0) out.push(`${g.dirtyFileCount} uncommitted change${g.dirtyFileCount === 1 ? "" : "s"}`);
-  if (g.ahead > 0) out.push(`${g.ahead} unpushed commit${g.ahead === 1 ? "" : "s"}`);
-  if (g.prState === "open") out.push("an open PR (not merged)");
-  return out;
-}
-/** Un-stick a session: recover a missing worktree, clear a parked permission, reset to idle. */
-async function resetSession(): Promise<void> {
-  if (!activeId) return;
-  const id = activeId;
-  const ok = await confirmDialog({
-    icon: "restart_alt",
-    title: "Reset this session?",
-    body: "Recovers the worktree if it's missing, clears any pending permission, drops the current turn, and returns the session to idle. Your committed work is untouched.",
-    confirmLabel: "Reset",
-  });
-  if (ok) {
-    sendTo(id, { type: "session.reset", sessionId: id });
-    setGitOutput("resetting…");
-  }
-}
-async function cleanupSession(): Promise<void> {
-  if (!activeId) return;
-  const id = activeId;
-  const outstanding = outstandingWork(sessions.get(id));
-  if (outstanding.length === 0) {
-    const ok = await confirmDialog({
-      icon: "cleaning_services",
-      title: "Clean up this session?",
-      body: "Removes the local + remote branch and the worktree. The work is committed, pushed, and/or merged.",
-      confirmLabel: "Clean up",
-      danger: true,
-    });
-    if (ok) killSession(id);
-    return;
-  }
-  showOutstandingDialog(outstanding);
-}
-async function abandonSession(): Promise<void> {
-  if (!activeId) return;
-  const id = activeId;
-  const s = sessions.get(id);
-  const ok = await confirmDialog({
-    icon: "delete_forever",
-    title: `Abandon “${s?.title ?? "this session"}”?`,
-    body: "Force-deletes the local + remote branch and the worktree, discarding ALL uncommitted / unmerged work. This cannot be undone.",
-    confirmLabel: "Abandon",
-    danger: true,
-  });
-  if (ok) killSession(id);
-}
 /** Remove a session from the local view + caches — the client-side half of a deletion. Shared by the
  *  daemon's session.deleted broadcast and the kill path's "no such session" fallback, so a row the
  *  owning daemon has disowned (a stale-routed ghost) can always be evicted locally. */
@@ -2451,48 +1969,6 @@ function killSession(id: string): void {
   }
   renderSessions();
 }
-/** Cleanup found outstanding work — offer to handle it first, or remove anyway. */
-function showOutstandingDialog(outstanding: string[]): void {
-  const s = activeId ? sessions.get(activeId) : undefined;
-  const pr = s?.git?.prState;
-  const m = document.createElement("div");
-  m.className = "modal";
-  m.innerHTML = `<div class="modal-box"><h3>${icon("warning")} Outstanding work</h3>
-    <p class="small muted">This session still has work that cleanup would lose:</p>
-    <ul>${outstanding.map((o) => `<li>${esc(o)}</li>`).join("")}</ul>
-    <p class="small muted">Have Claude handle it first:</p>
-    <div class="git-row">
-      <button type="button" id="od-commit">${icon("commit")} Commit</button>
-      <button type="button" id="od-push">${icon("cloud_upload")} Push</button>
-      <button type="button" id="od-pr">${icon(pr === "open" ? "merge" : "rocket_launch")} ${pr === "open" ? "Merge PR" : "Create PR"}</button>
-    </div>
-    <div class="btns"><button type="button" class="danger" id="od-remove">${icon("delete_forever")} Remove anyway</button><span style="flex:1"></span><button type="button" id="od-cancel">Cancel</button></div>
-  </div>`;
-  showModal(m);
-  const handle = (t: string) => {
-    closeModal();
-    askClaude(t);
-  };
-  $<HTMLButtonElement>("#od-commit").onclick = () => handle(STAGE_PROMPT.commit);
-  $<HTMLButtonElement>("#od-push").onclick = () => handle(STAGE_PROMPT.push);
-  $<HTMLButtonElement>("#od-pr").onclick = () => handle(pr === "open" ? STAGE_PROMPT.merge : STAGE_PROMPT.pr);
-  $<HTMLButtonElement>("#od-cancel").onclick = () => closeModal();
-  $<HTMLButtonElement>("#od-remove").onclick = () => {
-    closeModal();
-    if (activeId) killSession(activeId); // "Remove anyway" — the listed outstanding work IS the warning
-  };
-}
-function setGitOutput(text: string): void {
-  const el = document.getElementById("git-output");
-  if (el) el.textContent = text;
-}
-function showGitResult(e: GitResultEvent): void {
-  const el = document.getElementById("git-output");
-  if (!el) return;
-  const head = e.ok ? "" : "⚠ failed\n";
-  el.innerHTML = linkifyUrls(head + e.output); // [SEC-L6] esc + safe new-tab links (rel=noopener)
-}
-
 $("#btn-new-topic").addEventListener("click", async () => {
   if (!activeId) return;
   const ok = await confirmDialog({
@@ -2505,12 +1981,6 @@ $("#btn-new-topic").addEventListener("click", async () => {
   sendTo(activeId, { type: "session.new_topic", sessionId: activeId, cid: newCid() });
   toast("Started a new topic — fresh context.");
 });
-$("#btn-files").addEventListener("click", () => (panelView === "files" || panelView === "reader" ? closePanel() : openPanel("files")));
-$("#btn-git").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
-$("#btn-terminal").addEventListener("click", () => (panelView === "terminal" ? closePanel() : openPanel("terminal")));
-$("#btn-links").addEventListener("click", () => (panelView === "links" ? closePanel() : openPanel("links")));
-$("#panel-close").addEventListener("click", closePanel);
-document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.addEventListener("click", () => openPanel(t.dataset.view as "files" | "reader" | "git" | "terminal" | "links")));
 
 // ── Header dropdown menus ─────────────────────────────────────────────────────
 // Anchored dropdowns for header actions: the Prompts list, and (on phone) the ⋮ "More" overflow
@@ -2585,21 +2055,11 @@ document.addEventListener("pointerdown", (e) => {
   closeHeaderMenu();
 });
 
-// Click anywhere off the open side panel to dismiss it. The header toggles, in-conversation
-// file links, and the floating quote button legitimately drive/feed the panel, so they're
-// excluded (they manage their own open/close). Modals/dialogs and the settings view are layers
-// ABOVE the panel — a pointerdown there must NOT close the panel, because closePanel()
-// (dismissOverlay) unwinds every overlay above the panel too, which would tear down the open
-// dialog mid-click and swallow its button press (this is what made Cleanup/Abandon/Reset, all of
-// which confirm in a dialog over the git panel, silently do nothing). Pointerdown beats those
-// handlers' click.
-document.addEventListener("pointerdown", (e) => {
-  if (!panelView) return; // panel already closed
-  if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader") || overlayOpen("menu")) return; // a dialog/settings/autopilot/reader/header-menu is on top — leave the panel be
-  const t = e.target as HTMLElement;
-  if (t.closest("#side-panel") || t.closest("#header") || t.closest(".file-link") || t.closest("#quote-btn") || t.closest("#modal-root") || t.closest("#menu-root") || t.closest("#settings-root") || t.closest("#autopilot-root") || t.closest(".resizer")) return;
-  closePanel();
-});
+// Click anywhere off the open side panel to dismiss it (panel.ts). Wired HERE, after the
+// menu-dismiss pointerdown above: dismissOverlay pops the overlay stack synchronously, so with a
+// menu open above an open panel the menu listener must run first — the panel listener then sees
+// the menu gone and closes the panel too, one outside click unwinding both (as it always has).
+wirePanelOutsideDismiss();
 
 // ── Modals ─────────────────────────────────────────────────────────────────────
 let onDirs: ((e: DirsListResultEvent) => void) | null = null;
