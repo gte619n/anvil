@@ -61,11 +61,19 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.create": {
-        const session = deps.supervisor.create(cmd);
-        conn.attached.add(session.id);
-        const created: ServerEvent = { v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data };
-        send({ ...created, cid }); // creator: carries the cid
-        deps.registry.toAll(created, conn.id); // other devices: no cid
+        // [BE2-2] Async: a fresh-worktree create runs a network `git fetch` — settle off the dispatch
+        // path so a slow remote can't freeze the daemon. Same wire surface as before: the creator gets
+        // `session.created` with its cid, everyone else the broadcast, and a failure (BadCommand) still
+        // arrives as `command.error`.
+        deps.supervisor
+          .create(cmd)
+          .then((session) => {
+            conn.attached.add(session.id);
+            const created: ServerEvent = { v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data };
+            send({ ...created, cid }); // creator: carries the cid
+            deps.registry.toAll(created, conn.id); // other devices: no cid
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
       }
 
@@ -140,8 +148,8 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "team.plan.approve":
-        deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan);
-        if (cid) send(ack(cid));
+        // [BE2-2] Member spawns create worktrees via async git — ack when the spawns settle.
+        ackWhenDone(deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan), send, cid);
         return;
 
       case "team.plan.reject":
@@ -364,7 +372,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "autopilot.start":
-        send(deps.supervisor.startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid));
+        // [BE2-2] Go spawns a fresh-worktree session (async git) — settle off the dispatch path.
+        deps.supervisor
+          .startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "autopilot.pipeline.start":

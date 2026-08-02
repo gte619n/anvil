@@ -12,13 +12,13 @@ const tempState = () => mkdtempSync(join(tmpdir(), "anvil-xo-"));
 // Regression for adversarial-review Finding 2: daemon-handled commands (/goal, /clear, /compact) apply
 // a real side effect but emit no `message.user`, so they early-return in prompt(). They must STILL
 // record their cid, or a re-flushed offline copy re-runs the side effect (exactly-once violation).
-test("a daemon-handled command (/goal) records its cid so a re-flush is deduped", () => {
+test("a daemon-handled command (/goal) records its cid so a re-flush is deduped", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   sup.accountAdd("work", "sk-ant-oat01-workworkwork-1111"); // a real account → NOT degraded, so /goal runs
 
-  const s = sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
+  const s = await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
   expect(sup.isPromptApplied(s.id, "cid_goal")).toBe(false);
 
   sup.prompt(s.id, "/goal ship the feature", [], "cid_goal");

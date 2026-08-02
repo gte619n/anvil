@@ -53,7 +53,9 @@ export interface TeamCoordinatorDeps {
   kill: (id: string) => Promise<void>;
   budget: () => Budget;
   getEnvironment: (id: string) => Environment | undefined;
-  /** Create-and-brief a new session (Supervisor.handoffCreate) — how members are spawned. */
+  /** Create-and-brief a new session (Supervisor.handoffCreate) — how members are spawned.
+   *  [BE2-2] May resolve asynchronously (fresh-worktree creation runs async git); callers await
+   *  either shape, so synchronous test fakes keep working. */
   handoffCreate: (a: {
     environmentId?: string | undefined;
     repoRoot?: string | undefined;
@@ -67,7 +69,7 @@ export interface TeamCoordinatorDeps {
     parentId: string;
     teamRole: "member";
     memberTask: string;
-  }) => { id: string; title: string; cwd: string };
+  }) => { id: string; title: string; cwd: string } | Promise<{ id: string; title: string; cwd: string }>;
 }
 
 export class TeamCoordinator {
@@ -189,12 +191,12 @@ export class TeamCoordinator {
 
   /** The lead proposed a decomposition. At `bypass` autonomy it auto-approves and spawns; otherwise it
    *  parks a reviewable `team.plan` card and waits for `team.plan.approve` (see team-gate.ts). */
-  private teamProposePlan(leadId: string, members: TeamPlanMember[], integration: TeamPlan["integration"]): string {
+  private async teamProposePlan(leadId: string, members: TeamPlanMember[], integration: TeamPlan["integration"]): Promise<string> {
     const lead = this.deps.require(leadId);
     if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can propose a team plan");
     const plan: TeamPlan = { leadId, members, integration };
     if (shouldAutoApprove(lead.data.autonomy)) {
-      const started = this.startTeamPlan(plan);
+      const started = await this.startTeamPlan(plan);
       return `Auto-approved (bypass autonomy): started ${started} of ${members.length} member(s); the rest queue as slots free.`;
     }
     this.pendingTeamPlans.set(leadId, plan);
@@ -203,8 +205,10 @@ export class TeamCoordinator {
     return `Proposed a ${members.length}-member plan (${integration}); awaiting the user's approval before spawning.`;
   }
 
-  /** Approve a parked plan (possibly user-edited) and spawn its members up to the concurrency cap. */
-  approveTeamPlan(leadId: string, plan?: TeamPlan): void {
+  /** Approve a parked plan (possibly user-edited) and spawn its members up to the concurrency cap.
+   *  [BE2-2] Async: member spawns create worktrees via async git. The `team.plan.resolved` broadcast
+   *  still follows the spawns, and BadCommand still rejects to the dispatcher (→ command.error). */
+  async approveTeamPlan(leadId: string, plan?: TeamPlan): Promise<void> {
     const lead = this.deps.require(leadId);
     // Guard the auth boundary: a client-supplied sessionId + hand-built plan must not spawn members
     // off a session that was never created as a lead (e.g. the concierge). Mirrors teamProposePlan.
@@ -213,7 +217,7 @@ export class TeamCoordinator {
     if (!chosen) throw new BadCommand(`no pending team plan for ${leadId}`);
     if (!chosen.members?.length) throw new BadCommand("cannot approve an empty team plan (no members)"); // #8
     this.pendingTeamPlans.delete(leadId);
-    this.startTeamPlan({ ...chosen, leadId });
+    await this.startTeamPlan({ ...chosen, leadId });
     this.deps.registry.toAll({ v: PROTOCOL_VERSION, type: "team.plan.resolved", ts: now(), sessionId: leadId, approved: true });
     void lead;
   }
@@ -227,7 +231,7 @@ export class TeamCoordinator {
 
   /** Record the plan as active and spawn members up to the lead's cap; queue any overflow. Returns the
    *  count started now. */
-  private startTeamPlan(plan: TeamPlan): number {
+  private async startTeamPlan(plan: TeamPlan): Promise<number> {
     const lead = this.deps.require(plan.leadId);
     if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
     if (!plan.members?.length) throw new BadCommand("cannot start an empty team plan (no members)"); // #8
@@ -246,7 +250,8 @@ export class TeamCoordinator {
     const toStart = plan.members.slice(0, room);
     const overflow = plan.members.slice(room);
     let started = 0;
-    for (const m of toStart) if (this.spawnMember(plan.leadId, m)) started++;
+    // Sequential on purpose: spawn order = plan order (branch-slug auto-suffixing depends on it too).
+    for (const m of toStart) if (await this.spawnMember(plan.leadId, m)) started++;
     if (overflow.length) this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...overflow]);
     return started; // actual successes, not attempts — a failed spawn must not inflate the count
   }
@@ -255,9 +260,9 @@ export class TeamCoordinator {
    *  it (design §7: "that member is flagged and reported to the lead"). Returns true on success. A
    *  common cause is a branch-name collision (two teams in one repo asking for the same member title →
    *  the same branch slug → `git worktree add` fails). */
-  private spawnMember(leadId: string, m: TeamPlanMember): boolean {
+  private async spawnMember(leadId: string, m: TeamPlanMember): Promise<boolean> {
     try {
-      this.teamCreateMember(leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
+      await this.teamCreateMember(leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
       return true;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -272,7 +277,32 @@ export class TeamCoordinator {
    *  `justFinishedId` is the member whose completion triggered this: the driver fires `onResult` BEFORE
    *  flipping its status to idle (driver.ts), so we must exclude it from the active count or it would
    *  still occupy its own slot and the drain would be short by one (stalling a cap-1 team entirely). */
-  drainQueuedMembers(leadId: string, justFinishedId?: string): void {
+  /** [BE2-2] Per-lead re-entrancy guard: drains now await async spawns, so two members finishing
+   *  close together could otherwise interleave their while-loops and overshoot the concurrency cap.
+   *  A drain triggered while one is in flight marks a rerun; the in-flight drain loops again when it
+   *  finishes, so no freed slot is ever silently dropped. */
+  private readonly drainRuns = new Map<string, { rerun: boolean }>();
+
+  async drainQueuedMembers(leadId: string, justFinishedId?: string): Promise<void> {
+    const inFlight = this.drainRuns.get(leadId);
+    if (inFlight) {
+      inFlight.rerun = true; // fold this trigger into the running drain's next pass
+      return;
+    }
+    const run = { rerun: false };
+    this.drainRuns.set(leadId, run);
+    try {
+      do {
+        run.rerun = false;
+        await this.drainOnce(leadId, justFinishedId);
+        justFinishedId = undefined; // only the first pass excludes the just-finished member
+      } while (run.rerun);
+    } finally {
+      this.drainRuns.delete(leadId);
+    }
+  }
+
+  private async drainOnce(leadId: string, justFinishedId?: string): Promise<void> {
     const queue = this.queuedMembers.get(leadId);
     if (!queue || queue.length === 0) return;
     const lead = this.deps.getSession(leadId);
@@ -282,7 +312,7 @@ export class TeamCoordinator {
     let room = Math.max(0, cap - this.activeMemberCount(leadId, justFinishedId));
     while (room > 0 && queue.length > 0) {
       const m = queue.shift()!;
-      if (this.spawnMember(leadId, m)) room--; // a failed spawn is reported + dropped, not retried
+      if (await this.spawnMember(leadId, m)) room--; // a failed spawn is reported + dropped, not retried
     }
     if (queue.length === 0) this.queuedMembers.delete(leadId);
   }
@@ -305,10 +335,10 @@ export class TeamCoordinator {
   }
 
   /** Spawn one member session off the lead: its worktree branches off the lead's branch HEAD. */
-  private teamCreateMember(
+  private async teamCreateMember(
     leadId: string,
     a: { title: string; task: string; source: "fresh-worktree" | "existing-dir"; base?: string; brief: string },
-  ): { id: string; title: string; cwd: string } {
+  ): Promise<{ id: string; title: string; cwd: string }> {
     const lead = this.deps.require(leadId);
     const leadBranch = lead.data.worktree?.branch ?? lead.data.git?.branch;
     const env = lead.data.environmentId ? this.deps.getEnvironment(lead.data.environmentId) : undefined;

@@ -18,7 +18,7 @@ import { Supervisor } from "../../src/session/supervisor";
 import { ConnectionRegistry } from "../../src/server/registry";
 
 /** A Supervisor with every push channel replaced by a counter. Returns the counts array. */
-function harness(dir: string) {
+async function harness(dir: string) {
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
   const pushes: Array<{ kind?: string; body: string }> = [];
   const spy = async (p: { kind?: string; body: string }) => void pushes.push({ kind: p.kind, body: p.body });
@@ -26,17 +26,17 @@ function harness(dir: string) {
   (sup as any).webpush = { notify: spy, subscribe() {}, unsubscribe() {}, publicKey: "" };
   (sup as any).fcm = { notify: spy };
   (sup as any).apns = { notify: spy };
-  const s = sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
+  const s = await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
   return { sup, pushes, id: s.id, session: (sup as any).sessions.get(s.id) };
 }
 
 /** The `result` event that ends a turn — the branch D3 suppresses. */
 const emitResult = (session: any) => session.emit({ type: "result" });
 
-test("a goal in flight suppresses the per-turn 'your turn' push (D3)", () => {
+test("a goal in flight suppresses the per-turn 'your turn' push (D3)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "anvil-goalpush-"));
   try {
-    const { pushes, session } = harness(dir);
+    const { pushes, session } = await harness(dir);
 
     // No goal → the ordinary reminder fires (three channels: web, fcm, apns).
     emitResult(session);
@@ -60,10 +60,10 @@ test("a goal in flight suppresses the per-turn 'your turn' push (D3)", () => {
   }
 });
 
-test("resolving a goal pushes exactly once — the following result does NOT double-push", () => {
+test("resolving a goal pushes exactly once — the following result does NOT double-push", async () => {
   const dir = mkdtempSync(join(tmpdir(), "anvil-goalpush-"));
   try {
-    const { sup, pushes, id, session } = harness(dir);
+    const { sup, pushes, id, session } = await harness(dir);
     const goal: SessionGoal = { condition: "all tests pass", iterations: 2, setAt: "t" };
 
     // The Stop hook clears data.goal and then calls onGoalResolved — reproduce that order exactly.
@@ -86,10 +86,10 @@ test("resolving a goal pushes exactly once — the following result does NOT dou
   }
 });
 
-test("the ceiling push names the abandonment and its blocker (D4)", () => {
+test("the ceiling push names the abandonment and its blocker (D4)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "anvil-goalpush-"));
   try {
-    const { sup, pushes, id } = harness(dir);
+    const { sup, pushes, id } = await harness(dir);
     (sup as any).onGoalResolved(id, false, { condition: "impossible", iterations: 10, lastReason: "still red", setAt: "t" });
     expect(pushes.length).toBe(3);
     expect(pushes[0]!.body).toBe("Goal abandoned after 10 turns: impossible");
@@ -98,10 +98,10 @@ test("the ceiling push names the abandonment and its blocker (D4)", () => {
   }
 });
 
-test("a goal blocked on approval still reaches the user (only the result branch is suppressed)", () => {
+test("a goal blocked on approval still reaches the user (only the result branch is suppressed)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "anvil-goalpush-"));
   try {
-    const { pushes, session } = harness(dir);
+    const { pushes, session } = await harness(dir);
     session.data.goal = { condition: "c", iterations: 3, setAt: "t" } satisfies SessionGoal;
 
     // An unattended goal loop that needs a decision MUST be able to interrupt the user — otherwise
@@ -119,10 +119,10 @@ test("a goal blocked on approval still reaches the user (only the result branch 
   }
 });
 
-test("a persisted goal comes back PAUSED after a restart (D5)", () => {
+test("a persisted goal comes back PAUSED after a restart (D5)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "anvil-goalrestore-"));
   try {
-    const first = harness(dir);
+    const first = await harness(dir);
     first.session.data.goal = { condition: "keep going", iterations: 4, lastReason: "not yet", setAt: "t" } satisfies SessionGoal;
     (first.sup as any).persist();
 

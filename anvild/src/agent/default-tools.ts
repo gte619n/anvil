@@ -15,7 +15,9 @@ export interface DefaultToolDeps {
   getSession(id: string): SessionData | undefined;
   /** the registered environments (project repos). */
   listEnvironments(): Environment[];
-  /** Create a session AND auto-start it on a seeded brief. Throws on bad args. Returns new ids. */
+  /** Create a session AND auto-start it on a seeded brief. Throws/rejects on bad args. Returns new
+   *  ids. [BE2-2] May resolve asynchronously: fresh-worktree creation runs its git ops via Bun.spawn
+   *  (the tool handler awaits either shape; test fakes can stay synchronous). */
   handoff(args: {
     environmentId?: string;
     source: SessionSource;
@@ -29,7 +31,7 @@ export interface DefaultToolDeps {
     parentId?: string;
     teamRole?: "lead" | "member";
     memberTask?: string;
-  }): { id: string; title: string; cwd: string };
+  }): { id: string; title: string; cwd: string } | Promise<{ id: string; title: string; cwd: string }>;
 }
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -128,7 +130,7 @@ export function buildDefaultToolsServer(deps: DefaultToolDeps): McpSdkServerConf
         },
         async (a) => {
           try {
-            const { id, title, cwd } = deps.handoff({
+            const { id, title, cwd } = await deps.handoff({
               environmentId: a.environmentId,
               source: a.source as SessionSource,
               cwd: a.cwd,

@@ -12,12 +12,12 @@ function tempState(): string {
 const createCmd = (cwd: string) =>
   ({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd } as const);
 
-test("each session has an independent seq starting at 1", () => {
+test("each session has an independent seq starting at 1", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
 
-  const a = sup.create(createCmd(dir));
-  const b = sup.create(createCmd(dir));
+  const a = await sup.create(createCmd(dir));
+  const b = await sup.create(createCmd(dir));
 
   a.setStatus("thinking"); // a seq 1
   a.setStatus("idle"); // a seq 2
@@ -28,10 +28,10 @@ test("each session has an independent seq starting at 1", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("resume replays events after lastSeq, and snapshots from scratch", () => {
+test("resume replays events after lastSeq, and snapshots from scratch", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
   s.setStatus("thinking"); // seq 1 (persisted)
   s.setStatus("idle"); // seq 2
 
@@ -47,10 +47,10 @@ test("resume replays events after lastSeq, and snapshots from scratch", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("resume re-surfaces an unanswered permission prompt (the 'lost dialog' fix)", () => {
+test("resume re-surfaces an unanswered permission prompt (the 'lost dialog' fix)", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
 
   // Simulate the PreToolUse hook parking on a decision.
   s.requestPermission("perm-1", "Edit", { file_path: "a.ts" }, [{ decision: "allow", label: "Allow once" }]);
@@ -70,10 +70,10 @@ test("resume re-surfaces an unanswered permission prompt (the 'lost dialog' fix)
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("[BE2-8] a DELTA resume re-surfaces the pending prompt marked replay so a seq filter can't drop it", () => {
+test("[BE2-8] a DELTA resume re-surfaces the pending prompt marked replay so a seq filter can't drop it", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
   s.requestPermission("perm-1", "Edit", { file_path: "a.ts" }, [{ decision: "allow", label: "Allow once" }]);
 
   // Delta resume at the session's OWN watermark — the re-surfaced permission.request carries
@@ -91,10 +91,10 @@ test("[BE2-8] a DELTA resume re-surfaces the pending prompt marked replay so a s
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("concurrent permission prompts (sub-agent fan-out) each re-surface and clear independently", () => {
+test("concurrent permission prompts (sub-agent fan-out) each re-surface and clear independently", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
 
   // Two sub-agents each park a tool prompt on the SAME session at once.
   s.requestPermission("perm-1", "Bash", { command: "echo a" }, [{ decision: "allow", label: "Allow once" }]);
@@ -112,10 +112,10 @@ test("concurrent permission prompts (sub-agent fan-out) each re-surface and clea
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a session stays awaiting_permission while any prompt is still parked (no mid-fan-out badge clear)", () => {
+test("a session stays awaiting_permission while any prompt is still parked (no mid-fan-out badge clear)", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
 
   s.requestPermission("perm-1", "Bash", { command: "echo a" }, [{ decision: "allow", label: "Allow once" }]);
   s.requestPermission("perm-2", "Bash", { command: "echo b" }, [{ decision: "allow", label: "Allow once" }]);
@@ -133,10 +133,10 @@ test("a session stays awaiting_permission while any prompt is still parked (no m
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("concurrent AskUserQuestion prompts (sub-agent fan-out) each re-surface and clear independently", () => {
+test("concurrent AskUserQuestion prompts (sub-agent fan-out) each re-surface and clear independently", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
 
   const q = (txt: string) => [{ question: txt, header: "H", options: [{ label: "a", description: "" }] }];
   s.requestQuestion("q-1", q("one?"));
@@ -161,7 +161,7 @@ test("supervisor persists sessions and a fresh instance restores them", async ()
   const reg = new ConnectionRegistry();
 
   const sup1 = new Supervisor({ stateDir: dir }, reg);
-  const s = sup1.create(createCmd(dir));
+  const s = await sup1.create(createCmd(dir));
   s.setStatus("thinking"); // advance seq; [BE-1] emit-driven persistence is debounced
   const id = s.id;
   // Let the debounced registry write flush (a real turn always outlives the 100ms window) before
@@ -195,7 +195,7 @@ test("fresh-worktree session: create checks out a worktree, kill removes it", as
   git(["commit", "-q", "-m", "init"]);
 
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create({
+  const s = await sup.create({
     v: PROTOCOL_VERSION,
     ts: "t",
     type: "session.create",
@@ -216,15 +216,15 @@ test("fresh-worktree session: create checks out a worktree, kill removes it", as
   rmSync(repo, { recursive: true, force: true });
 });
 
-test("adversarial review defaults off, honours the create flag, and is togglable", () => {
+test("adversarial review defaults off, honours the create flag, and is togglable", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
 
   // Default: off (opt-in) unless the create command asks for it.
-  const off = sup.create(createCmd(dir));
+  const off = await sup.create(createCmd(dir));
   expect(off.data.adversarialReview).toBe(false);
 
-  const on = sup.create({ ...createCmd(dir), adversarialReview: true });
+  const on = await sup.create({ ...createCmd(dir), adversarialReview: true });
   expect(on.data.adversarialReview).toBe(true);
 
   // Runtime toggle (session.set_adversarial_review) flips it and persists.
@@ -239,7 +239,7 @@ test("adversarial review defaults off, honours the create flag, and is togglable
 test("killing a session removes it and its state dir", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
   const stateSub = join(dir, "sessions", s.id);
   expect(existsSync(stateSub)).toBe(true);
 
