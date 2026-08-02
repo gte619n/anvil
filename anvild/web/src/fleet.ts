@@ -34,10 +34,11 @@ export interface FleetDeps {
   sessions: Map<string, Session>;
   /** The merged environment list (main owns it; removeServer drops a gone server's rows). */
   environments: Map<string, Environment>;
-  /** Autopilot stale-run backstop for a server (main's `clearStaleRunTimer`). */
+  /** Autopilot stale-run backstop for a server (autopilot.ts's `clearStaleRunTimer`, passed through
+   *  by main — fleet.ts can't import autopilot.ts, which imports this module). */
   clearStaleRunTimer(url: string): void;
-  /** Drop a removed server's autopilot schedule entry (main's `serverSchedule.delete` — the map is a
-   *  `const` declared thousands of lines into main.ts, so it's injected as a lazy call, not a value). */
+  /** Drop a removed server's autopilot schedule entry (autopilot.ts's `serverSchedule.delete`,
+   *  passed through by main as a call for the same no-cycle reason). */
   deleteServerSchedule(url: string): void;
   reflectAutopilotRunning(): void;
   updateAutopilotBadge(): void;
