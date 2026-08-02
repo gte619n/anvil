@@ -33,7 +33,7 @@ import { ui } from "./state";
 import { clearCardMaps, toast } from "./dialogs";
 import { envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, type Server } from "./fleet";
-import { isAndroidApp } from "./push";
+import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
 import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session } from "../../protocol";
@@ -86,6 +86,11 @@ export const conversation = $("#conversation");
 // `ui.stickToBottom` lives in state.ts — main's selectSession also re-pins it on session open.
 export const scrollDown = (force = false): void => {
   if (force) ui.stickToBottom = true;
+  // [WEB2-9] Snapshot replay is batched: every appended message used to scroll here, and each scroll
+  // is a forced layout (scrollHeight read + scrollTop write) over an ever-growing pane — O(n²), which
+  // froze large transcripts. During replay the appends skip the scroll entirely; main's
+  // conversation.snapshot handler issues ONE scrollDown after clearing the flag.
+  if (ui.replayingSnapshot) return;
   if (ui.stickToBottom) conversation.scrollTop = conversation.scrollHeight;
 };
 

@@ -11,15 +11,10 @@ import { apiFetch } from "./api";
 import { $, icon } from "./dom";
 import { selectSession, sessions } from "./main";
 import { toast } from "./dialogs";
+// The bridge handle + platform flags live in platform.ts (a dependency-free leaf) so modules that
+// only need `isAndroidApp`/`nativeBridge` don't get pulled into this module's main.ts cycle.
+import { nativeBridge } from "./platform";
 
-// Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
-export const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;
-// The Android WebView shell can't host a second window (no onCreateWindow / multi-window support), so
-// window.open() there is a dead end (a chrome-less, Back-less, unscrollable takeover). The reader's
-// "pop out" therefore opens an in-app full-screen overlay on Android instead of a standalone window
-// (macOS gets a real NSWindow, the web a real tab). The Apple shell doesn't expose AnvilNative, so
-// this matches the Android app specifically, not Mac.
-export const isAndroidApp = !!nativeBridge && /Android/i.test(navigator.userAgent);
 if (nativeBridge) {
   nativeBridge.onmessage = (e) => {
     try {

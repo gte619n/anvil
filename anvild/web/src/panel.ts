@@ -30,7 +30,7 @@ import { $, esc, icon, linkifyUrls } from "./dom";
 import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { currentTheme } from "./theme";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
-import { isAndroidApp } from "./push";
+import { isAndroidApp } from "./platform";
 import { conversation, copyText, humanSize, references, relTime, runMermaid } from "./conversation";
 import type { DirEntry, FileContent, GitResultEvent, GitStatus, Session } from "../../protocol";
 

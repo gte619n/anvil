@@ -33,7 +33,7 @@ import { currentTheme, updateThemeControls } from "./theme";
 import type { ThemePref } from "./theme";
 import { ui } from "./state";
 import { dismissOverlay, openOverlay } from "./overlays";
-import { nativeBridge } from "./push";
+import { nativeBridge } from "./platform";
 import { refreshSetupState } from "./setup";
 import { stripeColor } from "./sessionColor";
 import { newCid } from "./outbox";

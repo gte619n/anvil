@@ -1327,6 +1327,10 @@ function handleSessionEvent(e: ServerEvent): void {
       ui.replayingSnapshot = true;
       renderSnapshotEvents(e.events);
       ui.replayingSnapshot = false;
+      // [WEB2-9] Replay is batched: scrollDown is a no-op while `replayingSnapshot` is set (each call
+      // forces a layout — O(n²) on large transcripts), so issue the ONE scroll for the whole snapshot
+      // here. Unforced: it follows the bottom exactly as the per-message calls used to.
+      scrollDown();
       // A replayed history has no `result` event, so the last turn's activity block was rebuilt
       // "live" — finalize it so it shows "Worked" instead of an eternally spinning "Working". If the
       // session is actually mid-turn, the live status/message events that follow re-light it.
