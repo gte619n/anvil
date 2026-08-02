@@ -87,9 +87,20 @@ jobs:
           tag="${{ steps.v.outputs.tag }}"
           # [CI2-12] Tag the commit actually CHECKED OUT (= release_ref when a manual run pins one;
           # identical to $GITHUB_SHA otherwise) so the commit↔version audit trail stays truthful.
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$(git rev-parse HEAD)" \
-                 --title "$tag" --notes "Automated full release $tag."
+          # Retried: the releases API intermittently answers a transient 403 ("Resource not accessible
+          # by integration") — observed 2026-08-02 sandwiched between two successful creates with the
+          # same token — and one flake here otherwise kills the whole release run.
+          for attempt in 1 2 3; do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+              || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$(git rev-parse HEAD)" \
+                   --title "$tag" --notes "Automated full release $tag."; then
+              exit 0
+            fi
+            echo "release create attempt $attempt failed — retrying in 10s…"
+            sleep 10
+          done
+          echo "::error::could not create release $tag after 3 attempts"
+          exit 1
 
   # ── merge gate, re-run at release time so no untested artifact ever ships ─────────────────────
   # Mirrors ci.yml. Every ship job below `needs:` this, so a red typecheck/build/test halts the whole
