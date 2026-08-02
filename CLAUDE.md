@@ -16,6 +16,29 @@ Tailscale. Start with [`README.md`](README.md) for the product overview and
 | `docs/` | `ARCHITECTURE.md`, `plans/` (design docs + the wire protocol `anvil-protocol.ts`), and the improvement program (`plans/anvil-improvement-program.md`). |
 | `scripts/`, `anvild/scripts/` | Build/release/signing + service management (`service.sh`, `merge-session.sh`). |
 
+**The session supervisor (`anvild/src/session/supervisor.ts`) is decomposed into domain services**
+(P7, behavior-preserving; see `docs/plans/2026-08-01-improvement-program-v2-decisions.md`). The
+supervisor owns session lifecycle + the WS event fan-out and delegates cohesive domains to
+injected-deps modules in `src/session/`: `integrations-facade.ts` (Todoist/lapo),
+`account-roster-service.ts` (multi-account roster), `environment-service.ts` (project
+CRUD/clone/README), `git-projection-service.ts` (git status + PR badges/sweep),
+`team-coordinator.ts` (team plans/spawn/relay/integration), `autopilot-service.ts` (work-unit
+plans, runs, dev pipeline, scheduler — owns the WorkUnit/schedule stores). Each has a `*Deps`
+interface documenting exactly what supervisor state it touches, and a guard test in `test/unit/`.
+`BadCommand` lives in `src/session/errors.ts`. When adding to one of these domains, edit the
+service, not the supervisor's thin delegation. `src/server/http.ts` routes REST through a
+method+path route table (`route`/`routeRe`) with a top-level try/catch→500 — register new
+endpoints there, don't add `if` ladders.
+
+**The web client is likewise decomposed** (`anvild/web/src/`): `main.ts` (~2000 lines) keeps boot,
+the event router, and session selection; the seams live in `fleet.ts` (multi-server sockets +
+fleet admin), `sidebar.ts`, `conversation.ts`, `autopilot.ts`, `settings.ts`, `composer.ts`,
+`panel.ts`, and `dialogs.ts` (modals/toast — a low-level leaf). Each seam gets its cross-boundary
+needs via an `initX(deps)` call from main.ts (no seam imports main.ts); scalars REASSIGNED across
+modules live on the `ui` object in `state.ts` (read its header — this is the TDZ/WEB2-1 discipline),
+while in-place Maps/Sets are `const` exports of their owning module. New dialog code should use
+`modalPromise`/`showModal` (focus-trapped, aria-correct) and the `busy()` button helper in `dom.ts`.
+
 The wire protocol is the source of truth for daemon↔client contracts:
 `docs/plans/anvil-protocol.ts` (symlinked as `anvild/protocol.ts`, imported as `@protocol`;
 `PROTOCOL_VERSION` is currently **4**). Two contract tests in `anvild/test/contract/` guard it:

@@ -514,610 +514,639 @@ export function createServer(opts: ServerOptions): ServerHandle {
     }
   })();
 
-  async function handle(req: Request, srv: typeof server, url: URL): Promise<Response | undefined> {
-      // [SEC2-2] Origin gate on every state-mutating /api route (defense-in-depth on the browser vector).
-      // WS is gated at /ws; the REST mutating routes were reachable via a CORS "simple request" (a
-      // no-preflight text/plain POST still carries Origin). Reject a foreign browser origin here so a page
-      // in a trusted device's browser can't drive update/fleet/daemon/permission/session/push mutations.
-      // Native clients (no Origin), the same-origin PWA, and same-tailnet fleet peers are all allowed.
-      if (url.pathname.startsWith("/api/") && (req.method === "POST" || req.method === "PUT" || req.method === "DELETE")) {
-        if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
-          return new Response("forbidden origin", { status: 403 });
-        }
-      }
+  type Srv = ReturnType<typeof Bun.serve<ConnState>>;
+  /** Per-request context handed to route handlers: the caller-identity resolvers ([SEC2-3]) and the
+   *  Bun server (for `requestIP`/`upgrade`). Built once per request in `handle`. */
+  interface ReqCtx {
+    srv: Srv;
+    /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback. */
+    callerIdentity: () => Promise<{ trust: PeerTrust; reject?: string }>;
+    /** [SEC2-3 refinement] A purely-LOCAL process on the box — loopback peer with NO injected
+     *  `Tailscale-User-Login` header — is inside the trust boundary already (e.g. the native macOS
+     *  updater hitting the REST route directly on localhost, not via `tailscale serve`). It's classified
+     *  `otherUser` ("local caller without a Tailscale identity") only because it presents no identity, so
+     *  the update routes permit it. NB: a loopback caller WITH a header is a serve-proxied tailnet user —
+     *  if that header resolves to a DIFFERENT user, callerIdentity still returns otherUser and we still
+     *  reject (this exception requires the ABSENCE of a header, so it can't wave a foreign user through). */
+    localNoIdentityCaller: boolean;
+  }
+  type RouteHandler = (req: Request, url: URL, m: RegExpExecArray | null, ctx: ReqCtx) => Promise<Response | undefined> | Response | undefined;
 
-      /** Resolve who is calling, peer-address first (§7 · HJ-37). Never trust the header off loopback.
-       *  Hoisted to the top of the handler so the update/daemon routes (which precede the fleet block in
-       *  the ladder) can reuse it for their [SEC2-3] identity gate. */
-      const callerIdentity = async (): Promise<{ trust: PeerTrust; reject?: string }> =>
+  // [P7] Method+path route table (replaces the former 560-line if-ladder). Static routes match on
+  // "METHOD pathname" exactly; pattern routes are tried in order (method "*" = the handler narrows the
+  // method itself, e.g. the attachments 405). Dispatch wraps the handler in a try/catch→500, which
+  // kills the BE2-10 crash-500 class for good: an unexpected throw used to reject through fetch(),
+  // producing an unlogged, CORS-less 500.
+  const routes = new Map<string, RouteHandler>();
+  const patterns: { method: string; re: RegExp; handler: RouteHandler }[] = [];
+  const route = (method: string, path: string, handler: RouteHandler): void => void routes.set(`${method} ${path}`, handler);
+  const routeRe = (method: string, re: RegExp, handler: RouteHandler): void => void patterns.push({ method, re, handler });
+
+  /** Tolerant JSON body: a missing/garbled body parses as {} — the route validates its own fields. */
+  const jsonBody = async <T>(req: Request): Promise<Partial<T>> => (await req.json().catch(() => ({}))) as Partial<T>;
+  /** [P7 DRY] The strict-body shape the copy-pasted push/adb handlers shared: parse + handle inside
+   *  one try, so a garbled body — or a throwing handler, matching the old inline try/catch — is a 400. */
+  const withJsonBody =
+    <T>(fn: (body: T) => Response | Promise<Response>, badRequest = "bad request"): RouteHandler =>
+    async (req) => {
+      try {
+        return await fn((await req.json()) as T);
+      } catch {
+        return new Response(badRequest, { status: 400 });
+      }
+    };
+
+  /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
+   *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
+  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
+    // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
+    // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
+    // anything.
+    const before = supervisor.tokensBySession();
+    // Adopt the roster BEFORE setClaudeToken, so the token being set is already consistent with the
+    // roster those sessions will resolve against (§7.3). Absent `accounts` (an older hub) leaves
+    // today's behaviour bit-for-bit unchanged.
+    if (body.accounts) {
+      try {
+        accounts.adoptReplica(body.accounts);
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+    }
+    try {
+      setClaudeToken(String(body.token ?? "")); // also clears the degrade marker + failure counter
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+    // Siblings are best-effort: a bad Todoist token must not fail a pair that already succeeded in
+    // handing over the credential that matters (HJ-24/HJ-27 — present keys overwrite).
+    if (body.openRouterKey) {
+      try {
+        setOpenRouterKey(body.openRouterKey);
+      } catch (e) {
+        console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    if (body.todoistToken) {
+      void supervisor.connectTodoist(body.todoistToken).catch((e: unknown) => console.warn(`[fleet] pushed Todoist token rejected: ${e instanceof Error ? e.message : e}`));
+    }
+    supervisor.authDegrade.recover();
+    supervisor.broadcastAuthState();
+    if (body.accounts) supervisor.broadcastAccounts();
+    void supervisor.restartIdleSessionsForNewToken(before);
+    return null;
+  };
+
+  route("GET", "/api/health", () => {
+    const auth = resolveAuthStatus({ accounts });
+    const body: rest.HealthResponse = {
+      ok: true,
+      // Honest now (§4.2): false for an absent token AND for an `sk-ant-api…` value. Note the daemon
+      // still answers `ok: true` — "up but unauthed" is the state this pair of fields has always
+      // modelled; headless-join is what made it reachable.
+      subscriptionAuthOk: auth.subscriptionAuthOk,
+      version: VERSION,
+      serverId: identity.serverId,
+      serverName: identity.serverName,
+      budget: supervisor.budget(),
+      // Discovery is REST — a hub has no WS session with a machine it hasn't joined yet — so the
+      // capability list a client normally reads off `server.hello` is mirrored here (HJ-32/§3.5).
+      // Deliberately NOT included: this window's arm-state, which would broadcast an open
+      // credential window to the whole tailnet (HJ-9).
+      capabilities: [...SERVER_CAPABILITIES],
+      // Frozen update API version + boot smoke result. A hub reads updateApiVersion off health
+      // (discovery is REST) to route this member through the stable path; the watchdog polls
+      // health and treats webBundleOk:false as NOT-healthy (spec §4.3/D14).
+      updateApiVersion: UPDATE_API_VERSION,
+      webBundleOk: webBundleOk(WEB_DIR),
+    };
+    return Response.json(body);
+  });
+
+  // ── Frozen update API v1 (stable-update-service spec §4.3) ────────────────────────────────────
+  // GET check (no mutation), POST apply (pull to a pinned target + restart), GET status (observe).
+  route("GET", "/api/update/v1/check", async () => Response.json(await updateCheck(updateDeps)));
+  route("POST", "/api/update/v1/apply", async (req, _url, _m, ctx) => {
+    // [SEC2-2] Require a JSON content-type. A cross-origin CORS "simple request" (text/plain, no
+    // preflight) can't set this, so a no-cors drive-by can't reach the apply path even if the Origin
+    // check were somehow bypassed; a body-less/wrong-type POST is rejected before we mutate anything.
+    const ct = (req.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
+    // [SEC2-3] Identity gate — parity with /api/fleet/*: a PROVEN different tailnet user must not be
+    // able to pin this member's checkout + force a restart onto it. sameUser/unknown proceed; a purely
+    // local process on the box (loopback, no header — e.g. the native macOS updater) is also allowed.
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const bodyReq = (await jsonBody<rest.update.ApplyRequest>(req)) as rest.update.ApplyRequest;
+    const result = await updateApply({ targetSha: bodyReq.targetSha }, updateDeps);
+    return Response.json(result, { status: result.ok ? 200 : 500 });
+  });
+  route("GET", "/api/update/v1/status", () => Response.json(updateStatus(updateDeps)));
+
+  // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
+  // /api/health, return the Anvil daemons found (deduped by serverId) as add-suggestions.
+  route("GET", "/api/fleet/discover", async () => {
+    const body = await discoverFleet({ port: opts.port, selfServerId: identity.serverId });
+    return Response.json(body satisfies rest.FleetDiscoverResponse);
+  });
+
+  // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
+  // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
+  route("GET", "/api/fleet/members", () => {
+    // [BE2-10] Both heals are fire-and-forget so a slow/failed probe never blocks (or 500s) this GET;
+    // the healed url/serverId lands on the next poll. The endpoint must always answer fast with the
+    // current roster.
+    void healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
+    void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP
+    void reconcileFleetMembers(); // [BE2-12] converge any pending-offline member to the pinned target
+    return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
+  });
+  // Read-only roster for the session-start picker, readable from ANY origin so a member's client
+  // can render it. Masked previews only — never a raw token (§11).
+  route("GET", "/api/fleet/accounts", () => {
+    const snap = accounts.snapshot();
+    const paired = pairedHub.get();
+    return Response.json({
+      rev: snap.rev,
+      ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
+      role: snap.role,
+      ...(paired ? { hubServerId: paired.hubServerId } : {}),
+      accounts: accounts.publicList(),
+    } satisfies rest.FleetAccountsResponse);
+  });
+  // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
+  route("GET", "/api/fleet/peers", async () => Response.json((await tailnetPeers()) satisfies rest.FleetPeersResponse));
+  route("POST", "/api/fleet/invite", async (req) => {
+    const { host, code } = await jsonBody<rest.FleetInviteRequest>(req);
+    if (!host || !code) return new Response("host and code required", { status: 400 });
+    // Resolve the joiner's tailnet IP up front so a plain-http member is recorded at its DNS-free
+    // http://<ip> url rather than a MagicDNS name (which strands the member the moment MagicDNS drops).
+    const memberIp = await peerIPv4(host);
+    // Ask the joiner what it speaks BEFORE pushing, so the destination is a lookup rather than a
+    // guess (HJ-15/§3.5). A peer that answers without capabilities is a pre-capability daemon →
+    // :7702. `invitePeer` still falls back on a 404/405 from :7701, for an un-upgraded Mac that
+    // answers on the daemon port but has no such route.
+    const preflight = await resolveMember(host, opts.port, undefined, memberIp);
+    const outcome = await invitePeer({
+      host,
+      ...(memberIp ? { ip: memberIp } : {}),
+      code,
+      token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
+      hubServerId: identity.serverId,
+      capabilities: preflight.capabilities,
+      port: opts.port,
+      // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
+      ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
+      ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+      // The whole roster rides the first join too, so a new member arrives with every account
+      // instead of only the mirrored default (§7.3).
+      ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
+    });
+    if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
+    // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
+    // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
+    // breaks targeted token propagation (members are matched by serverId).
+    const resolved = await resolveMember(host, opts.port, undefined, memberIp);
+    // Record the rev the joiner confirmed taking, exactly as `pushRosterToMembers` does after a
+    // rotation. Without it a freshly-paired member sits at an undefined rev and the Servers tab
+    // reports "out of date — press Sync now" about a member that is in fact perfectly in sync,
+    // until the next roster edit happens to paper over it. `invitePeer` reports what it actually
+    // sent, so this can't drift from the capability gate.
+    const member: rest.FleetMember = {
+      serverId: resolved.serverId || outcome.serverId || host,
+      serverName: outcome.serverName || resolved.serverName || host,
+      host,
+      url: resolved.url,
+      ...(outcome.accountsRev !== undefined ? { accountsRev: outcome.accountsRev } : {}),
+    };
+    fleet.upsert(member);
+    // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately
+    // AFTER the upsert: the joiner staying armed through a lost reply is the failure mode this
+    // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
+    void ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
+    pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
+    return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
+  });
+
+  // ── Joiner side: receive credentials on this daemon's own port (headless-join §5.3) ────────
+  // These are what let a NON-Mac machine be added to a fleet at all: the macOS Server.app's :7702
+  // listener has no Linux equivalent, and until Phase 1 a tokenless machine had no running daemon
+  // to host one anyway. Default closed, code + tailnet identity gated; see §8.2 for the full list.
+
+  // Arm a join window on THIS machine and show its code. The code lives in exactly one place —
+  // this UI (HJ-13) — so there is no log or CLI fallback to scrape.
+  route("POST", "/api/fleet/arm", async (req) => {
+    const { ttlMs } = await jsonBody<rest.FleetArmRequest>(req);
+    const { code, expiresAt } = pairWindow.arm(ttlMs ?? DEFAULT_ARM_TTL_MS);
+    const host = await supervisor.selfHost();
+    console.log(`[fleet] pairing window open for ${Math.round((expiresAt - Date.now()) / 60_000)} min`);
+    return Response.json({ ok: true, code, expiresAt: new Date(expiresAt).toISOString(), ...(host ? { host } : {}) } satisfies rest.FleetArmResponse);
+  });
+  route("DELETE", "/api/fleet/arm", () => {
+    pairWindow.disarm();
+    return Response.json({ ok: true } satisfies rest.FleetArmResponse);
+  });
+  // This machine's own setup state, for its takeover screen. Arm-state is exposed HERE and not on
+  // /api/health precisely because health is the unauthenticated, tailnet-wide surface (HJ-9).
+  route("GET", "/api/fleet/arm", async () => {
+    const w = pairWindow.state();
+    const host = await supervisor.selfHost();
+    const hub = pairedHub.get();
+    return Response.json({
+      armed: w !== null,
+      ...(w ? { code: w.code, expiresAt: new Date(w.expiresAt).toISOString() } : {}),
+      ...(host ? { host } : {}),
+      hasToken: (process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim().length > 0,
+      ...(hub ? { hubServerId: hub.hubServerId } : {}),
+      serverId: identity.serverId,
+      serverName: identity.serverName,
+    } satisfies rest.FleetArmStatusResponse);
+  });
+
+  // First join: code-gated + identity-gated. Mirrors /anvil-pair's semantics and its rejection
+  // vocabulary (Pairing.swift:129) so the two paths stay recognisably the same gate.
+  route("POST", "/api/fleet/pair", async (req, _url, _m, ctx) => {
+    const body = await jsonBody<rest.FleetPairRequest>(req);
+    const reject = (error: string, status = 403): Response => {
+      // Coalesce to at most one notification per armed window, with a count; an UNARMED machine
+      // logs but never notifies, so a tailnet scanner can't use this as a doorbell (HJ-33).
+      const alert = pairWindow.claimRejectionAlert();
+      console.warn(`[fleet] pair rejected: ${error}`);
+      if (alert.notify) supervisor.pushSystemAlert("Pairing attempt rejected", `Someone tried to pair this machine and was turned away (${error}).`, "pair-rejected");
+      return Response.json({ ok: false, error } satisfies rest.FleetPairResponse, { status });
+    };
+    if (!body.token || !body.hubServerId) return reject("bad request", 400);
+
+    const who = await ctx.callerIdentity();
+    // A caller whois says is a DIFFERENT tailnet user is rejected even with a correct code.
+    if (who.trust === "otherUser") return reject(who.reject ?? "different tailnet user");
+    // whois-unknown falls back to code-only, matching `notOtherUser` (Pairing.swift:118).
+
+    const codeError = pairWindow.accept(String(body.code ?? ""), body.hubServerId);
+    if (codeError) return reject(codeError, codeError === "not accepting pairings" ? 409 : 403);
+
+    const failure = adoptCredentials(body);
+    if (failure) return reject(failure, 400);
+    pairedHub.record(body.hubServerId, body.fleetName);
+    console.log(`[fleet] paired with hub ${body.hubServerId}${body.fleetName ? ` (${body.fleetName})` : ""}`);
+    supervisor.pushSystemAlert("Joined the fleet", `This machine now shares ${body.fleetName ? `the ${body.fleetName}` : "your"} Claude login.`, "pair-ok");
+    // Stay armed until the hub ACKs (HJ-16) — the window is now locked to this hub (HJ-17), which
+    // is what makes leaving it open a strictly smaller surface than a fresh one.
+    const self = await supervisor.selfBaseUrl();
+    return Response.json({
+      ok: true,
+      serverId: identity.serverId,
+      serverName: identity.serverName,
+      ...(self ? { url: self } : {}),
+    } satisfies rest.FleetPairResponse);
+  });
+
+  // The hub confirms the member is recorded → disarm. Gated exactly as /pair is, and the body must
+  // carry the SAME hubServerId and code the window locked to — otherwise any tailnet peer could
+  // POST this and cancel someone else's pairing window mid-flow. Idempotent by design.
+  route("POST", "/api/fleet/pair/ack", async (req, _url, _m, ctx) => {
+    const body = await jsonBody<rest.FleetPairAckRequest>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    if (!body.hubServerId || !pairWindow.ack(String(body.code ?? ""), body.hubServerId)) {
+      return Response.json({ ok: false, error: "not your pairing window" }, { status: 403 });
+    }
+    return Response.json({ ok: true });
+  });
+
+  // Rotation counterpart: identity-gated, NOT code-gated — persistent rather than armed, so the hub
+  // can push a refreshed token unattended. `hubServerId` is an anti-confusion check, not a
+  // credential: read §8.6 before reading this as "rotation is authenticated". The real gate is
+  // same-user tailnet reachability, so `unknown` trust is NOT enough here (unlike a coded pair).
+  route("POST", "/api/fleet/token", async (req, _url, _m, ctx) => {
+    const body = await jsonBody<rest.FleetTokenRequest>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust !== "sameUser") return Response.json({ ok: false, error: who.reject ?? "untrusted tailnet user" }, { status: 403 });
+    const hub = pairedHub.get();
+    if (!hub || !body.hubServerId || body.hubServerId !== hub.hubServerId) {
+      return Response.json({ ok: false, error: "unknown hub" }, { status: 403 });
+    }
+    const failure = adoptCredentials(body);
+    if (failure) return Response.json({ ok: false, error: failure }, { status: 400 });
+    console.log(`[fleet] token rotated by hub ${hub.hubServerId}`);
+    return Response.json({ ok: true, serverId: identity.serverId, serverName: identity.serverName } satisfies rest.FleetPairResponse);
+  });
+
+  // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
+  // here so this daemon can run autopilot for its own linked environments. Validated against the
+  // Todoist API before it's stored (mode 0600); tailnet-gated like the rest of the daemon API.
+  route("POST", "/api/integrations/todoist", async (req) => {
+    const { token } = await jsonBody<{ token?: string }>(req);
+    if (!token) return Response.json({ ok: false, error: "token required" }, { status: 400 });
+    try {
+      const ev = await supervisor.connectTodoist(token);
+      // Echo this daemon's identity so the hub can heal a stale fleet record (real serverId, and
+      // the URL it actually reached us on) off the same POST — no extra probe needed.
+      return Response.json({ ok: true, account: ev.account, serverId: identity.serverId, serverName: identity.serverName });
+    } catch (e) {
+      return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+    }
+  });
+  // lapo OAuth2 authorization-code callback: lapo redirects the user's browser here with ?code&state
+  // after they authorize. Exchange the code for tokens (validated + stored by the supervisor) and
+  // return a tiny HTML page that reports the outcome and closes itself. The main app updates live off
+  // the broadcast lapo.status, so this window closing (or not) doesn't matter to the connection.
+  route("GET", "/api/integrations/lapo/callback", async (_req, url) => {
+    const err = url.searchParams.get("error");
+    const code = url.searchParams.get("code") ?? "";
+    const state = url.searchParams.get("state") ?? "";
+    if (err) return lapoCallbackPage(false, `lapo denied the authorization: ${err}`);
+    if (!code || !state) return lapoCallbackPage(false, "The authorization response was missing its code or state.");
+    try {
+      const { account } = await supervisor.completeLapoAuth(code, state);
+      return lapoCallbackPage(true, account ? `Connected as ${account}.` : "Connected.");
+    } catch (e) {
+      return lapoCallbackPage(false, e instanceof Error ? e.message : String(e));
+    }
+  });
+
+  // "Sync now" — trigger an outbound roster push to this hub's own members. Identity-gated like the
+  // rest of the credential surface: a confirmed DIFFERENT tailnet user must not be able to drive a
+  // fleet credential operation, closing the asymmetry with /api/fleet/token (which ADOPTS a pushed
+  // token and so demands the stricter `sameUser`). Rotate only re-pushes tokens we already hold to
+  // members we already paired — it discloses nothing to the caller — so it takes /pair's posture
+  // instead: reject a proven `otherUser`, but stay permissive when identity is unprovable (`unknown`,
+  // e.g. whois momentarily down) rather than fail an operator's Sync now intermittently.
+  route("POST", "/api/fleet/rotate", async (_req, _url, _m, ctx) => {
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const results = await pushRosterToMembers();
+    return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
+  });
+  // Hub-orchestrated fleet update (spec §4.4). Same identity posture as /api/fleet/rotate — a
+  // fleet-wide mutating action, so reject a PROVEN other tailnet user but stay permissive when
+  // identity is unprovable (whois momentarily down) rather than fail an operator intermittently.
+  route("POST", "/api/fleet/update", async (req, _url, _m, ctx) => {
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const bodyReq = (await jsonBody<rest.FleetUpdateRequest>(req)) as rest.FleetUpdateRequest;
+    const result = await fleetRollout.start({ targetSha: bodyReq.targetSha });
+    return Response.json(result satisfies rest.FleetUpdateResponse, { status: result.ok ? 200 : 409 });
+  });
+  route("GET", "/api/fleet/update/status", () => Response.json(fleetRollout.status() satisfies rest.FleetUpdateStatusResponse));
+
+  routeRe("DELETE", /^\/api\/fleet\/members\/([^/]+)$/, (_req, _url, m) => {
+    fleet.remove(decodeURIComponent(m![1]!));
+    return Response.json({ ok: true });
+  });
+
+  // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint
+  route("GET", "/api/adb/info", async () => Response.json({ serverIps: lanIPv4(), devices: (await runAdb(["devices", "-l"])).output }));
+  route(
+    "POST",
+    "/api/adb/connect",
+    withJsonBody<{ host?: string; port?: number }>(async ({ host, port }) => {
+      if (!host || !port) return new Response("host and port required", { status: 400 });
+      return Response.json(await runAdb(["connect", adbTarget(host, port)]));
+    }),
+  );
+  route(
+    "POST",
+    "/api/adb/pair",
+    withJsonBody<{ host?: string; port?: number; code?: string }>(async ({ host, port, code }) => {
+      if (!host || !port || !code) return new Response("host, port, code required", { status: 400 });
+      const r = await runAdb(["pair", adbTarget(host, port), String(code)]);
+      return Response.json({ ok: /success/i.test(r.output), output: r.output });
+    }),
+  );
+
+  // Daemon self-update (arch §5): GET checks whether an update is available; POST applies it
+  // (pull + rebuild + restart). Mirrors the `daemon.update` WS command for native clients
+  // (the macOS menu command) and scripts that have no open WebSocket.
+  const daemonUpdate: RouteHandler = async (req, _url, _m, ctx) => {
+    // [SEC2-3] Identity gate on the mutating (POST = apply) path only; GET is a read-only check.
+    // Parity with /api/fleet/* and /api/update/v1/apply — reject a proven different tailnet user.
+    if (req.method === "POST") {
+      const who = await ctx.callerIdentity();
+      if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) {
+        return Response.json({ ok: false, phase: "error", output: who.reject ?? "different tailnet user", currentVersion: VERSION } satisfies rest.DaemonUpdateResponse, { status: 403 });
+      }
+    }
+    const result = await supervisor.daemonUpdate(req.method === "GET");
+    const body: rest.DaemonUpdateResponse = {
+      ok: result.ok,
+      phase: result.phase,
+      output: result.output,
+      currentVersion: result.currentVersion,
+      ...(result.behind !== undefined ? { behind: result.behind } : {}),
+      ...(result.willRestart !== undefined ? { willRestart: result.willRestart } : {}),
+    };
+    return Response.json(body, { status: result.ok ? 200 : 500 });
+  };
+  route("GET", "/api/daemon/update", daemonUpdate);
+  route("POST", "/api/daemon/update", daemonUpdate);
+
+  // environment README (arch §8): rendered markdown for the settings/management view
+  routeRe("GET", /^\/api\/environments\/([^/]+)\/readme$/, (_req, _url, m) => {
+    try {
+      return Response.json(supervisor.envReadme(m![1]!) satisfies rest.EnvReadmeResponse);
+    } catch (e) {
+      return new Response(e instanceof Error ? e.message : "not found", { status: 404 });
+    }
+  });
+
+  // Web Push (arch §6.7): VAPID public key + browser subscription management
+  route("GET", "/api/push/key", () => Response.json({ publicKey: supervisor.webpush.publicKey }));
+  route(
+    "POST",
+    "/api/push/subscribe",
+    withJsonBody<never>((body) => {
+      supervisor.webpush.subscribe(body);
+      return Response.json({ ok: true });
+    }, "bad subscription"),
+  );
+  // Answer a parked permission prompt over REST — lets a native notification action button
+  // resolve Allow/Deny without an open WebSocket (arch §6.6).
+  route("POST", "/api/permission/respond", async (req) => {
+    try {
+      const { requestId, decision, updatedInput } = (await req.json()) as {
+        requestId?: string;
+        decision?: PermissionDecision;
+        updatedInput?: unknown;
+      };
+      if (!requestId || (decision !== "allow" && decision !== "deny" && decision !== "allow_always")) {
+        return new Response("bad request", { status: 400 });
+      }
+      supervisor.resolvePermission(requestId, decision, updatedInput);
+      return Response.json({ ok: true });
+    } catch (e) {
+      // BadCommand → the request was already answered or expired; treat as gone, not a server error.
+      return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 409 });
+    }
+  });
+  // Un-stick a session over REST (parity with the WS command) — recovers a missing worktree,
+  // clears parked permissions, and resets status to idle.
+  routeRe("POST", /^\/api\/sessions\/([^/]+)\/reset$/, async (_req, _url, m) => {
+    try {
+      await supervisor.reset(decodeURIComponent(m![1]!));
+      return Response.json({ ok: true });
+    } catch (e) {
+      return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 409 });
+    }
+  });
+  route(
+    "POST",
+    "/api/push/fcm/register",
+    withJsonBody<{ token?: string }>(({ token }) => {
+      if (token) supervisor.fcm.register(token);
+      return Response.json({ ok: true });
+    }),
+  );
+  route(
+    "POST",
+    "/api/push/fcm/unregister",
+    withJsonBody<{ token?: string }>(({ token }) => {
+      if (token) supervisor.fcm.unregister(token);
+      return Response.json({ ok: true });
+    }),
+  );
+  route(
+    "POST",
+    "/api/push/apns/register",
+    withJsonBody<{ token?: string }>(({ token }) => {
+      if (token) supervisor.apns.register(token);
+      return Response.json({ ok: true });
+    }),
+  );
+  route(
+    "POST",
+    "/api/push/apns/unregister",
+    withJsonBody<{ token?: string }>(({ token }) => {
+      if (token) supervisor.apns.unregister(token);
+      return Response.json({ ok: true });
+    }),
+  );
+  route(
+    "POST",
+    "/api/push/unsubscribe",
+    withJsonBody<{ endpoint?: string }>(({ endpoint }) => {
+      if (endpoint) supervisor.webpush.unsubscribe(endpoint);
+      return Response.json({ ok: true });
+    }),
+  );
+
+  routeRe("*", /^\/ws$/, (req, _url, _m, ctx) => {
+    // [SEC-H3] Reject cross-site WebSocket hijack from a foreign browser origin. WS bypasses
+    // CORS, so this is the one place the browser vector can be closed; native clients and the
+    // same-origin PWA are allowlisted in isAllowedWsOrigin.
+    if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
+      return new Response("forbidden origin", { status: 403 });
+    }
+    const data: ConnState = { id: newId("conn"), attached: new Set() };
+    if (ctx.srv.upgrade(req, { data })) return undefined;
+    return new Response("expected a websocket upgrade", { status: 426 });
+  });
+
+  // worktree files (arch §8.1): serve a binary/image file from the session worktree.
+  // `download=1` forces a save-as via Content-Disposition (used by file-offer download cards, §8).
+  const FILES_RE = /^\/api\/sessions\/([^/]+)\/files$/;
+  routeRe("GET", FILES_RE, async (_req, url, m) => {
+    const sessionId = m![1]!;
+    const path = url.searchParams.get("path") ?? "";
+    try {
+      const abs = supervisor.fsResolve(sessionId, path);
+      const file = Bun.file(abs);
+      if (!(await file.exists())) return new Response("not found", { status: 404 });
+      const headers: Record<string, string> = {};
+      if (url.searchParams.get("download")) {
+        const name = (abs.split("/").pop() || "download").replace(/["\\]/g, "_");
+        headers["Content-Disposition"] = `attachment; filename="${name}"`;
+      }
+      return new Response(file, { headers });
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
+  });
+  // Upload a dropped file into the worktree at `path` (streamed raw body, not base64). Refuses
+  // to overwrite an existing path → 409, so a drag-drop can't silently clobber (arch §8.1).
+  routeRe("PUT", FILES_RE, async (req, url, m) => {
+    const sessionId = m![1]!;
+    const path = url.searchParams.get("path") ?? "";
+    try {
+      const data = new Uint8Array(await req.arrayBuffer());
+      const written = supervisor.fsWrite(sessionId, path, data);
+      return Response.json(written);
+    } catch (e) {
+      if (e instanceof FileExists) return new Response("a file with that name already exists", { status: 409 });
+      return new Response(e instanceof Error ? e.message : "upload failed", { status: 403 });
+    }
+  });
+
+  // attachments (arch §6.5): POST uploads a pasted/dropped file, GET serves it back. Method "*":
+  // the handler narrows POST/GET itself so any other method keeps answering 405 (not 404).
+  routeRe("*", /^\/api\/sessions\/([^/]+)\/attachments(?:\/([^/]+))?$/, async (req, _url, m) => {
+    const sessionId = m![1]!;
+    const attId = m![2];
+    if (req.method === "POST" && !attId) {
+      try {
+        const body = (await req.json()) as { name?: string; mediaType?: string; dataBase64?: string };
+        // mediaType may be empty (Android's content picker often omits it); the store infers
+        // it from the filename. Only dataBase64 is strictly required.
+        if (!body.dataBase64) return new Response("dataBase64 required", { status: 400 });
+        const attachment = supervisor.addAttachment(sessionId, body.name ?? "attachment", body.mediaType ?? "", body.dataBase64);
+        return Response.json({ attachment } satisfies rest.UploadAttachmentResponse);
+      } catch (e) {
+        return new Response(e instanceof Error ? e.message : "upload failed", { status: 400 });
+      }
+    }
+    if (req.method === "GET" && attId) {
+      const b = supervisor.attachmentBytes(sessionId, attId);
+      if (!b) return new Response("not found", { status: 404 });
+      return new Response(Bun.file(b.path), { headers: { "Content-Type": b.mediaType, "Cache-Control": "max-age=31536000" } });
+    }
+    return new Response("method not allowed", { status: 405 });
+  });
+
+  async function handle(req: Request, srv: Srv, url: URL): Promise<Response | undefined> {
+    // [SEC2-2] Origin gate on every state-mutating /api route (defense-in-depth on the browser vector).
+    // WS is gated at /ws; the REST mutating routes were reachable via a CORS "simple request" (a
+    // no-preflight text/plain POST still carries Origin). Reject a foreign browser origin here so a page
+    // in a trusted device's browser can't drive update/fleet/daemon/permission/session/push mutations.
+    // Native clients (no Origin), the same-origin PWA, and same-tailnet fleet peers are all allowed.
+    if (url.pathname.startsWith("/api/") && (req.method === "POST" || req.method === "PUT" || req.method === "DELETE")) {
+      if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
+        return new Response("forbidden origin", { status: 403 });
+      }
+    }
+
+    const ctx: ReqCtx = {
+      srv,
+      callerIdentity: async () =>
         resolveCallerIdentity({
           peerAddress: srv.requestIP(req)?.address,
           headerLogin: req.headers.get("Tailscale-User-Login"),
           selfLogin: tailscaleSelfLogin,
           whois: tailscaleWhois,
-        });
+        }),
+      localNoIdentityCaller: isLocalNoIdentityCaller(srv.requestIP(req)?.address, req.headers.get("Tailscale-User-Login")),
+    };
 
-      // [SEC2-3 refinement] A purely-LOCAL process on the box — loopback peer with NO injected
-      // `Tailscale-User-Login` header — is inside the trust boundary already (e.g. the native macOS
-      // updater hitting the REST route directly on localhost, not via `tailscale serve`). It's classified
-      // `otherUser` ("local caller without a Tailscale identity") only because it presents no identity, so
-      // the update routes permit it. NB: a loopback caller WITH a header is a serve-proxied tailnet user —
-      // if that header resolves to a DIFFERENT user, callerIdentity still returns otherUser and we still
-      // reject (this exception requires the ABSENCE of a header, so it can't wave a foreign user through).
-      const localNoIdentityCaller = isLocalNoIdentityCaller(srv.requestIP(req)?.address, req.headers.get("Tailscale-User-Login"));
+    try {
+      const exact = routes.get(`${req.method} ${url.pathname}`);
+      if (exact) return await exact(req, url, null, ctx);
+      for (const p of patterns) {
+        if (p.method !== "*" && p.method !== req.method) continue;
+        const m = p.re.exec(url.pathname);
+        if (m) return await p.handler(req, url, m, ctx);
+      }
+    } catch (e) {
+      // [P7/BE2-10 class] A handler that throws unexpectedly is answered as a clean, logged 500 (with
+      // CORS applied by fetch) instead of rejecting through fetch() — one bad request or record can
+      // no longer take a route down with an opaque, headerless 500.
+      console.error(`[http] ${req.method} ${url.pathname} failed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+      return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+    }
 
-      if (req.method === "GET" && url.pathname === "/api/health") {
-        const auth = resolveAuthStatus({ accounts });
-        const body: rest.HealthResponse = {
-          ok: true,
-          // Honest now (§4.2): false for an absent token AND for an `sk-ant-api…` value. Note the daemon
-          // still answers `ok: true` — "up but unauthed" is the state this pair of fields has always
-          // modelled; headless-join is what made it reachable.
-          subscriptionAuthOk: auth.subscriptionAuthOk,
-          version: VERSION,
-          serverId: identity.serverId,
-          serverName: identity.serverName,
-          budget: supervisor.budget(),
-          // Discovery is REST — a hub has no WS session with a machine it hasn't joined yet — so the
-          // capability list a client normally reads off `server.hello` is mirrored here (HJ-32/§3.5).
-          // Deliberately NOT included: this window's arm-state, which would broadcast an open
-          // credential window to the whole tailnet (HJ-9).
-          capabilities: [...SERVER_CAPABILITIES],
-          // Frozen update API version + boot smoke result. A hub reads updateApiVersion off health
-          // (discovery is REST) to route this member through the stable path; the watchdog polls
-          // health and treats webBundleOk:false as NOT-healthy (spec §4.3/D14).
-          updateApiVersion: UPDATE_API_VERSION,
-          webBundleOk: webBundleOk(WEB_DIR),
-        };
-        return Response.json(body);
-      }
+    // static web client (built into web/dist)
+    const web = await serveWeb(url.pathname);
+    if (web) return web;
 
-      // ── Frozen update API v1 (stable-update-service spec §4.3) ────────────────────────────────────
-      // GET check (no mutation), POST apply (pull to a pinned target + restart), GET status (observe).
-      if (url.pathname === "/api/update/v1/check" && req.method === "GET") {
-        return Response.json(await updateCheck(updateDeps));
-      }
-      if (url.pathname === "/api/update/v1/apply" && req.method === "POST") {
-        // [SEC2-2] Require a JSON content-type. A cross-origin CORS "simple request" (text/plain, no
-        // preflight) can't set this, so a no-cors drive-by can't reach the apply path even if the Origin
-        // check were somehow bypassed; a body-less/wrong-type POST is rejected before we mutate anything.
-        const ct = (req.headers.get("content-type") || "").toLowerCase();
-        if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
-        // [SEC2-3] Identity gate — parity with /api/fleet/*: a PROVEN different tailnet user must not be
-        // able to pin this member's checkout + force a restart onto it. sameUser/unknown proceed; a purely
-        // local process on the box (loopback, no header — e.g. the native macOS updater) is also allowed.
-        const who = await callerIdentity();
-        if (who.trust === "otherUser" && !localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
-        const bodyReq = (await req.json().catch(() => ({}))) as rest.update.ApplyRequest;
-        const result = await updateApply({ targetSha: bodyReq.targetSha }, updateDeps);
-        return Response.json(result, { status: result.ok ? 200 : 500 });
-      }
-      if (url.pathname === "/api/update/v1/status" && req.method === "GET") {
-        return Response.json(updateStatus(updateDeps));
-      }
-
-      // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
-      // /api/health, return the Anvil daemons found (deduped by serverId) as add-suggestions.
-      if (url.pathname === "/api/fleet/discover" && req.method === "GET") {
-        const body = await discoverFleet({ port: opts.port, selfServerId: identity.serverId });
-        return Response.json(body satisfies rest.FleetDiscoverResponse);
-      }
-
-      // Fleet administration (anvil-server-app.md §6): manage the fleet from ANY client (web/Android),
-      // not just the hub's Mac app. The hub daemon distributes its own OAuth token; it's never returned.
-      if (url.pathname === "/api/fleet/members" && req.method === "GET") {
-        // [BE2-10] Both heals are fire-and-forget so a slow/failed probe never blocks (or 500s) this GET;
-        // the healed url/serverId lands on the next poll. The endpoint must always answer fast with the
-        // current roster.
-        void healStaleFleetRecords(); // repair legacy http://-stored members so http-page clients can reach them
-        void healFleetUrlsByDiscovery(); // recover MagicDNS-off members over their tailnet IP
-        void reconcileFleetMembers(); // [BE2-12] converge any pending-offline member to the pinned target
-        return Response.json({ members: fleet.list() } satisfies rest.FleetMembersResponse);
-      }
-      // Read-only roster for the session-start picker, readable from ANY origin so a member's client
-      // can render it. Masked previews only — never a raw token (§11).
-      if (url.pathname === "/api/fleet/accounts" && req.method === "GET") {
-        const snap = accounts.snapshot();
-        const paired = pairedHub.get();
-        return Response.json({
-          rev: snap.rev,
-          ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
-          role: snap.role,
-          ...(paired ? { hubServerId: paired.hubServerId } : {}),
-          accounts: accounts.publicList(),
-        } satisfies rest.FleetAccountsResponse);
-      }
-      // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
-      if (url.pathname === "/api/fleet/peers" && req.method === "GET") {
-        return Response.json((await tailnetPeers()) satisfies rest.FleetPeersResponse);
-      }
-      if (url.pathname === "/api/fleet/invite" && req.method === "POST") {
-        const { host, code } = (await req.json().catch(() => ({}))) as Partial<rest.FleetInviteRequest>;
-        if (!host || !code) return new Response("host and code required", { status: 400 });
-        // Resolve the joiner's tailnet IP up front so a plain-http member is recorded at its DNS-free
-        // http://<ip> url rather than a MagicDNS name (which strands the member the moment MagicDNS drops).
-        const memberIp = await peerIPv4(host);
-        // Ask the joiner what it speaks BEFORE pushing, so the destination is a lookup rather than a
-        // guess (HJ-15/§3.5). A peer that answers without capabilities is a pre-capability daemon →
-        // :7702. `invitePeer` still falls back on a 404/405 from :7701, for an un-upgraded Mac that
-        // answers on the daemon port but has no such route.
-        const preflight = await resolveMember(host, opts.port, undefined, memberIp);
-        const outcome = await invitePeer({
-          host,
-          ...(memberIp ? { ip: memberIp } : {}),
-          code,
-          token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
-          hubServerId: identity.serverId,
-          capabilities: preflight.capabilities,
-          port: opts.port,
-          // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
-          ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
-          ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
-          // The whole roster rides the first join too, so a new member arrives with every account
-          // instead of only the mirrored default (§7.3).
-          ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
-        });
-        if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
-        // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
-        // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
-        // breaks targeted token propagation (members are matched by serverId).
-        const resolved = await resolveMember(host, opts.port, undefined, memberIp);
-        // Record the rev the joiner confirmed taking, exactly as `pushRosterToMembers` does after a
-        // rotation. Without it a freshly-paired member sits at an undefined rev and the Servers tab
-        // reports "out of date — press Sync now" about a member that is in fact perfectly in sync,
-        // until the next roster edit happens to paper over it. `invitePeer` reports what it actually
-        // sent, so this can't drift from the capability gate.
-        const member: rest.FleetMember = {
-          serverId: resolved.serverId || outcome.serverId || host,
-          serverName: outcome.serverName || resolved.serverName || host,
-          host,
-          url: resolved.url,
-          ...(outcome.accountsRev !== undefined ? { accountsRev: outcome.accountsRev } : {}),
-        };
-        fleet.upsert(member);
-        // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately
-        // AFTER the upsert: the joiner staying armed through a lost reply is the failure mode this
-        // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
-        void ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
-        pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
-        return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
-      }
-
-      // ── Joiner side: receive credentials on this daemon's own port (headless-join §5.3) ────────
-      // These are what let a NON-Mac machine be added to a fleet at all: the macOS Server.app's :7702
-      // listener has no Linux equivalent, and until Phase 1 a tokenless machine had no running daemon
-      // to host one anyway. Default closed, code + tailnet identity gated; see §8.2 for the full list.
-      // (`callerIdentity` is hoisted to the top of the handler now — the update/daemon routes reuse it.)
-
-      /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
-       *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-      const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
-        // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
-        // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
-        // anything.
-        const before = supervisor.tokensBySession();
-        // Adopt the roster BEFORE setClaudeToken, so the token being set is already consistent with the
-        // roster those sessions will resolve against (§7.3). Absent `accounts` (an older hub) leaves
-        // today's behaviour bit-for-bit unchanged.
-        if (body.accounts) {
-          try {
-            accounts.adoptReplica(body.accounts);
-          } catch (e) {
-            return e instanceof Error ? e.message : String(e);
-          }
-        }
-        try {
-          setClaudeToken(String(body.token ?? "")); // also clears the degrade marker + failure counter
-        } catch (e) {
-          return e instanceof Error ? e.message : String(e);
-        }
-        // Siblings are best-effort: a bad Todoist token must not fail a pair that already succeeded in
-        // handing over the credential that matters (HJ-24/HJ-27 — present keys overwrite).
-        if (body.openRouterKey) {
-          try {
-            setOpenRouterKey(body.openRouterKey);
-          } catch (e) {
-            console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
-          }
-        }
-        if (body.todoistToken) {
-          void supervisor.connectTodoist(body.todoistToken).catch((e: unknown) => console.warn(`[fleet] pushed Todoist token rejected: ${e instanceof Error ? e.message : e}`));
-        }
-        supervisor.authDegrade.recover();
-        supervisor.broadcastAuthState();
-        if (body.accounts) supervisor.broadcastAccounts();
-        void supervisor.restartIdleSessionsForNewToken(before);
-        return null;
-      };
-
-      // Arm a join window on THIS machine and show its code. The code lives in exactly one place —
-      // this UI (HJ-13) — so there is no log or CLI fallback to scrape.
-      if (url.pathname === "/api/fleet/arm" && req.method === "POST") {
-        const { ttlMs } = (await req.json().catch(() => ({}))) as Partial<rest.FleetArmRequest>;
-        const { code, expiresAt } = pairWindow.arm(ttlMs ?? DEFAULT_ARM_TTL_MS);
-        const host = await supervisor.selfHost();
-        console.log(`[fleet] pairing window open for ${Math.round((expiresAt - Date.now()) / 60_000)} min`);
-        return Response.json({ ok: true, code, expiresAt: new Date(expiresAt).toISOString(), ...(host ? { host } : {}) } satisfies rest.FleetArmResponse);
-      }
-      if (url.pathname === "/api/fleet/arm" && req.method === "DELETE") {
-        pairWindow.disarm();
-        return Response.json({ ok: true } satisfies rest.FleetArmResponse);
-      }
-      // This machine's own setup state, for its takeover screen. Arm-state is exposed HERE and not on
-      // /api/health precisely because health is the unauthenticated, tailnet-wide surface (HJ-9).
-      if (url.pathname === "/api/fleet/arm" && req.method === "GET") {
-        const w = pairWindow.state();
-        const host = await supervisor.selfHost();
-        const hub = pairedHub.get();
-        return Response.json({
-          armed: w !== null,
-          ...(w ? { code: w.code, expiresAt: new Date(w.expiresAt).toISOString() } : {}),
-          ...(host ? { host } : {}),
-          hasToken: (process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim().length > 0,
-          ...(hub ? { hubServerId: hub.hubServerId } : {}),
-          serverId: identity.serverId,
-          serverName: identity.serverName,
-        } satisfies rest.FleetArmStatusResponse);
-      }
-
-      // First join: code-gated + identity-gated. Mirrors /anvil-pair's semantics and its rejection
-      // vocabulary (Pairing.swift:129) so the two paths stay recognisably the same gate.
-      if (url.pathname === "/api/fleet/pair" && req.method === "POST") {
-        const body = (await req.json().catch(() => ({}))) as Partial<rest.FleetPairRequest>;
-        const reject = (error: string, status = 403): Response => {
-          // Coalesce to at most one notification per armed window, with a count; an UNARMED machine
-          // logs but never notifies, so a tailnet scanner can't use this as a doorbell (HJ-33).
-          const alert = pairWindow.claimRejectionAlert();
-          console.warn(`[fleet] pair rejected: ${error}`);
-          if (alert.notify) supervisor.pushSystemAlert("Pairing attempt rejected", `Someone tried to pair this machine and was turned away (${error}).`, "pair-rejected");
-          return Response.json({ ok: false, error } satisfies rest.FleetPairResponse, { status });
-        };
-        if (!body.token || !body.hubServerId) return reject("bad request", 400);
-
-        const who = await callerIdentity();
-        // A caller whois says is a DIFFERENT tailnet user is rejected even with a correct code.
-        if (who.trust === "otherUser") return reject(who.reject ?? "different tailnet user");
-        // whois-unknown falls back to code-only, matching `notOtherUser` (Pairing.swift:118).
-
-        const codeError = pairWindow.accept(String(body.code ?? ""), body.hubServerId);
-        if (codeError) return reject(codeError, codeError === "not accepting pairings" ? 409 : 403);
-
-        const failure = adoptCredentials(body);
-        if (failure) return reject(failure, 400);
-        pairedHub.record(body.hubServerId, body.fleetName);
-        console.log(`[fleet] paired with hub ${body.hubServerId}${body.fleetName ? ` (${body.fleetName})` : ""}`);
-        supervisor.pushSystemAlert("Joined the fleet", `This machine now shares ${body.fleetName ? `the ${body.fleetName}` : "your"} Claude login.`, "pair-ok");
-        // Stay armed until the hub ACKs (HJ-16) — the window is now locked to this hub (HJ-17), which
-        // is what makes leaving it open a strictly smaller surface than a fresh one.
-        const self = await supervisor.selfBaseUrl();
-        return Response.json({
-          ok: true,
-          serverId: identity.serverId,
-          serverName: identity.serverName,
-          ...(self ? { url: self } : {}),
-        } satisfies rest.FleetPairResponse);
-      }
-
-      // The hub confirms the member is recorded → disarm. Gated exactly as /pair is, and the body must
-      // carry the SAME hubServerId and code the window locked to — otherwise any tailnet peer could
-      // POST this and cancel someone else's pairing window mid-flow. Idempotent by design.
-      if (url.pathname === "/api/fleet/pair/ack" && req.method === "POST") {
-        const body = (await req.json().catch(() => ({}))) as Partial<rest.FleetPairAckRequest>;
-        const who = await callerIdentity();
-        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
-        if (!body.hubServerId || !pairWindow.ack(String(body.code ?? ""), body.hubServerId)) {
-          return Response.json({ ok: false, error: "not your pairing window" }, { status: 403 });
-        }
-        return Response.json({ ok: true });
-      }
-
-      // Rotation counterpart: identity-gated, NOT code-gated — persistent rather than armed, so the hub
-      // can push a refreshed token unattended. `hubServerId` is an anti-confusion check, not a
-      // credential: read §8.6 before reading this as "rotation is authenticated". The real gate is
-      // same-user tailnet reachability, so `unknown` trust is NOT enough here (unlike a coded pair).
-      if (url.pathname === "/api/fleet/token" && req.method === "POST") {
-        const body = (await req.json().catch(() => ({}))) as Partial<rest.FleetTokenRequest>;
-        const who = await callerIdentity();
-        if (who.trust !== "sameUser") return Response.json({ ok: false, error: who.reject ?? "untrusted tailnet user" }, { status: 403 });
-        const hub = pairedHub.get();
-        if (!hub || !body.hubServerId || body.hubServerId !== hub.hubServerId) {
-          return Response.json({ ok: false, error: "unknown hub" }, { status: 403 });
-        }
-        const failure = adoptCredentials(body);
-        if (failure) return Response.json({ ok: false, error: failure }, { status: 400 });
-        console.log(`[fleet] token rotated by hub ${hub.hubServerId}`);
-        return Response.json({ ok: true, serverId: identity.serverId, serverName: identity.serverName } satisfies rest.FleetPairResponse);
-      }
-
-      // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
-      // here so this daemon can run autopilot for its own linked environments. Validated against the
-      // Todoist API before it's stored (mode 0600); tailnet-gated like the rest of the daemon API.
-      if (url.pathname === "/api/integrations/todoist" && req.method === "POST") {
-        const { token } = (await req.json().catch(() => ({}))) as { token?: string };
-        if (!token) return Response.json({ ok: false, error: "token required" }, { status: 400 });
-        try {
-          const ev = await supervisor.connectTodoist(token);
-          // Echo this daemon's identity so the hub can heal a stale fleet record (real serverId, and
-          // the URL it actually reached us on) off the same POST — no extra probe needed.
-          return Response.json({ ok: true, account: ev.account, serverId: identity.serverId, serverName: identity.serverName });
-        } catch (e) {
-          return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 400 });
-        }
-      }
-      // lapo OAuth2 authorization-code callback: lapo redirects the user's browser here with ?code&state
-      // after they authorize. Exchange the code for tokens (validated + stored by the supervisor) and
-      // return a tiny HTML page that reports the outcome and closes itself. The main app updates live off
-      // the broadcast lapo.status, so this window closing (or not) doesn't matter to the connection.
-      if (url.pathname === "/api/integrations/lapo/callback" && req.method === "GET") {
-        const err = url.searchParams.get("error");
-        const code = url.searchParams.get("code") ?? "";
-        const state = url.searchParams.get("state") ?? "";
-        if (err) return lapoCallbackPage(false, `lapo denied the authorization: ${err}`);
-        if (!code || !state) return lapoCallbackPage(false, "The authorization response was missing its code or state.");
-        try {
-          const { account } = await supervisor.completeLapoAuth(code, state);
-          return lapoCallbackPage(true, account ? `Connected as ${account}.` : "Connected.");
-        } catch (e) {
-          return lapoCallbackPage(false, e instanceof Error ? e.message : String(e));
-        }
-      }
-
-      // "Sync now" — trigger an outbound roster push to this hub's own members. Identity-gated like the
-      // rest of the credential surface: a confirmed DIFFERENT tailnet user must not be able to drive a
-      // fleet credential operation, closing the asymmetry with /api/fleet/token (which ADOPTS a pushed
-      // token and so demands the stricter `sameUser`). Rotate only re-pushes tokens we already hold to
-      // members we already paired — it discloses nothing to the caller — so it takes /pair's posture
-      // instead: reject a proven `otherUser`, but stay permissive when identity is unprovable (`unknown`,
-      // e.g. whois momentarily down) rather than fail an operator's Sync now intermittently.
-      if (url.pathname === "/api/fleet/rotate" && req.method === "POST") {
-        const who = await callerIdentity();
-        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
-        const results = await pushRosterToMembers();
-        return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
-      }
-      // Hub-orchestrated fleet update (spec §4.4). Same identity posture as /api/fleet/rotate — a
-      // fleet-wide mutating action, so reject a PROVEN other tailnet user but stay permissive when
-      // identity is unprovable (whois momentarily down) rather than fail an operator intermittently.
-      if (url.pathname === "/api/fleet/update" && req.method === "POST") {
-        const who = await callerIdentity();
-        if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
-        const bodyReq = (await req.json().catch(() => ({}))) as rest.FleetUpdateRequest;
-        const result = await fleetRollout.start({ targetSha: bodyReq.targetSha });
-        return Response.json(result satisfies rest.FleetUpdateResponse, { status: result.ok ? 200 : 409 });
-      }
-      if (url.pathname === "/api/fleet/update/status" && req.method === "GET") {
-        return Response.json(fleetRollout.status() satisfies rest.FleetUpdateStatusResponse);
-      }
-
-      const memberMatch = url.pathname.match(/^\/api\/fleet\/members\/([^/]+)$/);
-      if (memberMatch && req.method === "DELETE") {
-        fleet.remove(decodeURIComponent(memberMatch[1]!));
-        return Response.json({ ok: true });
-      }
-
-      // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint
-      if (url.pathname === "/api/adb/info" && req.method === "GET") {
-        return Response.json({ serverIps: lanIPv4(), devices: (await runAdb(["devices", "-l"])).output });
-      }
-      if (url.pathname === "/api/adb/connect" && req.method === "POST") {
-        try {
-          const { host, port } = (await req.json()) as { host?: string; port?: number };
-          if (!host || !port) return new Response("host and port required", { status: 400 });
-          return Response.json(await runAdb(["connect", adbTarget(host, port)]));
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-      if (url.pathname === "/api/adb/pair" && req.method === "POST") {
-        try {
-          const { host, port, code } = (await req.json()) as { host?: string; port?: number; code?: string };
-          if (!host || !port || !code) return new Response("host, port, code required", { status: 400 });
-          const r = await runAdb(["pair", adbTarget(host, port), String(code)]);
-          return Response.json({ ok: /success/i.test(r.output), output: r.output });
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-
-      // Daemon self-update (arch §5): GET checks whether an update is available; POST applies it
-      // (pull + rebuild + restart). Mirrors the `daemon.update` WS command for native clients
-      // (the macOS menu command) and scripts that have no open WebSocket.
-      if (url.pathname === "/api/daemon/update" && (req.method === "GET" || req.method === "POST")) {
-        // [SEC2-3] Identity gate on the mutating (POST = apply) path only; GET is a read-only check.
-        // Parity with /api/fleet/* and /api/update/v1/apply — reject a proven different tailnet user.
-        if (req.method === "POST") {
-          const who = await callerIdentity();
-          if (who.trust === "otherUser" && !localNoIdentityCaller) {
-            return Response.json({ ok: false, phase: "error", output: who.reject ?? "different tailnet user", currentVersion: VERSION } satisfies rest.DaemonUpdateResponse, { status: 403 });
-          }
-        }
-        const result = await supervisor.daemonUpdate(req.method === "GET");
-        const body: rest.DaemonUpdateResponse = {
-          ok: result.ok,
-          phase: result.phase,
-          output: result.output,
-          currentVersion: result.currentVersion,
-          ...(result.behind !== undefined ? { behind: result.behind } : {}),
-          ...(result.willRestart !== undefined ? { willRestart: result.willRestart } : {}),
-        };
-        return Response.json(body, { status: result.ok ? 200 : 500 });
-      }
-
-      // environment README (arch §8): rendered markdown for the settings/management view
-      const readmeMatch = url.pathname.match(/^\/api\/environments\/([^/]+)\/readme$/);
-      if (readmeMatch && req.method === "GET") {
-        try {
-          return Response.json(supervisor.envReadme(readmeMatch[1]!) satisfies rest.EnvReadmeResponse);
-        } catch (e) {
-          return new Response(e instanceof Error ? e.message : "not found", { status: 404 });
-        }
-      }
-
-      // Web Push (arch §6.7): VAPID public key + browser subscription management
-      if (url.pathname === "/api/push/key" && req.method === "GET") {
-        return Response.json({ publicKey: supervisor.webpush.publicKey });
-      }
-      if (url.pathname === "/api/push/subscribe" && req.method === "POST") {
-        try {
-          supervisor.webpush.subscribe((await req.json()) as never);
-          return Response.json({ ok: true });
-        } catch {
-          return new Response("bad subscription", { status: 400 });
-        }
-      }
-      // Answer a parked permission prompt over REST — lets a native notification action button
-      // resolve Allow/Deny without an open WebSocket (arch §6.6).
-      if (url.pathname === "/api/permission/respond" && req.method === "POST") {
-        try {
-          const { requestId, decision, updatedInput } = (await req.json()) as {
-            requestId?: string;
-            decision?: PermissionDecision;
-            updatedInput?: unknown;
-          };
-          if (!requestId || (decision !== "allow" && decision !== "deny" && decision !== "allow_always")) {
-            return new Response("bad request", { status: 400 });
-          }
-          supervisor.resolvePermission(requestId, decision, updatedInput);
-          return Response.json({ ok: true });
-        } catch (e) {
-          // BadCommand → the request was already answered or expired; treat as gone, not a server error.
-          return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 409 });
-        }
-      }
-      // Un-stick a session over REST (parity with the WS command) — recovers a missing worktree,
-      // clears parked permissions, and resets status to idle.
-      const resetMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/reset$/);
-      if (resetMatch && req.method === "POST") {
-        try {
-          await supervisor.reset(decodeURIComponent(resetMatch[1]!));
-          return Response.json({ ok: true });
-        } catch (e) {
-          return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 409 });
-        }
-      }
-      if (url.pathname === "/api/push/fcm/register" && req.method === "POST") {
-        try {
-          const { token } = (await req.json()) as { token?: string };
-          if (token) supervisor.fcm.register(token);
-          return Response.json({ ok: true });
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-      if (url.pathname === "/api/push/fcm/unregister" && req.method === "POST") {
-        try {
-          const { token } = (await req.json()) as { token?: string };
-          if (token) supervisor.fcm.unregister(token);
-          return Response.json({ ok: true });
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-      if (url.pathname === "/api/push/apns/register" && req.method === "POST") {
-        try {
-          const { token } = (await req.json()) as { token?: string };
-          if (token) supervisor.apns.register(token);
-          return Response.json({ ok: true });
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-      if (url.pathname === "/api/push/apns/unregister" && req.method === "POST") {
-        try {
-          const { token } = (await req.json()) as { token?: string };
-          if (token) supervisor.apns.unregister(token);
-          return Response.json({ ok: true });
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-      if (url.pathname === "/api/push/unsubscribe" && req.method === "POST") {
-        try {
-          const { endpoint } = (await req.json()) as { endpoint?: string };
-          if (endpoint) supervisor.webpush.unsubscribe(endpoint);
-          return Response.json({ ok: true });
-        } catch {
-          return new Response("bad request", { status: 400 });
-        }
-      }
-
-      if (url.pathname === "/ws") {
-        // [SEC-H3] Reject cross-site WebSocket hijack from a foreign browser origin. WS bypasses
-        // CORS, so this is the one place the browser vector can be closed; native clients and the
-        // same-origin PWA are allowlisted in isAllowedWsOrigin.
-        if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) {
-          return new Response("forbidden origin", { status: 403 });
-        }
-        const data: ConnState = { id: newId("conn"), attached: new Set() };
-        if (srv.upgrade(req, { data })) return undefined;
-        return new Response("expected a websocket upgrade", { status: 426 });
-      }
-
-      // worktree files (arch §8.1): serve a binary/image file from the session worktree.
-      // `download=1` forces a save-as via Content-Disposition (used by file-offer download cards, §8).
-      const fileMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/files$/);
-      if (fileMatch && req.method === "GET") {
-        const sessionId = fileMatch[1]!;
-        const path = url.searchParams.get("path") ?? "";
-        try {
-          const abs = supervisor.fsResolve(sessionId, path);
-          const file = Bun.file(abs);
-          if (!(await file.exists())) return new Response("not found", { status: 404 });
-          const headers: Record<string, string> = {};
-          if (url.searchParams.get("download")) {
-            const name = (abs.split("/").pop() || "download").replace(/["\\]/g, "_");
-            headers["Content-Disposition"] = `attachment; filename="${name}"`;
-          }
-          return new Response(file, { headers });
-        } catch {
-          return new Response("forbidden", { status: 403 });
-        }
-      }
-      // Upload a dropped file into the worktree at `path` (streamed raw body, not base64). Refuses
-      // to overwrite an existing path → 409, so a drag-drop can't silently clobber (arch §8.1).
-      if (fileMatch && req.method === "PUT") {
-        const sessionId = fileMatch[1]!;
-        const path = url.searchParams.get("path") ?? "";
-        try {
-          const data = new Uint8Array(await req.arrayBuffer());
-          const written = supervisor.fsWrite(sessionId, path, data);
-          return Response.json(written);
-        } catch (e) {
-          if (e instanceof FileExists) return new Response("a file with that name already exists", { status: 409 });
-          return new Response(e instanceof Error ? e.message : "upload failed", { status: 403 });
-        }
-      }
-
-      // attachments (arch §6.5): POST uploads a pasted/dropped file, GET serves it back
-      const attMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/attachments(?:\/([^/]+))?$/);
-      if (attMatch) {
-        const sessionId = attMatch[1]!;
-        const attId = attMatch[2];
-        if (req.method === "POST" && !attId) {
-          try {
-            const body = (await req.json()) as { name?: string; mediaType?: string; dataBase64?: string };
-            // mediaType may be empty (Android's content picker often omits it); the store infers
-            // it from the filename. Only dataBase64 is strictly required.
-            if (!body.dataBase64) return new Response("dataBase64 required", { status: 400 });
-            const attachment = supervisor.addAttachment(sessionId, body.name ?? "attachment", body.mediaType ?? "", body.dataBase64);
-            return Response.json({ attachment } satisfies rest.UploadAttachmentResponse);
-          } catch (e) {
-            return new Response(e instanceof Error ? e.message : "upload failed", { status: 400 });
-          }
-        }
-        if (req.method === "GET" && attId) {
-          const b = supervisor.attachmentBytes(sessionId, attId);
-          if (!b) return new Response("not found", { status: 404 });
-          return new Response(Bun.file(b.path), { headers: { "Content-Type": b.mediaType, "Cache-Control": "max-age=31536000" } });
-        }
-        return new Response("method not allowed", { status: 405 });
-      }
-
-      // static web client (built into web/dist)
-      const web = await serveWeb(url.pathname);
-      if (web) return web;
-
-      return new Response("not found", { status: 404 });
+    return new Response("not found", { status: 404 });
   }
 
   return {
