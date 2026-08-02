@@ -10,10 +10,13 @@
  * serve them immutable (see `webCacheControl`) and a deploy can never leave a browser pinned to a
  * stale bundle. Split chunks were already hashed by Bun (chunk-<hash>.js).
  *
+ * [WEB2-17] The copied sw.js is stamped with `self.__ANVIL_BUILD` — the precache manifest (every
+ * servable dist asset) + a version hashed from their contents — see the stamping step below.
+ *
  * Exported as `buildWeb()` so the guard tests (test/web/bundle-hash.test.ts) can run the REAL build
  * into a temp dir and assert the hashing/sourcemap/manifest contract.
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 export interface WebBuildOptions {
@@ -102,7 +105,19 @@ export async function buildWeb(opts: WebBuildOptions = {}): Promise<{ dist: stri
   // Material Symbols: web loads the font from Google's CDN (index.html); the `material-symbols`
   // dep stays installed so the native client apps can bundle the woff2 offline.
 
-  cpSync(join(root, "sw.js"), join(next, "sw.js")); // service worker (web push)
+  // [WEB2-17] Stamp the service worker with the build manifest: every servable asset (sourcemaps
+  // excluded — debug-only; sw.js itself excluded — it's the updater, not an asset) plus a version
+  // hashed from their contents. The SW keys its cache off that version (so ANY shipped change —
+  // even in an unhashed shell file like index.html — rolls the cache automatically), precaches
+  // exactly this manifest, and prunes everything outside it on activate.
+  const assets = walkDist(next)
+    .sort()
+    .filter((f) => !f.endsWith(".map"));
+  let acc = "";
+  for (const f of assets) acc += `${f}:${Bun.hash(readFileSync(join(next, f))).toString(36)}\n`;
+  const version = Bun.hash(acc).toString(36);
+  const swPreamble = `self.__ANVIL_BUILD = ${JSON.stringify({ version, assets: assets.map((f) => `/${f}`) })};\n`;
+  writeFileSync(join(next, "sw.js"), swPreamble + readFileSync(join(root, "sw.js"), "utf8")); // service worker (web push + offline shell)
 
   // Swap `dist.next` → `dist` atomically. The gap between the two renames is two metadata ops
   // (sub-millisecond), versus the multi-second rebuild window the old in-place delete exposed.
@@ -112,6 +127,17 @@ export async function buildWeb(opts: WebBuildOptions = {}): Promise<{ dist: stri
   rmSync(old, { recursive: true, force: true });
 
   return { dist, entry: entryName };
+}
+
+/** All files under `dir`, as /-separated paths relative to it. */
+function walkDist(dir: string, base = ""): string[] {
+  const out: string[] = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const rel = base ? `${base}/${e.name}` : e.name;
+    if (e.isDirectory()) out.push(...walkDist(join(dir, e.name), rel));
+    else out.push(rel);
+  }
+  return out;
 }
 
 if (import.meta.main) {

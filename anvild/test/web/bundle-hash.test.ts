@@ -61,3 +61,22 @@ test("dist/index.html references a hashed app stylesheet that exists", () => {
 test("a RELEASE build ships no sourcemaps", () => {
   expect(walk(dist).filter((f) => f.endsWith(".map"))).toEqual([]);
 }, 30_000);
+
+// [WEB2-17] The service worker precaches exactly what the build shipped: build.ts must stamp
+// sw.js with a `self.__ANVIL_BUILD` manifest listing every servable dist asset (all files minus
+// sourcemaps and sw.js itself) and a content-derived version for the cache key.
+test("sw.js is stamped with a manifest listing exactly the dist assets", () => {
+  const sw = readFileSync(join(dist, "sw.js"), "utf8");
+  const m = sw.match(/^self\.__ANVIL_BUILD = (.+);$/m);
+  expect(m).not.toBeNull();
+  const build = JSON.parse(m![1]!) as { version: string; assets: string[] };
+  expect(build.version).toMatch(/^[a-z0-9]+$/);
+  const expected = walk(dist)
+    .filter((f) => !f.endsWith(".map") && f !== "sw.js")
+    .map((f) => `/${f}`)
+    .sort();
+  expect([...build.assets].sort()).toEqual(expected);
+  // the hashed entry + every lazy chunk are in the precache list (offline lazy loads work)
+  expect(build.assets.some((a) => /^\/main-[a-z0-9]+\.js$/.test(a))).toBe(true);
+  expect(build.assets.some((a) => /^\/chunk-[a-z0-9]+\.js$/.test(a))).toBe(true);
+}, 30_000);
