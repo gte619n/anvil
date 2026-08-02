@@ -110,7 +110,10 @@ test("[BE2-29] does NOT roll back a live daemon still legitimately building past
   expect(h.calls.rollback.length).toBe(0);
 });
 
-test("[BE2-31] a target that becomes healthy DURING rollback is NOT restarted backwards, and disk stays consistent", async () => {
+test("[BE2-31] once the gate has elapsed unhealthy, rollback completes with a restart to the known-good (consistent disk/state)", async () => {
+  // Interview decision: even if the target's process happens to go healthy during the rollback rebuild,
+  // we complete the rollback with a restart so disk/process/state are all immediately prePullSha — one
+  // deterministic restart-to-known-good, no transiently-inconsistent "healthy target on a reverted disk".
   const state = new UpdateStateStore(tmp());
   let clock = 0;
   let health: HealthProbe | null = null; // unreachable through the gate
@@ -120,7 +123,7 @@ test("[BE2-31] a target that becomes healthy DURING rollback is NOT restarted ba
     health: async () => health,
     rollback: async (sha) => {
       calls.rollback.push(sha); // rollback resets the CHECKOUT to prePullSha (oldsha)
-      health = { ok: true, version: "0.2.1+newsha", webBundleOk: true }; // process recovered during the rebuild
+      health = { ok: true, version: "0.2.1+newsha", webBundleOk: true }; // process happens to recover mid-rebuild
     },
     restartDaemon: () => calls.restart++,
     now: () => clock,
@@ -128,15 +131,13 @@ test("[BE2-31] a target that becomes healthy DURING rollback is NOT restarted ba
   });
   state.set({ phase: "restarting", targetSha: "newsha", prePullSha: "oldsha" });
   expect(await wd.tick()).toBe("waiting"); // arm (health null)
-  clock += 180_001; // gate elapses
+  clock += 180_001; // gate elapses with the daemon still unhealthy
   const r = await wd.tick();
-  expect(calls.rollback).toEqual(["oldsha"]); // rollback ran → disk is now oldsha
+  expect(calls.rollback).toEqual(["oldsha"]);
   expect(r).toBe("rolled-back");
-  expect(calls.restart).toBe(0); // the now-healthy process is NOT restarted backwards (no restart storm)
-  // Known-good MUST stay the on-disk SHA (oldsha), NOT the target — else a future failed update would
-  // "roll back" to the un-reverted target and the next restart would silently revert this process.
+  expect(calls.restart).toBe(1); // completes the rollback → disk/process/state all converge on oldsha
   expect(state.get().phase).toBe("rolled-back");
-  expect(state.get().targetSha).toBe("oldsha");
+  expect(state.get().targetSha).toBe("oldsha"); // known-good = the on-disk SHA
 });
 
 test("fails safe (no rollback attempt) when there is no pre-pull SHA to revert to", async () => {

@@ -32,12 +32,12 @@ function tempState(): string {
 const createCmd = (cwd: string, accountId?: string) =>
   ({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd, ...(accountId ? { accountId } : {}) }) as const;
 
-test("adding a NON-default account restarts no drivers", () => {
+test("adding a NON-default account restarts no drivers", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // default
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, a.id));
+  const s = await sup.create(createCmd(dir, a.id));
   driversOf(sup).set(s.data.id, fakeDriver());
 
   sup.accountAdd("personal", "sk-ant-oat01-personalpers-2222"); // does not steal default
@@ -51,7 +51,7 @@ test("changing the default's token restarts idle sessions on the default", async
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // default
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir)); // no explicit accountId -> resolves to the default
+  const s = await sup.create(createCmd(dir)); // no explicit accountId -> resolves to the default
   expect(s.data.accountId).toBe(a.id);
   const driver = fakeDriver();
   driversOf(sup).set(s.data.id, driver);
@@ -70,7 +70,7 @@ test("a session pinned to an untouched account is not restarted", async () => {
   accounts.add("work", "sk-ant-oat01-workworkwork-1111"); // default
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, b.id)); // pinned to "personal"
+  const s = await sup.create(createCmd(dir, b.id)); // pinned to "personal"
   const driver = fakeDriver();
   driversOf(sup).set(s.data.id, driver);
 
@@ -88,7 +88,7 @@ test("a mid-turn session is left running and gets the existing message", async (
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir));
+  const s = await sup.create(createCmd(dir));
   expect(s.data.accountId).toBe(a.id);
   s.setStatus("thinking"); // mid-turn
   const driver = fakeDriver();

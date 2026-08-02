@@ -11,10 +11,10 @@ const createExisting = (sup: Supervisor, cwd: string) =>
   sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd });
 
 // ── Daemon telemetry aggregation (v4 §5.7 / spec D11) ──────────────────────────
-test("resume() counts what it served (delta vs snapshot) — powers the 'delta not snapshot' assertion", () => {
+test("resume() counts what it served (delta vs snapshot) — powers the 'delta not snapshot' assertion", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup, dir);
+  const s = await createExisting(sup, dir);
 
   sup.resume(s.id); // cold → snapshot
   sup.resume(s.id, 0); // warm → delta
@@ -27,7 +27,7 @@ test("resume() counts what it served (delta vs snapshot) — powers the 'delta n
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("noteServerCounter + recordClientTelemetry aggregate into the snapshot", () => {
+test("noteServerCounter + recordClientTelemetry aggregate into the snapshot", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
   sup.noteServerCounter("promptDeduped");
@@ -44,7 +44,7 @@ test("noteServerCounter + recordClientTelemetry aggregate into the snapshot", ()
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("[BE2-23/SEC2-4] the client-telemetry map is LRU-capped at 50 (no unbounded growth / DoS)", () => {
+test("[BE2-23/SEC2-4] the client-telemetry map is LRU-capped at 50 (no unbounded growth / DoS)", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
   for (let i = 0; i < 5000; i++) sup.recordClientTelemetry(`client_${i}`, { reconnects: i });
@@ -56,7 +56,7 @@ test("[BE2-23/SEC2-4] the client-telemetry map is LRU-capped at 50 (no unbounded
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("[BE2-23/SEC2-4] malformed reports are ignored (bad id, non-object, non-finite, key flood)", () => {
+test("[BE2-23/SEC2-4] malformed reports are ignored (bad id, non-object, non-finite, key flood)", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
   sup.recordClientTelemetry("", { a: 1 }); // empty id → rejected

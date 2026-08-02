@@ -1,15 +1,20 @@
 // Anvil service worker — Web Push (arch §6.7) + offline app-shell caching.
-// Bump CACHE on any change that must invalidate stale clients: the activate handler below deletes every
-// cache whose key != CACHE, so a new version forces existing browsers to purge the old app-shell bundle
-// (the daemon now also serves the shell `no-cache`, but this guarantees a one-time purge of anything a
-// prior build cached under the old key). v2: flush bundles cached before the no-cache header fix.
-const CACHE = "anvil-shell-v4";
-const CORE = ["/", "/index.html", "/main.js", "/app.css", "/xterm.css", "/katex/katex.min.css", "/anvil.svg", "/manifest.json"];
+// [WEB2-17] build.ts prepends `self.__ANVIL_BUILD = { version, assets }` when it copies this file
+// into dist: `assets` is the exact list of servable bundle files (the precache manifest — hashed
+// entry/chunks included, so every lazy chunk works offline) and `version` is a hash of their
+// contents. The cache key derives from that version, so ANY shipped change — even to an unhashed
+// shell file — rolls the cache automatically (no more manual CACHE bumps; the last manual key was
+// anvil-shell-v4, which the != CACHE sweep below purges like any other stale cache). The fallback
+// only exists for an unstamped source checkout; production dist is always stamped.
+const BUILD = self.__ANVIL_BUILD || { version: "dev", assets: ["/", "/index.html", "/anvil.svg", "/manifest.json"] };
+const CACHE = "anvil-shell-" + BUILD.version;
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
   event.waitUntil(
-    caches.open(CACHE).then((c) => Promise.all(CORE.map((u) => c.add(u).catch(() => {})))),
+    // Precache the whole manifest. Hashed chunks are served `immutable`, so cross-version installs
+    // refetch only what actually changed — the rest fills from the browser's HTTP cache.
+    caches.open(CACHE).then((c) => Promise.all(BUILD.assets.map((u) => c.add(u).catch(() => {})))),
   );
 });
 
@@ -17,8 +22,17 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
       await self.clients.claim();
+      // Old versions die wholesale (their cache key != ours) — a stale shell and its orphaned
+      // hashed chunks are gone the moment this version activates…
       const keys = await caches.keys();
       await Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)));
+      // …and anything in OUR cache that isn't in the manifest (e.g. runtime-cached strays from the
+      // waiting window) is pruned, so the cache converges to exactly the shipped asset set.
+      const manifest = new Set(BUILD.assets);
+      const cache = await caches.open(CACHE);
+      for (const req of await cache.keys()) {
+        if (!manifest.has(new URL(req.url).pathname)) await cache.delete(req);
+      }
     })(),
   );
 });

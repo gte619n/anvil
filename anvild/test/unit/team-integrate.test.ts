@@ -20,7 +20,7 @@ function fakeGit(over: Partial<IntegrateGit> & { ancestors?: string[]; conflictO
 
 const M = (title: string, branch?: string): IntegrateMember => ({ sessionId: `s_${title}`, title, branch: branch ?? `b_${title}` });
 
-test("safeRemoteBranch never pushes the combined branch onto main/master/base", () => {
+test("safeRemoteBranch never pushes the combined branch onto main/master/base", async () => {
   expect(safeRemoteBranch("main", "main")).toBeUndefined();
   expect(safeRemoteBranch("master", "main")).toBeUndefined();
   expect(safeRemoteBranch("main", undefined)).toBeUndefined();
@@ -29,17 +29,17 @@ test("safeRemoteBranch never pushes the combined branch onto main/master/base", 
   expect(safeRemoteBranch(undefined, "main")).toBeUndefined();
 });
 
-test("pr-per-member merges nothing and opens no combined PR", () => {
+test("pr-per-member merges nothing and opens no combined PR", async () => {
   const fg = fakeGit();
-  const r = integrateTeam({ integration: "pr-per-member", leadCwd: "/l", leadBranch: "lead", members: [M("A")], prTitle: "t", prBody: "b", git: fg.git });
+  const r = await integrateTeam({ integration: "pr-per-member", leadCwd: "/l", leadBranch: "lead", members: [M("A")], prTitle: "t", prBody: "b", git: fg.git });
   expect(r.mode).toBe("pr-per-member");
   expect(fg.merged).toHaveLength(0);
   expect(fg.prs).toBe(0);
 });
 
-test("combined-pr merges every member in the given order, then opens one PR", () => {
+test("combined-pr merges every member in the given order, then opens one PR", async () => {
   const fg = fakeGit();
-  const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B")], prTitle: "t", prBody: "b", git: fg.git });
+  const r = await integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B")], prTitle: "t", prBody: "b", git: fg.git });
   expect(r.ok).toBe(true);
   expect(fg.merged).toEqual(["b_A", "b_B"]);
   expect(r.merged).toEqual(["A", "B"]);
@@ -47,24 +47,24 @@ test("combined-pr merges every member in the given order, then opens one PR", ()
   expect(fg.prs).toBe(1);
 });
 
-test("already-merged members (ancestor of HEAD) are skipped but counted — resume after a conflict", () => {
+test("already-merged members (ancestor of HEAD) are skipped but counted — resume after a conflict", async () => {
   const fg = fakeGit({ ancestors: ["b_A"] });
-  const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B")], prTitle: "t", prBody: "b", git: fg.git });
+  const r = await integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B")], prTitle: "t", prBody: "b", git: fg.git });
   expect(fg.merged).toEqual(["b_B"]); // A was already merged, only B is merged this run
   expect(r.merged).toEqual(["A", "B"]);
   expect(r.ok).toBe(true);
 });
 
-test("a member with no branch (read-only) is not merged", () => {
+test("a member with no branch (read-only) is not merged", async () => {
   const fg = fakeGit();
-  const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [{ sessionId: "s", title: "Doc", branch: undefined }, M("B")], prTitle: "t", prBody: "b", git: fg.git });
+  const r = await integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [{ sessionId: "s", title: "Doc", branch: undefined }, M("B")], prTitle: "t", prBody: "b", git: fg.git });
   expect(fg.merged).toEqual(["b_B"]);
   expect(r.ok).toBe(true);
 });
 
-test("a merge conflict parks: reports the member as a real conflict, opens no PR", () => {
+test("a merge conflict parks: reports the member as a real conflict, opens no PR", async () => {
   const fg = fakeGit({ conflictOn: "b_B" });
-  const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B"), M("C")], prTitle: "t", prBody: "b", git: fg.git });
+  const r = await integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A"), M("B"), M("C")], prTitle: "t", prBody: "b", git: fg.git });
   expect(r.ok).toBe(false);
   expect(r.failedMember).toBe("B");
   expect(r.conflicted).toBe(true);
@@ -73,14 +73,14 @@ test("a merge conflict parks: reports the member as a real conflict, opens no PR
   expect(r.output).toContain("Merge conflict");
 });
 
-test("a non-conflict merge failure is reported distinctly (not as a resolvable conflict)", () => {
+test("a non-conflict merge failure is reported distinctly (not as a resolvable conflict)", async () => {
   const g: IntegrateGit = {
     isAncestor: () => false,
     mergeBranch: () => ({ ok: false, conflicted: false, output: "error: Your local changes would be overwritten" }),
     push: () => ({ ok: true, output: "pushed" }),
     createPr: () => ({ ok: true, output: "created", url: "u" }),
   };
-  const r = integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A")], prTitle: "t", prBody: "b", git: g });
+  const r = await integrateTeam({ integration: "combined-pr", leadCwd: "/l", leadBranch: "lead", members: [M("A")], prTitle: "t", prBody: "b", git: g });
   expect(r.ok).toBe(false);
   expect(r.failedMember).toBe("A");
   expect(r.conflicted).toBe(false);

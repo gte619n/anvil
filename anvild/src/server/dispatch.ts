@@ -28,6 +28,14 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** [BE2-45] Reply to a fire-and-forget async command when it settles: `ack` on success (when
+ *  correlated), `command.error` on failure — the shape every promise-returning command shared. */
+function ackWhenDone(p: Promise<unknown>, send: Send, cid?: string): void {
+  p.then(() => {
+    if (cid) send(ack(cid));
+  }).catch((e) => send(cmdError(errMsg(e), cid)));
+}
+
 /**
  * Routes one inbound client frame (arch §6.1/§6.3): validates the envelope (parseCommandFrame),
  * narrows on `type`, mutates session state via the supervisor, and replies `ack` (for correlated
@@ -53,11 +61,19 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.create": {
-        const session = deps.supervisor.create(cmd);
-        conn.attached.add(session.id);
-        const created: ServerEvent = { v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data };
-        send({ ...created, cid }); // creator: carries the cid
-        deps.registry.toAll(created, conn.id); // other devices: no cid
+        // [BE2-2] Async: a fresh-worktree create runs a network `git fetch` — settle off the dispatch
+        // path so a slow remote can't freeze the daemon. Same wire surface as before: the creator gets
+        // `session.created` with its cid, everyone else the broadcast, and a failure (BadCommand) still
+        // arrives as `command.error`.
+        deps.supervisor
+          .create(cmd)
+          .then((session) => {
+            conn.attached.add(session.id);
+            const created: ServerEvent = { v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data };
+            send({ ...created, cid }); // creator: carries the cid
+            deps.registry.toAll(created, conn.id); // other devices: no cid
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
       }
 
@@ -81,21 +97,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.kill":
-        deps.supervisor
-          .kill(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.kill(cmd.sessionId), send, cid);
         return;
 
       case "session.archive":
-        deps.supervisor
-          .archive(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.archive(cmd.sessionId), send, cid);
         return;
 
       case "session.unarchive":
@@ -109,21 +115,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.reset":
-        deps.supervisor
-          .reset(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.reset(cmd.sessionId), send, cid);
         return;
 
       case "session.new_topic":
-        deps.supervisor
-          .newTopic(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.newTopic(cmd.sessionId), send, cid);
         return;
 
       case "git": {
@@ -138,12 +134,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.account.set":
-        deps.supervisor
-          .setSessionAccount(cmd.sessionId, cmd.accountId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.setSessionAccount(cmd.sessionId, cmd.accountId), send, cid);
         return;
 
       case "session.set_autonomy":
@@ -157,8 +148,8 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "team.plan.approve":
-        deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan);
-        if (cid) send(ack(cid));
+        // [BE2-2] Member spawns create worktrees via async git — ack when the spawns settle.
+        ackWhenDone(deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan), send, cid);
         return;
 
       case "team.plan.reject":
@@ -167,8 +158,9 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "team.integrate":
-        deps.supervisor.integrateTeam(cmd.sessionId);
-        if (cid) send(ack(cid));
+        // [BE2-3] N merges + push + `gh pr create` now run async — ack when the integration settles
+        // (like session.kill); a failure (BadCommand or git error) arrives as command.error.
+        ackWhenDone(deps.supervisor.integrateTeam(cmd.sessionId), send, cid);
         return;
 
       case "prompt.send": {
@@ -377,16 +369,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "autopilot.dismiss":
-        deps.supervisor
-          .dismissPlan(cmd.workUnitId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.dismissPlan(cmd.workUnitId), send, cid);
         return;
 
       case "autopilot.start":
-        send(deps.supervisor.startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid));
+        // [BE2-2] Go spawns a fresh-worktree session (async git) — settle off the dispatch path.
+        deps.supervisor
+          .startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "autopilot.pipeline.start":
@@ -403,12 +394,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "autopilot.resolve":
-        deps.supervisor
-          .resolvePlan(cmd.workUnitId, cmd.status, cmd.closeTodoist)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.resolvePlan(cmd.workUnitId, cmd.status, cmd.closeTodoist), send, cid);
         return;
 
       case "autopilot.link":

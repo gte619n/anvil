@@ -63,6 +63,42 @@ export interface GitSpawn {
  * child is SIGKILLed and the result carries a non-zero `code` (124, the conventional timeout code)
  * plus a stderr note, so callers take their normal failure path.
  */
+/**
+ * [BE2-2/3/5] The async twin of `gitSpawn`: same network-safe env, same hard timeout + SIGKILL, same
+ * result contract (124 on timeout, 127 on a missing binary) — but via `Bun.spawn`, so a slow or hung
+ * git/gh subprocess parks a promise instead of freezing the single-threaded event loop. Use this on
+ * every request/turn path; the sync `gitSpawn` remains for startup/recovery paths where blocking is
+ * intentional and for legacy callers not yet converted (see the improvement-program BE-4 family).
+ */
+export async function gitSpawnAsync(cmd: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): Promise<GitSpawn> {
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: GIT_ENV,
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+    });
+    // Drain both pipes CONCURRENTLY with exit — awaiting `exited` first can deadlock on a full pipe
+    // buffer (the child blocks writing, we block waiting). Response.text() completes at stream EOF.
+    const [stdout, stderrText] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    await proc.exited;
+    if (proc.exitCode == null) {
+      // Killed by the timeout (or another signal) — no exit code. Same 124-plus-note surface as gitSpawn.
+      const note = `[anvil] \`${cmd.join(" ")}\` exceeded ${timeoutMs}ms and was killed`;
+      return { code: 124, stdout, stderr: stderrText ? `${stderrText}\n${note}` : note };
+    }
+    return { code: proc.exitCode, stdout, stderr: stderrText };
+  } catch (e) {
+    // Missing binary / vanished cwd: Bun.spawn throws instead of returning a code — surface it as the
+    // conventional 127 so every `code !== 0` caller takes its normal reported-failure path (same
+    // contract as the sync twin; `gh` is optional and absent on plain Linux members).
+    const msg = e instanceof Error ? e.message : String(e);
+    return { code: 127, stdout: "", stderr: `[anvil] couldn't run \`${cmd[0]}\`: ${msg}` };
+  }
+}
+
 export function gitSpawn(cmd: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): GitSpawn {
   let r: ReturnType<typeof Bun.spawnSync>;
   try {

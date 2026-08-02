@@ -24,7 +24,7 @@ test("create flushes immediately; emit-driven changes are debounced then flushed
   const dir = mkdtempSync(join(tmpdir(), "anvil-persist-"));
   try {
     const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-    const s = sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
+    const s = await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
 
     // create() persisted synchronously — the row is on disk right away.
     const afterCreate = persistedSeq(dir, s.id);
@@ -50,8 +50,8 @@ test("kill flushes immediately (lifecycle ops are not debounced)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "anvil-persist-"));
   try {
     const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-    const a = sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
-    sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
+    const a = await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
+    await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
 
     await sup.kill(a.id);
     // Immediately on disk: the deleted session is gone without waiting for a debounce.

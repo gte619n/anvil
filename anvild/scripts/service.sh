@@ -17,7 +17,7 @@
 # serving the OLD web UI (the classic "my change merged but the dropdown/button isn't there"
 # symptom). `restart` now runs `build:web` first so a pull+restart is a true full deploy. To
 # verify the web change actually shipped, query the running daemon (not the browser, which the
-# service worker may have cached):  curl -s http://127.0.0.1:7701/main.js | grep -c <your-string>
+# service worker may have cached):  curl -s http://127.0.0.1:7701/$(curl -s http://127.0.0.1:7701/index.html | grep -o 'main-[a-z0-9]*\.js') | grep -c <your-string>
 #
 set -euo pipefail
 
@@ -91,7 +91,7 @@ build_web() {
   if ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null ); then
     return 0
   fi
-  if [ -f "$ANVILD_DIR/web/dist/main.js" ]; then
+  if [ -f "$ANVILD_DIR/web/dist/index.html" ]; then
     echo "warning: web build failed — serving the existing web/dist bundle (may be stale; see the build error above)"
     return 0
   fi
