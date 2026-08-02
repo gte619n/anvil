@@ -22,7 +22,6 @@ import { $, enhanceSelect, esc, icon, refreshSelect } from "./dom";
 // imports — they used to arrive via initFleet(deps).
 import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { armJoinWindow } from "./setup";
-import { newCid } from "./outbox";
 import { ui } from "./state";
 import type { AutopilotPlanInfo, Budget, Environment, ServerEvent, Session, TeamInfo, TeamPlan, rest } from "../../protocol";
 
@@ -50,8 +49,6 @@ export interface FleetDeps {
   renderSessions(): void;
   /** The Settings → Fleet card list (stays in main next to the roster/ADB card helpers). */
   renderServerCards(): void;
-  /** cid-tracked request/response over a server's socket (main's `sendAwait`). */
-  sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
   /** Write into the hub card's update-output pane (the restart-reload flow). */
   setUpdateStatus(text: string): void;
 }
@@ -70,7 +67,6 @@ let persistSessions: FleetDeps["persistSessions"];
 let persistEnvironments: FleetDeps["persistEnvironments"];
 let renderSessions: FleetDeps["renderSessions"];
 let renderServerCards: FleetDeps["renderServerCards"];
-let sendAwait: FleetDeps["sendAwait"];
 let setUpdateStatus: FleetDeps["setUpdateStatus"];
 export function initFleet(deps: FleetDeps): void {
   ({
@@ -86,7 +82,6 @@ export function initFleet(deps: FleetDeps): void {
     persistEnvironments,
     renderSessions,
     renderServerCards,
-    sendAwait,
     setUpdateStatus,
   } = deps);
 }
@@ -798,16 +793,20 @@ export function wireDaemonUpdate(srv: Server): void {
     out.hidden = false;
     out.textContent = "Fetching the latest source and rebuilding — this can take a minute…";
     try {
-      const res = await sendAwait(srv, { type: "daemon.update", cid: newCid() }, 180_000);
-      if (res.type === "command.error") {
-        out.textContent = `Update failed: ${res.message}`;
-        toast("Update failed — see Settings.");
-        reset();
-        return;
-      }
-      if (res.type !== "daemon.update.result") {
-        reset();
-        return;
+      // Issue #162: the update rides version-independent REST, NOT the versioned WS channel. A
+      // version-skewed daemon rejects every WS command frame — including the very `daemon.update`
+      // that would repair the skew (the bootstrap paradox). POST /api/daemon/update is identity-
+      // gated but carries no protocol version, so this button works exactly when it's needed most.
+      // Native clients keep the `daemon.update` WS command; only this button switched transport.
+      const resp = await serverFetch(srv.url, "/api/daemon/update", {
+        method: "POST",
+        signal: AbortSignal.timeout(180_000),
+      });
+      let res: rest.DaemonUpdateResponse;
+      try {
+        res = (await resp.json()) as rest.DaemonUpdateResponse;
+      } catch {
+        throw new Error(`HTTP ${resp.status}`); // non-JSON body (proxy error page etc.)
       }
       out.textContent = res.output;
       if (res.phase === "up-to-date") {

@@ -278,7 +278,6 @@ initFleet({
   persistEnvironments,
   renderSessions,
   renderServerCards,
-  sendAwait,
   setUpdateStatus,
 });
 // Sidebar deps (P7 — see sidebar.ts). Same timing contract as initFleet above: this runs during

@@ -47,8 +47,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // v4 (incremental-offline-resilience.md): adds the resume watermark (`resume.watermarks`), per-session
-// `epoch` on the snapshot, and `cid` on `message.user` (exactly-once send dedupe). A hard cutover —
-// parseCommandFrame rejects any other version, so a mixed-version fleet must upgrade together (spec D9).
+// `epoch` on the snapshot, and `cid` on `message.user` (exactly-once send dedupe).
+//
+// Gate semantics (issue #162): the daemon's parseCommandFrame treats this constant as a FLOOR, not an
+// equality. Frames from OLDER clients are accepted — the protocol is additive-or-bump, so an older
+// envelope still parses — and only frames NEWER than the daemon speaks are rejected (they may rely on
+// semantics the daemon predates). Strict equality turned every bump into a fleet-wide outage where a
+// one-release-behind peer was unreachable from the UI. Corollary: daemon self-update must never depend
+// on the versioned WS channel — the web client's "Update Anvil" rides POST /api/daemon/update (rest.
+// DaemonUpdateResponse), which carries no protocol version, so recovery can't be blocked by the very
+// skew it exists to repair. The `daemon.update` WS command remains for native clients.
 export const PROTOCOL_VERSION = 4 as const;
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 
