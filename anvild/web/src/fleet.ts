@@ -321,6 +321,29 @@ export const fleetMemberIdByHost = new Map<string, string>();
  *  every push so far failed. Populated by {@link loadFleetMembers} from the hub's /api/fleet/members. */
 export const fleetMemberAccountsRev = new Map<string, number | undefined>();
 
+/**
+ * [BE2-15] Await an async fleet job (rotate/invite). The POST answers immediately with a jobId — the
+ * fan-out runs as a daemon-side job (an offline member used to pin the request open for ~14s of
+ * pairing timeouts) — and completion is read by polling GET /api/fleet/jobs/<id>. Resolves with the
+ * job's result: the exact body the old synchronous POST returned. A transient poll failure is retried
+ * until the deadline; an unknown id (the daemon restarted mid-job) or a timeout rejects.
+ */
+async function awaitFleetJob<R>(jobId: string, timeoutMs = 120_000): Promise<R> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1_000));
+    let st: rest.FleetJobStatusResponse | null = null;
+    try {
+      st = (await (await apiFetch(`/api/fleet/jobs/${encodeURIComponent(jobId)}`)).json()) as rest.FleetJobStatusResponse;
+    } catch {
+      /* network blip — keep polling until the deadline */
+    }
+    if (st && !st.ok) throw new Error(st.error ?? "the daemon no longer knows this job");
+    if (st?.state === "done") return st.result as R;
+    if (Date.now() >= deadline) throw new Error("timed out waiting for the fleet operation");
+  }
+}
+
 /** Push the current login to every Mac in the fleet (hub fans it out). Header "Update token" button. */
 export async function rotateFleetToken(): Promise<void> {
   // /api/fleet/rotate fans out from THIS daemon to ITS members. On a machine that has none — a member,
@@ -332,10 +355,22 @@ export async function rotateFleetToken(): Promise<void> {
     return;
   }
   toast("Pushing the current login to every Mac…");
+  // [BE2-15] ?async=1 → the POST answers immediately with a jobId and the fan-out runs daemon-side;
+  // we poll for the same {ok,results} the synchronous route used to return. A pre-job daemon ignores
+  // the query and answers the legacy shape directly (no jobId) — use it as-is.
+  let started: rest.FleetJobStartResponse & rest.FleetRotateResponse;
   try {
-    const r = (await (await apiFetch("/api/fleet/rotate", { method: "POST" })).json()) as { ok: boolean; results: { host: string; ok: boolean }[] };
+    started = (await (await apiFetch("/api/fleet/rotate?async=1", { method: "POST" })).json()) as typeof started;
+  } catch {
+    // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
+    // failure below, not an exception, so this message must not be used for that case.
+    toast("Couldn't reach this machine's own daemon to start the sync.");
+    return;
+  }
+  try {
+    const r = started.jobId ? await awaitFleetJob<rest.FleetRotateResponse>(started.jobId) : started;
     if (r.results.length === 0) {
-      toast("No other Macs in this fleet yet.");
+      toast(r.error ? `Couldn't sync: ${r.error}` : "No other Macs in this fleet yet.");
       return;
     }
     const okN = r.results.filter((x) => x.ok).length;
@@ -349,9 +384,8 @@ export async function rotateFleetToken(): Promise<void> {
     }
     void loadFleetMembers(); // re-read each member's accountsRev so the per-card sync badges refresh
   } catch {
-    // Reaching here means the HUB itself didn't answer — an unreachable MEMBER is a per-result
-    // failure above, not an exception, so this message must not be used for that case.
-    toast("Couldn't reach this machine's own daemon to start the sync.");
+    // The job was started but its outcome couldn't be read (poll timeout / daemon restarted mid-job).
+    toast("Lost track of the sync — check the Servers tab for each Mac's status and try again.");
   }
 }
 
@@ -485,8 +519,18 @@ export function showAddMac(): void {
     if (!host) { setStatus("Pick the machine you're adding."); return; }
     if (!/^\d{6}$/.test(code)) { setStatus("Enter the 6-digit code that machine is showing."); return; }
     setStatus(`Sending the login to ${host} over the tailnet…`);
+    // [BE2-15] ?async=1 → the POST answers immediately with a jobId (the pairing push runs as a
+    // daemon-side job); poll for the same {ok,member,error} the synchronous route used to return.
+    // A pre-job daemon ignores the query and answers the legacy shape directly (no jobId).
+    let started: rest.FleetJobStartResponse & rest.FleetInviteResponse;
     try {
-      const r = (await (await apiFetch("/api/fleet/invite", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as { ok: boolean; member?: { url: string }; error?: string };
+      started = (await (await apiFetch("/api/fleet/invite?async=1", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ host, code }) })).json()) as typeof started;
+    } catch {
+      setStatus("Couldn't reach the hub daemon.");
+      return;
+    }
+    try {
+      const r = started.jobId ? await awaitFleetJob<rest.FleetInviteResponse>(started.jobId) : started;
       if (r.ok) {
         // Onboarded → also connect this client to it so its sessions show up (one step, not two).
         if (r.member?.url) { saveExtraServers([...loadExtraServers(), r.member.url]); ensureServer(r.member.url); }

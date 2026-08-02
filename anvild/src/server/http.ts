@@ -28,6 +28,7 @@ import { UpdateStateStore } from "../daemon/update-state";
 import { updateApply, updateCheck, updateStatus, settleAfterBoot, type UpdateApiDeps } from "../daemon/update-api";
 import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
 import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } from "./fleet-rollout";
+import { FleetJobs } from "./fleet-jobs";
 import { resolveTargetSha } from "../daemon/selfupdate";
 import { FileExists } from "../fs/session-fs";
 import type { MarkdownRenderer } from "../render/markdown";
@@ -173,6 +174,22 @@ export interface ServerOptions {
   /** Set by the real daemon (main.ts) to refresh model labels from the Models API shortly after boot;
    *  omitted by tests so they never make a live API call. */
   refreshModelLabelsOnBoot?: boolean;
+  /** [BE2-15] Test-only injection of the fleet fan-out network calls (rotate/invite jobs), so the job
+   *  guard tests can simulate a slow/unreachable member deterministically. Production omits it and
+   *  gets the real implementations from ./fleet. */
+  fleetNet?: Partial<FleetNetOps>;
+  /** [BE2-15] Test-only override of the caller-identity resolver (the real one shells out to the
+   *  tailscale CLI, which makes identity-gated routes untestable hermetically). */
+  resolveIdentity?: () => Promise<{ trust: PeerTrust; reject?: string }>;
+}
+
+/** The fleet fan-out network surface the rotate/invite paths reach the tailnet through ([BE2-15]). */
+export interface FleetNetOps {
+  rotateToken: typeof rotateToken;
+  invitePeer: typeof invitePeer;
+  resolveMember: typeof resolveMember;
+  peerIPv4: typeof peerIPv4;
+  ackPair: typeof ackPair;
 }
 
 /**
@@ -183,6 +200,11 @@ export interface ServerOptions {
  */
 export function createServer(opts: ServerOptions): ServerHandle {
   const identity = loadServerIdentity(opts.stateDir);
+  // [BE2-15] The fleet fan-out's network calls, swappable by tests (see ServerOptions.fleetNet).
+  const net: FleetNetOps = { rotateToken, invitePeer, resolveMember, peerIPv4, ackPair, ...opts.fleetNet };
+  // [BE2-15] Rotate/invite run as background jobs so the POST never holds a socket open for the whole
+  // fan-out (an offline member burns ~14s of pairing timeouts). Clients poll /api/fleet/jobs/:id.
+  const fleetJobs = new FleetJobs();
   const accounts = opts.accounts ?? new AccountStore(opts.stateDir);
   const fleet = new FleetStore(opts.stateDir);
   // Bind the degrade marker's home so a credential write from ANY path (a direct paste via
@@ -311,7 +333,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     const members = fleet.list();
     if (members.length === 0) return [];
     const payload = accounts.payload();
-    const results = await rotateToken({
+    const results = await net.rotateToken({
       members,
       token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
       hubServerId: identity.serverId,
@@ -376,7 +398,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
           } catch {
             /* malformed stored url — fall back to the default port and still try to heal */
           }
-          const r = await resolveMember(m.host, port);
+          const r = await net.resolveMember(m.host, port);
           const healedUrl = r.url || m.url;
           const healedServerId = r.serverId ?? m.serverId;
           const healedServerName = r.serverName || m.serverName;
@@ -676,56 +698,82 @@ export function createServer(opts: ServerOptions): ServerHandle {
   });
   // Tailnet Macs to pick from when adding to the fleet (so you choose a name, not an IP).
   route("GET", "/api/fleet/peers", async () => Response.json((await tailnetPeers()) satisfies rest.FleetPeersResponse));
-  route("POST", "/api/fleet/invite", async (req) => {
+  // [BE2-15] The invite fan-out body, run as a background job (the POST answers immediately in async
+  // mode). Returns EXACTLY the response the old synchronous route produced; any throw becomes a clean
+  // {ok:false} result so a poller can never hang on a died job.
+  async function runInviteJob(host: string, code: string): Promise<rest.FleetInviteResponse> {
+    try {
+      // Resolve the joiner's tailnet IP up front so a plain-http member is recorded at its DNS-free
+      // http://<ip> url rather than a MagicDNS name (which strands the member the moment MagicDNS drops).
+      const memberIp = await net.peerIPv4(host);
+      // Ask the joiner what it speaks BEFORE pushing, so the destination is a lookup rather than a
+      // guess (HJ-15/§3.5). A peer that answers without capabilities is a pre-capability daemon →
+      // :7702. `invitePeer` still falls back on a 404/405 from :7701, for an un-upgraded Mac that
+      // answers on the daemon port but has no such route.
+      const preflight = await net.resolveMember(host, opts.port, undefined, memberIp);
+      const outcome = await net.invitePeer({
+        host,
+        ...(memberIp ? { ip: memberIp } : {}),
+        code,
+        token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
+        hubServerId: identity.serverId,
+        capabilities: preflight.capabilities,
+        port: opts.port,
+        // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
+        ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
+        ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+        // The whole roster rides the first join too, so a new member arrives with every account
+        // instead of only the mirrored default (§7.3).
+        ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
+      });
+      if (!outcome.ok) return { ok: false, error: outcome.error };
+      // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
+      // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
+      // breaks targeted token propagation (members are matched by serverId).
+      // [BE2-15] Deduped double-probe: when the PREFLIGHT probe already resolved the joiner's identity
+      // (serverId present ⇒ its /api/health answered), reuse it — the transport url and serverId a
+      // health probe yields don't change during the seconds a pair takes (adopting a credential neither
+      // restarts the daemon nor flips its scheme). Re-probe ONLY when the preflight came back empty
+      // (fallback url, no identity): that's the joiner whose daemon wasn't answering yet — e.g. a
+      // :7702-only Mac or a daemon still booting — and the post-pairing probe is what picks up the
+      // identity/transport it NOW answers with. That late-boot pickup is the state change the second
+      // probe existed for; the identified-preflight case never benefited from it.
+      const resolved = preflight.serverId ? preflight : await net.resolveMember(host, opts.port, undefined, memberIp);
+      // Record the rev the joiner confirmed taking, exactly as `pushRosterToMembers` does after a
+      // rotation. Without it a freshly-paired member sits at an undefined rev and the Servers tab
+      // reports "out of date — press Sync now" about a member that is in fact perfectly in sync,
+      // until the next roster edit happens to paper over it. `invitePeer` reports what it actually
+      // sent, so this can't drift from the capability gate.
+      const member: rest.FleetMember = {
+        serverId: resolved.serverId || outcome.serverId || host,
+        serverName: outcome.serverName || resolved.serverName || host,
+        host,
+        url: resolved.url,
+        ...(outcome.accountsRev !== undefined ? { accountsRev: outcome.accountsRev } : {}),
+      };
+      fleet.upsert(member);
+      // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately
+      // AFTER the upsert: the joiner staying armed through a lost reply is the failure mode this
+      // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
+      void net.ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
+      pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
+      return { ok: true, member };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  route("POST", "/api/fleet/invite", async (req, url) => {
     const { host, code } = await jsonBody<rest.FleetInviteRequest>(req);
     if (!host || !code) return new Response("host and code required", { status: 400 });
-    // Resolve the joiner's tailnet IP up front so a plain-http member is recorded at its DNS-free
-    // http://<ip> url rather than a MagicDNS name (which strands the member the moment MagicDNS drops).
-    const memberIp = await peerIPv4(host);
-    // Ask the joiner what it speaks BEFORE pushing, so the destination is a lookup rather than a
-    // guess (HJ-15/§3.5). A peer that answers without capabilities is a pre-capability daemon →
-    // :7702. `invitePeer` still falls back on a 404/405 from :7701, for an un-upgraded Mac that
-    // answers on the daemon port but has no such route.
-    const preflight = await resolveMember(host, opts.port, undefined, memberIp);
-    const outcome = await invitePeer({
-      host,
-      ...(memberIp ? { ip: memberIp } : {}),
-      code,
-      token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
-      hubServerId: identity.serverId,
-      capabilities: preflight.capabilities,
-      port: opts.port,
-      // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
-      ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
-      ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
-      // The whole roster rides the first join too, so a new member arrives with every account
-      // instead of only the mirrored default (§7.3).
-      ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
-    });
-    if (!outcome.ok) return Response.json({ ok: false, error: outcome.error } satisfies rest.FleetInviteResponse);
-    // Probe the joiner's transport (https if it serves, else plain http) AND its identity. Prefer
-    // the probed serverId over the pairing outcome / host fallback: a host-as-serverId silently
-    // breaks targeted token propagation (members are matched by serverId).
-    const resolved = await resolveMember(host, opts.port, undefined, memberIp);
-    // Record the rev the joiner confirmed taking, exactly as `pushRosterToMembers` does after a
-    // rotation. Without it a freshly-paired member sits at an undefined rev and the Servers tab
-    // reports "out of date — press Sync now" about a member that is in fact perfectly in sync,
-    // until the next roster edit happens to paper over it. `invitePeer` reports what it actually
-    // sent, so this can't drift from the capability gate.
-    const member: rest.FleetMember = {
-      serverId: resolved.serverId || outcome.serverId || host,
-      serverName: outcome.serverName || resolved.serverName || host,
-      host,
-      url: resolved.url,
-      ...(outcome.accountsRev !== undefined ? { accountsRev: outcome.accountsRev } : {}),
-    };
-    fleet.upsert(member);
-    // The member is recorded — tell the joiner so it disarms (HJ-16). Best-effort and deliberately
-    // AFTER the upsert: the joiner staying armed through a lost reply is the failure mode this
-    // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
-    void ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
-    pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
-    return Response.json({ ok: true, member } satisfies rest.FleetInviteResponse);
+    // Join-by-host: a double-click (or a second client) while this host's invite is in flight shares
+    // the running job instead of double-pushing the credential.
+    const { job, completion } = fleetJobs.start("invite", `invite:${host}`, () => runInviteJob(host, code));
+    if (url.searchParams.get("async")) {
+      return Response.json({ ok: true, jobId: job.jobId, kind: "invite", state: job.state } satisfies rest.FleetJobStartResponse, { status: 202 });
+    }
+    // Legacy synchronous mode (no ?async=1): bundled native web UIs predate the job model — keep the
+    // original blocking behavior + response shape for them.
+    return Response.json(await completion);
   });
 
   // ── Joiner side: receive credentials on this daemon's own port (headless-join §5.3) ────────
@@ -872,11 +920,33 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // members we already paired — it discloses nothing to the caller — so it takes /pair's posture
   // instead: reject a proven `otherUser`, but stay permissive when identity is unprovable (`unknown`,
   // e.g. whois momentarily down) rather than fail an operator's Sync now intermittently.
-  route("POST", "/api/fleet/rotate", async (_req, _url, _m, ctx) => {
+  // [BE2-15] The rotate fan-out body — same job treatment as invite. A throw becomes a clean
+  // {ok:false} result (the old sync route surfaced it as a 500; the shape now carries it instead).
+  async function runRotateJob(): Promise<rest.FleetRotateResponse> {
+    try {
+      const results = await pushRosterToMembers();
+      return { ok: results.every((r) => r.ok), results };
+    } catch (e) {
+      return { ok: false, results: [], error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  route("POST", "/api/fleet/rotate", async (_req, url, _m, ctx) => {
     const who = await ctx.callerIdentity();
     if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
-    const results = await pushRosterToMembers();
-    return Response.json({ ok: results.every((r) => r.ok), results } satisfies rest.FleetRotateResponse);
+    // One rotate at a time: a second "Sync now" while one is running joins the in-flight fan-out.
+    const { job, completion } = fleetJobs.start("rotate", "rotate", runRotateJob);
+    if (url.searchParams.get("async")) {
+      return Response.json({ ok: true, jobId: job.jobId, kind: "rotate", state: job.state } satisfies rest.FleetJobStartResponse, { status: 202 });
+    }
+    // Legacy synchronous mode (no ?async=1) — original blocking behavior + shape for old bundled UIs.
+    return Response.json(await completion);
+  });
+  // [BE2-15] Job progress for the async rotate/invite fan-outs. `result` (present once done) is the
+  // exact body the synchronous POST would have returned — no signal is lost by going async.
+  routeRe("GET", /^\/api\/fleet\/jobs\/([^/]+)$/, (_req, _url, m) => {
+    const j = fleetJobs.get(decodeURIComponent(m![1]!));
+    if (!j) return Response.json({ ok: false, error: "no such job (it may have expired, or the daemon restarted)" } satisfies rest.FleetJobStatusResponse, { status: 404 });
+    return Response.json({ ok: true, ...j, result: j.result as rest.FleetRotateResponse | rest.FleetInviteResponse | undefined } satisfies rest.FleetJobStatusResponse);
   });
   // Hub-orchestrated fleet update (spec §4.4). Same identity posture as /api/fleet/rotate — a
   // fleet-wide mutating action, so reject a PROVEN other tailnet user but stay permissive when
@@ -1117,12 +1187,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
     const ctx: ReqCtx = {
       srv,
       callerIdentity: async () =>
-        resolveCallerIdentity({
-          peerAddress: srv.requestIP(req)?.address,
-          headerLogin: req.headers.get("Tailscale-User-Login"),
-          selfLogin: tailscaleSelfLogin,
-          whois: tailscaleWhois,
-        }),
+        opts.resolveIdentity // [BE2-15] test-only seam — the real resolver shells out to tailscale
+          ? opts.resolveIdentity()
+          : resolveCallerIdentity({
+              peerAddress: srv.requestIP(req)?.address,
+              headerLogin: req.headers.get("Tailscale-User-Login"),
+              selfLogin: tailscaleSelfLogin,
+              whois: tailscaleWhois,
+            }),
       localNoIdentityCaller: isLocalNoIdentityCaller(srv.requestIP(req)?.address, req.headers.get("Tailscale-User-Login")),
     };
 
