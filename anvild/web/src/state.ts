@@ -5,8 +5,11 @@
 // problem — they're mutated, never reassigned — so they're exported as plain `const`s from the
 // module that owns them, not parked here.
 //
-// This module imports nothing from the rest of the app: it's the leaf that other modules funnel
-// shared state through, which keeps import cycles from forming (see the load-order notes in main.ts).
+// This module imports nothing from the rest of the app (protocol types only, erased at compile
+// time): it's the leaf that other modules funnel shared state through, which keeps import cycles
+// from forming (see the load-order notes in main.ts).
+import type { AuthAccountsEvent } from "../../protocol";
+
 export const ui = {
   // popstates from our own dismissOverlay() unwind — the teardown already ran, so the matching
   // popstate is swallowed. Written by overlays.dismissOverlay, read/decremented by the popstate
@@ -36,4 +39,13 @@ export const ui = {
   // of Claude's past answers are relevant) and topic dividers keep normal flow. Written by main's
   // conversation.snapshot handler, read by conversation.ts (noteAnswerRefs / appendTopicDivider).
   replayingSnapshot: false,
+  // The Claude account roster (Settings → Models; multi-account §9). Absent until the connect burst
+  // or an explicit auth.accounts.get lands. Written by settings.ts (onAuthAccounts), read by main.ts
+  // (the header account chip + switch menu, and the new-session/environment account pickers).
+  claudeAccounts: undefined as AuthAccountsEvent | undefined,
+  // Todoist link state (Settings → Integrations). Written by settings.ts (status / connect / project
+  // load), read by main.ts (the environment modal's project picker + the event router's member
+  // token-propagation check).
+  todoistConnected: false,
+  todoistProjectsLoaded: false,
 };
