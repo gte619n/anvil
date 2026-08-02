@@ -15,4 +15,8 @@ export const ui = {
   // Whether the session sidebar is collapsed. Owned by layout.ts, but the conversation core also
   // sets it (selecting a session collapses the sidebar on a phone). Seeded at boot in main.ts.
   sidebarCollapsed: false,
+  // Set while a daemon self-update restart is in flight: the WS drops then reconnects, and that
+  // reconnect is our signal the new build is live — reload to pick up the rebuilt web bundle.
+  // Written by fleet.ts (wireDaemonUpdate), read/cleared by main.ts's onStatus reconnect handler.
+  pendingRestartReload: false,
 };
