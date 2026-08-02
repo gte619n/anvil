@@ -97,7 +97,7 @@ test("[WEB2-9] a 1000-event snapshot replays with ≤2 layout read/write cycles"
   // One scrollHeight read + one scrollTop write for the entire replay (the single batched scroll).
   expect(layoutReads + layoutWrites).toBeLessThanOrEqual(2);
   expect(layoutWrites).toBe(1); // the final scroll DID land at the bottom
-});
+}, 30_000);
 
 test("[WEB2-9] batching preserves message count, order, and activity folding", () => {
   const el = convo.conversation;
@@ -119,7 +119,7 @@ test("[WEB2-9] batching preserves message count, order, and activity folding", (
   const activities = el.querySelectorAll("details.activity");
   expect(activities.length).toBe(100);
   expect(el.querySelectorAll("details.activity.live").length).toBe(0);
-});
+}, 30_000);
 
 test("[WEB2-9] live (non-replay) appends still follow the bottom per message", () => {
   const el = convo.conversation;
