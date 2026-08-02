@@ -466,7 +466,11 @@ All evidence below is from commit `1905fb0` on branch `update-service`, 2026-08-
   back, hub is LAST (`membersSettled==true` at hub-apply); `[F4]` unreachable skipped→pending-offline + reconciled.
 - EL-7b · **poison-rollback** (REAL git repo): watchdog reverts a never-healthy build to the pre-pull commit via
   real `git reset --hard`; asserts repo HEAD moved back to the good commit + daemon restarted.
-- EL-7c · real-host launchd/systemd smoke (7.4): **PENDING** — requires a real host (§5.4).
+- EL-7c · real-host launchd/systemd smoke (7.4): **PARTIAL** — 2026-08-02, on the hub (M4, launchd):
+  `launchctl list` shows `com.anvil.anvil-updater` installed AND running (its own PID) alongside
+  `com.anvil.anvild`, i.e. the §4.5 bootstrap armed the supervisor unit on a real host in production.
+  Still pending: a witnessed real update + poison-build rollback on a live host (needs a maintenance
+  window — restarting the hub daemon drops every fleet client), and the systemd half (no Linux member).
 
 **Independent review (D24)** — adversarial reviewer over `git diff --cached`, 2026-08-01:
 - EL-R1 · [MED-HIGH] `applyUpdateToTarget` build-fail-after-checkout left the broken target on disk with nothing
