@@ -306,16 +306,18 @@ private class AssetsWebHandler(context: android.content.Context) : WebViewAssetL
             null
         }
     }
+}
 
-    private fun guessMime(p: String): String = when (p.substringAfterLast('.', "")) {
-        "html" -> "text/html"
-        "js", "mjs" -> "text/javascript"
-        "css" -> "text/css"
-        "json", "map" -> "application/json"
-        "svg" -> "image/svg+xml"
-        "woff2" -> "font/woff2"
-        "png" -> "image/png"
-        "wasm" -> "application/wasm"
-        else -> "application/octet-stream"
-    }
+/** MIME type for a bundled web asset path, by extension. Top-level (not a method of the Android-bound
+ *  handler above) so plain-JVM unit tests can exercise it — the seed of the app's unit-test target. */
+internal fun guessMime(p: String): String = when (p.substringAfterLast('.', "")) {
+    "html" -> "text/html"
+    "js", "mjs" -> "text/javascript"
+    "css" -> "text/css"
+    "json", "map" -> "application/json"
+    "svg" -> "image/svg+xml"
+    "woff2" -> "font/woff2"
+    "png" -> "image/png"
+    "wasm" -> "application/wasm"
+    else -> "application/octet-stream"
 }

@@ -138,6 +138,11 @@ jobs:
       - name: Build debug APK (no upload)
         run: ./gradlew :app:assembleDebug --stacktrace
 
+      # Seed unit-test target (plain-JVM JUnit, app/src/test — starts with GuessMimeTest). Separate
+      # step so a test failure is distinguishable from a build failure at a glance.
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
   # [CI2-1] Secrets-free Apple PR build. NB the macOS client is NOT an xcodebuild product: release.yml's
   # make-app.sh compiles it with plain `swift build` (SwiftPM) and only assembles/signs the .app after —
   # so `swift build` here IS the release compile, minus signing/notarization/Sparkle packaging. The web
@@ -180,6 +185,14 @@ jobs:
       - name: Build macOS shell (the exact compile make-app.sh runs)
         working-directory: apple
         run: swift build -c release
+
+      # Seed unit-test target (XCTest, apple/Tests — starts with DeepLinkTests). Needs the full-Xcode
+      # toolchain this runner selects above (XCTest isn't in the bare Command Line Tools); plain
+      # `swift build` (what make-app.sh runs) never builds test targets, so make-app.sh on a
+      # CLT-only host is unaffected by the target existing.
+      - name: Unit tests (swift test)
+        working-directory: apple
+        run: swift test
 
       - name: Generate Xcode project (xcodegen lint)
         working-directory: apple
