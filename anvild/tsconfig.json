@@ -6,7 +6,6 @@
     "moduleResolution": "bundler",
     "lib": ["ESNext"],
     "types": ["bun"],
-    "baseUrl": ".",
     "paths": {
       "@protocol": ["./protocol.ts"]
     },
