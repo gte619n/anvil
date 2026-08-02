@@ -17,8 +17,18 @@ Running log of decisions made during autonomous implementation of
   7600 → 2040 (−5560) across eight seams (`fleet/sidebar/conversation/autopilot/settings/composer/
   panel/dialogs.ts`), with WEB2-2/16 render diffs, WEB2-18 `modalPromise`, WEB2-8 dialog a11y, and
   WEB2-19 `busy()` folded into their seams. Suite 795 → 827 pass. See the P7 section below.
-- **Documented deferrals** (own follow-up PRs, each with rationale): async-git-ops (BE2-2/3/5/15),
-  BE2-30 cross-process CAS, WEB2-2/3/6/9/16, CI2-1/4/7/12, and native Swift/Kotlin test targets.
+- **Deferrals: ALL LANDED (2026-08-02, branch `program-followups`, one PR).** async-git-ops
+  (BE2-2/3/5 + slow-git harness), BE2-15 (fleet rotate/invite job-ified, `?async=1` + job polling,
+  legacy sync path kept for old bundled native UIs), BE2-30 (watchdog sidecar — one writer per file,
+  seq-absorbed merge), WEB2-9 (batched snapshot replay), WEB2-6 (convo cache capped to the last 200
+  blocks), WEB2-3/17 (content-hashed bundle + lazy xterm/Sortable chunks −51% entry, RELEASE-gated
+  sourcemaps, SW manifest precache/prune), CI2-1 (path-filtered android/apple/mac-server PR builds),
+  CI2-4 (apple-signing composite action), CI2-7 (rollback paths gated on trusted history — tags are
+  unsigned in CI, so signature verification was correctly NOT invented), CI2-12 (release_ref dispatch
+  input + per-platform rollback docs in CI-CD.md), and seed native test targets (Android JUnit,
+  Apple XCTest). Plus issues #158 (client-side default-chat namespacing), #160, #162 (version-gate
+  floor + REST update button). NOT included by design: the Stable Update Service watchdog-supervisor
+  (its locked spec designates its own branch `update-service`).
 
 ## P7 — God-file decomposition (in progress, branch `refactor/godfile-decomp`)
 
