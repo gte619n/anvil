@@ -25,6 +25,8 @@
 // insert, and the Escape blur. The outbox flush/reconcile orchestration stays in main (it touches
 // sockets, routing, and session state); the composer only calls the injected `enqueue`.
 import { $, esc } from "./dom";
+// dialogs.ts is a leaf, so toast is a direct import — it used to arrive via initComposer(deps).
+import { toast } from "./dialogs";
 import { newCid, type OutboxItem } from "./outbox";
 import { sendTo, serverOf, serverFetch, type Server } from "./fleet";
 import { appendOptimisticUser } from "./conversation";
@@ -43,7 +45,6 @@ export interface ComposerDeps {
   activeServer(): Server;
   /** Queue a write into main's outbox (badge + flush kick stay in main with the flush machinery). */
   enqueue(item: OutboxItem): void;
-  toast(msg: string): void;
   /** The side-panel reader's open file (main's `readerPath` — a reassigned scalar, read at call
    *  time; select-to-quote prefixes a reader quote with its path). */
   readerPath(): string;
@@ -56,10 +57,9 @@ let sessions: ComposerDeps["sessions"];
 let activeId: ComposerDeps["activeId"];
 let activeServer: ComposerDeps["activeServer"];
 let enqueue: ComposerDeps["enqueue"];
-let toast: ComposerDeps["toast"];
 let readerPath: ComposerDeps["readerPath"];
 export function initComposer(deps: ComposerDeps): void {
-  ({ sessions, activeId, activeServer, enqueue, toast, readerPath } = deps);
+  ({ sessions, activeId, activeServer, enqueue, readerPath } = deps);
   wireComposerDom();
 }
 

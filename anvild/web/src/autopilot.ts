@@ -15,12 +15,15 @@
 // is a function main calls (event router, hash routing, the #open-autopilot button, fleet deps).
 //
 // main.ts ↔ autopilot.ts wiring: autopilot.ts never imports from main.ts. Everything autopilot code
-// needs from main (the merged session/environment maps, sendAwait, modal/dialog/toast helpers,
-// selectSession, the Todoist panel refresh) is injected once via initAutopilot(deps) — mirroring
+// needs from main (the merged session/environment maps, sendAwait, selectSession, the Todoist
+// panel refresh) is injected once via initAutopilot(deps) — mirroring
 // fleet/sidebar/conversation — during main's module init, before any socket connects or deep link
 // fires. Cross-module state that main still reaches (`serverSchedule` in onStatus; the plan routing
 // maps live in fleet.ts) is an in-place container, so it stays an exported `const` here.
 import { $, esc, icon } from "./dom";
+// dialogs.ts is a leaf, so the modal/dialog/toast helpers are direct imports — they used to arrive
+// via initAutopilot(deps).
+import { closeModal, confirmDialog, confirmDialogWithOption, pickListDialog, showModal, toast } from "./dialogs";
 import { currentTheme } from "./theme";
 import { stripeColor } from "./sessionColor";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
@@ -38,20 +41,6 @@ export interface AutopilotDeps {
   environments: Map<string, Environment>;
   /** cid-tracked request/response over a server's socket (main's `sendAwait`). */
   sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
-  toast(msg: string): void;
-  showModal(el: HTMLElement): void;
-  closeModal(): void;
-  confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean>;
-  confirmDialogWithOption(opts: {
-    title: string;
-    body?: string;
-    confirmLabel?: string;
-    danger?: boolean;
-    icon?: string;
-    optionLabel: string;
-    optionChecked?: boolean;
-  }): Promise<{ ok: boolean; checked: boolean }>;
-  pickListDialog(title: string, items: { id: string; label: string; icon?: string }[], headIcon?: string): Promise<string | null>;
   /** Jump into a session (Go / Plan with Claude / Link land in the session they created/attached). */
   selectSession(id: string, push?: boolean): void;
   /** The Settings → Todoist panel embeds the schedule card — refresh it when the hub's schedule changes. */
@@ -63,16 +52,10 @@ export interface AutopilotDeps {
 let sessions: AutopilotDeps["sessions"];
 let environments: AutopilotDeps["environments"];
 let sendAwait: AutopilotDeps["sendAwait"];
-let toast: AutopilotDeps["toast"];
-let showModal: AutopilotDeps["showModal"];
-let closeModal: AutopilotDeps["closeModal"];
-let confirmDialog: AutopilotDeps["confirmDialog"];
-let confirmDialogWithOption: AutopilotDeps["confirmDialogWithOption"];
-let pickListDialog: AutopilotDeps["pickListDialog"];
 let selectSession: AutopilotDeps["selectSession"];
 let renderTodoistPanel: AutopilotDeps["renderTodoistPanel"];
 export function initAutopilot(deps: AutopilotDeps): void {
-  ({ sessions, environments, sendAwait, toast, showModal, closeModal, confirmDialog, confirmDialogWithOption, pickListDialog, selectSession, renderTodoistPanel } = deps);
+  ({ sessions, environments, sendAwait, selectSession, renderTodoistPanel } = deps);
 }
 
 // ── Autopilot (plan review & launch; anvil-autopilot-ui.md) ────────────────────────

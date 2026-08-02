@@ -17,8 +17,8 @@
 // dep wiring).
 //
 // main.ts ↔ settings.ts wiring: settings.ts never imports from main.ts. Everything settings code
-// needs from main (the merged session/environment maps, sendAwait, modal/dialog/toast helpers, the
-// theme setter, the environment/prompt modal openers, the header account chip) is injected once via
+// needs from main (the merged session/environment maps, sendAwait, the theme setter, the prompt
+// modal openers, the header account chip) is injected once via
 // initSettings(deps) — mirroring fleet/sidebar/conversation/autopilot — during main's module init.
 // Cross-module REASSIGNED scalars main still reads (`claudeAccounts` for the header chip + account
 // pickers; `todoistConnected`/`todoistProjectsLoaded` for the environment modal and the member
@@ -26,6 +26,9 @@
 // `readmeLoaded`) stay `const` here.
 import { apiFetch } from "./api";
 import { $, byEnvName, envIcon, esc, icon } from "./dom";
+// dialogs.ts is a leaf, so the modal/toast helpers and the environment modals are direct imports —
+// they used to arrive via initSettings(deps).
+import { closeModal, confirmDialog, showAddEnvironment, showEditEnvironment, showModal, toast } from "./dialogs";
 import { currentTheme, updateThemeControls } from "./theme";
 import type { ThemePref } from "./theme";
 import { ui } from "./state";
@@ -76,15 +79,8 @@ export interface SettingsDeps {
   activeId(): string | null;
   /** cid-tracked request/response over a server's socket (main's `sendAwait`). */
   sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
-  toast(msg: string): void;
-  showModal(el: HTMLElement): void;
-  closeModal(): void;
-  confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean>;
   /** Theme choice (Settings → Appearance) — the pref scalar stays in main next to the boot apply. */
   setThemePref(pref: ThemePref): void;
-  /** The environment modals (stay in main with the other modals/pickers — a later seam). */
-  showAddEnvironment(): void;
-  showEditEnvironment(id: string): void;
   /** The prompt-library editor + panel (stay in main with the composer they feed). */
   showEditPrompt(id?: string): void;
   renderPromptsPanel(): void;
@@ -99,13 +95,7 @@ let sessions: SettingsDeps["sessions"];
 let environments: SettingsDeps["environments"];
 let activeId: SettingsDeps["activeId"];
 let sendAwait: SettingsDeps["sendAwait"];
-let toast: SettingsDeps["toast"];
-let showModal: SettingsDeps["showModal"];
-let closeModal: SettingsDeps["closeModal"];
-let confirmDialog: SettingsDeps["confirmDialog"];
 let setThemePref: SettingsDeps["setThemePref"];
-let showAddEnvironment: SettingsDeps["showAddEnvironment"];
-let showEditEnvironment: SettingsDeps["showEditEnvironment"];
 let showEditPrompt: SettingsDeps["showEditPrompt"];
 let renderPromptsPanel: SettingsDeps["renderPromptsPanel"];
 let updateHeaderAccount: SettingsDeps["updateHeaderAccount"];
@@ -115,13 +105,7 @@ export function initSettings(deps: SettingsDeps): void {
     environments,
     activeId,
     sendAwait,
-    toast,
-    showModal,
-    closeModal,
-    confirmDialog,
     setThemePref,
-    showAddEnvironment,
-    showEditEnvironment,
     showEditPrompt,
     renderPromptsPanel,
     updateHeaderAccount,

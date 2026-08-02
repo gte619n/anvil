@@ -48,4 +48,9 @@ export const ui = {
   // token-propagation check).
   todoistConnected: false,
   todoistProjectsLoaded: false,
+  // The cid of a session.create we kicked off from the new-session dialog (dialogs.ts). The matching
+  // session.created echoes this cid back to *us* only (other devices get it cid-less), so main's
+  // event router can jump straight into the session we just made without also hijacking sessions
+  // created elsewhere. Written by dialogs.ts (showNewSession), read/cleared by main.ts (onEvent).
+  pendingCreateCid: null as string | null,
 };

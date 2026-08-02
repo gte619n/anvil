@@ -13,11 +13,14 @@
 // connects always happened.
 //
 // main.ts ↔ fleet.ts wiring: fleet.ts never imports from main.ts. Everything fleet code needs from
-// main (event/status handlers, renderers, persistence, modal/toast helpers) is injected once via
+// main (event/status handlers, renderers, persistence) is injected once via
 // initFleet(deps) — mirroring the daemon-side P7 services — before any socket is created.
 import { AnvilSocket } from "./ws";
 import { apiFetch, daemonBase, sameServerUrl } from "./api";
 import { $, enhanceSelect, esc, icon, refreshSelect } from "./dom";
+// dialogs.ts is a leaf (it only type-imports this module), so the modal/toast helpers are direct
+// imports — they used to arrive via initFleet(deps).
+import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { armJoinWindow } from "./setup";
 import { newCid } from "./outbox";
 import { ui } from "./state";
@@ -47,10 +50,6 @@ export interface FleetDeps {
   renderSessions(): void;
   /** The Settings → Fleet card list (stays in main next to the roster/ADB card helpers). */
   renderServerCards(): void;
-  toast(msg: string): void;
-  showModal(el: HTMLElement): void;
-  closeModal(): void;
-  confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean>;
   /** cid-tracked request/response over a server's socket (main's `sendAwait`). */
   sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
   /** Write into the hub card's update-output pane (the restart-reload flow). */
@@ -71,10 +70,6 @@ let persistSessions: FleetDeps["persistSessions"];
 let persistEnvironments: FleetDeps["persistEnvironments"];
 let renderSessions: FleetDeps["renderSessions"];
 let renderServerCards: FleetDeps["renderServerCards"];
-let toast: FleetDeps["toast"];
-let showModal: FleetDeps["showModal"];
-let closeModal: FleetDeps["closeModal"];
-let confirmDialog: FleetDeps["confirmDialog"];
 let sendAwait: FleetDeps["sendAwait"];
 let setUpdateStatus: FleetDeps["setUpdateStatus"];
 export function initFleet(deps: FleetDeps): void {
@@ -91,10 +86,6 @@ export function initFleet(deps: FleetDeps): void {
     persistEnvironments,
     renderSessions,
     renderServerCards,
-    toast,
-    showModal,
-    closeModal,
-    confirmDialog,
     sendAwait,
     setUpdateStatus,
   } = deps);

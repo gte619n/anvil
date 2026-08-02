@@ -28,6 +28,9 @@ import MarkdownIt from "markdown-it";
 import { $, esc, icon, sessIcon } from "./dom";
 import { currentTheme } from "./theme";
 import { ui } from "./state";
+// dialogs.ts is a leaf, so toast + the permission/question card-map reset are direct imports —
+// they used to arrive via initConversation(deps).
+import { clearCardMaps, toast } from "./dialogs";
 import { envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, type Server } from "./fleet";
 import { isAndroidApp } from "./push";
@@ -55,11 +58,6 @@ export interface ConversationDeps {
   saveConvoCache(): void;
   /** Status fan-out (main's `setStatus` — cancelThinking forces "idle" through the same path). */
   setStatus(status: string): void;
-  /** Transient notification (main's `toast` — the long-press menu reports copy/download results). */
-  toast(msg: string): void;
-  /** Forget the per-request permission/question card maps (main's `permCards`/`questionCards`) when
-   *  the pane is cleared — the cards themselves are detached by the innerHTML reset. */
-  clearCardMaps(): void;
   /** The open side panel, if any (panel.ts's `panelView` — a reassigned scalar, read at call time). */
   panelView(): string | null;
   /** The links side-panel chrome (lives in panel.ts; refreshed when the reference set changes). */
@@ -76,12 +74,10 @@ let environments: ConversationDeps["environments"];
 let snapshotLoaded: ConversationDeps["snapshotLoaded"];
 let saveConvoCache: ConversationDeps["saveConvoCache"];
 let setStatus: ConversationDeps["setStatus"];
-let toast: ConversationDeps["toast"];
-let clearCardMaps: ConversationDeps["clearCardMaps"];
 let panelView: ConversationDeps["panelView"];
 let renderLinks: ConversationDeps["renderLinks"];
 export function initConversation(deps: ConversationDeps): void {
-  ({ activeId, activeServer, sessions, environments, snapshotLoaded, saveConvoCache, setStatus, toast, clearCardMaps, panelView, renderLinks } = deps);
+  ({ activeId, activeServer, sessions, environments, snapshotLoaded, saveConvoCache, setStatus, panelView, renderLinks } = deps);
   wireConversationDom();
 }
 

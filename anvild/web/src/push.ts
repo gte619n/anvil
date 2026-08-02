@@ -9,7 +9,8 @@
 // (the headless smoke test guards the load-order assumption).
 import { apiFetch } from "./api";
 import { $, icon } from "./dom";
-import { selectSession, sessions, toast } from "./main";
+import { selectSession, sessions } from "./main";
+import { toast } from "./dialogs";
 
 // Native Android/Apple shell bridge (present only inside the app): ADB-wifi connect, native push.
 export const nativeBridge: { postMessage(s: string): void; onmessage?: (e: MessageEvent) => void } | undefined = (window as unknown as { AnvilNative?: typeof nativeBridge }).AnvilNative;

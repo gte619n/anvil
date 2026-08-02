@@ -16,7 +16,7 @@
 // the note on the function).
 //
 // main.ts ↔ panel.ts wiring: panel.ts never imports from main.ts. Everything panel code needs from
-// main (the active session, modal/toast helpers, the session-kill lifecycle) is injected once via
+// main (the active session, the session-kill lifecycle) is injected once via
 // initPanel(deps). Session lifecycle (killSession/purgeSessionLocally) stays in main — it reassigns
 // main's `activeId` and touches the persistence/caches — and is reached via the injected
 // `killSession`. `panelView`/`readerPath`/`xterm` are exported live bindings: panel.ts is their
@@ -25,6 +25,9 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { sendTo, serverApiUrl, serverFetch, type Server } from "./fleet";
 import { $, esc, icon, linkifyUrls } from "./dom";
+// dialogs.ts is a leaf, so the modal/toast helpers are direct imports — they used to arrive via
+// initPanel(deps).
+import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { currentTheme } from "./theme";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
 import { isAndroidApp } from "./push";
@@ -47,10 +50,6 @@ export interface PanelDeps {
   activeServer(): Server;
   /** The merged session list (main owns it; the git panel reads status off it). */
   sessions: Map<string, Session>;
-  toast(msg: string): void;
-  showModal(el: HTMLElement): void;
-  closeModal(): void;
-  confirmDialog(opts: { title: string; body?: string; confirmLabel?: string; danger?: boolean; icon?: string }): Promise<boolean>;
   /** Kill a session (main's `killSession` — session lifecycle: it reassigns main's `activeId`,
    *  drops caches/drafts, and watches the kill's cid reply for the disowned-ghost eviction). */
   killSession(id: string): void;
@@ -62,13 +61,9 @@ export interface PanelDeps {
 let activeId: PanelDeps["activeId"];
 let activeServer: PanelDeps["activeServer"];
 let sessions: PanelDeps["sessions"];
-let toast: PanelDeps["toast"];
-let showModal: PanelDeps["showModal"];
-let closeModal: PanelDeps["closeModal"];
-let confirmDialog: PanelDeps["confirmDialog"];
 let killSession: PanelDeps["killSession"];
 export function initPanel(deps: PanelDeps): void {
-  ({ activeId, activeServer, sessions, toast, showModal, closeModal, confirmDialog, killSession } = deps);
+  ({ activeId, activeServer, sessions, killSession } = deps);
 
   // ── Moved top-level DOM wiring (runs at main's original side-panel wiring point) ──
   // file links in the conversation (Read/Edit/… tool calls) open the reader
