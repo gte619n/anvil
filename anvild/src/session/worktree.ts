@@ -1,12 +1,20 @@
 import { existsSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { GitStatus, Worktree } from "@protocol";
-import { gitSpawn, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "../git/spawn";
+import { gitSpawn, gitSpawnAsync, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "../git/spawn";
 
 /** Run git in `cwd`, capturing output. Hardened against network hangs via the shared `gitSpawn`
  *  (SSH keepalive + hard timeout); pass `NET_TIMEOUT_MS` for ops that touch the network (fetch). */
 function git(args: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): { code: number; stdout: string; stderr: string } {
   return gitSpawn(["git", ...args], cwd, timeoutMs);
+}
+
+/** [BE2-2] The async twin: same contract, but a slow subprocess parks a promise instead of freezing
+ *  the single-threaded daemon. The whole worktree-creation chain runs through this so the network
+ *  `git fetch` in `syncedBase` (and a wedged local git) can never block session.create / team spawn /
+ *  autopilot startPlan. */
+function gitAsync(args: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): Promise<{ code: number; stdout: string; stderr: string }> {
+  return gitSpawnAsync(["git", ...args], cwd, timeoutMs);
 }
 
 /**
@@ -49,27 +57,27 @@ export interface CreatedWorktree {
  * anything else (a remote ref, tag, or raw SHA the caller asked for explicitly) resolves to undefined
  * so we leave it untouched.
  */
-function localBranchFor(repoRoot: string, base: string): string | undefined {
+async function localBranchFor(repoRoot: string, base: string): Promise<string | undefined> {
   if (base === "HEAD") {
-    const cur = git(["symbolic-ref", "--short", "HEAD"], repoRoot);
+    const cur = await gitAsync(["symbolic-ref", "--short", "HEAD"], repoRoot);
     return cur.code === 0 ? cur.stdout.trim() : undefined; // detached HEAD → nothing to sync
   }
   const name = base.startsWith("refs/heads/") ? base.slice("refs/heads/".length) : base;
-  return git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], repoRoot).code === 0 ? name : undefined;
+  return (await gitAsync(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], repoRoot)).code === 0 ? name : undefined;
 }
 
 /** The remote-tracking ref a local branch should sync to: its upstream, else `origin/<branch>` if
  *  that tracking ref exists. Undefined when the branch tracks nothing on a remote. */
-function remoteTrackingRef(repoRoot: string, branch: string): string | undefined {
-  const up = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`], repoRoot);
+async function remoteTrackingRef(repoRoot: string, branch: string): Promise<string | undefined> {
+  const up = await gitAsync(["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`], repoRoot);
   if (up.code === 0 && up.stdout.trim()) return up.stdout.trim();
   const guess = `origin/${branch}`;
-  return git(["rev-parse", "--verify", "--quiet", `refs/remotes/${guess}`], repoRoot).code === 0 ? guess : undefined;
+  return (await gitAsync(["rev-parse", "--verify", "--quiet", `refs/remotes/${guess}`], repoRoot)).code === 0 ? guess : undefined;
 }
 
 /** True if `branch` is checked out in any worktree of this repo (so its ref must not be moved). */
-function isCheckedOutAnywhere(repoRoot: string, branch: string): boolean {
-  const r = git(["worktree", "list", "--porcelain"], repoRoot);
+async function isCheckedOutAnywhere(repoRoot: string, branch: string): Promise<boolean> {
+  const r = await gitAsync(["worktree", "list", "--porcelain"], repoRoot);
   if (r.code !== 0) return false;
   return r.stdout.split("\n").some((l) => l.trim() === `branch refs/heads/${branch}`);
 }
@@ -86,18 +94,18 @@ function isCheckedOutAnywhere(repoRoot: string, branch: string): boolean {
  * Never throws; on any failure the local branch simply stays put (the worktree already bases off
  * `tracking`, so correctness never depends on this).
  */
-function fastForwardLocal(repoRoot: string, branch: string, tracking: string): void {
-  if (git(["merge-base", "--is-ancestor", branch, tracking], repoRoot).code !== 0) return; // not a ff
+async function fastForwardLocal(repoRoot: string, branch: string, tracking: string): Promise<void> {
+  if ((await gitAsync(["merge-base", "--is-ancestor", branch, tracking], repoRoot)).code !== 0) return; // not a ff
 
-  const here = git(["symbolic-ref", "--short", "HEAD"], repoRoot);
+  const here = await gitAsync(["symbolic-ref", "--short", "HEAD"], repoRoot);
   if (here.code === 0 && here.stdout.trim() === branch) {
-    const dirty = git(["status", "--porcelain", "--untracked-files=no"], repoRoot).stdout.trim();
+    const dirty = (await gitAsync(["status", "--porcelain", "--untracked-files=no"], repoRoot)).stdout.trim();
     if (dirty) return; // tracked changes present — don't touch the user's working tree
-    git(["merge", "--ff-only", tracking], repoRoot);
+    await gitAsync(["merge", "--ff-only", tracking], repoRoot);
     return;
   }
-  if (isCheckedOutAnywhere(repoRoot, branch)) return; // a live session is on it; can't move it safely
-  git(["branch", "-f", branch, tracking], repoRoot);
+  if (await isCheckedOutAnywhere(repoRoot, branch)) return; // a live session is on it; can't move it safely
+  await gitAsync(["branch", "-f", branch, tracking], repoRoot);
 }
 
 /**
@@ -117,18 +125,19 @@ function fastForwardLocal(repoRoot: string, branch: string, tracking: string): v
  * remote ref, tag, SHA, or a detached/untracked branch — are honored unchanged. Best-effort: offline /
  * no-remote / failed fetch all fall back to `base`, so worktree creation never depends on the network.
  */
-function syncedBase(repoRoot: string, base: string): string {
-  const branch = localBranchFor(repoRoot, base);
+async function syncedBase(repoRoot: string, base: string): Promise<string> {
+  const branch = await localBranchFor(repoRoot, base);
   if (!branch) return base;
-  const tracking = remoteTrackingRef(repoRoot, branch);
+  const tracking = await remoteTrackingRef(repoRoot, branch);
   if (!tracking) return base;
 
   const slash = tracking.indexOf("/"); // split "origin/feature/x" → remote "origin", branch "feature/x"
   const remote = tracking.slice(0, slash);
   const remoteBranch = tracking.slice(slash + 1);
-  const fetched = git(["fetch", remote, remoteBranch], repoRoot, NET_TIMEOUT_MS); // network; updates refs/remotes/<tracking>
+  // [BE2-2] Network fetch — async, so a stalled connection parks this create instead of the daemon.
+  const fetched = await gitAsync(["fetch", remote, remoteBranch], repoRoot, NET_TIMEOUT_MS); // updates refs/remotes/<tracking>
   if (fetched.code !== 0) return base;
-  fastForwardLocal(repoRoot, branch, tracking);
+  await fastForwardLocal(repoRoot, branch, tracking);
   return tracking;
 }
 
@@ -151,21 +160,24 @@ export function assertSafeRef(ref: string, label: string): void {
   }
 }
 
-export function createWorktree(
+// [BE2-2] Async: the base-sync fetch (network) and the worktree add run via Bun.spawn, so a slow
+// remote or wedged git parks this creation instead of freezing the daemon (which used to stall
+// session.create, team spawn, and autopilot startPlan behind one `git fetch`).
+export async function createWorktree(
   repoRoot: string,
   base: string,
   branch: string,
   worktreeRoot: string,
   sessionId: string,
-): CreatedWorktree {
+): Promise<CreatedWorktree> {
   assertSafeRef(base, "base");
   assertSafeRef(branch, "branch");
   const cwd = join(worktreeRoot, sessionId);
-  base = syncedBase(repoRoot, base);
-  const r = git(["worktree", "add", "-b", branch, cwd, base], repoRoot);
+  base = await syncedBase(repoRoot, base);
+  const r = await gitAsync(["worktree", "add", "-b", branch, cwd, base], repoRoot);
   if (r.code !== 0) {
     // An empty repo (unborn HEAD) can't branch a worktree — git only says "invalid reference: HEAD".
-    if (git(["rev-parse", "--verify", "HEAD"], repoRoot).code !== 0) {
+    if ((await gitAsync(["rev-parse", "--verify", "HEAD"], repoRoot)).code !== 0) {
       throw new Error(`repository has no commits yet — make an initial commit in ${repoRoot} before starting a session`);
     }
     throw new Error(r.stderr.trim() || r.stdout.trim() || "git worktree add failed");
@@ -209,16 +221,16 @@ export function worktreeHealth(cwd: string, branch?: string): WorktreeHealth {
  * Prunes any stale registration, then re-adds the worktree from the existing branch; if the branch
  * itself is gone, recreates it off `base`. Returns whether the worktree is healthy afterward.
  */
-export function recreateWorktree(repoRoot: string, cwd: string, branch: string, base = "HEAD"): { ok: boolean; error?: string } {
+export async function recreateWorktree(repoRoot: string, cwd: string, branch: string, base = "HEAD"): Promise<{ ok: boolean; error?: string }> {
   // Clear any half-state so `worktree add` won't refuse ("already exists"/"missing but locked").
-  git(["worktree", "remove", "--force", cwd], repoRoot);
-  git(["worktree", "prune"], repoRoot);
+  await gitAsync(["worktree", "remove", "--force", cwd], repoRoot);
+  await gitAsync(["worktree", "prune"], repoRoot);
   if (existsSync(cwd)) rmSync(cwd, { recursive: true, force: true });
 
-  const branchExists = git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot).code === 0;
+  const branchExists = (await gitAsync(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot)).code === 0;
   const add = branchExists
-    ? git(["worktree", "add", cwd, branch], repoRoot)
-    : git(["worktree", "add", "-b", branch, cwd, syncedBase(repoRoot, base)], repoRoot);
+    ? await gitAsync(["worktree", "add", cwd, branch], repoRoot)
+    : await gitAsync(["worktree", "add", "-b", branch, cwd, await syncedBase(repoRoot, base)], repoRoot);
   if (add.code !== 0) return { ok: false, error: add.stderr.trim() || add.stdout.trim() || "git worktree add failed" };
   linkDeps(repoRoot, cwd);
   return { ok: true };
@@ -293,6 +305,40 @@ function isLinkedNodeModules(porcelainLine: string): boolean {
   return path === "node_modules" || path.endsWith("/node_modules");
 }
 
+// [BE2-22] Cap the diffstat: a huge tree (thousands of changed files, e.g. a lockfile/generated-code
+// churn) otherwise rode every session.updated broadcast AND every debounced full-registry write. Keep
+// the first ~200 lines and append a one-line summary of the remainder rather than the whole array.
+const DIFFSTAT_CAP = 200;
+const capDiffstat = (allStat: string[]): string[] =>
+  allStat.length > DIFFSTAT_CAP
+    ? [...allStat.slice(0, DIFFSTAT_CAP), `… (+${allStat.length - DIFFSTAT_CAP} more files)`]
+    : allStat;
+
+/** [BE2-5] Async twin of `gitStatus` for the per-turn / background refresh paths: the same 3-4 local
+ *  git subprocesses, but via Bun.spawn so a wedged git parks a promise instead of freezing the event
+ *  loop after every agent turn. Keep the two projections identical when editing either. */
+export async function gitStatusAsync(cwd: string): Promise<GitStatus | undefined> {
+  const branch = await gitAsync(["branch", "--show-current"], cwd);
+  if (branch.code !== 0) return undefined;
+
+  const dirty = (await gitAsync(["status", "--porcelain"], cwd)).stdout
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .filter((l) => !isLinkedNodeModules(l));
+
+  let ahead = 0;
+  let behind = 0;
+  const ab = await gitAsync(["rev-list", "--left-right", "--count", "@{u}...HEAD"], cwd);
+  if (ab.code === 0) {
+    const parts = ab.stdout.trim().split(/\s+/).map(Number);
+    behind = parts[0] ?? 0;
+    ahead = parts[1] ?? 0;
+  }
+
+  const allStat = (await gitAsync(["diff", "--stat"], cwd)).stdout.split("\n").filter((l) => l.trim().length > 0);
+  return { branch: branch.stdout.trim(), ahead, behind, dirtyFileCount: dirty.length, diffstat: capDiffstat(allStat) };
+}
+
 /** Best-effort git state for the worktree panel (arch §8); undefined if `cwd` isn't a repo. */
 export function gitStatus(cwd: string): GitStatus | undefined {
   const branch = git(["branch", "--show-current"], cwd);
@@ -312,15 +358,6 @@ export function gitStatus(cwd: string): GitStatus | undefined {
     ahead = parts[1] ?? 0;
   }
 
-  // [BE2-22] Cap the diffstat: a huge tree (thousands of changed files, e.g. a lockfile/generated-code
-  // churn) otherwise rode every session.updated broadcast AND every debounced full-registry write. Keep
-  // the first ~200 lines and append a one-line summary of the remainder rather than the whole array.
-  const DIFFSTAT_CAP = 200;
   const allStat = git(["diff", "--stat"], cwd).stdout.split("\n").filter((l) => l.trim().length > 0);
-  const diffstat =
-    allStat.length > DIFFSTAT_CAP
-      ? [...allStat.slice(0, DIFFSTAT_CAP), `… (+${allStat.length - DIFFSTAT_CAP} more files)`]
-      : allStat;
-
-  return { branch: branch.stdout.trim(), ahead, behind, dirtyFileCount: dirty.length, diffstat };
+  return { branch: branch.stdout.trim(), ahead, behind, dirtyFileCount: dirty.length, diffstat: capDiffstat(allStat) };
 }

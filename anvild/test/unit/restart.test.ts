@@ -24,7 +24,7 @@ const freshCmd = (repo: string, title: string) =>
   ({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "fresh-worktree", repoRoot: repo, base: "HEAD", title } as const);
 
 // ── store ────────────────────────────────────────────────────────────────────
-test("store: saveAll is atomic (no leftover temp) and round-trips", () => {
+test("store: saveAll is atomic (no leftover temp) and round-trips", async () => {
   const dir = tempState();
   const store = new SessionStore(dir);
   store.saveAll([{ data: { id: "sess_x" } as never, lastSeq: 3 }]);
@@ -34,7 +34,7 @@ test("store: saveAll is atomic (no leftover temp) and round-trips", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("store: a corrupt sessions.json is backed up, not silently wiped", () => {
+test("store: a corrupt sessions.json is backed up, not silently wiped", async () => {
   const dir = tempState();
   const store = new SessionStore(dir);
   writeFileSync(join(dir, "sessions.json"), "{ this is not json");
@@ -46,10 +46,10 @@ test("store: a corrupt sessions.json is backed up, not silently wiped", () => {
 });
 
 // ── restore resilience ────────────────────────────────────────────────────────
-test("restore: a malformed session entry is quarantined; the good one still loads", () => {
+test("restore: a malformed session entry is quarantined; the good one still loads", async () => {
   const dir = tempState();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const good = sup1.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
+  const good = await sup1.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: dir });
 
   // inject a poison row that throws when wrapped (data.id is read first)
   const raw = JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8")) as { sessions: unknown[] };
@@ -64,11 +64,11 @@ test("restore: a malformed session entry is quarantined; the good one still load
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("restore: a fresh-worktree session whose worktree vanished is recovered", () => {
+test("restore: a fresh-worktree session whose worktree vanished is recovered", async () => {
   const dir = tempState();
   const repo = makeRepo();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup1.create(freshCmd(repo, "Recover Me"));
+  const s = await sup1.create(freshCmd(repo, "Recover Me"));
   const cwd = s.data.cwd;
   expect(existsSync(cwd)).toBe(true);
 
@@ -77,6 +77,7 @@ test("restore: a fresh-worktree session whose worktree vanished is recovered", (
 
   const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry()); // restore recovers it
   expect(sup2.get(s.id)).toBeDefined();
+  await sup2.worktreeRecoveriesSettled; // [BE2-2] recovery runs async git in the background now
   expect(existsSync(cwd)).toBe(true); // worktree re-established from the branch
   rmSync(dir, { recursive: true, force: true });
   rmSync(repo, { recursive: true, force: true });
@@ -87,7 +88,7 @@ test("reset: recovers a missing worktree and clears a frozen status", async () =
   const dir = tempState();
   const repo = makeRepo();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = sup.create(freshCmd(repo, "Stuck"));
+  const s = await sup.create(freshCmd(repo, "Stuck"));
   const cwd = s.data.cwd;
 
   rmSync(cwd, { recursive: true, force: true });
@@ -101,7 +102,7 @@ test("reset: recovers a missing worktree and clears a frozen status", async () =
 });
 
 // ── disposal guard ───────────────────────────────────────────────────────────
-test("session: emit is a no-op after dispose (late-draining turn can't write to a dead session)", () => {
+test("session: emit is a no-op after dispose (late-draining turn can't write to a dead session)", async () => {
   const sink: ServerEvent[] = [];
   const s = new Session(
     { id: "sess_d" } as never,

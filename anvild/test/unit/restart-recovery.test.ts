@@ -15,10 +15,10 @@ const createExisting = (sup: Supervisor, cwd: string) =>
 // server side of that: the epoch is stable (so the client stays in delta mode), the persisted log
 // survives, and a delta resume returns ONLY the missed events, always ending with a live status — so a
 // client whose spinner was "optimistically" left running self-heals the moment it re-attaches (D6).
-test("after a restart, a client delta-resumes the missed tail and status re-asserts", () => {
+test("after a restart, a client delta-resumes the missed tail and status re-asserts", async () => {
   const dir = tempState();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup1, dir);
+  const s = await createExisting(sup1, dir);
 
   // The client has seen up to here (its cached watermark).
   const clientLastSeq = sup1.get(s.id)!.lastSeq;
@@ -53,10 +53,10 @@ test("after a restart, a client delta-resumes the missed tail and status re-asse
 });
 
 // A cold client (no cached seq) still gets a full snapshot after restart — the safe fallback.
-test("after a restart, a cold client (no lastSeq) gets a full snapshot", () => {
+test("after a restart, a cold client (no lastSeq) gets a full snapshot", async () => {
   const dir = tempState();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup1, dir);
+  const s = await createExisting(sup1, dir);
   sup1.get(s.id)!.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: { source: "x", html: "x" } }] });
 
   const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());

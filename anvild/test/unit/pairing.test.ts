@@ -8,6 +8,7 @@ import {
   PairedHubStore,
   PairingWindow,
   generatePairCode,
+  isLocalNoIdentityCaller,
   isLoopbackAddress,
   isTailnetAddress,
   resolveCallerIdentity,
@@ -176,6 +177,19 @@ test("address classification", () => {
   expect(isTailnetAddress("fd7a:115c:a1e0::1")).toBe(true);
   expect(isTailnetAddress("10.0.0.5")).toBe(false); // a LAN peer is NOT the tailnet
   expect(isTailnetAddress("100.200.0.1")).toBe(false); // 100.x outside the CGNAT /10
+});
+
+test("[SEC2-3] isLocalNoIdentityCaller: only a loopback peer with NO identity header is 'local'", () => {
+  // The native-updater case: a local process on the box, no serve, no header → permitted on update routes.
+  expect(isLocalNoIdentityCaller("127.0.0.1", null)).toBe(true);
+  expect(isLocalNoIdentityCaller("::1", "")).toBe(true);
+  expect(isLocalNoIdentityCaller("::ffff:127.0.0.1", "   ")).toBe(true); // whitespace-only header ≈ absent
+  // A serve-proxied request carries a header — even over loopback it is NOT "local" (could be a
+  // DIFFERENT tailnet user), so it must NOT get the loopback exception.
+  expect(isLocalNoIdentityCaller("127.0.0.1", "someone@example.com")).toBe(false);
+  // A tailnet/LAN peer is never "local", header or not.
+  expect(isLocalNoIdentityCaller("100.64.0.9", null)).toBe(false);
+  expect(isLocalNoIdentityCaller(undefined, null)).toBe(false);
 });
 
 test("serve mode: loopback WITH the injected header, matching this node's owner → sameUser", async () => {

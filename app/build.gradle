@@ -175,4 +175,7 @@ dependencies {
     // Firebase Cloud Messaging (push)
     implementation platform('com.google.firebase:firebase-bom:33.7.0')
     implementation 'com.google.firebase:firebase-messaging'
+
+    // Plain-JVM unit tests (src/test) — run via :app:testDebugUnitTest in the CI PR gate (CI2-1).
+    testImplementation 'junit:junit:4.13.2'
 }

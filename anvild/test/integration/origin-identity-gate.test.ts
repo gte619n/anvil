@@ -89,18 +89,9 @@ test("[SEC2-2] /api/update/v1/apply requires an application/json content-type", 
   }
 });
 
-test("[SEC2-3] apply from a caller with no proven tailnet identity is rejected 403", async () => {
-  const { base, cleanup } = boot();
-  try {
-    // Loopback with no Tailscale-User-Login header ⇒ resolveCallerIdentity classifies "otherUser"
-    // ("local caller without a Tailscale identity") ⇒ the identity gate rejects before any git runs.
-    const res = await fetch(`${base}/api/update/v1/apply`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ targetSha: "deadbeef" }),
-    });
-    expect(res.status).toBe(403);
-  } finally {
-    cleanup();
-  }
-});
+// NOTE: the SEC2-3 identity gate is exercised here only for the ORIGIN + content-type paths, which
+// short-circuit BEFORE the update flow. We deliberately do NOT drive a real loopback apply through the
+// booted server: after the interview decision to permit a local (loopback, no-header) caller, such a
+// request would reach the REAL update flow and run `git` against this checkout. The identity DECISION
+// (reject proven otherUser, allow a local no-identity caller) is unit-tested via
+// `isLocalNoIdentityCaller` in test/unit/pairing.test.ts + the existing resolveCallerIdentity tests.

@@ -31,6 +31,10 @@ export class AnvilSocket {
     private readonly url: string,
     private readonly onEvent: EventHandler,
     private readonly onStatus: StatusHandler,
+    /** Optional last-touch rewrite of every outbound command — the client↔wire id seam (#158):
+     *  fleet.ts uses it to strip the client-side `sess_default@<server>` namespace back to the id
+     *  the daemon actually knows, on exactly the socket that owns the session. */
+    private readonly mapOut?: (cmd: Record<string, unknown> & { type: string }) => Record<string, unknown> & { type: string },
   ) {
     // Reconnect promptly when the device/network comes back, instead of waiting out the backoff.
     if (typeof window !== "undefined") {
@@ -190,7 +194,8 @@ export class AnvilSocket {
   /** Send a client command; the envelope (v, ts) is stamped here. Returns false if not connected. */
   send(cmd: Record<string, unknown> & { type: string }): boolean {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify({ v: PROTOCOL_VERSION, ts: new Date().toISOString(), ...cmd }));
+    const wire = this.mapOut ? this.mapOut(cmd) : cmd;
+    this.ws.send(JSON.stringify({ v: PROTOCOL_VERSION, ts: new Date().toISOString(), ...wire }));
     return true;
   }
 }

@@ -214,6 +214,37 @@ export async function resolveTargetSha(run: CommandRunner = runDefault): Promise
 }
 
 /**
+ * [CI2-7] Provenance gate for the ROLLBACK paths: true when `sha` is already part of this checkout's
+ * trusted history — an ancestor of (or equal to) the trusted upstream tip, or reachable from the
+ * current HEAD. A legit rollback target (a prePullSha we recorded ourselves) always satisfies one of
+ * the two: it was HEAD on the release track before the update moved us. What this refuses is a
+ * "rollback" to an arbitrary side-branch/attacker SHA — the hole SEC2-1's forward gate left open,
+ * since `allowNonFastForward`/`rollbackTo` previously reset the tree with NO check at all.
+ *
+ * The HEAD rule exists because a pinned forward target may legitimately be BEHIND the pre-update HEAD
+ * (any ancestor of the upstream tip is a valid pin), in which case the prePullSha is not an ancestor
+ * of the new HEAD but IS an ancestor of the upstream tip — and conversely, when the upstream ref can't
+ * be resolved at rollback time (e.g. origin/HEAD unrecorded on a re-init'd checkout), a target inside
+ * our own history is still provably ours. Both checks are local-only (remote-tracking refs), so a
+ * watchdog rollback works with the network down.
+ *
+ * Why not `git verify-tag`/`verify-commit` against pinned allowed signers: nothing in CI signs today —
+ * release.yml mints its `v*` tags UNSIGNED via `gh release create` (a plain API tag), and commits land
+ * unsigned — so signature verification would check a property the pipeline doesn't produce and brick
+ * every update. Ancestry against the trusted remote is the strongest provenance that is real today;
+ * revisit if CI ever grows a signing step.
+ */
+async function inTrustedHistory(run: CommandRunner, root: string, sha: string): Promise<boolean> {
+  try {
+    const ref = await resolveUpdateRef(run, root);
+    if ((await run(["git", "merge-base", "--is-ancestor", sha, ref], root)).code === 0) return true;
+  } catch {
+    // Upstream unresolvable — fall through to the local-history rule below.
+  }
+  return (await run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], root)).code === 0;
+}
+
+/**
  * Update the checkout to an EXPLICIT target SHA (spec D13), capturing the pre-pull SHA first so a
  * failed boot can be rolled back (spec D8). Mirrors {@link applyUpdate}'s pull→install→build→typecheck
  * safety, but checks out a pinned commit rather than fast-forwarding to a moving branch tip — so every
@@ -223,9 +254,10 @@ export async function resolveTargetSha(run: CommandRunner = runDefault): Promise
  * [SEC2-1] Supply-chain integrity: before checkout we require the target to be an ancestor of the
  * trusted upstream tip (`git merge-base --is-ancestor <target> <resolvedUpstreamRef>`), so a
  * fleet-update route can only pin the checkout to a commit actually reachable from origin's release
- * track — never an arbitrary side-branch/attacker commit. `allowNonFastForward` bypasses the gate for
- * the rollback path only (which deliberately resets backwards to a known-good prePullSha). Local
- * commits / a dirty tree make `git checkout` fail loudly and are never clobbered.
+ * track — never an arbitrary side-branch/attacker commit. `allowNonFastForward` relaxes (but does not
+ * remove — [CI2-7]) the gate for the rollback path, which deliberately resets backwards to a
+ * known-good prePullSha: the target must still be in {@link inTrustedHistory} (upstream track or our
+ * own history). Local commits / a dirty tree make `git checkout` fail loudly and are never clobbered.
  */
 export async function applyUpdateToTarget(
   targetSha: string,
@@ -253,6 +285,13 @@ export async function applyUpdateToTarget(
           `(${upstreamRef}) — only commits reachable from the release track can be applied.`,
       );
     }
+  } else if (!(await inTrustedHistory(run, root, targetSha))) {
+    // [CI2-7] Rollback path: relaxed, not open. The target may be behind the tip, but it must still be
+    // provably ours (upstream track or our own history) — never an arbitrary out-of-tree commit.
+    throw new Error(
+      `refusing to roll back to ${targetSha}: it is neither an ancestor of the trusted upstream tip ` +
+        `nor reachable from the current checkout's history.`,
+    );
   }
 
   // Reset to the exact target. --hard so a partially-applied prior attempt (e.g. a build that swapped
@@ -303,10 +342,19 @@ export async function applyUpdateToTarget(
 
 /** Roll the checkout back to a known-good SHA and rebuild (spec D4/D8). Used by the watchdog when a
  *  freshly-updated daemon fails its health/smoke gate. Best-effort rebuild: even if the rebuild fails
- *  we've at least restored the good SOURCE, which the next boot re-reads; the caller restarts after. */
+ *  we've at least restored the good SOURCE, which the next boot re-reads; the caller restarts after.
+ *  [CI2-7] Gated by {@link inTrustedHistory}: a rollback target must be on the upstream track or in
+ *  our own history — `git reset --hard` to an arbitrary SHA was the last unchecked way to move the
+ *  daemon's tree (the persisted prePullSha this is fed from always passes; tampered state does not). */
 export async function rollbackTo(sha: string, run: CommandRunner = runDefault): Promise<{ output: string }> {
   const root = await repoRoot(run);
   const log: string[] = [];
+  if (!(await inTrustedHistory(run, root, sha))) {
+    throw new Error(
+      `refusing to roll back to ${sha}: it is neither an ancestor of the trusted upstream tip ` +
+        `nor reachable from the current checkout's history.`,
+    );
+  }
   const reset = await run(["git", "reset", "--hard", sha], root);
   log.push(`$ git reset --hard ${sha}\n${reset.out}`);
   if (reset.code !== 0) throw new Error(`rollback git reset --hard ${sha} failed:\n${reset.out}`);

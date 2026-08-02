@@ -129,6 +129,31 @@ That's it for the apps — there is no tag to push and no store console to touch
 
 ---
 
+## Rolling back a bad release
+
+There is **one universal rollback knob** and a per-platform reality check. The universal knob:
+
+> **Actions → Full release → Run workflow → set `release_ref` to the last known-good SHA.**
+> The run gets a fresh (higher) run number, so every surface ships a **newer version of the older
+> code** — a roll-*forward* to known-good, which is the only rollback shape Firebase, TestFlight and
+> Sparkle all accept (none of them will push a lower version number to devices). Leaving
+> `release_ref` empty keeps today's behavior (release the current `main` tip). The `meta` job tags
+> the commit actually checked out, so the `v<version>` audit trail stays truthful.
+
+Fix `main` afterwards (revert the bad commit) or the next merge re-ships the regression.
+
+Per platform, what rollback actually means today:
+
+| Surface | Automatic? | Manual rollback today |
+|---------|-----------|------------------------|
+| **daemon** | **Yes** — the out-of-process watchdog health-gates every update for 180s and auto-rolls back to `prePullSha`, then re-restarts (see [the update service](#the-stable-update-service--fleet-rollout-what-to-do-during-an-incident)). Rollback targets are ancestry-gated (CI2-7): only commits on the release track / the checkout's own history can be applied. | Pin an older SHA: `POST /api/update/v1/apply` with `targetSha`, or on the host `git reset --hard <sha> && ./scripts/service.sh restart`. |
+| **macOS client + server (Sparkle)** | No — Sparkle only ever offers the highest version in the appcast (the feed keeps ~20 items of history, so past zips stay downloadable). | Cut a `release_ref` release (above). Stopgap for one machine: download the older `Anvil.zip` / `Anvil-Server.zip` from its `v<version>` GitHub Release and replace the app by hand. |
+| **Android (Firebase App Distribution)** | No. | Cut a `release_ref` release (new build gets a higher `versionCode`, testers are emailed). Stopgap: Firebase console → App Distribution → re-distribute an older build, or grab the `anvil-debug-apk` artifact from the old workflow run — but an APK with a *lower* versionCode needs uninstall/reinstall on the device. |
+| **iOS (TestFlight)** | No. | Cut a `release_ref` release (new, higher build number). Stopgap: older processed builds stay installable in the TestFlight app for ~90 days — testers can pick a previous build manually. Uploaded builds can be *expired* in App Store Connect to stop new installs, never un-shipped. |
+| **web (browser)** | n/a — rides the daemon deploy. | Roll the daemon back (above); `service.sh restart` rebuilds `web/dist` from the restored source. |
+
+---
+
 ## The daemon channel (self-update)
 
 The daemon is **not** built or shipped by CI. It runs from TS source under a service manager

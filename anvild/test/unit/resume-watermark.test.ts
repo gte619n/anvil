@@ -12,10 +12,10 @@ const createExisting = (sup: Supervisor, cwd: string) =>
   sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd });
 
 // ── watermark event (v4, spec A1) ──────────────────────────────────────────────
-test("resumeWatermarksEvent lists every session's {epoch,lastSeq}", () => {
+test("resumeWatermarksEvent lists every session's {epoch,lastSeq}", async () => {
   const dir = tempState();
   const sup = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup, dir);
+  const s = await createExisting(sup, dir);
   const ev = sup.resumeWatermarksEvent();
   expect(ev.type).toBe("resume.watermarks");
   const wm = ev.watermarks.find((w) => w.sessionId === s.id);
@@ -28,10 +28,10 @@ test("resumeWatermarksEvent lists every session's {epoch,lastSeq}", () => {
 });
 
 // ── epoch is stable across a daemon restart (spec A2/A3) ───────────────────────
-test("epoch persists across restart so a cached transcript stays delta-resumable", () => {
+test("epoch persists across restart so a cached transcript stays delta-resumable", async () => {
   const dir = tempState();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup1, dir);
+  const s = await createExisting(sup1, dir);
   const epochBefore = s.epoch;
   expect(epochBefore.length).toBeGreaterThan(0);
 
@@ -46,10 +46,10 @@ test("epoch persists across restart so a cached transcript stays delta-resumable
 });
 
 // ── a pre-v4 row (no epoch) gets a minted one on load (spec: migration) ─────────
-test("a persisted session with no epoch is minted one on load (pre-v4 migration)", () => {
+test("a persisted session with no epoch is minted one on load (pre-v4 migration)", async () => {
   const dir = tempState();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup1, dir);
+  const s = await createExisting(sup1, dir);
 
   // Rewrite the store row WITHOUT an epoch, as a v3 daemon would have left it.
   const store = new SessionStore(dir);
@@ -64,10 +64,10 @@ test("a persisted session with no epoch is minted one on load (pre-v4 migration)
 });
 
 // ── dedupe set is seeded from the durable log across a restart (spec A5) ────────
-test("applied prompt cids survive a daemon restart (seeded from the event log)", () => {
+test("applied prompt cids survive a daemon restart (seeded from the event log)", async () => {
   const dir = tempState();
   const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
-  const s = createExisting(sup1, dir);
+  const s = await createExisting(sup1, dir);
 
   // Simulate an applied prompt by appending its message.user (carrying the cid) to the durable log,
   // exactly as supervisor.prompt() would once a turn ran.
