@@ -32,7 +32,7 @@ def computedVersionCode = ciBuildNumber ? (100 + ciBuildNumber.toInteger()) : 8
 
 android {
     namespace 'com.gte619n.anvil'
-    compileSdk 35
+    compileSdk 36
 
     defaultConfig {
         applicationId "com.gte619n.anvil"
