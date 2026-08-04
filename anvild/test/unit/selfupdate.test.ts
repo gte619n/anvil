@@ -51,6 +51,14 @@ test("dependencies install only when the pull touched package.json / lockfile", 
   expect(ran(unchanged.calls, "bun install")).toBe(false);
 });
 
+test("the deploy install is --frozen-lockfile so it never dirties the tracked lockfile", async () => {
+  // A bare `bun install` rewrites bun.lock in place; the next update's dirty-tree guard would then
+  // refuse. --frozen-lockfile installs exactly what's pinned and leaves the tree clean.
+  const { run, calls } = fakeRunner({ "git diff": { code: 0, out: "anvild/bun.lock" } });
+  await applyUpdate(run);
+  expect(ran(calls, "bun install --frozen-lockfile")).toBe(true);
+});
+
 test("checkForUpdate reports how many commits behind upstream", async () => {
   const { run } = fakeRunner({ "abbrev-ref": { code: 0, out: "origin/main" }, "rev-list --count": { code: 0, out: "3" } });
   const r = await checkForUpdate(run);

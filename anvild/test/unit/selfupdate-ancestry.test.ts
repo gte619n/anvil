@@ -51,6 +51,43 @@ test("[SEC2-1] rollback path (allowNonFastForward) still resets backwards to a S
   expect(ran(calls, "checkout --detach 0old000")).toBe(true);
 });
 
+test("an untracked-only dirty tree does NOT block the update (leftover artifacts / *.bak)", async () => {
+  // The fingerprint of the field bug: a removed subtree left build junk behind and a stray *.bak sits
+  // beside package.json — all UNTRACKED (`??`). `git checkout` never silently clobbers untracked files,
+  // so the guard must let the update through instead of bricking auto-update on an otherwise-clean host.
+  const { run, calls } = fakeRunner({
+    "merge-base --is-ancestor": { code: 0, out: "" },
+    "status --porcelain": { code: 0, out: "?? anvil-server/\n?? anvild/package.json.bak" },
+  });
+  const res = await applyUpdateToTarget("abc1234", { run });
+  expect(res.targetSha).toBe("abc1234");
+  expect(ran(calls, "checkout --detach abc1234")).toBe(true);
+});
+
+test("a TRACKED modification still blocks the update (protects the user's own work)", async () => {
+  const { run, calls } = fakeRunner({
+    "merge-base --is-ancestor": { code: 0, out: "" },
+    // Mixed: a real tracked edit alongside untracked junk — the tracked line must still refuse.
+    "status --porcelain": { code: 0, out: " M anvild/src/x.ts\n?? anvil-server/" },
+  });
+  await expect(applyUpdateToTarget("abc1234", { run })).rejects.toThrow(/dirty working tree/);
+  expect(ran(calls, "checkout --detach")).toBe(false); // rejected before the tree is touched
+});
+
+test("the post-checkout install is --frozen-lockfile (never rewrites the tracked bun.lock)", async () => {
+  // Without --frozen-lockfile a deploy's `bun install` normalizes bun.lock in place, leaving the tree
+  // dirty after a *successful* update — which then trips this very guard on the next run.
+  const { run, calls } = fakeRunner({
+    "merge-base --is-ancestor": { code: 0, out: "" },
+    "status --porcelain": { code: 0, out: "" },
+    "rev-parse --short HEAD": { code: 0, out: "oldsha" },
+    "git diff --name-only": { code: 0, out: "anvild/package.json" }, // force the install path
+  });
+  await applyUpdateToTarget("abc1234", { run });
+  expect(ran(calls, "bun install --frozen-lockfile")).toBe(true);
+  expect(ran(calls, "bun install")).toBe(true); // sanity: the install ran at all
+});
+
 test("[SEC2-1] records the pre-pull SHA before rejecting a bad target (caller may need it)", async () => {
   const seen: string[] = [];
   const { run } = fakeRunner({
