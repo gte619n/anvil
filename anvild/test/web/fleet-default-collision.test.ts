@@ -126,12 +126,14 @@ setTimeout(() => {
 
 const SERVERS_SEED = { "anvil.servers": JSON.stringify([MEMBER_URL]) };
 
-test("[#158] two servers' default chats render as two rows, each routed to its own server", () => {
+test("[#158] only the hub's default chat pins to the concierge; the member's is hidden, still routed", () => {
   const r = runFleet("hub-first", SERVERS_SEED);
   expect(r.initErr).toBeNull();
-  // Two distinct pinned concierge rows — not one collapsed row.
-  expect([...r.conciergeIds].sort()).toEqual(["sess_default", "sess_default@srv_member"]);
-  // Each routes to its own daemon: the plain id to the origin, the namespaced one to the member.
+  // A fleet shows ONE "Claude" entry — the hub's. The member also mints a default chat (arriving as
+  // the namespaced id), but it's hidden from the sidebar rather than pinned as a second row.
+  expect(r.conciergeIds).toEqual(["sess_default"]);
+  // Attribution is unchanged: each default is still received and routed to its own daemon — the plain
+  // id to the origin, the namespaced one to the member — so nothing about routing regresses.
   const routing = new Map(r.routing);
   expect(routing.get("sess_default")).toBe(HUB_ORIGIN);
   expect(routing.get("sess_default@srv_member")).toBe(MEMBER_URL);
@@ -145,8 +147,8 @@ test("[#158] reload-equivalent opposite delivery order keeps attribution stable 
     "anvil.sessionServer": JSON.stringify([["sess_default", MEMBER_URL]]),
   });
   expect(r.initErr).toBeNull();
-  // Same two rows, same attribution — delivery order (a reload's connect race) doesn't flip anything.
-  expect([...r.conciergeIds].sort()).toEqual(["sess_default", "sess_default@srv_member"]);
+  // Same single hub row, same attribution — delivery order (a reload's connect race) doesn't flip anything.
+  expect(r.conciergeIds).toEqual(["sess_default"]);
   const routing = new Map(r.routing);
   expect(routing.get("sess_default")).toBe(HUB_ORIGIN); // migrated off the stale member url
   expect(routing.get("sess_default@srv_member")).toBe(MEMBER_URL);
