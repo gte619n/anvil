@@ -34,6 +34,14 @@ export function runningSha(): string {
 /** The anvild package dir (where package.json + build:web live): .../anvild */
 const anvildDir = join(import.meta.dir, "..", "..");
 
+/** The dependency install every update/rollback path runs. `--frozen-lockfile` installs EXACTLY what
+ *  bun.lock pins and refuses to rewrite it. Without it, a deploy's `bun install` normalizes the tracked
+ *  lockfile in place, leaving the tree dirty *after an otherwise successful update* — which then trips
+ *  the next update's dirty-tree guard (a self-poisoning loop that permanently bricks auto-update on a
+ *  host that never touched a file itself). A release whose package.json and lockfile genuinely disagree
+ *  now fails loudly here instead of silently mutating the daemon's checkout. */
+const INSTALL_CMD = ["bun", "install", "--frozen-lockfile"];
+
 /** Service manager that launched us, as reported by the launcher's ANVIL_MANAGED (set in
  *  service.sh). null when unmanaged (e.g. `bun dev`), where exiting/restarting would just die. */
 export type ServiceManager = "launchd" | "systemd";
@@ -155,7 +163,7 @@ export async function applyUpdate(run: CommandRunner = runDefault): Promise<{ ou
   const changed = before ? (await run(["git", "diff", "--name-only", `${before}..HEAD`], root)).out : "";
   const depsChanged = !before || /(^|\/)(package\.json|bun\.lockb?)$/m.test(changed);
   if (depsChanged) {
-    const install = await run(["bun", "install"], anvildDir);
+    const install = await run(INSTALL_CMD, anvildDir);
     log.push(`$ bun install\n${install.out}`);
     if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
   } else {
@@ -171,7 +179,7 @@ export async function applyUpdate(run: CommandRunner = runDefault): Promise<{ ou
   // build fails to resolve that import ("Could not resolve …"). If we didn't already install this
   // run, do it now and retry the build once before giving up.
   if (build.code !== 0 && !depsChanged) {
-    const install = await run(["bun", "install"], anvildDir);
+    const install = await run(INSTALL_CMD, anvildDir);
     log.push(`(build failed — running bun install and retrying)\n$ bun install\n${install.out}`);
     if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
     build = await run(["bun", "run", "build:web"], anvildDir);
@@ -294,9 +302,19 @@ export async function applyUpdateToTarget(
     );
   }
 
-  // Reset to the exact target. --hard so a partially-applied prior attempt (e.g. a build that swapped
-  // some files) can't wedge the checkout; local commits are surfaced by the pre-flight guard below.
-  const dirty = (await run(["git", "status", "--porcelain"], root)).out.trim();
+  // Pre-flight guard: refuse to check out over the user's own uncommitted work. Only TRACKED changes
+  // (modified/staged/deleted — anything git would carry into or conflict with the checkout) block. We
+  // deliberately do NOT block on untracked files (`git status --porcelain` marks them `??`): `git
+  // checkout --detach` never silently clobbers them — it preserves them, or aborts loudly if the target
+  // introduces a file at that exact path (still safe). Blocking on untracked was too broad and bricked
+  // auto-update on otherwise-clean hosts: e.g. leftover build artifacts under a subtree the release
+  // deleted (anvil-server/ after #179, once its .gitignore went with it) or a stray *.bak beside
+  // package.json — files the daemon never touched, yet which failed every future update.
+  const status = (await run(["git", "status", "--porcelain"], root)).out.trim();
+  const dirty = status
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !line.startsWith("??"))
+    .join("\n");
   if (dirty) throw new Error(`refusing to update onto a dirty working tree:\n${dirty}`);
   const checkout = await run(["git", "checkout", "--detach", targetSha], root);
   log.push(`$ git checkout --detach ${targetSha}\n${checkout.out}`);
@@ -311,7 +329,7 @@ export async function applyUpdateToTarget(
     const changed = before ? (await run(["git", "diff", "--name-only", `${before}..${after}`], root)).out : "";
     const depsChanged = !before || /(^|\/)(package\.json|bun\.lockb?)$/m.test(changed);
     if (depsChanged) {
-      const install = await run(["bun", "install"], anvildDir);
+      const install = await run(INSTALL_CMD, anvildDir);
       log.push(`$ bun install\n${install.out}`);
       if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
     } else {
@@ -321,7 +339,7 @@ export async function applyUpdateToTarget(
     let build = await run(["bun", "run", "build:web"], anvildDir);
     log.push(`$ bun run build:web\n${build.out}`);
     if (build.code !== 0 && !depsChanged) {
-      const install = await run(["bun", "install"], anvildDir);
+      const install = await run(INSTALL_CMD, anvildDir);
       log.push(`(build failed — running bun install and retrying)\n$ bun install\n${install.out}`);
       if (install.code !== 0) throw new Error(`bun install failed:\n${install.out}`);
       build = await run(["bun", "run", "build:web"], anvildDir);
@@ -358,7 +376,7 @@ export async function rollbackTo(sha: string, run: CommandRunner = runDefault): 
   const reset = await run(["git", "reset", "--hard", sha], root);
   log.push(`$ git reset --hard ${sha}\n${reset.out}`);
   if (reset.code !== 0) throw new Error(`rollback git reset --hard ${sha} failed:\n${reset.out}`);
-  const install = await run(["bun", "install"], anvildDir);
+  const install = await run(INSTALL_CMD, anvildDir);
   log.push(`$ bun install\n${install.out}`);
   const build = await run(["bun", "run", "build:web"], anvildDir);
   log.push(`$ bun run build:web\n${build.out}`);
