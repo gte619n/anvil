@@ -26,7 +26,7 @@ import { currentTheme } from "./theme";
 import { sessionBg, stripeColor } from "./sessionColor";
 import { sessionHref } from "./overlays";
 import { newCid } from "./outbox";
-import { orderedServers, pendingTeamPlans, sendTo, serverOf, servers, sessionServer } from "./fleet";
+import { isNamespacedDefaultId, orderedServers, pendingTeamPlans, sendTo, serverOf, servers, sessionServer } from "./fleet";
 import type { Environment, Session } from "../../protocol";
 
 // ── Injected dependencies (initSidebar) ──────────────────────────────────────────────────────────
@@ -222,8 +222,11 @@ function renderSessionsNow(): void {
   // Teams: a member (parentId → a lead we know) is NOT rendered at the top level — it appears nested
   // under its lead's row instead (anvil-team-support.md §5).
   const isNestedMember = (s: Session): boolean => !!s.parentId && sessions.has(s.parentId);
-  // The concierge (isDefault) is pinned at the top, OUTSIDE the sortable/grouped lists (#26).
-  syncList(conciergeUl, all.filter((s) => s.isDefault), false, ctx, keyed);
+  // The concierge (isDefault) is pinned at the top, OUTSIDE the sortable/grouped lists (#26). Only the
+  // HUB's Claude chat belongs here: every daemon mints its own default session, but a member's arrives
+  // with a namespaced id (sess_default@<serverId>, fleet §Default-chat id namespacing). Rendering those
+  // too gave one "Claude" row per server; the origin/hub default keeps the plain id, so filter to it.
+  syncList(conciergeUl, all.filter((s) => s.isDefault && !isNamespacedDefaultId(s.id)), false, ctx, keyed);
   // One flat list across every server — no per-machine grouping. Sessions interleave by their
   // server-synced order; which machine a session lives on is shown subtly in its row meta when
   // there's more than one server. (fleet — anvil-multi-server.md §4)
