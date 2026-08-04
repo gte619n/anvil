@@ -85,6 +85,11 @@ ensure_bun() {
 # `build:web` resolves imports straight out of node_modules — so without an install the build
 # fails with "Could not resolve …" and the atomic dist swap silently keeps serving the old UI.
 # An in-sync lockfile makes the install a fast no-op, so it's cheap to always run.
+# `--frozen-lockfile` installs exactly what bun.lock pins and NEVER rewrites it: a bare `bun install`
+# normalizes the tracked lockfile in place, leaving the checkout dirty, which then trips the daemon's
+# self-update dirty-tree guard (see selfupdate.ts INSTALL_CMD — same fix, same reason). If package.json
+# and the lock genuinely disagree the install fails, and the graceful fallback below builds against the
+# existing node_modules rather than mutating the tree.
 #
 # CRITICAL: the rebuild is best-effort and must NEVER block the daemon from starting. The app ships a
 # prebuilt web/dist (Provision copies it into the install root) and build.ts swaps atomically — a
@@ -101,7 +106,7 @@ build_web() {
   # "bun: command not found" (exit 127) — observed on a fleet M1, which silently kept the daemon down.
   export PATH="$(dirname "$bun"):$PATH"
   echo "installing dependencies…"
-  ( cd "$ANVILD_DIR" && "$bun" install ) || echo "warning: bun install failed — building against the existing node_modules"
+  ( cd "$ANVILD_DIR" && "$bun" install --frozen-lockfile ) || echo "warning: bun install failed — building against the existing node_modules"
   echo "building web client…"
   if ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null ); then
     return 0
