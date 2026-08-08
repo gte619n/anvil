@@ -181,7 +181,11 @@ function mountTerminal(): void {
       fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
       fontSize: 13,
       cursorBlink: true,
-      theme: dark ? { background: "#1a1b1e", foreground: "#e6e7e9" } : { background: "#ffffff", foreground: "#1c2024" },
+      // selectionBackground is REQUIRED: without it xterm resolves selection to white-on-white and
+      // the DOM renderer paints selected glyph cells invisibly (live debug, design 2026-08-08).
+      theme: dark
+        ? { background: "#1a1b1e", foreground: "#e6e7e9", selectionBackground: "rgba(107,155,255,0.35)", selectionInactiveBackground: "rgba(107,155,255,0.18)" }
+        : { background: "#ffffff", foreground: "#1c2024", selectionBackground: "rgba(59,110,245,0.30)", selectionInactiveBackground: "rgba(59,110,245,0.15)" },
     });
     fit = new FitAddon();
     xterm.loadAddon(fit);
@@ -189,6 +193,40 @@ function mountTerminal(): void {
     fit.fit();
     xterm.onData((d) => {
       if (activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(d) });
+    });
+    // Copy-on-select (design 2026-08-08): a settled selection lands in the clipboard, iTerm-style.
+    let selTimer = 0;
+    xterm.onSelectionChange(() => {
+      if (selTimer) clearTimeout(selTimer);
+      selTimer = window.setTimeout(() => {
+        const sel = xterm?.getSelection();
+        if (sel) void navigator.clipboard.writeText(sel).catch(() => {}); // keys still work if blocked
+      }, 150);
+    });
+    // ⌘C / Ctrl+Shift+C copy; Ctrl+C WITH a selection copies, without one it stays SIGINT.
+    xterm.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== "keydown") return true;
+      const wantsCopy =
+        (ev.metaKey && !ev.ctrlKey && ev.key === "c") ||
+        (ev.ctrlKey && ev.shiftKey && (ev.key === "C" || ev.key === "c")) ||
+        (ev.ctrlKey && !ev.shiftKey && !ev.metaKey && ev.key === "c" && !!xterm?.hasSelection());
+      if (wantsCopy && xterm?.hasSelection()) {
+        void navigator.clipboard.writeText(xterm.getSelection()).catch(() => toast("Copy failed — clipboard blocked"));
+        xterm.clearSelection();
+        return false; // consumed: don't also send \x03 to the shell
+      }
+      return true;
+    });
+    // PuTTY-style right-click paste (Shift+right-click keeps the browser's own menu).
+    $("#term-host").addEventListener("contextmenu", (e) => {
+      if (e.shiftKey) return;
+      e.preventDefault();
+      navigator.clipboard
+        .readText()
+        .then((t) => {
+          if (t && activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(t) });
+        })
+        .catch(() => toast("Allow clipboard access to paste"));
     });
     if (activeId()) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
     // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
