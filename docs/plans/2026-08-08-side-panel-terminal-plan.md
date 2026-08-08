@@ -18,7 +18,8 @@ Worktree note: run all daemon commands from `anvild/`. CI gates: `bun run typech
 | 7 | Web: terminal chip strip + termId routing | pending | no | no |
 | 8 | Web: pin + split view (desktop-gated) | pending | no | no |
 | 9 | Full gates + live daemon acceptance + phone-layout proof | pending | no | no |
-| 10 | Push branch, open upstream PR | pending | no | no |
+| 10 | ⏸ PAUSE — user testing + independent fix round | pending | no | no |
+| 11 | Push branch, open upstream PR | pending | no | no |
 
 ---
 
@@ -867,7 +868,36 @@ cd anvild && bun run start   # serves http://localhost:7701 (run in background)
 
 ---
 
-### Task 10: Push + upstream PR
+### Task 10: ⏸ PAUSE — user testing + independent fix round
+
+**This task is a hard stop. The executing agent MUST NOT proceed to Task 11 (PR) until the user
+explicitly says testing is done.** This round is independent of Task 9's automated acceptance —
+it exists so the user can drive the real UI by hand and so fixes come from a fresh pair of eyes,
+not the agent that wrote the code.
+
+**Step 1: Hand over for manual testing.** Leave the local daemon from Task 9 running (or restart
+it: `cd anvild && bun run start`, http://localhost:7701). Tell the user the branch is ready to
+test and summarize what to poke at (the Task 9 checklist is a good script, but the user tests
+whatever they like — including on their own fleet hosts if they choose to deploy the branch).
+Then **stop and wait**. Do not push, do not open a PR, do not start new tasks.
+
+**Step 2: Fix round by the user + a separate agent.** Issues found in Step 1 are fixed by the
+user directly and/or by a **separate agent session** (fresh context — e.g. a new Claude Code
+session pointed at this branch with the issue list), NOT by the executing agent continuing in
+this context. The executing agent's only job during this step is to answer questions if asked.
+After fixes land, the separate agent (or the user) re-runs the four CI gates:
+
+```sh
+cd anvild && bun run typecheck && bun run typecheck:web && bun run build:web && bun test
+```
+
+**Step 3: Resume signal.** Only when the user explicitly confirms testing + fixes are complete
+does execution resume with Task 11. Record the outcome (issues found → fixed) in this table's
+Status column.
+
+---
+
+### Task 11: Push + upstream PR
 
 Governance (memory): upstream `gte619n/anvil` is OSS; Evan approves/merges — **stop after opening the PR**.
 
