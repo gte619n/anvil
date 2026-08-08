@@ -9,16 +9,16 @@ Worktree note: run all daemon commands from `anvild/`. CI gates: `bun run typech
 
 | Task | Description | Status | Tested | Pushed |
 |------|-------------|--------|--------|--------|
-| 1 | Branch + Bun job-control spike | pending | no | no |
-| 2 | ctty wrapper (`cttyArgv`) — TDD | pending | no | no |
-| 3 | Protocol: additive `termId` + `Session.terminals` + contract test | pending | no | no |
-| 4 | TerminalManager multi-terminal — TDD | pending | no | no |
-| 5 | Supervisor + dispatch wiring, restore() roster clear | pending | no | no |
-| 6 | Web: selection theme + copy-on-select + right-click paste | pending | no | no |
-| 7 | Web: terminal chip strip + termId routing | pending | no | no |
-| 8 | Web: pin + split view (desktop-gated) | pending | no | no |
-| 9 | Full gates + live daemon acceptance + phone-layout proof | pending | no | no |
-| 10 | ⏸ PAUSE — user testing + independent fix round | pending | no | no |
+| 1 | Branch + Bun job-control spike | done | yes | no |
+| 2 | ctty wrapper (`cttyArgv`) — TDD | done | yes | no |
+| 3 | Protocol: additive `termId` + `Session.terminals` + contract test | done | yes | no |
+| 4 | TerminalManager multi-terminal — TDD | done | yes | no |
+| 5 | Supervisor + dispatch wiring, restore() roster clear | done | yes | no |
+| 6 | Web: selection theme + copy-on-select + right-click paste | done | yes | no |
+| 7 | Web: terminal chip strip + termId routing | done | yes | no |
+| 8 | Web: pin + split view (desktop-gated) | done | yes | no |
+| 9 | Full gates + live daemon acceptance + phone-layout proof | done | yes | no |
+| 10 | ⏸ PAUSE — user testing + independent fix round | in progress (awaiting user) | no | no |
 | 11 | Push branch, open upstream PR | pending | no | no |
 
 ---

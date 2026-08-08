@@ -185,9 +185,9 @@ shell exit → terminal.exit {termId} → roster update → strip refresh (+ "ex
 
 | Phase | Description | Status | Tested | Pushed |
 |-------|-------------|--------|--------|--------|
-| 1 | Daemon job-control fix (spike Bun native, else wrapper) | pending | no | no |
-| 2 | Web: selection theme + copy/paste wiring | pending | no | no |
-| 3 | Protocol `termId`/roster + TerminalManager multi-term | pending | no | no |
-| 4 | Web: chip strip + kill/respawn | pending | no | no |
-| 5 | Pin + split view (desktop-gated) | pending | no | no |
-| 6 | Cross-host live acceptance + phone-layout proof | pending | no | no |
+| 1 | Daemon job-control fix (spike Bun native, else wrapper) | done | yes | no |
+| 2 | Web: selection theme + copy/paste wiring | done | yes | no |
+| 3 | Protocol `termId`/roster + TerminalManager multi-term | done | yes | no |
+| 4 | Web: chip strip + kill/respawn | done | yes | no |
+| 5 | Pin + split view (desktop-gated) | done | yes | no |
+| 6 | Cross-host live acceptance + phone-layout proof | done | yes | no |
