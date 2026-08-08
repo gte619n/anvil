@@ -465,17 +465,20 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "terminal.open":
-        deps.supervisor.terminalOpen(cmd.sessionId, cmd.cols, cmd.rows);
+        deps.supervisor.terminalOpen(cmd.sessionId, cmd.cols, cmd.rows, cmd.termId);
         if (cid) send(ack(cid));
         return;
       case "terminal.input":
-        deps.supervisor.terminalInput(cmd.sessionId, cmd.data);
+        deps.supervisor.terminalInput(cmd.sessionId, cmd.data, cmd.termId);
         return;
       case "terminal.resize":
-        deps.supervisor.terminalResize(cmd.sessionId, cmd.cols, cmd.rows);
+        deps.supervisor.terminalResize(cmd.sessionId, cmd.cols, cmd.rows, cmd.termId);
         return;
       case "terminal.close":
-        if (cid) send(ack(cid)); // PTY persists (arch §7); the client just stops rendering
+        // Kills the PTY (kill/respawn escape hatch, design 2026-08-08). Previously a documented
+        // no-op that no released client ever sent, so repurposing it is not a breaking change.
+        deps.supervisor.terminalClose(cmd.sessionId, cmd.termId);
+        if (cid) send(ack(cid));
         return;
 
       case "ping":
