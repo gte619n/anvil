@@ -27,15 +27,15 @@ Worktree note: run all daemon commands from `anvild/`. CI gates: `bun run typech
 
 **Files:** none committed (spike runs from the scratchpad).
 
-**Step 1: Create the feature branch, restore main**
+**Step 1: Confirm the feature branch**
 
-The design-doc commit (`1807f18`) currently sits on local `main`, unpushed. Move it onto the feature branch and put `main` back on `origin/main`:
+Already done during planning: `feat/side-panel-terminal` exists carrying the design + plan doc
+commits, and local `main` was reset to `origin/main`. Just confirm you're on it:
 
 ```sh
 cd /home/stonelyd/anvil
-git checkout -b feat/side-panel-terminal
-git branch -f main origin/main
-git log --oneline -1   # expect: 1807f18 docs: design for side-panel pin + terminal overhaul
+git branch --show-current   # expect: feat/side-panel-terminal
+git log --oneline origin/main..HEAD   # expect: the three docs commits (design, plan, plan pause-task)
 ```
 
 **Step 2: Spike — does Bun 1.3.14 give the shell a controlling TTY?**
