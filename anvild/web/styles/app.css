@@ -1008,6 +1008,14 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
   /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
   .resizer { display: none; }
+  #panel-pin { display: none; } /* pin is desktop-only — phone keeps overlay + dismiss untouched */
+}
+
+/* Pinned side panel (desktop-only split, design 2026-08-08): the conversation column reflows
+   beside the open panel instead of being covered. Width tracks the existing --panel-w resizer. */
+@media (min-width: 701px) {
+  body.panel-pinned #convo-col { margin-right: var(--panel-w, 460px); }
+  body.panel-pinned #side-panel { box-shadow: none; }
 }
 
 /* ── Safe-area insets (iOS notch / Dynamic Island / home indicator) ──────────────

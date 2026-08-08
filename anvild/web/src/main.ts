@@ -141,6 +141,7 @@ import {
   renderLinks,
   renderReader,
   renderTermStrip,
+  reopenPanelForSession,
   requestGitStatus,
   resetPanelForSession,
   showGitResult,
@@ -1881,7 +1882,7 @@ export function selectSession(id: string, push = true): void {
   }
   // reset the side panel for the new session's worktree
   resetPanelForSession();
-  if (panelView) openPanel("files");
+  reopenPanelForSession(); // pinned → same tab, new session; unpinned open panel → files (as before)
 }
 
 // ── Composer (moved to composer.ts — P7 decomposition) ───────────────────────────────────────────

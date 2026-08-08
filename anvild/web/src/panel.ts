@@ -34,6 +34,7 @@ import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { currentTheme } from "./theme";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
 import { isAndroidApp } from "./platform";
+import { isNarrow } from "./layout";
 import { conversation, copyText, humanSize, references, relTime, runMermaid } from "./conversation";
 import type { DirEntry, FileContent, GitResultEvent, GitStatus, Session, TerminalInfo } from "../../protocol";
 
@@ -84,6 +85,20 @@ export function initPanel(deps: PanelDeps): void {
   $("#btn-links").addEventListener("click", () => (panelView === "links" ? closePanel() : openPanel("links")));
   $("#panel-close").addEventListener("click", closePanel);
   document.querySelectorAll<HTMLElement>(".ptab").forEach((t) => t.addEventListener("click", () => openPanel(t.dataset.view as "files" | "reader" | "git" | "terminal" | "links")));
+
+  document.getElementById("panel-pin")?.addEventListener("click", () => {
+    if (isNarrow()) return; // pin is desktop-only
+    if (!panelPinned) {
+      panelPinned = true;
+      localStorage.setItem(PIN_KEY, panelView ?? "terminal");
+    } else {
+      panelPinned = false;
+      localStorage.removeItem(PIN_KEY);
+      if (panelView) openOverlay("panel", closePanelDom); // back to overlay semantics: Back closes it again
+    }
+    syncPinnedLayout();
+  });
+  panelPinned = !isNarrow() && localStorage.getItem(PIN_KEY) !== null; // restore across reloads
 }
 
 // Click anywhere off the open side panel to dismiss it. The header toggles, in-conversation
@@ -102,6 +117,7 @@ export function initPanel(deps: PanelDeps): void {
 // the panel too — one outside click unwinds both, exactly as before the extraction.
 export function wirePanelOutsideDismiss(): void {
   document.addEventListener("pointerdown", (e) => {
+    if (panelPinned) return; // pinned panels don't dismiss
     if (!panelView) return; // panel already closed
     if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader") || overlayOpen("menu")) return; // a dialog/settings/autopilot/reader/header-menu is on top — leave the panel be
     const t = e.target as HTMLElement;
@@ -117,6 +133,24 @@ const panelContent = $("#panel-content");
 // (as a live import binding / an injected lazy getter). Initialized at module eval, which runs
 // before main's instant-restore init chain — clearReferences() reads it at load.
 export let panelView: "files" | "reader" | "git" | "terminal" | "links" | null = null;
+
+// ── Pin (desktop-only, design 2026-08-08) ────────────────────────────────────────
+// Pinned = the panel is a split column: no overlay/back-stack entry, no outside-click dismiss,
+// survives session switches, persisted across reloads. panel.ts is the sole writer.
+export let panelPinned = false;
+const PIN_KEY = "anvil.panelPin"; // value = the pinned view; presence = pinned
+const VIEWS = ["files", "reader", "git", "terminal", "links"] as const;
+type View = (typeof VIEWS)[number];
+function pinnedStoredView(): View {
+  const v = localStorage.getItem(PIN_KEY);
+  return (VIEWS as readonly string[]).includes(v ?? "") ? (v as View) : "terminal";
+}
+/** body.panel-pinned drives the split CSS — only while the panel is actually open. */
+function syncPinnedLayout(): void {
+  document.body.classList.toggle("panel-pinned", panelPinned && panel.classList.contains("open"));
+  document.getElementById("panel-pin")?.classList.toggle("active", panelPinned);
+}
+
 let filesPath = "";
 export let readerPath = ""; // main's fs.changed router + the composer's quote path read it
 let readerWatch = "";
@@ -194,8 +228,10 @@ export function openPanel(view: "files" | "reader" | "git" | "terminal" | "links
   if (view !== "terminal") disposeTerminal();
   panelView = view;
   panel.classList.add("open");
-  openOverlay("panel", closePanelDom); // Back closes the panel (no-op if it's already a layer)
+  if (panelPinned) localStorage.setItem(PIN_KEY, view); // remember the pinned tab
+  else openOverlay("panel", closePanelDom); // Back closes the panel (no-op if it's already a layer)
   setPanelTabs();
+  syncPinnedLayout();
   if (view === "files") requestFiles(filesPath);
   else if (view === "reader" && !readerPath) requestFiles(filesPath);
   else if (view === "git") renderGit();
@@ -204,14 +240,40 @@ export function openPanel(view: "files" | "reader" | "git" | "terminal" | "links
 }
 /** Tear down the panel (DOM/state only). Reached via Back (popstate) or closePanel(). */
 function closePanelDom(): void {
+  if (panelPinned) return; // a stale Back entry must not close a pinned panel
   if (readerWatch && activeId()) sendTo(activeId()!, { type: "fs.unwatch", sessionId: activeId()!, path: readerWatch });
   readerWatch = "";
   disposeTerminal();
   panelView = null;
   panel.classList.remove("open");
   setPanelTabs();
+  syncPinnedLayout();
 }
-export const closePanel = (): void => dismissOverlay("panel"); // programmatic close → unwind the back-stack
+/** ✕ / programmatic close. A pinned panel unpins first (✕ means "put it away"). */
+export const closePanel = (): void => {
+  if (panelPinned) {
+    panelPinned = false;
+    localStorage.removeItem(PIN_KEY);
+    panel.classList.remove("open");
+    panelView = null;
+    disposeTerminal();
+    setPanelTabs();
+    syncPinnedLayout();
+    return;
+  }
+  dismissOverlay("panel"); // programmatic close → unwind the back-stack
+};
+
+/** Called by selectSession after resetPanelForSession: a pinned panel stays open and re-targets
+ *  the new session (its own terminal/worktree); an unpinned open panel falls back to Files
+ *  (historical behavior). Also restores a pinned panel on the boot-time first selection. */
+export function reopenPanelForSession(): void {
+  if (panelPinned) {
+    openPanel(panelView ?? pinnedStoredView());
+    return;
+  }
+  if (panelView) openPanel("files");
+}
 function mountTerminal(): void {
   disposeTerminal();
   panelContent.innerHTML = '<div class="term-wrap"><div id="term-strip" class="term-strip"></div><div id="term-host"></div></div>';
@@ -419,7 +481,8 @@ function openFile(path: string): void {
   if (!activeId()) return;
   disposeTerminal();
   panel.classList.add("open"); // a file link may open the reader while the panel is closed
-  openOverlay("panel", closePanelDom); // Back closes it (no-op if the panel is already a layer)
+  if (panelPinned) localStorage.setItem(PIN_KEY, "reader"); // the pinned tab follows (reader is pinnable too)
+  else openOverlay("panel", closePanelDom); // Back closes it (no-op if the panel is already a layer)
   readerPath = path;
   panelView = "reader";
   setPanelTabs();
