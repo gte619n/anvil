@@ -133,6 +133,7 @@ import {
   closePanel,
   initPanel,
   activeTermId,
+  flushPinnedBoot,
   openPanel,
   panel,
   panelView,
@@ -1094,6 +1095,7 @@ function onEvent(url: string, e: ServerEvent): void {
       // page-load, delta-resume without wiping the pane; otherwise run a full skeleton→cache→attach load.
       if (activeId && sessions.has(activeId) && sessionServer.get(activeId) === url) {
         setHeaderTitle(sessions.get(activeId));
+        flushPinnedBoot(); // restore a pinned panel now that this socket is provably live (one-shot)
         if (snapshotLoaded.has(activeId)) attachReconnect(activeId);
         else if (pendingLoadId === activeId) { /* a fresh load is already resolving; it will attach itself */ }
         else void loadConversation(activeId);

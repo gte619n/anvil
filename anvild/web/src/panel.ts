@@ -99,6 +99,20 @@ export function initPanel(deps: PanelDeps): void {
     syncPinnedLayout();
   });
   panelPinned = !isNarrow() && localStorage.getItem(PIN_KEY) !== null; // restore across reloads
+  pinnedBootPending = panelPinned;
+}
+
+// A pinned panel is restored on the FIRST attach of the active session's server (main's
+// session.list handler), not during module init: opening it at boot would fire its view's opening
+// frames (terminal.open / fs.list) into a socket that isn't connected yet — ws.send drops them
+// silently and the panel would sit dead until the user re-drove it by hand.
+let pinnedBootPending = false;
+/** One-shot boot restore of a pinned panel, called by main.ts when the active session's server
+ *  first delivers session.list (socket provably live). No-op on later reconnects. */
+export function flushPinnedBoot(): void {
+  if (!pinnedBootPending) return;
+  pinnedBootPending = false;
+  if (panelPinned && activeId()) openPanel(panelView ?? pinnedStoredView());
 }
 
 // Click anywhere off the open side panel to dismiss it. The header toggles, in-conversation
