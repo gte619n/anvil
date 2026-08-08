@@ -155,7 +155,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@v6.2.0
 
       - name: Write Firebase service account
         env:
