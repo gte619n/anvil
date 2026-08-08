@@ -18,8 +18,8 @@ Worktree note: run all daemon commands from `anvild/`. CI gates: `bun run typech
 | 7 | Web: terminal chip strip + termId routing | done | yes | no |
 | 8 | Web: pin + split view (desktop-gated) | done | yes | no |
 | 9 | Full gates + live daemon acceptance + phone-layout proof | done | yes | no |
-| 10 | ⏸ PAUSE — user testing + independent fix round | fixes done (E2E round: BUG-1..5 + UX-6, all fixed + re-verified live) | yes | no |
-| 11 | Push branch, open upstream PR | pending | no | no |
+| 10 | ⏸ PAUSE — user testing + independent fix round | done (E2E round: BUG-1..5 + UX-6 fixed + re-verified live; user approved) | yes | yes |
+| 11 | Push branch, open upstream PR | done — gte619n/anvil#189 | yes | yes |
 
 ---
 
