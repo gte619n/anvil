@@ -31,6 +31,16 @@ export type SpawnTerminal = (opts: {
 
 const SCROLLBACK_CAP = 262_144; // 256KB retained per session
 
+/** Wrap the shell so it starts as a session leader with the PTY slave as its controlling TTY.
+ *  Bun.spawn({terminal}) attaches the PTY as stdio only — without a ctty the line discipline has
+ *  no foreground process group, so ^C's SIGINT is delivered to nobody ("bash: no job control in
+ *  this shell"; zsh degrades silently). Verified live on both fleet hosts (design 2026-08-08). */
+export function cttyArgv(platform: string, shell: string): string[] {
+  if (platform === "linux") return ["setsid", "--ctty", "--wait", shell];
+  if (platform === "darwin") return ["script", "-q", "/dev/null", shell];
+  return [shell];
+}
+
 /** The real PTY factory: Bun.Terminal + a shell spawned onto it. */
 const defaultSpawnTerminal: SpawnTerminal = ({ cols, rows, cwd, env, onData }) => {
   const BunAny = Bun as unknown as {
@@ -39,7 +49,13 @@ const defaultSpawnTerminal: SpawnTerminal = ({ cols, rows, cwd, env, onData }) =
   };
   const term = new BunAny.Terminal({ cols, rows, data: (_t, bytes) => onData(bytes) });
   const shell = process.env.SHELL || "/bin/zsh";
-  const proc = BunAny.spawn([shell], { terminal: term, cwd, env });
+  let proc: { exited: Promise<number | null> };
+  try {
+    proc = BunAny.spawn(cttyArgv(process.platform, shell), { terminal: term, cwd, env });
+  } catch {
+    // setsid/script binary missing — degrade to the ctty-less spawn (terminal works, no job control)
+    proc = BunAny.spawn([shell], { terminal: term, cwd, env });
+  }
   return { pty: term, proc };
 };
 

@@ -5,7 +5,13 @@
  * input/resize/kill, and shutdown. These tests pin the behavior the extraction must preserve.
  */
 import { test, expect } from "bun:test";
-import { TerminalManager, type SpawnTerminal, type TerminalSession } from "../../src/session/terminal-manager";
+import { TerminalManager, cttyArgv, type SpawnTerminal, type TerminalSession } from "../../src/session/terminal-manager";
+
+test("cttyArgv wraps the shell so it acquires a controlling TTY (job control)", () => {
+  expect(cttyArgv("linux", "/bin/bash")).toEqual(["setsid", "--ctty", "--wait", "/bin/bash"]);
+  expect(cttyArgv("darwin", "/bin/zsh")).toEqual(["script", "-q", "/dev/null", "/bin/zsh"]);
+  expect(cttyArgv("win32", "/bin/sh")).toEqual(["/bin/sh"]); // unknown platform → unwrapped
+});
 
 function fakeSession(cwd = "/tmp/wt") {
   const events: Array<{ type: string; data?: string; code?: number }> = [];
