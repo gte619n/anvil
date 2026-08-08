@@ -1165,16 +1165,28 @@ export class Supervisor {
       return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
     },
     (sessionId) => this.shellEnv(this.sessions.get(sessionId)),
+    (sessionId, terminals) => {
+      // The roster rides the Session (additive `terminals`, design 2026-08-08) so every device's
+      // chip strip stays live. Runtime-only: restore() clears it — PTYs die with the process.
+      const s = this.sessions.get(sessionId);
+      if (!s) return; // roster change raced a session kill
+      s.data.terminals = terminals.length ? terminals : undefined;
+      this.broadcastUpdated(s.data);
+    },
   );
 
-  terminalOpen(sessionId: string, cols: number, rows: number): void {
-    this.terminalMgr.open(sessionId, cols, rows);
+  terminalOpen(sessionId: string, cols: number, rows: number, termId?: string): void {
+    this.terminalMgr.open(sessionId, cols, rows, termId);
   }
-  terminalInput(sessionId: string, dataBase64: string): void {
-    this.terminalMgr.input(sessionId, dataBase64);
+  terminalInput(sessionId: string, dataBase64: string, termId?: string): void {
+    this.terminalMgr.input(sessionId, dataBase64, termId);
   }
-  terminalResize(sessionId: string, cols: number, rows: number): void {
-    this.terminalMgr.resize(sessionId, cols, rows);
+  terminalResize(sessionId: string, cols: number, rows: number, termId?: string): void {
+    this.terminalMgr.resize(sessionId, cols, rows, termId);
+  }
+  /** Kill one PTY (chip ×) — the client's respawn escape hatch for a wedged shell. */
+  terminalClose(sessionId: string, termId?: string): void {
+    this.terminalMgr.closeOne(sessionId, termId);
   }
 
   // Attachments (arch §6.5) — uploaded via REST, fed to the agent as image blocks.
@@ -1884,6 +1896,7 @@ export class Supervisor {
         // turn interrupted — reset to idle and leave a visible notice so it isn't silently lost.
         const interrupted = transient.includes(p.data.status);
         if (interrupted) p.data.status = "idle";
+        p.data.terminals = undefined; // terminal roster is runtime state — the PTYs died with the old process
         // A restored goal is re-armed PAUSED (design D5): a self-update must never resume an
         // unattended loop. The next user prompt un-pauses it (see prompt()).
         if (p.data.goal) p.data.goal.paused = true;
