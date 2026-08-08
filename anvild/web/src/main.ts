@@ -132,6 +132,7 @@ import { autoGrow, initComposer, input, restoreDraft, saveDraft, updateSendState
 import {
   closePanel,
   initPanel,
+  activeTermId,
   openPanel,
   panel,
   panelView,
@@ -139,6 +140,7 @@ import {
   renderFiles,
   renderLinks,
   renderReader,
+  renderTermStrip,
   requestGitStatus,
   resetPanelForSession,
   showGitResult,
@@ -1121,6 +1123,7 @@ function onEvent(url: string, e: ServerEvent): void {
       renderSessions();
       if (e.session.id === activeId) {
         updateGitPanelMeta();
+        renderTermStrip(); // roster changes (open/exit/kill on any device) refresh the chip strip
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
         updateHeaderAccount(e.session); // reflect an account switch + the idle/mid-turn tooltip
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
@@ -1388,10 +1391,10 @@ function handleSessionEvent(e: ServerEvent): void {
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
       return;
     case "terminal.data":
-      xterm?.write(b64ToBytes(e.data));
+      if ((e.termId ?? "1") === activeTermId) xterm?.write(b64ToBytes(e.data));
       return;
     case "terminal.exit":
-      xterm?.write(`\r\n\x1b[90m[process exited: ${e.code}]\x1b[0m\r\n`);
+      if ((e.termId ?? "1") === activeTermId) xterm?.write(`\r\n\x1b[90m[process exited: ${e.code}] — click the terminal's chip to restart\x1b[0m\r\n`);
       return;
     case "error":
       toast(e.message);

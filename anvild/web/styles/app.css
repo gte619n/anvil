@@ -1131,3 +1131,14 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .goal-chip.paused {
   opacity: 0.6;
 }
+
+/* Terminal chip strip (multi-terminal, design 2026-08-08) */
+.term-wrap { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.term-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.term-chip { display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.term-chip.active { border-color: var(--accent); }
+.term-chip button { background: none; border: none; color: var(--text); cursor: pointer; font: inherit; font-size: 12px; padding: 3px 8px; }
+.term-chip .term-kill { padding: 3px 5px; color: var(--muted); }
+.term-chip .term-kill .msym { font-size: 14px; }
+.term-chip.term-new { padding: 3px 6px; color: var(--muted); }
+#term-host { flex: 1; min-height: 0; }

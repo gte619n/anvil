@@ -35,7 +35,7 @@ import { currentTheme } from "./theme";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
 import { isAndroidApp } from "./platform";
 import { conversation, copyText, humanSize, references, relTime, runMermaid } from "./conversation";
-import type { DirEntry, FileContent, GitResultEvent, GitStatus, Session } from "../../protocol";
+import type { DirEntry, FileContent, GitResultEvent, GitStatus, Session, TerminalInfo } from "../../protocol";
 
 const strToB64 = (s: string): string => {
   const bytes = new TextEncoder().encode(s);
@@ -123,12 +123,58 @@ let readerWatch = "";
 export let xterm: XTerm | null = null; // main's terminal.data/exit router writes into it
 let fit: FitAddon | null = null;
 let termObs: ResizeObserver | null = null;
+export let activeTermId = "1"; // which of the session's terminals the mounted xterm shows (panel.ts sole writer)
+
+/** The chips to draw: the session's live roster, always including the tab we're on (a just-created
+ *  terminal isn't in the roster until the daemon's session.updated lands). */
+function termRoster(): TerminalInfo[] {
+  const roster: TerminalInfo[] = (activeId() ? sessions.get(activeId()!)?.terminals : undefined) ?? [];
+  const merged = roster.some((t) => t.id === activeTermId) ? [...roster] : [...roster, { id: activeTermId, title: "shell" }];
+  return merged.sort((a, b) => Number(a.id) - Number(b.id));
+}
+
+/** Redraw the chip strip (no-op unless the Terminal tab is mounted). main.ts calls this on
+ *  session.updated for the active session so roster changes from any device land live. */
+export function renderTermStrip(): void {
+  const strip = document.getElementById("term-strip");
+  if (!strip || panelView !== "terminal") return;
+  const chips = termRoster()
+    .map(
+      (t) =>
+        `<span class="term-chip${t.id === activeTermId ? " active" : ""}" data-tid="${esc(t.id)}">` +
+        `<button type="button" class="term-sel">${esc(t.id)}: ${esc(t.title)}</button>` +
+        `<button type="button" class="term-kill" title="Kill this terminal">${icon("close")}</button></span>`,
+    )
+    .join("");
+  strip.innerHTML = chips + `<button type="button" id="term-new" class="term-chip term-new" title="New terminal">${icon("add")}</button>`;
+  strip.querySelectorAll<HTMLElement>(".term-sel").forEach((b) =>
+    b.addEventListener("click", () => {
+      const tid = (b.parentElement as HTMLElement).dataset.tid!;
+      // Same chip → remount (respawns if the shell exited); other chip → switch to it.
+      if (tid !== activeTermId) activeTermId = tid;
+      mountTerminal();
+    }),
+  );
+  strip.querySelectorAll<HTMLElement>(".term-kill").forEach((b) =>
+    b.addEventListener("click", () => {
+      const tid = (b.parentElement as HTMLElement).dataset.tid!;
+      if (activeId()) sendTo(activeId()!, { type: "terminal.close", sessionId: activeId()!, termId: tid });
+    }),
+  );
+  const add = document.getElementById("term-new");
+  if (add)
+    add.onclick = () => {
+      activeTermId = String(Math.max(0, ...termRoster().map((t) => Number(t.id) || 0)) + 1);
+      mountTerminal(); // daemon caps at 8 → command.error toast
+    };
+}
 
 /** Reset the per-session panel state for a newly selected session's worktree (main's selectSession). */
 export function resetPanelForSession(): void {
   filesPath = "";
   readerPath = "";
   readerWatch = "";
+  activeTermId = "1";
 }
 
 function setPanelTabs(): void {
@@ -168,7 +214,8 @@ function closePanelDom(): void {
 export const closePanel = (): void => dismissOverlay("panel"); // programmatic close → unwind the back-stack
 function mountTerminal(): void {
   disposeTerminal();
-  panelContent.innerHTML = '<div id="term-host" style="height:100%;width:100%"></div>';
+  panelContent.innerHTML = '<div class="term-wrap"><div id="term-strip" class="term-strip"></div><div id="term-host"></div></div>';
+  renderTermStrip();
   // Lazy chunk: awaited once per page (subsequent opens hit the module cache). The token guards the
   // await gap — if the user closes the panel or switches tabs before the chunk lands (disposeTerminal
   // bumps the token), the stale mount must not resurrect a terminal over the new view.
@@ -192,7 +239,7 @@ function mountTerminal(): void {
     xterm.open($("#term-host"));
     fit.fit();
     xterm.onData((d) => {
-      if (activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(d) });
+      if (activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(d), termId: activeTermId });
     });
     // Copy-on-select (design 2026-08-08): a settled selection lands in the clipboard, iTerm-style.
     let selTimer = 0;
@@ -224,11 +271,11 @@ function mountTerminal(): void {
       navigator.clipboard
         .readText()
         .then((t) => {
-          if (t && activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(t) });
+          if (t && activeId()) sendTo(activeId()!, { type: "terminal.input", sessionId: activeId()!, data: strToB64(t), termId: activeTermId });
         })
         .catch(() => toast("Allow clipboard access to paste"));
     });
-    if (activeId()) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
+    if (activeId()) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows, termId: activeTermId });
     // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
     // Debounce ~100ms, and only send terminal.resize when the grid (cols/rows) actually changed — a repaint
     // that doesn't alter the character grid shouldn't spam the daemon (which re-sizes the real PTY).
@@ -243,7 +290,7 @@ function mountTerminal(): void {
         if (xterm.cols !== lastCols || xterm.rows !== lastRows) {
           lastCols = xterm.cols;
           lastRows = xterm.rows;
-          sendTo(activeId()!, { type: "terminal.resize", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows });
+          sendTo(activeId()!, { type: "terminal.resize", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows, termId: activeTermId });
         }
       }, 100);
     });
