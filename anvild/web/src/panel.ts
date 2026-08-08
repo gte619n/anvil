@@ -112,7 +112,7 @@ let pinnedBootPending = false;
 export function flushPinnedBoot(): void {
   if (!pinnedBootPending) return;
   pinnedBootPending = false;
-  if (panelPinned && activeId()) openPanel(panelView ?? pinnedStoredView());
+  if (panelPinned && !isNarrow() && activeId()) openPanel(panelView ?? pinnedStoredView());
 }
 
 // Click anywhere off the open side panel to dismiss it. The header toggles, in-conversation
@@ -131,7 +131,7 @@ export function flushPinnedBoot(): void {
 // the panel too — one outside click unwinds both, exactly as before the extraction.
 export function wirePanelOutsideDismiss(): void {
   document.addEventListener("pointerdown", (e) => {
-    if (panelPinned) return; // pinned panels don't dismiss
+    if (panelPinned && !isNarrow()) return; // pinned panels don't dismiss (desktop; narrow keeps tap-away)
     if (!panelView) return; // panel already closed
     if (overlayOpen("modal") || overlayOpen("settings") || overlayOpen("autopilot") || overlayOpen("reader") || overlayOpen("menu")) return; // a dialog/settings/autopilot/reader/header-menu is on top — leave the panel be
     const t = e.target as HTMLElement;
@@ -159,10 +159,16 @@ function pinnedStoredView(): View {
   const v = localStorage.getItem(PIN_KEY);
   return (VIEWS as readonly string[]).includes(v ?? "") ? (v as View) : "terminal";
 }
-/** body.panel-pinned drives the split CSS — only while the panel is actually open. */
+/** body.panel-pinned drives the split CSS — only while the panel is actually open. Also the single
+ *  place the pin button's state is painted (icon tilt/fill via .active, aria-pressed, title). */
 function syncPinnedLayout(): void {
   document.body.classList.toggle("panel-pinned", panelPinned && panel.classList.contains("open"));
-  document.getElementById("panel-pin")?.classList.toggle("active", panelPinned);
+  const btn = document.getElementById("panel-pin");
+  if (btn) {
+    btn.classList.toggle("active", panelPinned);
+    btn.setAttribute("aria-pressed", String(panelPinned));
+    btn.title = panelPinned ? "Unpin — the panel floats over the conversation again" : "Pin — keep the panel open beside the conversation";
+  }
 }
 
 let filesPath = "";
@@ -172,6 +178,35 @@ export let xterm: XTerm | null = null; // main's terminal.data/exit router write
 let fit: FitAddon | null = null;
 let termObs: ResizeObserver | null = null;
 export let activeTermId = "1"; // which of the session's terminals the mounted xterm shows (panel.ts sole writer)
+const MAX_TERMINALS = 8; // keep in sync with the daemon's per-session cap (terminal-manager.ts)
+// Per-mount terminal health, reported by main.ts's event router (import bindings are read-only, so
+// these are setter functions): did ANY terminal.data land since the current mount, and did the
+// mounted PTY exit? Drive the lost-replay watchdog and the reconnect resync below.
+let termDataSeen = false;
+let termExited = false;
+export function noteTerminalData(): void {
+  termDataSeen = true;
+}
+export function noteTerminalExit(): void {
+  termExited = true;
+}
+
+/** Reconcile a mounted terminal after the active session's server (re)attaches (main's
+ *  session.list handler). Three cases (BUG-4 / BUG-2):
+ *  - the roster no longer has this termId and it never exited on-screen → the PTY died without a
+ *    terminal.exit (daemon restart): remount for a fresh shell instead of a zombie that swallows
+ *    keystrokes;
+ *  - the roster has it but this mount never received a byte → the open or its scrollback replay
+ *    was dropped (boot race, dead-socket send): re-request the open (replays into an empty xterm,
+ *    so no duplication);
+ *  - healthy live terminal → no-op (a mere socket blip must not duplicate the replay). */
+export function resyncTerminal(): void {
+  if (panelView !== "terminal" || !xterm || !activeId()) return;
+  if (termExited) return; // user-killed shell showing "[process exited]" — restarting is the chip's job
+  const roster: TerminalInfo[] = sessions.get(activeId()!)?.terminals ?? [];
+  if (!roster.some((t) => t.id === activeTermId)) mountTerminal();
+  else if (!termDataSeen) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows, termId: activeTermId });
+}
 
 /** The chips to draw: the session's live roster, always including the tab we're on (a just-created
  *  terminal isn't in the roster until the daemon's session.updated lands). */
@@ -212,8 +247,16 @@ export function renderTermStrip(): void {
   const add = document.getElementById("term-new");
   if (add)
     add.onclick = () => {
-      activeTermId = String(Math.max(0, ...termRoster().map((t) => Number(t.id) || 0)) + 1);
-      mountTerminal(); // daemon caps at 8 → command.error toast
+      const roster = termRoster();
+      // Client-side clamp (BUG-1): the daemon rejects the 9th open with BadCommand, but
+      // terminal.open is fire-and-forget (no cid) and the router deliberately drops cid-less
+      // command.error — so without this clamp the strip rendered a phantom chip with no PTY.
+      if (roster.length >= MAX_TERMINALS) {
+        toast(`This session already has ${MAX_TERMINALS} terminals — close one first`);
+        return;
+      }
+      activeTermId = String(Math.max(0, ...roster.map((t) => Number(t.id) || 0)) + 1);
+      mountTerminal();
     };
 }
 
@@ -263,9 +306,35 @@ function closePanelDom(): void {
   setPanelTabs();
   syncPinnedLayout();
 }
-/** ✕ / programmatic close. A pinned panel unpins first (✕ means "put it away"). */
+/** Tear down the panel DOM but KEEP the pin (state + storage). Used when the active session
+ *  vanishes under us (remote kill → closePanelForDeselect) and on narrow screens where the pin
+ *  control is hidden (BUG-5: closing there must not silently cost the desktop pin). The pin
+ *  re-engages on the next selectSession via reopenPanelForSession. */
+function closePanelKeepPin(): void {
+  readerWatch = "";
+  disposeTerminal();
+  panelView = null;
+  panel.classList.remove("open");
+  setPanelTabs();
+  syncPinnedLayout();
+}
+
+/** The active session vanished (remote kill / server prune — main's deselectSession): put the
+ *  panel away so it can't keep showing a dead session's terminal and swallow keystrokes (BUG-3).
+ *  Unlike closePanel, a pinned panel keeps its pin. */
+export function closePanelForDeselect(): void {
+  if (panelPinned) closePanelKeepPin();
+  else if (panelView) dismissOverlay("panel");
+}
+
+/** ✕ / programmatic close. A pinned panel unpins first (✕ means "put it away") — except on narrow
+ *  screens, where the pin control is hidden and an invisible unpin would just surprise (BUG-5). */
 export const closePanel = (): void => {
   if (panelPinned) {
+    if (isNarrow()) {
+      closePanelKeepPin();
+      return;
+    }
     panelPinned = false;
     localStorage.removeItem(PIN_KEY);
     panel.classList.remove("open");
@@ -282,7 +351,7 @@ export const closePanel = (): void => {
  *  the new session (its own terminal/worktree); an unpinned open panel falls back to Files
  *  (historical behavior). Also restores a pinned panel on the boot-time first selection. */
 export function reopenPanelForSession(): void {
-  if (panelPinned) {
+  if (panelPinned && !isNarrow()) {
     openPanel(panelView ?? pinnedStoredView());
     return;
   }
@@ -290,6 +359,8 @@ export function reopenPanelForSession(): void {
 }
 function mountTerminal(): void {
   disposeTerminal();
+  termDataSeen = false;
+  termExited = false;
   panelContent.innerHTML = '<div class="term-wrap"><div id="term-strip" class="term-strip"></div><div id="term-host"></div></div>';
   renderTermStrip();
   // Lazy chunk: awaited once per page (subsequent opens hit the module cache). The token guards the
@@ -352,6 +423,14 @@ function mountTerminal(): void {
         .catch(() => toast("Allow clipboard access to paste"));
     });
     if (activeId()) sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows, termId: activeTermId });
+    // Lost-replay watchdog (BUG-2): a PTY (re)open ALWAYS produces bytes — a fresh shell prints its
+    // prompt, an existing PTY replays scrollback (never empty). Silence means the open or its
+    // replay was dropped (boot attach race, socket not open yet): re-request once. termDataSeen and
+    // the mount token keep a healthy terminal from ever seeing a duplicate replay.
+    window.setTimeout(() => {
+      if (token !== termMountToken || termDataSeen || !xterm || !activeId()) return;
+      sendTo(activeId()!, { type: "terminal.open", sessionId: activeId()!, cols: xterm.cols, rows: xterm.rows, termId: activeTermId });
+    }, 1500);
     // [WEB2-4] The ResizeObserver fired a fit() + a terminal.resize WS frame on every tick (many per drag).
     // Debounce ~100ms, and only send terminal.resize when the grid (cols/rows) actually changed — a repaint
     // that doesn't alter the character grid shouldn't spam the daemon (which re-sizes the real PTY).

@@ -1150,3 +1150,9 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .term-chip .term-kill .msym { font-size: 14px; }
 .term-chip.term-new { padding: 3px 6px; color: var(--muted); }
 #term-host { flex: 1; min-height: 0; }
+
+/* Pin state is readable from the icon itself (UX-6): tilted = loose, upright + filled + accent =
+   pinned. The web font is the variable Material Symbols cut (FILL axis in the CDN URL); on a
+   static native bundle the fill no-ops and the tilt still carries the state. */
+#panel-pin .msym { transform: rotate(45deg); transition: transform 0.12s ease; }
+#panel-pin.active .msym { transform: none; font-variation-settings: "FILL" 1; color: var(--accent); }

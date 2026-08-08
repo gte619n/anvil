@@ -133,9 +133,13 @@ import {
   closePanel,
   initPanel,
   activeTermId,
+  closePanelForDeselect,
   flushPinnedBoot,
+  noteTerminalData,
+  noteTerminalExit,
   openPanel,
   panel,
+  resyncTerminal,
   panelView,
   readerPath,
   renderFiles,
@@ -1096,6 +1100,7 @@ function onEvent(url: string, e: ServerEvent): void {
       if (activeId && sessions.has(activeId) && sessionServer.get(activeId) === url) {
         setHeaderTitle(sessions.get(activeId));
         flushPinnedBoot(); // restore a pinned panel now that this socket is provably live (one-shot)
+        resyncTerminal(); // daemon restart / dropped open: heal a mounted terminal (no-op when healthy)
         if (snapshotLoaded.has(activeId)) attachReconnect(activeId);
         else if (pendingLoadId === activeId) { /* a fresh load is already resolving; it will attach itself */ }
         else void loadConversation(activeId);
@@ -1394,10 +1399,16 @@ function handleSessionEvent(e: ServerEvent): void {
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
       return;
     case "terminal.data":
-      if ((e.termId ?? "1") === activeTermId) xterm?.write(b64ToBytes(e.data));
+      if ((e.termId ?? "1") === activeTermId) {
+        noteTerminalData(); // feeds the lost-replay watchdog + reconnect resync in panel.ts
+        xterm?.write(b64ToBytes(e.data));
+      }
       return;
     case "terminal.exit":
-      if ((e.termId ?? "1") === activeTermId) xterm?.write(`\r\n\x1b[90m[process exited: ${e.code}] — click the terminal's chip to restart\x1b[0m\r\n`);
+      if ((e.termId ?? "1") === activeTermId) {
+        noteTerminalExit(); // an on-screen exit means "restart is the chip's job" — resync must not respawn
+        xterm?.write(`\r\n\x1b[90m[process exited: ${e.code}] — click the terminal's chip to restart\x1b[0m\r\n`);
+      }
       return;
     case "error":
       toast(e.message);
@@ -1459,6 +1470,7 @@ function renderSnapshotEvents(events: ConversationEvent[]): void {
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
   saveDraft(activeId, input.value); // keep the unsent draft with the session we're leaving
+  closePanelForDeselect(); // don't leave a (pinned) panel showing the dead session's terminal (BUG-3)
   activeId = null;
   localStorage.removeItem("anvil.active");
   setSessionHash(null, false);
