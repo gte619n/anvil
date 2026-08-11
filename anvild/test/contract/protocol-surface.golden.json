@@ -73,6 +73,8 @@
     "loop.dryrun",
     "loop.gate.open",
     "loop.gate.sendback",
+    "loop.intake",
+    "loop.intake.result",
     "loop.pause",
     "loop.remove",
     "loop.run",

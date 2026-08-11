@@ -7,7 +7,8 @@
  * Deps are injected (the AutopilotService pattern) so the wiring stays testable and the Supervisor only
  * gathers the projections. The engine itself is proven deterministically by test/integration/loops-*.
  */
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { newId } from "../util/ids";
 import { now } from "../util/envelope";
 import { slugify } from "./slug";
@@ -24,6 +25,8 @@ import { PROTOCOL_VERSION } from "@protocol";
 import type {
   Loop,
   LoopInput,
+  LoopIntakeResultEvent,
+  LoopIntakeSuggestion,
   LoopRun,
   LoopsListEvent,
   LoopUpdatedEvent,
@@ -31,6 +34,27 @@ import type {
   LoopRunsEvent,
   Model,
 } from "@protocol";
+
+const SESSION_INTAKE_BUDGET = 300_000;
+const PIPELINE_INTAKE_BUDGET = 400_000;
+
+/** Best-effort: the repo's configured test script (package.json "scripts.test"), for a repo-aware check. */
+function readTestScript(repoRoot: string): string | undefined {
+  try {
+    const pkgPath = join(repoRoot, "package.json");
+    if (!existsSync(pkgPath)) return undefined;
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { scripts?: Record<string, string> };
+    const test = pkg.scripts?.test;
+    if (!test) return undefined;
+    // Prefer a runner-native invocation over "npm test" so a narrowing keyword can append cleanly.
+    if (/\bbun\b/.test(test)) return "bun test";
+    if (/\bvitest\b/.test(test)) return "vitest run";
+    if (/\bjest\b/.test(test)) return "jest";
+    return "npm test";
+  } catch {
+    return undefined;
+  }
+}
 import type { EnvironmentStore } from "../env/store";
 import type { ConnectionRegistry } from "../server/registry";
 import type { AccountStore } from "../auth/accounts";
@@ -262,6 +286,52 @@ export class LoopService {
     void this.engine.run(loop, { kind: "manual" }).catch((e) => console.error(`[loops] run ${loopId} failed:`, e));
     const latest = this.store.latestRun(loopId);
     return this.runEvent(latest ?? placeholderRun(loop), cid);
+  }
+
+  /** Dry-run the first lap in a throwaway worktree (report only). Removes the worktree after — no branch/PR. */
+  async dryRun(loopId: string, cid?: string): Promise<LoopRunEvent> {
+    const loop = this.require(loopId);
+    if (this.engine.isActive(loopId)) throw new BadCommand("a run is already live for this loop");
+    const run = await this.engine.dryRun(loop);
+    const wt = this.worktrees.get(run.id);
+    if (wt) {
+      try {
+        removeWorktree(wt.repoRoot, wt.cwd, wt.branch);
+      } catch {
+        /* best-effort */
+      }
+      this.worktrees.delete(run.id);
+    }
+    return this.runEvent(run, cid);
+  }
+
+  /** Repo-aware intake proposal (spec §4.4): a heuristic check/scope/stops/gate + logged assumptions for
+   *  an outcome. Reads the env's package.json test script so the check matches the repo. (A small-model
+   *  enhancement is a follow-up — this deterministic core keeps intake CI-reproducible.) */
+  intakeSuggest(prompt: string, environmentId?: string, cid?: string): LoopIntakeResultEvent {
+    const p = prompt.trim();
+    const isFeature = !/\b(fix|flak|bug|broke|broken|fail|regress)/i.test(p) && /\b(add|export|feature|build|create|new|implement)/i.test(p);
+    // A repo-relative noun to narrow the check + scope (e.g. "upload", "reports").
+    const keyword = (p.toLowerCase().match(/\b(upload|report|reports|export|auth|payment|search|api|sync|login|cache)\w*/) ?? [])[0];
+    const env = environmentId ? this.deps.envStore.get(environmentId) : undefined;
+    const testScript = env ? readTestScript(env.repoRoot) : undefined;
+    const base = testScript ?? "bun test";
+    const checkCommand = keyword ? `${base} ${keyword}` : base;
+    const scopeAllow = keyword ? [`src/${keyword}/`] : [];
+    const suggestion: LoopIntakeSuggestion = {
+      isFeature,
+      name: p.replace(/^\(from Todoist\)\s*/i, "").slice(0, 60) || "New loop",
+      checkCommand,
+      ...(keyword ? { checkLocks: [] } : {}),
+      scopeAllow,
+      maxLaps: isFeature ? 12 : 10,
+      tokenBudget: isFeature ? PIPELINE_INTAKE_BUDGET : SESSION_INTAKE_BUDGET,
+      rung: "pr",
+      assumptions: isFeature
+        ? ["Comma delimiter, UTF-8 where output format is unstated", "Streams all rows — no hard cap"]
+        : ["The failure is deterministic/timing-related, not environment-specific"],
+    };
+    return { v: PROTOCOL_VERSION, type: "loop.intake.result", ts: now(), ...(cid ? { cid } : {}), suggestion };
   }
 
   async gateOpen(runId: string, cid?: string): Promise<LoopRunEvent> {

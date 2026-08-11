@@ -176,11 +176,13 @@ Vertical slices; each independently shippable. `☐` not started · `◐` in pro
 ### Phase 3 — Claude-led intake
 | Task | Implemented | Tested | Pushed |
 |---|---|---|---|
-| Daemon intake session (check→scope→stops→gate question order; suggested answers; repo-aware check proposal) | ☐ | ☐ | ☐ |
-| Live circuit build above chat; "still ambiguous" → `assumptions`; intent preview | ☐ | ☐ | ☐ |
-| Dry-run first lap (throwaway worktree; report only, no branch/PR/push) via `loop.dryrun` | ☐ | ☐ | ☐ |
-| Todoist task → intake path (draft conversion enters the same conversation) | ☐ | ☐ | ☐ |
-| **Acceptance:** typing an outcome in the home's prompt box yields a ≤5-question conversation ending in an armed loop whose check, scope, stops, rung, and ≥1 logged assumption match the answers; the first lap is a dry-run leaving no branch/PR; a Todoist draft converts through the same flow | ☐ | ☐ | ☐ |
+| Daemon intake session (check→scope→stops→gate question order; suggested answers; repo-aware check proposal) | ☑ | ☑ | ☐ |
+| Live circuit build above chat; "still ambiguous" → `assumptions`; intent preview | ☑ | ☑ | ☐ |
+| Dry-run first lap (throwaway worktree; report only, no branch/PR/push) via `loop.dryrun` | ☑ | ☑ | ☐ |
+| Todoist task → intake path (draft conversion enters the same conversation) | ☑ | ☑ | ☐ |
+| **Acceptance:** typing an outcome in the home's prompt box yields a ≤5-question conversation ending in an armed loop whose check, scope, stops, rung, and ≥1 logged assumption match the answers; the first lap is a dry-run leaving no branch/PR; a Todoist draft converts through the same flow | ☑ | ☑ | ☐ |
+
+> **Phase 3 evidence** (2026-08-11, branch `loops-circuit`). `bun test` → 960 pass / 1 skip / 0 fail. Daemon + web `bunx typescript@5.9 --noEmit` → exit 0. `bun run web/build.ts` → built OK. Golden regenerated: +2 literals (`loop.intake`, `loop.intake.result`), **PROTOCOL_VERSION stays 4** (additive: also `LoopRun.dryRun?`, `LoopInput.workUnitId?`). New: `src/loops/engine.ts` `dryRun()` + gate dry-run guard; `src/session/loop-service.ts` `dryRun()`/`intakeSuggest()`; `web/src/loops-intake.ts` (the conversation). Tests: `loops-lifecycle` dry-run scenario, `test/unit/loop-service.test.ts` (repo-aware intakeSuggest, feature vs fix, workUnitId linkage, edit-while-armed + configRevision bump), `test/web/loops-intake.test.ts` (≤5-question conversation → armed loop matching answers + dry-run first lap; Todoist draft links the unit; failed-arm fires no dry-run). Fresh-context adversarial review: 1 BLOCKER (home-prompt loops had no environment → dry-run failed silently) + 1 MAJOR (arm result ignored) — **both resolved** (D-016) with a regression test. *Pushed left ☐: committed to the feature branch, not merged to `main`.*
 
 ### Phase 4 — Triggers, migration flip, notifications
 | Task | Implemented | Tested | Pushed |

@@ -1041,6 +1041,19 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .lc-ladder button.on b { color: #b07cc3; }
 .lc-ladder button:disabled { cursor: default; opacity: 0.85; }
 .lc-ladder-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+.lc-assume { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+.lc-assume li { margin: 3px 0; }
+/* Claude-led intake conversation */
+.lc-chat { display: flex; flex-direction: column; gap: 10px; }
+.lc-bub { max-width: 92%; padding: 10px 13px; border-radius: 13px; font-size: 13px; line-height: 1.55; }
+.lc-bub.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.lc-bub.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.lc-bub code { background: color-mix(in srgb, var(--muted) 22%, transparent); padding: 0 4px; border-radius: 4px; }
+.lc-bub ul { margin: 6px 0 0; padding-left: 18px; }
+.lc-chips { display: flex; flex-wrap: wrap; gap: 7px; align-self: flex-start; }
+.lc-chips button { border: 1px solid var(--accent); background: transparent; color: var(--accent); border-radius: 999px; padding: 6px 13px; font: inherit; font-size: 12.5px; cursor: pointer; }
+.lc-chips button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.lc-new-modal textarea, .lc-new-modal input, .lc-new-modal select { width: 100%; box-sizing: border-box; }
 
 /* Plan reader. The plan reads full-width; `position: relative` anchors the pipeline-trace card and
    `overflow: hidden` clips nothing here (the body owns the vertical scroll). */

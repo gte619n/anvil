@@ -106,7 +106,7 @@ export function completeLoop(input: LoopInput, opts: CompleteOpts): CompleteResu
     notify,
     cleanGatedLaps: existing?.cleanGatedLaps ?? 0,
     configRevision: (existing?.configRevision ?? 0) + 1, // bump on every save; a run pins its revision
-    ...(existing?.workUnitId ? { workUnitId: existing.workUnitId } : {}),
+    ...(existing?.workUnitId ? { workUnitId: existing.workUnitId } : input.workUnitId ? { workUnitId: input.workUnitId } : {}),
     createdAt: existing?.createdAt ?? opts.now,
     updatedAt: opts.now,
   };

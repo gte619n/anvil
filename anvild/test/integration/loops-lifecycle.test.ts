@@ -247,6 +247,25 @@ test("gate open is idempotent under concurrent verbs (no double-ship)", async ()
   }
 });
 
+test("dry run drives exactly one lap, flags dryRun, and the gate refuses it (no branch/PR)", async () => {
+  const loop = makeLoop();
+  const h = harness([
+    { diffFiles: ["src/upload/a.ts"], command: { exit: 0 } }, // would pass
+    { diffFiles: ["src/upload/a.ts"], command: { exit: 0 } }, // must NOT run (dry run = one lap)
+  ]);
+  try {
+    h.store.save(loop);
+    const run = await h.engine.dryRun(loop);
+    expect(run.dryRun).toBe(true);
+    expect(run.laps.length).toBe(1); // exactly one lap
+    expect(run.reason).toMatch(/dry run/i);
+    // The gate refuses a dry run — no ship action can ever push a branch or open a PR.
+    await expect(h.engine.openGate(loop.id, run.id)).rejects.toThrow(/dry run/i);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("check-error does not fail the loop; it counts toward no-progress", async () => {
   const loop = makeLoop({
     checks: [{ kind: "judge", condition: "it works" }],

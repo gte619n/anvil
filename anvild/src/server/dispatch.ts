@@ -477,8 +477,13 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         send(deps.supervisor.convertDraftToLoop(cmd.workUnitId, cid));
         return;
       case "loop.dryrun":
-        // Phase 3 wires the throwaway-worktree dry run; until then it's a plain manual run.
-        send(deps.supervisor.loops.run(cmd.loopId, cid));
+        deps.supervisor.loops
+          .dryRun(cmd.loopId, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+      case "loop.intake":
+        send(deps.supervisor.loops.intakeSuggest(cmd.prompt, cmd.environmentId, cid));
         return;
 
       case "autopilot.tags.reset":

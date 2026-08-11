@@ -932,6 +932,7 @@ export interface LoopInput {
   hardStops?: Partial<LoopHardStops>;
   assumptions?: string[];
   notify?: Partial<LoopNotify>;
+  workUnitId?: string; // link to the autopilot draft this loop was set up from (intake convert path)
 }
 
 export type LapVerdict = "pass" | "fail" | "check-error" | "scope-violation" | "check-tampering";
@@ -959,6 +960,7 @@ export interface LoopRun {
   checkpoint?: { lap: number; claudeSessionId?: string; pipelinePhase?: string };
   gate?: { openedAt?: Iso8601; sentBackNote?: string };
   reason?: string; // terminal explanation (budget, no-progress, error)
+  dryRun?: boolean; // a throwaway first lap (Phase 3 intake) — report only, gate verbs refuse it
   startedAt: Iso8601;
   endedAt?: Iso8601;
 }
@@ -987,6 +989,24 @@ export interface LoopRunsEvent extends Envelope {
   cid?: Cid;
   loopId: string;
   runs: LoopRun[];
+}
+/** A repo-aware intake proposal (loops-circuit spec §4.4) — Claude's suggested check/scope/stops/gate for
+ *  an outcome, plus the "still ambiguous" assumptions. The web's intake conversation drives off this. */
+export interface LoopIntakeSuggestion {
+  isFeature: boolean; // fix-something-broken vs build-something-new (drives the check-first framing)
+  name: string;
+  checkCommand?: string; // the proposed command check (e.g. "bun test upload")
+  checkLocks?: string[]; // its on-disk inputs to lock (check-tampering guard)
+  scopeAllow: string[]; // proposed scope globs
+  maxLaps: number;
+  tokenBudget: number;
+  rung: LoopRung;
+  assumptions: string[]; // the "still ambiguous" acceptances to log
+}
+export interface LoopIntakeResultEvent extends Envelope {
+  type: "loop.intake.result";
+  cid?: Cid;
+  suggestion: LoopIntakeSuggestion;
 }
 
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
@@ -1239,6 +1259,7 @@ export type ServerEvent =
   | LoopUpdatedEvent
   | LoopRunEvent
   | LoopRunsEvent
+  | LoopIntakeResultEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent
@@ -1696,6 +1717,11 @@ export interface LoopConvertCmd extends Envelope, Correlated {
   type: "loop.convert"; // an autopilot draft → a real Loop (keeps the unit; drives its tags) → loop.updated
   workUnitId: string;
 }
+export interface LoopIntakeCmd extends Envelope, Correlated {
+  type: "loop.intake"; // repo-aware intake proposal for an outcome → loop.intake.result
+  prompt: string;
+  environmentId?: string;
+}
 export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   type: "autopilot.schedule.set"; // update fields (omitted fields unchanged) → autopilot.schedule
   enabled?: boolean;
@@ -1858,6 +1884,7 @@ export type ClientCommand =
   | LoopGateSendbackCmd
   | LoopRunsGetCmd
   | LoopConvertCmd
+  | LoopIntakeCmd
   | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd

@@ -13,6 +13,7 @@ import { openPlanDeepLink } from "./autopilot";
 import { actLabel, checkLabelShort, circuitSvg, entityStatus, loopEntityToCircuit, loopToCircuit, miniSvg, RUNGS, rung, triggerLabel } from "./circuit";
 import { stripeColor } from "./sessionColor";
 import { currentTheme } from "./theme";
+import { initIntake, openIntake } from "./loops-intake";
 import type { Environment, Loop, LoopInput, LoopRun, LoopSummary, ServerEvent } from "../../protocol";
 
 // ── Injected dependencies (initLoops) ──────────────────────────────────────────────────────────────
@@ -26,6 +27,16 @@ let sendAwait: LoopsDeps["sendAwait"];
 let selectSession: LoopsDeps["selectSession"];
 export function initLoops(deps: LoopsDeps): void {
   ({ environments, sendAwait, selectSession } = deps);
+  // The Claude-led intake conversation renders into the loops overlay root; on arm it opens the new
+  // loop's detail, on cancel it returns to the home.
+  initIntake({
+    environments: deps.environments,
+    sendAwait: deps.sendAwait,
+    rootId: "lc-root",
+    onArmed: (loopId) => openDetail(loopId, true),
+    onCancel: () => renderHome(),
+  });
+  setLoopIntake((prompt, fromDraft) => void openIntake(prompt, fromDraft ? { workUnitId: fromDraft } : undefined));
 }
 
 // Claude-led intake (Phase 3) registers its opener here; until then the prompt box opens the dialog.
@@ -337,7 +348,9 @@ function renderProjectedDetail(): void {
     dismissOverlay("loops");
     openPlanDeepLink(l.id);
   });
-  document.getElementById("lc-convert")?.addEventListener("click", () => void convertDraft(l.id));
+  document.getElementById("lc-convert")?.addEventListener("click", () =>
+    void openIntake(l.title, { workUnitId: l.id, ...(l.environmentId ? { environmentId: l.environmentId } : {}) }),
+  );
   document.getElementById("lc-approve")?.addEventListener("click", () => void approveProposal(l.id));
   document.getElementById("lc-reject")?.addEventListener("click", () => void rejectProposal(l.id, l.title));
 }
@@ -393,24 +406,6 @@ async function sendBack(loopId: string, runId: string): Promise<void> {
   if (!note) return;
   if (await loopSend(loopId, { type: "loop.gate.sendback", runId, note })) toast("Sent back for another lap");
 }
-async function convertDraft(workUnitId: string): Promise<void> {
-  const srv = projSock(workUnitId) ?? serverByUrl(HUB_URL);
-  if (!srv?.sock.isOpen()) {
-    toast("That draft's server is offline");
-    return;
-  }
-  try {
-    const res = await sendAwait(srv, { type: "loop.convert", workUnitId, cid: newCid() }, 60_000);
-    if (res.type === "command.error") return void toast(res.message);
-    if (res.type === "loop.updated") {
-      toast("Converted to a loop — pause to tune the check, then arm");
-      openDetail(res.loop.id, true);
-    }
-  } catch (err) {
-    toast(`Convert failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
 async function approveProposal(id: string): Promise<void> {
   const srv = projSock(id);
   if (!srv?.sock.isOpen()) return void toast("That loop's server is offline");
