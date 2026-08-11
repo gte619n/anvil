@@ -374,6 +374,12 @@ export class Supervisor {
         const r = await this.autopilot.runAutopilot({ notify: false, autoStart: false });
         return { created: r.created, summary: `${r.created} new · ${r.skipped} already in pipeline` };
       },
+      runPipeline: async (loop) => {
+        // A `pipeline`-body loop runs the autonomous dev pipeline over its linked work unit.
+        if (!loop.workUnitId) return "no linked work unit for the pipeline body";
+        const outcome = await this.autopilot.runDevPipeline(loop.workUnitId, {});
+        return `pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}`;
+      },
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);

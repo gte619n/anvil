@@ -15,6 +15,8 @@ export interface CheckContext {
   judge: (condition: string, transcript: string) => Promise<{ met: boolean; reason?: string }>;
   /** Run a command in the worktree; returns exit code + combined output. */
   runCommand: (command: string, cwd: string) => Promise<{ exit: number; output: string }>;
+  /** GET a URL; returns the status code (for http checks). Optional — absent ⇒ http checks check-error. */
+  httpGet?: (url: string) => Promise<{ status: number }>;
   /** The acting lap's recent transcript (fed to judge checks). */
   transcript: string;
   /** The run's worktree. */
@@ -37,9 +39,20 @@ export async function runCheck(check: LoopCheck, ctx: CheckContext): Promise<Lap
           ? { check: label, v: "pass" }
           : { check: label, v: "fail", detail: `exit ${exit} (wanted ${want})${output ? `: ${lastLine(output)}` : ""}` };
       }
-      case "metric":
-      case "http":
-        return { check: label, v: "check-error", detail: `${check.kind} checks arrive in Phase 5` };
+      case "metric": {
+        // Run the command, read the last number in its output, compare against the threshold.
+        const { output } = await ctx.runCommand(check.command, ctx.cwd);
+        const value = lastNumber(output);
+        if (value === undefined) return { check: label, v: "check-error", detail: `no number in output: ${lastLine(output)}` };
+        const ok = check.op === "gte" ? value >= check.threshold : check.op === "lte" ? value <= check.threshold : value === check.threshold;
+        return ok ? { check: label, v: "pass" } : { check: label, v: "fail", detail: `${value} !${check.op} ${check.threshold}` };
+      }
+      case "http": {
+        if (!ctx.httpGet) return { check: label, v: "check-error", detail: "http checks need a fetch capability" };
+        const { status } = await ctx.httpGet(check.url);
+        const want = check.expectStatus ?? 200;
+        return status === want ? { check: label, v: "pass" } : { check: label, v: "fail", detail: `HTTP ${status} (wanted ${want})` };
+      }
     }
   } catch (e) {
     return { check: label, v: "check-error", detail: e instanceof Error ? e.message : String(e) };
@@ -78,4 +91,11 @@ export function combineVerdicts(results: LapCheckResult[], mode: "all" | "any"):
 function lastLine(s: string): string {
   const lines = s.trim().split("\n");
   return lines[lines.length - 1] ?? "";
+}
+
+/** The last number appearing in a string (e.g. a coverage/count line), or undefined. */
+function lastNumber(s: string): number | undefined {
+  const matches = s.match(/-?\d+(?:\.\d+)?/g);
+  if (!matches || !matches.length) return undefined;
+  return Number(matches[matches.length - 1]);
 }

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { completeLoop, defaultTokenBudget, checkLocks, chainCycleReason, chainedTargets, eventTargets, SESSION_TOKEN_BUDGET, PIPELINE_TOKEN_BUDGET, DEFAULT_MAX_LAPS, DEFAULT_NO_PROGRESS_LAPS } from "../../src/loops/contract";
+import { completeLoop, defaultTokenBudget, checkLocks, chainCycleReason, chainedTargets, eventTargets, promotionSuggestion, shipUnlocked, PROMOTION_THRESHOLD, SESSION_TOKEN_BUDGET, PIPELINE_TOKEN_BUDGET, DEFAULT_MAX_LAPS, DEFAULT_NO_PROGRESS_LAPS } from "../../src/loops/contract";
 import type { Loop, LoopInput } from "../../protocol";
 
 const opts = { now: "2026-08-11T00:00:00.000Z", genId: () => "loop_1" };
@@ -117,6 +117,22 @@ test("eventTargets selects only armed event loops subscribed to the kind", () =>
   const loops = [mk("ci", "event", "ci-failure"), mk("gh", "event", "github"), mk("ciPaused", "event", "ci-failure", "paused"), mk("man", "manual")];
   expect(eventTargets(loops, "ci-failure").map((l) => l.id)).toEqual(["ci"]);
   expect(eventTargets(loops, "github").map((l) => l.id)).toEqual(["gh"]);
+});
+
+test("earned autonomy: promotionSuggestion appears only after 3 clean gated laps, and never past Ship", () => {
+  expect(promotionSuggestion({ rung: "pr", cleanGatedLaps: 2 })).toBeNull(); // not earned yet
+  expect(promotionSuggestion({ rung: "pr", cleanGatedLaps: PROMOTION_THRESHOLD })).toBe("ship"); // earned → suggest Ship
+  expect(promotionSuggestion({ rung: "suggest", cleanGatedLaps: 5 })).toBe("draft");
+  expect(promotionSuggestion({ rung: "ship", cleanGatedLaps: 9 })).toBeNull(); // already at the top
+  expect(shipUnlocked({ rung: "pr", cleanGatedLaps: 2 })).toBe(false);
+  expect(shipUnlocked({ rung: "pr", cleanGatedLaps: 3 })).toBe(true);
+});
+
+test("the Ship rung must be earned — completeLoop rejects it below the threshold, allows it once earned", () => {
+  expect(() => completeLoop({ ...base, rung: "ship" }, opts)).toThrow(/earned/i);
+  const earned = { ...completeLoop(base, opts).loop, rung: "pr" as const, cleanGatedLaps: 3 };
+  const promoted = completeLoop({ ...base, id: earned.id, rung: "ship" }, { ...opts, existing: earned });
+  expect(promoted.loop.rung).toBe("ship");
 });
 
 test("checkLocks is the union of every check's locks", () => {

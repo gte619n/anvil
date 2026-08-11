@@ -37,7 +37,7 @@ function makeLoop(over: Partial<LoopInput> = {}): Loop {
   return completeLoop(input, { now: "2026-08-11T00:00:00.000Z", genId: () => "loop_test" }).loop;
 }
 
-function harness(script: ScriptLap[], gateResult = { summary: "opened PR", url: "https://pr/1" }) {
+function harness(script: ScriptLap[], gateResult: { summary: string; url?: string } = { summary: "opened PR", url: "https://pr/1" }) {
   const dir = mkdtempSync(join(tmpdir(), "anvil-loop-"));
   const store = new LoopStore(dir);
   let clock = Date.parse("2026-08-11T00:00:00.000Z");
@@ -244,6 +244,34 @@ test("gate open is idempotent under concurrent verbs (no double-ship)", async ()
     expect(store.get(loop.id)!.cleanGatedLaps).toBe(1); // no double autonomy credit
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a gate action that throws grants NO autonomy credit and leaves the run at-gate", async () => {
+  const loop = makeLoop();
+  const h = harness([{ diffFiles: ["src/upload/a.ts"], command: { exit: 0 } }], { summary: "n/a" });
+  // Override openGateAction to throw (simulates the lost-worktree restart case).
+  // Rebuild the engine with a throwing gate action over the same store.
+  const dir = mkdtempSync(join(tmpdir(), "anvil-loop-"));
+  const store = new LoopStore(dir);
+  let clock = Date.parse("2026-08-11T00:00:00.000Z");
+  const engine = new LoopEngine({
+    store, now: () => new Date(clock), genRunId: () => "run_g",
+    runLap: async () => { clock += 1000; return { diffFiles: ["src/upload/a.ts"], summary: "lap", tokens: 100, transcript: "x", cwd: dir }; },
+    judge: async () => ({ met: true }), runCommand: async () => ({ exit: 0, output: "" }),
+    openGateAction: async () => { throw new Error("worktree is gone"); },
+    onRun: () => {},
+  });
+  try {
+    store.save(loop);
+    const run = await engine.run(loop, { kind: "manual" });
+    expect(run.status).toBe("at-gate");
+    await expect(engine.openGate(loop.id, run.id)).rejects.toThrow(/worktree is gone/);
+    expect(store.runById(loop.id, run.id)?.status).toBe("at-gate"); // still at-gate, not shipped
+    expect(store.get(loop.id)!.cleanGatedLaps).toBe(0); // no unearned credit
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    h.cleanup();
   }
 });
 

@@ -10,7 +10,7 @@ import { dismissOverlay, loopFromHash, openOverlay, overlayOpen } from "./overla
 import { newCid } from "./outbox";
 import { HUB_URL, envServer, loopEntityServer, loopRuns, orderedServers, serverByUrl, serverLoopEntities, serverLoops, serverSupports, servers, type Server } from "./fleet";
 import { openPlanDeepLink } from "./autopilot";
-import { actLabel, checkLabelShort, circuitSvg, entityStatus, loopEntityToCircuit, loopToCircuit, miniSvg, RUNGS, rung, triggerLabel } from "./circuit";
+import { actLabel, checkLabelShort, circuitSvg, entityStatus, loopEntityToCircuit, loopToCircuit, miniSvg, promotionSuggestion, RUNGS, rung, shipUnlocked, triggerLabel } from "./circuit";
 import { stripeColor } from "./sessionColor";
 import { currentTheme } from "./theme";
 import { initIntake, openIntake } from "./loops-intake";
@@ -283,7 +283,13 @@ function renderEntityDetail(): void {
         <div class="cap"><b>No progress → stop</b><div class="lc-bar"><i style="width:0%"></i></div><span>${hs.noProgressLaps} identical laps halts it</span></div>
       </div></div>
     <div class="lc-card"><h3>Autonomy — where your gate sits</h3>
-      <div class="lc-ladder">${RUNGS.map((x) => `<button data-rung="${x.k}" class="${loop.rung === x.k ? "on" : ""}"${x.k === "ship" ? " disabled title=\"Ship unlocks after earned autonomy (Phase 5)\"" : loop.status === "armed" ? " disabled title=\"Pause to change the gate\"" : ""}><b>${x.name}</b>${esc(x.desc.split(".")[0]!)}</button>`).join("")}</div>
+      <div class="lc-ladder">${RUNGS.map((x) => {
+        const shipLocked = x.k === "ship" && !shipUnlocked(loop);
+        const disabled = shipLocked || loop.status === "armed";
+        const title = shipLocked ? "Ship unlocks after 3 clean gated laps" : loop.status === "armed" ? "Pause to change the gate" : "";
+        return `<button data-rung="${x.k}" class="${loop.rung === x.k ? "on" : ""}"${disabled ? ` disabled title="${esc(title)}"` : ""}><b>${x.name}</b>${esc(x.desc.split(".")[0]!)}</button>`;
+      }).join("")}</div>
+      ${promoteBannerHtml(loop)}
       <p class="lc-ladder-note">${icon("trending_up")} Loops <b>earn</b> autonomy: after 3 clean gated laps, Claude suggests moving the gate right. ${loop.cleanGatedLaps ? `(${loop.cleanGatedLaps} clean so far)` : ""}</p></div>
     ${assumptions}
     <div class="lc-card"><h3>Lap history</h3><div class="lc-laps">${runsHtml || `<p class="small muted">No laps yet — Run now to start.</p>`}</div></div>`;
@@ -295,12 +301,33 @@ function renderEntityDetail(): void {
   document.getElementById("lc-delete")?.addEventListener("click", () => void deleteLoop(loop));
   document.getElementById("lc-open")?.addEventListener("click", () => void openGate(loop.id, run!.id));
   document.getElementById("lc-sendback")?.addEventListener("click", () => void sendBack(loop.id, run!.id));
-  app.querySelectorAll<HTMLElement>("[data-rung]").forEach((b) =>
+  app.querySelectorAll<HTMLElement>(".lc-ladder [data-rung]").forEach((b) =>
     b.addEventListener("click", () => {
       if ((b as HTMLButtonElement).disabled) return;
       void setRung(loop, b.dataset.rung as Loop["rung"]);
     }),
   );
+  document.getElementById("lc-promote-accept")?.addEventListener("click", () => void promoteRung(loop, (document.getElementById("lc-promote-accept") as HTMLElement).dataset.rung as Loop["rung"]));
+}
+
+/** Accept a promotion suggestion: pause if armed, move the gate one rung, re-arm — an explicit user tap. */
+async function promoteRung(loop: Loop, next: Loop["rung"]): Promise<void> {
+  const wasArmed = loop.status === "armed";
+  if (wasArmed && !(await loopSend(loop.id, { type: "loop.pause", loopId: loop.id }))) return;
+  const input = loopToInput(loop);
+  input.rung = next;
+  if (!(await loopSend(loop.id, { type: "loop.save", loop: input }))) return;
+  if (wasArmed) await loopSend(loop.id, { type: "loop.arm", loopId: loop.id });
+  toast(`Gate moved to ${rung(next).name}`);
+}
+
+/** The earned-autonomy promotion suggestion banner (never silent; only an explicit tap changes the rung). */
+function promoteBannerHtml(loop: Loop): string {
+  const next = promotionSuggestion(loop);
+  if (!next) return "";
+  return `<div class="lc-promote" id="lc-promote">${icon("trending_up")}
+    <span><b>Earned it.</b> ${loop.cleanGatedLaps} clean gated laps — move the gate to <b>${esc(rung(next).name)}</b>?</span>
+    <button class="mini" id="lc-promote-accept" data-rung="${next}">${icon("check")} Move gate</button></div>`;
 }
 
 function lapRowHtml(lap: LoopRun["laps"][number], run: LoopRun): string {

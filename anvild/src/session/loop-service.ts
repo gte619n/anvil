@@ -16,7 +16,7 @@ import { createWorktree, removeWorktree } from "./worktree";
 import { runAgentQuery } from "../agent/query";
 import { judgeGoal } from "../agent/goal";
 import { sdkModelId } from "../agent/models";
-import { commit as gitCommit, push as gitPush, createPr as gitCreatePr } from "../git/ops";
+import { commit as gitCommit, push as gitPush, createPr as gitCreatePr, mergePr as gitMergePr } from "../git/ops";
 import { LoopStore } from "../loops/store";
 import { LoopEngine, type LapExecution, type LoopEngineDeps } from "../loops/engine";
 import { completeLoop, chainCycleReason, chainedTargets, eventTargets } from "../loops/contract";
@@ -76,6 +76,8 @@ export interface LoopServiceDeps {
   onCatalogChange?: () => void;
   /** Run the Todoist-intake autopilot (the re-homed nightly) — returns a one-line summary + draft count. */
   autopilotRun?: () => Promise<{ created: number; summary: string }>;
+  /** Run the autonomous dev pipeline for a `pipeline`-body loop in its worktree; returns a summary. */
+  runPipeline?: (loop: Loop, cwd: string) => Promise<string>;
 }
 
 const LOOP_SCHEDULE_WINDOW_MS = 10 * 60_000; // edge-trigger window (matches the autopilot scheduler)
@@ -97,6 +99,31 @@ export class LoopService {
     mkdirSync(deps.stateDir, { recursive: true });
     this.store = new LoopStore(deps.stateDir);
     this.engine = new LoopEngine(this.engineDeps());
+    this.recoverInterruptedRuns();
+  }
+
+  /**
+   * Durability (loops-circuit spec §7): a daemon that died mid-lap left its run persisted as `running`
+   * (or `sent-back`). On boot, mark every such run `interrupted` so no run is ever latched `running`
+   * after a restart — the next trigger reruns it (Phase 5 in-lap `--resume` reattach is a later refinement;
+   * the checkpoint is preserved on the run for that). Mirrors the autopilot time-bounded-run guarantee.
+   */
+  private recoverInterruptedRuns(): void {
+    for (const loop of this.store.list()) {
+      for (const run of this.store.runs(loop.id)) {
+        // running/sent-back are mid-flight; an at-gate run of a branch/PR/ship loop can no longer ship
+        // (its in-memory worktree is gone after the restart), so it too must not stay openable — mark it
+        // interrupted rather than let the gate false-ship + bank unearned autonomy credit. A Suggest-rung
+        // at-gate run needs no worktree (report only), so it stays resumable.
+        const staleGate = run.status === "at-gate" && loop.rung !== "suggest";
+        if (run.status === "running" || run.status === "sent-back" || staleGate) {
+          run.status = "interrupted";
+          run.reason = "daemon restarted mid-run — marked interrupted (no side effects were shipped)";
+          run.endedAt = now();
+          this.store.putRun(run);
+        }
+      }
+    }
   }
 
   // ── Engine ports bound to the real machinery ──────────────────────────────────────────────────────
@@ -108,6 +135,10 @@ export class LoopService {
       runLap: (a) => this.runLap(a.loop, a.run, a.feedback, a.note),
       judge: (condition, transcript) => judgeGoal(condition, transcript, this.deps.judgeEnv()).then((v) => ({ met: v.met, ...(v.reason ? { reason: v.reason } : {}) })),
       runCommand: (command, cwd) => this.shellExit(command, cwd),
+      httpGet: async (url) => {
+        const r = await fetch(url, { redirect: "manual" });
+        return { status: r.status };
+      },
       openGateAction: (loop, run) => this.openGateAction(loop, run),
       onRun: (run) => this.broadcastRun(run),
       notify: (loop, run, kind) => this.notifyGate(loop, run, kind),
@@ -139,8 +170,14 @@ export class LoopService {
       const tokens = Math.ceil((prompt.length + res.text.length) / 4);
       return { diffFiles, summary: firstLine(res.text) || "worked a lap", tokens, transcript: res.text, cwd: wt.cwd };
     }
-    // autopilot / pipeline bodies are Phase 4/5.
-    throw new BadCommand(`act body "${loop.act.kind}" is not runnable yet`);
+    if (loop.act.kind === "pipeline") {
+      const wt = await this.ensureWorktree(loop, run);
+      const summary = this.deps.runPipeline ? await this.deps.runPipeline(loop, wt.cwd) : "pipeline body not configured on this daemon";
+      const diffFiles = await this.diffFiles(wt.cwd);
+      return { diffFiles, summary, tokens: 0, transcript: summary, cwd: wt.cwd };
+    }
+    // autopilot bodies never reach here — startRun routes them to runAutopilotLoop.
+    throw new BadCommand(`act body "${loop.act.kind}" is not runnable here`);
   }
 
   private modelSpec(model?: Model): { id: "claude"; profile: "claude"; sdkModel: string; label: string } {
@@ -178,21 +215,29 @@ export class LoopService {
     return { exit: code, output: `${out}${err}`.trim() };
   }
 
-  /** Ship per rung at the gate. Suggest: report only. Draft: commit+push branch. PR/Ship: +open a PR. */
+  /** Ship per rung at the gate. Suggest: report only. Draft: commit+push branch. PR: +open a PR. Ship:
+   *  +merge. A non-Suggest rung whose worktree was lost (daemon restarted at the gate) REFUSES rather than
+   *  silently reporting a fake success (which would also grant unearned autonomy credit). */
   private async openGateAction(loop: Loop, run: LoopRun): Promise<{ summary: string; url?: string }> {
     const wt = this.worktrees.get(run.id);
-    if (loop.rung === "suggest" || !wt) return { summary: "Report published (Suggest rung — no branch)" };
+    if (loop.rung === "suggest") return { summary: "Report published (Suggest rung — no branch)" };
+    if (!wt) throw new BadCommand("this run's worktree is gone (the daemon restarted at the gate) — re-run the loop");
     const msg = `${loop.name} (loop ${loop.id}, run ${run.id})`;
     gitCommit(wt.cwd, msg); // no-op if nothing to commit
     if (loop.rung === "draft") {
       const p = gitPush(wt.cwd, wt.branch);
       return { summary: p.ok ? `Pushed branch ${wt.branch}` : `Push failed: ${lastLine(p.output)}` };
     }
-    // pr / ship
+    // pr / ship both open a verified PR; ship additionally auto-merges (earned autonomy, no human merge).
     const push = gitPush(wt.cwd, wt.branch);
     if (!push.ok) return { summary: `Push failed: ${lastLine(push.output)}` };
     const pr = gitCreatePr(wt.cwd, loop.name, `Automated by loop ${loop.id}. Assumptions:\n${loop.assumptions.map((a) => `- ${a}`).join("\n") || "(none)"}`);
-    return { summary: pr.ok ? "Opened PR" : `PR failed: ${lastLine(pr.output)}`, ...(pr.url ? { url: pr.url } : {}) };
+    if (!pr.ok) return { summary: `PR failed: ${lastLine(pr.output)}` };
+    if (loop.rung === "ship") {
+      const merged = gitMergePr(wt.cwd, "squash", wt.branch);
+      return { summary: merged.ok ? "Merged (Ship rung)" : `PR opened; merge failed: ${lastLine(merged.output)}`, ...(pr.url ? { url: pr.url } : {}) };
+    }
+    return { summary: "Opened PR", ...(pr.url ? { url: pr.url } : {}) };
   }
 
   private notifyGate(loop: Loop, run: LoopRun, kind: "gate" | "failure" | "success"): void {

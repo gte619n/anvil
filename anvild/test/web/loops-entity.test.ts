@@ -113,6 +113,32 @@ test("Send back a lap opens a note dialog and routes loop.gate.sendback", async 
   expect(cmd?.runId).toBe("run_1");
 });
 
+test("earned autonomy: after 3 clean gated laps the detail suggests moving the gate + unlocks Ship", () => {
+  const earned: Loop = { ...loop, status: "paused", rung: "pr", cleanGatedLaps: 3 };
+  fleet.serverLoopEntities.set(fleet.HUB_URL, [earned]);
+  fleet.loopRuns.set("loop_1", []);
+  loops.openLoops();
+  (document.querySelector("#loops-root .lc-row[data-entity='1']") as HTMLElement).click();
+  const html = document.querySelector("#loops-root")!.innerHTML;
+  expect(html).toContain("lc-promote"); // the promotion suggestion banner
+  expect(html).toMatch(/move the gate/i);
+  // Ship rung is no longer disabled (earned). The promote-accept button targets 'ship'.
+  const ship = [...document.querySelectorAll<HTMLButtonElement>(".lc-ladder [data-rung]")].find((b) => b.dataset.rung === "ship")!;
+  expect(ship.disabled).toBe(false);
+  expect((document.getElementById("lc-promote-accept") as HTMLElement).dataset.rung).toBe("ship");
+});
+
+test("not-yet-earned loop shows no promotion banner and Ship stays locked", () => {
+  const young: Loop = { ...loop, status: "paused", rung: "pr", cleanGatedLaps: 1 };
+  fleet.serverLoopEntities.set(fleet.HUB_URL, [young]);
+  fleet.loopRuns.set("loop_1", []);
+  loops.openLoops();
+  (document.querySelector("#loops-root .lc-row[data-entity='1']") as HTMLElement).click();
+  expect(document.querySelector("#loops-root")!.innerHTML).not.toContain("lc-promote");
+  const ship = [...document.querySelectorAll<HTMLButtonElement>(".lc-ladder [data-rung]")].find((b) => b.dataset.rung === "ship")!;
+  expect(ship.disabled).toBe(true);
+});
+
 test("live loop.run updates the cache and re-renders the open detail", () => {
   fleet.serverLoopEntities.set(fleet.HUB_URL, [loop]);
   fleet.loopRuns.set("loop_1", [{ ...gateRun, status: "running", laps: [gateRun.laps[0]!] }]);

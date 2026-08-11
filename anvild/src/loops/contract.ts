@@ -9,7 +9,26 @@
  * is rejected on user-created loops.
  */
 import { BadCommand } from "../session/errors";
-import type { Loop, LoopAct, LoopCheck, LoopInput, LoopState } from "@protocol";
+import type { Loop, LoopAct, LoopCheck, LoopInput, LoopRung, LoopState } from "@protocol";
+
+export const PROMOTION_THRESHOLD = 3; // consecutive clean gated laps before Claude suggests the next rung
+const RUNG_ORDER: LoopRung[] = ["suggest", "draft", "pr", "ship"];
+
+/**
+ * Earned autonomy (loops-circuit spec §5, Phase 5): after PROMOTION_THRESHOLD clean human-approved gates,
+ * suggest moving the gate one rung to the right. Never silent, never automatic — the caller surfaces this
+ * as a *suggestion* and only an explicit user tap changes `rung`. Returns the suggested next rung, or null.
+ */
+export function promotionSuggestion(loop: Pick<Loop, "rung" | "cleanGatedLaps">): LoopRung | null {
+  const i = RUNG_ORDER.indexOf(loop.rung);
+  if (i < 0 || i >= RUNG_ORDER.length - 1) return null; // already at Ship
+  return loop.cleanGatedLaps >= PROMOTION_THRESHOLD ? RUNG_ORDER[i + 1]! : null;
+}
+
+/** Whether the `ship` rung is unlocked for this loop (earned via promotion from `pr`). */
+export function shipUnlocked(loop: Pick<Loop, "rung" | "cleanGatedLaps">): boolean {
+  return loop.rung === "ship" || (loop.rung === "pr" && loop.cleanGatedLaps >= PROMOTION_THRESHOLD);
+}
 
 export const DEFAULT_MAX_LAPS = 10;
 export const DEFAULT_NO_PROGRESS_LAPS = 2;
@@ -70,6 +89,11 @@ export function completeLoop(input: LoopInput, opts: CompleteOpts): CompleteResu
     if (c.kind === "metric" && isBlank(c.command)) throw new BadCommand("a metric check needs a command");
     if (c.kind === "http" && isBlank(c.url)) throw new BadCommand("an http check needs a url");
   }
+
+  // Earned autonomy: the Ship rung (auto-merge) can't be requested until a loop has earned it (3 clean
+  // gated laps). A loop already promoted to Ship keeps it across edits.
+  if (input.rung === "ship" && opts.existing?.rung !== "ship" && (opts.existing?.cleanGatedLaps ?? 0) < PROMOTION_THRESHOLD)
+    throw new BadCommand("the Ship rung is earned — it unlocks after 3 clean gated laps");
 
   const warnings: string[] = [];
   if (checks.length === 0) warnings.push("This loop has no checks — it can't prove it's done, so a lap always parks at the gate.");

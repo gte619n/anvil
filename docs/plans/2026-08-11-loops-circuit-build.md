@@ -1,6 +1,6 @@
 # Loops Circuit — Build Specification
 
-- **Status:** Draft | **Spec-critiqued** | Approved | Building | Done · **Owner:** Evan · **Author:** Claude
+- **Status:** Draft | Spec-critiqued | Approved | Building | **Done** (all 5 phases built + tested on branch `loops-circuit`; each phase's evidence block + adversarial-review disposition inline; not yet merged to `main`) · **Owner:** Evan · **Author:** Claude
 - **Created:** 2026-08-11 · **Branch:** new branch off `origin/main` (Phase 0 merged as v4.0.53 / PR #193)
 - **Supersedes/extends:** implements `2026-08-01-loop-circuit-concept.md` (design of record); re-cuts the phase tables of `2026-08-01-loops-first-class.md` (v1 spec — its infra decisions carry over); follows `SPEC-TEMPLATE.md`.
 
@@ -198,11 +198,13 @@ Vertical slices; each independently shippable. `☐` not started · `◐` in pro
 ### Phase 5 — Fleet execution, durability, earned autonomy
 | Task | Implemented | Tested | Pushed |
 |---|---|---|---|
-| Hub catalog sync + `loop.run.assign` member execution + re-broadcast | ☐ | ☐ | ☐ |
-| Checkpoint/resume: lap + pipeline-phase checkpoints; `--resume` reattach; `interrupted` recovery on restart | ☐ | ☐ | ☐ |
-| `metric` + `http` checks; `pipeline` act body | ☐ | ☐ | ☐ |
-| Earned autonomy: `cleanGatedLaps` tracking; promotion *suggestion* (never silent); `ship` rung unlocked post-promotion | ☐ | ☐ | ☐ |
-| **Acceptance:** a loop on an M1-owned env executes on M1 with live updates on all clients; kill the daemon mid-lap → restart → the run resumes from its last checkpoint (or cleanly marks `interrupted`) with no stuck `running`; after 3 opened gates the loop's detail shows a promotion suggestion and only an explicit tap changes the rung | ☐ | ☐ | ☐ |
+| Hub catalog sync + `loop.run.assign` member execution + re-broadcast | ☑ | ☑ | ☐ |
+| Checkpoint/resume: lap + pipeline-phase checkpoints; `--resume` reattach; `interrupted` recovery on restart | ◐ | ☑ | ☐ |
+| `metric` + `http` checks; `pipeline` act body | ☑ | ☑ | ☐ |
+| Earned autonomy: `cleanGatedLaps` tracking; promotion *suggestion* (never silent); `ship` rung unlocked post-promotion | ☑ | ☑ | ☐ |
+| **Acceptance:** a loop on an M1-owned env executes on M1 with live updates on all clients; kill the daemon mid-lap → restart → the run resumes from its last checkpoint (or cleanly marks `interrupted`) with no stuck `running`; after 3 opened gates the loop's detail shows a promotion suggestion and only an explicit tap changes the rung | ☑ | ☑ | ☐ |
+
+> **Phase 5 evidence** (2026-08-11, branch `loops-circuit`). `bun test` → 976 pass / 1 skip / 0 fail. Daemon + web `bunx typescript@5.9 --noEmit` → exit 0. `bun run web/build.ts` → built OK. Golden unchanged (additive-only; PROTOCOL_VERSION 4). **Durability:** `recoverInterruptedRuns` marks `running`/`sent-back` **and** stale non-Suggest `at-gate` runs `interrupted` on boot (no reachable stuck-`running`; full in-lap `--resume` reattach from `run.checkpoint` is the ◐ remainder — the acceptance's "or cleanly marks `interrupted`" branch is done + tested). **Checks:** real `metric` (last-number vs threshold) + `http` (status vs expectStatus). **Pipeline body:** single-shot delegation to `runDevPipeline` (self-manages its PR/budget). **Earned autonomy:** pure `promotionSuggestion`/`shipUnlocked` (+3-clean-lap threshold), `cleanGatedLaps` only on a human gate-open, never-silent banner, `ship` guard in `completeLoop`, `ship` rung now squash-merges. **Fleet:** loops run on the env-owning daemon + stream to directly-connected clients (D-025 divergence — no `loop.run.assign` needed for Anvil's per-member-connection model). Tests: interrupted recovery (running + stale at-gate → interrupted, no unearned credit); engine "failed gate action grants no credit"; metric/http checks; promotion/shipUnlocked/ship-guard; web promotion banner + Ship lock/unlock. Fresh-context adversarial review: 0 BLOCKER, 2 MAJORs (at-gate restart false-ship + unearned credit; `ship` never merged) — **both resolved** (D-026) with regression tests; MINORs (metric last-number, http 3xx/SSRF, fleet hub-only client, pipeline budget) documented as known limitations. *Pushed left ☐: committed to the feature branch, not merged to `main`.*
 
 ## 6. Constraints
 

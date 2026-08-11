@@ -26,6 +26,18 @@ export const RUNGS: { k: LoopRung; name: string; gate: string; desc: string }[] 
 ];
 export const rung = (k: LoopRung): (typeof RUNGS)[number] => RUNGS.find((r) => r.k === k) ?? RUNGS[2]!;
 
+export const PROMOTION_THRESHOLD = 3;
+const RUNG_ORDER: LoopRung[] = ["suggest", "draft", "pr", "ship"];
+/** Earned autonomy: the next rung to suggest after 3 clean gated laps, or null. Mirrors the daemon. */
+export function promotionSuggestion(loop: { rung: LoopRung; cleanGatedLaps: number }): LoopRung | null {
+  const i = RUNG_ORDER.indexOf(loop.rung);
+  if (i < 0 || i >= RUNG_ORDER.length - 1) return null;
+  return loop.cleanGatedLaps >= PROMOTION_THRESHOLD ? RUNG_ORDER[i + 1]! : null;
+}
+export function shipUnlocked(loop: { rung: LoopRung; cleanGatedLaps: number }): boolean {
+  return loop.rung === "ship" || (loop.rung === "pr" && loop.cleanGatedLaps >= PROMOTION_THRESHOLD);
+}
+
 // stations: trigger(70) act(240) check(410) ship(640); gate diamond between check→ship
 const ST: Record<LoopStation | "gate" | "ret", { x: number; y: number }> = {
   trigger: { x: 70, y: 74 },

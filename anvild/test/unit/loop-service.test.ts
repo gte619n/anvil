@@ -5,6 +5,7 @@
  */
 import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+// (writeFileSync is used by the durability test to plant a `running` run before the second boot.)
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -127,6 +128,44 @@ test("the daily digest fires once per day (after 09:00) when a loop opts in, and
     expect(h.notes.filter((n) => n.tag === "loops-digest").length).toBe(1);
   } finally {
     h.cleanup();
+  }
+});
+
+test("durability: a run left `running` after a crash is recovered as `interrupted` on the next boot", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "anvil-loopsvc-"));
+  const repo = mkdtempSync(join(tmpdir(), "anvil-loopsvc-repo-"));
+  spawnSync("git", ["init", "-q"], { cwd: repo });
+  const envStore = new EnvironmentStore(stateDir);
+  const env = envStore.add("proj", repo);
+  const registry = { toAll: () => {} } as unknown as ConnectionRegistry;
+  const mk = () => new LoopService({ registry, stateDir, envStore, worktreeRoot: () => join(stateDir, "worktrees"), judgeEnv: () => ({}) });
+  try {
+    // First daemon: create a loop and hand-write a `running` run (simulating a crash mid-lap).
+    const svc1 = mk();
+    const loop = svc1.save({ name: "L", environmentId: env.id, trigger: { kind: "manual" }, act: { kind: "session-prompt", prompt: "x" }, checks: [] }).loop;
+    // The store is private; write the run file directly under the loops runs dir.
+    const runsDir = join(stateDir, "loops", "runs");
+    const run = { id: "run_x", loopId: loop.id, configRevision: 1, trigger: { kind: "manual", at: "t" }, status: "running", laps: [{ n: 1, summary: "mid-lap", verdicts: [], at: "t" }], startedAt: "t" };
+    writeFileSync(join(runsDir, `${loop.id}.jsonl`), JSON.stringify(run) + "\n");
+    // Also plant an at-gate run for a PR-rung loop (its in-memory worktree is lost on restart, so it
+    // must NOT stay openable — else the gate would false-ship + bank unearned autonomy credit).
+    const prLoop = svc1.save({ name: "PR", environmentId: env.id, trigger: { kind: "manual" }, act: { kind: "session-prompt", prompt: "x" }, checks: [], rung: "pr" }).loop;
+    const gate = { id: "run_g", loopId: prLoop.id, configRevision: 1, trigger: { kind: "manual", at: "t" }, status: "at-gate", laps: [{ n: 1, summary: "passed", verdicts: [{ check: "c", v: "pass" }], at: "t" }], startedAt: "t" };
+    writeFileSync(join(runsDir, `${prLoop.id}.jsonl`), JSON.stringify(gate) + "\n");
+    // Second daemon boot over the same stateDir → recovery marks the running run interrupted, never latched.
+    const svc2 = mk();
+    const recovered = svc2.runsEvent(loop.id).runs.find((r) => r.id === "run_x");
+    expect(recovered?.status).toBe("interrupted");
+    expect(recovered?.reason).toMatch(/restart/i);
+    // No run remains `running`.
+    expect(svc2.runsEvent(loop.id).runs.some((r) => r.status === "running")).toBe(false);
+    // The stale at-gate PR run is recovered too (worktree gone → can't ship).
+    expect(svc2.runsEvent(prLoop.id).runs.find((r) => r.id === "run_g")?.status).toBe("interrupted");
+    // Its loop earned NO autonomy credit from the phantom gate.
+    expect(svc2.list().loops.find((l) => l.id === prLoop.id)?.cleanGatedLaps).toBe(0);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
   }
 });
 

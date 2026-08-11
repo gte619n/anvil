@@ -35,8 +35,25 @@ test("a throwing/timed-out check yields check-error (never throws)", async () =>
   expect(r.detail).toContain("unreachable");
 });
 
-test("metric/http checks are Phase-5 stubs (check-error)", async () => {
-  expect((await runCheck({ kind: "metric", command: "cov", op: "gte", threshold: 80 }, ctx())).v).toBe("check-error");
+test("metric check: reads the last number from output and compares against the threshold", async () => {
+  const cov = (n: number): CheckContext => ctx({ runCommand: async () => ({ exit: 0, output: `coverage: ${n}%` }) });
+  expect((await runCheck({ kind: "metric", command: "cov", op: "gte", threshold: 80 }, cov(85))).v).toBe("pass");
+  const fail = await runCheck({ kind: "metric", command: "cov", op: "gte", threshold: 80 }, cov(70));
+  expect(fail.v).toBe("fail");
+  expect(fail.detail).toContain("70");
+  expect((await runCheck({ kind: "metric", command: "n", op: "lte", threshold: 5 }, ctx({ runCommand: async () => ({ exit: 0, output: "3" }) }))).v).toBe("pass");
+  // No number in output → check-error (not a silent pass).
+  expect((await runCheck({ kind: "metric", command: "n", op: "eq", threshold: 1 }, ctx({ runCommand: async () => ({ exit: 0, output: "no digits here" }) }))).v).toBe("check-error");
+});
+
+test("http check: compares the status to expectStatus; needs a fetch capability", async () => {
+  const get = (status: number): CheckContext => ctx({ httpGet: async () => ({ status }) });
+  expect((await runCheck({ kind: "http", url: "http://x" }, get(200))).v).toBe("pass");
+  expect((await runCheck({ kind: "http", url: "http://x", expectStatus: 204 }, get(204))).v).toBe("pass");
+  const fail = await runCheck({ kind: "http", url: "http://x" }, get(500));
+  expect(fail.v).toBe("fail");
+  expect(fail.detail).toContain("500");
+  // No fetch capability → check-error.
   expect((await runCheck({ kind: "http", url: "http://x" }, ctx())).v).toBe("check-error");
 });
 

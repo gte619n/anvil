@@ -33,6 +33,8 @@ export interface LoopEngineDeps {
   judge: (condition: string, transcript: string) => Promise<{ met: boolean; reason?: string }>;
   /** Run a check command in the run's worktree. */
   runCommand: (command: string, cwd: string) => Promise<{ exit: number; output: string }>;
+  /** GET a URL for http checks (returns the status). Optional — absent ⇒ http checks check-error. */
+  httpGet?: (url: string) => Promise<{ status: number }>;
   /** Ship at the gate per rung (Suggest report / Draft branch / PR PR). Returns a summary + optional url. */
   openGateAction: (loop: Loop, run: LoopRun) => Promise<{ summary: string; url?: string }>;
   /** Live run/lap broadcast. */
@@ -158,7 +160,7 @@ export class LoopEngine {
     if (scope.verdict !== "ok") {
       lap = { n, summary: exec.summary, verdicts: [{ check: "scope", v: scope.verdict, detail: scope.offending.join(", ") }], tokens: exec.tokens, at };
     } else {
-      const ctx: CheckContext = { judge: this.deps.judge, runCommand: this.deps.runCommand, transcript: exec.transcript, cwd: exec.cwd };
+      const ctx: CheckContext = { judge: this.deps.judge, runCommand: this.deps.runCommand, ...(this.deps.httpGet ? { httpGet: this.deps.httpGet } : {}), transcript: exec.transcript, cwd: exec.cwd };
       const results = await runChecks(loop.checks, ctx);
       lap = { n, summary: exec.summary, verdicts: results, tokens: exec.tokens, at };
     }
