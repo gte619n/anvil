@@ -1737,6 +1737,9 @@ export class Supervisor {
     // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
     // the reviewer to answer them first, in a "Plan with Claude" session, before it can start.
     if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before starting");
+    // Server-side propose-don't-run: the web hides Start for proposals, but the gate must hold for ANY
+    // client — an unapproved event-triggered unit never builds without an explicit approve.
+    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
     const brief = this.autopilotBrief(u);
@@ -1773,10 +1776,12 @@ export class Supervisor {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
+    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     const session = this.sessions.get(sessionId);
     if (!session) throw new BadCommand("no such session");
     if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
-    this.workUnits.update(u.id, { sessionId, status: "building" });
+    // A human deliberately linking the plan to live work clears any auto-start hold (mirrors startPlan).
+    this.workUnits.update(u.id, { sessionId, status: "building", hold: undefined });
     void this.tagTasks(u, "building");
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
@@ -2063,6 +2068,7 @@ export class Supervisor {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before running the pipeline");
+    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the work unit's environment no longer exists");
     if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
@@ -2090,6 +2096,9 @@ export class Supervisor {
       this.workUnits.update(u.id, {
         devPipeline: { status: outcome.status, phaseReached: outcome.phaseReached, ...(outcome.reason ? { reason: outcome.reason } : {}), trace: outcome.trace },
         status: mapped.status,
+        // The pipeline was deliberately run on this unit — drop any pre-run auto-start hold so the
+        // review/blocked card shows the pipeline verdict, not a stale "Held — adversarial…" banner.
+        hold: undefined,
         ...(mapped.prUrl ? { prUrl: mapped.prUrl } : {}),
         ...(mapped.blockedReason ? { blockedReason: mapped.blockedReason } : {}),
       });
@@ -3163,6 +3172,10 @@ export class Supervisor {
     this.persist();
     this.broadcastUpdated(s.data);
     this.broadcastLoops(); // a goal resolving removes its loop row
+    // The card's display-only goalCondition mirrors the session goal — clear it so a unit that later
+    // returns to the grid (review/blocked) doesn't advertise a stop-condition that already resolved.
+    const unit = this.workUnits.list().find((u) => u.sessionId === id && u.goalCondition);
+    if (unit) this.workUnits.update(unit.id, { goalCondition: undefined });
     // This push IS the turn's notification — swallow the ordinary "your turn" that the `result`
     // arriving moments later would otherwise fire (the goal is already cleared by then).
     this.goalPushSuppressed.add(id);
