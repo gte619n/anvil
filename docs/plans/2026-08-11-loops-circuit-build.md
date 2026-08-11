@@ -187,11 +187,13 @@ Vertical slices; each independently shippable. `☐` not started · `◐` in pro
 ### Phase 4 — Triggers, migration flip, notifications
 | Task | Implemented | Tested | Pushed |
 |---|---|---|---|
-| Schedule + event + chained triggers per loop (edge-triggered; event routing via existing intake; chain cycle-check at save) | ☐ | ☐ | ☐ |
-| Autopilot nightly re-homed as the **Todoist-intake loop** (act: `autopilot`); schedule card/flags absorbed | ☐ | ☐ | ☐ |
-| Card grid retired; sidebar flips to **Loops**; `loops.snapshot` panel removed; `#autopilot` deep-links redirect | ☐ | ☐ | ☐ |
-| Notifications: at-gate, failure/auto-stop, success (opt-in), daily digest | ☐ | ☐ | ☐ |
-| **Acceptance (headline demo):** a schedule loop fires within its window → runs → check verdicts recorded → parks at gate → push notification received → gate opened from the notification's deep link; the sidebar shows only Loops; the nightly Todoist loop appears as row #1 and produces drafts at the gate | ☐ | ☐ | ☐ |
+| Schedule + event + chained triggers per loop (edge-triggered; event routing via existing intake; chain cycle-check at save) | ☑ | ☑ | ☐ |
+| Autopilot nightly re-homed as the **Todoist-intake loop** (act: `autopilot`); schedule card/flags absorbed | ☑ | ☑ | ☐ |
+| Card grid retired; sidebar flips to **Loops**; `loops.snapshot` panel removed; `#autopilot` deep-links redirect | ☑ | ☑ | ☐ |
+| Notifications: at-gate, failure/auto-stop, success (opt-in), daily digest | ☑ | ☑ | ☐ |
+| **Acceptance (headline demo):** a schedule loop fires within its window → runs → check verdicts recorded → parks at gate → push notification received → gate opened from the notification's deep link; the sidebar shows only Loops; the nightly Todoist loop appears as row #1 and produces drafts at the gate | ☑ | ☑ | ☐ |
+
+> **Phase 4 evidence** (2026-08-11, branch `loops-circuit`). `bun test` → 969 pass / 1 skip / 0 fail. Daemon + web `bunx typescript@5.9 --noEmit` → exit 0. `bun run web/build.ts` → built OK. Golden unchanged (no new wire types — trigger kinds already existed; `PushPayload.hash` is not a protocol type). New/changed: `loop-service.ts` scheduler (`tick`/`startScheduler`, edge-triggered), `fireChained`, `handleEvent`, `ensureAutopilotLoop`/`runAutopilotLoop`, daily digest; `contract.ts` pure `chainCycleReason`/`chainedTargets`/`eventTargets`; `supervisor.ts` wiring (startScheduler, `autopilotRun`, notify hash, `ingestTrigger`→`handleEvent`); notification deep-link (`PushPayload.hash` + `web/sw.js` + `web/src/push.ts`); migration flip (`index.html` sidebar, `main.ts` `#autopilot`→`#loops` redirect, `autopilot.ts` panel retired). Tests: scheduler fires the autopilot singleton edge-triggered (single-fire in window); chain cycle rejected at save; pure `chainedTargets`/`eventTargets`; daily digest once/day + deep-link; migration flip (sidebar + redirect + SW hash carry). Fresh-context adversarial review: 1 BLOCKER (SW dropped the notification `hash` → deep-link broken) + 2 MAJORs (event triggers unwired; digest absent) — **all resolved** (D-021) with regression tests. *Pushed left ☐: committed to the feature branch, not merged to `main`.*
 
 ### Phase 5 — Fleet execution, durability, earned autonomy
 | Task | Implemented | Tested | Pushed |

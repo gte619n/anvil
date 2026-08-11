@@ -89,7 +89,6 @@ import {
   onAutopilotProgress,
   onAutopilotRunSnapshot,
   onAutopilotSchedule,
-  openAutopilot,
   openPlanDeepLink,
   reflectAutopilotRunning,
   serverSchedule,
@@ -466,7 +465,8 @@ window.addEventListener("hashchange", () => {
     return;
   }
   if (autopilotFromHash()) {
-    if (!overlayOpen("autopilot")) openAutopilot(); // external #autopilot deep link → open the grid
+    // Phase 4 flip: #autopilot permanently redirects to the Loops home (drafts section), the new surface.
+    openLoopsDeepLink();
     return;
   }
   if (loopsFromHash()) {
@@ -1004,7 +1004,7 @@ void loadFleetMembers();
 // module eval, BEFORE this body runs. The microtask stays as the original timing (the view opens
 // after the rest of module init — e.g. the settings/menu wiring below — has finished).
 if (deepLinkedPlan) queueMicrotask(() => openPlanDeepLink(deepLinkedPlan));
-else if (deepLinkedAutopilot) queueMicrotask(() => openAutopilot()); // bare #autopilot deep link → open the grid
+else if (deepLinkedAutopilot) queueMicrotask(() => openLoopsDeepLink()); // Phase 4 flip: #autopilot → the Loops home
 else if (deepLinkedLoops) queueMicrotask(() => openLoopsDeepLink()); // #loops / #loops/<id> deep link → open the Loops home
 
 // A daemon with no Claude login can't run a single turn, so the session list would be a lie — take the
@@ -2093,6 +2093,7 @@ wirePanelOutsideDismiss();
 
 initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
-$("#open-autopilot").addEventListener("click", openAutopilot);
+// Phase 4 migration flip: the sidebar shows only Loops now. The Autopilot overlay stays reachable via a
+// draft's "Open the draft" (openPlanDeepLink) and Settings → Todoist; its sidebar entry is retired.
 $("#open-loops").addEventListener("click", openLoops);
 $("#new-session-top").addEventListener("click", () => showNewSession());

@@ -58,6 +58,8 @@ function entities(): Loop[] {
       out.push(l);
       loopEntityServer.set(l.id, s.url);
     }
+  // Pin the daemon-managed Todoist-intake singleton to the top (spec §5 headline: "appears as row #1").
+  out.sort((a, b) => (a.id === "loop_autopilot" ? -1 : b.id === "loop_autopilot" ? 1 : 0));
   return out;
 }
 function projected(): LoopSummary[] {

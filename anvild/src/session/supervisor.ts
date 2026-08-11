@@ -363,8 +363,17 @@ export class Supervisor {
       judgeEnv: () => this.agentEnv(),
       accounts: this.accounts,
       accountId: () => undefined,
-      notify: (title, body, tag) => this.pushSystemAlert(title, body, tag),
+      notify: (title, body, tag, hash) => {
+        const payload = { title, body, tag, ...(hash ? { hash } : {}) };
+        void this.webpush.notify(payload);
+        void this.fcm.notify(payload);
+        void this.apns.notify(payload);
+      },
       onCatalogChange: () => this.broadcastLoops(),
+      autopilotRun: async () => {
+        const r = await this.autopilot.runAutopilot({ notify: false, autoStart: false });
+        return { created: r.created, summary: `${r.created} new · ${r.skipped} already in pipeline` };
+      },
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
@@ -377,6 +386,7 @@ export class Supervisor {
     });
     this.restore();
     this.autopilot.startScheduler();
+    this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
     this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
@@ -742,8 +752,10 @@ export class Supervisor {
     if (!seed) throw new BadCommand(`no such work unit: ${workUnitId}`);
     return this.loops.convert(workUnitId, seed, cid);
   }
-  /** Ingest an external event as a proposed work unit (loop-engineering: Channels). */
+  /** Ingest an external event as a proposed work unit (loop-engineering: Channels). Also routes the event
+   *  to any armed `event`-triggered Loop subscribed to this kind (spec §4 Phase 4 event routing). */
   ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
+    this.loops.handleEvent(input.kind, input.source, input.dedupeKey);
     return this.autopilot.ingestTrigger(input);
   }
   /** Approve a proposed (event-triggered) unit — promote to planned and optionally start. */

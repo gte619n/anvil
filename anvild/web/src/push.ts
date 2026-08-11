@@ -51,6 +51,10 @@ export async function initPush(): Promise<void> {
   }
   navigator.serviceWorker.addEventListener("message", (e) => {
     if (e.data?.type === "open-session" && e.data.sessionId && sessions.has(e.data.sessionId)) selectSession(e.data.sessionId);
+    // A loop at-gate notification tap carries a "#loops/<id>" hash — drive it through the hash router.
+    else if (e.data?.type === "open-hash" && typeof e.data.hash === "string" && e.data.hash.startsWith("#")) {
+      location.hash = e.data.hash;
+    }
   });
   bell.addEventListener("click", () => void toggleNotify());
   void refreshBell();

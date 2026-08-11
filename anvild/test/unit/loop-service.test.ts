@@ -20,7 +20,10 @@ function harness() {
   const envStore = new EnvironmentStore(stateDir);
   const env = envStore.add("proj", repo);
   const events: string[] = [];
-  const registry = { toAll: (e: { type: string }) => events.push(e.type) } as unknown as ConnectionRegistry;
+  const runEvents: { type: string; run?: { loopId: string; status: string } }[] = [];
+  const registry = { toAll: (e: { type: string; run?: { loopId: string; status: string } }) => { events.push(e.type); if (e.type === "loop.run") runEvents.push(e); } } as unknown as ConnectionRegistry;
+  let autopilotCalls = 0;
+  const notes: { title: string; body: string; tag: string; hash?: string }[] = [];
   const svc = new LoopService({
     registry,
     stateDir,
@@ -28,8 +31,10 @@ function harness() {
     worktreeRoot: () => join(stateDir, "worktrees"),
     judgeEnv: () => ({}),
     onCatalogChange: () => {},
+    autopilotRun: async () => { autopilotCalls++; return { created: 3, summary: "3 new" }; },
+    notify: (title, body, tag, hash) => notes.push({ title, body, tag, ...(hash ? { hash } : {}) }),
   });
-  return { svc, env, events, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
+  return { svc, env, events, runEvents, notes, autopilotCalls: () => autopilotCalls, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
 }
 
 test("intakeSuggest is repo-aware: reads the env's test script and narrows by a keyword", () => {
@@ -75,6 +80,65 @@ test("loop.save honours a workUnitId (intake convert linkage); byWorkUnit finds 
     expect(ev.loop.workUnitId).toBe("wu42");
     // A second save of a new loop won't duplicate; the linked loop is discoverable.
     expect(h.svc.list().loops.find((l) => l.workUnitId === "wu42")).toBeTruthy();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the scheduler ensures a Todoist-intake singleton and fires it in its window (autopilot act)", async () => {
+  const h = harness();
+  try {
+    h.svc.startScheduler(); // creates loop_autopilot (schedule 02:00, act autopilot)
+    h.svc.stopScheduler(); // don't let the real interval fire during the test
+    const auto = h.svc.list().loops.find((l) => l.id === "loop_autopilot");
+    expect(auto).toBeTruthy();
+    expect(auto!.act.kind).toBe("autopilot");
+    // Fire the 02:00 window on an arbitrary day; the autopilot run executes and the run ships.
+    h.svc.tick(new Date("2026-08-11T02:05:00.000Z"));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.autopilotCalls()).toBe(1);
+    const run = h.svc.runsEvent("loop_autopilot").runs[0];
+    expect(run?.status).toBe("shipped");
+    expect(run?.reason).toContain("draft");
+    // Edge-triggered: ticking again inside the same window (already ran) does NOT re-fire.
+    h.svc.tick(new Date("2026-08-11T02:06:00.000Z"));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.autopilotCalls()).toBe(1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the daily digest fires once per day (after 09:00) when a loop opts in, and deep-links to #loops", () => {
+  const h = harness();
+  try {
+    h.svc.startScheduler(); // the autopilot singleton opts into dailyDigest
+    h.svc.stopScheduler();
+    // Before 09:00 → no digest.
+    h.svc.tick(new Date(2026, 7, 11, 8, 0, 0));
+    expect(h.notes.some((n) => n.tag === "loops-digest")).toBe(false);
+    // After 09:00 → one digest, deep-linking to #loops.
+    h.svc.tick(new Date(2026, 7, 11, 9, 30, 0));
+    const digest = h.notes.filter((n) => n.tag === "loops-digest");
+    expect(digest.length).toBe(1);
+    expect(digest[0]!.hash).toBe("#loops");
+    // Same day again → no second digest.
+    h.svc.tick(new Date(2026, 7, 11, 10, 0, 0));
+    expect(h.notes.filter((n) => n.tag === "loops-digest").length).toBe(1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("save rejects a chain cycle (a chained loop that reaches itself)", () => {
+  const h = harness();
+  try {
+    const a = h.svc.save({ name: "A", environmentId: h.env.id, trigger: { kind: "manual" }, act: { kind: "session-prompt", prompt: "x" }, checks: [] }).loop;
+    // B chained on A — fine.
+    const b = h.svc.save({ name: "B", environmentId: h.env.id, trigger: { kind: "chained", onLoopId: a.id, on: "success" }, act: { kind: "session-prompt", prompt: "x" }, checks: [] }).loop;
+    h.svc.pause(a.id);
+    // Now editing A to chain onto B would form A→B→A → rejected.
+    expect(() => h.svc.save({ id: a.id, name: "A", environmentId: h.env.id, trigger: { kind: "chained", onLoopId: b.id, on: "success" }, act: { kind: "session-prompt", prompt: "x" }, checks: [] })).toThrow(/loops back|cycle|can't save/i);
   } finally {
     h.cleanup();
   }

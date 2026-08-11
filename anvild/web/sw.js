@@ -87,7 +87,9 @@ self.addEventListener("push", (event) => {
         body,
         tag: data.sessionId || data.tag,
         renotify: true,
-        data: { sessionId: data.sessionId || null },
+        // Carry `hash` (e.g. "#loops/<id>") so a non-session notification (a loop at its gate) deep-links
+        // straight to its view on tap; without it the click fell through to the app root.
+        data: { sessionId: data.sessionId || null, hash: data.hash || null },
       });
     })(),
   );
@@ -111,17 +113,21 @@ self.addEventListener("message", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const sessionId = event.notification.data && event.notification.data.sessionId;
+  const data = event.notification.data || {};
+  const sessionId = data.sessionId;
+  // A `hash` (e.g. "#loops/<id>") deep-links a non-session notification (loop at-gate) straight to its view.
+  const hash = typeof data.hash === "string" ? data.hash : null;
   event.waitUntil(
     (async () => {
       const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const c of wins) {
         if ("focus" in c) {
-          c.postMessage({ type: "open-session", sessionId });
+          if (hash) c.postMessage({ type: "open-hash", hash });
+          else c.postMessage({ type: "open-session", sessionId });
           return c.focus();
         }
       }
-      return self.clients.openWindow(sessionId ? `/#s/${encodeURIComponent(sessionId)}` : "/");
+      return self.clients.openWindow(hash ? `/${hash}` : sessionId ? `/#s/${encodeURIComponent(sessionId)}` : "/");
     })(),
   );
 });

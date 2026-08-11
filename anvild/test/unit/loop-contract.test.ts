@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
-import { completeLoop, defaultTokenBudget, checkLocks, SESSION_TOKEN_BUDGET, PIPELINE_TOKEN_BUDGET, DEFAULT_MAX_LAPS, DEFAULT_NO_PROGRESS_LAPS } from "../../src/loops/contract";
-import type { LoopInput } from "../../protocol";
+import { completeLoop, defaultTokenBudget, checkLocks, chainCycleReason, chainedTargets, eventTargets, SESSION_TOKEN_BUDGET, PIPELINE_TOKEN_BUDGET, DEFAULT_MAX_LAPS, DEFAULT_NO_PROGRESS_LAPS } from "../../src/loops/contract";
+import type { Loop, LoopInput } from "../../protocol";
 
 const opts = { now: "2026-08-11T00:00:00.000Z", genId: () => "loop_1" };
 const base: LoopInput = {
@@ -60,6 +60,63 @@ test("update path preserves createdAt/cleanGatedLaps/workUnitId and bumps config
   expect(loop.configRevision).toBe(5); // bumped
   expect(loop.createdAt).toBe("2026-01-01T00:00:00.000Z");
   expect(loop.updatedAt).toBe("2026-08-12T00:00:00.000Z");
+});
+
+test("chainCycleReason: detects a self-loop and a longer cycle; passes an acyclic chain", () => {
+  const mk = (id: string, onLoopId?: string): Loop => ({
+    id, name: id, status: "armed",
+    trigger: onLoopId ? { kind: "chained", onLoopId, on: "success" } : { kind: "manual" },
+    act: { kind: "session-prompt", prompt: "x" }, checks: [], checksMode: "all", rung: "pr",
+    hardStops: { maxLaps: 10, tokenBudget: 300_000, noProgressLaps: 2 }, assumptions: [],
+    notify: { onGate: true, onFailure: true, onSuccess: false, dailyDigest: false },
+    cleanGatedLaps: 0, configRevision: 1, createdAt: "t", updatedAt: "t",
+  });
+  // A → B → C, and we try to save A chained onto C (A→B→C→A would cycle).
+  const b = mk("B", "C");
+  const c = mk("C", "A"); // C already chains to A
+  const loops = [b, c];
+  expect(chainCycleReason(loops, { id: "A", trigger: { kind: "chained", onLoopId: "C", on: "any" } })).toMatch(/loops back/);
+  // Self-loop.
+  expect(chainCycleReason([], { id: "A", trigger: { kind: "chained", onLoopId: "A", on: "any" } })).toMatch(/loops back/);
+  // Acyclic: A → B (B is manual) is fine.
+  expect(chainCycleReason([mk("B")], { id: "A", trigger: { kind: "chained", onLoopId: "B", on: "any" } })).toBeNull();
+  // A non-chained trigger is never a cycle.
+  expect(chainCycleReason([], { id: "A", trigger: { kind: "manual" } })).toBeNull();
+});
+
+test("chainedTargets fires only armed chained loops matching the parent + outcome", () => {
+  const mk = (id: string, onLoopId: string, on: "success" | "failure" | "any", status: Loop["status"] = "armed"): Loop => ({
+    id, name: id, status, trigger: { kind: "chained", onLoopId, on },
+    act: { kind: "session-prompt", prompt: "x" }, checks: [], checksMode: "all", rung: "pr",
+    hardStops: { maxLaps: 10, tokenBudget: 300_000, noProgressLaps: 2 }, assumptions: [],
+    notify: { onGate: true, onFailure: true, onSuccess: false, dailyDigest: false },
+    cleanGatedLaps: 0, configRevision: 1, createdAt: "t", updatedAt: "t",
+  });
+  const loops = [
+    mk("onSuccess", "P", "success"),
+    mk("onFailure", "P", "failure"),
+    mk("onAny", "P", "any"),
+    mk("otherParent", "Q", "any"),
+    mk("paused", "P", "any", "paused"),
+  ];
+  // Parent P shipped (success): onSuccess + onAny fire; onFailure/otherParent/paused don't.
+  expect(chainedTargets(loops, "P", "shipped").map((l) => l.id).sort()).toEqual(["onAny", "onSuccess"]);
+  // Parent P failed: onFailure + onAny fire.
+  expect(chainedTargets(loops, "P", "no-progress").map((l) => l.id).sort()).toEqual(["onAny", "onFailure"]);
+});
+
+test("eventTargets selects only armed event loops subscribed to the kind", () => {
+  const mk = (id: string, kind: "event" | "manual", eventKind?: string, status: Loop["status"] = "armed"): Loop => ({
+    id, name: id, status,
+    trigger: kind === "event" ? { kind: "event", eventKind: eventKind as never } : { kind: "manual" },
+    act: { kind: "session-prompt", prompt: "x" }, checks: [], checksMode: "all", rung: "pr",
+    hardStops: { maxLaps: 10, tokenBudget: 300_000, noProgressLaps: 2 }, assumptions: [],
+    notify: { onGate: true, onFailure: true, onSuccess: false, dailyDigest: false },
+    cleanGatedLaps: 0, configRevision: 1, createdAt: "t", updatedAt: "t",
+  });
+  const loops = [mk("ci", "event", "ci-failure"), mk("gh", "event", "github"), mk("ciPaused", "event", "ci-failure", "paused"), mk("man", "manual")];
+  expect(eventTargets(loops, "ci-failure").map((l) => l.id)).toEqual(["ci"]);
+  expect(eventTargets(loops, "github").map((l) => l.id)).toEqual(["gh"]);
 });
 
 test("checkLocks is the union of every check's locks", () => {

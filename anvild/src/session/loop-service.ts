@@ -19,7 +19,8 @@ import { sdkModelId } from "../agent/models";
 import { commit as gitCommit, push as gitPush, createPr as gitCreatePr } from "../git/ops";
 import { LoopStore } from "../loops/store";
 import { LoopEngine, type LapExecution, type LoopEngineDeps } from "../loops/engine";
-import { completeLoop } from "../loops/contract";
+import { completeLoop, chainCycleReason, chainedTargets, eventTargets } from "../loops/contract";
+import { scheduledFireDue } from "../integrations/schedule";
 import { BadCommand } from "./errors";
 import { PROTOCOL_VERSION } from "@protocol";
 import type {
@@ -69,11 +70,16 @@ export interface LoopServiceDeps {
   /** Multi-account roster + the account this daemon bills to (absent ⇒ env-var path). */
   accounts?: AccountStore;
   accountId?: () => string | undefined;
-  /** Push notification fan-out (at-gate / failure / success). */
-  notify?: (title: string, body: string, tag: string) => void;
+  /** Push notification fan-out (at-gate / failure / success). `deepLink` is the #loops/<id> hash. */
+  notify?: (title: string, body: string, tag: string, deepLink?: string) => void;
   /** Loops feed the Phase-0 projection panel too — nudge it when the entity set changes. */
   onCatalogChange?: () => void;
+  /** Run the Todoist-intake autopilot (the re-homed nightly) — returns a one-line summary + draft count. */
+  autopilotRun?: () => Promise<{ created: number; summary: string }>;
 }
+
+const LOOP_SCHEDULE_WINDOW_MS = 10 * 60_000; // edge-trigger window (matches the autopilot scheduler)
+const TICK_MS = 60_000; // per-loop trigger tick
 
 /** Per-run worktree bookkeeping (in-memory; durable checkpoint/resume is Phase 5). */
 interface RunWorktree {
@@ -192,9 +198,10 @@ export class LoopService {
   private notifyGate(loop: Loop, run: LoopRun, kind: "gate" | "failure" | "success"): void {
     if (!this.deps.notify) return;
     const title = "Anvil loop";
-    if (kind === "gate" && loop.notify.onGate) this.deps.notify(title, `${loop.name} is at your gate`, `loop-${loop.id}`);
-    else if (kind === "failure" && loop.notify.onFailure) this.deps.notify(title, `${loop.name}: ${run.status} — ${run.reason ?? ""}`, `loop-${loop.id}`);
-    else if (kind === "success" && loop.notify.onSuccess) this.deps.notify(title, `${loop.name} shipped`, `loop-${loop.id}`);
+    const link = `#loops/${loop.id}`; // deep link into the loop's detail (gate verbs live there)
+    if (kind === "gate" && loop.notify.onGate) this.deps.notify(title, `${loop.name} is at your gate`, `loop-${loop.id}`, link);
+    else if (kind === "failure" && loop.notify.onFailure) this.deps.notify(title, `${loop.name}: ${run.status} — ${run.reason ?? ""}`, `loop-${loop.id}`, link);
+    else if (kind === "success" && loop.notify.onSuccess) this.deps.notify(title, `${loop.name} shipped`, `loop-${loop.id}`, link);
   }
 
   // ── Broadcast helpers ──────────────────────────────────────────────────────────────────────────────
@@ -221,6 +228,16 @@ export class LoopService {
         }
         this.worktrees.delete(run.id);
       }
+    }
+    // Chained triggers: when a run reaches a terminal, fire loops chained onto it (spec §4.3, edge-triggered).
+    if (["shipped", "failed", "over-budget", "no-progress"].includes(run.status)) this.fireChained(run);
+  }
+
+  /** Fire loops whose `chained` trigger matches this run's terminal outcome (success/failure/any). */
+  private fireChained(run: LoopRun): void {
+    for (const loop of chainedTargets(this.store.list(), run.loopId, run.status)) {
+      if (this.engine.isActive(loop.id)) continue;
+      void this.startRun(loop, { kind: "chained", source: `after ${run.loopId} (${run.status})` });
     }
   }
   private broadcastCatalog(): void {
@@ -251,6 +268,9 @@ export class LoopService {
     // Edit-while-armed is rejected — pause to edit (spec §7). Trigger/schedule changes are the exception.
     if (existing && existing.status === "armed") throw new BadCommand("pause this loop before editing it");
     const { loop } = completeLoop(input, { now: now(), genId: () => newId("loop"), ...(existing ? { existing } : {}) });
+    // Chain cycle-check at save (spec §5): a chained loop must not reach itself through its links.
+    const cycle = chainCycleReason(this.store.list(), { id: loop.id, trigger: loop.trigger });
+    if (cycle) throw new BadCommand(`can't save: ${cycle}`);
     this.store.save(loop);
     this.broadcastCatalog();
     return this.loopUpdatedEvent(loop, cid);
@@ -282,10 +302,133 @@ export class LoopService {
   run(loopId: string, cid?: string): LoopRunEvent {
     const loop = this.require(loopId);
     if (this.engine.isActive(loopId)) throw new BadCommand("a run is already live for this loop");
-    // Drive in the background; laps + gate stream through onRun/broadcastRun.
-    void this.engine.run(loop, { kind: "manual" }).catch((e) => console.error(`[loops] run ${loopId} failed:`, e));
+    void this.startRun(loop, { kind: "manual" });
     const latest = this.store.latestRun(loopId);
     return this.runEvent(latest ?? placeholderRun(loop), cid);
+  }
+
+  /** Drive a run in the background (laps + gate stream via onRun). The `autopilot` singleton delegates to
+   *  the re-homed Todoist-intake run instead of the lap engine. */
+  private async startRun(loop: Loop, trigger: { kind: string; source?: string }): Promise<void> {
+    try {
+      if (loop.act.kind === "autopilot") await this.runAutopilotLoop(loop, trigger);
+      else await this.engine.run(loop, trigger);
+    } catch (e) {
+      console.error(`[loops] run ${loop.id} failed:`, e);
+    }
+  }
+
+  /** The re-homed nightly autopilot (spec §5): one lap that runs the Todoist re-plan and reports the
+   *  drafts it produced. Terminal `shipped` (the drafts land in the home's "drafts at your gate"). */
+  private async runAutopilotLoop(loop: Loop, trigger: { kind: string; source?: string }): Promise<void> {
+    if (this.engine.isActive(loop.id)) return;
+    const nowIso = now();
+    const run: LoopRun = {
+      id: newId("run"),
+      loopId: loop.id,
+      configRevision: loop.configRevision,
+      trigger: { kind: trigger.kind, ...(trigger.source ? { source: trigger.source } : {}), at: nowIso },
+      status: "running",
+      laps: [],
+      startedAt: nowIso,
+    };
+    this.store.putRun(run);
+    this.broadcastRun(run);
+    const result = this.deps.autopilotRun ? await this.deps.autopilotRun() : { created: 0, summary: "autopilot not wired" };
+    run.laps.push({ n: 1, summary: result.summary, verdicts: [{ check: "tasks triaged into drafts", v: "pass" }], at: now() });
+    run.status = "shipped";
+    run.reason = `${result.created} draft${result.created === 1 ? "" : "s"} created`;
+    run.endedAt = now();
+    this.store.putRun(run);
+    this.broadcastRun(run);
+  }
+
+  // ── Trigger scheduler (per-loop tick; edge-triggered like the autopilot scheduler) ────────────────────
+  private scheduleTimer?: ReturnType<typeof setInterval>;
+  startScheduler(): void {
+    if (this.scheduleTimer) return;
+    this.ensureAutopilotLoop();
+    this.scheduleTimer = setInterval(() => this.tick(), TICK_MS);
+    if (typeof this.scheduleTimer.unref === "function") this.scheduleTimer.unref();
+    // The first tick fires on the interval (≤TICK_MS) — no synchronous boot tick, so tests that drive
+    // tick() with a fake clock aren't polluted by a real-time boot fire.
+  }
+  stopScheduler(): void {
+    if (this.scheduleTimer) clearInterval(this.scheduleTimer);
+    this.scheduleTimer = undefined;
+  }
+  /** One trigger tick: fire any armed schedule loop whose window is due (no catch-up, no double-fire). */
+  tick(nowD: Date = new Date(now())): void {
+    for (const loop of this.store.list()) {
+      if (loop.status !== "armed" || loop.trigger.kind !== "schedule") continue;
+      if (this.engine.isActive(loop.id)) continue;
+      const sched = { enabled: true, timeOfDay: loop.trigger.timeOfDay, autoStart: false, ...(loop.trigger.days ? { days: loop.trigger.days } : {}) } as Parameters<typeof scheduledFireDue>[0];
+      const lastRunAt = this.store.latestRun(loop.id)?.startedAt;
+      if (scheduledFireDue(sched, nowD, LOOP_SCHEDULE_WINDOW_MS, lastRunAt)) void this.startRun(loop, { kind: "schedule" });
+    }
+    this.maybeDigest(nowD);
+  }
+
+  /** Daily digest (spec §4 Phase 4): once per calendar day (after 09:00 local), if any loop opted in,
+   *  send one summary push — how many loops are at your gate / shipped / stopped. In-memory day marker
+   *  (best-effort; resets on restart). */
+  private lastDigestDay?: string;
+  private maybeDigest(nowD: Date): void {
+    if (nowD.getHours() < 9) return;
+    const day = `${nowD.getFullYear()}-${nowD.getMonth() + 1}-${nowD.getDate()}`; // local day (matches getHours)
+    if (this.lastDigestDay === day) return;
+    this.lastDigestDay = day;
+    if (!this.store.list().some((l) => l.notify.dailyDigest)) return;
+    let atGate = 0, shipped = 0, stopped = 0;
+    for (const l of this.store.list()) {
+      const r = this.store.latestRun(l.id);
+      if (!r) continue;
+      if (r.status === "at-gate") atGate++;
+      else if (r.status === "shipped") shipped++;
+      else if (["failed", "over-budget", "no-progress"].includes(r.status)) stopped++;
+    }
+    this.deps.notify?.("Anvil loops — daily digest", `${atGate} at your gate · ${shipped} shipped · ${stopped} stopped`, "loops-digest", "#loops");
+  }
+
+  /** Route an external event to matching armed `event` loops (dedupe by key). Called from ingestTrigger. */
+  private readonly eventDedupe = new Set<string>();
+  private static readonly EVENT_DEDUPE_CAP = 2000; // bound the set so a long-lived daemon can't leak
+  handleEvent(eventKind: string, source: string, dedupeKey?: string): void {
+    for (const loop of eventTargets(this.store.list(), eventKind)) {
+      if (loop.trigger.kind !== "event") continue; // narrow (eventTargets already guarantees it)
+      // A per-loop dedupeKey on the trigger overrides the event's key (idempotency), spec §7.
+      const key = `${loop.id}:${loop.trigger.dedupeKey ?? dedupeKey ?? source}`;
+      if (this.eventDedupe.has(key)) continue;
+      if (this.eventDedupe.size >= LoopService.EVENT_DEDUPE_CAP) this.eventDedupe.clear(); // simple bound (rare)
+      this.eventDedupe.add(key);
+      if (this.engine.isActive(loop.id)) continue;
+      void this.startRun(loop, { kind: "event", source });
+    }
+  }
+
+  /** Ensure the daemon-managed Todoist-intake singleton exists (the re-homed nightly autopilot). */
+  private ensureAutopilotLoop(): void {
+    const id = "loop_autopilot";
+    if (this.store.get(id)) return;
+    const nowIso = now();
+    const loop: Loop = {
+      id,
+      name: "Todoist intake",
+      status: "armed",
+      trigger: { kind: "schedule", timeOfDay: "02:00" },
+      act: { kind: "autopilot" },
+      checks: [{ kind: "judge", condition: "every task triaged into a draft" }],
+      checksMode: "all",
+      rung: "suggest",
+      hardStops: { maxLaps: 1, tokenBudget: PIPELINE_INTAKE_BUDGET, noProgressLaps: 1 },
+      assumptions: [],
+      notify: { onGate: false, onFailure: true, onSuccess: false, dailyDigest: true },
+      cleanGatedLaps: 0,
+      configRevision: 1,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    this.store.save(loop);
   }
 
   /** Dry-run the first lap in a throwaway worktree (report only). Removes the worktree after — no branch/PR. */

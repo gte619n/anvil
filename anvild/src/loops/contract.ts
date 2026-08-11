@@ -118,6 +118,46 @@ function clampInt(v: number | undefined, min: number, max: number, dflt: number)
   return Math.min(max, Math.max(min, Math.round(v)));
 }
 
+/**
+ * Detect a chain cycle (loops-circuit spec §5, Phase 4): a `chained` loop must not, by following its
+ * `onLoopId` links, reach itself. Returns the offending reason, or null when the chain is acyclic.
+ * @param loops   the full catalog (may or may not already contain the candidate)
+ * @param candidate the loop being saved (its id + trigger)
+ */
+export function chainCycleReason(loops: Loop[], candidate: { id: string; trigger: Loop["trigger"] }): string | null {
+  if (candidate.trigger.kind !== "chained") return null;
+  const byId = new Map(loops.map((l) => [l.id, l]));
+  // Walk the chain from the candidate's target; if we ever land on the candidate, it's a cycle.
+  const seen = new Set<string>([candidate.id]);
+  let cursor: string | undefined = candidate.trigger.onLoopId;
+  while (cursor) {
+    if (cursor === candidate.id) return "this chain loops back onto itself";
+    if (seen.has(cursor)) break; // a pre-existing cycle elsewhere isn't this save's fault
+    seen.add(cursor);
+    const next: Loop | undefined = byId.get(cursor);
+    if (!next) return `chained onto a loop that doesn't exist (${cursor})`;
+    cursor = next.trigger.kind === "chained" ? next.trigger.onLoopId : undefined;
+  }
+  return null;
+}
+
+/** Armed `event` loops subscribed to `eventKind` (pure, testable — the dedupe lives in the service). */
+export function eventTargets(loops: Loop[], eventKind: string): Loop[] {
+  return loops.filter((l) => l.status === "armed" && l.trigger.kind === "event" && l.trigger.eventKind === eventKind);
+}
+
+/** Armed `chained` loops that should fire when `parentLoopId` reaches `terminalStatus` (pure, testable). */
+export function chainedTargets(loops: Loop[], parentLoopId: string, terminalStatus: string): Loop[] {
+  const outcome: "success" | "failure" = terminalStatus === "shipped" ? "success" : "failure";
+  return loops.filter(
+    (l) =>
+      l.status === "armed" &&
+      l.trigger.kind === "chained" &&
+      l.trigger.onLoopId === parentLoopId &&
+      (l.trigger.on === "any" || l.trigger.on === outcome),
+  );
+}
+
 /** The union of every check's `locks` — the globs the acting lap may not touch (deterministic). */
 export function checkLocks(checks: LoopCheck[]): string[] {
   const out = new Set<string>();
