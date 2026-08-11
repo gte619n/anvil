@@ -426,6 +426,25 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send({ v: PROTOCOL_VERSION, type: "autopilot.run.result", ts: now(), cid, ok: false, created: 0, skipped: 0, output: errMsg(e) }));
         return;
 
+      case "autopilot.trigger":
+        deps.supervisor
+          .ingestTrigger({ kind: cmd.kind, source: cmd.source, title: cmd.title, body: cmd.body, environmentId: cmd.environmentId, dedupeKey: cmd.dedupeKey, autoApprove: cmd.autoApprove })
+          .then((plan) => send({ v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), cid, plan }))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "autopilot.approve":
+        try {
+          send(deps.supervisor.approveProposed(cmd.workUnitId, cmd.start ?? false, cid));
+        } catch (e) {
+          send(cmdError(errMsg(e), cid));
+        }
+        return;
+
+      case "loops.get":
+        send(deps.supervisor.loopsSnapshotEvent(cid));
+        return;
+
       case "autopilot.tags.reset":
         deps.supervisor
           .resetAnvilTags(cid)

@@ -4,6 +4,7 @@
  * status label is kept on a task at a time; the rest of its labels are preserved.
  *
  * Lifecycle:
+ *   proposed → planned (an event-triggered unit a human approved; see event-trigger.ts) → …
  *   (none) → planned → building → review → ✓ completed (marked done in the Autopilot UI)
  *                  │           ↘ blocked (needs a human decision)
  *                  ├→ dismissed (the user rejected the plan in the Autopilot UI; never re-planned)
@@ -20,7 +21,7 @@
  */
 export const STATUS_PREFIX = "anvil:";
 
-export const STATUSES = ["planned", "needs-clarification", "planning", "building", "review", "blocked", "dismissed", "completed", "expired"] as const;
+export const STATUSES = ["proposed", "planned", "needs-clarification", "planning", "building", "review", "blocked", "dismissed", "completed", "expired"] as const;
 export type AnvilStatus = (typeof STATUSES)[number];
 
 export function statusLabel(status: AnvilStatus): string {

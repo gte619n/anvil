@@ -34,6 +34,7 @@ import {
   type AutopilotScheduleEvent,
   type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
+  type LoopsSnapshotEvent,
   type AuthProvider,
   type AuthStatusEvent,
   type AuthAccountsEvent,
@@ -84,7 +85,7 @@ import { EnvironmentStore } from "../env/store";
 import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
-import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildPlanningBrief } from "../integrations/autopilot-plans";
+import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildAutopilotGoal, buildPlanningBrief } from "../integrations/autopilot-plans";
 import { deriveTeams } from "../integrations/team-tree";
 import { integrationOrder } from "../integrations/team-plan";
 import { integrateTeam as runTeamIntegration, safeRemoteBranch, type IntegrateMember } from "../integrations/team-integrate";
@@ -100,6 +101,8 @@ import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
+import { normalizeTrigger, type TriggerEvent } from "../integrations/event-trigger";
+import { buildLoopsSnapshot } from "../integrations/loops";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { reviewPlan, formatReview } from "../integrations/adversarial";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
@@ -256,6 +259,9 @@ export class Supervisor {
     return runWithinBudget(this.autopilotRunStartedAt, Date.now(), AUTOPILOT_RUN_TIMEOUT_MS);
   }
   private autopilotRunLog: string[] = []; // the live run's progress lines, retained so a connecting/refreshed client can replay them
+  /** Work units whose autonomous dev pipeline is running right now (id → title). Feeds the Loops panel's
+   *  live pipeline rows; populated at runDevPipeline start, cleared in its finally. */
+  private readonly runningPipelines = new Map<string, string>();
   private scheduleTimer?: ReturnType<typeof setInterval>;
   private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
@@ -1088,6 +1094,43 @@ export class Supervisor {
   }
   private broadcastAutopilotPlans(): void {
     this.registry.toAll(this.autopilotPlansEvent());
+    this.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid
+  }
+
+  // ── Loops (loop-engineering: one surface naming every active loop) ────────────────────
+  /** Project every active loop — the schedule heartbeat, sessions carrying a `/goal`, in-flight
+   *  pipelines, and pending event proposals — into the flat snapshot the Loops panel renders. */
+  loopsSnapshotEvent(cid?: string): LoopsSnapshotEvent {
+    const schedule = this.autopilotSchedule.get();
+    const next = nextScheduledFire(schedule, new Date());
+    const goals = this.list()
+      .filter((s) => s.goal)
+      .map((s) => ({
+        sessionId: s.id,
+        title: s.title,
+        condition: s.goal!.condition,
+        iterations: s.goal!.iterations,
+        ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
+        ...(s.goal!.paused ? { paused: true } : {}),
+      }));
+    const pipelines = [...this.runningPipelines].map(([id, title]) => {
+      const phaseReached = this.workUnits.get(id)?.devPipeline?.phaseReached;
+      return { id, title, ...(phaseReached ? { phaseReached } : {}) };
+    });
+    const proposals = this.workUnits
+      .list()
+      .filter((u) => u.status === "proposed")
+      .map((u) => ({ id: u.id, title: u.title, source: u.trigger?.source ?? "event" }));
+    const loops = buildLoopsSnapshot({
+      schedule: { enabled: schedule.enabled, timeOfDay: schedule.timeOfDay, running: this.autopilotRunning, autoStart: schedule.autoStart, ...(next ? { nextRunAt: next.toISOString() } : {}) },
+      goals,
+      pipelines,
+      proposals,
+    });
+    return { v: PROTOCOL_VERSION, type: "loops.snapshot", ts: now(), ...(cid ? { cid } : {}), loops };
+  }
+  private broadcastLoops(): void {
+    this.registry.toAll(this.loopsSnapshotEvent());
   }
 
   /** Teams are derived (not stored): group the flat session list by `parentId` (see team-tree.ts). */
@@ -1697,6 +1740,10 @@ export class Supervisor {
     const env = this.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
     const brief = this.autopilotBrief(u);
+    // Seed the build session with a `/goal` derived from the plan so it self-verifies to completion — the
+    // Stop hook keeps it going until a judge agrees the plan is actually built + the checks pass, rather
+    // than stopping the instant the model claims it's done (loop-engineering: run-until-done).
+    const goalCondition = buildAutopilotGoal(u);
     const { id } = this.handoffCreate({
       environmentId: env.id,
       source: "fresh-worktree",
@@ -1705,7 +1752,15 @@ export class Supervisor {
       autonomy: autonomy ?? "bypass",
       brief,
     });
-    this.workUnits.update(u.id, { sessionId: id, status: "building" });
+    // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
+    this.workUnits.update(u.id, { sessionId: id, status: "building", hold: undefined, ...(goalCondition ? { goalCondition } : {}) });
+    if (goalCondition) {
+      const built = this.sessions.get(id);
+      if (built) {
+        built.data.goal = { condition: goalCondition, iterations: 0, setAt: now() };
+        this.broadcastUpdated(built.data);
+      }
+    }
     void this.tagTasks(u, "building");
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
@@ -1730,6 +1785,67 @@ export class Supervisor {
   /** The opening brief handed to a plan's build session (see integrations/autopilot-plans.ts). */
   private autopilotBrief(u: WorkUnit): string {
     return buildAutopilotBrief(u);
+  }
+
+  // ── Event-driven intake (loop-engineering: Channels) ──────────────────────────────────
+  /** Statuses a triggered unit is considered "live" in for dedupe (a terminal one may re-propose). */
+  private static readonly TRIGGER_LIVE = new Set<AnvilStatus>(["proposed", "planned", "needs-clarification", "planning", "building", "review", "blocked"]);
+
+  /**
+   * Ingest an external event as a PROPOSED work unit (a CI failure, a labelled task, a webhook). Defaults
+   * to needing a human approve — nothing runs unattended off an event unless a trusted source opts in via
+   * `autoApprove`. Dedupes on the trigger key so a re-delivered event collapses onto the existing card.
+   */
+  async ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
+    const intent = normalizeTrigger(input, new Date().toISOString());
+    const envId =
+      intent.environmentId ??
+      this.autopilotSchedule.get().defaultEnvironmentId ??
+      this.envStore.list().find((e) => e.todoistProjectId)?.id ??
+      this.envStore.list()[0]?.id;
+    if (!envId) throw new BadCommand("no environment is configured to route the trigger to");
+    const env = this.envStore.get(envId);
+    if (!env) throw new BadCommand("the target environment no longer exists");
+    // Dedupe: a live unit with the same trigger key already covers this event — return it, don't clone.
+    const dup = this.workUnits
+      .list()
+      .find((u) => u.trigger?.dedupeKey === intent.trigger.dedupeKey && Supervisor.TRIGGER_LIVE.has(u.status));
+    if (dup) return this.autopilotPlanInfo(dup);
+    const unit = this.workUnits.create({
+      environmentId: env.id,
+      todoistProjectId: env.todoistProjectId ?? "",
+      taskIds: [],
+      title: intent.title,
+      summary: intent.summary,
+      ...(input.body ? { rationale: input.body } : {}),
+      trigger: intent.trigger,
+      status: intent.autoApprove ? "planned" : "proposed",
+    });
+    this.broadcastAutopilotPlans();
+    // A trusted source may auto-run: it's already `planned`, so start a build if the budget is healthy.
+    if (intent.autoApprove && !this.budget().warn) {
+      try {
+        this.startPlan(unit.id);
+      } catch (e) {
+        console.error(`[autopilot] auto-approved trigger “${unit.title}” could not start: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    return this.autopilotPlanInfo(this.workUnits.get(unit.id) ?? unit);
+  }
+
+  /**
+   * Approve a proposed (event-triggered) unit: promote it to `planned` and, when `start`, launch the build
+   * immediately. Rejecting a proposal reuses the existing `autopilot.dismiss` path. Returns the started
+   * event (when `start`) or the promoted plan.
+   */
+  approveProposed(workUnitId: string, start: boolean, cid?: string): AutopilotStartedEvent | AutopilotPlanResultEvent {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.status !== "proposed") throw new BadCommand(`only a proposed plan can be approved (this one is ${u.status})`);
+    this.workUnits.update(u.id, { status: "planned" });
+    this.broadcastAutopilotPlans();
+    if (start) return this.startPlan(u.id, undefined, undefined, cid);
+    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(this.workUnits.get(u.id)!) };
   }
 
   /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
@@ -1864,7 +1980,12 @@ export class Supervisor {
       for (const u of createdUnits) {
         const decision = autoStartDecision(u);
         if (decision.start) autoStartable.push(u);
-        else if (u.source !== "label" && u.status === "planned" && decision.reason) emit(`⏸ Holding “${u.title}” — ${decision.reason}.`);
+        else if (u.source !== "label" && u.status === "planned" && decision.reason) {
+          // Persist the hold on the unit so the stop-reason is durable on the card (not just this run's
+          // log): the panel can show "Held: adversarial 4/10" until a human starts or dismisses it.
+          this.workUnits.update(u.id, { hold: { reason: decision.reason, at: new Date().toISOString() } });
+          emit(`⏸ Holding “${u.title}” — ${decision.reason}.`);
+        }
       }
       // Pipeline auto-start needs an OpenRouter key (GLM authors several gates); fall back to a plain build
       // session if the operator asked for the pipeline but no key is set, rather than failing every unit.
@@ -1951,6 +2072,8 @@ export class Supervisor {
     const branch = `${slugify(u.title)}-pipeline`;
     // One worktree for the whole run: read-only phases inspect it, P3/P4 write, P6 opens the PR from it.
     const { cwd } = createWorktree(env.repoRoot, env.defaultBase ?? "HEAD", branch, this.store.worktreeRoot(), runId);
+    this.runningPipelines.set(u.id, u.title); // surface it as a live loop in the Loops panel
+    this.broadcastLoops();
     try {
       const glmSlug = this.adversarial.models.find((m) => /glm/i.test(m));
       const deps: PhaseDeps = {
@@ -1974,6 +2097,8 @@ export class Supervisor {
       log(`Pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}.`);
       return outcome;
     } finally {
+      this.runningPipelines.delete(workUnitId); // pipeline loop ended (shipped/blocked/threw)
+      this.broadcastLoops();
       // [BE-13] Persist metrics on EVERY exit, not just success. `executeDevPipeline` mutates the
       // in-memory tallies (recordFirstPass) as it runs; a run that throws is exactly one where the
       // adversary fired hardest, so saving only on success biased the §6.3 collusion metric toward
@@ -2004,6 +2129,7 @@ export class Supervisor {
   }
   private broadcastSchedule(): void {
     this.registry.toAll(this.autopilotScheduleEvent());
+    this.broadcastLoops(); // the schedule heartbeat + its running state are loop rows
   }
   /** Stream one run-progress line to every connected client (live, regardless of who started the run —
    *  or whether it was the scheduler). Centralized here so manual and scheduled runs behave the same. */
@@ -2659,6 +2785,7 @@ export class Supervisor {
         () => {
           this.persist();
           this.broadcastUpdated(s.data);
+          this.broadcastLoops(); // each unmet attempt bumps the loop's live iteration count
         },
       );
       this.drivers.set(id, driver);
@@ -3015,6 +3142,7 @@ export class Supervisor {
     }
     this.persist();
     this.broadcastUpdated(s.data);
+    this.broadcastLoops(); // a goal set/cleared adds or removes its loop row
   }
 
   /** A goal lifecycle marker in the transcript — same divider block the compact boundary uses. */
@@ -3034,6 +3162,7 @@ export class Supervisor {
     this.goalDivider(s, label, note);
     this.persist();
     this.broadcastUpdated(s.data);
+    this.broadcastLoops(); // a goal resolving removes its loop row
     // This push IS the turn's notification — swallow the ordinary "your turn" that the `result`
     // arriving moments later would otherwise fire (the goal is already cleared by then).
     this.goalPushSuppressed.add(id);

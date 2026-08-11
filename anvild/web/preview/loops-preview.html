@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Anvil · Loops — circuit concept</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
+  <link rel="stylesheet" href="../styles/app.css" />
+  <style>
+    html, body { height: auto !important; overflow: visible !important; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-overflow-scrolling: touch; }
+    .lc-app { max-width: 780px; margin: 0 auto; padding: 18px 14px 90px; }
+    .autopilot-view { position: static !important; inset: auto !important; background: transparent !important; display: block !important; }
+
+    .lc-top { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+    .lc-top h1 { font-size: 20px; margin: 0; flex: 1; display: flex; align-items: center; gap: 8px; }
+    .lc-top h1 .msym { color: var(--accent); }
+    .lc-sub { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; line-height: 1.5; }
+
+    /* intake */
+    .lc-intake { border: 1px solid var(--border); border-radius: 14px; background: var(--panel); padding: 14px; margin-bottom: 20px; }
+    .lc-intake-row { display: flex; gap: 8px; }
+    .lc-intake input { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+    .lc-intake .primary { white-space: nowrap; }
+    .lc-todoist { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 12px; color: var(--muted); cursor: pointer; }
+    .lc-todoist b { color: var(--text); }
+    .lc-todoist .msym { font-size: 15px; color: #e8730c; }
+
+    /* list rows */
+    .lc-envsep { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); margin: 14px 2px 8px; }
+    .lc-rows { display: flex; flex-direction: column; gap: 8px; }
+    .lc-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); cursor: pointer; }
+    .lc-row:hover { border-color: var(--accent); }
+    .lc-row .lc-mini { flex-shrink: 0; }
+    .lc-row .m { flex: 1; min-width: 0; }
+    .lc-row .t { display: block; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lc-row .s { display: block; font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+    .lc-chip { font-size: 11px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+    .lc-chip.running { color: #f2c037; border-color: #f2c03766; }
+    .lc-chip.armed { color: #2196c9; border-color: #2196c966; }
+    .lc-chip.gated { color: #b07cc3; border-color: #b07cc366; }
+    .lc-chip.paused { color: var(--muted); }
+
+    /* circuit svg */
+    .lc-circuit-card { border: 1px solid var(--border); border-radius: 14px; background: var(--panel); padding: 10px 8px 4px; margin-bottom: 14px; }
+    .lc-circuit { width: 100%; height: auto; display: block; }
+    .lc-st-circle { fill: var(--bg); stroke: var(--border); stroke-width: 2; }
+    .lc-st.on .lc-st-circle { stroke: var(--accent); }
+    .lc-st.done .lc-st-circle { stroke: #21ba45; }
+    .lc-st-ico { font-family: "Material Symbols Rounded"; font-size: 20px; fill: var(--muted); }
+    .lc-st.on .lc-st-ico { fill: var(--accent); }
+    .lc-st.done .lc-st-ico { fill: #21ba45; }
+    .lc-st-lbl { font-size: 11px; fill: var(--muted); }
+    .lc-st-sub { font-size: 9.5px; fill: var(--muted); opacity: .8; }
+    .lc-track { stroke: var(--border); stroke-width: 2; fill: none; }
+    .lc-return { stroke: var(--accent); stroke-width: 2; fill: none; stroke-dasharray: 5 5; opacity: .75; }
+    .lc-lap { font-size: 11px; fill: var(--accent); }
+    .lc-gate-d { fill: var(--panel); stroke: #b07cc3; stroke-width: 2; }
+    .lc-gate-ico { font-family: "Material Symbols Rounded"; font-size: 13px; fill: #b07cc3; }
+    .lc-gate-lbl { font-size: 9.5px; fill: #b07cc3; }
+    .lc-runner { fill: #f2c037; filter: drop-shadow(0 0 5px #f2c037); }
+    .lc-runner-g { transition: transform 0.9s cubic-bezier(.5,0,.4,1); }
+    .lc-scope { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 2px 12px 8px; }
+    .lc-scope .msym { font-size: 14px; color: #21ba45; }
+    .lc-scope b { color: var(--text); font-weight: 600; }
+    .lc-assume { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+    .lc-assume li { margin: 3px 0; }
+
+    /* detail */
+    .lc-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    .lc-head h2 { font-size: 16.5px; margin: 0; flex: 1; min-width: 140px; }
+    .lc-actions { display: inline-flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .lc-card { border: 1px solid var(--border); border-radius: 12px; background: var(--panel); padding: 12px 14px; margin-bottom: 12px; }
+    .lc-card > h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 10px; }
+    .lc-caps { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; }
+    .lc-caps .cap { min-width: 130px; flex: 1; }
+    .lc-caps .cap b { display: block; font-size: 12px; margin-bottom: 4px; }
+    .lc-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    .lc-bar i { display: block; height: 100%; background: var(--accent); }
+    .lc-bar i.warn { background: #e8730c; }
+    .lc-caps .cap span { color: var(--muted); font-size: 11px; }
+    .lc-laps { display: flex; flex-direction: column; }
+    .lc-lap-row { display: flex; gap: 10px; align-items: flex-start; padding: 8px 4px; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+    .lc-lap-row:last-child { border-bottom: 0; }
+    .lc-lap-n { width: 44px; flex-shrink: 0; color: var(--muted); font-size: 11px; padding-top: 2px; }
+    .lc-lap-row .what { flex: 1; }
+    .lc-lap-row .verdict { font-size: 11px; white-space: nowrap; padding: 2px 8px; border-radius: 999px; border: 1px solid; }
+    .verdict.pass { color: #21ba45; border-color: #21ba4566; }
+    .verdict.fail { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+    .verdict.live { color: #f2c037; border-color: #f2c03766; }
+
+    /* autonomy ladder */
+    .lc-ladder { display: flex; gap: 6px; }
+    .lc-ladder button { flex: 1; padding: 9px 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--muted); cursor: pointer; font: inherit; font-size: 11.5px; text-align: center; }
+    .lc-ladder button b { display: block; font-size: 12px; color: var(--text); margin-bottom: 2px; }
+    .lc-ladder button.on { border-color: #b07cc3; background: color-mix(in srgb, #b07cc3 12%, transparent); }
+    .lc-ladder button.on b { color: #b07cc3; }
+    .lc-ladder-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+
+    /* claude-led intake chat */
+    .lc-chat { display: flex; flex-direction: column; gap: 10px; }
+    .lc-bub { max-width: 92%; padding: 10px 13px; border-radius: 13px; font-size: 13px; line-height: 1.55; }
+    .lc-bub.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+    .lc-bub.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+    .lc-bub code { background: color-mix(in srgb, var(--muted) 22%, transparent); padding: 0 4px; border-radius: 4px; }
+    .lc-chips { display: flex; flex-wrap: wrap; gap: 7px; align-self: flex-start; }
+    .lc-chips button { border: 1px solid var(--accent); background: transparent; color: var(--accent); border-radius: 999px; padding: 6px 13px; font: inherit; font-size: 12.5px; cursor: pointer; }
+    .lc-chips button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+    .lc-typing { align-self: flex-start; color: var(--muted); font-size: 12px; padding: 2px 6px; }
+
+    #pv-toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 200; box-shadow: 0 6px 22px rgba(0,0,0,.28); }
+    #pv-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+  <div class="autopilot-view"><div class="lc-app" id="lc-root"></div></div>
+  <div id="pv-toast"></div>
+
+<script>
+// scene mode (?scene=…) drives the mock into a fixed state for automated screenshots
+const SCENE = new URLSearchParams(location.search).get("scene");
+const FAST = SCENE !== null; // collapse chat delays so scenes settle quickly
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const icon = (n) => `<span class="msym">${n}</span>`;
+const toast = (m) => { const t=document.getElementById("pv-toast"); t.textContent=m; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),2400); };
+const app = document.getElementById("lc-root");
+
+// ── the one mental model ──────────────────────────────────────────────────────
+// A Loop = Trigger → Act ⇄ Check → [gate] → Ship.  Autonomy = where the gate sits.
+const RUNGS = [
+  { k:"suggest", name:"Suggest", gate:"reports findings only", desc:"Read-only. Each lap ends in a report." },
+  { k:"draft",   name:"Draft",   gate:"stops before PR",      desc:"Writes to a branch; you open the PR." },
+  { k:"pr",      name:"PR",      gate:"stops before merge",    desc:"Opens a verified PR; you merge." },
+  { k:"ship",    name:"Ship",    gate:"",                      desc:"Merges on green. No gate." },
+];
+const rung = (k) => RUNGS.find(r=>r.k===k);
+
+function seed() { return [
+  { id:"l1", name:"Todoist intake", env:"fleet", status:"armed",
+    trigger:"Daily 02:00", act:"Turn new Todoist tasks into loop drafts", check:"every task triaged into a draft",
+    rungK:"suggest", laps:[1,1], budget:[0,500], nextFire:"Tomorrow 02:00", runnerAt:null,
+    scope:"Todoist → loop drafts only (writes nothing else)",
+    history:[ {n:"Lap 1", what:"Planned 3 tasks → 3 loop drafts below", v:["pass","3 drafts created"]} ],
+    note:"This IS the old “autopilot” — now just a loop whose job is making other loops." },
+  { id:"l2", name:"Fix flaky upload test", env:"anvil-web", status:"running",
+    trigger:"Manual", act:"Find & fix the flakiness (session)", check:"bun test upload ×10 all green",
+    rungK:"pr", laps:[3,10], budget:[44,300], runnerAt:"act",
+    scope:"src/upload/ only · test files locked",
+    assumptions:["Flake is timing-related (not env-specific)","Fix stays inside src/upload/"],
+    history:[
+      {n:"Lap 3", what:"Pinned the retry timer; re-running the suite…", v:["live","checking"]},
+      {n:"Lap 2", what:"Fixed drained-buffer reuse in upload.ts", v:["fail","2 tests still red"]},
+      {n:"Lap 1", what:"Reproduced: fails 4/10 runs on retry timing", v:["fail","flaky confirmed"]},
+    ] },
+  { id:"l3", name:"CI: failing build on main", env:"ops", status:"gated",
+    trigger:"On ci-failure", act:"Fix the reported build break (session)", check:"bun run build exits 0",
+    rungK:"draft", laps:[2,6], budget:[91,250], runnerAt:"gate",
+    scope:"src/ + build config · CI workflow files untouched",
+    history:[
+      {n:"Lap 2", what:"Build green on branch ci-fix-1421 — waiting at your gate", v:["pass","build exits 0"]},
+      {n:"Lap 1", what:"Cloned chunk before retry; build still red (types)", v:["fail","tsc: 2 errors"]},
+    ] },
+  { id:"l4", name:"Reports: CSV export", env:"anvil-web", status:"running",
+    trigger:"Manual", act:"Build CSV export, tests-first (session)", check:"reports-export.test.ts + build green",
+    rungK:"pr", laps:[5,12], budget:[212,400], runnerAt:"check",
+    scope:"src/reports/ + reports-export.test.ts (locked once written)",
+    assumptions:["Comma delimiter, UTF-8 (Excel-friendly)","Streams all rows — no cap"],
+    history:[
+      {n:"Lap 5", what:"Streaming rows through the encoder; re-running acceptance tests…", v:["live","checking"]},
+      {n:"Lap 4", what:"Fixed UTF-8 encoding for accented names", v:["fail","1 test still red"]},
+      {n:"Lap 3", what:"Wired the Download button to the new endpoint", v:["fail","2 tests red"]},
+      {n:"Lap 2", what:"Built the export endpoint", v:["fail","3 tests red"]},
+      {n:"Lap 1", what:"Wrote acceptance tests FIRST — all red, as they should be", v:["pass","tests exist & fail"]},
+    ] },
+]; }
+let loops = seed();
+let state = { view:"home", id:null };
+
+// ── circuit SVG ───────────────────────────────────────────────────────────────
+// stations: trigger(70) act(240) check(410) ship(640); gate diamond between check→ship
+const ST = { trigger:{x:70,y:74}, act:{x:240,y:74}, check:{x:410,y:74}, ship:{x:640,y:74}, gate:{x:522,y:74}, ret:{x:325,y:158} };
+function circuitSvg(l, big) {
+  const r = rung(l.rungK); const gated = l.rungK !== "ship";
+  const runner = l.runnerAt ? `<g class="lc-runner-g" id="runner" transform="translate(${ST[l.runnerAt].x},${ST[l.runnerAt].y})"><circle class="lc-runner" r="7"/></g>` : "";
+  const st = (k, ic, lbl, sub, cls) => `
+    <g class="lc-st ${cls||""}">
+      <circle class="lc-st-circle" cx="${ST[k].x}" cy="${ST[k].y}" r="24"/>
+      <text class="lc-st-ico" x="${ST[k].x}" y="${ST[k].y+7}" text-anchor="middle">${ic}</text>
+      <text class="lc-st-lbl" x="${ST[k].x}" y="${ST[k].y+44}" text-anchor="middle">${esc(lbl)}</text>
+      ${sub?`<text class="lc-st-sub" x="${ST[k].x}" y="${ST[k].y+58}" text-anchor="middle">${esc(sub.length>30?sub.slice(0,29)+"…":sub)}</text>`:""}
+    </g>`;
+  const active = (k) => l.runnerAt===k ? "on" : "";
+  return `<svg class="lc-circuit" viewBox="0 0 710 190" xmlns="http://www.w3.org/2000/svg">
+    <line class="lc-track" x1="94" y1="74" x2="216" y2="74"/>
+    <line class="lc-track" x1="264" y1="74" x2="386" y2="74"/>
+    <line class="lc-track" x1="434" y1="74" x2="${gated?506:616}" y2="74"/>
+    ${gated?`<line class="lc-track" x1="538" y1="74" x2="616" y2="74"/>`:""}
+    <path class="lc-return" d="M 410 100 L 410 158 L 240 158 L 240 100" marker-end=""/>
+    <text class="lc-lap" x="${ST.ret.x}" y="150" text-anchor="middle">lap ${l.laps[0]} of ${l.laps[1]} · until check passes</text>
+    ${st("trigger","bolt","Trigger", l.trigger, active("trigger"))}
+    ${st("act","construction","Act", l.act, active("act"))}
+    ${st("check","verified","Check", l.check, active("check"))}
+    ${gated?`<g class="lc-st ${active("gate")}">
+      <rect class="lc-gate-d" x="${ST.gate.x-14}" y="${ST.gate.y-14}" width="28" height="28" rx="6" transform="rotate(45 ${ST.gate.x} ${ST.gate.y})"/>
+      <text class="lc-gate-ico" x="${ST.gate.x}" y="${ST.gate.y+5}" text-anchor="middle">lock</text>
+      <text class="lc-gate-lbl" x="${ST.gate.x}" y="${ST.gate.y+44}" text-anchor="middle">you · ${esc(r.gate)}</text>
+    </g>`:""}
+    ${st("ship","rocket_launch","Ship", r.k==="ship"?"merges on green":"", active("ship"))}
+    ${runner}
+  </svg>${l.scope ? `<div class="lc-scope">${icon("shield")}<span><b>Scope:</b> ${esc(l.scope)}</span></div>` : ""}`;
+}
+function miniSvg(l) {
+  const dot = { trigger:14, act:44, check:74, gate:89, ship:104 }[l.runnerAt] ?? null;
+  const col = l.status==="running"?"#f2c037":l.status==="gated"?"#b07cc3":l.status==="paused"?"var(--muted)":"#2196c9";
+  return `<svg class="lc-mini" width="118" height="34" viewBox="0 0 118 34">
+    <line x1="14" y1="14" x2="104" y2="14" stroke="var(--border)" stroke-width="2"/>
+    <path d="M 74 18 L 74 27 L 44 27 L 44 18" stroke="${col}" stroke-width="1.5" fill="none" stroke-dasharray="3 3" opacity=".7"/>
+    ${[14,44,74,104].map(x=>`<circle cx="${x}" cy="14" r="4.5" fill="var(--bg)" stroke="var(--border)" stroke-width="1.5"/>`).join("")}
+    ${l.rungK!=="ship"?`<rect x="85" y="10" width="8" height="8" rx="2" transform="rotate(45 89 14)" fill="none" stroke="#b07cc3" stroke-width="1.5"/>`:""}
+    ${dot!==null?`<circle cx="${dot}" cy="14" r="5" fill="${col}"/>`:""}
+  </svg>`;
+}
+
+// ── HOME ──────────────────────────────────────────────────────────────────────
+function renderHome() {
+  const statusChip = (l) => l.status==="gated" ? `<span class="lc-chip gated">${icon("lock")} at your gate</span>`
+    : l.status==="running" ? `<span class="lc-chip running">lap ${l.laps[0]}/${l.laps[1]}</span>`
+    : l.status==="paused" ? `<span class="lc-chip paused">paused</span>`
+    : `<span class="lc-chip armed">${esc(l.nextFire||"armed")}</span>`;
+  app.innerHTML = `
+    <div class="lc-top"><h1>${icon("all_inclusive")} Loops</h1></div>
+    <p class="lc-sub">One idea, drawn once: <b>Trigger → Act ⇄ Check → Ship</b>, and the lock is where <i>you</i> sit. Start below — Claude sets the loop up with you.</p>
+    <div class="lc-intake">
+      <div class="lc-intake-row">
+        <input id="lc-prompt" placeholder="What should get done? e.g. Fix the flaky upload test" />
+        <button class="primary" id="lc-go">${icon("auto_awesome")} Build my loop</button>
+      </div>
+      <div class="lc-todoist" id="lc-td">${icon("inbox")} <b>3 Todoist tasks</b>&nbsp;are waiting to become loops — tap to triage them the same way</div>
+    </div>
+    <div class="lc-rows">
+      ${loops.map(l=>`<div class="lc-row" data-id="${l.id}">
+        ${miniSvg(l)}
+        <span class="m"><span class="t">${esc(l.name)}</span><span class="s">${esc(l.trigger)} → ${esc(l.act)}</span></span>
+        ${statusChip(l)}
+        <span class="msym" style="color:var(--muted)">chevron_right</span>
+      </div>`).join("")}
+    </div>`;
+  document.getElementById("lc-go").addEventListener("click", ()=>{ const v=document.getElementById("lc-prompt").value.trim(); startIntake(v || "Fix the flaky upload test"); });
+  document.getElementById("lc-prompt").addEventListener("keydown", (e)=>{ if(e.key==="Enter") document.getElementById("lc-go").click(); });
+  document.getElementById("lc-td").addEventListener("click", ()=>startIntake("(from Todoist) Add retry logic to the S3 uploader", true));
+  app.querySelectorAll(".lc-row").forEach(r=>r.addEventListener("click", ()=>{ state={view:"detail", id:r.dataset.id}; render(); }));
+}
+
+// ── DETAIL ────────────────────────────────────────────────────────────────────
+let runnerTimer = null;
+function renderDetail() {
+  const l = loops.find(x=>x.id===state.id); if (!l) { state={view:"home"}; return renderHome(); }
+  const r = rung(l.rungK);
+  const budPct = Math.min(100, Math.round(l.budget[0]/l.budget[1]*100));
+  app.innerHTML = `
+    <div class="lc-head">
+      <button class="mini" id="lc-back">${icon("arrow_back")} Loops</button>
+      <h2>${esc(l.name)}</h2>
+      <span class="lc-chip ${l.status}">${l.status==="gated"?"at your gate":l.status}</span>
+    </div>
+    <div class="lc-circuit-card">${circuitSvg(l, true)}</div>
+    ${l.note?`<p class="lc-sub" style="margin-top:-6px">${icon("info")} ${esc(l.note)}</p>`:""}
+    <div class="lc-actions">
+      ${l.status==="gated"?`<button class="primary" id="lc-approve">${icon("lock_open")} Open the gate ${r.k==="draft"?"(open PR)":"(merge)"}</button><button class="mini danger" id="lc-rework">${icon("replay")} Send back a lap</button>`:""}
+      <button class="mini" id="lc-runnow">${icon("play_arrow")} Run a lap now</button>
+      <button class="mini" id="lc-pause">${icon(l.status==="paused"?"bolt":"pause")} ${l.status==="paused"?"Arm":"Pause"}</button>
+      <button class="mini" id="lc-chat">${icon("forum")} Ask Claude</button>
+    </div>
+    <div class="lc-card"><h3>Hard stops <span style="text-transform:none">(every loop has all three)</span></h3>
+      <div class="lc-caps">
+        <div class="cap"><b>Laps ${l.laps[0]} / ${l.laps[1]}</b><div class="lc-bar"><i style="width:${Math.round(l.laps[0]/l.laps[1]*100)}%"></i></div><span>hard ceiling</span></div>
+        <div class="cap"><b>Budget ${l.budget[0]}k / ${l.budget[1]}k</b><div class="lc-bar"><i class="${budPct>70?"warn":""}" style="width:${budPct}%"></i></div><span>tokens this run</span></div>
+        <div class="cap"><b>No progress → stop</b><div class="lc-bar"><i style="width:0%"></i></div><span>2 identical laps halts it</span></div>
+      </div></div>
+    <div class="lc-card"><h3>Autonomy — where your gate sits</h3>
+      <div class="lc-ladder">${RUNGS.map(x=>`<button data-rung="${x.k}" class="${l.rungK===x.k?"on":""}"><b>${x.name}</b>${x.desc.split(".")[0]}</button>`).join("")}</div>
+      <p class="lc-ladder-note">${icon("trending_up")} Loops <b>earn</b> autonomy: after 3 clean gated laps, Claude will suggest moving the gate right.</p></div>
+    ${l.assumptions?.length ? `<div class="lc-card"><h3>Assumptions — logged at intake</h3><ul class="lc-assume">${l.assumptions.map(a=>`<li>${esc(a)}</li>`).join("")}</ul></div>` : ""}
+    <div class="lc-card"><h3>Lap history</h3><div class="lc-laps">
+      ${l.history.map(h=>`<div class="lc-lap-row"><span class="lc-lap-n">${h.n}</span><span class="what">${esc(h.what)}</span><span class="verdict ${h.v[0]}">${esc(h.v[1])}</span></div>`).join("")}
+    </div></div>`;
+  document.getElementById("lc-back").addEventListener("click", ()=>{ state={view:"home"}; render(); });
+  const ap=document.getElementById("lc-approve"); if(ap) ap.addEventListener("click", ()=>{ l.status="armed"; l.runnerAt="ship"; l.history.unshift({n:"—", what:r.k==="draft"?"You opened the gate — PR #189 opened":"You opened the gate — merged", v:["pass","shipped"]}); toast("Gate opened"); renderDetail(); });
+  const rw=document.getElementById("lc-rework"); if(rw) rw.addEventListener("click", ()=>{ l.status="running"; l.runnerAt="act"; l.laps[0]++; l.history.unshift({n:"Lap "+l.laps[0], what:"Sent back with your notes — reworking", v:["live","running"]}); toast("Sent back for another lap"); renderDetail(); });
+  document.getElementById("lc-runnow").addEventListener("click", ()=>{ l.status="running"; l.runnerAt="act"; toast("Lap started"); renderDetail(); });
+  document.getElementById("lc-pause").addEventListener("click", ()=>{ l.status=l.status==="paused"?"armed":"paused"; l.runnerAt=null; toast(l.status==="paused"?"Loop paused":"Loop armed"); renderDetail(); });
+  document.getElementById("lc-chat").addEventListener("click", ()=>toast("Would open a chat scoped to this loop (tune the check, widen the budget, …)"));
+  app.querySelectorAll("[data-rung]").forEach(b=>b.addEventListener("click", ()=>{ l.rungK=b.dataset.rung; toast(`Gate moved: ${rung(l.rungK).name}${rung(l.rungK).gate?" — "+rung(l.rungK).gate:""}`); renderDetail(); }));
+  // animate the runner around the circuit while running
+  if (runnerTimer) clearInterval(runnerTimer);
+  if (l.status==="running") {
+    const pathK = ["act","check","act"];
+    let i = 0;
+    runnerTimer = setInterval(()=>{
+      const g = document.getElementById("runner"); if (!g) return;
+      i = (i+1) % pathK.length; const p = ST[pathK[i]];
+      g.setAttribute("transform", `translate(${p.x},${p.y})`);
+    }, 1400);
+  }
+}
+
+// ── CLAUDE-LED INTAKE — the LLM dials the loop in ─────────────────────────────
+function startIntake(promptText, fromTodoist) {
+  const draft = { id:"l"+Date.now(), name:promptText.replace(/^\(from Todoist\)\s*/,"").slice(0,48), env:"anvil-web", status:"draft",
+    trigger:"", act:"", check:"", rungK:"pr", laps:[0,10], budget:[0,300], runnerAt:null, history:[] };
+  state = { view:"intake", id:draft.id };
+  // Two scripts: fixing something broken vs building something new. The feature script's key
+  // difference: nothing fails today, so the CHECK must be created (acceptance tests first).
+  const isFeature = !/fix|flak|bug|broke|fail/i.test(promptText) && /add|export|feature|build|create|new/i.test(promptText);
+  const bugSteps = [
+    { claude: `Got it${fromTodoist?" — pulling this in from Todoist":""}: <b>${esc(draft.name)}</b>.<br><br>A loop is only as good as its <b>check</b> — how will we <i>know</i> it's done? From the repo I'd verify with:<br><code>bun test upload</code> green <b>and</b> no failure across 10 straight runs.`,
+      chips: [["Use that check", ()=>{ draft.check="bun test ×10 all green"; }], ["Just make tests pass once", ()=>{ draft.check="bun test upload exits 0"; }]] },
+    { claude: `Check locked — and the test files it runs are now <b>locked too</b>: a lap that edits the tests it's graded by fails as check-tampering.<br><br><b>Scope:</b> I'll stay inside <code>src/upload/</code> — a lap that touches anything else fails as a scope violation.<br><br>Hard stops: <b>10 laps max</b>, <b>300k tokens</b>, stop if 2 laps make no progress. Sound right?`,
+      chips: [["Sounds right", ()=>{ draft.act="Find & fix the flakiness (session)"; draft.scope="src/upload/ only · test files locked"; }], ["Tighter budget (150k)", ()=>{ draft.act="Find & fix the flakiness (session)"; draft.scope="src/upload/ only · test files locked"; draft.budget=[0,150]; }]] },
+    { claude: `<b>Where do you want to sit</b> on the circuit? I'd suggest <b>PR</b>: I fix and open a verified PR, the merge is yours. (New loops start gated; they earn a longer leash.)`,
+      chips: [["PR — I merge", ()=>{ draft.rungK="pr"; }], ["Draft — I open the PR myself", ()=>{ draft.rungK="draft"; }], ["Just suggest fixes", ()=>{ draft.rungK="suggest"; }]] },
+    { claude: `One more thing — <b>still ambiguous</b>, so you decide instead of me guessing:<br><br>1. I'm assuming the flake is <b>timing-related</b>. If it's environment-specific, the ×10 check won't catch it.<br>2. If the fix needs shared retry code <em>outside</em> <code>src/upload/</code>, I'll stop at the scope wall and ask.<br><br>Accept as logged assumptions, or adjust?`,
+      chips: [["Accept — log them on the loop", ()=>{ draft.assumptions=["Flake is timing-related (not env-specific)","Fix stays inside src/upload/"]; }], ["Widen scope to retry.ts too", ()=>{ draft.scope="src/upload/ + src/net/retry.ts · test files locked"; draft.assumptions=["Flake is timing-related (not env-specific)"]; }]] },
+    { claude: `Here's your loop — first lap will be a <b>dry-run</b> (sandboxed, no side effects) so you can see it work before it's trusted.<br><br><b>Trigger:</b> manual for now — once it's proven I can wire it to CI failures automatically.`,
+      chips: [["Arm it — run the dry lap", ()=>{ draft.trigger="Manual"; draft.status="running"; draft.runnerAt="act"; draft.laps=[1,10]; draft.history.unshift({n:"Lap 1", what:"Dry-run: reproducing the flake in a sandbox…", v:["live","dry-run"]}); loops.unshift(draft); toast("Loop armed — dry lap running"); state={view:"detail", id:draft.id}; render(); }],
+              ["Save as draft", ()=>{ draft.trigger="Manual"; loops.unshift(draft); toast("Saved as draft"); state={view:"home"}; render(); }]],
+      final:true },
+  ];
+  const featSteps = [
+    { claude: `Got it: <b>${esc(draft.name)}</b> — a <b>new feature</b>, so nothing fails today. That means the check has to be <i>created</i> before anything gets built.<br><br>I'll write the <b>acceptance tests first</b> — the downloaded CSV matches the on-screen table, has a header row, opens cleanly in Excel — and the check is those tests <b>plus</b> build green. Once written, that test file <b>locks</b>: I can't grade my own homework.`,
+      chips: [["Tests first — use that check", ()=>{ draft.check="reports-export.test.ts + build green"; draft.act="Build CSV export, tests-first (session)"; }], ["Judge only — no new tests", ()=>{ draft.check="judge: export works as described"; draft.act="Build CSV export (session)"; }]] },
+    { claude: `<b>Scope:</b> <code>src/reports/</code> plus the one new test file <code>reports-export.test.ts</code> (locked once written). Anything else fails the lap.<br><br>Features need more room than fixes — hard stops: <b>12 laps</b>, <b>400k tokens</b>, stop after 2 no-progress laps.`,
+      chips: [["Good", ()=>{ draft.scope="src/reports/ + reports-export.test.ts (locked once written)"; draft.laps=[0,12]; draft.budget=[0,400]; }], ["Cap it at 250k", ()=>{ draft.scope="src/reports/ + reports-export.test.ts (locked once written)"; draft.laps=[0,12]; draft.budget=[0,250]; }]] },
+    { claude: `Where do you sit? For a user-facing feature I'd keep the gate at <b>PR</b> — you see the UI in the PR before it merges.`,
+      chips: [["PR — I merge", ()=>{ draft.rungK="pr"; }], ["Draft branch only", ()=>{ draft.rungK="draft"; }]] },
+    { claude: `<b>Still ambiguous</b> — two product decisions I'd otherwise be guessing at:<br><br>1. Delimiter & encoding: I'll assume <b>comma + UTF-8</b> (Excel-friendly).<br>2. Big reports: I'll assume we <b>stream all rows</b> rather than cap at 10k.<br><br>Accept as logged assumptions, or answer now?`,
+      chips: [["Accept — log them on the loop", ()=>{ draft.assumptions=["Comma delimiter, UTF-8 (Excel-friendly)","Streams all rows — no cap"]; }], ["Cap at 10k rows", ()=>{ draft.assumptions=["Comma delimiter, UTF-8 (Excel-friendly)","Row cap 10k (your call at intake)"]; }]] },
+    { claude: `Your loop. Lap 1 writes the acceptance tests — <b>they'll fail, and that's the point</b>; building starts on lap 2. First lap is a dry-run.`,
+      chips: [["Arm it", ()=>{ draft.trigger="Manual"; draft.status="running"; draft.runnerAt="act"; draft.laps=[1,12]; draft.history.unshift({n:"Lap 1", what:"Writing acceptance tests first (they should fail)…", v:["live","dry-run"]}); loops.unshift(draft); toast("Loop armed"); state={view:"detail", id:draft.id}; render(); }],
+              ["Save as draft", ()=>{ draft.trigger="Manual"; loops.unshift(draft); toast("Saved as draft"); state={view:"home"}; render(); }]],
+      final:true },
+  ];
+  const steps = isFeature ? featSteps : bugSteps;
+  let step = 0;
+  app.innerHTML = `
+    <div class="lc-head"><button class="mini" id="lc-back">${icon("close")} Cancel</button><h2>New loop</h2></div>
+    <div class="lc-circuit-card" id="lc-live-circuit">${circuitSvg(draft)}</div>
+    <p class="lc-sub" style="text-align:center">${icon("auto_awesome")} Claude is building the circuit with you — watch the stations light up.</p>
+    <div class="lc-chat" id="lc-chat"></div>`;
+  document.getElementById("lc-back").addEventListener("click", ()=>{ state={view:"home"}; render(); });
+  const chat = document.getElementById("lc-chat");
+  const bubble = (cls, html) => { const d=document.createElement("div"); d.className="lc-bub "+cls; d.innerHTML=html; chat.appendChild(d); d.scrollIntoView({behavior:"smooth", block:"end"}); return d; };
+  bubble("user", esc(promptText));
+  const ask = () => {
+    const s = steps[step];
+    const typing = document.createElement("div"); typing.className="lc-typing"; typing.textContent="Claude is thinking…"; chat.appendChild(typing);
+    setTimeout(()=>{ typing.remove(); bubble("bot", s.claude);
+      const row=document.createElement("div"); row.className="lc-chips";
+      s.chips.forEach(([label, fn])=>{ const b=document.createElement("button"); b.textContent=label;
+        b.addEventListener("click", ()=>{ row.remove(); bubble("user", esc(label)); fn();
+          document.getElementById("lc-live-circuit").innerHTML = circuitSvg(draft);
+          if (!s.final) { step++; setTimeout(ask, FAST ? 30 : 350); } });
+        row.appendChild(b); });
+      chat.appendChild(row); row.scrollIntoView({behavior:"smooth", block:"end"});
+    }, FAST ? 40 : 700);
+  };
+  ask();
+}
+
+function render() { if (runnerTimer) { clearInterval(runnerTimer); runnerTimer=null; } ({ home:renderHome, detail:renderDetail }[state.view] || renderHome)(); }
+render();
+
+// ── screenshot scenes (?scene=…) ─────────────────────────────────────────────
+if (SCENE) {
+  const answerChips = (target) => { // auto-click the first (recommended) chip `target` times
+    let done = 0;
+    const t = setInterval(() => {
+      const b = document.querySelector(".lc-chips button");
+      if (b && done < target) { done++; b.click(); }
+      if (done >= target) clearInterval(t);
+    }, 120);
+  };
+  if (SCENE === "circuit") {
+    const l = loops.find(x=>x.id==="l2");
+    app.innerHTML = `<div class="lc-head" style="justify-content:center"><h2 style="flex:none">The loop, drawn as a loop</h2></div>
+      <div class="lc-circuit-card">${circuitSvg(l, true)}</div>
+      <p class="lc-sub" style="text-align:center">Trigger → Act ⇄ Check → 🔒 gate → Ship — the runner keeps lapping Act ⇄ Check until the check passes.</p>`;
+  } else if (SCENE.startsWith("intake")) {
+    const feat = SCENE.startsWith("intakefeat"); // intake-0…4 (bug fix) · intakefeat-0…4 (new feature)
+    const n = Number(SCENE.split("-")[1] || 0);
+    startIntake(feat ? "Add CSV export to the reports page" : "Fix the flaky upload test");
+    if (n > 0) answerChips(n);
+  } else if (SCENE === "detail-l2") {
+    state = { view:"detail", id:"l2" }; render();
+  } else if (SCENE === "detail-l3") {
+    state = { view:"detail", id:"l3" }; render();
+  } else if (SCENE === "detail-l4") {
+    state = { view:"detail", id:"l4" }; render();
+  } else if (SCENE === "shipped") {
+    const l = loops.find(x=>x.id==="l3");
+    l.status = "armed"; l.runnerAt = "ship";
+    l.history.unshift({ n:"—", what:"You opened the gate — PR #189 opened", v:["pass","shipped"] });
+    state = { view:"detail", id:"l3" }; render();
+  } // default: home
+}
+</script>
+</body>
+</html>
