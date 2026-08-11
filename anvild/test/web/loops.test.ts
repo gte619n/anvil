@@ -39,6 +39,9 @@ beforeEach(() => {
   overlays.overlays.length = 0;
   sent.length = 0;
   approved.length = 0;
+  fleet.serverLoops.clear(); // module Maps are shared across test files — clear all loop caches
+  fleet.serverLoopEntities.clear();
+  fleet.loopRuns.clear();
   history.replaceState(null, "", "https://appassets.androidplatform.net/");
 });
 

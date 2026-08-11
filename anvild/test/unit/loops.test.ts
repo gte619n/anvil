@@ -79,6 +79,18 @@ test("circuit fields: schedule is a suggest-rung heartbeat; a live goal laps at 
   expect(rows[1]).toMatchObject({ kind: "goal", rung: "pr", runnerAt: "check" });
 });
 
+test("excludeSessionIds drops goal rows owned by a live LoopRun (no double-vision)", () => {
+  const rows = buildLoopsSnapshot({
+    ...empty,
+    goals: [
+      { sessionId: "s1", title: "owned by a loop", condition: "c", iterations: 1 },
+      { sessionId: "s2", title: "free goal", condition: "c", iterations: 1 },
+    ],
+    excludeSessionIds: ["s1"],
+  });
+  expect(rows.map((r) => r.id)).toEqual(["s2"]);
+});
+
 test("environment id/name flow through to rows for grouping", () => {
   const rows = buildLoopsSnapshot({
     ...empty,

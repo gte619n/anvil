@@ -303,6 +303,13 @@ export class AutopilotService {
     this.deps.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid
   }
 
+  /** Seed a loop.convert with a draft work unit's request (name / env / prompt), or undefined if gone. */
+  workUnitSeed(id: string): { name: string; environmentId?: string; prompt: string } | undefined {
+    const u = this.workUnits.get(id);
+    if (!u) return undefined;
+    return { name: u.title, ...(u.environmentId ? { environmentId: u.environmentId } : {}), prompt: workUnitTaskText(u) };
+  }
+
   /** The autopilot-owned slice of the Loops panel snapshot (the Supervisor adds the goal rows). */
   loopsInputs(): Omit<LoopsInput, "goals"> {
     const schedule = this.autopilotSchedule.get();

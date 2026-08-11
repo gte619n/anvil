@@ -40,6 +40,9 @@ export interface LoopsInput {
   /** Work-unit drafts a human owns next: planned/needs-clarification units not yet built (Loops home's
    *  "drafts at your gate" section — the row opens the plan reader / converts to a real Loop in Phase 2). */
   drafts?: { id: string; title: string; status: string; source?: string; environmentId?: string; environmentName?: string }[];
+  /** Sessions owned by a live LoopRun — their goal rows are suppressed so a real Loop and its session
+   *  never render as two rows (spec §5 projection dedupe). */
+  excludeSessionIds?: string[];
 }
 
 const envFields = (o: { environmentId?: string; environmentName?: string }): { environmentId?: string; environmentName?: string } => ({
@@ -71,7 +74,9 @@ export function buildLoopsSnapshot(input: LoopsInput): LoopSummary[] {
     });
   }
 
+  const excluded = new Set(input.excludeSessionIds ?? []);
   for (const g of input.goals) {
+    if (excluded.has(g.sessionId)) continue; // owned by a live LoopRun — the real Loop renders it instead
     rows.push({
       kind: "goal",
       id: g.sessionId,

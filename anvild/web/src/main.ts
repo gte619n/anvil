@@ -101,7 +101,7 @@ import {
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
 // The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
 // Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
-import { initLoops, onLoopsHome, openLoops, openLoopsDeepLink } from "./loops";
+import { initLoops, onLoopRun, onLoopRuns, onLoopsHome, onLoopsList, onLoopUpdated, openLoops, openLoopsDeepLink } from "./loops";
 import {
   closeSettings,
   initSettings,
@@ -1273,6 +1273,18 @@ function onEvent(url: string, e: ServerEvent): void {
     case "loops.snapshot":
       onLoopsSnapshot(url, e.loops); // Autopilot Loops panel (writes the shared serverLoops cache)
       onLoopsHome(); // Loops home re-renders from that cache (coexists through Phases 1–3)
+      return;
+    case "loops.list":
+      onLoopsList(url, e.loops); // the real Loop-entity catalog
+      return;
+    case "loop.updated":
+      onLoopUpdated(url, e.loop);
+      return;
+    case "loop.run":
+      onLoopRun(e.run); // live run/lap update
+      return;
+    case "loop.runs":
+      onLoopRuns(e.loopId, e.runs);
       return;
     case "autopilot.plan":
       return; // resolved via cidWaiter (reassignPlan); the matching autopilot.plans broadcast refreshes state

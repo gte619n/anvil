@@ -161,15 +161,17 @@ Vertical slices; each independently shippable. `☐` not started · `◐` in pro
 ### Phase 2 — Loop entity, engine v1, gate verbs
 | Task | Implemented | Tested | Pushed |
 |---|---|---|---|
-| Protocol: Loop/LoopRun types, `loop.*` commands/events, `loops` capability; golden regen | ☐ | ☐ | ☐ |
-| `LoopStore` (catalog + JSONL runs, quarantine, retention) | ☐ | ☐ | ☐ |
-| `contract.ts`: validation/completeness/defaulting (pure) | ☐ | ☐ | ☐ |
-| Engine v1: manual trigger; `session-prompt` + `skill-check` bodies; `judge` + `command` checks; hard stops (laps/budget/no-progress); lap history | ☐ | ☐ | ☐ |
-| Scope guard: lap-boundary diff vs `scope.allow`; check-input lock → `check-tampering` | ☐ | ☐ | ☐ |
-| Gate: `at-gate` state; `Open the gate` (Suggest→report / Draft→branch / PR→PR) + `Send back a lap` (note injected) | ☐ | ☐ | ☐ |
-| Web: real loops in home/detail; minimal "New loop" dialog (scaffolding); `loop.convert` on drafts | ☐ | ☐ | ☐ |
-| Projection dedupe: `buildLoopsSnapshot` input gains `excludeSessionIds` (sessions owned by any live `LoopRun`) so a real Loop and its session never render as two rows | ☐ | ☐ | ☐ |
-| **Acceptance:** create a loop (prompt body, `bun test` command check, PR rung, 5-lap cap) via the dialog; Run now → laps advance with verdicts in the detail page; a lap whose diff exits scope fails `scope-violation`; a lap that edits the check's test file fails `check-tampering`; a passing check parks the run `at-gate`; `Open the gate` opens the PR; `Send back a lap` runs exactly one more lap carrying the note; 6th lap never runs; a run hitting no-progress ends terminal `no-progress` without parking at the gate | ☐ | ☐ | ☐ |
+| Protocol: Loop/LoopRun types, `loop.*` commands/events, `loops` capability; golden regen | ☑ | ☑ | ☐ |
+| `LoopStore` (catalog + JSONL runs, quarantine, retention) | ☑ | ☑ | ☐ |
+| `contract.ts`: validation/completeness/defaulting (pure) | ☑ | ☑ | ☐ |
+| Engine v1: manual trigger; `session-prompt` + `skill-check` bodies; `judge` + `command` checks; hard stops (laps/budget/no-progress); lap history | ☑ | ☑ | ☐ |
+| Scope guard: lap-boundary diff vs `scope.allow`; check-input lock → `check-tampering` | ☑ | ☑ | ☐ |
+| Gate: `at-gate` state; `Open the gate` (Suggest→report / Draft→branch / PR→PR) + `Send back a lap` (note injected) | ☑ | ☑ | ☐ |
+| Web: real loops in home/detail; minimal "New loop" dialog (scaffolding); `loop.convert` on drafts | ☑ | ☑ | ☐ |
+| Projection dedupe: `buildLoopsSnapshot` input gains `excludeSessionIds` (sessions owned by any live `LoopRun`) so a real Loop and its session never render as two rows | ☑ | ☑ | ☐ |
+| **Acceptance:** create a loop (prompt body, `bun test` command check, PR rung, 5-lap cap) via the dialog; Run now → laps advance with verdicts in the detail page; a lap whose diff exits scope fails `scope-violation`; a lap that edits the check's test file fails `check-tampering`; a passing check parks the run `at-gate`; `Open the gate` opens the PR; `Send back a lap` runs exactly one more lap carrying the note; 6th lap never runs; a run hitting no-progress ends terminal `no-progress` without parking at the gate | ☑ | ☑ | ☐ |
+
+> **Phase 2 evidence** (2026-08-11, branch `loops-circuit`). `bun test` → 952 pass / 1 skip / 0 fail (156 files). Daemon + web `bunx typescript@5.9 --noEmit` → exit 0. `bun run web/build.ts` → built OK. Protocol golden regenerated: +13 loop wire literals, **PROTOCOL_VERSION stays 4** (additive; `protocol-surface.test` passes). New daemon modules: `src/loops/{contract,scope-guard,checks,store,engine}.ts` + `src/session/loop-service.ts`, wired via `supervisor.ts` + `dispatch.ts`. New tests: `test/integration/loops-lifecycle.test.ts` (9 scenarios — the full acceptance: laps→verdicts→at-gate→open PR, scope-violation, check-tampering, 5-lap ceiling, terminal no-progress, over-budget, sendback exactly-one-lap + ceiling refusal, check-error tolerance, concurrent-gate idempotency), `test/unit/loop-{contract,scope-guard,checks,store}.test.ts` (37 pure-module cases), `test/web/loops-entity.test.ts` (real-loop home + gate verbs over jsdom), plus `excludeSessionIds` projection test. Fresh-context adversarial review: **no BLOCKER**; 1 MAJOR (concurrent `openGate` double-ship) — **resolved** via an in-flight gate guard + regression test (D-013). *Pushed left ☐: committed to the feature branch, not merged to `main`.*
 
 ### Phase 3 — Claude-led intake
 | Task | Implemented | Tested | Pushed |

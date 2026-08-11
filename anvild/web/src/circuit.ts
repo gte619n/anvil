@@ -5,7 +5,7 @@
 // Both the Phase-1 projection (loopToCircuit below) and the Phase-2 real Loop entity produce a
 // CircuitView, so the same renderer draws every row.
 import { esc, icon } from "./dom";
-import type { LoopRung, LoopStation, LoopStatus, LoopSummary } from "../../protocol";
+import type { Loop, LoopRun, LoopRung, LoopStation, LoopStatus, LoopSummary } from "../../protocol";
 
 export interface CircuitView {
   trigger: string; // Trigger-station sublabel
@@ -96,6 +96,74 @@ export function miniSvg(l: CircuitView): string {
     ${l.rung !== "ship" ? `<rect x="85" y="10" width="8" height="8" rx="2" transform="rotate(45 89 14)" fill="none" stroke="#b07cc3" stroke-width="1.5"/>` : ""}
     ${dot !== null ? `<circle cx="${dot}" cy="14" r="5" fill="${col}"/>` : ""}
   </svg>`;
+}
+
+// ── Real Loop entity → circuit view (Phase 2) ──────────────────────────────────────────────────────
+export function triggerLabel(t: Loop["trigger"]): string {
+  switch (t.kind) {
+    case "manual":
+      return "Manual";
+    case "schedule":
+      return `Daily ${t.timeOfDay}`;
+    case "event":
+      return `On ${t.eventKind}`;
+    case "chained":
+      return `After another loop (${t.on})`;
+  }
+}
+export function actLabel(a: Loop["act"]): string {
+  switch (a.kind) {
+    case "session-prompt":
+      return a.prompt.length > 48 ? a.prompt.slice(0, 47) + "…" : a.prompt;
+    case "skill-check":
+      return `run: ${a.command}`;
+    case "autopilot":
+      return "Turn tasks into loop drafts";
+    case "pipeline":
+      return "Autonomous dev pipeline";
+  }
+}
+export function checkLabelShort(c: Loop["checks"][number]): string {
+  switch (c.kind) {
+    case "judge":
+      return c.condition;
+    case "command":
+      return c.command;
+    case "metric":
+      return `${c.command} ${c.op} ${c.threshold}`;
+    case "http":
+      return c.url;
+  }
+}
+/** The run's position on the circuit → runner station. */
+function runnerForRun(run?: LoopRun): LoopStation | null {
+  if (!run) return null;
+  if (run.status === "at-gate") return "gate";
+  if (run.status === "shipped") return "ship";
+  if (run.status === "running" || run.status === "sent-back") return "check";
+  return null; // terminal / no live run
+}
+/** Map a persisted Loop + its latest run to a circuit view. */
+export function loopEntityToCircuit(loop: Loop, run?: LoopRun): CircuitView {
+  const checks = loop.checks.length ? loop.checks.map(checkLabelShort).join(" · ") : "no check — always gates";
+  return {
+    trigger: triggerLabel(loop.trigger),
+    act: actLabel(loop.act),
+    check: checks,
+    rung: loop.rung,
+    runnerAt: runnerForRun(run),
+    laps: { current: run?.laps.length ?? 0, max: loop.hardStops.maxLaps },
+    ...(loop.scope?.allow.length ? { scope: loop.scope.allow.join(", ") + (loop.scope.note ? ` — ${loop.scope.note}` : "") } : {}),
+    status: entityStatus(loop, run),
+  };
+}
+/** A row/mini status word for a real loop (drives the mini-glyph colour + chip). */
+export function entityStatus(loop: Loop, run?: LoopRun): LoopStatus {
+  if (run?.status === "at-gate") return "gated";
+  if (run && (run.status === "running" || run.status === "sent-back")) return "running";
+  if (loop.status === "paused" || loop.status === "disabled") return "paused";
+  if (loop.status === "armed") return "armed";
+  return "idle";
 }
 
 /** Map a projected/real loop row to a circuit view, filling display defaults the daemon may have omitted. */

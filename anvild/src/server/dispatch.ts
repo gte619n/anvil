@@ -439,6 +439,48 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         send(deps.supervisor.loopsSnapshotEvent(cid));
         return;
 
+      // ── Loop entity (loops-circuit spec §4.3) ──
+      case "loops.list":
+        send(deps.supervisor.loops.list(cid));
+        return;
+      case "loop.save":
+        send(deps.supervisor.loops.save(cmd.loop, cid));
+        return;
+      case "loop.remove":
+        send(deps.supervisor.loops.remove(cmd.loopId, cid) as unknown as ServerEvent);
+        return;
+      case "loop.arm":
+        send(deps.supervisor.loops.arm(cmd.loopId, cid));
+        return;
+      case "loop.pause":
+        send(deps.supervisor.loops.pause(cmd.loopId, cid));
+        return;
+      case "loop.run":
+        send(deps.supervisor.loops.run(cmd.loopId, cid));
+        return;
+      case "loop.gate.open":
+        deps.supervisor.loops
+          .gateOpen(cmd.runId, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+      case "loop.gate.sendback":
+        deps.supervisor.loops
+          .gateSendback(cmd.runId, cmd.note, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+      case "loop.runs.get":
+        send(deps.supervisor.loops.runsEvent(cmd.loopId, cid));
+        return;
+      case "loop.convert":
+        send(deps.supervisor.convertDraftToLoop(cmd.workUnitId, cid));
+        return;
+      case "loop.dryrun":
+        // Phase 3 wires the throwaway-worktree dry run; until then it's a plain manual run.
+        send(deps.supervisor.loops.run(cmd.loopId, cid));
+        return;
+
       case "autopilot.tags.reset":
         deps.supervisor
           .resetAnvilTags(cid)

@@ -1046,6 +1046,33 @@ export function confirmDialog(opts: { title: string; body?: string; confirmLabel
   );
 }
 
+/** A single-line text prompt dialog (replaces window.prompt, which the WebView shells don't support and
+ *  jsdom can't run). Resolves the trimmed text, or null if cancelled / left blank. */
+export function promptDialog(opts: { title: string; placeholder?: string; confirmLabel?: string; icon?: string; multiline?: boolean }): Promise<string | null> {
+  const field = opts.multiline
+    ? `<textarea id="pd-input" rows="3" placeholder="${esc(opts.placeholder ?? "")}"></textarea>`
+    : `<input type="text" id="pd-input" placeholder="${esc(opts.placeholder ?? "")}" />`;
+  return modalPromise<string | null>(
+    `<div class="modal-box">
+      <h3>${opts.icon ? icon(opts.icon) + " " : ""}${esc(opts.title)}</h3>
+      <label class="ap-field">${field}</label>
+      <div class="btns"><button type="button" id="pd-cancel">Cancel</button><button type="button" id="pd-ok" class="primary">${esc(opts.confirmLabel ?? "OK")}</button></div>
+    </div>`,
+    null,
+    (_m, done) => {
+      const input = $<HTMLInputElement | HTMLTextAreaElement>("#pd-input");
+      const submit = (): void => {
+        const v = input.value.trim();
+        done(v ? v : null);
+      };
+      $<HTMLButtonElement>("#pd-ok").onclick = submit;
+      $<HTMLButtonElement>("#pd-cancel").onclick = () => done(null);
+      if (!opts.multiline) input.onkeydown = (e) => { if ((e as KeyboardEvent).key === "Enter") submit(); };
+      input.focus();
+    },
+  );
+}
+
 /** Like confirmDialog, but with one extra checkbox toggle. Resolves { ok, checked }; cancelling
  *  (button, Escape, Back, backdrop) resolves { ok:false } and the checkbox state is irrelevant. */
 export function confirmDialogWithOption(opts: {

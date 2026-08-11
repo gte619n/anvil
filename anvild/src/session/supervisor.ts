@@ -31,6 +31,7 @@ import {
   type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
   type LoopsSnapshotEvent,
+  type LoopUpdatedEvent,
   type AuthProvider,
   type AuthStatusEvent,
   type AuthAccountsEvent,
@@ -84,6 +85,7 @@ import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
 import { GitProjectionService } from "./git-projection-service";
 import { AutopilotService } from "./autopilot-service";
+import { LoopService } from "./loop-service";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
 import type { WorkUnit } from "../integrations/workunit";
@@ -224,6 +226,7 @@ export class Supervisor {
   private readonly teams: TeamCoordinator;
   /** Autopilot domain — work-unit plans, runs, dev pipeline, schedule, Todoist/lapo sync (P7 extraction). */
   private readonly autopilot: AutopilotService;
+  readonly loops: LoopService;
   private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
@@ -351,6 +354,17 @@ export class Supervisor {
         this.persist();
         this.broadcastUpdated(built.data);
       },
+    });
+    this.loops = new LoopService({
+      registry: this.registry,
+      stateDir: cfg.stateDir,
+      envStore: this.envStore,
+      worktreeRoot: () => this.store.worktreeRoot(),
+      judgeEnv: () => this.agentEnv(),
+      accounts: this.accounts,
+      accountId: () => undefined,
+      notify: (title, body, tag) => this.pushSystemAlert(title, body, tag),
+      onCatalogChange: () => this.broadcastLoops(),
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
@@ -716,11 +730,17 @@ export class Supervisor {
           ...(envName ? { environmentName: envName } : {}),
         };
       });
-    const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals });
+    const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals, excludeSessionIds: this.loops.activeRunSessionIds() });
     return { v: PROTOCOL_VERSION, type: "loops.snapshot", ts: now(), ...(cid ? { cid } : {}), loops };
   }
   private broadcastLoops(): void {
     this.registry.toAll(this.loopsSnapshotEvent());
+  }
+  /** Convert an autopilot draft (work unit) into a real Loop, seeded from the unit's request. */
+  convertDraftToLoop(workUnitId: string, cid?: string): LoopUpdatedEvent {
+    const seed = this.autopilot.workUnitSeed(workUnitId);
+    if (!seed) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    return this.loops.convert(workUnitId, seed, cid);
   }
   /** Ingest an external event as a proposed work unit (loop-engineering: Channels). */
   ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
