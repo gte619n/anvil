@@ -14,6 +14,8 @@ import { toPipelineTraceInfo } from "../pipeline/daemon-adapters";
 export function selectPendingPlans(units: WorkUnit[]): WorkUnit[] {
   return units.filter(
     (u) =>
+      // Event-proposed units awaiting a human approve (propose-don't-run) live on the grid with a badge.
+      (u.status === "proposed" && !u.sessionId) ||
       (u.status === "planned" && !u.sessionId) ||
       // Held-for-clarification units live on the grid too, so the reviewer can read the open questions
       // and answer them (by opening a planning session, which promotes the unit back to `planned`) or dismiss.
@@ -79,9 +81,24 @@ export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, ren
     taskCount: u.taskIds.length,
     ...(u.plan ? { plan: renderer.render(u.plan) } : {}),
     ...(u.devPipeline ? { pipeline: toPipelineTraceInfo(u.devPipeline) } : {}),
+    ...(u.hold ? { hold: u.hold } : {}),
+    // Strip the server-only dedupeKey — the card only needs kind/source/at.
+    ...(u.trigger ? { trigger: { kind: u.trigger.kind, source: u.trigger.source, at: u.trigger.at } } : {}),
+    ...(u.goalCondition ? { goalCondition: u.goalCondition } : {}),
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
   };
+}
+
+/**
+ * The stop-condition seeded onto a plan's build session as a `/goal` (loop-engineering: run-until-done).
+ * A build session with a goal self-verifies — the Stop hook won't let it go idle until a judge agrees the
+ * plan is actually implemented and the checks pass, instead of stopping the moment the model *claims* it's
+ * done. Returns undefined for a unit with no plan (a bare title isn't a checkable goal). Pure + testable.
+ */
+export function buildAutopilotGoal(u: WorkUnit): string | undefined {
+  if (!u.plan?.trim()) return undefined;
+  return `the plan for “${u.title}” is fully implemented in this worktree and the project's build and tests pass`;
 }
 
 /** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */

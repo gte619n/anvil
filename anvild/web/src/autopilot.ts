@@ -29,8 +29,8 @@ import { stripeColor } from "./sessionColor";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
 import { newCid } from "./outbox";
 import { relTime } from "./conversation";
-import { HUB_URL, envServer, orderedServers, planServer, serverByUrl, serverPlans, serverSupports, sessionServer, type Server } from "./fleet";
-import type { AutopilotPlanInfo, AutopilotSchedule, Environment, PipelineTraceInfo, ServerEvent, Session } from "../../protocol";
+import { HUB_URL, envServer, orderedServers, planServer, serverByUrl, serverLoops, serverPlans, serverSupports, sessionServer, type Server } from "./fleet";
+import type { AutopilotPlanInfo, AutopilotSchedule, Environment, LoopSummary, PipelineTraceInfo, ServerEvent, Session } from "../../protocol";
 
 // ── Injected dependencies (initAutopilot) ────────────────────────────────────────────────────────
 // What autopilot code calls back into main.ts for. Each field documents the main.ts state it reaches.
@@ -303,6 +303,7 @@ export function openAutopilot(): void {
   for (const s of orderedServers())
     if (s.sock.isOpen() && serverSupports(s, "autopilot")) {
       s.sock.send({ type: "autopilot.plans.list" }); // fresh pull (autopilot-capable servers only)
+      s.sock.send({ type: "loops.get" }); // active loops for the Loops panel
       s.sock.send({ type: "autopilot.schedule.get" });
     }
 }
@@ -335,12 +336,27 @@ function planCardHtml(p: AutopilotPlanInfo): string {
   const when = ms
     ? `<span class="ap-chip ap-chip-when" title="Last action ${esc(new Date(ms).toLocaleString())}">${icon("history")}${esc(relTime(ms))}</span>`
     : "";
-  return `<button class="plan-card" data-id="${esc(p.id)}" style="--plan-stripe:${stripe}">
+  // Event-triggered provenance (CI failure, label, webhook) — how this card got here.
+  const trig = p.trigger
+    ? `<span class="ap-chip ap-chip-trigger" title="Triggered by ${esc(p.trigger.source)}">${icon("bolt")}${esc(p.trigger.source)}</span>`
+    : "";
+  // The run-until-done stop-condition seeded onto the build session, shown as a goal chip.
+  const goal = p.goalCondition
+    ? `<span class="ap-chip ap-chip-goal" title="Stop condition: ${esc(p.goalCondition)}">${icon("target")}goal</span>`
+    : "";
+  // A persisted auto-start hold (e.g. adversarial consensus below the bar) — the durable stop-reason.
+  const hold = p.hold
+    ? `<span class="plan-hold" title="${esc(p.hold.reason)}">${icon("pause_circle")} Held — ${esc(p.hold.reason)}</span>`
+    : "";
+  return `<button class="plan-card${p.status === "proposed" ? " plan-proposed" : ""}" data-id="${esc(p.id)}" style="--plan-stripe:${stripe}">
     <span class="plan-title">${esc(p.title)}</span>
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
+    ${hold}
     <span class="plan-meta">
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
+      ${trig}
+      ${goal}
       ${p.source === "label" ? `<span class="ap-chip ap-chip-label">${icon("label")}via label</span>` : ""}
       <span class="ap-chip status-${esc(p.status)}">${esc(p.status)}</span>
       ${when}
@@ -376,6 +392,51 @@ function plansByEnvironment(list: AutopilotPlanInfo[]): { envId?: string; name: 
 const apScrollBody = (): HTMLElement | null => document.querySelector(".autopilot-view .settings-body");
 let apGridScroll = 0;
 
+/** Every active loop across the connected fleet, in server order (schedule → goals → pipelines → proposals). */
+function activeLoops(): LoopSummary[] {
+  const out: LoopSummary[] = [];
+  for (const s of orderedServers()) out.push(...(serverLoops.get(s.url) ?? []));
+  return out;
+}
+const LOOP_ICON: Record<string, string> = { schedule: "schedule", goal: "target", pipeline: "hub", trigger: "bolt" };
+/** One loop row: what it is, what fires it, when it stops, and (run-until-done) which attempt it's on. */
+function loopRowHtml(l: LoopSummary): string {
+  const iter = l.iteration ? `<span class="loop-iter" title="attempt ${l.iteration.current} of ${l.iteration.max}">${l.iteration.current}/${l.iteration.max}</span>` : "";
+  const next = l.nextFireAt ? `<span class="small muted loop-next" title="${esc(new Date(l.nextFireAt).toLocaleString())}">next ${esc(new Date(l.nextFireAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span>` : "";
+  const jump = l.sessionId ? ` data-loop-session="${esc(l.sessionId)}" role="button" tabindex="0"` : "";
+  return `<div class="loop-row loop-${esc(l.status)}"${jump}>
+    <span class="loop-kind">${icon(LOOP_ICON[l.kind] ?? "all_inclusive")}</span>
+    <span class="loop-main">
+      <span class="loop-title">${esc(l.title)}</span>
+      <span class="loop-sub small muted">${esc(l.trigger)} <span class="loop-arrow">→</span> ${esc(l.stopCondition)}</span>
+      ${l.detail ? `<span class="loop-detail small muted">${esc(l.detail)}</span>` : ""}
+    </span>
+    <span class="loop-meta">${iter}<span class="loop-status-chip loop-${esc(l.status)}">${esc(l.status)}</span>${next}</span>
+  </div>`;
+}
+/** The Loops panel — one surface naming every active loop (empty string when nothing is looping). */
+function loopsPanelHtml(): string {
+  const loops = activeLoops();
+  if (!loops.length) return "";
+  return `<section class="loops-panel">
+    <div class="loops-head">${icon("all_inclusive")} <b>Loops</b> <span class="small muted">${loops.length} active</span></div>
+    <div class="loops-list">${loops.map(loopRowHtml).join("")}</div>
+  </section>`;
+}
+/** A loop row that owns a session jumps into it on click/Enter. */
+function wireLoopRows(host: HTMLElement): void {
+  host.querySelectorAll<HTMLElement>(".loop-row[data-loop-session]").forEach((r) => {
+    const go = (): void => { dismissOverlay("autopilot"); selectSession(r.dataset.loopSession!); };
+    r.addEventListener("click", go);
+    r.addEventListener("keydown", (ev) => { if ((ev as KeyboardEvent).key === "Enter") go(); });
+  });
+}
+/** A server delivered its active loops: cache + re-render the panel if the grid is visible. */
+export function onLoopsSnapshot(url: string, loops: LoopSummary[]): void {
+  serverLoops.set(url, loops);
+  if (openPlanId === null && document.getElementById("autopilot-grid")) renderAutopilotGrid();
+}
+
 function renderAutopilotGrid(): void {
   const body = apScrollBody();
   // Coming back from a plan reader (openPlanId still set) → restore where the grid was; a same-view
@@ -386,14 +447,16 @@ function renderAutopilotGrid(): void {
   if (!host) return;
   const restoreScroll = (): void => { if (body) body.scrollTop = keepScroll; };
   const multi = orderedServers().length > 1;
+  const loopsHtml = loopsPanelHtml(); // one surface for every active loop, above the plan grid
   if (pendingPlanCount() === 0) {
-    host.innerHTML = `<div class="ap-empty">${icon("inbox")}
+    host.innerHTML = `${loopsHtml}<div class="ap-empty">${icon("inbox")}
       <p>No pending plans.</p>
       <p class="small muted">Link a Todoist project to an environment in Settings, then <b>Run autopilot</b> to generate plans.</p></div>`;
+    wireLoopRows(host);
     restoreScroll();
     return;
   }
-  let html = "";
+  let html = loopsHtml;
   for (const srv of orderedServers()) {
     const list = serverPlans.get(srv.url) ?? [];
     if (multi) html += `<div class="ap-server-sep"><span class="conn-dot ${srv.status}"></span>${esc(srv.name)}</div>`;
@@ -410,6 +473,7 @@ function renderAutopilotGrid(): void {
     }
   }
   host.innerHTML = html;
+  wireLoopRows(host);
   host.querySelectorAll<HTMLElement>(".plan-card").forEach((c) =>
     c.addEventListener("click", () => openPlan(c.dataset.id!)),
   );
@@ -434,7 +498,12 @@ function renderPipelineTrace(t: PipelineTraceInfo): string {
     : "";
   const check = (label: string, v?: string): string =>
     v ? `<span class="pt-check pt-${esc(v)}">${label}: ${esc(v)}</span>` : "";
-  const loops = t.loopbacks.filter((l) => l.count > 0).map((l) => `${esc(l.phase)} ×${l.count}`).join(", ");
+  // Narrate the re-work: which phases bounced and how many times (a stalled/thrashing run is visible here
+  // rather than hidden behind a bare spinner). e.g. "design revised 2×, implementation revised 1×".
+  const loops = t.loopbacks
+    .filter((l) => l.count > 0)
+    .map((l) => `${esc(l.phase)} revised ${l.count}×`)
+    .join(", ");
   const criteria = t.criteria
     .map((c) => `<li><code>${esc(c.id)}</code> <span class="small muted">[${esc(c.kind)}]</span> ${esc(c.text)}</li>`)
     .join("");
@@ -448,7 +517,7 @@ function renderPipelineTrace(t: PipelineTraceInfo): string {
     ${t.reason ? `<p class="small">${esc(t.reason)}</p>` : ""}
     ${prLink ? `<p class="small">PR: ${prLink}</p>` : ""}
     <div class="pt-checks">${check("criteria", t.verification.criteriaTests)}${check("adversary tests", t.verification.adversaryTests)}${check("lint/types/build", t.verification.lintTypesBuild)}${t.verification.coverage ? `<span class="pt-check">coverage: ${esc(t.verification.coverage)}</span>` : ""}</div>
-    ${loops ? `<p class="small muted">Loop-backs: ${esc(loops)}</p>` : ""}
+    ${loops ? `<p class="small muted">${icon("replay")} Re-work loops: ${loops}</p>` : ""}
     ${t.validationNote ? `<p class="small"><b>Built vs. asked:</b> ${esc(t.validationNote)}</p>` : ""}
     ${criteria ? `<details class="pt-details"><summary class="small">Acceptance criteria (${t.criteria.length})</summary><ul class="small">${criteria}</ul></details>` : ""}
     ${rows ? `<details class="pt-details"><summary class="small">Model assignment per phase</summary><table class="pt-table small"><thead><tr><th>Phase</th><th>Author</th><th>Adversary</th></tr></thead><tbody>${rows}</tbody></table></details>` : ""}
@@ -469,11 +538,17 @@ function openPlan(id: string): void {
   // A unit with a live "Plan with Claude" session is owned by that session — Start/Plan/Pipeline would all
   // just error ("already has a live session"). Swap the whole action set for a jump-into-the-session button.
   const planning = p.status === "planning";
+  // An event-proposed unit awaiting a human decision (propose-don't-run): approve (→ planned) or reject.
+  const proposed = p.status === "proposed";
   const actions = planning
     ? `<button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
         <button class="primary" id="plan-open-session"${p.sessionId ? "" : " disabled title=\"Its planning session is no longer available\""}>${icon("open_in_new")} Open session</button>`
+    : proposed
+    ? `<button class="mini danger" id="plan-dismiss">${icon("close")} Reject</button>
+        <button class="mini" id="plan-approve">${icon("check")} Approve</button>
+        <button class="primary" id="plan-approve-start">${icon("rocket_launch")} Approve &amp; start</button>`
     : `<button class="mini" id="plan-complete">${icon("check_circle")} Complete</button>
         <button class="mini" id="plan-expire">${icon("schedule")} Expired</button>
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
@@ -490,6 +565,9 @@ function openPlan(id: string): void {
     </div>
     <div class="plan-reader-body">
       ${planning ? `<p class="small muted">${icon("auto_awesome")} This plan is being worked out in a live planning session. Open it to continue, answer questions, and build.</p>` : ""}
+      ${proposed && p.trigger ? `<p class="small muted">${icon("bolt")} Proposed by <b>${esc(p.trigger.source)}</b> — approve to plan &amp; build, or reject.</p>` : ""}
+      ${p.hold ? `<div class="reader-hold">${icon("pause_circle")} <b>Held for review:</b> ${esc(p.hold.reason)}</div>` : ""}
+      ${p.goalCondition ? `<p class="small muted">${icon("target")} Stop condition once building: ${esc(p.goalCondition)}</p>` : ""}
       ${p.pipeline ? renderPipelineTrace(p.pipeline) : ""}
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
     </div>
@@ -499,15 +577,19 @@ function openPlan(id: string): void {
   // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
   openOverlay("plan", () => renderAutopilotGrid());
   $("#plan-back").addEventListener("click", () => backToGrid());
-  $("#plan-complete").addEventListener("click", () => void resolvePlan(id, "completed"));
-  $("#plan-expire").addEventListener("click", () => void resolvePlan(id, "expired"));
-  $("#plan-dismiss").addEventListener("click", () => void dismissPlan(id));
+  // These three exist only in some action sets (not on a proposed card), so wire them null-safe.
+  document.getElementById("plan-complete")?.addEventListener("click", () => void resolvePlan(id, "completed"));
+  document.getElementById("plan-expire")?.addEventListener("click", () => void resolvePlan(id, "expired"));
+  document.getElementById("plan-dismiss")?.addEventListener("click", () => void dismissPlan(id));
   if (planning) {
     $("#plan-open-session").addEventListener("click", () => {
       if (!p.sessionId) return;
       dismissOverlay("autopilot");
       selectSession(p.sessionId);
     });
+  } else if (proposed) {
+    document.getElementById("plan-approve")?.addEventListener("click", () => void approvePlan(id, false));
+    document.getElementById("plan-approve-start")?.addEventListener("click", () => void approvePlan(id, true));
   } else {
     $("#plan-reassign").addEventListener("click", () => void reassignPlan(id));
     $("#plan-link").addEventListener("click", () => void linkPlanToSession(id));
@@ -613,6 +695,45 @@ async function resolvePlan(id: string, status: "completed" | "expired"): Promise
     backToGrid(); // the broadcast also refreshes, but don't wait on it
   } catch (err) {
     toast(`${verb} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Approve an event-proposed plan (propose-don't-run): promote it to `planned` and, when `start`, launch
+ *  the build immediately. Rejecting a proposal reuses the Dismiss path. */
+async function approvePlan(id: string, start: boolean): Promise<void> {
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  const btn = document.getElementById(start ? "plan-approve-start" : "plan-approve") as HTMLButtonElement | null;
+  const reset = (): void => {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = start ? `${icon("rocket_launch")} Approve & start` : `${icon("check")} Approve`;
+    }
+  };
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `${icon("hourglass_empty")} ${start ? "Starting…" : "Approving…"}`;
+  }
+  try {
+    const res = await sendAwait(srv, { type: "autopilot.approve", workUnitId: id, start, cid: newCid() }, 60_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      reset();
+      return;
+    }
+    if (start && res.type === "autopilot.started") {
+      dismissOverlay("autopilot");
+      selectSession(res.sessionId);
+      return;
+    }
+    toast(start ? "Approved & started" : "Approved — ready to build");
+    backToGrid(); // the autopilot.plans broadcast refreshes the grid
+  } catch (err) {
+    toast(`Approve failed: ${err instanceof Error ? err.message : String(err)}`);
+    reset();
   }
 }
 

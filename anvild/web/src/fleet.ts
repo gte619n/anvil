@@ -23,7 +23,7 @@ import { $, enhanceSelect, esc, icon, refreshSelect } from "./dom";
 import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { armJoinWindow } from "./setup";
 import { ui } from "./state";
-import type { AutopilotPlanInfo, Budget, Environment, ServerEvent, Session, TeamInfo, TeamPlan, rest } from "../../protocol";
+import type { AutopilotPlanInfo, Budget, Environment, LoopSummary, ServerEvent, Session, TeamInfo, TeamPlan, rest } from "../../protocol";
 
 // ── Injected dependencies (initFleet) ────────────────────────────────────────────────────────────
 // What fleet code calls back into main.ts for. Each field documents the main.ts state it reaches.
@@ -135,6 +135,7 @@ export const sessionServer = new Map<string, string>(); // sessionId → server 
 export const envServer = new Map<string, string>(); // environmentId → server url (grouping/routing)
 // Autopilot pending plans, tagged by the server they arrived from (anvil-autopilot-ui.md).
 export const serverPlans = new Map<string, AutopilotPlanInfo[]>(); // server url → its pending plans
+export const serverLoops = new Map<string, LoopSummary[]>(); // server url → its active loops (Loops panel)
 export const planServer = new Map<string, string>(); // workUnitId → server url (route plan.session/dismiss/start)
 // Team trees, derived on the daemon and tagged by server (anvil-team-support.md §5). Cached like
 // serverPlans so the sidebar rollup + the lead's member board stay live off `team.info`.
@@ -284,6 +285,7 @@ function removeServer(url: string): void {
   for (const [sid, u] of [...sessionServer]) if (u === url) { sessionServer.delete(sid); sessions.delete(sid); }
   for (const [eid, u] of [...envServer]) if (u === url) { envServer.delete(eid); environments.delete(eid); }
   serverPlans.delete(url);
+  serverLoops.delete(url);
   serverTeams.delete(url);
   for (const [pid, u] of [...planServer]) if (u === url) planServer.delete(pid);
   // Drop the removed server's autopilot state too, else a lingering `running: true` keeps the fleet-wide

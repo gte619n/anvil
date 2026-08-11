@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Anvil Loops — a walkthrough</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <style>
+    :root { --r-main-font-size: 30px; --accent: #6b9bff; --ok: #21ba45; --warnc: #e8730c; --gate: #b07cc3; --run: #f2c037; }
+    .reveal { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .reveal .slides { text-align: left; }
+    .reveal h1, .reveal h2, .reveal h3 { font-family: inherit; text-transform: none; letter-spacing: -0.01em; }
+    .reveal h1 { font-size: 1.9em; } .reveal h2 { font-size: 1.15em; margin-bottom: .6em; }
+    .reveal .accent { color: var(--accent); }
+    .reveal .muted { color: #9aa0a6; }
+    .reveal .small { font-size: .62em; line-height: 1.55; }
+    .reveal .duo { display: flex; gap: 34px; align-items: center; }
+    .reveal .duo .txt { flex: 1.05; min-width: 0; }
+    .reveal .duo .pic { flex: 1.4; min-width: 0; text-align: center; }
+    .reveal .duo img { max-height: 620px; max-width: 100%; width: auto; border-radius: 12px; border: 1px solid #34373c; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+    .reveal img.wide { max-height: 470px; max-width: 92%; border-radius: 12px; border: 1px solid #34373c; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+    .reveal .stepno { display: inline-flex; align-items: center; justify-content: center; width: 1.5em; height: 1.5em; border-radius: 50%; background: var(--accent); color: #fff; font-size: .7em; font-weight: 700; margin-right: .45em; vertical-align: middle; }
+    .reveal .stepno.f { background: var(--ok); }
+    .reveal ul { margin-left: .8em; } .reveal li { margin: .35em 0; }
+    .reveal .callout { border-left: 4px solid var(--accent); padding: .35em .8em; background: rgba(107,155,255,.08); border-radius: 0 10px 10px 0; font-size: .68em; line-height: 1.5; }
+    .reveal .pill { display: inline-block; font-size: .5em; border: 1px solid; border-radius: 999px; padding: .15em .8em; margin-right: .4em; vertical-align: middle; }
+    .reveal table { font-size: .58em; } .reveal table td, .reveal table th { border-bottom: 1px solid #34373c; padding: .45em .7em; }
+    .reveal .kbd { font-family: ui-monospace, Menlo, monospace; font-size: .85em; background: #24292e; border-radius: 6px; padding: .05em .4em; }
+    .reveal blockquote { background: rgba(255,255,255,.04); border-left: 4px solid var(--warnc); font-style: normal; padding: .5em 1em; width: 100%; box-shadow: none; }
+    .reveal .usecase { display: inline-block; font-size: .55em; letter-spacing: .12em; text-transform: uppercase; color: var(--run); border: 1px solid var(--run); border-radius: 999px; padding: .2em 1em; margin-bottom: .6em; }
+    .reveal .usecase.f { color: var(--ok); border-color: var(--ok); }
+  </style>
+</head>
+<body>
+<div class="reveal"><div class="slides">
+
+  <!-- 1 · title -->
+  <section>
+    <h1><span class="accent">∞ Loops</span></h1>
+    <h2 style="font-size:1.4em">Work that runs until it's <em>verifiably</em> done.</h2>
+    <p class="small muted">A walkthrough of the Anvil Loops concept — two real use cases: a bug fix and a new feature.<br/>Concept mock · August 2026 · <span class="kbd">→</span> to advance</p>
+  </section>
+
+  <!-- 2 · why -->
+  <section>
+    <h2>Why loops?</h2>
+    <blockquote class="small"><b>“A loop is a task with a check. A task without a check is just hope.”</b><br/><span class="muted">— the agentic-loop field guide</span></blockquote>
+    <ul class="small">
+      <li>Today Anvil's autonomy is spread across four surfaces — autopilot cards, <span class="kbd">/goal</span> chips, event proposals, pipeline traces — <b>four vocabularies for one idea</b>.</li>
+      <li>You can't answer at a glance: <em>what is running, why, and when will it stop?</em></li>
+      <li>Loops collapse all of it into <b>one entity, drawn one way</b> — and Claude sets each one up with you.</li>
+    </ul>
+  </section>
+
+  <!-- 3 · the one idea -->
+  <section>
+    <h2>The one idea: draw the loop as a loop</h2>
+    <p style="text-align:center"><img class="wide" src="img/circuit.png" alt="The circuit" /></p>
+    <ul class="small">
+      <li><b class="accent">Trigger</b> fires it · <b class="accent">Act</b> makes one bounded change per <b>lap</b> · <b class="accent">Check</b> renders a mechanical verdict — same check every lap.</li>
+      <li>The dashed arc <em>is</em> the loop — <b>Act ⇄ Check until the check passes</b>; the glowing runner shows where work is right now.</li>
+      <li>The <b style="color:var(--gate)">◆ lock</b> is <em>you</em> · the green <b style="color:var(--ok)">shield</b> line is the loop's <b>scope</b>. Then <b class="accent">Ship</b>.</li>
+    </ul>
+  </section>
+
+  <!-- 4 · autonomy -->
+  <section>
+    <h2>Autonomy isn't a setting — it's <em>where the lock sits</em></h2>
+    <table>
+      <tr><th>Rung</th><th>The gate</th><th>Meaning</th></tr>
+      <tr><td><b>Suggest</b></td><td>after Check</td><td>read-only — every lap ends in a report</td></tr>
+      <tr><td><b>Draft</b></td><td>before PR</td><td>writes to a branch; <em>you</em> open the PR</td></tr>
+      <tr><td><b>PR</b></td><td>before merge</td><td>opens a verified PR; <em>you</em> merge</td></tr>
+      <tr><td><b>Ship</b></td><td>no gate</td><td>merges on green</td></tr>
+    </table>
+    <p class="callout">Loops <b>earn</b> autonomy: new loops start gated, and after clean gated laps Claude <em>proposes</em> moving the lock right — never silently.</p>
+  </section>
+
+  <!-- 5 · guardrails + can't cheat -->
+  <section>
+    <h2>Bounded — and unable to cheat</h2>
+    <ul class="small">
+      <li><b>Three hard stops on every loop:</b> a lap ceiling · a token/time budget · no-progress detection (2 identical laps halts it).</li>
+      <li><b>Scope is a contract slot:</b> what Act may touch is declared at setup — a lap whose diff leaves scope <em>fails that lap</em> as a scope violation.</li>
+      <li><b>Check integrity:</b> the check is frozen once armed, judged <em>outside</em> the acting session, and the files backing it are locked — “make the tests pass by editing the tests” fails as <b>check-tampering</b>.</li>
+    </ul>
+    <p class="callout">A loop can fail — but it can't run away, wander off, or grade its own homework.</p>
+  </section>
+
+  <!-- ═══ USE CASE 1 · bug fix ═══ -->
+  <section>
+    <span class="usecase">Use case 1 · Bug fix</span>
+    <h1 style="font-size:1.3em">“The upload test fails <span class="accent">4 out of 10</span> runs.”</h1>
+    <ul class="small">
+      <li>Flaky for weeks, blocks merges at random, nobody wants to own it.</li>
+      <li><b>Goal:</b> fixed <em>for good</em> — hands-off, with proof, and a human on the merge.</li>
+      <li>Set up in under a minute; Claude does the loop engineering.</li>
+    </ul>
+  </section>
+
+  <!-- UC1 step 1 -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno">1</span>Start with a prompt</h2>
+        <ul class="small">
+          <li>The Loops home: every loop is a row — a <b>mini-circuit glyph</b>, trigger → action, live state.</li>
+          <li>Type the <em>outcome</em>: <span class="kbd">Fix the flaky upload test</span> → <b>Build my loop</b>.</li>
+          <li class="muted">Todoist tasks flow in through the same path (bottom of the box).</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/home.png" alt="Loops home" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 step 2 -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno">2</span>The check comes first</h2>
+        <ul class="small">
+          <li>Not “what schedule?” — first: <b>how will we know it's done?</b></li>
+          <li>Claude reads the repo and proposes a mechanical check: <span class="kbd">bun test upload</span> green <b>and</b> 10 straight clean runs.</li>
+          <li>One tap; the <b>Check station lights up</b> on the circuit above the chat.</li>
+        </ul>
+        <p class="callout">The circuit <em>is</em> the progress meter — stations light as they're decided.</p>
+      </div>
+      <div class="pic"><img src="img/intake-0.png" alt="The check question" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 step 3 -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno">3</span>Scope, locks & hard stops</h2>
+        <ul class="small">
+          <li><b>The tests the check runs are now locked</b> — editing them fails the lap as check-tampering.</li>
+          <li><b>Scope:</b> <span class="kbd">src/upload/</span> only — anything else is a scope violation. It renders as the shield line under the circuit.</li>
+          <li>Hard stops preset: 10 laps · 300k tokens · no-progress halt. Approve or tighten in one tap.</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/intake-1.png" alt="Scope and hard stops" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 step 4 -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno">4</span>Pick where <em>you</em> sit</h2>
+        <ul class="small">
+          <li>Claude recommends <b>PR</b>: it fixes and opens a verified PR — <b>the merge stays yours</b>.</li>
+          <li>That's the lock's position on the circuit, chosen in one tap.</li>
+          <li class="muted">New loops start gated; reliability earns a longer leash later.</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/intake-2.png" alt="Gate choice" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 step 5 -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno">5</span>“Still ambiguous” — Claude won't guess silently</h2>
+        <ul class="small">
+          <li>Before arming, Claude volunteers what it <em>couldn't</em> pin down: “I'm assuming the flake is timing-related…”.</li>
+          <li>Each ambiguity: resolve with a tap, or <b>accept as a logged assumption</b> — visible on the loop's page forever.</li>
+        </ul>
+        <p class="callout">This is where specification gaming dies — at setup, not in a post-mortem.</p>
+      </div>
+      <div class="pic"><img src="img/intake-3.png" alt="Still ambiguous step" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 step 6 -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno">6</span>Intent preview → arm</h2>
+        <ul class="small">
+          <li>The finished circuit is the contract: trigger, act, check, scope, lock, stops — all visible.</li>
+          <li><b>The first lap is a dry-run</b>: sandboxed, no side effects — see it work before you trust it.</li>
+          <li>Trigger stays <em>manual</em> until proven; then Claude can wire it to CI failures.</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/intake-4.png" alt="Arm" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 running -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2>Watching it run</h2>
+        <ul class="small">
+          <li>The runner laps <b>Act ⇄ Check</b> — <span class="pill" style="color:var(--run);border-color:var(--run)">lap 3/10</span> live.</li>
+          <li><b>Lap history reads like a story:</b> lap 1 reproduced it → lap 2 fixed buffer reuse <span class="pill" style="color:#dc2626;border-color:#dc2626">2 tests still red</span> → lap 3 pinned the timer <span class="pill" style="color:var(--run);border-color:var(--run)">checking</span>.</li>
+          <li>Hard-stop bars burn down in view; assumptions sit right on the page. <b>No black box.</b></li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/detail-l2.png" alt="Running detail" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 gate -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2>The gate moment — the only state that needs you</h2>
+        <ul class="small">
+          <li>A different loop (event-triggered by CI) has a green check waiting <b>at your lock</b>: <span class="pill" style="color:var(--gate);border-color:var(--gate)">at your gate</span>.</li>
+          <li>The whole system reduces to <b>two human verbs</b>:</li>
+        </ul>
+        <p class="callout"><b>Open the gate</b> (ship it) · <b>Send back a lap</b> (with your notes).<br/>That's the entire review workload.</p>
+      </div>
+      <div class="pic"><img src="img/detail-l3.png" alt="At the gate" /></div>
+    </div>
+  </section>
+
+  <!-- UC1 shipped -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2>Open the gate → shipped</h2>
+        <ul class="small">
+          <li>One tap: the runner crosses the lock, the PR opens, the lap history records <span class="pill" style="color:var(--ok);border-color:var(--ok)">shipped</span>.</li>
+          <li>The loop re-arms for the next CI failure — it's standing infrastructure now.</li>
+          <li>After 3 clean gated laps, Claude <em>suggests</em> promoting Draft → PR → Ship.</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/shipped.png" alt="Shipped" /></div>
+    </div>
+  </section>
+
+  <!-- ═══ USE CASE 2 · new feature ═══ -->
+  <section>
+    <span class="usecase f">Use case 2 · New feature</span>
+    <h1 style="font-size:1.3em">“Add CSV export to the reports page.”</h1>
+    <ul class="small">
+      <li>Different shape of problem: <b>nothing fails today</b> — there's no red test to chase.</li>
+      <li>So the check must be <em>created</em>: <b>define done first, then build toward it</b>.</li>
+      <li>Same circuit, same conversation — watch what changes.</li>
+    </ul>
+  </section>
+
+  <!-- UC2 check -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno f">1</span>For a feature, the check is <em>written</em> first</h2>
+        <ul class="small">
+          <li>Claude: “nothing fails today, so I'll write the <b>acceptance tests first</b> — CSV matches the table, header row, opens in Excel — and the check is those tests + build green.”</li>
+          <li><b>Then the test file locks.</b> “I can't grade my own homework.”</li>
+          <li>Lap 1's job is to make the tests <em>exist and fail</em>; building starts lap 2.</li>
+        </ul>
+        <p class="callout">This is test-first development, enforced by the loop's structure rather than discipline.</p>
+      </div>
+      <div class="pic"><img src="img/intakefeat-0.png" alt="Tests-first check" /></div>
+    </div>
+  </section>
+
+  <!-- UC2 ambiguity -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2><span class="stepno f">2</span>Ambiguities here are <em>product decisions</em></h2>
+        <ul class="small">
+          <li>For a feature, “still ambiguous” surfaces choices Claude would otherwise silently make: delimiter & encoding, row caps for big reports.</li>
+          <li>Answer now, or accept as logged assumptions — either way <b>the decision is recorded on the loop</b>, not buried in a diff.</li>
+        </ul>
+        <p class="callout">The catalog incident — autopilot building the wrong thing from a vague task — becomes structurally impossible.</p>
+      </div>
+      <div class="pic"><img src="img/intakefeat-3.png" alt="Product-decision ambiguities" /></div>
+    </div>
+  </section>
+
+  <!-- UC2 running -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2>A feature mid-flight</h2>
+        <ul class="small">
+          <li>Lap history tells the tests-first story: <b>lap 1 wrote failing acceptance tests</b> <span class="pill" style="color:var(--ok);border-color:var(--ok)">tests exist & fail</span>, laps 2–5 build toward green — endpoint, button, encoding, streaming.</li>
+          <li>Scope shows the one new test file, <b>locked once written</b>.</li>
+          <li>Bigger stops for bigger work: 12 laps, 400k — set at intake, visible always.</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/detail-l4.png" alt="Feature loop detail" /></div>
+    </div>
+  </section>
+
+  <!-- autopilot -->
+  <section>
+    <div class="duo">
+      <div class="txt">
+        <h2>And autopilot? It's just a loop.</h2>
+        <ul class="small">
+          <li>Top of the home list: <b>“Todoist intake”</b> — trigger: nightly 02:00 · act: turn new tasks into <em>loop drafts</em> · gate: Suggest.</li>
+          <li>Its scope: “Todoist → loop drafts only” — the intake loop can't touch anything else.</li>
+          <li>No separate autopilot system, schedule card, or proposals queue — <b>one list, one picture, one vocabulary</b>.</li>
+        </ul>
+      </div>
+      <div class="pic"><img src="img/home.png" alt="Autopilot as a loop" /></div>
+    </div>
+  </section>
+
+  <!-- where it lives -->
+  <section>
+    <h2>Where does all this live?</h2>
+    <table>
+      <tr><th>Layer</th><th>What</th><th>Where</th></tr>
+      <tr><td><b>UI</b></td><td><b>Loops home</b> — a new top-level view (<span class="kbd">#loops</span>)</td><td>replaces the “Autopilot” sidebar button</td></tr>
+      <tr><td><b>Entity</b></td><td><span class="kbd">Loop</span> + <span class="kbd">LoopRun</span> in a hub-authoritative store, synced fleet-wide</td><td>new <span class="kbd">loops</span> capability</td></tr>
+      <tr><td><b>Engine</b></td><td>trigger ticks · laps · checks · gates · hard stops</td><td>runs on the daemon that <b>owns the environment</b></td></tr>
+      <tr><td><b>Execution</b></td><td>a lap <b>is a session</b> (own worktree, transcript); light checks are run-records</td><td>existing session infra, unchanged</td></tr>
+    </table>
+    <p class="callout"><b>Sessions are the hands, loops are the manager.</b> A lap spawns a normal sidebar session — tap a lap to open its transcript. Your interactive chat workflow doesn't change; Loops is where standing work is reviewed, not where you work.</p>
+  </section>
+
+  <!-- migration -->
+  <section>
+    <h2>Migration: retire the concept, keep the machinery</h2>
+    <ul class="small">
+      <li><b>1 · Coexist</b> — Loops home ships alongside the Autopilot view, reading the same stores (work units project as loop drafts).</li>
+      <li><b>2 · Retire the card grid</b> <span class="pill" style="color:var(--ok);border-color:var(--ok)">decided</span> — plan review moves <b>into the loop detail page</b>: a draft is a loop whose circuit isn't fully lit; reviewing = lighting the remaining stations through the intake chat, then arming. The home list's <b>drafts-at-your-gate</b> section covers the grid's scan job.</li>
+      <li><b>3 · Flip the entry point</b> — the sidebar button becomes <b>Loops</b>; <span class="kbd">autoStart</span>/<span class="kbd">usePipeline</span>/<span class="kbd">maxAutoStart</span>/propose-flags are absorbed by the autonomy rung and removed from Settings.</li>
+    </ul>
+    <p class="callout">The planner, work-unit store, pipeline, and Todoist tagging all survive as internals — the word “autopilot” retires from the UI, not the code. No flag-day rewrite.</p>
+  </section>
+
+  <!-- recap -->
+  <section>
+    <h2>Recap</h2>
+    <ul class="small">
+      <li><b>One picture:</b> Trigger → Act ⇄ Check → 🔒 → Ship, with a scope shield under it. Every loop, everywhere.</li>
+      <li><b>One authoring flow:</b> prompt in → Claude dials in the check, scope, stops, gate → surfaces what's still ambiguous → dry-run → arm.</li>
+      <li><b>Bug fix vs feature:</b> same circuit — a fix chases an existing red check; a feature <em>writes its check first</em>, then builds to green.</li>
+      <li><b>One safety story:</b> three hard stops · scope violations fail laps · check-tampering fails laps · autonomy = the lock's position, earned.</li>
+      <li><b>Two human verbs:</b> open the gate · send back a lap.</li>
+    </ul>
+    <p class="small muted">Live mock: <span class="kbd">/preview/loops-preview.html</span> · Concept: <span class="kbd">docs/plans/2026-08-01-loop-circuit-concept.md</span> · Spec standard: <span class="kbd">docs/plans/SPEC-TEMPLATE.md</span></p>
+  </section>
+
+</div></div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>
+  Reveal.initialize({ hash: true, width: 1400, height: 850, margin: 0.045, transition: "slide", controls: true, progress: true });
+</script>
+</body>
+</html>

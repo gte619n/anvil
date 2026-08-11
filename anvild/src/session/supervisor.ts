@@ -23,12 +23,14 @@ import {
   type AutopilotPlansEvent,
   type TeamInfoEvent,
   type TeamPlan,
+  type AutopilotPlanInfo,
   type AutopilotPlanResultEvent,
   type AutopilotStartedEvent,
   type AutopilotSchedule,
   type AutopilotScheduleEvent,
   type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
+  type LoopsSnapshotEvent,
   type AuthProvider,
   type AuthStatusEvent,
   type AuthAccountsEvent,
@@ -85,6 +87,8 @@ import { AutopilotService } from "./autopilot-service";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
 import type { WorkUnit } from "../integrations/workunit";
+import { buildLoopsSnapshot } from "../integrations/loops";
+import type { TriggerEvent } from "../integrations/event-trigger";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { AccountStore } from "../auth/accounts";
 import type { PairedHubStore } from "../server/pairing";
@@ -338,6 +342,14 @@ export class Supervisor {
         void this.webpush.notify(payload);
         void this.fcm.notify(payload);
         void this.apns.notify(payload);
+      },
+      broadcastLoops: () => this.broadcastLoops(),
+      armGoal: (sessionId, condition) => {
+        const built = this.sessions.get(sessionId);
+        if (!built) return;
+        built.data.goal = { condition, iterations: 0, setAt: now() };
+        this.persist();
+        this.broadcastUpdated(built.data);
       },
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
@@ -681,6 +693,37 @@ export class Supervisor {
   }
   startPlanningSession(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     return this.autopilot.startPlanningSession(workUnitId, model, autonomy, cid);
+  }
+
+  // ── Loops (loop-engineering: one surface naming every active loop) ────────────────────
+  /** Project every active loop — the schedule heartbeat, sessions carrying a `/goal`, in-flight
+   *  pipelines, and pending event proposals — into the flat snapshot the Loops panel renders. The
+   *  autopilot-owned inputs (schedule/pipelines/proposals) come from the service; the goal rows are
+   *  composed here because sessions live on the Supervisor. */
+  loopsSnapshotEvent(cid?: string): LoopsSnapshotEvent {
+    const goals = this.list()
+      .filter((s) => s.goal)
+      .map((s) => ({
+        sessionId: s.id,
+        title: s.title,
+        condition: s.goal!.condition,
+        iterations: s.goal!.iterations,
+        ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
+        ...(s.goal!.paused ? { paused: true } : {}),
+      }));
+    const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals });
+    return { v: PROTOCOL_VERSION, type: "loops.snapshot", ts: now(), ...(cid ? { cid } : {}), loops };
+  }
+  private broadcastLoops(): void {
+    this.registry.toAll(this.loopsSnapshotEvent());
+  }
+  /** Ingest an external event as a proposed work unit (loop-engineering: Channels). */
+  ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
+    return this.autopilot.ingestTrigger(input);
+  }
+  /** Approve a proposed (event-triggered) unit — promote to planned and optionally start. */
+  approveProposed(workUnitId: string, start: boolean, cid?: string): Promise<AutopilotStartedEvent | AutopilotPlanResultEvent> {
+    return this.autopilot.approveProposed(workUnitId, start, cid);
   }
   reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
     return this.autopilot.reassignPlan(workUnitId, environmentId, cid);
@@ -1323,6 +1366,7 @@ export class Supervisor {
         () => {
           this.persist();
           this.broadcastUpdated(s.data);
+          this.broadcastLoops(); // each unmet attempt bumps the loop's live iteration count
         },
       );
       this.drivers.set(id, driver);
@@ -1682,6 +1726,7 @@ export class Supervisor {
     }
     this.persist();
     this.broadcastUpdated(s.data);
+    this.broadcastLoops(); // a goal set/cleared adds or removes its loop row
   }
 
   /** A goal lifecycle marker in the transcript — same divider block the compact boundary uses. */
@@ -1701,6 +1746,10 @@ export class Supervisor {
     this.goalDivider(s, label, note);
     this.persist();
     this.broadcastUpdated(s.data);
+    this.broadcastLoops(); // a goal resolving removes its loop row
+    // The card's display-only goalCondition mirrors the session goal — clear it so a unit that later
+    // returns to the grid (review/blocked) doesn't advertise a stop-condition that already resolved.
+    this.autopilot.clearGoalCondition(id);
     // This push IS the turn's notification — swallow the ordinary "your turn" that the `result`
     // arriving moments later would otherwise fire (the goal is already cleared by then).
     this.goalPushSuppressed.add(id);

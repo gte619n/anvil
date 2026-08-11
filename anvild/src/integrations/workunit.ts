@@ -27,6 +27,9 @@ export interface WorkUnit {
   devPipeline?: { status: PipelineStatus; phaseReached: PipelinePhase; reason?: string; trace: TraceRecord }; // last autonomous-dev-pipeline run (§4)
   status: AnvilStatus; // mirrors the anvil:* label kept on the member tasks
   source?: "project" | "label"; // how the unit was sourced: a linked project (default) or the Autopilot label
+  hold?: { reason: string; at: string }; // persisted auto-start hold (e.g. adversarial consensus below the bar); surfaced on the card, cleared on start/dismiss
+  trigger?: { kind: string; source: string; at: string; dedupeKey?: string }; // set when an event (not the nightly tick) proposed this unit; drives the "proposed" tier + trigger badge (dedupeKey is server-only, stripped by toPlanInfo)
+  goalCondition?: string; // the /goal seeded onto this unit's build session (run-until-done); display-only on the card
   sessionId?: string; // the worktree session implementing it, once started
   prUrl?: string; // PR opened after validation passes
   validation?: { passed: boolean; log?: string; at?: string }; // last validation result

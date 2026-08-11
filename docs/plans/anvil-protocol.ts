@@ -655,7 +655,7 @@ export interface AutopilotEffort {
 }
 /** The anvil autopilot's status, mirrored from the `anvil:*` Todoist labels. Kept in lockstep with
  *  STATUSES in src/integrations/status.ts (the server is the source of truth). */
-export type AnvilStatus = "planned" | "needs-clarification" | "planning" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
+export type AnvilStatus = "proposed" | "planned" | "needs-clarification" | "planning" | "building" | "review" | "blocked" | "dismissed" | "completed" | "expired";
 /** A focused projection of the autonomous-dev-pipeline trace record (§7), shaped for the reader. The
  *  full plan markdown stays in `AutopilotPlanInfo.plan`; this carries the gate/assignment residue. */
 export interface PipelineTraceInfo {
@@ -687,8 +687,24 @@ export interface AutopilotPlanInfo {
   taskCount: number; // Todoist tasks bundled into the unit
   plan?: RenderedMarkdown; // full implementation plan (source + sanitized HTML) for the reader
   pipeline?: PipelineTraceInfo; // present once the autonomous dev pipeline (§4) has run on this unit
+  // A persisted auto-start hold: the nightly run planned this unit but the auto-start gate held it (e.g.
+  // adversarial consensus below the bar). Surfaced on the card so the stop-reason is durable, not just a
+  // line in the run log. Cleared when a human starts or dismisses it. (loop-engineering: verify → gate)
+  hold?: { reason: string; at: Iso8601 };
+  // Present when an event (not the nightly tick) proposed this unit — a CI failure, a labelled task, a
+  // webhook. Drives the "proposed" approval tier + the trigger badge on the card. (loop-engineering: Channels)
+  trigger?: AutopilotTriggerInfo;
+  // The stop-condition seeded onto this unit's build session as a `/goal` (loop-engineering: run-until-done).
+  // Display-only on the card; the live iteration count rides the session's `goal`.
+  goalCondition?: string;
   createdAt: Iso8601;
   updatedAt: Iso8601;
+}
+/** Provenance of an event-triggered work unit (structurally matches integrations/event-trigger TriggerInfo). */
+export interface AutopilotTriggerInfo {
+  kind: string; // "ci-failure" | "github" | "todoist-label" | "webhook" | "manual"
+  source: string; // human label for the origin
+  at: Iso8601;
 }
 /** The server's pending plans — answer to `autopilot.plans.list` (carries cid), and broadcast (no cid)
  *  whenever the set changes (a run plans new units, a planning session saves one, a dismiss/start removes one). */
@@ -792,6 +808,31 @@ export interface AutopilotScheduleEvent extends Envelope {
   schedule: AutopilotSchedule;
   nextRunAt?: Iso8601; // computed next fire, for display
   running: boolean; // whether an autopilot run is in progress right now (server-authoritative)
+}
+
+// ── Loops (loop-engineering: one surface naming every active loop) ────────────────────
+export type LoopKind = "schedule" | "goal" | "pipeline" | "trigger";
+export type LoopStatus = "idle" | "armed" | "running" | "waiting";
+/** One active loop, projected for the Loops panel. Answers the four questions a loop is framed around:
+ *  what triggers it, what stops it, where it is now, and (run-until-done loops) which iteration it's on. */
+export interface LoopSummary {
+  kind: LoopKind;
+  id: string; // stable per-loop id (session id, work-unit id, or the synthetic "schedule")
+  title: string;
+  trigger: string; // what fires it
+  stopCondition: string; // when it stops
+  status: LoopStatus;
+  nextFireAt?: Iso8601; // schedule only
+  iteration?: { current: number; max: number }; // goal loops (and pipeline loopbacks)
+  sessionId?: SessionId; // jump target when the loop owns a session
+  detail?: string; // the judge's last blocker, the phase reached, etc.
+}
+/** The set of active loops — answer to `loops.get` (cid) and broadcast (no cid) whenever the set changes
+ *  (a run starts/ends, a goal arms/resolves, an event proposes a unit). */
+export interface LoopsSnapshotEvent extends Envelope {
+  type: "loops.snapshot";
+  cid?: Cid;
+  loops: LoopSummary[];
 }
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
 export type GitOp = "status" | "diff" | "commit" | "push" | "create-pr" | "merge-pr";
@@ -1038,6 +1079,7 @@ export type ServerEvent =
   | AutopilotRunSnapshotEvent
   | AutopilotMaintenanceResultEvent
   | AutopilotScheduleEvent
+  | LoopsSnapshotEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent
@@ -1419,6 +1461,25 @@ export interface AutopilotRunCmd extends Envelope, Correlated {
   type: "autopilot.run"; // re-plan linked Todoist projects on this server → autopilot.run.result
   environmentId?: string; // limit to one environment; omitted = every linked environment
 }
+/** Ingest an external event as a PROPOSED work unit (loop-engineering: Channels/event intake). Defaults
+ *  to needing a human approve; a trusted source may set autoApprove. → autopilot.plans + loops.snapshot. */
+export interface AutopilotTriggerCmd extends Envelope, Correlated {
+  type: "autopilot.trigger";
+  kind: "ci-failure" | "github" | "todoist-label" | "webhook" | "manual";
+  source: string; // human label for the origin
+  title: string; // the proposed unit's title
+  body?: string; // detail (failure log, comment) — seeds the summary + planning brief
+  environmentId?: string; // route to a specific environment; omitted → the schedule's default env
+  dedupeKey?: string; // idempotency key; auto-derived from kind+title when absent
+  autoApprove?: boolean; // trusted source → skip the propose gate (still bounded by budget)
+}
+/** Approve a proposed (event-triggered) work unit: promote it to `planned` and, when `start`, launch it.
+ *  Reject via the existing autopilot.dismiss. → autopilot.plans / autopilot.started. */
+export interface AutopilotApproveCmd extends Envelope, Correlated {
+  type: "autopilot.approve";
+  workUnitId: string;
+  start?: boolean; // also start a build session immediately (else it lands on the grid as `planned`)
+}
 export interface AutopilotTagsResetCmd extends Envelope, Correlated {
   type: "autopilot.tags.reset"; // strip anvil:* labels (keep the Autopilot sourcing label) so tasks re-plan → autopilot.maintenance.result
 }
@@ -1427,6 +1488,9 @@ export interface AutopilotClearCmd extends Envelope, Correlated {
 }
 export interface AutopilotScheduleGetCmd extends Envelope, Correlated {
   type: "autopilot.schedule.get"; // current schedule → autopilot.schedule
+}
+export interface LoopsGetCmd extends Envelope, Correlated {
+  type: "loops.get"; // the current set of active loops → loops.snapshot
 }
 export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   type: "autopilot.schedule.set"; // update fields (omitted fields unchanged) → autopilot.schedule
@@ -1572,10 +1636,13 @@ export type ClientCommand =
   | AutopilotLinkCmd
   | AutopilotReassignCmd
   | AutopilotRunCmd
+  | AutopilotTriggerCmd
+  | AutopilotApproveCmd
   | AutopilotTagsResetCmd
   | AutopilotClearCmd
   | AutopilotScheduleGetCmd
   | AutopilotScheduleSetCmd
+  | LoopsGetCmd
   | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd

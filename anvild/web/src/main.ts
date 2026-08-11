@@ -84,6 +84,7 @@ import {
   clearStaleRunTimer,
   initAutopilot,
   onAutopilotPlans,
+  onLoopsSnapshot,
   onAutopilotProgress,
   onAutopilotRunSnapshot,
   onAutopilotSchedule,
@@ -1183,6 +1184,7 @@ function onEvent(url: string, e: ServerEvent): void {
       // never gets `unknown command type` and just sits out the federated plan view until it's updated.
       if (serverSupports(srv, "autopilot")) {
         srv!.sock.send({ type: "autopilot.plans.list" }); // keep the sidebar badge + grid live for this server
+        srv!.sock.send({ type: "loops.get" }); // active loops for the Loops panel
         srv!.sock.send({ type: "autopilot.schedule.get" }); // current schedule for the Autopilot view
       }
       // Pull the hub's model-provider auth state so the Settings → Models card is live (hub-scoped) —
@@ -1249,6 +1251,9 @@ function onEvent(url: string, e: ServerEvent): void {
       return; // resolved via cidWaiter (resetAnvilTags / clearAutopilot)
     case "autopilot.plans":
       onAutopilotPlans(url, e.plans);
+      return;
+    case "loops.snapshot":
+      onLoopsSnapshot(url, e.loops);
       return;
     case "autopilot.plan":
       return; // resolved via cidWaiter (reassignPlan); the matching autopilot.plans broadcast refreshes state

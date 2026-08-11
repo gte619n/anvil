@@ -935,6 +935,39 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .ap-chip.eff-xs, .ap-chip.eff-s { color: #21ba45; }
 .ap-chip.eff-m { color: #f2c037; }
 .ap-chip.eff-l, .ap-chip.eff-xl { color: #e8703a; }
+.ap-chip.status-proposed { color: #b07cc3; border-color: #b07cc366; }
+.ap-chip.ap-chip-trigger { color: #b07cc3; border-color: #b07cc366; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-chip.ap-chip-goal { color: #2196c9; border-color: #2196c966; }
+/* An event-proposed card awaiting approval: dashed to read as "not yet running". */
+.plan-card.plan-proposed { border-style: dashed; }
+/* A persisted auto-start hold (e.g. adversarial consensus below the bar), shown on the card + reader. */
+.plan-hold { display: flex; align-items: center; gap: 5px; font-size: 11.5px; line-height: 1.4; color: #e8730c; background: color-mix(in srgb, #e8730c 12%, transparent); border: 1px solid #e8730c44; border-radius: 8px; padding: 4px 8px; }
+.plan-hold .msym { font-size: 14px; }
+.reader-hold { display: flex; align-items: center; gap: 6px; color: #e8730c; background: color-mix(in srgb, #e8730c 12%, transparent); border: 1px solid #e8730c44; border-radius: 10px; padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
+
+/* Loops panel — one surface naming every active loop, above the plan grid. */
+.loops-panel { border: 1px solid var(--border); border-radius: 12px; background: var(--panel); padding: 10px 12px; margin-bottom: 16px; }
+.loops-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.loops-head .msym { color: var(--accent); }
+.loops-list { display: flex; flex-direction: column; gap: 6px; }
+.loop-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-left: 3px solid var(--muted); border-radius: 10px; background: var(--bg); }
+.loop-row[data-loop-session] { cursor: pointer; }
+.loop-row[data-loop-session]:hover { border-color: var(--accent); }
+.loop-row.loop-running { border-left-color: #f2c037; }
+.loop-row.loop-armed { border-left-color: #2196c9; }
+.loop-row.loop-waiting { border-left-color: #b07cc3; }
+.loop-kind .msym { font-size: 18px; color: var(--muted); }
+.loop-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.loop-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.loop-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.loop-arrow { opacity: 0.6; }
+.loop-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.loop-meta { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; }
+.loop-iter { font-variant-numeric: tabular-nums; font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
+.loop-status-chip { font-size: 11px; text-transform: capitalize; }
+.loop-status-chip.loop-running { color: #f2c037; }
+.loop-status-chip.loop-armed { color: #2196c9; }
+.loop-status-chip.loop-waiting { color: #b07cc3; }
 
 /* Plan reader. The plan reads full-width; `position: relative` anchors the pipeline-trace card and
    `overflow: hidden` clips nothing here (the body owns the vertical scroll). */

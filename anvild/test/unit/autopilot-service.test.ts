@@ -74,6 +74,8 @@ function harness() {
     claimDegradeEpisodeAlert: () => false,
     pushSystemAlert: () => {},
     notifyAll: () => {},
+    broadcastLoops: () => {},
+    armGoal: () => {},
   };
   const svc = new AutopilotService(deps);
   const cleanup = () => {

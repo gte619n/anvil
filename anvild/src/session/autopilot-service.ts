@@ -36,7 +36,9 @@ import type { AccountStore } from "../auth/accounts";
 import type { MarkdownRenderer } from "../render/markdown";
 import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
 import { AutopilotScheduleStore, scheduledFireDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
-import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildPlanningBrief } from "../integrations/autopilot-plans";
+import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildAutopilotGoal, buildPlanningBrief } from "../integrations/autopilot-plans";
+import { normalizeTrigger, type TriggerEvent } from "../integrations/event-trigger";
+import type { LoopsInput } from "../integrations/loops";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { LapoClient, type LapoEntryEndpoint } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
@@ -116,6 +118,10 @@ export interface AutopilotDeps {
   pushSystemAlert: (title: string, body: string, tag: string) => void;
   /** Fan a push out to every registry (webpush + FCM + APNs). */
   notifyAll: (payload: PushPayload) => void;
+  /** Rebroadcast the Loops panel snapshot (Supervisor composes it — goal rows live on sessions). */
+  broadcastLoops: () => void;
+  /** Arm a run-until-done `/goal` on a freshly-created build session (Supervisor owns goal state). */
+  armGoal: (sessionId: string, condition: string) => void;
 }
 
 export class AutopilotService {
@@ -136,6 +142,11 @@ export class AutopilotService {
     return runWithinBudget(this.autopilotRunStartedAt, Date.now(), AUTOPILOT_RUN_TIMEOUT_MS);
   }
   private autopilotRunLog: string[] = []; // the live run's progress lines, retained so a connecting/refreshed client can replay them
+  /** Work units whose autonomous dev pipeline is running right now (id → title). Feeds the Loops panel's
+   *  live pipeline rows; populated at runDevPipeline start, cleared in its finally. */
+  private readonly runningPipelines = new Map<string, string>();
+  /** Statuses a triggered unit is considered "live" in for dedupe (a terminal one may re-propose). */
+  private static readonly TRIGGER_LIVE = new Set<AnvilStatus>(["proposed", "planned", "needs-clarification", "planning", "building", "review", "blocked"]);
   private scheduleTimer?: ReturnType<typeof setInterval>;
   /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
   private readonly devPipelineMetrics: AdversaryMetrics;
@@ -289,6 +300,26 @@ export class AutopilotService {
   }
   private broadcastAutopilotPlans(): void {
     this.deps.registry.toAll(this.autopilotPlansEvent());
+    this.deps.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid
+  }
+
+  /** The autopilot-owned slice of the Loops panel snapshot (the Supervisor adds the goal rows). */
+  loopsInputs(): Omit<LoopsInput, "goals"> {
+    const schedule = this.autopilotSchedule.get();
+    const next = nextScheduledFire(schedule, new Date());
+    const pipelines = [...this.runningPipelines].map(([id, title]) => {
+      const phaseReached = this.workUnits.get(id)?.devPipeline?.phaseReached;
+      return { id, title, ...(phaseReached ? { phaseReached } : {}) };
+    });
+    const proposals = this.workUnits
+      .list()
+      .filter((u) => u.status === "proposed")
+      .map((u) => ({ id: u.id, title: u.title, source: u.trigger?.source ?? "event" }));
+    return {
+      schedule: { enabled: schedule.enabled, timeOfDay: schedule.timeOfDay, running: this.autopilotRunning, autoStart: schedule.autoStart, ...(next ? { nextRunAt: next.toISOString() } : {}) },
+      pipelines,
+      proposals,
+    };
   }
 
 
@@ -585,9 +616,16 @@ export class AutopilotService {
     // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
     // the reviewer to answer them first, in a "Plan with Claude" session, before it can start.
     if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before starting");
+    // Server-side propose-don't-run: the web hides Start for proposals, but the gate must hold for ANY
+    // client — an unapproved event-triggered unit never builds without an explicit approve.
+    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
     const brief = this.autopilotBrief(u);
+    // Seed the build session with a `/goal` derived from the plan so it self-verifies to completion — the
+    // Stop hook keeps it going until a judge agrees the plan is actually built + the checks pass, rather
+    // than stopping the instant the model claims it's done (loop-engineering: run-until-done).
+    const goalCondition = buildAutopilotGoal(u);
     const { id } = await this.deps.handoffCreate({
       environmentId: env.id,
       source: "fresh-worktree",
@@ -596,7 +634,9 @@ export class AutopilotService {
       autonomy: autonomy ?? "bypass",
       brief,
     });
-    this.workUnits.update(u.id, { sessionId: id, status: "building" });
+    // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
+    this.workUnits.update(u.id, { sessionId: id, status: "building", hold: undefined, ...(goalCondition ? { goalCondition } : {}) });
+    if (goalCondition) this.deps.armGoal(id, goalCondition);
     void this.tagTasks(u, "building");
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
@@ -609,10 +649,12 @@ export class AutopilotService {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a running session");
+    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     const session = this.deps.getSession(sessionId);
     if (!session) throw new BadCommand("no such session");
     if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
-    this.workUnits.update(u.id, { sessionId, status: "building" });
+    // A human deliberately linking the plan to live work clears any auto-start hold (mirrors startPlan).
+    this.workUnits.update(u.id, { sessionId, status: "building", hold: undefined });
     void this.tagTasks(u, "building");
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
@@ -621,6 +663,70 @@ export class AutopilotService {
   /** The opening brief handed to a plan's build session (see integrations/autopilot-plans.ts). */
   private autopilotBrief(u: WorkUnit): string {
     return buildAutopilotBrief(u);
+  }
+
+  // ── Event-driven intake (loop-engineering: Channels) ──────────────────────────────────
+  /**
+   * Ingest an external event as a PROPOSED work unit (a CI failure, a labelled task, a webhook). Defaults
+   * to needing a human approve — nothing runs unattended off an event unless a trusted source opts in via
+   * `autoApprove`. Dedupes on the trigger key so a re-delivered event collapses onto the existing card.
+   */
+  async ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
+    const intent = normalizeTrigger(input, new Date().toISOString());
+    const envId =
+      intent.environmentId ??
+      this.autopilotSchedule.get().defaultEnvironmentId ??
+      this.deps.envStore.list().find((e) => e.todoistProjectId)?.id ??
+      this.deps.envStore.list()[0]?.id;
+    if (!envId) throw new BadCommand("no environment is configured to route the trigger to");
+    const env = this.deps.envStore.get(envId);
+    if (!env) throw new BadCommand("the target environment no longer exists");
+    // Dedupe: a live unit with the same trigger key already covers this event — return it, don't clone.
+    const dup = this.workUnits
+      .list()
+      .find((u) => u.trigger?.dedupeKey === intent.trigger.dedupeKey && AutopilotService.TRIGGER_LIVE.has(u.status));
+    if (dup) return this.autopilotPlanInfo(dup);
+    const unit = this.workUnits.create({
+      environmentId: env.id,
+      todoistProjectId: env.todoistProjectId ?? "",
+      taskIds: [],
+      title: intent.title,
+      summary: intent.summary,
+      ...(input.body ? { rationale: input.body } : {}),
+      trigger: intent.trigger,
+      status: intent.autoApprove ? "planned" : "proposed",
+    });
+    this.broadcastAutopilotPlans();
+    // A trusted source may auto-run: it's already `planned`, so start a build if the budget is healthy.
+    if (intent.autoApprove && !this.deps.budget().warn) {
+      try {
+        await this.startPlan(unit.id);
+      } catch (e) {
+        console.error(`[autopilot] auto-approved trigger “${unit.title}” could not start: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    return this.autopilotPlanInfo(this.workUnits.get(unit.id) ?? unit);
+  }
+
+  /**
+   * Approve a proposed (event-triggered) unit: promote it to `planned` and, when `start`, launch the build
+   * immediately. Rejecting a proposal reuses the existing `autopilot.dismiss` path. Returns the started
+   * event (when `start`) or the promoted plan.
+   */
+  async approveProposed(workUnitId: string, start: boolean, cid?: string): Promise<AutopilotStartedEvent | AutopilotPlanResultEvent> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (u.status !== "proposed") throw new BadCommand(`only a proposed plan can be approved (this one is ${u.status})`);
+    this.workUnits.update(u.id, { status: "planned" });
+    this.broadcastAutopilotPlans();
+    if (start) return this.startPlan(u.id, undefined, undefined, cid);
+    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(this.workUnits.get(u.id)!) };
+  }
+
+  /** Clear the display-only goalCondition mirror when a session's goal resolves (called by Supervisor). */
+  clearGoalCondition(sessionId: string): void {
+    const unit = this.workUnits.list().find((u) => u.sessionId === sessionId && u.goalCondition);
+    if (unit) this.workUnits.update(unit.id, { goalCondition: undefined });
   }
 
   /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
@@ -755,7 +861,12 @@ export class AutopilotService {
       for (const u of createdUnits) {
         const decision = autoStartDecision(u);
         if (decision.start) autoStartable.push(u);
-        else if (u.source !== "label" && u.status === "planned" && decision.reason) emit(`⏸ Holding “${u.title}” — ${decision.reason}.`);
+        else if (u.source !== "label" && u.status === "planned" && decision.reason) {
+          // Persist the hold on the unit so the stop-reason is durable on the card (not just this run's
+          // log): the panel can show "Held: adversarial 4/10" until a human starts or dismisses it.
+          this.workUnits.update(u.id, { hold: { reason: decision.reason, at: new Date().toISOString() } });
+          emit(`⏸ Holding “${u.title}” — ${decision.reason}.`);
+        }
       }
       // Pipeline auto-start needs an OpenRouter key (GLM authors several gates); fall back to a plain build
       // session if the operator asked for the pipeline but no key is set, rather than failing every unit.
@@ -831,6 +942,7 @@ export class AutopilotService {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before running the pipeline");
+    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the work unit's environment no longer exists");
     if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
@@ -840,6 +952,8 @@ export class AutopilotService {
     const branch = `${slugify(u.title)}-pipeline`;
     // One worktree for the whole run: read-only phases inspect it, P3/P4 write, P6 opens the PR from it.
     const { cwd } = await createWorktree(env.repoRoot, env.defaultBase ?? "HEAD", branch, this.deps.worktreeRoot(), runId);
+    this.runningPipelines.set(u.id, u.title); // surface it as a live loop in the Loops panel
+    this.deps.broadcastLoops();
     try {
       const glmSlug = this.deps.adversarial.models.find((m) => /glm/i.test(m));
       const deps: PhaseDeps = {
@@ -856,6 +970,9 @@ export class AutopilotService {
       this.workUnits.update(u.id, {
         devPipeline: { status: outcome.status, phaseReached: outcome.phaseReached, ...(outcome.reason ? { reason: outcome.reason } : {}), trace: outcome.trace },
         status: mapped.status,
+        // The pipeline was deliberately run on this unit — drop any pre-run auto-start hold so the
+        // review/blocked card shows the pipeline verdict, not a stale "Held — adversarial…" banner.
+        hold: undefined,
         ...(mapped.prUrl ? { prUrl: mapped.prUrl } : {}),
         ...(mapped.blockedReason ? { blockedReason: mapped.blockedReason } : {}),
       });
@@ -863,6 +980,8 @@ export class AutopilotService {
       log(`Pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}.`);
       return outcome;
     } finally {
+      this.runningPipelines.delete(workUnitId); // pipeline loop ended (shipped/blocked/threw)
+      this.deps.broadcastLoops();
       // [BE-13] Persist metrics on EVERY exit, not just success. `executeDevPipeline` mutates the
       // in-memory tallies (recordFirstPass) as it runs; a run that throws is exactly one where the
       // adversary fired hardest, so saving only on success biased the §6.3 collusion metric toward
@@ -893,6 +1012,7 @@ export class AutopilotService {
   }
   private broadcastSchedule(): void {
     this.deps.registry.toAll(this.autopilotScheduleEvent());
+    this.deps.broadcastLoops(); // the schedule heartbeat + its running state are loop rows
   }
   /** Stream one run-progress line to every connected client (live, regardless of who started the run —
    *  or whether it was the scheduler). Centralized here so manual and scheduled runs behave the same. */
