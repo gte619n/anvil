@@ -30,3 +30,14 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # [CI2-10] Swift/SPM packages. Without this, Sparkle — the framework that VERIFIES the daemon/app
+  # updates (EdDSA) — was completely unmonitored for security fixes. The macOS client (apple/) is the
+  # remaining Swift target that ships in the release.
+  - package-ecosystem: swift
+    directory: /apple
+    schedule:
+      interval: weekly
+    groups:
+      apple-deps:
+        patterns: ["*"]

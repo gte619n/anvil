@@ -1,0 +1,79 @@
+name: Dependabot — sync Bun lockfile
+
+# Self-heal for the recurring Dependabot + Bun mismatch. Dependabot bumps anvild/package.json but does
+# NOT reliably regenerate anvild/bun.lock (it managed it for grouped minor/patch bumps like #171, but
+# left the lockfile stale on the markdown-it 14→15 major bump in #181). The CI daemon job installs with
+# `bun install --frozen-lockfile` — deliberately, so the gate and self-update build from the exact locked
+# tree — which then fails at the install step with "lockfile had changes, but lockfile is frozen", before
+# it ever typechecks or tests. That is a false red on a bump that may be perfectly fine.
+#
+# This workflow runs alongside the CI gate on Dependabot PRs that touch anvild/package.json, regenerates
+# anvild/bun.lock, and pushes it back onto the PR branch so the manifest and lock agree. The re-generation
+# is a plain `bun install` (same pinned Bun the gate uses); if the lock is already in sync it no-ops, so a
+# PAT-triggered re-run of this workflow can't loop.
+#
+# TOKEN / RE-RUN NOTE: pushes made with the default GITHUB_TOKEN do NOT trigger a new workflow run
+# (GitHub's loop-prevention), so with only GITHUB_TOKEN the lockfile gets fixed in the PR but the already-
+# failed `daemon` gate will NOT re-run on its own — a maintainer must click "Re-run" once (or merge, since
+# the fix is now in the branch). For fully hands-off healing, add a fine-grained PAT with `contents:write`
+# on this repo as a *Dependabot* secret (Settings → Secrets and variables → Dependabot) named
+# LOCKFILE_SYNC_PAT — Dependabot-triggered runs can read Dependabot secrets but NOT regular Actions
+# secrets, hence that specific location. With the PAT present, the lockfile push re-triggers the gate and
+# the PR goes green untouched.
+
+on:
+  pull_request:
+    paths:
+      - anvild/package.json
+
+# Needed to push the regenerated lockfile back onto the PR branch. On Dependabot-triggered runs the
+# GITHUB_TOKEN honours this block (it is read-only by default otherwise).
+permissions:
+  contents: write
+
+concurrency:
+  group: dependabot-lockfile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-lockfile:
+    name: regenerate anvild/bun.lock
+    # Only Dependabot's own PRs. A human editing package.json is expected to commit the matching lockfile
+    # themselves; auto-committing onto their branch would be surprising.
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Check out the PR's own branch (not the detached merge ref) so we can commit and push back.
+          ref: ${{ github.head_ref }}
+          # Prefer a PAT stored as a Dependabot secret so the push re-triggers the CI gate; fall back to
+          # the built-in token (fixes the lock, but the gate needs a manual re-run — see header).
+          token: ${{ secrets.LOCKFILE_SYNC_PAT || github.token }}
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # Same pin as ci.yml — the healed lockfile must be the one the pinned interpreter resolves.
+          bun-version: 1.3.14
+
+      - name: Regenerate lockfile
+        working-directory: anvild
+        run: bun install
+
+      - name: Commit & push if the lockfile changed
+        env:
+          # Pass the (attacker-influenceable) branch name via the environment rather than interpolating
+          # it into the script body — avoids shell injection through a crafted ref. See actionlint's
+          # script-injection check.
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if git diff --quiet -- anvild/bun.lock; then
+            echo "anvild/bun.lock already in sync with package.json — nothing to do."
+            exit 0
+          fi
+          git config user.name  "dependabot[bot]"
+          git config user.email "49699333+dependabot[bot]@users.noreply.github.com"
+          git add anvild/bun.lock
+          git commit -m "chore(deps): sync bun.lock to package.json"
+          git push origin "HEAD:$HEAD_REF"

@@ -1,5 +1,5 @@
 {
-  "protocolVersion": 3,
+  "protocolVersion": 4,
   "wireTypes": [
     "ack",
     "assistant.delta",
@@ -88,6 +88,7 @@
     "question.resolved",
     "question.respond",
     "result",
+    "resume.watermarks",
     "server.hello",
     "session.account.set",
     "session.archive",
@@ -113,6 +114,8 @@
     "team.plan.approve",
     "team.plan.reject",
     "team.plan.resolved",
+    "telemetry.report",
+    "telemetry.snapshot",
     "terminal.close",
     "terminal.data",
     "terminal.exit",

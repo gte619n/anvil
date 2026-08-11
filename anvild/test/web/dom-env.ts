@@ -9,7 +9,7 @@
  */
 import { JSDOM } from "jsdom";
 
-const DOM_GLOBALS = ["window", "document", "location", "history", "navigator", "localStorage", "HTMLElement", "Event", "CustomEvent", "getComputedStyle"] as const;
+const DOM_GLOBALS = ["window", "document", "location", "history", "navigator", "localStorage", "HTMLElement", "Event", "CustomEvent", "getComputedStyle", "Node", "NodeFilter"] as const;
 
 let saved: Record<string, unknown> = {};
 

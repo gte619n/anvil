@@ -14,7 +14,7 @@ function tempState(): string {
 const createCmd = (cwd: string, accountId?: string) =>
   ({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd, ...(accountId ? { accountId } : {}) }) as const;
 
-test("accountAdd/rename/replace/setDefault/remove all return a fresh roster snapshot", () => {
+test("accountAdd/rename/replace/setDefault/remove all return a fresh roster snapshot", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
@@ -39,7 +39,7 @@ test("accountAdd/rename/replace/setDefault/remove all return a fresh roster snap
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("removing an in-use account falls its sessions back to the default and PRESERVES the old label", () => {
+test("removing an in-use account falls its sessions back to the default and PRESERVES the old label", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
@@ -47,7 +47,7 @@ test("removing an in-use account falls its sessions back to the default and PRES
   const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   accounts.setDefault(personal.id); // default is now "personal"; "work" is the one we'll remove
 
-  const s = sup.create(createCmd(dir, work.id));
+  const s = await sup.create(createCmd(dir, work.id));
   expect(s.data.accountId).toBe(work.id);
   expect(s.data.accountLabel).toBe("work");
 
@@ -68,19 +68,19 @@ test("removing an in-use account falls its sessions back to the default and PRES
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("accountsEvent's inUse map only lists ACTIVE (non-archived) sessions", () => {
+test("accountsEvent's inUse map only lists ACTIVE (non-archived) sessions", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
-  const s = sup.create(createCmd(dir, a.id));
+  const s = await sup.create(createCmd(dir, a.id));
   expect(sup.accountsEvent().inUse?.[a.id]).toHaveLength(1);
   s.data.archived = true;
   expect(sup.accountsEvent().inUse?.[a.id] ?? []).toHaveLength(0);
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a mutation on a replica throws BadCommand with AccountStore's message unchanged", () => {
+test("a mutation on a replica throws BadCommand with AccountStore's message unchanged", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.adoptReplica({ rev: 1, defaultId: "acct_x", entries: [{ id: "acct_x", label: "work", token: "sk-ant-oat01-pushed-9999", createdAt: 1 }] });
@@ -92,14 +92,14 @@ test("a mutation on a replica throws BadCommand with AccountStore's message unch
 
 // ── §5.4 boot reconciliation + the replica "not yet replicated" refusal ──────────────────────
 
-test("a session bound to an account removed while the daemon was DOWN is reconciled on restore", () => {
+test("a session bound to an account removed while the daemon was DOWN is reconciled on restore", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const personal = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   accounts.setDefault(personal.id); // removing the DEFAULT is refused (§10) — choose another first
   const sup1 = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup1.create(createCmd(dir, work.id));
+  const s = await sup1.create(createCmd(dir, work.id));
   const sessionId = s.data.id;
 
   // Simulate the account vanishing out-of-band (a hand-edited accounts.json, or a hub push that
@@ -115,12 +115,12 @@ test("a session bound to an account removed while the daemon was DOWN is reconci
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a REPLICA never rewrites a session's binding on restore (the push may just be late)", () => {
+test("a REPLICA never rewrites a session's binding on restore (the push may just be late)", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const sup1 = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const sessionId = sup1.create(createCmd(dir, work.id)).data.id;
+  const sessionId = (await sup1.create(createCmd(dir, work.id))).data.id;
 
   // This machine becomes a member and adopts a roster that doesn't (yet) carry `work`.
   const accounts2 = new AccountStore(dir);
@@ -142,7 +142,7 @@ test("a REPLICA never rewrites a session's binding on restore (the push may just
 // overwrote their working Claude credential with a fixture token. Caught by hand on 2026-07-26 after
 // the suite clobbered a live machine. The override is now the only thing standing between the test
 // suite and every contributor's daemon.
-test("a roster mutation mirrors into the CONFIGURED env file, never the real one", () => {
+test("a roster mutation mirrors into the CONFIGURED env file, never the real one", async () => {
   const dir = tempState();
   const envFile = join(dir, "env");
   const accounts = new AccountStore(dir);
@@ -164,7 +164,7 @@ test("a roster mutation mirrors into the CONFIGURED env file, never the real one
 // chip, which renders the CURRENT default's label, names the NEW one. The UI then advertises a
 // subscription that isn't being billed, which is the exact confusion this whole feature exists to
 // prevent. Clearing the binding makes it track the default for real.
-test("F1: a fallen-back session follows the default when the default LATER moves", () => {
+test("F1: a fallen-back session follows the default when the default LATER moves", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   const work = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
@@ -172,7 +172,7 @@ test("F1: a fallen-back session follows the default when the default LATER moves
   const third = accounts.add("third", "sk-ant-oat01-thirdthird-3333");
   accounts.setDefault(personal.id);
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, work.id));
+  const s = await sup.create(createCmd(dir, work.id));
 
   sup.accountRemove(work.id); // falls back to the default, which is currently "personal"
   expect(s.data.accountMissing).toBe(true);
@@ -189,7 +189,7 @@ test("F1: a fallen-back session follows the default when the default LATER moves
 // reconciled SESSIONS. A removed account left a dangling env.accountId that surfaced later,
 // unattended, as a failed autopilot spawn — and because the run loop had `finally` but no `catch`,
 // that one environment aborted the whole nightly run including every environment after it.
-test("C2: removing an account clears it from ENVIRONMENTS too", () => {
+test("C2: removing an account clears it from ENVIRONMENTS too", async () => {
   const dir = tempState();
   const accounts = new AccountStore(dir);
   accounts.add("work", "sk-ant-oat01-workworkwork-1111");

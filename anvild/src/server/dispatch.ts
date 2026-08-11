@@ -28,6 +28,14 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** [BE2-45] Reply to a fire-and-forget async command when it settles: `ack` on success (when
+ *  correlated), `command.error` on failure — the shape every promise-returning command shared. */
+function ackWhenDone(p: Promise<unknown>, send: Send, cid?: string): void {
+  p.then(() => {
+    if (cid) send(ack(cid));
+  }).catch((e) => send(cmdError(errMsg(e), cid)));
+}
+
 /**
  * Routes one inbound client frame (arch §6.1/§6.3): validates the envelope (parseCommandFrame),
  * narrows on `type`, mutates session state via the supervisor, and replies `ack` (for correlated
@@ -53,11 +61,19 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.create": {
-        const session = deps.supervisor.create(cmd);
-        conn.attached.add(session.id);
-        const created: ServerEvent = { v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data };
-        send({ ...created, cid }); // creator: carries the cid
-        deps.registry.toAll(created, conn.id); // other devices: no cid
+        // [BE2-2] Async: a fresh-worktree create runs a network `git fetch` — settle off the dispatch
+        // path so a slow remote can't freeze the daemon. Same wire surface as before: the creator gets
+        // `session.created` with its cid, everyone else the broadcast, and a failure (BadCommand) still
+        // arrives as `command.error`.
+        deps.supervisor
+          .create(cmd)
+          .then((session) => {
+            conn.attached.add(session.id);
+            const created: ServerEvent = { v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data };
+            send({ ...created, cid }); // creator: carries the cid
+            deps.registry.toAll(created, conn.id); // other devices: no cid
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
       }
 
@@ -81,21 +97,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.kill":
-        deps.supervisor
-          .kill(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.kill(cmd.sessionId), send, cid);
         return;
 
       case "session.archive":
-        deps.supervisor
-          .archive(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.archive(cmd.sessionId), send, cid);
         return;
 
       case "session.unarchive":
@@ -109,21 +115,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.reset":
-        deps.supervisor
-          .reset(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.reset(cmd.sessionId), send, cid);
         return;
 
       case "session.new_topic":
-        deps.supervisor
-          .newTopic(cmd.sessionId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.newTopic(cmd.sessionId), send, cid);
         return;
 
       case "git": {
@@ -138,12 +134,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "session.account.set":
-        deps.supervisor
-          .setSessionAccount(cmd.sessionId, cmd.accountId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.setSessionAccount(cmd.sessionId, cmd.accountId), send, cid);
         return;
 
       case "session.set_autonomy":
@@ -157,8 +148,8 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "team.plan.approve":
-        deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan);
-        if (cid) send(ack(cid));
+        // [BE2-2] Member spawns create worktrees via async git — ack when the spawns settle.
+        ackWhenDone(deps.supervisor.approveTeamPlan(cmd.sessionId, cmd.plan), send, cid);
         return;
 
       case "team.plan.reject":
@@ -167,13 +158,22 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "team.integrate":
-        deps.supervisor.integrateTeam(cmd.sessionId);
-        if (cid) send(ack(cid));
+        // [BE2-3] N merges + push + `gh pr create` now run async — ack when the integration settles
+        // (like session.kill); a failure (BadCommand or git error) arrives as command.error.
+        ackWhenDone(deps.supervisor.integrateTeam(cmd.sessionId), send, cid);
         return;
 
       case "prompt.send": {
         // attach so this connection receives the streamed turn (arch §6.4)
         conn.attached.add(cmd.sessionId);
+        // Exactly-once (v4, spec A5): a re-flushed offline send repeats its cid. If we already applied
+        // it, re-ack WITHOUT running the turn again — the client's 20s ack may have been lost to a drop,
+        // so the ack (not silence) is what lets it dequeue. Deliberately before any side effect.
+        if (cid && deps.supervisor.isPromptApplied(cmd.sessionId, cid)) {
+          deps.supervisor.noteServerCounter("promptDeduped"); // §5.7: exactly-once caught a re-flush
+          send(ack(cid));
+          return;
+        }
         let text = cmd.text;
         if (cmd.cites?.length) {
           const ctx = cmd.cites
@@ -181,7 +181,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
             .join("\n\n");
           text = `${ctx}\n\n${text}`;
         }
-        deps.supervisor.prompt(cmd.sessionId, text, cmd.attachmentIds ?? []);
+        deps.supervisor.prompt(cmd.sessionId, text, cmd.attachmentIds ?? [], cid);
         deps.supervisor.noteHumanPrompt(cmd.sessionId); // a human in the loop resets the team relay guard
         if (cid) send(ack(cid));
         return;
@@ -369,16 +369,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "autopilot.dismiss":
-        deps.supervisor
-          .dismissPlan(cmd.workUnitId)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.dismissPlan(cmd.workUnitId), send, cid);
         return;
 
       case "autopilot.start":
-        send(deps.supervisor.startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid));
+        // [BE2-2] Go spawns a fresh-worktree session (async git) — settle off the dispatch path.
+        deps.supervisor
+          .startPlan(cmd.workUnitId, cmd.model, cmd.autonomy, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "autopilot.pipeline.start":
@@ -395,12 +394,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "autopilot.resolve":
-        deps.supervisor
-          .resolvePlan(cmd.workUnitId, cmd.status, cmd.closeTodoist)
-          .then(() => {
-            if (cid) send(ack(cid));
-          })
-          .catch((e) => send(cmdError(errMsg(e), cid)));
+        ackWhenDone(deps.supervisor.resolvePlan(cmd.workUnitId, cmd.status, cmd.closeTodoist), send, cid);
         return;
 
       case "autopilot.link":
@@ -434,11 +428,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "autopilot.approve":
-        try {
-          send(deps.supervisor.approveProposed(cmd.workUnitId, cmd.start ?? false, cid));
-        } catch (e) {
-          send(cmdError(errMsg(e), cid));
-        }
+        // Async now (startPlan awaits worktree creation) — settle off the dispatch path like autopilot.start.
+        deps.supervisor
+          .approveProposed(cmd.workUnitId, cmd.start ?? false, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "loops.get":
@@ -490,23 +484,34 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "terminal.open":
-        deps.supervisor.terminalOpen(cmd.sessionId, cmd.cols, cmd.rows);
+        deps.supervisor.terminalOpen(cmd.sessionId, cmd.cols, cmd.rows, cmd.termId);
         if (cid) send(ack(cid));
         return;
       case "terminal.input":
-        deps.supervisor.terminalInput(cmd.sessionId, cmd.data);
+        deps.supervisor.terminalInput(cmd.sessionId, cmd.data, cmd.termId);
         return;
       case "terminal.resize":
-        deps.supervisor.terminalResize(cmd.sessionId, cmd.cols, cmd.rows);
+        deps.supervisor.terminalResize(cmd.sessionId, cmd.cols, cmd.rows, cmd.termId);
         return;
       case "terminal.close":
-        if (cid) send(ack(cid)); // PTY persists (arch §7); the client just stops rendering
+        // Kills the PTY (kill/respawn escape hatch, design 2026-08-08). Previously a documented
+        // no-op that no released client ever sent, so repurposing it is not a breaking change.
+        deps.supervisor.terminalClose(cmd.sessionId, cmd.termId);
+        if (cid) send(ack(cid));
         return;
 
       case "ping":
         // Heartbeat (§6.4): echo pong so the client can prove the socket is still alive and
         // detect a half-open connection. Deliberately not correlated — no cid, no ack.
         send({ v: PROTOCOL_VERSION, type: "pong", ts: now() });
+        return;
+
+      case "telemetry.report":
+        // §5.7: record this client's counters and rebroadcast the aggregate so every device (and the
+        // debug panel) sees the fleet-wide resilience picture. Best-effort — never fails a client.
+        deps.supervisor.recordClientTelemetry(cmd.clientId, cmd.counters);
+        deps.supervisor.broadcastTelemetry();
+        if (cid) send(ack(cid));
         return;
 
       default:

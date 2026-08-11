@@ -43,3 +43,26 @@ test("a failed write does not destroy the existing target", () => {
   expect(existsSync(f)).toBe(true);
   expect(readFileSync(f, "utf8")).toBe('{"good":true}'); // untouched
 });
+
+// ── [BE2-14] the two sites this program moved onto the atomic writer ───────────────────────────────
+import { FleetStore } from "../../src/fleet/store";
+import { upsertEnvLine, readEnvKey } from "../../src/auth/env-file";
+
+test("[BE2-14] FleetStore.save is atomic — no stray fleet.json.tmp, round-trips", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-atomic-fleet-"));
+  const f = new FleetStore(dir);
+  f.upsert({ serverId: "a", serverName: "a", host: "a.ts.net", url: "https://a.ts.net:7701/" });
+  expect(existsSync(join(dir, "fleet.json.tmp"))).toBe(false);
+  expect(new FleetStore(dir).list().map((m) => m.serverId)).toEqual(["a"]); // survives reload
+});
+
+test("[BE2-14] upsertEnvLine writes the token atomically, preserves 0600 + other keys", () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-atomic-env-"));
+  const file = join(dir, "env");
+  upsertEnvLine(file, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-xyz");
+  upsertEnvLine(file, "OTHER", "keep");
+  expect(readEnvKey(file, "CLAUDE_CODE_OAUTH_TOKEN")).toBe("sk-ant-oat-xyz");
+  expect(readEnvKey(file, "OTHER")).toBe("keep"); // other keys survive a rewrite
+  expect(existsSync(`${file}.tmp`)).toBe(false);
+  expect(statSync(file).mode & 0o777).toBe(0o600);
+});

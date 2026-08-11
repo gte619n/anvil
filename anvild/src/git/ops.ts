@@ -4,7 +4,7 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { CLONE_TIMEOUT_MS, GIT_ENV, gitSpawn, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "./spawn";
+import { CLONE_TIMEOUT_MS, GIT_ENV, gitSpawn, gitSpawnAsync, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "./spawn";
 
 /** Run a git/gh command in `cwd`, returning its exit code + combined stdout/stderr. Hardened against
  *  network hangs via the shared `gitSpawn` (SSH keepalive + hard timeout). Local ops use the generous
@@ -12,6 +12,15 @@ import { CLONE_TIMEOUT_MS, GIT_ENV, gitSpawn, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS }
  *  connection can never wedge the single-threaded daemon. */
 function run(cmd: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): { code: number; out: string } {
   const r = gitSpawn(cmd, cwd, timeoutMs);
+  const out = `${r.stdout}${r.stderr}`.trim();
+  return { code: r.code, out };
+}
+
+/** [BE2-3] Async twin of `run` (Bun.spawn via gitSpawnAsync): identical result contract, but a slow
+ *  or hung git/gh parks a promise instead of freezing the single-threaded event loop. Backs the
+ *  `*Async` op twins used on request/turn paths (team integration, per-turn refresh). */
+async function runAsync(cmd: string[], cwd: string, timeoutMs: number = LOCAL_TIMEOUT_MS): Promise<{ code: number; out: string }> {
+  const r = await gitSpawnAsync(cmd, cwd, timeoutMs);
   const out = `${r.stdout}${r.stderr}`.trim();
   return { code: r.code, out };
 }
@@ -170,6 +179,39 @@ export function isAncestor(cwd: string, ref: string): boolean {
   return run(["git", "merge-base", "--is-ancestor", ref, "HEAD"], cwd).code === 0;
 }
 
+// ── [BE2-3] Async twins for the team-integration path ─────────────────────────────────────────────
+// `integrateTeam` runs N merges + a push + `gh pr create` back-to-back; the sync forms froze the
+// whole daemon for the duration (worst case minutes on a stalled network). Same semantics as the
+// sync originals — keep each pair in lockstep when editing either.
+
+/** Async `isAncestor`. */
+export async function isAncestorAsync(cwd: string, ref: string): Promise<boolean> {
+  return (await runAsync(["git", "merge-base", "--is-ancestor", ref, "HEAD"], cwd)).code === 0;
+}
+
+/** Async `mergeBranch` — same conflict detection (message sniff, then `ls-files -u`). */
+export async function mergeBranchAsync(cwd: string, branch: string, message?: string): Promise<{ ok: boolean; conflicted: boolean; output: string }> {
+  const args = ["git", "merge", "--no-edit", ...(message ? ["-m", message] : []), branch];
+  const r = await runAsync(args, cwd);
+  if (r.code === 0) return { ok: true, conflicted: false, output: r.out || `merged ${branch}` };
+  const conflicted = /conflict/i.test(r.out) || (await runAsync(["git", "ls-files", "-u"], cwd)).out.trim().length > 0;
+  return { ok: false, conflicted, output: r.out || `merge of ${branch} failed (exit ${r.code})` };
+}
+
+/** Async `push` — same refspec/upstream behaviour (see `push`). */
+export async function pushAsync(cwd: string, branch: string, remoteBranch?: string): Promise<{ ok: boolean; output: string }> {
+  const refspec = remoteBranch && remoteBranch !== branch ? `${branch}:${remoteBranch}` : branch;
+  const r = await runAsync(["git", "push", "-u", "origin", refspec], cwd, NET_TIMEOUT_MS);
+  return { ok: r.code === 0, output: r.out || "pushed" };
+}
+
+/** Async `createPr`. */
+export async function createPrAsync(cwd: string, title: string, body: string): Promise<{ ok: boolean; output: string; url?: string }> {
+  const r = await runAsync(["gh", "pr", "create", "--title", title, "--body", body], cwd, NET_TIMEOUT_MS);
+  const url = r.out.match(/https?:\/\/\S+/)?.[0];
+  return { ok: r.code === 0, output: r.out, url };
+}
+
 export function createPr(cwd: string, title: string, body: string): { ok: boolean; output: string; url?: string } {
   const r = run(["gh", "pr", "create", "--title", title, "--body", body], cwd, NET_TIMEOUT_MS);
   const url = r.out.match(/https?:\/\/\S+/)?.[0];
@@ -321,4 +363,23 @@ export async function prStatusAsync(cwd: string): Promise<{ state?: "open" | "me
 /** Best-effort delete of the remote branch (for abandon/cleanup). */
 export function deleteRemoteBranch(cwd: string, branch: string): void {
   run(["git", "push", "origin", "--delete", branch], cwd, NET_TIMEOUT_MS);
+}
+
+/** [BE2-4] Async best-effort delete of the remote branch — non-blocking so a background session
+ *  teardown never freezes the single-threaded daemon on the network `git push --delete` (up to
+ *  NET_TIMEOUT_MS on a stalled connection). Same env + hard timeout as the sync path. */
+export async function deleteRemoteBranchAsync(cwd: string, branch: string): Promise<void> {
+  try {
+    const proc = Bun.spawn(["git", "push", "origin", "--delete", branch], {
+      cwd,
+      stdout: "ignore",
+      stderr: "ignore",
+      env: GIT_ENV,
+      timeout: NET_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    await proc.exited;
+  } catch {
+    /* best-effort: the remote branch may already be gone, or the network is down */
+  }
 }

@@ -2,7 +2,8 @@
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@drawable/ic_launcher_background" />
     <foreground android:drawable="@drawable/ic_launcher_foreground_inset" />
-    <!-- Android 13+ themed (monochrome) icon: the system tints the art's silhouette to match the
-         user's wallpaper/theme. Reuses the same inset art so it stays centered. -->
-    <monochrome android:drawable="@drawable/ic_launcher_foreground_inset" />
+    <!-- Android 13+ themed (monochrome) icon: the system discards the RGB and tints this silhouette
+         to match the user's wallpaper/theme. Uses a dedicated single-weight anvil outline vector
+         (not the colored raster, which collapses to an unreadable blob when tinted). -->
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
 </adaptive-icon>

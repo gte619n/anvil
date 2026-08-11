@@ -17,15 +17,20 @@
 # serving the OLD web UI (the classic "my change merged but the dropdown/button isn't there"
 # symptom). `restart` now runs `build:web` first so a pull+restart is a true full deploy. To
 # verify the web change actually shipped, query the running daemon (not the browser, which the
-# service worker may have cached):  curl -s http://127.0.0.1:7701/main.js | grep -c <your-string>
+# service worker may have cached):  curl -s http://127.0.0.1:7701/$(curl -s http://127.0.0.1:7701/index.html | grep -o 'main-[a-z0-9]*\.js') | grep -c <your-string>
 #
 set -euo pipefail
 
 LABEL="com.anvil.anvild"
+# The update watchdog runs as its OWN service-manager unit alongside the daemon (stable-update-service
+# spec §4.1/D17): a separate, minimal process that polls the daemon's health and rolls a bad update back
+# from the OUTSIDE, so it survives a daemon build that won't boot.
+UPDATER_LABEL="com.anvil.anvil-updater"
 PORT="${ANVIL_PORT:-7701}"
 ANVILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="$HOME/.local/bin"
 LAUNCHER="$BIN_DIR/anvild-launch"
+UPDATER_LAUNCHER="$BIN_DIR/anvil-updater-launch"
 STATE_DIR="$HOME/.local/state/anvil"
 CONFIG_ENV="$HOME/.config/anvil/env"
 
@@ -35,6 +40,7 @@ case "$OS" in
   Darwin)
     MANAGED="launchd"
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+    UPDATER_PLIST="$HOME/Library/LaunchAgents/$UPDATER_LABEL.plist"
     UNIT_DIR="$(dirname "$PLIST")"
     DOMAIN="gui/$(id -u)"
     # launchd launcher PATH: Homebrew (Apple silicon + Intel) then the base system dirs.
@@ -44,6 +50,7 @@ case "$OS" in
     MANAGED="systemd"
     UNIT_DIR="$HOME/.config/systemd/user"
     UNIT="$UNIT_DIR/$LABEL.service"
+    UPDATER_UNIT="$UNIT_DIR/$UPDATER_LABEL.service"
     # systemd launcher PATH: user bins then the base system dirs (no Homebrew).
     LAUNCHER_PATH='export PATH="$HOME/.bun/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"'
     ;;
@@ -57,12 +64,32 @@ find_bun() {
   return 1
 }
 
+# The daemon requires Bun (pinned — see BUN_VERSION_PIN, kept in step with anvild/package.json's
+# engines.bun). This used to be the native Anvil Server.app's job (Deps.swift ran the same one-liner);
+# folding it into the installer is what lets a fresh Mac come up from a plain shell with no native app.
+# Idempotent: if a usable bun is already resolvable we leave it alone (never clobber a newer one the
+# user manages themselves). Only when none is found do we fetch the pinned build into ~/.bun.
+BUN_VERSION_PIN="1.3.14"
+ensure_bun() {
+  find_bun >/dev/null 2>&1 && return 0
+  echo "installing Bun v$BUN_VERSION_PIN (not found on PATH or ~/.bun/bin)…"
+  command -v curl >/dev/null 2>&1 || { echo "error: curl is required to install Bun"; exit 1; }
+  curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION_PIN" \
+    || { echo "error: Bun install failed"; exit 1; }
+  find_bun >/dev/null 2>&1 || { echo "error: Bun still not found after install (looked on PATH and ~/.bun/bin)"; exit 1; }
+}
+
 # Rebuild the web client into web/dist. Both `install` and `restart` call this so the bundle the
 # daemon serves can never lag the source (see the DEPLOY NOTE at the top of this file). We run
 # `bun install` first: a `git pull` can add a new dependency (e.g. sortablejs in #26), and
 # `build:web` resolves imports straight out of node_modules — so without an install the build
 # fails with "Could not resolve …" and the atomic dist swap silently keeps serving the old UI.
 # An in-sync lockfile makes the install a fast no-op, so it's cheap to always run.
+# `--frozen-lockfile` installs exactly what bun.lock pins and NEVER rewrites it: a bare `bun install`
+# normalizes the tracked lockfile in place, leaving the checkout dirty, which then trips the daemon's
+# self-update dirty-tree guard (see selfupdate.ts INSTALL_CMD — same fix, same reason). If package.json
+# and the lock genuinely disagree the install fails, and the graceful fallback below builds against the
+# existing node_modules rather than mutating the tree.
 #
 # CRITICAL: the rebuild is best-effort and must NEVER block the daemon from starting. The app ships a
 # prebuilt web/dist (Provision copies it into the install root) and build.ts swaps atomically — a
@@ -79,12 +106,12 @@ build_web() {
   # "bun: command not found" (exit 127) — observed on a fleet M1, which silently kept the daemon down.
   export PATH="$(dirname "$bun"):$PATH"
   echo "installing dependencies…"
-  ( cd "$ANVILD_DIR" && "$bun" install ) || echo "warning: bun install failed — building against the existing node_modules"
+  ( cd "$ANVILD_DIR" && "$bun" install --frozen-lockfile ) || echo "warning: bun install failed — building against the existing node_modules"
   echo "building web client…"
   if ( cd "$ANVILD_DIR" && "$bun" run build:web >/dev/null ); then
     return 0
   fi
-  if [ -f "$ANVILD_DIR/web/dist/main.js" ]; then
+  if [ -f "$ANVILD_DIR/web/dist/index.html" ]; then
     echo "warning: web build failed — serving the existing web/dist bundle (may be stale; see the build error above)"
     return 0
   fi
@@ -286,15 +313,114 @@ svc_restart_only() {
   esac
 }
 
+# ── Update watchdog unit (stable-update-service spec §4.1/D17) ───────────────────────────────────────
+# The watchdog is the STABLE backstop: a separate process that polls the daemon's /api/health and, if a
+# freshly-updated daemon never becomes healthy within the gate, git-resets to the pre-pull SHA and
+# restarts it. It runs its OWN main (src/daemon/updater/main.ts) so it survives a daemon that won't boot.
+
+write_updater_launcher() {
+  local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
+  # Mirrors the daemon launcher (incl. sourcing the SAME env file) with NO Claude token — the watchdog
+  # never talks to Anthropic; it only reads local state, probes localhost health, and shells git. It MUST
+  # source the env file so it resolves the SAME ANVIL_STATE_DIR the daemon does (else it would watch the
+  # wrong update-state.json and silently never roll anything back). ANVIL_PORT/ANVIL_MANAGED are exported
+  # AFTER sourcing, matching the daemon launcher, so the watchdog finds the health endpoint and knows how
+  # to restart the daemon's unit.
+  cat > "$UPDATER_LAUNCHER" <<ULAUNCH
+#!/bin/sh
+$LAUNCHER_PATH
+set -a
+[ -f "\$HOME/.config/anvil/env" ] && . "\$HOME/.config/anvil/env"
+set +a
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+export ANVIL_PORT=$PORT
+export ANVIL_MANAGED=$MANAGED
+exec "$bun" run "$ANVILD_DIR/src/daemon/updater/main.ts"
+ULAUNCH
+  chmod 755 "$UPDATER_LAUNCHER"
+}
+
+svc_write_updater_unit() {
+  case "$OS" in
+    Darwin)
+      cat > "$UPDATER_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$UPDATER_LABEL</string>
+  <key>ProgramArguments</key><array><string>$UPDATER_LAUNCHER</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>WorkingDirectory</key><string>$ANVILD_DIR</string>
+  <key>StandardOutPath</key><string>$STATE_DIR/anvil-updater.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/anvil-updater.error.log</string>
+</dict>
+</plist>
+PLISTEOF
+      ;;
+    Linux)
+      cat > "$UPDATER_UNIT" <<UNITEOF
+[Unit]
+Description=Anvil update watchdog (anvil-updater)
+After=$LABEL.service
+
+[Service]
+Type=simple
+ExecStart=$UPDATER_LAUNCHER
+WorkingDirectory=$ANVILD_DIR
+Restart=always
+RestartSec=10
+StandardOutput=append:$STATE_DIR/anvil-updater.log
+StandardError=append:$STATE_DIR/anvil-updater.error.log
+
+[Install]
+WantedBy=default.target
+UNITEOF
+      ;;
+  esac
+}
+
+svc_bootstrap_updater() {
+  case "$OS" in
+    Darwin)
+      launchctl bootout "$DOMAIN" "$UPDATER_PLIST" 2>/dev/null || true
+      launchctl bootstrap "$DOMAIN" "$UPDATER_PLIST"
+      launchctl kickstart -k "$DOMAIN/$UPDATER_LABEL"
+      ;;
+    Linux)
+      systemctl --user daemon-reload
+      systemctl --user enable "$UPDATER_LABEL.service" >/dev/null 2>&1 || true
+      systemctl --user restart "$UPDATER_LABEL.service"
+      ;;
+  esac
+}
+
+# Install + start ONLY the watchdog unit. Idempotent and best-effort — a failure here must never take
+# the daemon down (the daemon's own settleAfterBoot is the in-process half of the resilience model).
+# Called from do_install and, for the self-bootstrapping migration (D15), by the daemon on first boot
+# after it pulls a build that carries the watchdog (see src/daemon/updater/arm.ts).
+install_updater() {
+  mkdir -p "$BIN_DIR" "$STATE_DIR" "$UNIT_DIR"
+  write_updater_launcher
+  svc_write_updater_unit
+  svc_bootstrap_updater
+  echo "installed $UPDATER_LABEL ($MANAGED) — update watchdog armed"
+}
+
 svc_uninstall() {
   case "$OS" in
     Darwin)
+      launchctl bootout "$DOMAIN" "$UPDATER_PLIST" 2>/dev/null || true
       launchctl bootout "$DOMAIN" "$PLIST" 2>/dev/null || true
-      rm -f "$PLIST" "$LAUNCHER"
+      rm -f "$PLIST" "$LAUNCHER" "$UPDATER_PLIST" "$UPDATER_LAUNCHER"
       ;;
     Linux)
+      systemctl --user disable --now "$UPDATER_LABEL.service" 2>/dev/null || true
       systemctl --user disable --now "$LABEL.service" 2>/dev/null || true
-      rm -f "$UNIT" "$LAUNCHER"
+      rm -f "$UNIT" "$LAUNCHER" "$UPDATER_UNIT" "$UPDATER_LAUNCHER"
       systemctl --user daemon-reload 2>/dev/null || true
       ;;
   esac
@@ -314,6 +440,7 @@ launcher_is_serve_mode() {
 }
 
 do_install() {
+  ensure_bun
   local bun; bun="$(find_bun)" || { echo "error: bun not found (looked on PATH and ~/.bun/bin)"; exit 1; }
   svc_preflight
   # A missing env file is NO LONGER fatal (anvil-headless-join.md §4.4). The daemon boots degraded
@@ -373,6 +500,10 @@ LAUNCH
   svc_write_unit
   svc_bootstrap
 
+  # Arm the update watchdog alongside the daemon. Best-effort: never let a watchdog hiccup fail the
+  # daemon install (the in-process settleAfterBoot still gives basic resilience without it).
+  install_updater || echo "warning: couldn't arm the update watchdog (daemon still installed) — re-run: $0 install-updater"
+
   if wait_health; then
     echo "healthy: $(curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health")"
   else
@@ -398,7 +529,11 @@ LAUNCH
 
 case "${1:-install}" in
   install)   do_install ;;
-  uninstall) svc_uninstall; echo "removed $LABEL (state kept at $STATE_DIR)" ;;
+  # Install/arm ONLY the update watchdog (idempotent). Used by the self-bootstrapping migration: an
+  # existing host that self-updates via the OLD path pulls this build, then arms the watchdog on first
+  # boot (see src/daemon/updater/arm.ts). Safe to re-run by hand.
+  install-updater) svc_preflight; install_updater ;;
+  uninstall) svc_uninstall; echo "removed $LABEL + $UPDATER_LABEL (state kept at $STATE_DIR)" ;;
   restart)
     build_web
     # Re-assert `tailscale serve` only if this install chose serve mode (see launcher_is_serve_mode).
@@ -408,5 +543,5 @@ case "${1:-install}" in
     ;;
   status)    svc_status; { curl -fsS "http://127.0.0.1:$PORT/api/health" 2>/dev/null || curl -fsS "http://$(tailnet_ip):$PORT/api/health" 2>/dev/null; } && echo || echo "no health" ;;
   logs)      tail -n 80 -f "$STATE_DIR/anvild.log" ;;
-  *) echo "usage: service.sh {install|uninstall|restart|status|logs}"; exit 1 ;;
+  *) echo "usage: service.sh {install|install-updater|uninstall|restart|status|logs}"; exit 1 ;;
 esac

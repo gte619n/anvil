@@ -40,36 +40,36 @@ afterAll(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
-test("a lead created with teamRole carries its policy verbatim", () => {
+test("a lead created with teamRole carries its policy verbatim", async () => {
   const { sup } = makeSup();
-  const lead = sup.create(leadCmd(makeRepo(), { team: { integration: "pr-per-member", maxConcurrentMembers: 2 } }));
+  const lead = await sup.create(leadCmd(makeRepo(), { team: { integration: "pr-per-member", maxConcurrentMembers: 2 } }));
   expect(lead.data.teamRole).toBe("lead");
   expect(lead.data.team).toEqual({ integration: "pr-per-member", maxConcurrentMembers: 2 });
 });
 
-test("a lead with no explicit policy gets combined-pr + cap 3 defaults", () => {
+test("a lead with no explicit policy gets combined-pr + cap 3 defaults", async () => {
   const { sup } = makeSup();
-  const lead = sup.create(leadCmd(makeRepo()));
+  const lead = await sup.create(leadCmd(makeRepo()));
   expect(lead.data.team).toEqual({ integration: "combined-pr", maxConcurrentMembers: 3 });
 });
 
-test("#3: maxConcurrentMembers is clamped to >= 1 (a 0/negative cap would wedge the team)", () => {
+test("#3: maxConcurrentMembers is clamped to >= 1 (a 0/negative cap would wedge the team)", async () => {
   const { sup } = makeSup();
-  const zero = sup.create(leadCmd(makeRepo(), { team: { integration: "combined-pr", maxConcurrentMembers: 0 } }));
+  const zero = await sup.create(leadCmd(makeRepo(), { team: { integration: "combined-pr", maxConcurrentMembers: 0 } }));
   expect(zero.data.team?.maxConcurrentMembers).toBe(1);
-  const neg = sup.create(leadCmd(makeRepo(), { team: { integration: "combined-pr", maxConcurrentMembers: -5 } }));
+  const neg = await sup.create(leadCmd(makeRepo(), { team: { integration: "combined-pr", maxConcurrentMembers: -5 } }));
   expect(neg.data.team?.maxConcurrentMembers).toBe(1);
 });
 
-test("#8: approving an empty plan is rejected (no silent no-op spawn)", () => {
+test("#8: approving an empty plan is rejected (no silent no-op spawn)", async () => {
   const { sup } = makeSup();
-  const lead = sup.create(leadCmd(makeRepo()));
-  expect(() => sup.approveTeamPlan(lead.id, { leadId: lead.id, members: [], integration: "combined-pr" })).toThrow();
+  const lead = await sup.create(leadCmd(makeRepo()));
+  await expect(sup.approveTeamPlan(lead.id, { leadId: lead.id, members: [], integration: "combined-pr" })).rejects.toThrow();
 });
 
-test("rejectTeamPlan broadcasts team.plan.resolved{approved:false} without spawning members", () => {
+test("rejectTeamPlan broadcasts team.plan.resolved{approved:false} without spawning members", async () => {
   const { sup, reg } = makeSup();
-  const lead = sup.create(leadCmd(makeRepo()));
+  const lead = await sup.create(leadCmd(makeRepo()));
   reg.events.length = 0; // ignore the create burst
   sup.rejectTeamPlan(lead.id);
   const resolved = reg.events.find((e) => e.type === "team.plan.resolved");
@@ -78,18 +78,18 @@ test("rejectTeamPlan broadcasts team.plan.resolved{approved:false} without spawn
   expect(sup.list().filter((s) => s.parentId === lead.id)).toHaveLength(0);
 });
 
-test("approving/rejecting an unknown session throws a BadCommand", () => {
+test("approving/rejecting an unknown session throws a BadCommand", async () => {
   const { sup } = makeSup();
   expect(() => sup.rejectTeamPlan("sess_nope")).toThrow();
-  expect(() => sup.approveTeamPlan("sess_nope")).toThrow();
+  await expect(sup.approveTeamPlan("sess_nope")).rejects.toThrow();
 });
 
-test("approveTeamPlan refuses a non-lead session (auth boundary — no member spawn off a plain session)", () => {
+test("approveTeamPlan refuses a non-lead session (auth boundary — no member spawn off a plain session)", async () => {
   const { sup } = makeSup();
   // A plain (non-lead) session, plus a hand-built plan a malicious/confused client could send.
-  const plain = sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "fresh-worktree", repoRoot: makeRepo(), base: "HEAD", title: "plain" } as SessionCreateCmd);
+  const plain = await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "fresh-worktree", repoRoot: makeRepo(), base: "HEAD", title: "plain" } as SessionCreateCmd);
   expect(plain.data.teamRole).toBeUndefined();
   const plan = { leadId: plain.id, integration: "combined-pr" as const, members: [{ title: "X", task: "t", source: "fresh-worktree" as const }] };
-  expect(() => sup.approveTeamPlan(plain.id, plan)).toThrow();
+  await expect(sup.approveTeamPlan(plain.id, plan)).rejects.toThrow();
   expect(sup.list().filter((s) => s.parentId === plain.id)).toHaveLength(0);
 });

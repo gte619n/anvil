@@ -1,6 +1,5 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
     id 'com.google.gms.google-services'
     id 'com.google.firebase.appdistribution'
     // Play Store production publish — configured but DORMANT: no workflow invokes publishReleaseBundle
@@ -33,7 +32,7 @@ def computedVersionCode = ciBuildNumber ? (100 + ciBuildNumber.toInteger()) : 8
 
 android {
     namespace 'com.gte619n.anvil'
-    compileSdk 35
+    compileSdk 37
 
     defaultConfig {
         applicationId "com.gte619n.anvil"
@@ -99,12 +98,15 @@ android {
         sourceCompatibility JavaVersion.VERSION_21
         targetCompatibility JavaVersion.VERSION_21
     }
-    kotlinOptions {
-        jvmTarget = '21'
-    }
 
     buildFeatures {
         buildConfig true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
     }
 }
 
@@ -167,12 +169,15 @@ play {
 }
 
 dependencies {
-    implementation 'androidx.core:core-ktx:1.15.0'
-    implementation 'androidx.activity:activity-ktx:1.10.0'
+    implementation 'androidx.core:core-ktx:1.19.0'
+    implementation 'androidx.activity:activity-ktx:1.13.0'
     implementation 'androidx.webkit:webkit:1.12.1'
-    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'com.google.android.material:material:1.14.0'
 
     // Firebase Cloud Messaging (push)
     implementation platform('com.google.firebase:firebase-bom:33.7.0')
     implementation 'com.google.firebase:firebase-messaging'
+
+    // Plain-JVM unit tests (src/test) — run via :app:testDebugUnitTest in the CI PR gate (CI2-1).
+    testImplementation 'junit:junit:4.13.2'
 }

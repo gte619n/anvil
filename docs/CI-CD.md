@@ -2,7 +2,8 @@
 
 The single reference for **what gets built, where, and what you push to ship it**. The short version:
 **every merge to `main` cuts a "full release"** — one version fanned out to all client surfaces at
-once. There are no release tags to push and no store submissions to babysit.
+once. You push **nothing manually**: the `meta` job mints a `v<version>` git tag + GitHub Release
+automatically (it hosts the macOS Sparkle zips), and there are no app-store submissions to babysit.
 
 > **Accuracy note.** This describes the pipeline **as wired in `.github/workflows/` today**. Where it
 > disagrees with older prose in [`RELEASING.md`](../RELEASING.md), this file is authoritative.
@@ -20,7 +21,6 @@ surface at one shared version**:
 | **Android** | signed debug APK → Firebase App Distribution | testers (emails in `app/build.gradle`) |
 | **iOS/iPadOS** | archive + upload → TestFlight | testers via TestFlight |
 | **macOS client** (`Anvil.app`) | Developer-ID-notarized, Sparkle-signed | GitHub Release zip + appcast → auto-update |
-| **macOS server** (`Anvil Server.app`) | Developer-ID-notarized, Sparkle-signed | GitHub Release zip + appcast → auto-update |
 | **web PWA** | bundled into every shell above; served by the daemon | rides along — not a separate job |
 
 **Public app stores are deliberately not part of this.** No Play Store production, no App Store
@@ -46,8 +46,9 @@ served over Tailscale updates on a **daemon deploy**, which is a separate channe
 | **Merge / push to `main`** | `ci.yml`, `codeql.yml`, **`release.yml`** | Re-runs the gate, then the **full release** to all surfaces | ✅ **everything** |
 | **Run `release.yml` manually** (Actions → Run workflow, or `gh workflow run release.yml`) | `release.yml` | Re-fires the full release for the current `main` | ✅ everything |
 
-There are **no release tags** — versioning is automatic (below). `ci.yml` remains the fast PR gate;
-`release.yml` re-runs the same checks as its `verify` job so nothing untested can ship.
+Versioning is automatic (below): every release mints a `v<version>` tag + GitHub Release from `meta` —
+you never tag by hand. `ci.yml` remains the fast PR gate; `release.yml`'s `meta` and every ship job
+`needs: [verify]`, so a red gate mints no tag and ships nothing (CI2-5).
 
 > **Cost / cadence note.** Every merge to `main` runs **two macOS notarizations + a TestFlight
 > upload** (three `macos-15` jobs) plus the Firebase build. That's real runner time, and each iOS
@@ -61,7 +62,7 @@ There are **no release tags** — versioning is automatic (below). `ci.yml` rema
 
 Runs on merge to `main`, in dependency order:
 
-- **meta** *(ubuntu)* — computes the version (`<VERSION>.<run_number>`, e.g. `2.2.47`) and creates a
+- **meta** *(ubuntu)* — computes the version (`<VERSION>.<run_number>`, e.g. `3.0.47`) and creates a
   GitHub Release tagged `v<version>`. That Release is the stable public URL the macOS Sparkle zips
   are attached to and the appcasts point at. (No tag is pushed by a human; the workflow mints it.)
 - **verify** *(ubuntu)* — the merge gate again (`typecheck` + `typecheck:web` + `build:web` +
@@ -72,14 +73,12 @@ Runs on merge to `main`, in dependency order:
   upload to **TestFlight**.
 - **mac-client** *(macos-15)* — builds, Developer-ID-signs, notarizes, staples `Anvil.app`; attaches
   `Anvil.zip` to the Release; signs it with the Sparkle key.
-- **mac-server** *(macos-15)* — same for `Anvil Server.app` → `Anvil-Server.zip`.
-- **pages** *(ubuntu)* — updates both Sparkle appcasts and deploys them to GitHub Pages.
+- **pages** *(ubuntu)* — updates the Sparkle appcast and deploys it to GitHub Pages.
 
 **When each goes live:**
 
-- **macOS** — installed apps auto-update via Sparkle **as soon as `pages` finishes**. Appcast URLs
-  (embedded at build time): client `https://gte619n.github.io/anvil/appcast.xml`, server
-  `https://gte619n.github.io/anvil/appcast-server.xml`.
+- **macOS** — the installed client auto-updates via Sparkle **as soon as `pages` finishes**. Appcast
+  URL (embedded at build time): `https://gte619n.github.io/anvil/appcast.xml`.
 - **Android / iOS** — available to testers once Firebase/TestFlight finish processing (minutes).
 
 ---
@@ -91,7 +90,7 @@ Everything builds in **GitHub Actions** — nothing ships from a laptop in the n
 | Runner | Jobs |
 |--------|------|
 | `ubuntu-latest` | `meta`, `verify`, `android` (Firebase), `pages` (appcast deploy); also `ci.yml`, `codeql.yml` |
-| `macos-15` | `ios` (TestFlight), `mac-client`, `mac-server` (needs full Xcode + Developer-ID signing) |
+| `macos-15` | `ios` (TestFlight), `mac-client` (needs full Xcode + Developer-ID signing) |
 
 Bun is pinned to **1.3.14** in the gate; other jobs use `latest`. Android needs **JDK 21 + Android
 SDK**; Apple needs **Xcode 16.x** (why the Apple jobs pin `macos-15`).
@@ -103,12 +102,12 @@ daemon/web (Kotlin/Swift shells are covered by review, by design).
 
 ## Versioning (single source of truth)
 
-`MAJOR.MINOR` lives in **one** file: repo-root [`VERSION`](../VERSION) (currently **`2.2`**). All
-build paths read it (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`,
-`anvil-server/make-app.sh`). The full version is **`MAJOR.MINOR.<run_number>`** (e.g. `2.2.47`),
-shared by every job in a run so all four apps report the same number.
+`MAJOR.MINOR` lives in **one** file: repo-root [`VERSION`](../VERSION) (currently **`3.0`**). All
+build paths read it (`app/build.gradle`, `apple/make-app.sh`, `apple/make-ios.sh`). The full version
+is **`MAJOR.MINOR.<run_number>`** (e.g. `3.0.47`), shared by every job in a run so all shipped apps
+report the same number.
 
-**To start a new line, bump `VERSION`** (e.g. `2.2` → `2.3`) and merge it — the next full release is
+**To start a new line, bump `VERSION`** (e.g. `3.0` → `3.1`) and merge it — the next full release is
 `2.3.<run_number>`. Nothing else to push. (`apple/project.yml`'s static `MARKETING_VERSION` is only
 for raw Xcode dev builds — keep its MAJOR.MINOR in sync by hand.)
 
@@ -124,6 +123,31 @@ for raw Xcode dev builds — keep its MAJOR.MINOR in sync by hand.)
 | **Deploy new daemon / browser UI** | `cd anvild && git pull && ./scripts/service.sh restart` (or in-app "Update Anvil") |
 
 That's it for the apps — there is no tag to push and no store console to touch.
+
+---
+
+## Rolling back a bad release
+
+There is **one universal rollback knob** and a per-platform reality check. The universal knob:
+
+> **Actions → Full release → Run workflow → set `release_ref` to the last known-good SHA.**
+> The run gets a fresh (higher) run number, so every surface ships a **newer version of the older
+> code** — a roll-*forward* to known-good, which is the only rollback shape Firebase, TestFlight and
+> Sparkle all accept (none of them will push a lower version number to devices). Leaving
+> `release_ref` empty keeps today's behavior (release the current `main` tip). The `meta` job tags
+> the commit actually checked out, so the `v<version>` audit trail stays truthful.
+
+Fix `main` afterwards (revert the bad commit) or the next merge re-ships the regression.
+
+Per platform, what rollback actually means today:
+
+| Surface | Automatic? | Manual rollback today |
+|---------|-----------|------------------------|
+| **daemon** | **Yes** — the out-of-process watchdog health-gates every update for 180s and auto-rolls back to `prePullSha`, then re-restarts (see [the update service](#the-stable-update-service--fleet-rollout-what-to-do-during-an-incident)). Rollback targets are ancestry-gated (CI2-7): only commits on the release track / the checkout's own history can be applied. | Pin an older SHA: `POST /api/update/v1/apply` with `targetSha`, or on the host `git reset --hard <sha> && ./scripts/service.sh restart`. |
+| **macOS client (Sparkle)** | No — Sparkle only ever offers the highest version in the appcast (the feed keeps ~20 items of history, so past zips stay downloadable). | Cut a `release_ref` release (above). Stopgap for one machine: download the older `Anvil.zip` from its `v<version>` GitHub Release and replace the app by hand. |
+| **Android (Firebase App Distribution)** | No. | Cut a `release_ref` release (new build gets a higher `versionCode`, testers are emailed). Stopgap: Firebase console → App Distribution → re-distribute an older build, or grab the `anvil-debug-apk` artifact from the old workflow run — but an APK with a *lower* versionCode needs uninstall/reinstall on the device. |
+| **iOS (TestFlight)** | No. | Cut a `release_ref` release (new, higher build number). Stopgap: older processed builds stay installable in the TestFlight app for ~90 days — testers can pick a previous build manually. Uploaded builds can be *expired* in App Store Connect to stop new installs, never un-shipped. |
+| **web (browser)** | n/a — rides the daemon deploy. | Roll the daemon back (above); `service.sh restart` rebuilds `web/dist` from the restored source. |
 
 ---
 
@@ -151,6 +175,28 @@ A deploy = **pull source → rebuild `web/dist` → restart** so the new source 
 This is independent of the app channels: a daemon deploy never updates an installed native shell
 (each bundles its own web copy — re-ship it via a full release), and a full release never touches a
 running daemon. (Scheduled/nightly autopilot deploys are hub-only.)
+
+### The stable update service + fleet rollout (what to do during an incident)
+
+The self-update button is now backed by a **frozen Update API v1** and an **out-of-process watchdog** —
+this is the part to understand when a release goes bad (spec: `plans/2026-08-01-stable-update-service.md`,
+constraints: [`REQUIREMENTS.md`](REQUIREMENTS.md) §5):
+
+- **Pinned targets, not moving tips.** A hub pins ONE target SHA (`resolveTargetSha`) and fans it out to
+  every reachable member over `/api/update/v1/apply`; the hub updates **itself last** (D6). Members
+  offline at fan-out are marked `pending-offline` and reconciled to the pinned target when they reconnect.
+- **Ancestry gate (SEC2-1).** `applyUpdateToTarget` refuses a target that isn't an ancestor of the trusted
+  upstream tip — only commits on the release track can be applied.
+- **prePullSha + 180s health gate.** The pre-pull SHA is recorded before the checkout moves. The
+  **watchdog** (`src/daemon/updater/*`, its own service unit) polls `/api/health`; if the new build
+  crash-loops / hangs / serves a broken bundle within the gate, it **rolls back** to `prePullSha` and
+  restarts. It arms across `pulling|building|restarting` and re-probes after rollback (adopts a target
+  that went healthy late) so it never resets a now-healthy daemon backwards.
+- **Rollback is a *health* guarantee, not authenticity** — authenticity is the ancestry gate above.
+- **If a rollout wedges:** check `GET /api/fleet/update/status` and `GET /api/update/v1/status`; the
+  coordinator releases its in-flight lock even on a thrown body (BE2-11), and applies are serialized by a
+  single in-flight lock (BE2-28). A member stuck on an old SHA converges on its next `/api/fleet/members`
+  poll (reconcile, BE2-12).
 
 ---
 
@@ -189,9 +235,9 @@ and Sparkle key generation are in [`RELEASING.md`](../RELEASING.md). Which secre
 |---------|-------------|
 | `FIREBASE_SERVICE_ACCOUNT` | `android` (Firebase distribution) |
 | `IOS_DIST_P12_BASE64`, `IOS_DIST_P12_PASSWORD`, `IOS_PROVISIONING_PROFILE_BASE64` | `ios` (TestFlight) |
-| `APPLE_TEAM_ID`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | `ios` + both macOS jobs |
-| `MAC_DEVELOPER_ID_P12_BASE64`, `MAC_DEVELOPER_ID_P12_PASSWORD` | `mac-client`, `mac-server` |
-| `SPARKLE_ED_PRIVATE_KEY`, `SPARKLE_PUBLIC_ED_KEY` | `mac-client`, `mac-server`, `pages` |
+| `APPLE_TEAM_ID`, `APPLE_API_KEY_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` | `ios`, `mac-client` |
+| `MAC_DEVELOPER_ID_P12_BASE64`, `MAC_DEVELOPER_ID_P12_PASSWORD` | `mac-client` |
+| `SPARKLE_ED_PRIVATE_KEY`, `SPARKLE_PUBLIC_ED_KEY` | `mac-client`, `pages` |
 
 The **Android upload key / Play service account** and **App Store Connect submission** secrets in
 `RELEASING.md` are only needed if the public-store path is ever wired — the full release doesn't use

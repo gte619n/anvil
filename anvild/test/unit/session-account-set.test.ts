@@ -34,7 +34,7 @@ test("switching an idle session's account updates its record and drops the live 
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, a.id));
+  const s = await sup.create(createCmd(dir, a.id));
   const driver = fakeDriver();
   driversOf(sup).set(s.data.id, driver);
 
@@ -54,7 +54,7 @@ test("refuses to switch a mid-turn session", async () => {
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, a.id));
+  const s = await sup.create(createCmd(dir, a.id));
   s.setStatus("thinking");
 
   await expect(sup.setSessionAccount(s.data.id, b.id)).rejects.toThrow(/mid-turn/i);
@@ -67,7 +67,7 @@ test("refuses an unknown accountId", async () => {
   const accounts = new AccountStore(dir);
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, a.id));
+  const s = await sup.create(createCmd(dir, a.id));
 
   await expect(sup.setSessionAccount(s.data.id, "acct_gone")).rejects.toThrow(BadCommand);
   rmSync(dir, { recursive: true, force: true });
@@ -79,7 +79,7 @@ test("clears a stale accountMissing flag on a successful switch", async () => {
   const a = accounts.add("work", "sk-ant-oat01-workworkwork-1111");
   const b = accounts.add("personal", "sk-ant-oat01-personalpers-2222");
   const sup = new Supervisor({ stateDir: dir, accounts, envFile: join(dir, "env") }, new ConnectionRegistry());
-  const s = sup.create(createCmd(dir, a.id));
+  const s = await sup.create(createCmd(dir, a.id));
   s.data.accountMissing = true; // simulate a prior removal fallback
 
   await sup.setSessionAccount(s.data.id, b.id);

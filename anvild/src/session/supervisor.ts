@@ -17,17 +17,13 @@ import {
   type ModelLabelsEvent,
   type TodoistStatusEvent,
   type TodoistProjectsResultEvent,
-  type TodoistProjectInfo,
   type LapoStatusEvent,
   type LapoAuthorizeEvent,
-  type AutopilotPlanInfo,
   type AutopilotPipelineMetricsEvent,
   type AutopilotPlansEvent,
   type TeamInfoEvent,
-  type TeamInfo,
   type TeamPlan,
-  type TeamPlanMember,
-  type TeamPlanEvent,
+  type AutopilotPlanInfo,
   type AutopilotPlanResultEvent,
   type AutopilotStartedEvent,
   type AutopilotSchedule,
@@ -38,7 +34,6 @@ import {
   type AuthProvider,
   type AuthStatusEvent,
   type AuthAccountsEvent,
-  type AccountInfo,
   type CommandInfo,
   type GitCmd,
   type GitResultEvent,
@@ -52,6 +47,8 @@ import {
   type SessionListEvent,
   type SessionSource,
   type SessionGoal,
+  type ResumeWatermarksEvent,
+  type TelemetrySnapshotEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
@@ -62,16 +59,14 @@ import { Session } from "./session";
 import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
-import { applyPrBadge, carryPrBadge, createWorktree, gitStatus, isPrSweepEligible, prBadgeFor, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
+import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
-import { buildTeamToolsServer, TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
-import { buildMemberToolsServer, MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
-import { buildPlanningToolsServer, PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
-import { memberBaseRef } from "../integrations/member-base";
-import { shouldAutoApprove, spawnPaused, relayExhausted, MAX_TEAM_RELAY_HOPS } from "../integrations/team-gate";
+import { TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
+import { MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
+import { PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
 import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
 import { fetchModelCatalog, resolveModelLabels } from "../agent/model-catalog";
 import { ModelLabelStore } from "../models/store";
@@ -84,73 +79,45 @@ import { RateLimitTracker } from "../budget/tracker";
 import { EnvironmentStore } from "../env/store";
 import { PromptStore } from "../prompts/store";
 import { IntegrationStore } from "../integrations/store";
-import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
-import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildAutopilotGoal, buildPlanningBrief } from "../integrations/autopilot-plans";
-import { deriveTeams } from "../integrations/team-tree";
-import { integrationOrder } from "../integrations/team-plan";
-import { integrateTeam as runTeamIntegration, safeRemoteBranch, type IntegrateMember } from "../integrations/team-integrate";
-import { TodoistClient, type TodoistTask } from "../integrations/todoist";
-import { LapoClient, tokenNeedsRefresh, type LapoTokens, type LapoEntryEndpoint, type LapoConfig } from "../integrations/lapo";
-import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
-import { resolveLapoConfig } from "../config";
-import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
+import { IntegrationsFacade } from "./integrations-facade";
+import { AccountRosterService } from "./account-roster-service";
+import { EnvironmentService } from "./environment-service";
+import { GitProjectionService } from "./git-projection-service";
+import { AutopilotService } from "./autopilot-service";
+import { TeamCoordinator } from "./team-coordinator";
+import { slugify } from "./slug";
+import type { WorkUnit } from "../integrations/workunit";
+import { buildLoopsSnapshot } from "../integrations/loops";
+import type { TriggerEvent } from "../integrations/event-trigger";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
 import { AccountStore } from "../auth/accounts";
-import { mirrorDefault, defaultPersisted } from "../auth/account-mirror";
 import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
-import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
-import { autoStartDecision } from "../integrations/autostart-gate";
-import { normalizeTrigger, type TriggerEvent } from "../integrations/event-trigger";
-import { buildLoopsSnapshot } from "../integrations/loops";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { reviewPlan, formatReview } from "../integrations/adversarial";
-import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
-import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
-import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, adversaryStats } from "../pipeline/daemon-adapters";
-import { loadMetrics, saveMetrics } from "../pipeline/metrics-store";
-import type { AdversaryMetrics } from "../pipeline/metrics";
-import type { PhaseDeps } from "../pipeline/phases";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
-import { AutopilotScheduleStore, scheduledFireDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
 import { AttachmentStore } from "../attach/store";
 import { FileNotFound, listDir, locateInside, readFile, resolveInside, writeFile } from "../fs/session-fs";
 import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
+import { UpdateStateStore } from "../daemon/update-state";
+import { updateApply, updateCheck, type UpdateApiDeps } from "../daemon/update-api";
 import { VERSION } from "../version";
 import { pickIcon } from "../agent/icon";
-import { classifyBranchKind, heuristicKind } from "../agent/branch-kind";
+import { classifyBranchKind } from "../agent/branch-kind";
 import { AuthDegradeTracker, type DegradeMarker } from "../auth/degrade";
 import { WebPush, type PushPayload } from "../push/webpush";
 import { Fcm } from "../push/fcm";
 import { Apns } from "../push/apns";
 
-/** A client command that can't be honored (bad args, no such session). → command.error. */
-export class BadCommand extends Error {}
+// BadCommand moved to ./errors so domain services (IntegrationsFacade, …) can throw it without a
+// circular import through supervisor.ts. Imported + re-exported here so existing importers keep working.
+import { BadCommand } from "./errors";
+export { BadCommand };
 
 /** Stable sentinel id for the single persistent "concierge" default chat (§0.6). `newId` is random
  *  so this can never collide with an ordinary session. */
 export const DEFAULT_SESSION_ID = "sess_default";
-
-/** Hard ceiling on a single autopilot run, and the budget the DERIVED `running` state uses: a run older
- *  than this reports `running: false` to every client no matter what, so a hung run (an await that never
- *  settles, a skipped finally) can't latch the live spinner. A full multi-env run plans several units
- *  with Opus, so keep it generous enough to never cut off legitimate work. */
-const AUTOPILOT_RUN_TIMEOUT_MS = 30 * 60_000;
-/** Per-unit budget for a background dev-pipeline run auto-started by the scheduler. Generous: a full
- *  7-gate run with both live models + real checks + loop-backs can legitimately take a while. */
-const PIPELINE_RUN_BUDGET_MS = 45 * 60_000;
-
-/** How often the scheduler checks whether the scheduled time has arrived. */
-const SCHEDULE_TICK_MS = 5 * 60_000;
-/** A scheduled run fires only if the daemon notices within this window of the scheduled time. Must be
- *  > SCHEDULE_TICK_MS so a tick always lands inside it; small enough that a restart well away from the
- *  scheduled time never trips it (see scheduledFireDue — restarts must not launch a run). */
-const SCHEDULE_RUN_WINDOW_MS = 10 * 60_000;
-/** How far back the inbound completion sync looks for tasks checked off in Todoist. Todoist caps the
- *  completion query at ~3 months; 60 days stays well under that while covering any realistic stretch of
- *  daemon downtime between the completion and the next reconcile tick. */
-const RECONCILE_WINDOW_DAYS = 60;
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -198,6 +165,16 @@ export class Supervisor {
   private readonly sessions = new Map<string, Session>();
   private readonly drivers = new Map<string, AgentDriver>();
   private readonly logs = new Map<string, EventLog>();
+  /** Resilience telemetry (v4, §5.7): the daemon's own counters + the latest report from each client. */
+  private readonly serverCounters: Record<string, number> = { resumeDelta: 0, resumeSnapshot: 0, promptDeduped: 0 };
+  // [BE2-23/SEC2-4] Bounded, TTL'd, and validated: keyed by an UNvalidated client-supplied id, this map
+  // otherwise grows forever (a leak + a trivial DoS — flood unique ids) and the whole thing is
+  // re-serialized into a broadcast on every report. Insertion-ordered LRU (re-set moves to newest);
+  // evict oldest past the cap; drop entries past the TTL on read/write.
+  private readonly clientTelemetry = new Map<string, { counters: Record<string, number>; at: number }>();
+  private static readonly MAX_TELEMETRY_CLIENTS = 50;
+  private static readonly TELEMETRY_TTL_MS = 30 * 60_000;
+  private telemetryBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly broker = new PermissionBroker();
   private readonly questionBroker = new QuestionBroker();
   /** Sessions whose awaiting_permission state has been announced to the whole fleet (list badge). */
@@ -226,43 +203,27 @@ export class Supervisor {
     listEnvironments: () => this.envStore.list(),
     handoff: (a) => this.handoffCreate(a),
   });
-  // ── Teams (see docs/plans/anvil-team-support.md) ──────────────────────────────────────────────
-  /** Plans awaiting the user's approval, keyed by lead id (the reviewable team-plan card). */
-  private readonly pendingTeamPlans = new Map<string, TeamPlan>();
-  /** The approved/active plan per lead — kept so `integrate` can order the merge by `dependsOn`. */
-  private readonly activeTeamPlans = new Map<string, TeamPlan>();
-  /** Members not yet spawned because the lead is at its concurrency cap; drained as members finish. */
-  private readonly queuedMembers = new Map<string, TeamPlanMember[]>();
-  /** Per-team (leadId) count of automatic lead↔member relay hops since the last human prompt — the
-   *  loop guard for two-way conversations. Reset by `noteHumanPrompt`. */
-  private readonly teamRelayHops = new Map<string, number>();
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
+  private readonly updateState: UpdateStateStore;
   /** Live model-tier labels (hub-refreshed from the Models API); empty until the first refresh lands. */
   private readonly modelLabels: ModelLabelStore;
   private modelLabelTimer?: ReturnType<typeof setInterval>;
   private readonly integrations: IntegrationStore;
-  private readonly workUnits: WorkUnitStore;
-  private readonly autopilotSchedule: AutopilotScheduleStore;
-  // The live run is tracked by a START TIMESTAMP, not a boolean — `running` is DERIVED from it (below),
-  // so it physically cannot latch: once a run outlives AUTOPILOT_RUN_TIMEOUT_MS, every reader (schedule
-  // event, connect handshake, the re-run guard) sees `running: false` automatically, even if the run's
-  // cleanup never fires (a hung await, a skipped finally). A monotonically-increasing token disambiguates
-  // overlapping runs so a slow run's late cleanup can't clear a newer run's state. undefined = idle.
-  private autopilotRunStartedAt: number | undefined;
-  private autopilotRunToken = 0;
-  /** Derived live-run state: a run is "running" only while its start is within the time budget. This is
-   *  the single source of truth broadcast to clients; being time-bounded is what makes the spinner
-   *  un-latchable. */
-  private get autopilotRunning(): boolean {
-    return runWithinBudget(this.autopilotRunStartedAt, Date.now(), AUTOPILOT_RUN_TIMEOUT_MS);
-  }
-  private autopilotRunLog: string[] = []; // the live run's progress lines, retained so a connecting/refreshed client can replay them
-  /** Work units whose autonomous dev pipeline is running right now (id → title). Feeds the Loops panel's
-   *  live pipeline rows; populated at runDevPipeline start, cleared in its finally. */
-  private readonly runningPipelines = new Map<string, string>();
-  private scheduleTimer?: ReturnType<typeof setInterval>;
+  /** Todoist + lapo integration domain (P7 extraction). Constructed in the ctor once `integrations` exists. */
+  private readonly integrationsFacade: IntegrationsFacade;
+  /** Claude multi-account roster domain (P7 extraction). Constructed in the ctor once its deps exist. */
+  private readonly accountRoster: AccountRosterService;
+  /** Environment (project) CRUD + clone + README domain (P7 extraction). */
+  private readonly environments: EnvironmentService;
+  /** Git projection + PR-badge/sweep domain (P7 extraction). */
+  private readonly gitProjection: GitProjectionService;
+  /** Team orchestration domain — plan lifecycle, member spawn/queue/drain, relay guard, integration
+   *  (P7 extraction; see docs/plans/anvil-team-support.md). */
+  private readonly teams: TeamCoordinator;
+  /** Autopilot domain — work-unit plans, runs, dev pipeline, schedule, Todoist/lapo sync (P7 extraction). */
+  private readonly autopilot: AutopilotService;
   private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
@@ -274,8 +235,6 @@ export class Supervisor {
    *  set from Settings → Models (which updates process.env + the env file) takes effect on the next run
    *  without a daemon restart, mirroring how the Claude token is picked up per agent spawn. */
   private readonly adversarial: { models: string[]; provider?: string };
-  /** Persisted first-pass rejection-rate metric for the dev pipeline's adversaries (§6.3). */
-  private readonly devPipelineMetrics: AdversaryMetrics;
   private readonly stateDir: string;
   /** The Claude account roster (multi-account §3). Exactly one instance per process — see
    *  `SupervisorConfig.accounts`. */
@@ -308,14 +267,91 @@ export class Supervisor {
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
       this.notifyAuthDegraded(marker),
     );
-    this.devPipelineMetrics = loadMetrics(cfg.stateDir);
     this.store = new SessionStore(cfg.stateDir);
     this.envStore = new EnvironmentStore(cfg.stateDir);
+    this.environments = new EnvironmentService({
+      envStore: this.envStore,
+      registry: this.registry,
+      clonesDir: this.clonesDir,
+      renderer: this.renderer,
+    });
+    this.gitProjection = new GitProjectionService({
+      require: (id) => this.require(id),
+      getSession: (id) => this.sessions.get(id),
+      sessions: () => this.sessions.values(),
+      persist: () => this.persist(),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+    });
+    this.teams = new TeamCoordinator({
+      require: (id) => this.require(id),
+      getSession: (id) => this.sessions.get(id),
+      list: () => this.list(),
+      registry: this.registry,
+      persist: () => this.persist(),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+      prompt: (sessionId, text) => this.prompt(sessionId, text),
+      kill: (id) => this.kill(id),
+      budget: () => this.budget(),
+      getEnvironment: (id) => this.envStore.get(id),
+      handoffCreate: (a) => this.handoffCreate(a),
+    });
     this.promptStore = new PromptStore(cfg.stateDir);
+    this.updateState = new UpdateStateStore(cfg.stateDir);
     this.modelLabels = new ModelLabelStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
-    this.workUnits = new WorkUnitStore(cfg.stateDir);
-    this.autopilotSchedule = new AutopilotScheduleStore(cfg.stateDir);
+    this.integrationsFacade = new IntegrationsFacade({
+      integrations: this.integrations,
+      registry: this.registry,
+      selfBaseUrl: () => this.selfBaseUrl(),
+      cachedSelfBaseUrl: () => this.selfBaseUrlCache?.url,
+    });
+    this.accountRoster = new AccountRosterService({
+      accounts: this.accounts,
+      registry: this.registry,
+      envFile: this.envFile,
+      envStore: this.envStore,
+      pairedHub: this.pairedHub,
+      sessions: () => this.sessions.values(),
+      tokensBySession: () => this.tokensBySession(),
+      restartIdleSessionsForNewToken: (before) => this.restartIdleSessionsForNewToken(before),
+      ...(this.onRosterChanged ? { onRosterChanged: this.onRosterChanged } : {}),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+      environmentsEvent: () => this.environmentsEvent(),
+      persist: () => this.persist(),
+    });
+    this.autopilot = new AutopilotService({
+      registry: this.registry,
+      stateDir: cfg.stateDir,
+      envStore: this.envStore,
+      integrations: this.integrations,
+      integrationsFacade: this.integrationsFacade,
+      accounts: this.accounts,
+      renderer: this.renderer,
+      adversarial: this.adversarial,
+      worktreeRoot: () => this.store.worktreeRoot(),
+      selfBaseUrl: () => this.selfBaseUrl(),
+      getSession: (id) => this.sessions.get(id),
+      hasSession: (id) => this.sessions.has(id),
+      require: (id) => this.require(id),
+      budget: () => this.budget(),
+      handoffCreate: (a) => this.handoffCreate(a),
+      authDegraded: () => this.authDegrade.degraded(),
+      claimDegradeEpisodeAlert: () => this.authDegrade.claimEpisodeAlert(),
+      pushSystemAlert: (title, body, tag) => this.pushSystemAlert(title, body, tag),
+      notifyAll: (payload) => {
+        void this.webpush.notify(payload);
+        void this.fcm.notify(payload);
+        void this.apns.notify(payload);
+      },
+      broadcastLoops: () => this.broadcastLoops(),
+      armGoal: (sessionId, condition) => {
+        const built = this.sessions.get(sessionId);
+        if (!built) return;
+        built.data.goal = { condition, iterations: 0, setAt: now() };
+        this.persist();
+        this.broadcastUpdated(built.data);
+      },
+    });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
@@ -326,7 +362,7 @@ export class Supervisor {
       softStopFraction: cfg.softStopFraction ?? 0.95,
     });
     this.restore();
-    this.startAutopilotScheduler();
+    this.autopilot.startScheduler();
     this.startPrStateSweeper();
     this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
@@ -334,22 +370,6 @@ export class Supervisor {
     void this.selfBaseUrl().then(() => this.registry.toAll(this.lapoStatusEvent()));
   }
 
-  /** In-daemon autopilot timer (anvil-autopilot-ui.md → Scheduling): every 5 min check whether the
-   *  scheduled time has just arrived and fire it then. `unref` so it never holds the process (or a
-   *  test) open. NO startup tick on purpose — a (re)start must not kick off a run (that fired a fresh
-   *  run + spinner on every restart); the run happens only when the clock crosses the scheduled time
-   *  while the daemon is already running. SCHEDULE_TICK_MS must stay < SCHEDULE_RUN_WINDOW_MS so a tick
-   *  always lands inside the window. */
-  private startAutopilotScheduler(): void {
-    this.scheduleTimer = setInterval(() => {
-      void this.maybeRunScheduled();
-      // Todoist has no webhooks, so completion is polled: on every tick, drop any pending plan whose
-      // source task the user has since checked off in Todoist. Independent of whether a scheduled run
-      // is due, so a card clears within a tick of the task being completed even with autopilot idle.
-      void this.reconcileCompletedUnits();
-    }, SCHEDULE_TICK_MS);
-    this.scheduleTimer.unref?.();
-  }
   /** Keep the sidebar's PR/merge badges fresh for an already-open app: a connect triggers a sweep, but
    *  if the app stays connected while a PR is merged on GitHub nothing else would catch it. Sweep every
    *  few minutes, but only while a client is actually watching (no point spawning `gh` for nobody).
@@ -388,31 +408,6 @@ export class Supervisor {
       console.warn(`[models] label refresh failed: ${(e as Error).message}`);
     }
   }
-  private async maybeRunScheduled(): Promise<void> {
-    const sched = this.autopilotSchedule.get();
-    if (this.autopilotRunning || !scheduledFireDue(sched, new Date(), SCHEDULE_RUN_WINDOW_MS, sched.lastRunAt)) return;
-    // Degraded machine: every unit this run planned would fail at spawn. Suppress the run rather than
-    // manufacturing a nightly wall of auth errors — but say so ONCE per degraded episode, so it's not a
-    // silent stop either (HJ-12/HJ-29). Stamp the window as run so the 5-min ticks don't re-alert.
-    if (this.authDegrade.degraded()) {
-      this.autopilotSchedule.markRun(now());
-      this.broadcastSchedule();
-      if (this.authDegrade.claimEpisodeAlert()) {
-        console.warn("[anvild] autopilot: scheduled run suppressed — this machine has no usable Claude token.");
-        this.pushSystemAlert("Autopilot paused", "This machine has no Claude login, so the scheduled run was skipped. Pair it with your fleet to resume.", "auth-degraded");
-      }
-      return;
-    }
-    // Stamp the run NOW so a slow run isn't re-triggered on the next 5-min tick, and so a hard error
-    // (Todoist down, no linked envs) doesn't hammer — it waits for the next scheduled window.
-    this.autopilotSchedule.markRun(now());
-    this.broadcastSchedule();
-    try {
-      await this.runAutopilot({ notify: true, autoStart: sched.autoStart, usePipeline: sched.usePipeline, maxAutoStart: sched.maxAutoStart });
-    } catch {
-      /* swallowed: re-tries at the next due window */
-    }
-  }
 
   budget(): Budget {
     return this.rateLimits.snapshot();
@@ -421,101 +416,65 @@ export class Supervisor {
     return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.rateLimits.snapshot() };
   }
 
+  // ── Environments (projects) — delegated to EnvironmentService (P7 extraction). environmentsEvent is
+  // kept here as a thin delegation because several other Supervisor domains + AccountRosterService read it.
   environmentsEvent(): EnvironmentsEvent {
-    return { v: PROTOCOL_VERSION, type: "environments", ts: now(), environments: this.envStore.list() };
+    return this.environments.environmentsEvent();
   }
   getEnvironment(id: string): Environment | undefined {
-    return this.envStore.get(id);
+    return this.environments.getEnvironment(id);
   }
   addEnvironment(name: string, repoRoot: string, defaultBase?: string, color?: string, icon?: string): void {
-    try {
-      this.envStore.add(name, repoRoot, defaultBase, color, icon);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.addEnvironment(name, repoRoot, defaultBase, color, icon);
   }
-  /** Clone a git URL into `clonesDir` (host git auth) and register it as an environment. */
   cloneEnvironment(url: string, name?: string, defaultBase?: string, color?: string, icon?: string): void {
-    let dest: string;
-    try {
-      dest = git.cloneRepo(url, this.clonesDir).dest;
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    try {
-      this.envStore.add(name?.trim() || git.repoNameFromUrl(url), dest, defaultBase, color, icon);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.cloneEnvironment(url, name, defaultBase, color, icon);
   }
 
   private updating = false; // guards against concurrent applyUpdate (double-click → racing builds)
 
+  /** Deps for the frozen update-API layer (stable-update-service spec §4.3). The legacy `daemon.update`
+   *  command now delegates here so it shares ONE code path with `/api/update/v1/*` — crucially, it
+   *  records the pre-pull SHA so the watchdog can roll a bad legacy-triggered update back too. */
+  private updateDeps(): UpdateApiDeps {
+    return { state: this.updateState, isManaged: selfupdate.isManaged, scheduleRestart: selfupdate.scheduleRestart };
+  }
+
   /** Update the daemon itself (arch §5): pull its source, rebuild web, and restart to apply.
-   *  `checkOnly` just fetches and reports whether an update is available. */
+   *  `checkOnly` just fetches and reports whether an update is available. Kept for back-compat (the
+   *  macOS menu command + native clients speak this); it delegates to the frozen v1 apply, mapping the
+   *  richer v1 phases back onto the legacy check|up-to-date|updated|error shape (spec §4.3). */
   async daemonUpdate(checkOnly: boolean): Promise<DaemonUpdateResultEvent> {
     const base = { v: PROTOCOL_VERSION, type: "daemon.update.result" as const, ts: now(), currentVersion: VERSION };
-    if (!checkOnly && this.updating) {
-      return { ...base, ok: false, phase: "error", output: "an update is already in progress" };
+    const deps = this.updateDeps();
+    if (checkOnly) {
+      const c = await updateCheck(deps);
+      if (!c.ok) return { ...base, ok: false, phase: "error", output: c.error ?? "update check failed" };
+      return { ...base, ok: true, phase: "check", output: c.output, behind: c.behind };
     }
+    if (this.updating) return { ...base, ok: false, phase: "error", output: "an update is already in progress" };
+    this.updating = true;
     try {
-      const chk = await selfupdate.checkForUpdate();
-      if (checkOnly) {
-        return { ...base, ok: true, phase: "check", output: chk.output, behind: chk.behind };
+      // No pinned SHA → resolve the upstream tip (the legacy "latest on branch" behaviour).
+      const r = await updateApply({}, deps);
+      // v1 "restarting" ⇒ an update (or stale-process restart) is being applied; a restart is now
+      // SCHEDULED (a ~1s setTimeout), so DELIBERATELY keep `updating` set — clearing it here would let a
+      // second daemon.update slip in during that window and schedule a redundant second kickstart. The
+      // guard is released for free when the process dies on restart.
+      if (r.ok && r.phase === "restarting") {
+        return { ...base, ok: true, phase: "updated", output: r.output, willRestart: r.willRestart };
       }
-      // The on-disk checkout is already current with the remote, but the LIVE process is stale (a prior
-      // update pulled new source and its restart never landed). No pull/rebuild needed — just restart
-      // onto the code already on disk. Without this, "up to date" would no-op forever on a stale process.
-      if (chk.behind === 0 && chk.needsRestart) {
-        if (selfupdate.isManaged()) {
-          selfupdate.scheduleRestart();
-          return { ...base, ok: true, phase: "updated", output: chk.output, willRestart: true };
-        }
-        return {
-          ...base,
-          ok: true,
-          phase: "updated",
-          output: `${chk.output}\n\nNot running under the launchd/systemd service — restart the daemon manually to apply.`,
-          willRestart: false,
-        };
-      }
-      if (chk.behind === 0) {
-        return { ...base, ok: true, phase: "up-to-date", output: chk.output, behind: 0 };
-      }
-      this.updating = true;
-      const upd = await selfupdate.applyUpdate();
-      if (selfupdate.isManaged()) {
-        selfupdate.scheduleRestart();
-        return { ...base, ok: true, phase: "updated", output: upd.output, willRestart: true };
-      }
-      this.updating = false; // no restart coming — allow another attempt
-      return {
-        ...base,
-        ok: true,
-        phase: "updated",
-        output: `${upd.output}\n\nNot running under the launchd service — restart the daemon manually to apply.`,
-        willRestart: false,
-      };
-    } catch (e) {
+      // No restart coming (up-to-date, error, or unmanaged) — release the guard so another attempt works.
       this.updating = false;
+      if (!r.ok) return { ...base, ok: false, phase: "error", output: r.error ?? r.output };
+      return { ...base, ok: true, phase: "up-to-date", output: r.output, behind: 0 };
+    } catch (e) {
+      this.updating = false; // updateApply shouldn't reject, but never leave the guard stuck on a throw
       return { ...base, ok: false, phase: "error", output: e instanceof Error ? e.message : String(e) };
     }
   }
-  /** Read & render an environment repo's README (arch §8). */
   envReadme(id: string): { markdown?: ReturnType<MarkdownRenderer["render"]>; text?: string; missing?: boolean } {
-    const env = this.envStore.get(id);
-    if (!env) throw new BadCommand(`no such environment: ${id}`);
-    for (const name of ["README.md", "README.markdown", "Readme.md", "readme.md", "README", "README.txt"]) {
-      const p = join(env.repoRoot, name);
-      if (existsSync(p)) {
-        const raw = readFileSync(p, "utf8").slice(0, 256 * 1024);
-        const isMd = /\.(md|markdown)$/i.test(name) || name === "README";
-        return isMd ? { markdown: this.renderer.render(raw) } : { text: raw };
-      }
-    }
-    return { missing: true };
+    return this.environments.envReadme(id);
   }
   updateEnvironment(
     id: string,
@@ -529,8 +488,7 @@ export class Supervisor {
       accountId?: string | null;
     },
   ): void {
-    this.envStore.update(id, fields);
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.updateEnvironment(id, fields);
   }
 
   // ── Prompt library (saved composer snippets, synced across a user's devices) ───
@@ -550,169 +508,33 @@ export class Supervisor {
     this.registry.toAll(this.promptsEvent());
   }
 
-  // ── Todoist integration (task autopilot) ──────────────────────────────────
+  // ── Integrations (Todoist + lapo) — delegated to IntegrationsFacade (P7 extraction) ──────────────
   todoistStatusEvent(cid?: string): TodoistStatusEvent {
-    const state = this.integrations.todoist();
-    return {
-      v: PROTOCOL_VERSION,
-      type: "todoist.status",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      connected: !!state?.accessToken,
-      ...(state?.account ? { account: state.account } : {}),
-    };
+    return this.integrationsFacade.todoistStatusEvent(cid);
   }
-
-  /** Validate a personal API token against the API, then persist it and broadcast the new status. */
-  async connectTodoist(token: string, cid?: string): Promise<TodoistStatusEvent> {
-    const trimmed = token.trim();
-    if (!trimmed) throw new BadCommand("A Todoist API token is required");
-    let user;
-    try {
-      user = await new TodoistClient(trimmed).whoami(); // throws on a bad/revoked token
-    } catch (e) {
-      throw new BadCommand(`Todoist rejected that token: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    this.integrations.setTodoistToken(trimmed, user.email ?? user.full_name);
-    this.registry.toAll(this.todoistStatusEvent()); // refresh every connected client
-    return this.todoistStatusEvent(cid);
+  connectTodoist(token: string, cid?: string): Promise<TodoistStatusEvent> {
+    return this.integrationsFacade.connectTodoist(token, cid);
   }
-
-  /** The raw stored token, for hub→member fleet replication ONLY. Never sent to a client. */
   todoistTokenForFleet(): string | undefined {
-    return this.integrations.todoist()?.accessToken;
+    return this.integrationsFacade.todoistTokenForFleet();
   }
-
-  /** Clear the stored token and broadcast the disconnected status. */
   disconnectTodoist(cid?: string): TodoistStatusEvent {
-    this.integrations.disconnectTodoist();
-    this.registry.toAll(this.todoistStatusEvent());
-    return this.todoistStatusEvent(cid);
+    return this.integrationsFacade.disconnectTodoist(cid);
   }
 
-  // ── lapo integration (OAuth2 information-entry reports) ────────────────────
-  /** Current lapo connection state. `configured` is true unless lapo is explicitly disabled — a client
-   *  id is no longer required (the daemon dynamically registers one). `callbackUrl` is the OAuth redirect
-   *  the daemon will use (its own tailnet URL), shown in the UI so the user can register it if needed. */
+  // lapo (OAuth2 information-entry reports) — delegated to IntegrationsFacade. `postAutopilotReport`
+  // reuses the facade's effectiveLapoConfig()/lapoAccessToken() directly (see below).
   lapoStatusEvent(cid?: string): LapoStatusEvent {
-    const state = this.integrations.lapo();
-    const callback = this.cachedCallbackUrl();
-    return {
-      v: PROTOCOL_VERSION,
-      type: "lapo.status",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      connected: !!state?.accessToken,
-      configured: !!resolveLapoConfig(),
-      ...(state?.account ? { account: state.account } : {}),
-      ...(callback ? { callbackUrl: callback } : {}),
-    };
+    return this.integrationsFacade.lapoStatusEvent(cid);
   }
-
-  /** The OAuth callback URL from the cached self base URL (or ANVIL_BASE_URL). Sync — reads the cache
-   *  populated by `selfBaseUrl()`; undefined until discovery has run once. */
-  private cachedCallbackUrl(): string | undefined {
-    const override = process.env.ANVIL_BASE_URL?.trim();
-    const base = override ? override.replace(/\/+$/, "") : this.selfBaseUrlCache?.url;
-    return base ? `${base}${LapoClient.callbackPath()}` : undefined;
+  beginLapoAuth(redirectBase: string, cid?: string): Promise<LapoAuthorizeEvent> {
+    return this.integrationsFacade.beginLapoAuth(redirectBase, cid);
   }
-
-  /** The lapo config with the effective client id/secret filled in: from ANVIL_LAPO_CLIENT_ID if set,
-   *  else the dynamically-registered client. `undefined` only when lapo is disabled. */
-  private effectiveLapoConfig(): LapoConfig | undefined {
-    const base = resolveLapoConfig();
-    if (!base || base.clientId) return base;
-    const reg = this.integrations.lapoRegistration();
-    return reg ? { ...base, clientId: reg.clientId, ...(reg.clientSecret ? { clientSecret: reg.clientSecret } : {}) } : base;
+  completeLapoAuth(code: string, state: string): Promise<{ account?: string }> {
+    return this.integrationsFacade.completeLapoAuth(code, state);
   }
-
-  /** Begin the OAuth authorization-code handshake. Uses the daemon's OWN self-discovered URL for the
-   *  redirect (the native shells' page origin is a local asset host, not reachable), discovers lapo's
-   *  endpoints (RFC 8414), dynamically registers a client (RFC 7591) if none is configured, picks PKCE,
-   *  stashes the handshake, and returns the authorize URL. The browser lands on the daemon's callback. */
-  async beginLapoAuth(redirectBase: string, cid?: string): Promise<LapoAuthorizeEvent> {
-    const baseCfg = resolveLapoConfig();
-    if (!baseCfg) throw new BadCommand("lapo is disabled on this server (ANVIL_LAPO_DISABLE).");
-    // The redirect MUST be the daemon's own URL — a client page origin is a local asset host in the
-    // native shells (appassets.androidplatform.net / anvil-app://), which lapo can't reach.
-    const self = (await this.selfBaseUrl()) ?? redirectBase.trim().replace(/\/+$/, "");
-    if (!/^https?:\/\//.test(self)) throw new BadCommand("couldn't determine this server's URL for the OAuth redirect — set ANVIL_BASE_URL.");
-    const redirectUri = `${self}${LapoClient.callbackPath()}`;
-
-    const disco = new LapoClient(baseCfg);
-    const meta = await disco.discover();
-
-    // Resolve a client id: env → stored registration (matching this redirect) → dynamic registration.
-    let cfg = this.effectiveLapoConfig()!;
-    const reg = this.integrations.lapoRegistration();
-    if (!baseCfg.clientId && (!reg || reg.redirectUri !== redirectUri)) {
-      const regEndpoint = meta?.registrationEndpoint;
-      if (!regEndpoint) throw new BadCommand("this lapo doesn't advertise dynamic registration — set ANVIL_LAPO_CLIENT_ID.");
-      const registered = await disco.registerClient({ registrationEndpoint: regEndpoint, redirectUri, scope: baseCfg.scope });
-      this.integrations.setLapoRegistration({ ...registered, redirectUri });
-      cfg = { ...baseCfg, clientId: registered.clientId, ...(registered.clientSecret ? { clientSecret: registered.clientSecret } : {}) };
-    }
-    if (!cfg.clientId) throw new BadCommand("lapo has no client id.");
-
-    const client = new LapoClient(cfg);
-    const usePkce = (meta?.codeChallengeMethodsSupported?.includes("S256") ?? false) || !cfg.clientSecret;
-    const pkce = usePkce ? LapoClient.generatePkce() : undefined;
-    const state = newId("lapoauth");
-    this.integrations.setLapoPendingAuth(state, redirectUri, {
-      ...(pkce ? { codeVerifier: pkce.verifier } : {}),
-      ...(meta?.tokenEndpoint ? { tokenEndpoint: meta.tokenEndpoint } : {}),
-    });
-    const url = client.authorizeUrl({
-      redirectUri,
-      state,
-      ...(meta?.authorizationEndpoint ? { authorizationEndpoint: meta.authorizationEndpoint } : {}),
-      ...(pkce ? { codeChallenge: pkce.challenge } : {}),
-    });
-    return { v: PROTOCOL_VERSION, type: "lapo.authorize", ts: now(), ...(cid ? { cid } : {}), url };
-  }
-
-  /** Complete the handshake from the OAuth callback: validate `state`, exchange the code (reusing the
-   *  discovered token endpoint + PKCE verifier the authorize step used), persist the tokens, and
-   *  broadcast the connected status. Throws BadCommand on a bad/expired handshake or a rejected
-   *  exchange. Returns the account label for the callback page. */
-  async completeLapoAuth(code: string, state: string): Promise<{ account?: string }> {
-    const cfg = this.effectiveLapoConfig();
-    if (!cfg?.clientId) throw new BadCommand("lapo isn't ready — start again from Settings → Integrations.");
-    const pending = this.integrations.consumeLapoPendingAuth(state);
-    if (!pending) throw new BadCommand("this lapo authorization link has expired or didn't match — start again from Settings → Integrations.");
-    const client = new LapoClient(cfg);
-    let tokens: LapoTokens;
-    try {
-      tokens = await client.exchangeCode({
-        code,
-        redirectUri: pending.redirectUri,
-        ...(pending.tokenEndpoint ? { tokenEndpoint: pending.tokenEndpoint } : {}),
-        ...(pending.codeVerifier ? { codeVerifier: pending.codeVerifier } : {}),
-      });
-    } catch (e) {
-      throw new BadCommand(`lapo rejected the authorization: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    const [{ account }, entry] = await Promise.all([client.whoami(tokens.accessToken), client.discoverResource()]);
-    this.integrations.setLapoTokens(tokens, account, pending.tokenEndpoint, entry);
-    this.registry.toAll(this.lapoStatusEvent());
-    return account ? { account } : {};
-  }
-
-  /** Clear the stored lapo tokens and broadcast the disconnected status. */
   disconnectLapo(cid?: string): LapoStatusEvent {
-    this.integrations.disconnectLapo();
-    this.registry.toAll(this.lapoStatusEvent());
-    return this.lapoStatusEvent(cid);
-  }
-
-  /** A valid access token, refreshing (and persisting) proactively when it's within the expiry skew. */
-  private async lapoAccessToken(client: LapoClient): Promise<string> {
-    const state = this.integrations.lapo();
-    if (!state?.accessToken) throw new BadCommand("lapo is not connected");
-    if (!tokenNeedsRefresh({ accessToken: state.accessToken, expiresAt: state.expiresAt }, Date.now()) || !state.refreshToken) return state.accessToken;
-    const next = await client.refresh(state.refreshToken, { tokenEndpoint: state.tokenEndpoint });
-    this.integrations.patchLapoTokens(next);
-    return next.accessToken;
+    return this.integrationsFacade.disconnectLapo(cid);
   }
 
   /** This daemon's externally-reachable base URL, for deep links in outbound reports. Discovery shells
@@ -797,78 +619,6 @@ export class Supervisor {
     return new Map([...this.drivers.keys()].map((id) => [id, this.accounts.token(this.sessions.get(id)?.data.accountId)]));
   }
 
-  /**
-   * Post an autopilot run report to lapo as a markdown information entry (what was done, what's held
-   * for clarification, what was skipped). Best-effort and fully defensive: a lapo hiccup must never
-   * fail — or surface into — the autopilot run, so it's fire-and-forget and swallows every error. On a
-   * 401 it refreshes once and retries. No-op when lapo isn't configured/connected.
-   */
-  async postAutopilotReport(input: {
-    units: WorkUnit[];
-    skipped: number;
-    started: number;
-    startedIds: Set<string>;
-    trigger: "scheduled" | "manual";
-  }): Promise<void> {
-    const cfg = this.effectiveLapoConfig();
-    if (!cfg || !this.integrations.isLapoConnected()) return;
-    const client = new LapoClient(cfg);
-    const appBaseUrl = await this.selfBaseUrl(); // deep-link target back into this daemon's Autopilot view
-    const environments = [...new Set(input.units.map((u) => this.envStore.get(u.environmentId)?.name ?? u.environmentId))];
-    const units: ReportUnit[] = input.units.map((u) => ({
-      id: u.id,
-      title: u.title,
-      status: u.status,
-      ...(u.summary ? { summary: u.summary } : {}),
-      ...(u.effort ? { effort: u.effort } : {}),
-      taskCount: u.taskIds.length,
-      ...(u.source ? { source: u.source } : {}),
-      started: input.startedIds.has(u.id),
-      ...(u.prUrl ? { prUrl: u.prUrl } : {}),
-      ...(u.status === "needs-clarification" ? { questions: extractOpenQuestions(u.plan) } : {}),
-    }));
-    const reportInput = {
-      runAt: new Date().toISOString(),
-      trigger: input.trigger,
-      environments,
-      units,
-      skipped: input.skipped,
-      started: input.started,
-      ...(appBaseUrl ? { appBaseUrl } : {}), // deep link into the Autopilot view (undefined → no link)
-    };
-    try {
-      // Prefer the entry endpoint discovered at connect; if it wasn't captured (older connection),
-      // discover it now. Undefined → createEntry falls back to the configured entryPath + fields.
-      let entry: LapoEntryEndpoint | undefined = this.integrations.lapo()?.entry;
-      if (!entry) {
-        entry = await client.discoverResource();
-        if (entry) this.integrations.patchLapoEntry(entry);
-      }
-      const token = await this.lapoAccessToken(client);
-      // A journal endpoint (no title field) renders as a Logseq outline folded under one collapsed
-      // node — so a run adds a single tidy bullet to the day's journal. A document endpoint gets the
-      // titled markdown report instead.
-      const doc = entry && entry.titleField
-        ? buildAutopilotReport(reportInput)
-        : { title: "", markdown: renderJournalOutline(reportInput) };
-      try {
-        const res = await client.createEntry(token, doc, entry);
-        console.log(`[lapo] posted autopilot report${res.url ? ` → ${res.url}` : ""}`);
-      } catch (e) {
-        // Token may have lapsed between the refresh check and the write — refresh once and retry.
-        const stored = this.integrations.lapo();
-        if (e instanceof Error && /→ 401\b/.test(e.message) && stored?.refreshToken) {
-          const next = await client.refresh(stored.refreshToken, { tokenEndpoint: stored.tokenEndpoint });
-          this.integrations.patchLapoTokens(next);
-          const res = await client.createEntry(next.accessToken, doc, entry);
-          console.log(`[lapo] posted autopilot report (after refresh)${res.url ? ` → ${res.url}` : ""}`);
-        } else throw e;
-      }
-    } catch (e) {
-      console.warn(`[lapo] couldn't post the autopilot report: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
   // ── Model-provider auth (Settings → Models) ──────────
   // Two providers share this surface: "claude" (the subscription OAuth token driving the Agent SDK) and
   // "openrouter" (the metered key powering the adversarial planning panel). Each has its own env-file-
@@ -901,208 +651,56 @@ export class Supervisor {
     return this.authStatusEvent(provider, cid);
   }
 
-  // ── Claude account roster (Settings → Models; multi-account §7/§9) ───────────────────────────
-  /** Active (non-terminal) sessions currently bound to `accountId` — drives the removal confirm
-   *  (§9.1/§10) without a second round trip. */
+  // ── Claude account roster (multi-account §7/§9) — delegated to AccountRosterService (P7 extraction) ──
   sessionsUsingAccount(accountId: string): { sessionId: string; title: string }[] {
-    return [...this.sessions.values()]
-      .filter((s) => !s.data.archived && s.data.accountId === accountId)
-      .map((s) => ({ sessionId: s.data.id, title: s.data.title }));
+    return this.accountRoster.sessionsUsingAccount(accountId);
   }
-
-  private accountsInUse(): Record<string, { sessionId: string; title: string }[]> {
-    const out: Record<string, { sessionId: string; title: string }[]> = {};
-    for (const s of this.sessions.values()) {
-      if (s.data.archived || !s.data.accountId) continue;
-      (out[s.data.accountId] ??= []).push({ sessionId: s.data.id, title: s.data.title });
-    }
-    return out;
-  }
-
-  /** Roster snapshot for clients — masked previews only (§11). */
   accountsEvent(cid?: string): AuthAccountsEvent {
-    const snap = this.accounts.snapshot();
-    const accounts: AccountInfo[] = this.accounts.publicList();
-    const inUse = this.accountsInUse();
-    return {
-      v: PROTOCOL_VERSION,
-      type: "auth.accounts",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      rev: snap.rev,
-      ...(snap.defaultId ? { defaultId: snap.defaultId } : {}),
-      role: snap.role,
-      ...(snap.role === "replica" && this.pairedHub?.get()?.hubServerId ? { hubServerId: this.pairedHub.get()!.hubServerId } : {}),
-      accounts,
-      persisted: defaultPersisted(this.accounts, this.envFile),
-      ...(Object.keys(inUse).length ? { inUse } : {}),
-    };
+    return this.accountRoster.accountsEvent(cid);
   }
-
-  /** Broadcast the roster to every connected client, like `broadcastAuthState()`. */
   broadcastAccounts(): void {
-    this.registry.toAll(this.accountsEvent());
+    this.accountRoster.broadcastAccounts();
   }
-
-  /** Every mutator: apply → mirror the default → broadcast → return the same event to the caller. A
-   *  mutation on a replica throws `AccountStore`'s "change accounts on the hub" message unchanged
-   *  (BadCommand via the caller's catch). `before` — a snapshot from {@link tokensBySession} taken
-   *  BEFORE the mutation — narrows the restart to sessions whose OWN resolved token actually changed
-   *  (adding a non-default account, or replacing a token no live session is pinned to, restarts no
-   *  one). Fire-and-forget, like every other credential-change call site (http.ts's pair/rotate
-   *  handlers). */
-  private afterAccountMutation(cid: string | undefined, before: Map<string, string | undefined>, reason: string): AuthAccountsEvent {
-    mirrorDefault(this.accounts, this.envFile); // the ONLY place a roster change is written to the launcher env file
-    this.onRosterChanged?.(reason); // replicate to fleet members (§7.3); fire-and-forget, no-op on a leaf
-    void this.restartIdleSessionsForNewToken(before);
-    const event = this.accountsEvent(cid);
-    this.registry.toAll(cid ? { ...event, cid: undefined } : event);
-    return event;
-  }
-
   accountAdd(label: string, token: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.add(label, token);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    return this.afterAccountMutation(cid, before, "add");
+    return this.accountRoster.accountAdd(label, token, cid);
   }
-
   accountRename(accountId: string, label: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.rename(accountId, label);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    // accountLabel is denormalised for display; refresh every session bound to this account.
-    for (const s of this.sessions.values()) {
-      if (s.data.accountId === accountId) {
-        s.data.accountLabel = label;
-        this.broadcastUpdated(s.data);
-      }
-    }
-    this.persist();
-    return this.afterAccountMutation(cid, before, "rename");
+    return this.accountRoster.accountRename(accountId, label, cid);
   }
-
   accountReplace(accountId: string, token: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.replace(accountId, token);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    return this.afterAccountMutation(cid, before, "replace");
+    return this.accountRoster.accountReplace(accountId, token, cid);
   }
-
   accountSetDefault(accountId: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.setDefault(accountId);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    return this.afterAccountMutation(cid, before, "set-default");
+    return this.accountRoster.accountSetDefault(accountId, cid);
   }
-
   accountRemove(accountId: string, cid?: string): AuthAccountsEvent {
-    const before = this.tokensBySession();
-    try {
-      this.accounts.remove(accountId);
-    } catch (e) {
-      throw new BadCommand(e instanceof Error ? e.message : String(e));
-    }
-    // §5.4 removal fallback: fall every session bound to the removed account back to the default,
-    // flagged so the client can render the "⚠ was <label>" badge (Task 24/20).
-    //
-    // `accountId` is CLEARED rather than set to a snapshot of `defaultId()`. Both resolve to the
-    // default today, but a snapshot silently stops tracking it: move the default afterwards and the
-    // session keeps spawning on the OLD one while the header chip — which renders the CURRENT
-    // default's label — names the new one. The chip then advertises a subscription that isn't paying,
-    // which is precisely the confusion this feature exists to prevent. `undefined` genuinely follows
-    // the default, because that is what `AccountStore.token(undefined)` resolves.
-    //
-    // `accountLabel` IS deliberately left holding the removed account's old name — it's the only
-    // place that survives the removal, and the badge needs it.
-    for (const s of this.sessions.values()) {
-      if (s.data.accountId !== accountId) continue;
-      delete s.data.accountId;
-      s.data.accountMissing = true;
-      this.broadcastUpdated(s.data);
-    }
-    // Environments bind to accounts too (§6), and were NOT being reconciled — a removed account left a
-    // dangling `env.accountId` that only surfaced later, unattended, as a failed autopilot spawn.
-    // Clearing it falls the environment back to the roster default, same as a session.
-    let envsCleared = 0;
-    for (const env of this.envStore.list()) {
-      if (env.accountId !== accountId) continue;
-      this.envStore.update(env.id, { accountId: null });
-      envsCleared++;
-    }
-    if (envsCleared) this.registry.toAll(this.environmentsEvent());
-    this.persist();
-    return this.afterAccountMutation(cid, before, "remove");
+    return this.accountRoster.accountRemove(accountId, cid);
   }
 
   /** Live-fetch the connected account's projects (with active task counts) for the link UI. */
-  async listTodoistProjects(cid?: string): Promise<TodoistProjectsResultEvent> {
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
-    const client = new TodoistClient(state.accessToken);
-    const [projects, tasks] = await Promise.all([client.projects(), client.tasks()]);
-    const counts = new Map<string, number>();
-    for (const t of tasks) counts.set(t.project_id, (counts.get(t.project_id) ?? 0) + 1);
-    const infos: TodoistProjectInfo[] = projects.map((p) => ({
-      id: p.id,
-      name: p.name,
-      ...(p.parent_id ? { parentId: p.parent_id } : {}),
-      ...(p.is_inbox_project ? { isInbox: true } : {}),
-      ...(p.is_favorite ? { isFavorite: true } : {}),
-      taskCount: counts.get(p.id) ?? 0,
-    }));
-    return { v: PROTOCOL_VERSION, type: "todoist.projects.result", ts: now(), ...(cid ? { cid } : {}), projects: infos };
+  listTodoistProjects(cid?: string): Promise<TodoistProjectsResultEvent> {
+    return this.integrationsFacade.listTodoistProjects(cid);
   }
 
-  // ── Autopilot plan review (anvil-autopilot-ui.md) ─────────────────────────────────
-  // Selection + presentation logic lives in integrations/autopilot-plans.ts (pure + unit-tested);
-  // these methods just supply the Supervisor's stores/renderer.
-  /** Pending plans = planned work units not yet started; what the Autopilot card grid shows. */
-  private pendingPlans(): WorkUnit[] {
-    return selectPendingPlans(this.workUnits.list());
-  }
-
-  /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
-  private autopilotPlanInfo(u: WorkUnit): AutopilotPlanInfo {
-    return toPlanInfo(u, this.envStore.get(u.environmentId)?.name, this.renderer);
-  }
-
-  /** The §6.3 adversary calibration metrics for the Models settings card. */
+  // ── Autopilot — delegated to AutopilotService (P7 extraction). The thin wrappers below are the
+  // wire/dispatch entry points; the domain (plan cards, runs, dev pipeline, schedule, Todoist/lapo
+  // sync) lives in autopilot-service.ts.
   devPipelineMetricsEvent(cid?: string): AutopilotPipelineMetricsEvent {
-    return { v: PROTOCOL_VERSION, type: "autopilot.pipeline.metrics", ts: now(), ...(cid ? { cid } : {}), adversaries: adversaryStats(this.devPipelineMetrics) };
+    return this.autopilot.devPipelineMetricsEvent(cid);
   }
   autopilotPlansEvent(cid?: string): AutopilotPlansEvent {
-    return {
-      v: PROTOCOL_VERSION,
-      type: "autopilot.plans",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      plans: this.pendingPlans().map((u) => this.autopilotPlanInfo(u)),
-    };
+    return this.autopilot.autopilotPlansEvent(cid);
   }
-  private broadcastAutopilotPlans(): void {
-    this.registry.toAll(this.autopilotPlansEvent());
-    this.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid
+  startPlanningSession(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
+    return this.autopilot.startPlanningSession(workUnitId, model, autonomy, cid);
   }
 
   // ── Loops (loop-engineering: one surface naming every active loop) ────────────────────
   /** Project every active loop — the schedule heartbeat, sessions carrying a `/goal`, in-flight
-   *  pipelines, and pending event proposals — into the flat snapshot the Loops panel renders. */
+   *  pipelines, and pending event proposals — into the flat snapshot the Loops panel renders. The
+   *  autopilot-owned inputs (schedule/pipelines/proposals) come from the service; the goal rows are
+   *  composed here because sessions live on the Supervisor. */
   loopsSnapshotEvent(cid?: string): LoopsSnapshotEvent {
-    const schedule = this.autopilotSchedule.get();
-    const next = nextScheduledFire(schedule, new Date());
     const goals = this.list()
       .filter((s) => s.goal)
       .map((s) => ({
@@ -1113,1085 +711,98 @@ export class Supervisor {
         ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
         ...(s.goal!.paused ? { paused: true } : {}),
       }));
-    const pipelines = [...this.runningPipelines].map(([id, title]) => {
-      const phaseReached = this.workUnits.get(id)?.devPipeline?.phaseReached;
-      return { id, title, ...(phaseReached ? { phaseReached } : {}) };
-    });
-    const proposals = this.workUnits
-      .list()
-      .filter((u) => u.status === "proposed")
-      .map((u) => ({ id: u.id, title: u.title, source: u.trigger?.source ?? "event" }));
-    const loops = buildLoopsSnapshot({
-      schedule: { enabled: schedule.enabled, timeOfDay: schedule.timeOfDay, running: this.autopilotRunning, autoStart: schedule.autoStart, ...(next ? { nextRunAt: next.toISOString() } : {}) },
-      goals,
-      pipelines,
-      proposals,
-    });
+    const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals });
     return { v: PROTOCOL_VERSION, type: "loops.snapshot", ts: now(), ...(cid ? { cid } : {}), loops };
   }
   private broadcastLoops(): void {
     this.registry.toAll(this.loopsSnapshotEvent());
   }
-
-  /** Teams are derived (not stored): group the flat session list by `parentId` (see team-tree.ts). */
-  teamInfoEvent(): TeamInfoEvent {
-    return { v: PROTOCOL_VERSION, type: "team.info", ts: now(), teams: deriveTeams(this.list()) };
+  /** Ingest an external event as a proposed work unit (loop-engineering: Channels). */
+  ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
+    return this.autopilot.ingestTrigger(input);
   }
-  private broadcastTeamInfo(): void {
-    this.registry.toAll(this.teamInfoEvent());
+  /** Approve a proposed (event-triggered) unit — promote to planned and optionally start. */
+  approveProposed(workUnitId: string, start: boolean, cid?: string): Promise<AutopilotStartedEvent | AutopilotPlanResultEvent> {
+    return this.autopilot.approveProposed(workUnitId, start, cid);
   }
-
-  /** Build the lead-only orchestration MCP server, closed over this lead's session id. */
-  private buildTeamServer(leadId: string) {
-    return buildTeamToolsServer({
-      leadId,
-      proposePlan: (members, integration) => this.teamProposePlan(leadId, members, integration),
-      createMember: (a) => this.teamCreateMember(leadId, a),
-      listMembers: () => this.teamListMembers(leadId),
-      integrate: () => this.integrateTeam(leadId),
-      dismissMember: (sid) => this.teamDismissMember(leadId, sid),
-      messageMember: (sid, text) => this.teamMessageMember(leadId, sid, text),
-    });
+  reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
+    return this.autopilot.reassignPlan(workUnitId, environmentId, cid);
   }
-
-  /** Steer a member (lead→member): queue `text` as a prompt for the member's next turn — the same
-   *  input path any session uses. Guarded to the lead's own members. Member↔member peer messaging
-   *  stays deferred (only leads get this tool), so there's no ping-pong risk between members. */
-  private teamMessageMember(leadId: string, memberId: string, text: string): string {
-    const member = this.sessions.get(memberId);
-    if (!member || member.data.parentId !== leadId) throw new BadCommand(`not a member of this team: ${memberId}`);
-    this.chargeRelay(leadId);
-    this.prompt(memberId, text); // queues via the member's InputQueue; starts a turn if idle
-    return `Sent to member "${member.data.title}" (${memberId}); it will act on your message next turn.`;
+  dismissPlan(workUnitId: string): Promise<void> {
+    return this.autopilot.dismissPlan(workUnitId);
   }
-
-  /** Member→lead reply: the other half of the two-way conversation. Queues the member's message as a
-   *  prompt for the lead's next turn, attributed so the lead knows who spoke. Guarded to the member's
-   *  own lead (a member can talk only to its lead — never a sibling: member↔member stays deferred). */
-  private teamMessageLead(memberId: string, text: string): string {
-    const member = this.sessions.get(memberId);
-    const leadId = member?.data.parentId;
-    if (!member || !leadId) throw new BadCommand(`not a team member: ${memberId}`);
-    const lead = this.sessions.get(leadId);
-    if (!lead || lead.data.teamRole !== "lead") throw new BadCommand("this member has no lead to message");
-    this.chargeRelay(leadId);
-    this.prompt(leadId, `Member "${member.data.title}" (${memberId}) says: ${text}`);
-    return `Relayed to your lead "${lead.data.title}"; it will see your message next turn.`;
+  resolvePlan(workUnitId: string, status: "completed" | "expired", closeTodoist: boolean): Promise<void> {
+    return this.autopilot.resolvePlan(workUnitId, status, closeTodoist);
   }
-
-  /** Charge one lead↔member relay hop and enforce the loop guard. A human prompt to any team session
-   *  resets the counter (see `noteHumanPrompt`), so a person can always continue a long conversation. */
-  private chargeRelay(leadId: string): void {
-    const hops = (this.teamRelayHops.get(leadId) ?? 0) + 1;
-    if (relayExhausted(hops)) {
-      throw new BadCommand(
-        `Team relay limit reached (${MAX_TEAM_RELAY_HOPS} automatic lead↔member messages with no human input). ` +
-          `Pausing the exchange to avoid a runaway agent-to-agent loop — the user can send a message to continue.`,
-      );
-    }
-    this.teamRelayHops.set(leadId, hops);
+  reconcileCompletedUnits(): Promise<number> {
+    return this.autopilot.reconcileCompletedUnits();
   }
-
-  /** A human prompt to a team session (lead or member) resets that team's relay hop counter — a real
-   *  person in the loop clears the ping-pong guard. Called from the `prompt.send` dispatch path. */
-  noteHumanPrompt(sessionId: string): void {
-    const s = this.sessions.get(sessionId);
-    if (!s) return;
-    const leadId = s.data.teamRole === "lead" ? s.data.id : s.data.parentId;
-    if (leadId) this.teamRelayHops.delete(leadId);
+  resetAnvilTags(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
+    return this.autopilot.resetAnvilTags(cid);
   }
-
-  /** Build the member-only tool server (message_lead), closed over this member's id. */
-  private buildMemberServer(memberId: string) {
-    return buildMemberToolsServer({ memberId, messageLead: (text) => this.teamMessageLead(memberId, text) });
+  clearAutopilot(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
+    return this.autopilot.clearAutopilot(cid);
   }
-
-  /** Dismiss (tear down) a member of this lead: reuse the standard session teardown (kill worktree +
-   *  branch + state). Guarded so a lead can only dismiss its OWN members. */
-  private teamDismissMember(leadId: string, memberId: string): string {
-    const member = this.sessions.get(memberId);
-    if (!member || member.data.parentId !== leadId) throw new BadCommand(`not a member of this team: ${memberId}`);
-    const title = member.data.title;
-    void this.kill(memberId); // async teardown; broadcasts session.deleted + team.info
-    return `Dismissed member "${title}" (${memberId}); its worktree and branch are being removed.`;
+  startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
+    return this.autopilot.startPlan(workUnitId, model, autonomy, cid);
   }
-
-  /** The lead proposed a decomposition. At `bypass` autonomy it auto-approves and spawns; otherwise it
-   *  parks a reviewable `team.plan` card and waits for `team.plan.approve` (see team-gate.ts). */
-  private teamProposePlan(leadId: string, members: TeamPlanMember[], integration: TeamPlan["integration"]): string {
-    const lead = this.require(leadId);
-    if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can propose a team plan");
-    const plan: TeamPlan = { leadId, members, integration };
-    if (shouldAutoApprove(lead.data.autonomy)) {
-      const started = this.startTeamPlan(plan);
-      return `Auto-approved (bypass autonomy): started ${started} of ${members.length} member(s); the rest queue as slots free.`;
-    }
-    this.pendingTeamPlans.set(leadId, plan);
-    const ev: TeamPlanEvent = { v: PROTOCOL_VERSION, type: "team.plan", ts: now(), sessionId: leadId, plan };
-    this.registry.toAll(ev);
-    return `Proposed a ${members.length}-member plan (${integration}); awaiting the user's approval before spawning.`;
-  }
-
-  /** Approve a parked plan (possibly user-edited) and spawn its members up to the concurrency cap. */
-  approveTeamPlan(leadId: string, plan?: TeamPlan): void {
-    const lead = this.require(leadId);
-    // Guard the auth boundary: a client-supplied sessionId + hand-built plan must not spawn members
-    // off a session that was never created as a lead (e.g. the concierge). Mirrors teamProposePlan.
-    if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
-    const chosen = plan ?? this.pendingTeamPlans.get(leadId);
-    if (!chosen) throw new BadCommand(`no pending team plan for ${leadId}`);
-    if (!chosen.members?.length) throw new BadCommand("cannot approve an empty team plan (no members)"); // #8
-    this.pendingTeamPlans.delete(leadId);
-    this.startTeamPlan({ ...chosen, leadId });
-    this.registry.toAll({ v: PROTOCOL_VERSION, type: "team.plan.resolved", ts: now(), sessionId: leadId, approved: true });
-    void lead;
-  }
-
-  /** Reject a parked plan — no members spawn. */
-  rejectTeamPlan(leadId: string): void {
-    this.require(leadId);
-    this.pendingTeamPlans.delete(leadId);
-    this.registry.toAll({ v: PROTOCOL_VERSION, type: "team.plan.resolved", ts: now(), sessionId: leadId, approved: false });
-  }
-
-  /** Record the plan as active and spawn members up to the lead's cap; queue any overflow. Returns the
-   *  count started now. */
-  private startTeamPlan(plan: TeamPlan): number {
-    const lead = this.require(plan.leadId);
-    if (lead.data.teamRole !== "lead") throw new BadCommand("not a team lead");
-    if (!plan.members?.length) throw new BadCommand("cannot start an empty team plan (no members)"); // #8
-    lead.data.team = lead.data.team ?? { integration: plan.integration, maxConcurrentMembers: 3 };
-    lead.data.team.integration = plan.integration; // honor the plan's integration choice
-    this.persist();
-    this.activeTeamPlans.set(plan.leadId, plan);
-    // Budget backstop: while the subscription budget is warning, spawn nothing new — queue every
-    // member and let the drain (on member completion / budget recovery) start them later.
-    if (spawnPaused(this.budget())) {
-      this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...plan.members]);
-      return 0;
-    }
-    const cap = Math.max(1, lead.data.team.maxConcurrentMembers ?? 3); // #3: never 0/negative
-    const room = Math.max(0, cap - this.activeMemberCount(plan.leadId));
-    const toStart = plan.members.slice(0, room);
-    const overflow = plan.members.slice(room);
-    let started = 0;
-    for (const m of toStart) if (this.spawnMember(plan.leadId, m)) started++;
-    if (overflow.length) this.queuedMembers.set(plan.leadId, [...(this.queuedMembers.get(plan.leadId) ?? []), ...overflow]);
-    return started; // actual successes, not attempts — a failed spawn must not inflate the count
-  }
-
-  /** Spawn one planned member, surfacing a failure to the lead's conversation rather than swallowing
-   *  it (design §7: "that member is flagged and reported to the lead"). Returns true on success. A
-   *  common cause is a branch-name collision (two teams in one repo asking for the same member title →
-   *  the same branch slug → `git worktree add` fails). */
-  private spawnMember(leadId: string, m: TeamPlanMember): boolean {
-    try {
-      this.teamCreateMember(leadId, { title: m.title, task: m.task, source: m.source, brief: m.task });
-      return true;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[teams] member spawn failed for "${m.title}":`, msg);
-      this.sessions.get(leadId)?.emitError(`Team member "${m.title}" failed to spawn — not added: ${msg}`, false);
-      return false;
-    }
-  }
-
-  /** Start queued members up to the lead's concurrency cap, unless the budget is paused. Called when a
-   *  member frees a slot (its turn ends) so a large plan drains as capacity + budget allow.
-   *  `justFinishedId` is the member whose completion triggered this: the driver fires `onResult` BEFORE
-   *  flipping its status to idle (driver.ts), so we must exclude it from the active count or it would
-   *  still occupy its own slot and the drain would be short by one (stalling a cap-1 team entirely). */
-  private drainQueuedMembers(leadId: string, justFinishedId?: string): void {
-    const queue = this.queuedMembers.get(leadId);
-    if (!queue || queue.length === 0) return;
-    const lead = this.sessions.get(leadId);
-    if (!lead || lead.data.teamRole !== "lead") return;
-    if (spawnPaused(this.budget())) return; // still under budget pressure — leave them queued
-    const cap = Math.max(1, lead.data.team?.maxConcurrentMembers ?? 3); // #3
-    let room = Math.max(0, cap - this.activeMemberCount(leadId, justFinishedId));
-    while (room > 0 && queue.length > 0) {
-      const m = queue.shift()!;
-      if (this.spawnMember(leadId, m)) room--; // a failed spawn is reported + dropped, not retried
-    }
-    if (queue.length === 0) this.queuedMembers.delete(leadId);
-  }
-
-  /** Members currently occupying a concurrency slot (spawned and not yet terminal). `excludeId` drops a
-   *  member that is about to free its slot but hasn't flipped to idle yet (see drainQueuedMembers). */
-  private activeMemberCount(leadId: string, excludeId?: string): number {
-    return this.list().filter(
-      (s) => s.parentId === leadId && s.id !== excludeId && s.status !== "idle" && s.status !== "exited" && s.status !== "error",
-    ).length;
-  }
-
-  /** Spawn one member session off the lead: its worktree branches off the lead's branch HEAD. */
-  private teamCreateMember(
-    leadId: string,
-    a: { title: string; task: string; source: "fresh-worktree" | "existing-dir"; base?: string; brief: string },
-  ): { id: string; title: string; cwd: string } {
-    const lead = this.require(leadId);
-    const leadBranch = lead.data.worktree?.branch ?? lead.data.git?.branch;
-    const env = lead.data.environmentId ? this.envStore.get(lead.data.environmentId) : undefined;
-    const base = a.base ?? memberBaseRef({ source: a.source, leadBranch, envDefault: env?.defaultBase });
-    // #1: auto-suffix the title so its branch slug is unique — two members whose titles slugify the
-    // same (dup / case / punctuation / 32-char-truncation collision) no longer drop one silently.
-    // #7: a lead without an env can still spawn members off its own repo (worktree repoRoot, or its
-    // cwd when it's an existing-dir lead pointing at a git repo).
-    const repoRoot = lead.data.worktree?.repoRoot ?? env?.repoRoot ?? lead.data.cwd;
-    const title = a.source === "fresh-worktree" && repoRoot ? this.uniqueMemberTitle(repoRoot, a.title) : a.title;
-    return this.handoffCreate({
-      environmentId: lead.data.environmentId,
-      repoRoot,
-      source: a.source,
-      cwd: a.source === "existing-dir" ? lead.data.cwd : undefined,
-      base,
-      title,
-      model: lead.data.model,
-      autonomy: lead.data.autonomy,
-      brief: a.brief,
-      parentId: leadId,
-      teamRole: "member",
-      memberTask: a.task,
-    });
-  }
-
-  /** A member title whose branch slug is free in `repoRoot` — appends " 2", " 3", … on collision. */
-  private uniqueMemberTitle(repoRoot: string, desired: string): string {
-    if (!git.branchExists(repoRoot, slugify(desired))) return desired;
-    for (let n = 2; n < 200; n++) {
-      const cand = `${desired} ${n}`;
-      if (!git.branchExists(repoRoot, slugify(cand))) return cand;
-    }
-    return desired; // exhausted — let the spawn fail and surface the error via spawnMember
-  }
-
-  private teamListMembers(leadId: string): TeamInfo | null {
-    return deriveTeams(this.list()).find((t) => t.leadId === leadId) ?? null;
-  }
-
-  /** Integrate member branches per the team policy (combined-pr merges into the lead's worktree in
-   *  dependency order → one PR; pr-per-member is a no-op merge). Idempotent + resumable: on a merge
-   *  conflict it prompts the lead to resolve as an agent turn, then a re-run continues. */
-  integrateTeam(leadId: string): string {
-    const lead = this.require(leadId);
-    if (lead.data.teamRole !== "lead") throw new BadCommand("only a team lead can integrate");
-    const team = deriveTeams(this.list()).find((t) => t.leadId === leadId);
-    if (!team || team.members.length === 0) throw new BadCommand("this lead has no members to integrate");
-    // #6: don't merge a member's branch while it's mid-work — refuse until every member is terminal.
-    const stillRunning = team.members.filter((m) => m.status !== "idle" && m.status !== "exited" && m.status !== "error");
-    if (stillRunning.length) {
-      throw new BadCommand(
-        `Cannot integrate yet — ${stillRunning.length} member(s) still working: ${stillRunning.map((m) => m.task ?? m.sessionId).join(", ")}. ` +
-          `Wait for them to finish (or dismiss them) before integrating.`,
-      );
-    }
-
-    // Order members by the plan's dependsOn when we have it (session.title === plan member title,
-    // stamped at spawn); hand-added members with no plan entry keep their natural order at the end.
-    const memberSessions = team.members
-      .map((m) => this.sessions.get(m.sessionId)?.data)
-      .filter((s): s is SessionData => !!s);
-    const plan = this.activeTeamPlans.get(leadId);
-    let ordered = memberSessions;
-    if (plan) {
-      const byTitle = new Map(memberSessions.map((s) => [s.title, s]));
-      const seen = new Set<string>();
-      const out: SessionData[] = [];
-      for (const pm of integrationOrder(plan.members)) {
-        const s = byTitle.get(pm.title);
-        if (s && !seen.has(s.id)) { out.push(s); seen.add(s.id); }
-      }
-      for (const s of memberSessions) if (!seen.has(s.id)) out.push(s);
-      ordered = out;
-    }
-
-    const members: IntegrateMember[] = ordered.map((s) => ({
-      sessionId: s.id,
-      title: s.title,
-      branch: s.worktree?.branch,
-    }));
-    const integration = lead.data.team?.integration ?? "combined-pr";
-    // Guard the push target: never push the combined branch ONTO the repo's default/base branch. If the
-    // remote-branch classifier tagged the lead as "main"/"master" (or the base), pushing branch:main
-    // would try to shove team work straight onto main — fall back to the branch's own name instead.
-    const baseName = lead.data.worktree?.base?.replace(/^origin\//, "");
-    const leadRemoteBranch = safeRemoteBranch(lead.data.worktree?.remoteBranch, baseName);
-    const result = runTeamIntegration({
-      integration,
-      leadCwd: lead.data.cwd,
-      leadBranch: lead.data.worktree?.branch ?? lead.data.git?.branch ?? "HEAD",
-      leadRemoteBranch,
-      members,
-      prTitle: `${lead.data.title}: team integration`,
-      prBody: `Combined PR integrating ${members.length} team member(s):\n${members.map((m) => `- ${m.title}${m.branch ? ` (${m.branch})` : ""}`).join("\n")}`,
-      git,
-    });
-
-    // Refresh the lead's git projection (branch/PR badge) and the derived team rollup.
-    lead.data.git = gitStatus(lead.data.cwd);
-    this.persist();
-    this.broadcastUpdated(lead.data);
-
-    if (!result.ok && result.failedMember && result.conflicted) {
-      // A real conflict: hand it to the lead as an agent turn; a re-run of integrate() continues past it.
-      this.prompt(
-        leadId,
-        `Integration hit a merge conflict pulling in member "${result.failedMember}". ` +
-          `Resolve the conflicts in this worktree, commit the merge, then call the integrate tool again to continue.`,
-      );
-    }
-    // #8: a completed integrate consumes the active plan (no stale dependsOn lingering for a re-run).
-    if (result.ok) this.activeTeamPlans.delete(leadId);
-    return result.output;
-  }
-
-  /**
-   * Open an interactive "Plan with Claude" session on a work unit (replaces the old refine chat).
-   * Unlike Go (`startPlan`, which seeds the plan and builds autonomously), this hands the session the
-   * FULL context — the live Todoist prompt, the design so far, and any open questions — and lets the
-   * user and Claude settle the plan together before building. It's a continuous session: once the plan
-   * is agreed it can implement here, or call `run_pipeline` to hand off to the autonomous loop. Works on
-   * held (needs-clarification) units too — this is how their open questions get answered.
-   */
-  async startPlanningSession(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a live session");
-    const env = this.envStore.get(u.environmentId);
-    if (!env) throw new BadCommand("the plan's environment no longer exists");
-    // Best-effort: re-fetch the live Todoist prompt (task text + comments) so the session sees exactly
-    // what the user asked for, not just the planner's derived plan. Todoist offline → empty, plan carries on.
-    let todoistPrompt = "";
-    const state = this.integrations.todoist();
-    if (state?.accessToken) {
-      try {
-        todoistPrompt = await buildTodoistPrompt(new TodoistClient(state.accessToken), u.taskIds, AbortSignal.timeout(30_000));
-      } catch {
-        /* Todoist unreachable — plan on the derived plan alone */
-      }
-    }
-    const { id } = this.handoffCreate({
-      environmentId: env.id,
-      source: "fresh-worktree",
-      title: u.title,
-      model: model ?? "opus",
-      // Interactive by default: it should ask the open questions and confirm the design, not blast ahead.
-      autonomy: autonomy ?? "mostly-autonomous",
-      brief: buildPlanningBrief(u, todoistPrompt),
-      workUnitId: u.id,
-      workUnitRole: "planner",
-    });
-    this.workUnits.update(u.id, { sessionId: id, status: "planning" });
-    void this.tagTasks(u, "planning");
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
-  }
-
-  /** Build the planning-session MCP server (save_plan / run_pipeline), closed over its session id. */
-  private buildPlanningServer(sessionId: string) {
-    return buildPlanningToolsServer({
-      sessionId,
-      savePlan: (plan, ready) => this.plannerSavePlan(sessionId, plan, ready),
-      runPipeline: () => this.plannerRunPipeline(sessionId),
-    });
-  }
-
-  /** `save_plan` tool: a planning session writes its settled plan back onto its work unit and posts it
-   *  to Todoist. Scoped to the session's own unit. `ready` is advisory (the unit stays owned by the live
-   *  session); it just marks the plan settled in the Todoist note. */
-  private plannerSavePlan(sessionId: string, plan: string, ready: boolean): string {
-    const u = this.plannerUnit(sessionId);
-    this.workUnits.update(u.id, { plan });
-    void this.postPlanComment(
-      u,
-      ready
-        ? `🤖 **anvil** settled the plan for “${u.title}” in a planning session.`
-        : `🤖 **anvil** checkpointed a work-in-progress plan for “${u.title}”.`,
-    );
-    this.broadcastAutopilotPlans();
-    return `Saved the plan to “${u.title}”${ready ? " and marked it settled" : " as a checkpoint"}. Posted it to Todoist.`;
-  }
-
-  /** `run_pipeline` tool: a planning session hands its settled unit to the autonomous dev pipeline (§4).
-   *  Fire-and-forget — progress streams to the Autopilot screen; returns once the run is launched. */
-  private plannerRunPipeline(sessionId: string): string {
-    const u = this.plannerUnit(sessionId);
-    void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) }).catch((e) => {
-      this.broadcastRunProgress(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`);
-    });
-    return `Started the review→development→testing pipeline for “${u.title}”. It builds in a fresh worktree and opens a PR; watch the Autopilot screen for progress.`;
-  }
-
-  /** Resolve + validate a planning session's work unit (guards the save_plan/run_pipeline tools). */
-  private plannerUnit(sessionId: string): WorkUnit {
-    const s = this.require(sessionId);
-    if (s.data.workUnitRole !== "planner" || !s.data.workUnitId) throw new BadCommand("not a planning session");
-    const u = this.workUnits.get(s.data.workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${s.data.workUnitId}`);
-    return u;
-  }
-
-  /** Reassign a plan to a different environment (repo) and re-evaluate it there: re-plan the unit's
-   *  existing tasks against the new repo, persist the fresh plan/summary/effort, note it on Todoist,
-   *  broadcast, and return the updated plan. Used to correct a mis-routed (e.g. label-sourced) plan. */
-  async reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session; can't reassign it");
-    const env = this.envStore.get(environmentId);
-    if (!env) throw new BadCommand("no such environment");
-    if (env.id === u.environmentId) throw new BadCommand("the plan is already in that environment");
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
-    const client = new TodoistClient(state.accessToken);
-    const tasks: TodoistTask[] = [];
-    for (const id of u.taskIds) {
-      try {
-        tasks.push(await client.getTask(id));
-      } catch {
-        /* skip a deleted/closed task */
-      }
-    }
-    if (tasks.length === 0) throw new BadCommand("this plan has no live tasks to re-evaluate");
-    const planned = await planUnit(
-      { title: u.title, rationale: u.rationale ?? "", taskIds: tasks.map((t) => t.id) },
-      tasks,
-      { repoRoot: env.repoRoot, accounts: this.accounts, ...(env.accountId ? { accountId: env.accountId } : {}) },
-    );
-    const updated = this.workUnits.update(u.id, {
-      environmentId: env.id,
-      plan: planned.plan,
-      ...(planned.summary ? { summary: planned.summary } : {}),
-      ...(planned.effort ? { effort: planned.effort } : {}),
-    });
-    void this.postPlanComment(
-      u,
-      `🤖 **anvil** re-evaluated “${u.title}” against **${env.name}**.\n\n${planned.summary?.trim() || "Plan updated."}`,
-    );
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(updated ?? u) };
-  }
-
-  /** Reject a plan: label its member tasks `anvil:dismissed` (so the nightly run skips them) and
-   *  drop the card. Best-effort on the Todoist side — the local status change is authoritative. */
-  async dismissPlan(workUnitId: string): Promise<void> {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    const state = this.integrations.todoist();
-    if (state?.accessToken) {
-      const client = new TodoistClient(state.accessToken);
-      for (const taskId of u.taskIds) {
-        try {
-          const t = await client.getTask(taskId);
-          await client.setTaskLabels(taskId, withStatus(t.labels, "dismissed"));
-        } catch {
-          /* a deleted/closed task — skip it, the local status still drops the card */
-        }
-      }
-    }
-    this.workUnits.update(u.id, { status: "dismissed" });
-    this.broadcastAutopilotPlans();
-  }
-
-  /** Mark a plan completed or expired: relabel its member tasks (anvil:completed / anvil:expired) and,
-   *  when `closeTodoist`, close them in Todoist too. Drops the card (status is no longer "planned").
-   *  Best-effort on the Todoist side — the local status change is authoritative. */
-  async resolvePlan(workUnitId: string, status: "completed" | "expired", closeTodoist: boolean): Promise<void> {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    const state = this.integrations.todoist();
-    if (state?.accessToken) {
-      const client = new TodoistClient(state.accessToken);
-      for (const taskId of u.taskIds) {
-        try {
-          const t = await client.getTask(taskId);
-          await client.setTaskLabels(taskId, withStatus(t.labels, status));
-          if (closeTodoist) await client.closeTask(taskId);
-        } catch {
-          /* a deleted/closed task — skip it, the local status still drops the card */
-        }
-      }
-    }
-    this.workUnits.update(u.id, { status });
-    this.broadcastAutopilotPlans();
-  }
-
-  /** Inbound completion sync (Todoist → anvil): when the human checks off a plan's source task(s) in
-   *  Todoist, mark that work unit `completed` here too, so the card leaves the grid on its own. Todoist
-   *  has no webhooks, so this polls the completion-date endpoint — driven by the schedule tick and the
-   *  top of every autopilot run. Best-effort: a Todoist hiccup just means we retry next tick; a unit with
-   *  a live build session is left alone (its session, not the checkbox, owns its lifecycle). Returns the
-   *  number of units completed. */
-  async reconcileCompletedUnits(): Promise<number> {
-    if (this.autopilotRunning) return 0; // don't race a run that's mutating the same store
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) return 0;
-    const isLive = (u: WorkUnit): boolean => !!u.sessionId && this.sessions.has(u.sessionId);
-    const pending = this.workUnits
-      .list()
-      .filter((u) => RECONCILABLE_STATUSES.has(u.status) && !isLive(u) && u.taskIds.length > 0);
-    if (pending.length === 0) return 0;
-    // One completion query per distinct project the pending units draw from — this is exactly the set of
-    // boards we care about, whether project- or label-sourced (each unit stores the project its tasks live in).
-    const projectIds = new Set(pending.map((u) => u.todoistProjectId).filter((id): id is string => !!id));
-    const client = new TodoistClient(state.accessToken);
-    const completed = new Set<string>();
-    try {
-      for (const projectId of projectIds) {
-        for (const t of await client.completedTasks({ projectId, windowDays: RECONCILE_WINDOW_DAYS })) completed.add(t.id);
-      }
-    } catch {
-      return 0; // Todoist unreachable/rate-limited — leave the cards as-is and retry next tick
-    }
-    const done = selectCompletedUnits(pending, completed, isLive);
-    for (const u of done) this.workUnits.update(u.id, { status: "completed" });
-    if (done.length > 0) this.broadcastAutopilotPlans();
-    return done.length;
-  }
-
-  // ── Autopilot maintenance (Todoist-settings buttons) ──────────────────────────────
-  /** Remove the anvil:* status label from each given task (best-effort), keeping the user's own labels —
-   *  including the "Autopilot" sourcing label — intact. Returns how many tasks actually had one removed. */
-  private async stripAnvilLabels(taskIds: Iterable<string>): Promise<number> {
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) return 0;
-    const client = new TodoistClient(state.accessToken);
-    let cleared = 0;
-    for (const taskId of new Set(taskIds)) {
-      try {
-        const t = await client.getTask(taskId);
-        if (!readStatus(t.labels)) continue; // no anvil:* label → nothing to strip
-        await client.setTaskLabels(taskId, withStatus(t.labels, undefined));
-        cleared++;
-      } catch {
-        /* a deleted/closed task — skip it */
-      }
-    }
-    return cleared;
-  }
-
-  /** Every Todoist task currently carrying an anvil:* status label, swept straight from Todoist across
-   *  all linked project boards and the Autopilot sourcing label. This sees labels orphaned from a work
-   *  unit that no longer exists (e.g. a wiped/lost store) — which the known-units list cannot — so Reset
-   *  can clear them and let the task be re-planned. Best-effort: returns whatever it managed to gather. */
-  private async taggedTaskIds(): Promise<Set<string>> {
-    const ids = new Set<string>();
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) return ids;
-    const client = new TodoistClient(state.accessToken);
-    const label = this.autopilotSchedule.get().label;
-    try {
-      const swept: TodoistTask[] = [];
-      for (const env of this.envStore.list()) {
-        if (env.todoistProjectId) swept.push(...(await client.tasks(env.todoistProjectId)));
-      }
-      if (label) swept.push(...(await client.tasksByLabel(label)));
-      for (const t of swept) if (readStatus(t.labels)) ids.add(t.id);
-    } catch {
-      /* best-effort sweep — fall back to whatever was gathered */
-    }
-    return ids;
-  }
-
-  /** Reset the pipeline so tasks can be re-planned: strip anvil:* labels and drop the work units that
-   *  aren't tied to a live session (in-progress builds are left alone). The "Autopilot" sourcing label
-   *  is preserved, so the next run picks the tasks straight back up. Sweeps Todoist directly for tagged
-   *  tasks too, so labels orphaned by a lost work unit don't block a re-plan forever. */
-  async resetAnvilTags(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
-    const all = this.workUnits.list();
-    const isLive = (u: WorkUnit) => !!u.sessionId && this.sessions.has(u.sessionId);
-    const resettable = all.filter((u) => !isLive(u));
-    // Tasks owned by a live build session keep their labels — the running session depends on them.
-    const protectedIds = new Set<string>();
-    for (const u of all) if (isLive(u)) for (const id of u.taskIds) protectedIds.add(id);
-    // Clear every anvil-tagged task: the resettable units' members PLUS any orphaned by a lost unit
-    // (swept straight from Todoist), minus the protected live-session ones.
-    const toClear = await this.taggedTaskIds();
-    for (const u of resettable) for (const id of u.taskIds) toClear.add(id);
-    for (const id of protectedIds) toClear.delete(id);
-    const tasksCleared = await this.stripAnvilLabels(toClear);
-    for (const u of resettable) this.workUnits.remove(u.id);
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "reset", tasksCleared, unitsRemoved: resettable.length };
-  }
-
-  /** Clear the autopilot entirely: strip anvil:* labels from every unit's tasks and remove ALL work
-   *  units (the pending grid empties). Running sessions are not killed, but their unit is forgotten. */
-  async clearAutopilot(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
-    const units = this.workUnits.list();
-    const taskIds = new Set<string>();
-    for (const u of units) for (const id of u.taskIds) taskIds.add(id);
-    const tasksCleared = await this.stripAnvilLabels(taskIds);
-    for (const u of units) this.workUnits.remove(u.id);
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.maintenance.result", ts: now(), ...(cid ? { cid } : {}), op: "clear", tasksCleared, unitsRemoved: units.length };
-  }
-
-  /** Go: create a fresh-worktree session seeded with the plan and start it. Autonomy defaults to
-   *  `bypass` so the work runs without stalling on a permission prompt. The card then leaves the
-   *  pending grid (sessionId set + status building). */
-  startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): AutopilotStartedEvent {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
-    // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
-    // the reviewer to answer them first, in a "Plan with Claude" session, before it can start.
-    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before starting");
-    // Server-side propose-don't-run: the web hides Start for proposals, but the gate must hold for ANY
-    // client — an unapproved event-triggered unit never builds without an explicit approve.
-    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
-    const env = this.envStore.get(u.environmentId);
-    if (!env) throw new BadCommand("the plan's environment no longer exists");
-    const brief = this.autopilotBrief(u);
-    // Seed the build session with a `/goal` derived from the plan so it self-verifies to completion — the
-    // Stop hook keeps it going until a judge agrees the plan is actually built + the checks pass, rather
-    // than stopping the instant the model claims it's done (loop-engineering: run-until-done).
-    const goalCondition = buildAutopilotGoal(u);
-    const { id } = this.handoffCreate({
-      environmentId: env.id,
-      source: "fresh-worktree",
-      title: u.title,
-      model: model ?? "opus",
-      autonomy: autonomy ?? "bypass",
-      brief,
-    });
-    // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
-    this.workUnits.update(u.id, { sessionId: id, status: "building", hold: undefined, ...(goalCondition ? { goalCondition } : {}) });
-    if (goalCondition) {
-      const built = this.sessions.get(id);
-      if (built) {
-        built.data.goal = { condition: goalCondition, iterations: 0, setAt: now() };
-        this.broadcastUpdated(built.data);
-      }
-    }
-    void this.tagTasks(u, "building");
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
-  }
-
-  /** Link a plan to an existing session that's already doing the work, instead of spawning a new one
-   *  via Go. Sets the unit's sessionId + status building and tags its tasks — the card then leaves the
-   *  pending grid, exactly like startPlan. The session must belong to the plan's environment. */
   linkPlan(workUnitId: string, sessionId: string, cid?: string): AutopilotStartedEvent {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.sessionId && this.sessions.has(u.sessionId)) throw new BadCommand("this plan already has a running session");
-    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new BadCommand("no such session");
-    if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
-    // A human deliberately linking the plan to live work clears any auto-start hold (mirrors startPlan).
-    this.workUnits.update(u.id, { sessionId, status: "building", hold: undefined });
-    void this.tagTasks(u, "building");
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
+    return this.autopilot.linkPlan(workUnitId, sessionId, cid);
   }
-
-  /** The opening brief handed to a plan's build session (see integrations/autopilot-plans.ts). */
-  private autopilotBrief(u: WorkUnit): string {
-    return buildAutopilotBrief(u);
-  }
-
-  // ── Event-driven intake (loop-engineering: Channels) ──────────────────────────────────
-  /** Statuses a triggered unit is considered "live" in for dedupe (a terminal one may re-propose). */
-  private static readonly TRIGGER_LIVE = new Set<AnvilStatus>(["proposed", "planned", "needs-clarification", "planning", "building", "review", "blocked"]);
-
-  /**
-   * Ingest an external event as a PROPOSED work unit (a CI failure, a labelled task, a webhook). Defaults
-   * to needing a human approve — nothing runs unattended off an event unless a trusted source opts in via
-   * `autoApprove`. Dedupes on the trigger key so a re-delivered event collapses onto the existing card.
-   */
-  async ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
-    const intent = normalizeTrigger(input, new Date().toISOString());
-    const envId =
-      intent.environmentId ??
-      this.autopilotSchedule.get().defaultEnvironmentId ??
-      this.envStore.list().find((e) => e.todoistProjectId)?.id ??
-      this.envStore.list()[0]?.id;
-    if (!envId) throw new BadCommand("no environment is configured to route the trigger to");
-    const env = this.envStore.get(envId);
-    if (!env) throw new BadCommand("the target environment no longer exists");
-    // Dedupe: a live unit with the same trigger key already covers this event — return it, don't clone.
-    const dup = this.workUnits
-      .list()
-      .find((u) => u.trigger?.dedupeKey === intent.trigger.dedupeKey && Supervisor.TRIGGER_LIVE.has(u.status));
-    if (dup) return this.autopilotPlanInfo(dup);
-    const unit = this.workUnits.create({
-      environmentId: env.id,
-      todoistProjectId: env.todoistProjectId ?? "",
-      taskIds: [],
-      title: intent.title,
-      summary: intent.summary,
-      ...(input.body ? { rationale: input.body } : {}),
-      trigger: intent.trigger,
-      status: intent.autoApprove ? "planned" : "proposed",
-    });
-    this.broadcastAutopilotPlans();
-    // A trusted source may auto-run: it's already `planned`, so start a build if the budget is healthy.
-    if (intent.autoApprove && !this.budget().warn) {
-      try {
-        this.startPlan(unit.id);
-      } catch (e) {
-        console.error(`[autopilot] auto-approved trigger “${unit.title}” could not start: ${e instanceof Error ? e.message : e}`);
-      }
-    }
-    return this.autopilotPlanInfo(this.workUnits.get(unit.id) ?? unit);
-  }
-
-  /**
-   * Approve a proposed (event-triggered) unit: promote it to `planned` and, when `start`, launch the build
-   * immediately. Rejecting a proposal reuses the existing `autopilot.dismiss` path. Returns the started
-   * event (when `start`) or the promoted plan.
-   */
-  approveProposed(workUnitId: string, start: boolean, cid?: string): AutopilotStartedEvent | AutopilotPlanResultEvent {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.status !== "proposed") throw new BadCommand(`only a proposed plan can be approved (this one is ${u.status})`);
-    this.workUnits.update(u.id, { status: "planned" });
-    this.broadcastAutopilotPlans();
-    if (start) return this.startPlan(u.id, undefined, undefined, cid);
-    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(this.workUnits.get(u.id)!) };
-  }
-
-  /** Re-plan linked Todoist projects on this server (the Autopilot "Run autopilot" button + the
-   *  scheduled run). Broadcasts refreshed plans; when `autoStart`, launches up to `maxAutoStart` of
-   *  the new units (skipped while the budget is warning); pushes a summary when `notify`. */
-  async runAutopilot(opts: {
+  runAutopilot(opts: {
     environmentId?: string;
     notify?: boolean;
     autoStart?: boolean;
-    usePipeline?: boolean; // auto-start units through the autonomous dev pipeline (§4) instead of a plain build session
+    usePipeline?: boolean;
     maxAutoStart?: number;
   }): Promise<{ created: number; skipped: number; started: number; output: string }> {
-    if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
-    // Clear any plan whose source task was checked off since the last tick before we plan afresh, so a
-    // manual "Run autopilot" reflects completions immediately. Runs before the run marks itself active.
-    await this.reconcileCompletedUnits().catch(() => 0);
-    // Run-level abort: the watchdog (below) fires it on timeout so every in-flight Todoist/SDK call
-    // unwinds instead of hanging the run open. Threaded into the client and the planning calls.
-    const ac = new AbortController();
-    const client = new TodoistClient(state.accessToken, ac.signal);
-    // Build the adversarial panel once for this run — a plain OpenRouter client (its own provider/key,
-    // outside the §3 subscription-auth guard). The key is read LIVE from the environment so a key set via
-    // Settings → Models applies to this run without a restart. Threaded into planning with the same
-    // run-level signal so a timed-out/cancelled run tears down the OpenRouter calls too. Undefined → skipped.
-    const openRouterKey = (process.env[OPENROUTER_KEY] ?? "").trim();
-    const adversarial =
-      openRouterKey && process.env.ANVIL_ADVERSARIAL !== "0" // key present + not killed via ANVIL_ADVERSARIAL=0
-        ? {
-            enabled: true,
-            client: new OpenRouterClient(openRouterKey, ac.signal, this.adversarial.provider),
-            models: this.adversarial.models,
-          }
-        : undefined;
-    const envs = this.envStore
-      .list()
-      .filter((e) => e.todoistProjectId && (!opts.environmentId || e.id === opts.environmentId));
-    const schedule = this.autopilotSchedule.get();
-    const defaultEnv = schedule.defaultEnvironmentId ? this.envStore.get(schedule.defaultEnvironmentId) : undefined;
-    // The account-wide Autopilot-label pass runs only on a full run (no single-env scope) and needs both a
-    // label and a resolvable catch-all environment configured.
-    const labelPass = !opts.environmentId && !!schedule.label && !!defaultEnv;
-    if (envs.length === 0 && !labelPass) throw new BadCommand("no environments are linked to a Todoist project");
-    const deps = { client, workUnits: this.workUnits };
-    this.autopilotRunLog = [];
-    const emit = (line: string): void => {
-      this.autopilotRunLog.push(line);
-      this.broadcastRunProgress(line); // every client, live — not just the one that triggered the run
-    };
-    // Each unit broadcasts the refreshed plan list the moment it's persisted, so every client's grid
-    // climbs in real time (12 → 13 → …) instead of only filling in when the whole run finishes.
-    const onUnitCreated = (): void => this.broadcastAutopilotPlans();
-    const token = ++this.autopilotRunToken;
-    this.autopilotRunStartedAt = Date.now();
-    this.broadcastSchedule(); // tell every client a run just started (running: true)
-    // Watchdog: clients only re-render `running` when they RECEIVE a schedule event, so once the derived
-    // state flips to false (run outlived its budget) we proactively abort the hung work and broadcast it,
-    // rather than waiting for the next connect. The derived getter already guarantees correctness; this
-    // just makes the spinner clear promptly and frees the in-flight subprocess/socket.
-    const watchdog = setTimeout(() => {
-      if (this.autopilotRunToken !== token) return; // a newer run already owns the state
-      emit("⚠ Autopilot run exceeded its time budget — ending it. Check the daemon log if this recurs.");
-      ac.abort();
-      this.autopilotRunStartedAt = undefined;
-      this.broadcastSchedule();
-    }, AUTOPILOT_RUN_TIMEOUT_MS);
-    watchdog.unref?.(); // a pending watchdog must never keep the daemon alive on its own
-    const createdUnits: WorkUnit[] = [];
-    const startedUnitIds = new Set<string>(); // units this run auto-started — feeds the lapo report
-    let skipped = 0;
-    let started = 0;
-    try {
-      for (const env of envs) {
-        // Name the Claude account the run bills to, so the report/log says whose subscription paid
-        // for an unattended run rather than leaving it to be inferred (§6).
-        const envAcct = this.accounts.labelOf(env.accountId ?? this.accounts.defaultId());
-        emit(`▸ ${env.name}${envAcct ? ` · account: ${envAcct}` : ""}`);
-        const res = await this.runEnvPlan(emit, env.name, () =>
-          planAndTagProject(deps, {
-          environmentId: env.id,
-          projectId: env.todoistProjectId!,
-          repoRoot: env.repoRoot,
-          repoName: env.name,
-          adversarial,
-          signal: ac.signal,
-          onProgress: emit,
-          onUnitCreated,
-          // Unattended runs bill to the environment's chosen account, else the roster default (§6).
-            accounts: this.accounts,
-            ...(env.accountId ? { accountId: env.accountId } : {}),
-          }),
-        );
-        if (!res) continue; // this environment failed; the others still run
-        createdUnits.push(...res.created);
-        skipped += res.skipped;
-      }
-      // Account-wide label pass: pull every @<label> task, drop those a linked project already covers
-      // (coexist + dedup), and plan the rest against the catch-all env. These are review-only (below).
-      if (labelPass && defaultEnv && schedule.label) {
-        const labelAcct = this.accounts.labelOf(defaultEnv.accountId ?? this.accounts.defaultId());
-        emit(`▸ @${schedule.label} → ${defaultEnv.name}${labelAcct ? ` · account: ${labelAcct}` : ""}`);
-        const linkedProjectIds = new Set(
-          this.envStore.list().map((e) => e.todoistProjectId).filter((id): id is string => !!id),
-        );
-        const labelled = await client.tasksByLabel(schedule.label);
-        const external = labelled.filter((t) => !linkedProjectIds.has(t.project_id));
-        emit(`  ${labelled.length} @${schedule.label} task(s) · ${external.length} outside linked projects.`);
-        const res = await planAndTagTasks(deps, {
-          environmentId: defaultEnv.id,
-          repoRoot: defaultEnv.repoRoot,
-          repoName: defaultEnv.name,
-          tasks: external,
-          adversarial,
-          signal: ac.signal,
-          onProgress: emit,
-          onUnitCreated,
-          accounts: this.accounts,
-          ...(defaultEnv.accountId ? { accountId: defaultEnv.accountId } : {}),
-        });
-        createdUnits.push(...res.created);
-        skipped += res.skipped;
-      }
-      // Auto-start the new units, capped, and only when the subscription budget is healthy — an
-      // unattended run must never spawn a swarm of sessions or exhaust the weekly window. Each unit must
-      // also clear the auto-start gate: label-sourced units are review-only, units held `needs-clarification`
-      // by intake are never built, and a plan the adversarial panel scored below the confidence bar is left
-      // `planned` for a human. (The intake/clarification holds were already logged during planning; only
-      // surface the adversarial-quality holds here so the run log explains a plan that DID get planned but
-      // won't build.)
-      const autoStartable: WorkUnit[] = [];
-      for (const u of createdUnits) {
-        const decision = autoStartDecision(u);
-        if (decision.start) autoStartable.push(u);
-        else if (u.source !== "label" && u.status === "planned" && decision.reason) {
-          // Persist the hold on the unit so the stop-reason is durable on the card (not just this run's
-          // log): the panel can show "Held: adversarial 4/10" until a human starts or dismisses it.
-          this.workUnits.update(u.id, { hold: { reason: decision.reason, at: new Date().toISOString() } });
-          emit(`⏸ Holding “${u.title}” — ${decision.reason}.`);
-        }
-      }
-      // Pipeline auto-start needs an OpenRouter key (GLM authors several gates); fall back to a plain build
-      // session if the operator asked for the pipeline but no key is set, rather than failing every unit.
-      const pipeline = opts.usePipeline && !!openRouterKey;
-      if (opts.usePipeline && !openRouterKey) emit("⚠ Pipeline requested but no OpenRouter key is set — falling back to build sessions. Set one in Settings → Models.");
-      if (opts.autoStart && autoStartable.length) {
-        if (this.budget().warn) {
-          emit("⏸ Auto-start skipped — subscription budget is in its warn zone; plans left for review.");
-        } else {
-          const cap = opts.maxAutoStart ?? 3;
-          for (const u of autoStartable.slice(0, cap)) {
-            try {
-              if (pipeline) {
-                // Long-running (all 7 gates, both models, opens a PR). Fire in the background with its own
-                // budget so one slow unit can't pin the scheduled run open; progress + status update live.
-                emit(`🔬 Pipeline “${u.title}”…`);
-                void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) })
-                  .then((o) => emit(`  “${u.title}” → ${o.status} (reached ${o.phaseReached}).`))
-                  .catch((e) => emit(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`));
-              } else {
-                this.startPlan(u.id);
-                emit(`🚀 Started “${u.title}”.`);
-              }
-              started++;
-              startedUnitIds.add(u.id);
-            } catch (e) {
-              emit(`⚠ Couldn't start “${u.title}”: ${e instanceof Error ? e.message : String(e)}`);
-            }
-          }
-          if (autoStartable.length > cap) emit(`${autoStartable.length - cap} more plan(s) left for manual review (cap ${cap}).`);
-        }
-      }
-    } finally {
-      clearTimeout(watchdog);
-      // Only clear if THIS run still owns the state — a watchdog-timed-out run that's been superseded by
-      // a newer run must not wipe the newer run's start timestamp when its own late cleanup finally runs.
-      if (this.autopilotRunToken === token) this.autopilotRunStartedAt = undefined;
-      this.broadcastSchedule(); // run finished (or errored) — tell every client (running: false)
-    }
-    const created = createdUnits.length;
-    this.broadcastAutopilotPlans();
-    // Post a run report to lapo (best-effort, fire-and-forget) — what was done, what's held for
-    // clarification, and what was skipped. Only when something actually happened this run (empty runs
-    // are skipped by the operator's choice). `notify` is true only for the scheduled run, so it also
-    // distinguishes the nightly run from a manual "Run autopilot" in the report header.
-    if (created > 0 || started > 0) {
-      void this.postAutopilotReport({
-        units: createdUnits,
-        skipped,
-        started,
-        startedIds: startedUnitIds,
-        trigger: opts.notify ? "scheduled" : "manual",
-      });
-    }
-    if (opts.notify && created > 0) {
-      const body = started
-        ? `${created} new plan${created === 1 ? "" : "s"} · ${started} started`
-        : `${created} new plan${created === 1 ? "" : "s"} ready to review`;
-      const payload: PushPayload = { title: "Anvil autopilot", body, tag: "autopilot", kind: "result" };
-      void this.webpush.notify(payload);
-      void this.fcm.notify(payload);
-      void this.apns.notify(payload);
-    }
-    return { created, skipped, started, output: this.autopilotRunLog.join("\n") };
+    return this.autopilot.runAutopilot(opts);
   }
-
-  /**
-   * Run the autonomous dev pipeline (§4) for a planned work unit: intake → the tier-selected gauntlet,
-   * in a fresh worktree, with the environment's validation commands as the P4 gate and the existing
-   * git/gh ops opening the PR at P6. Both models run through the Agent SDK (GLM via OpenRouter's
-   * Anthropic Skin). Persists the trace record on the unit + the §6.3 metrics on completion. Opt-in
-   * (manual trigger) — it does not replace the existing startPlan build flow.
-   */
-  async runDevPipeline(workUnitId: string, opts: { signal?: AbortSignal; onProgress?: (m: string) => void } = {}): Promise<PipelineOutcome> {
-    const u = this.workUnits.get(workUnitId);
-    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
-    if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before running the pipeline");
-    if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
-    const env = this.envStore.get(u.environmentId);
-    if (!env) throw new BadCommand("the work unit's environment no longer exists");
-    if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
-    // Default to broadcasting progress to every client (so the live view updates like an autopilot run).
-    const log = opts.onProgress ?? ((m: string) => this.broadcastRunProgress(m));
-    const runId = newId("pipe");
-    const branch = `${slugify(u.title)}-pipeline`;
-    // One worktree for the whole run: read-only phases inspect it, P3/P4 write, P6 opens the PR from it.
-    const { cwd } = createWorktree(env.repoRoot, env.defaultBase ?? "HEAD", branch, this.store.worktreeRoot(), runId);
-    this.runningPipelines.set(u.id, u.title); // surface it as a live loop in the Loops panel
-    this.broadcastLoops();
-    try {
-      const glmSlug = this.adversarial.models.find((m) => /glm/i.test(m));
-      const deps: PhaseDeps = {
-        task: { id: u.id, text: workUnitTaskText(u) },
-        repoRoot: cwd,
-        ...(glmSlug ? { glmSlug } : {}),
-        agent: defaultAgent,
-        ...(env.validation?.commands?.length ? { checks: envChecks(env.validation.commands) } : {}),
-        openPr: gitPrOpener(branch),
-        captureDiff: captureGitDiff,
-      };
-      const outcome = await executeDevPipeline(deps, { metrics: this.devPipelineMetrics, log, signal: opts.signal });
-      const mapped = pipelineStatusToUnit(outcome);
-      this.workUnits.update(u.id, {
-        devPipeline: { status: outcome.status, phaseReached: outcome.phaseReached, ...(outcome.reason ? { reason: outcome.reason } : {}), trace: outcome.trace },
-        status: mapped.status,
-        // The pipeline was deliberately run on this unit — drop any pre-run auto-start hold so the
-        // review/blocked card shows the pipeline verdict, not a stale "Held — adversarial…" banner.
-        hold: undefined,
-        ...(mapped.prUrl ? { prUrl: mapped.prUrl } : {}),
-        ...(mapped.blockedReason ? { blockedReason: mapped.blockedReason } : {}),
-      });
-      this.broadcastAutopilotPlans();
-      log(`Pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}.`);
-      return outcome;
-    } finally {
-      this.runningPipelines.delete(workUnitId); // pipeline loop ended (shipped/blocked/threw)
-      this.broadcastLoops();
-      // [BE-13] Persist metrics on EVERY exit, not just success. `executeDevPipeline` mutates the
-      // in-memory tallies (recordFirstPass) as it runs; a run that throws is exactly one where the
-      // adversary fired hardest, so saving only on success biased the §6.3 collusion metric toward
-      // clean runs. saveMetrics is atomic (tmp+rename), so a partial write can't corrupt the file.
-      saveMetrics(this.stateDir, this.devPipelineMetrics);
-      // The branch (when shipped) is on origin via P6's push; the local worktree is disposable either way.
-      try {
-        removeWorktree(env.repoRoot, cwd, branch);
-      } catch {
-        /* best-effort cleanup */
-      }
-    }
+  runDevPipeline(workUnitId: string, opts: { signal?: AbortSignal; onProgress?: (m: string) => void } = {}): Promise<PipelineOutcome> {
+    return this.autopilot.runDevPipeline(workUnitId, opts);
   }
-
-  // ── Autopilot schedule (in-daemon timer) ──────────────────────────────────────────
   autopilotScheduleEvent(cid?: string): AutopilotScheduleEvent {
-    const schedule = this.autopilotSchedule.get();
-    const next = nextScheduledFire(schedule, new Date());
-    return {
-      v: PROTOCOL_VERSION,
-      type: "autopilot.schedule",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      schedule,
-      ...(next ? { nextRunAt: next.toISOString() } : {}),
-      running: this.autopilotRunning,
-    };
+    return this.autopilot.autopilotScheduleEvent(cid);
   }
-  private broadcastSchedule(): void {
-    this.registry.toAll(this.autopilotScheduleEvent());
-    this.broadcastLoops(); // the schedule heartbeat + its running state are loop rows
-  }
-  /** Stream one run-progress line to every connected client (live, regardless of who started the run —
-   *  or whether it was the scheduler). Centralized here so manual and scheduled runs behave the same. */
-  private broadcastRunProgress(line: string): void {
-    this.registry.toAll({ v: PROTOCOL_VERSION, type: "autopilot.run.progress", ts: now(), line });
-  }
-  /** The live run's accumulated progress, for replay to a client that connects/refreshes mid-run so it
-   *  restores the running view instead of blanking. `log` is empty when no run is in flight. */
   autopilotRunSnapshotEvent(cid?: string): AutopilotRunSnapshotEvent {
-    return {
-      v: PROTOCOL_VERSION,
-      type: "autopilot.run.snapshot",
-      ts: now(),
-      ...(cid ? { cid } : {}),
-      running: this.autopilotRunning,
-      log: this.autopilotRunning ? [...this.autopilotRunLog] : [],
-    };
+    return this.autopilot.autopilotRunSnapshotEvent(cid);
   }
   setAutopilotSchedule(patch: Partial<Omit<AutopilotSchedule, "lastRunAt">>, cid?: string): AutopilotScheduleEvent {
-    this.autopilotSchedule.set(patch);
-    this.broadcastSchedule(); // every device (no cid)
-    return this.autopilotScheduleEvent(cid); // the requester (cid)
+    return this.autopilot.setAutopilotSchedule(patch, cid);
+  }
+  postAutopilotReport(input: {
+    units: WorkUnit[];
+    skipped: number;
+    started: number;
+    startedIds: Set<string>;
+    trigger: "scheduled" | "manual";
+  }): Promise<void> {
+    return this.autopilot.postAutopilotReport(input);
   }
 
-  /** Best-effort: set every member task's anvil status label (used on dismiss/build/promotion transitions). */
-  private async tagTasks(u: WorkUnit, status: AnvilStatus): Promise<void> {
-    const state = this.integrations.todoist();
-    if (!state?.accessToken) return;
-    const client = new TodoistClient(state.accessToken);
-    for (const taskId of u.taskIds) {
-      try {
-        const t = await client.getTask(taskId);
-        await client.setTaskLabels(taskId, withStatus(t.labels, status));
-      } catch {
-        /* skip a missing task */
-      }
-    }
+  // ── Teams — delegated to TeamCoordinator (P7 extraction). The thin wrappers below are the wire/
+  // dispatch entry points; the orchestration (plan lifecycle, spawn/queue/drain, relay guard,
+  // integration) lives in team-coordinator.ts.
+  /** Derived team tree (team.info) — sent on connect alongside the session list. */
+  teamInfoEvent(): TeamInfoEvent {
+    return this.teams.teamInfoEvent();
   }
-  /** Best-effort: post a comment on the unit's first task (the plan-carrying one). */
-  private async postPlanComment(u: WorkUnit, content: string): Promise<void> {
-    const state = this.integrations.todoist();
-    const taskId = u.taskIds[0];
-    if (!state?.accessToken || !taskId) return;
-    try {
-      await new TodoistClient(state.accessToken).addComment(taskId, content);
-    } catch {
-      /* comment is an audit nicety — never fail the plan save over it */
-    }
+  /** A human prompt to a team session resets that team's relay-loop guard (prompt.send path). */
+  noteHumanPrompt(sessionId: string): void {
+    this.teams.noteHumanPrompt(sessionId);
+  }
+  approveTeamPlan(leadId: string, plan?: TeamPlan): Promise<void> {
+    return this.teams.approveTeamPlan(leadId, plan);
+  }
+  rejectTeamPlan(leadId: string): void {
+    this.teams.rejectTeamPlan(leadId);
+  }
+  integrateTeam(leadId: string): Promise<string> {
+    return this.teams.integrateTeam(leadId);
   }
 
   removeEnvironment(id: string): void {
-    this.envStore.remove(id);
-    this.registry.toAll(this.environmentsEvent());
+    this.environments.removeEnvironment(id);
   }
 
   /** Events to send a (re)attaching connection (arch §6.4): replay seq > lastSeq, else snapshot. */
@@ -2199,7 +810,8 @@ export class Supervisor {
     const s = this.require(id);
     const log = this.logs.get(id);
     if (!log) return [];
-    const events = lastSeq === undefined ? [log.snapshot(id, s.lastSeq)] : log.since(lastSeq);
+    this.noteServerCounter(lastSeq === undefined ? "resumeSnapshot" : "resumeDelta"); // §5.7: what we served
+    const events = lastSeq === undefined ? [log.snapshot(id, s.lastSeq, s.epoch)] : log.since(lastSeq);
     // Always end with the live status so a re-attaching client's thinking indicator reflects
     // reality (the per-turn `status` events it missed while detached aren't replayed).
     events.push({ v: PROTOCOL_VERSION, type: "status", ts: now(), sessionId: id, seq: s.lastSeq, status: s.data.status });
@@ -2227,8 +839,77 @@ export class Supervisor {
   sessionListEvent(): SessionListEvent {
     return { v: PROTOCOL_VERSION, type: "session.list", ts: now(), sessions: this.list() };
   }
+  /** Cheap per-session resume watermarks (v4, §6.4) — sent on connect so a cold-opening client can
+   *  verify its cached transcript (epoch + lastSeq) without pulling a full snapshot. In-memory only:
+   *  O(sessions), no event-log reads. */
+  resumeWatermarksEvent(): ResumeWatermarksEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "resume.watermarks",
+      ts: now(),
+      watermarks: [...this.sessions.values()].map((s) => ({ sessionId: s.id, epoch: s.epoch, lastSeq: s.lastSeq })),
+    };
+  }
+  /** Whether a prompt with this `cid` was already applied to the session (v4 exactly-once dedupe). */
+  isPromptApplied(id: string, cid: string): boolean {
+    return this.sessions.get(id)?.isPromptApplied(cid) ?? false;
+  }
 
-  create(cmd: SessionCreateCmd): Session {
+  // ── Telemetry (v4, §5.7) ──────────────────────────────────────────────────
+  /** Bump a daemon-side counter (e.g. a deduped prompt). */
+  noteServerCounter(key: string): void {
+    this.serverCounters[key] = (this.serverCounters[key] ?? 0) + 1;
+  }
+  /** Record a client's latest counter report (keyed by its stable clientId). [BE2-23/SEC2-4] The id and
+   *  counters are client-supplied, so both are validated; the map is an LRU capped at MAX_TELEMETRY_CLIENTS. */
+  recordClientTelemetry(clientId: string, counters: Record<string, number>): void {
+    if (typeof clientId !== "string" || !clientId || clientId.length > 200) return; // reject junk/oversized ids
+    const clean = sanitizeCounters(counters);
+    if (!clean) return; // not a plain object, or too many keys → ignore the report entirely
+    this.clientTelemetry.delete(clientId); // re-insert at the end so this id becomes the newest (LRU)
+    this.clientTelemetry.set(clientId, { counters: clean, at: Date.now() });
+    // Evict the oldest entries past the cap (Map preserves insertion order → first key is the oldest).
+    while (this.clientTelemetry.size > Supervisor.MAX_TELEMETRY_CLIENTS) {
+      const oldest = this.clientTelemetry.keys().next().value;
+      if (oldest === undefined) break;
+      this.clientTelemetry.delete(oldest);
+    }
+  }
+  /** The aggregated telemetry snapshot broadcast on connect + whenever a client reports (spec D11). */
+  telemetrySnapshotEvent(): TelemetrySnapshotEvent {
+    const cutoff = Date.now() - Supervisor.TELEMETRY_TTL_MS;
+    const clients: Record<string, Record<string, number>> = {};
+    for (const [id, rec] of this.clientTelemetry) {
+      if (rec.at < cutoff) {
+        this.clientTelemetry.delete(id); // stale — prune lazily on read
+        continue;
+      }
+      clients[id] = rec.counters;
+    }
+    return {
+      v: PROTOCOL_VERSION,
+      type: "telemetry.snapshot",
+      ts: now(),
+      server: { ...this.serverCounters },
+      clients,
+    };
+  }
+  /** Broadcast the current telemetry snapshot to every connected client. [BE2-23] Coalesced: a burst of
+   *  reports (or a reconnect storm) collapses into at most one broadcast per 250ms instead of
+   *  re-serializing + fanning out the whole map on every single report. */
+  broadcastTelemetry(): void {
+    if (this.telemetryBroadcastTimer) return;
+    this.telemetryBroadcastTimer = setTimeout(() => {
+      this.telemetryBroadcastTimer = null;
+      this.registry.toAll(this.telemetrySnapshotEvent());
+    }, 250);
+    this.telemetryBroadcastTimer.unref?.(); // never hold the process/test open for a coalesced broadcast
+  }
+
+  // [BE2-2] Async: a fresh-worktree create runs a network `git fetch` (base sync) plus the worktree
+  // add — those now park this create instead of freezing the daemon, so every other session/client
+  // stays live while it runs. Failures still surface as BadCommand to the dispatcher.
+  async create(cmd: SessionCreateCmd): Promise<Session> {
     const id = newId("sess");
     let cwd: string;
     let worktree: SessionData["worktree"];
@@ -2237,7 +918,7 @@ export class Supervisor {
       if (!cmd.repoRoot) throw new BadCommand("repoRoot is required for a fresh-worktree session");
       const branch = slugify(cmd.title ?? "session");
       try {
-        const created = createWorktree(cmd.repoRoot, cmd.base ?? "HEAD", branch, this.store.worktreeRoot(), id);
+        const created = await createWorktree(cmd.repoRoot, cmd.base ?? "HEAD", branch, this.store.worktreeRoot(), id);
         cwd = created.cwd;
         worktree = created.worktree;
       } catch (e) {
@@ -2266,7 +947,7 @@ export class Supervisor {
       cwd,
       source: cmd.source,
       worktree,
-      git: gitStatus(cwd),
+      git: await gitStatusAsync(cwd),
       model: cmd.model ?? "opus",
       autonomy: cmd.autonomy ?? "mostly-autonomous",
       adversarialReview: cmd.adversarialReview ?? false,
@@ -2300,7 +981,7 @@ export class Supervisor {
    * frame, so this broadcasts `session.created` itself. `prompt()` emits the brief as `message.user`,
    * so it appears in the new session's history and starts the first turn.
    */
-  private handoffCreate(a: {
+  private async handoffCreate(a: {
     environmentId?: string;
     source: SessionSource;
     cwd?: string;
@@ -2317,7 +998,7 @@ export class Supervisor {
     // ── Autopilot: mark a "Plan with Claude" planning session and link it to its work unit ──
     workUnitId?: string;
     workUnitRole?: "planner";
-  }): { id: string; title: string; cwd: string } {
+  }): Promise<{ id: string; title: string; cwd: string }> {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
       const env = a.environmentId ? this.envStore.get(a.environmentId) : undefined;
@@ -2353,7 +1034,7 @@ export class Supervisor {
         autonomy: a.autonomy,
       };
     }
-    const session = this.create(cmd);
+    const session = await this.create(cmd);
     // Teams: stamp the parent link BEFORE the session.created broadcast so members arrive labeled.
     if (a.parentId || a.teamRole || a.memberTask) {
       session.data.parentId = a.parentId;
@@ -2369,7 +1050,7 @@ export class Supervisor {
       this.persist();
     }
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
-    this.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
+    this.teams.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
     this.prompt(session.id, a.brief); // lazily starts the driver and runs the first turn
     return { id: session.id, title: session.data.title, cwd: session.data.cwd };
   }
@@ -2428,17 +1109,6 @@ export class Supervisor {
    * prefix from the keyword heuristic on the spot so we never push a bare, unprefixed remote. The
    * result is persisted so it stays stable. Returns undefined for non-worktree sessions.
    */
-  private resolveRemoteBranch(s: Session): string | undefined {
-    const wt = s.data.worktree;
-    if (!wt) return undefined;
-    if (wt.remoteBranch) return wt.remoteBranch;
-    const existing = git.upstreamRemoteBranch(s.data.cwd);
-    wt.remoteBranch = existing ?? `${heuristicKind(s.openingPrompt ?? s.data.title ?? "")}/${wt.branch}`;
-    this.persist();
-    this.broadcastUpdated(s.data);
-    return wt.remoteBranch;
-  }
-
   // File browser & reader (arch §8.1/§8.2), scoped to the session worktree. Change-watching is
   // extracted to FileWatchManager (unit-tested); the Supervisor injects locate/read/session access.
   private readonly fileWatchMgr = new FileWatchManager(
@@ -2482,139 +1152,15 @@ export class Supervisor {
     return `/api/sessions/${sessionId}/files?path=${encodeURIComponent(relPath)}`;
   }
 
-  // Git lifecycle (arch §8): operate on the session worktree, return combined output.
+  // Git lifecycle + PR projection (arch §8) — delegated to GitProjectionService (P7 extraction).
   gitOp(cmd: GitCmd): GitResultEvent {
-    const s = this.require(cmd.sessionId);
-    const cwd = s.data.cwd;
-    const branch = s.data.worktree?.branch ?? "HEAD";
-    let ok = true;
-    let output = "";
-    let url: string | undefined;
-    switch (cmd.op) {
-      case "status": {
-        this.refreshGit(s);
-        if (s.data.git) {
-          const pr = git.prStatus(cwd); // network: gh pr view
-          const badge = prBadgeFor(pr.state, pr.url, s.data.git.branch, s.data.git.dirtyFileCount);
-          applyPrBadge(s.data.git, badge); // badge is branch-scoped, and merged hides on a dirty tree
-          this.persist();
-          this.broadcastUpdated(s.data);
-          output = `${s.data.git.branch} — ${s.data.git.dirtyFileCount} changed, ${s.data.git.ahead} ahead / ${s.data.git.behind} behind${s.data.git.prState ? ` · PR ${s.data.git.prState}` : ""}`;
-        } else {
-          output = "(not a git repo)";
-        }
-        break;
-      }
-      case "diff": {
-        const r = git.diff(cwd);
-        ok = r.ok;
-        output = r.output;
-        break;
-      }
-      case "commit": {
-        const r = git.commit(cwd, cmd.message?.trim() || "update");
-        ok = r.ok;
-        output = r.output;
-        this.refreshGit(s);
-        break;
-      }
-      case "push": {
-        const r = git.push(cwd, branch, this.resolveRemoteBranch(s));
-        ok = r.ok;
-        output = r.output;
-        this.refreshGit(s);
-        break;
-      }
-      case "create-pr": {
-        const r = git.createPr(cwd, cmd.title?.trim() || s.data.title, cmd.body ?? "");
-        ok = r.ok;
-        output = r.output;
-        url = r.url;
-        break;
-      }
-      case "merge-pr": {
-        const r = git.mergePr(cwd, cmd.method ?? "squash", s.data.worktree?.branch, s.data.worktree?.remoteBranch);
-        ok = r.ok;
-        output = r.output;
-        if (r.ok) {
-          // The worktree rolled onto a fresh follow-up branch — track it so the restart health
-          // check (which compares against worktree.branch) stays happy and work can continue here.
-          if (r.newBranch && s.data.worktree) s.data.worktree.branch = r.newBranch;
-          this.refreshGit(s); // refresh dirty/ahead and pick up the new current branch (the follow-up)
-          if (s.data.git) {
-            // Show the merged badge scoped to the current branch (the follow-up after a rollover) so
-            // it clears once new work starts — a dirty tree, or another branch switch. See prBadgeFor.
-            const badge = prBadgeFor("merged", s.data.git.prUrl, s.data.git.branch, s.data.git.dirtyFileCount);
-            applyPrBadge(s.data.git, badge);
-          }
-          this.persist();
-          this.broadcastUpdated(s.data);
-        }
-        break;
-      }
-    }
-    return { v: PROTOCOL_VERSION, type: "git.result", ts: now(), sessionId: cmd.sessionId, op: cmd.op, ok, output, url };
+    return this.gitProjection.gitOp(cmd);
   }
-  private refreshGit(s: Session): void {
-    const g = gitStatus(s.data.cwd);
-    if (g) {
-      // gitStatus() is local-only; carry the PR badge learned from gh across refreshes — but it
-      // clears once work moves to a new branch, or (for a merged PR) once the tree is dirty again.
-      Object.assign(g, carryPrBadge(s.data.git, g));
-      const changed = JSON.stringify(s.data.git) !== JSON.stringify(g);
-      s.data.git = g;
-      if (changed) {
-        this.persist();
-        this.broadcastUpdated(s.data);
-      }
-    }
+  refreshPrState(id: string): Promise<void> {
+    return this.gitProjection.refreshPrState(id);
   }
-  /** Best-effort, non-blocking PR-state refresh (network via gh), called on attach so a PR merged
-   *  outside the app surfaces its badge without opening the git panel. Skips sessions already known
-   *  merged (terminal) or without a branch, so the common case costs nothing. */
-  async refreshPrState(id: string): Promise<void> {
-    const s = this.sessions.get(id);
-    if (!s) return;
-    this.refreshGit(s); // local: pick up a branch switch / new changes and clear a stale badge first
-    const g = s.data.git;
-    // Skip the gh probe for sessions with no branch or already terminal-merged (shared with the sweep).
-    if (!g || !isPrSweepEligible(g, s.data.worktree?.branch)) return;
-    const pr = await git.prStatusAsync(s.data.cwd);
-    const cur = this.sessions.get(id); // may have changed/closed during the await
-    if (!cur?.data.git) return;
-    const badge = prBadgeFor(pr.state, pr.url, cur.data.git.branch, cur.data.git.dirtyFileCount);
-    if (!applyPrBadge(cur.data.git, badge)) return; // nothing changed → no persist/broadcast
-    this.persist();
-    this.broadcastUpdated(cur.data);
-  }
-
-  private prSweepRunning = false; // a sweep is in flight — don't stack `gh` storms
-  private lastPrSweepAt = 0; // throttle: at most one sweep per PR_SWEEP_THROTTLE_MS
-  /** Refresh PR badges for EVERY eligible session, not just the one a client has open. The per-session
-   *  attach refresh (`refreshPrState`) only covers the session you click into, so a PR merged on
-   *  GitHub, from another device, or in another session left the rest of the sidebar's merge badges
-   *  frozen at their last-known state. This reconciles the whole list. Bounded concurrency keeps us
-   *  from spawning a `gh` per session at once on the single-threaded daemon; `refreshPrState` already
-   *  skips terminal-merged and branchless sessions cheaply (no network). */
-  async refreshAllPrStates(force = false): Promise<void> {
-    if (this.prSweepRunning) return;
-    const t = Date.now();
-    if (!force && t - this.lastPrSweepAt < 30_000) return; // coalesce bursts (e.g. many clients reconnecting)
-    this.prSweepRunning = true;
-    this.lastPrSweepAt = t;
-    try {
-      // Only sessions that could have a live PR worth a network probe: on a branch, and not already
-      // terminal-merged on that same branch. Mirrors refreshPrState's own guards to avoid the work.
-      const ids = [...this.sessions.values()]
-        .filter((s) => isPrSweepEligible(s.data.git, s.data.worktree?.branch))
-        .map((s) => s.id);
-      const LIMIT = 4;
-      for (let i = 0; i < ids.length; i += LIMIT) {
-        await Promise.all(ids.slice(i, i + LIMIT).map((id) => this.refreshPrState(id).catch(() => {})));
-      }
-    } finally {
-      this.prSweepRunning = false;
-    }
+  refreshAllPrStates(force = false): Promise<void> {
+    return this.gitProjection.refreshAllPrStates(force);
   }
 
   /** Archive: stop the agent + terminal/watchers, keep the worktree/branch/history. */
@@ -2662,16 +1208,28 @@ export class Supervisor {
       return { cwd: s.data.cwd, emit: (body) => s.emit(body) };
     },
     (sessionId) => this.shellEnv(this.sessions.get(sessionId)),
+    (sessionId, terminals) => {
+      // The roster rides the Session (additive `terminals`, design 2026-08-08) so every device's
+      // chip strip stays live. Runtime-only: restore() clears it — PTYs die with the process.
+      const s = this.sessions.get(sessionId);
+      if (!s) return; // roster change raced a session kill
+      s.data.terminals = terminals.length ? terminals : undefined;
+      this.broadcastUpdated(s.data);
+    },
   );
 
-  terminalOpen(sessionId: string, cols: number, rows: number): void {
-    this.terminalMgr.open(sessionId, cols, rows);
+  terminalOpen(sessionId: string, cols: number, rows: number, termId?: string): void {
+    this.terminalMgr.open(sessionId, cols, rows, termId);
   }
-  terminalInput(sessionId: string, dataBase64: string): void {
-    this.terminalMgr.input(sessionId, dataBase64);
+  terminalInput(sessionId: string, dataBase64: string, termId?: string): void {
+    this.terminalMgr.input(sessionId, dataBase64, termId);
   }
-  terminalResize(sessionId: string, cols: number, rows: number): void {
-    this.terminalMgr.resize(sessionId, cols, rows);
+  terminalResize(sessionId: string, cols: number, rows: number, termId?: string): void {
+    this.terminalMgr.resize(sessionId, cols, rows, termId);
+  }
+  /** Kill one PTY (chip ×) — the client's respawn escape hatch for a wedged shell. */
+  terminalClose(sessionId: string, termId?: string): void {
+    this.terminalMgr.closeOne(sessionId, termId);
   }
 
   // Attachments (arch §6.5) — uploaded via REST, fed to the agent as image blocks.
@@ -2684,8 +1242,11 @@ export class Supervisor {
   }
 
   /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
-  prompt(id: string, text: string, attachmentIds: string[] = []): void {
+  prompt(id: string, text: string, attachmentIds: string[] = [], cid?: string): void {
     const s = this.require(id);
+    // Exactly-once (v4, spec A5): a re-flushed offline send carries the same cid. If we've already
+    // applied it, record nothing new and don't run the turn again — the dispatcher re-acks it.
+    if (cid && s.isPromptApplied(cid)) return;
     // Degraded machine (no usable Claude token): stop here with the explicit §4.3 message instead of
     // letting `buildAgentEnv` throw out through the dispatcher as an opaque command error. The user's
     // text is deliberately NOT echoed — nothing consumed it, so a bubble with no reply would be a lie.
@@ -2700,11 +1261,17 @@ export class Supervisor {
 
     // Built-in context controls are handled by the daemon, not passed through as prose (§context). They
     // must be the WHOLE message (matching Claude Code's slash-command rule) and carry no attachments.
+    // These daemon-handled commands apply a real side effect (new topic / compact / goal change) but
+    // emit no `message.user`, so they early-return before the record below. Record the cid HERE so a
+    // re-flushed offline copy is deduped and the side effect doesn't run twice (v4 exactly-once, A5).
+    // (The degraded branch above deliberately does NOT record — nothing was applied, so a re-flush once
+    // the token is fixed SHOULD run.)
     const trimmed = text.trim();
     if (trimmed === "/clear") {
       // Same effect as the "New topic" action: null the resume id, reset the context meter, drop a
       // divider. SDK-native /clear would do none of that (the daemon would still resume the old topic
       // on restart), so we route to newTopic instead of forwarding the command.
+      if (cid) s.recordPromptCid(cid);
       void this.newTopic(id);
       return;
     }
@@ -2712,6 +1279,7 @@ export class Supervisor {
       // Forward to the SDK so it actually summarizes the context. We suppress the user-echo (the
       // compact_boundary divider the driver emits is the visible marker) and let the refreshed context
       // meter ride the turn's result. Any `/compact <instructions>` guidance passes through verbatim.
+      if (cid) s.recordPromptCid(cid);
       this.ensureDriver(id).prompt(text);
       return;
     }
@@ -2720,6 +1288,7 @@ export class Supervisor {
     // session's goal without consuming a turn; the Stop hook registered in the driver enforces it.
     const goalCmd = parseGoalCommand(text);
     if (goalCmd) {
+      if (cid) s.recordPromptCid(cid);
       this.handleGoalCommand(s, goalCmd);
       return;
     }
@@ -2747,8 +1316,11 @@ export class Supervisor {
     // from what the user actually asked for (arch §8) — the local slug alone is too terse.
     if (!s.data.worktree?.remoteBranch && text.trim()) s.openingPrompt ??= text.trim();
 
-    // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4)
-    s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments });
+    // record the user's prompt so history/snapshot includes it and all devices agree (arch §6.4).
+    // Persist the cid (v4) so a re-flushed offline send is deduped even across a daemon restart, and so
+    // the client can retire its optimistic bubble instead of double-rendering (spec A5/A6).
+    if (cid) s.recordPromptCid(cid);
+    s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments, ...(cid ? { cid } : {}) });
     this.ensureDriver(id).prompt(text, inline);
   }
 
@@ -2778,11 +1350,11 @@ export class Supervisor {
         isDefault
           ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
           : isLead
-            ? { [TEAM_MCP_SERVER_NAME]: this.buildTeamServer(id) }
+            ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
             : isMember
-              ? { [MEMBER_MCP_SERVER_NAME]: this.buildMemberServer(id) }
+              ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
               : isPlanner
-                ? { [PLANNING_MCP_SERVER_NAME]: this.buildPlanningServer(id) }
+                ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
                 : undefined,
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
@@ -2975,10 +1547,7 @@ export class Supervisor {
     // are unreachable by team tools. Drop the lead's orchestration state FIRST so the cascade kills
     // can't re-spawn queued members off a dying lead (#8: clears activeTeamPlans/queue too).
     if (isLead) {
-      this.queuedMembers.delete(id);
-      this.pendingTeamPlans.delete(id);
-      this.activeTeamPlans.delete(id);
-      this.teamRelayHops.delete(id);
+      this.teams.onLeadKilled(id);
       for (const m of this.list().filter((x) => x.parentId === id)) {
         await this.kill(m.id).catch((e) => console.error(`[teams] cascade teardown failed for member ${m.id}:`, e));
       }
@@ -2987,12 +1556,16 @@ export class Supervisor {
     this.clearNotifications(id); // dismiss any lingering "your turn" reminder for the gone session
     this.sessions.delete(id);
     this.logs.delete(id);
+    // [BE2-24] These per-session Sets were never cleaned on kill — they'd retain a dead session id for
+    // the daemon's lifetime (a slow leak keyed by every session ever killed).
+    this.awaitingAnnounced.delete(id);
+    this.goalPushSuppressed.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
-    this.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
+    this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
     // Teams (#5): a killed member frees a concurrency slot — start a queued member (no-op if the lead
     // is also being torn down, since its queue was cleared above).
-    if (parentId && !isLead) this.drainQueuedMembers(parentId);
+    if (parentId && !isLead) void this.teams.drainQueuedMembers(parentId);
     this.trackTeardown(this.teardownSession(id, s));
   }
 
@@ -3018,7 +1591,9 @@ export class Supervisor {
       this.terminalMgr.kill(id);
       await s.stop(); // reap any attached process group (PTY in Phase 3)
       if (s.data.source === "fresh-worktree" && s.data.worktree) {
-        git.deleteRemoteBranch(s.data.cwd, s.data.worktree.branch); // best-effort, before the worktree goes
+        // [BE2-4] Async so this background teardown never freezes the event loop on the network
+        // `git push --delete` (removeWorktree below is local/bounded). Best-effort, before the worktree goes.
+        await git.deleteRemoteBranchAsync(s.data.cwd, s.data.worktree.branch);
         removeWorktree(s.data.worktree.repoRoot, s.data.cwd, s.data.worktree.branch);
       }
       rmSync(this.store.sessionDir(id), { recursive: true, force: true });
@@ -3059,11 +1634,11 @@ export class Supervisor {
     if (s.data.source === "fresh-worktree" && s.data.worktree) {
       const { repoRoot, branch, base } = s.data.worktree;
       if (worktreeHealth(s.data.cwd, branch) !== "ok") {
-        const r = recreateWorktree(repoRoot, s.data.cwd, branch, base);
+        const r = await recreateWorktree(repoRoot, s.data.cwd, branch, base);
         recovered = r.ok ? `restored worktree from \`${branch}\`` : `worktree could not be restored (${r.error})`;
       }
     }
-    const g = gitStatus(s.data.cwd);
+    const g = await gitStatusAsync(s.data.cwd);
     if (g) s.data.git = g;
     s.data.status = "idle";
     s.data.lastActivityAt = now();
@@ -3174,8 +1749,7 @@ export class Supervisor {
     this.broadcastLoops(); // a goal resolving removes its loop row
     // The card's display-only goalCondition mirrors the session goal — clear it so a unit that later
     // returns to the grid (review/blocked) doesn't advertise a stop-condition that already resolved.
-    const unit = this.workUnits.list().find((u) => u.sessionId === id && u.goalCondition);
-    if (unit) this.workUnits.update(unit.id, { goalCondition: undefined });
+    this.autopilot.clearGoalCondition(id);
     // This push IS the turn's notification — swallow the ordinary "your turn" that the `result`
     // arriving moments later would otherwise fire (the goal is already cleared by then).
     this.goalPushSuppressed.add(id);
@@ -3228,12 +1802,12 @@ export class Supervisor {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
-  private wrap(data: SessionData, lastSeq: number): Session {
+  private wrap(data: SessionData, lastSeq: number, epoch: string = newId("ep")): Session {
     const dir = this.store.sessionDir(data.id);
     ensureDir(dir, { recursive: true });
     const log = new EventLog(dir);
     this.logs.set(data.id, log);
-    return new Session(
+    const session = new Session(
       data,
       lastSeq,
       (sessionId, event) => {
@@ -3244,7 +1818,12 @@ export class Supervisor {
       },
       () => this.persistSoon(), // [BE-1] high-frequency emit path is debounced; lifecycle ops flush now
       (event) => log.append(event),
+      epoch,
     );
+    // Seed exactly-once dedupe from the durable log so a re-flushed offline send is recognised as a
+    // duplicate even across the daemon restart that dropped the in-memory set (v4, spec A5).
+    for (const cid of log.promptCids()) session.recordPromptCid(cid);
+    return session;
   }
 
   /**
@@ -3322,12 +1901,14 @@ export class Supervisor {
     this.authDegrade.recordTurnSuccess();
     // The agent may have committed, switched/created a branch, or left new changes this turn —
     // refresh git so the worktree panel and session-list badge stay current without a manual
-    // "status" press. Local-only and a no-op (no broadcast) when nothing changed.
+    // "status" press. Local-only and a no-op (no broadcast) when nothing changed. [BE2-5] Async +
+    // per-session coalescing: a burst of turns collapses into at most one subprocess batch per
+    // window instead of 4-5 sync spawns blocking the event loop after every turn.
     const s = this.sessions.get(sessionId);
-    if (s) this.refreshGit(s);
+    if (s) this.gitProjection.scheduleRefreshGit(sessionId);
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
-    if (s?.data.parentId) this.drainQueuedMembers(s.data.parentId, sessionId);
+    if (s?.data.parentId) void this.teams.drainQueuedMembers(s.data.parentId, sessionId);
     // Refresh the live context-window meter from this turn's reading (§context). Broadcast so every
     // device's composer gauge updates; skip the push when the SDK didn't report (keep the last value).
     if (s && usage.contextUsage) {
@@ -3350,33 +1931,52 @@ export class Supervisor {
     }
   }
 
+  /** [BE2-2] Settles when every restore-time worktree recovery (background, async git) has finished.
+   *  Restore itself no longer blocks on git — this is the deterministic hook for tests/shutdown. */
+  worktreeRecoveriesSettled: Promise<void> = Promise.resolve();
+
   private restore(): void {
     const transient: SessionData["status"][] = ["thinking", "running_tool", "awaiting_permission", "awaiting_question"];
-    let recovered = 0;
     let quarantined = 0;
+    const recoveries: Promise<unknown>[] = [];
     for (const p of this.store.loadAll()) {
       try {
         // a daemon restart/crash means no live agent process; a session caught mid-turn had its
         // turn interrupted — reset to idle and leave a visible notice so it isn't silently lost.
         const interrupted = transient.includes(p.data.status);
         if (interrupted) p.data.status = "idle";
+        p.data.terminals = undefined; // terminal roster is runtime state — the PTYs died with the old process
         // A restored goal is re-armed PAUSED (design D5): a self-update must never resume an
         // unattended loop. The next user prompt un-pauses it (see prompt()).
         if (p.data.goal) p.data.goal.paused = true;
-        const session = this.wrap(p.data, p.lastSeq);
+        // Reuse the persisted epoch so a client's cached transcript stays delta-resumable across a
+        // daemon restart; a pre-v4 row has none → wrap mints one (forces one harmless full snapshot).
+        const session = this.wrap(p.data, p.lastSeq, p.epoch);
         this.sessions.set(p.data.id, session);
 
-        const notice = this.recoverWorktreeOnRestore(p.data); // returns a notice if anything happened
-        if (notice?.recovered) recovered++;
         if (interrupted) {
           session.emit({
             type: "assistant.message",
             blocks: [{ kind: "markdown", rendered: this.renderer.render("⚠️ _The previous turn was interrupted by a daemon restart. Re-send your message to continue._") }],
           });
         }
-        if (notice) {
-          session.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(notice.message) }] });
-        }
+        // [BE2-2] Worktree recovery shells out to (now async) git — fire-and-forget so one repo with a
+        // wedged/slow git can't stall the whole restore (and thereby daemon startup). The recovery
+        // notice lands in the conversation when it completes; the healed git state is persisted +
+        // broadcast then (clients may already be connected by that point).
+        recoveries.push(
+          this.recoverWorktreeOnRestore(p.data)
+            .then((notice) => {
+              if (!notice) return;
+              if (notice.recovered) {
+                console.log(`[restore] recovered worktree for session ${p.data.id}`);
+                this.persist();
+                this.broadcastUpdated(p.data);
+              }
+              session.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(notice.message) }] });
+            })
+            .catch((e) => console.error(`[restore] worktree recovery failed for ${p.data.id}: ${e instanceof Error ? e.message : e}`)),
+        );
       } catch (e) {
         // One unloadable session must not crash the daemon (no startup crash-loop). Skip it; its
         // state stays on disk for inspection and the rest of the fleet loads normally.
@@ -3384,6 +1984,7 @@ export class Supervisor {
         console.error(`[restore] quarantined session ${p?.data?.id ?? "<unknown>"}: ${e instanceof Error ? e.message : e}`);
       }
     }
+    this.worktreeRecoveriesSettled = Promise.allSettled(recoveries).then(() => {});
     this.reconcileSessionAccounts(); // §5.4: an account removed while this daemon was down
     this.persist(); // reconcile disk == memory after status resets / recovery (fixes drift)
     this.ensureDefaultSession(); // the concierge chat always exists (reused if persisted, else created)
@@ -3393,27 +1994,11 @@ export class Supervisor {
     const orphanDirs = this.store.listSessionDirs().filter((d) => !known.has(d));
     console.log(
       `[restore] ${this.sessions.size} session(s) loaded` +
-        ` · ${recovered} worktree(s) recovered · ${quarantined} quarantined` +
+        ` · ${quarantined} quarantined` +
         (orphanDirs.length ? ` · ${orphanDirs.length} orphan state dir(s)` : ""),
-    );
+    ); // worktree recoveries log individually when their (async) git ops complete
   }
 
-  /**
-   * Run ONE environment's planning pass, isolated. The scheduled run used to have a `finally` but no
-   * `catch`, so a single failing environment — most easily one left pointing at a removed Claude
-   * account — aborted the whole nightly run, silently taking every environment after it with no
-   * report. An unattended run must degrade per-environment, not all-or-nothing.
-   */
-  private async runEnvPlan<T>(emit: (line: string) => void, envName: string, run: () => Promise<T>): Promise<T | undefined> {
-    try {
-      return await run();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      emit(`  ⚠ ${envName} failed: ${msg} — continuing with the remaining environments.`);
-      console.warn(`[autopilot] environment ${envName} failed: ${msg}`);
-      return undefined;
-    }
-  }
 
   /**
    * §5.4, boot half: `accountRemove()` falls live sessions back the moment an account goes, but an
@@ -3444,7 +2029,7 @@ export class Supervisor {
    * alone (it may hold uncommitted work) but flagged for the user to Reset. Returns a notice to
    * surface in the conversation, or undefined if the worktree was already healthy.
    */
-  private recoverWorktreeOnRestore(data: SessionData): { message: string; recovered: boolean } | undefined {
+  private async recoverWorktreeOnRestore(data: SessionData): Promise<{ message: string; recovered: boolean } | undefined> {
     if (data.source !== "fresh-worktree" || !data.worktree) return undefined;
     const { repoRoot, branch, base } = data.worktree;
     const health = worktreeHealth(data.cwd, branch);
@@ -3452,9 +2037,9 @@ export class Supervisor {
     if (health === "wrong-branch") {
       return { message: `⚠️ _This worktree is checked out on the wrong branch (expected \`${branch}\`). Use **Reset** to restore it._`, recovered: false };
     }
-    const r = recreateWorktree(repoRoot, data.cwd, branch, base);
+    const r = await recreateWorktree(repoRoot, data.cwd, branch, base);
     if (r.ok) {
-      data.git = gitStatus(data.cwd);
+      data.git = await gitStatusAsync(data.cwd);
       return { message: `🔧 _Worktree was ${health} after a restart and has been restored from branch \`${branch}\`._`, recovered: true };
     }
     return { message: `⚠️ _This session's worktree was ${health} and could not be auto-restored (${r.error}). Use **Reset** to retry._`, recovered: false };
@@ -3497,7 +2082,7 @@ export class Supervisor {
       this.persistTimer = undefined;
     }
     this.persistDirty = false;
-    this.store.saveAll([...this.sessions.values()].map((s) => ({ data: s.data, lastSeq: s.lastSeq })));
+    this.store.saveAll([...this.sessions.values()].map((s) => ({ data: s.data, lastSeq: s.lastSeq, epoch: s.epoch })));
   }
 
   /** Debounced flush for the high-frequency emit path. */
@@ -3526,19 +2111,24 @@ export class Supervisor {
 
   private broadcastUpdated(data: SessionData): void {
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.updated", ts: now(), session: data });
-    // Teams are derived from the session list, so any session change can shift a team's rollup.
-    this.broadcastTeamInfo();
+    // [BE2-21] A team's derived rollup can only shift when the changed session is part of a team. For a
+    // plain session, skip the team-tree re-derive/broadcast entirely; for a team session, coalesce it.
+    if (data.teamRole || data.parentId) this.teams.scheduleTeamInfoBroadcast();
   }
 }
 
-function slugify(s: string): string {
-  return (
-    s
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 32) || "session"
-  );
+/** [BE2-23/SEC2-4] Validate a client-supplied telemetry counters object: a plain object with ≤32 keys
+ *  mapping short string names to FINITE numbers. Non-finite/non-number values are dropped; a non-object
+ *  or an over-large map returns null (the whole report is ignored). Never trust the wire shape. */
+function sanitizeCounters(counters: unknown): Record<string, number> | null {
+  if (!counters || typeof counters !== "object" || Array.isArray(counters)) return null;
+  const entries = Object.entries(counters as Record<string, unknown>);
+  if (entries.length > 32) return null; // a client flooding keys is a DoS vector, not a real report
+  const clean: Record<string, number> = {};
+  for (const [k, v] of entries) {
+    if (typeof k === "string" && k.length <= 64 && typeof v === "number" && Number.isFinite(v)) clean[k] = v;
+  }
+  return clean;
 }
 function deriveTitle(cwd: string): string {
   return cwd.split("/").filter(Boolean).pop() ?? "session";

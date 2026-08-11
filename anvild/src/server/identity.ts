@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import type { ServerHelloEvent } from "@protocol";
-import { PROTOCOL_VERSION } from "@protocol";
+import { PROTOCOL_VERSION, UPDATE_API_VERSION } from "@protocol";
 import { now } from "../util/envelope";
 import { newId } from "../util/ids";
 import { VERSION } from "../version";
@@ -92,6 +92,10 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   "pairing",
   "model-labels",
   "accounts",
+  // The frozen update API v1 (/api/update/v1/*) + hub-orchestrated fleet rollout. A hub reads this (or
+  // the `updateApiVersion` field) to drive a member through the stable path vs the legacy daemon.update
+  // (stable-update-service spec §4.3).
+  "stable-update",
 ];
 
 /** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */
@@ -115,6 +119,7 @@ export function serverHelloEvent(id: ServerIdentity, pos: FleetPosition = { pair
     serverName: id.serverName,
     version: VERSION,
     protocolVersion: PROTOCOL_VERSION,
+    updateApiVersion: UPDATE_API_VERSION,
     capabilities: [...SERVER_CAPABILITIES],
     role,
     ...(pos.pairedHubId ? { hubServerId: pos.pairedHubId } : {}),

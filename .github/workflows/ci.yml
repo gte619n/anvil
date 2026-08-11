@@ -5,6 +5,14 @@ name: CI
 # The full-release workflow (release.yml) ships every client surface AFTER merge to `main`, so without
 # this gate a broken build would auto-ship to Firebase/TestFlight/Sparkle. Keep this job fast and
 # green; release.yml `needs:` an equivalent `verify` step so nothing untested ships.
+#
+# [CI2-1] Native shells are ALSO gated here, path-filtered so daemon-only PRs stay fast. History:
+# Android had never built in CI, so the AGP 9 dependabot bump (#109) sailed through the daemon-only
+# gate and broke the RELEASE; with these jobs such a bump goes red at PR time. Each job mirrors the
+# secrets-free part of its release.yml counterpart:
+#   • android    — `:app:assembleDebug` (committed debug keystore; no Firebase upload)
+#   • apple      — `swift build` of the macOS shell (exactly what make-app.sh compiles) + xcodegen
+#                  project lint + an unsigned `xcodebuild build` of the iOS target
 on:
   pull_request:
   push:
@@ -52,3 +60,162 @@ jobs:
 
       - name: Test
         run: bun test
+
+  # [CI2-1] Per-job path filtering. `on.paths` filters the whole workflow, so per-surface gating needs
+  # a filter job the native jobs key off. Root gradle files are part of the android filter because
+  # that's exactly where the AGP-9 bump (#109) landed — a dependabot bump to the root `build.gradle`
+  # must trigger the Android build, or this gate re-misses the regression it exists to catch.
+  changes:
+    name: native path filter
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      android: ${{ steps.filter.outputs.android }}
+      apple: ${{ steps.filter.outputs.apple }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            android:
+              - 'app/**'
+              - 'build.gradle'
+              - 'settings.gradle'
+              - 'gradle.properties'
+              - 'gradle/**'
+              - 'gradlew'
+              - 'gradlew.bat'
+              - '.github/workflows/ci.yml'
+            apple:
+              - 'apple/**'
+              - '.github/workflows/ci.yml'
+
+  # [CI2-1] Secrets-free Android PR build — mirrors release.yml's android job (same JDK/SDK/Bun/gradle
+  # setup) minus the Firebase service account, release notes, and upload. `assembleDebug` signs with
+  # the COMMITTED debug keystore (app/anvil-debug.keystore, fixed "android" password — deliberately
+  # checked in, see app/build.gradle), so no secret is needed. The gradle `bundleWebAssets` task runs
+  # `bun run build:web` via a login shell before the APK is assembled, hence the Bun setup + symlink.
+  android:
+    name: android — assembleDebug
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.3.14 }
+
+      # gradle bundleWebAssets runs `bun` via a login shell (`bash -lc`) whose PATH may miss Bun's
+      # install dir; symlink it onto a dir that's always on PATH. (Same trick as release.yml.)
+      - name: Make Bun available to login shells
+        run: sudo ln -sf "$(which bun)" /usr/local/bin/bun
+
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build debug APK (no upload)
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      # Seed unit-test target (plain-JVM JUnit, app/src/test — starts with GuessMimeTest). Separate
+      # step so a test failure is distinguishable from a build failure at a glance.
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+  # [CI2-1] Secrets-free Apple PR build. NB the macOS client is NOT an xcodebuild product: release.yml's
+  # make-app.sh compiles it with plain `swift build` (SwiftPM) and only assembles/signs the .app after —
+  # so `swift build` here IS the release compile, minus signing/notarization/Sparkle packaging. The web
+  # bundle must be generated first: apple/Package.swift declares `.copy("web")`, so a missing
+  # Sources/Anvil/web fails the build. The iOS target ships via xcodegen + `xcodebuild archive`
+  # (make-ios.sh); the cheapest signal without signing secrets is `xcodegen generate` as a project lint
+  # plus an unsigned `xcodebuild build` of the same scheme — that catches iOS-only compile breaks
+  # (#if os(iOS) code) the macOS swift build can't see.
+  apple:
+    name: apple — swift build (macOS) + unsigned xcodebuild (iOS)
+    needs: changes
+    if: needs.changes.outputs.apple == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: |
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)"
+          sudo xcode-select -s "${latest:-/Applications/Xcode.app}"
+          xcodebuild -version
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.3.14 }
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Install web client deps (anvild)
+        working-directory: anvild
+        run: bun install --frozen-lockfile
+
+      - name: Bundle web client into the shell (required by Package.swift resources)
+        working-directory: anvild
+        run: |
+          bun run build:web
+          bun run web/bundle-native.ts "$GITHUB_WORKSPACE/apple/Sources/Anvil/web"
+
+      - name: Build macOS shell (the exact compile make-app.sh runs)
+        working-directory: apple
+        run: swift build -c release
+
+      # Seed unit-test target (XCTest, apple/Tests — starts with DeepLinkTests). Needs the full-Xcode
+      # toolchain this runner selects above (XCTest isn't in the bare Command Line Tools); plain
+      # `swift build` (what make-app.sh runs) never builds test targets, so make-app.sh on a
+      # CLT-only host is unaffected by the target existing.
+      - name: Unit tests (swift test)
+        working-directory: apple
+        run: swift test
+
+      - name: Generate Xcode project (xcodegen lint)
+        working-directory: apple
+        run: xcodegen generate
+
+      - name: Build iOS target (unsigned)
+        working-directory: apple
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Anvil.xcodeproj -scheme Anvil-iOS -configuration Release \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+  workflow-lint:
+    name: workflow lint — pinned Bun everywhere
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # [CI2-6] The gate pins Bun, but the ship jobs in release.yml used an unpinned `latest`, so the
+      # web bundle that actually SHIPS was built by an unvalidated Bun. Fail if any workflow uses an
+      # unpinned Bun, so the shipped artifact is always built by the same interpreter the gate validated.
+      # NB: neither this comment nor the error message below may spell out the grepped literal — the
+      # grep matched its own step's text and failed every run until PR #175 reworded them.
+      - name: No unpinned bun-version in any workflow
+        run: |
+          if grep -rn "bun-version:[[:space:]]*latest" .github/workflows/; then
+            echo "::error::unpinned bun-version found — pin it to the engines floor (1.3.14)"
+            exit 1
+          fi
+          echo "all workflows pin bun-version"

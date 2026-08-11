@@ -1,0 +1,88 @@
+name: Apple signing setup
+# [CI2-4] The one copy of the keychain/cert/API-key setup, shared across the signing jobs in
+# release.yml (ios, mac-client). Imports a .p12 signing certificate into an ephemeral
+# keychain, optionally resolves a signing identity from it, and writes the App Store Connect API
+# key to $RUNNER_TEMP/private_keys/AuthKey.p8. Exports via GITHUB_ENV:
+#   SIGNING_KEYCHAIN — path of the ephemeral keychain (consumed by the job's cleanup step)
+#   SIGN_ID          — only when identity-pattern is set (the make-app.sh signing identity)
+#
+# NB composite actions cannot register `post:` cleanup, so every consuming job keeps its own
+# `if: always()` "Clean up keychain" step that deletes $SIGNING_KEYCHAIN and
+# $RUNNER_TEMP/private_keys. Keep those steps when adding a new consumer.
+description: >-
+  Import an Apple signing certificate into an ephemeral keychain and write the App Store Connect
+  API key. Exports SIGNING_KEYCHAIN (and SIGN_ID when identity-pattern is set).
+
+inputs:
+  p12-base64:
+    description: Base64-encoded .p12 signing certificate (pass the secret)
+    required: true
+  p12-password:
+    description: Password for the .p12 (pass the secret)
+    required: true
+  p12-secret-name:
+    description: Name of the repo secret backing p12-base64 — used in the "not set" error message
+    required: true
+  keychain-file:
+    description: Filename of the ephemeral keychain created under $RUNNER_TEMP
+    required: true
+  trust-xcodebuild:
+    description: Also trust /usr/bin/xcodebuild on the imported key (iOS signing needs it; macOS Developer ID does not)
+    required: false
+    default: 'false'
+  identity-pattern:
+    description: >-
+      When non-empty (e.g. "Developer ID Application"), resolve the first matching codesigning
+      identity from the imported cert and export it as SIGN_ID; fail if none matches.
+    required: false
+    default: ''
+  api-key-base64:
+    description: Base64-encoded App Store Connect API key (.p8), written to $RUNNER_TEMP/private_keys/AuthKey.p8
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Import signing certificate into an ephemeral keychain
+      shell: bash
+      env:
+        P12_BASE64: ${{ inputs.p12-base64 }}
+        P12_PASSWORD: ${{ inputs.p12-password }}
+        P12_SECRET_NAME: ${{ inputs.p12-secret-name }}
+        KEYCHAIN_FILE: ${{ inputs.keychain-file }}
+        TRUST_XCODEBUILD: ${{ inputs.trust-xcodebuild }}
+        IDENTITY_PATTERN: ${{ inputs.identity-pattern }}
+      run: |
+        set -euo pipefail
+        [ -n "$P12_BASE64" ] || { echo "::error::$P12_SECRET_NAME secret is not set — add it in repo Settings → Secrets → Actions."; exit 1; }
+        KC="$RUNNER_TEMP/$KEYCHAIN_FILE"
+        KC_PASS="$(openssl rand -base64 24)"
+        security create-keychain -p "$KC_PASS" "$KC"
+        security set-keychain-settings -lut 21600 "$KC"
+        security unlock-keychain -p "$KC_PASS" "$KC"
+        echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing-cert.p12"
+        if [ "$TRUST_XCODEBUILD" = "true" ]; then
+          security import "$RUNNER_TEMP/signing-cert.p12" -k "$KC" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/xcodebuild
+        else
+          security import "$RUNNER_TEMP/signing-cert.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+        fi
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+        security list-keychains -d user -s "$KC" login.keychain-db
+        rm -f "$RUNNER_TEMP/signing-cert.p12"
+        if [ -n "$IDENTITY_PATTERN" ]; then
+          SIGN_ID="$(security find-identity -v -p codesigning "$KC" | grep "$IDENTITY_PATTERN" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$SIGN_ID" ] || { echo "::error::no '$IDENTITY_PATTERN' identity in the imported cert"; exit 1; }
+          echo "SIGN_ID=$SIGN_ID" >> "$GITHUB_ENV"
+        fi
+        echo "SIGNING_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+    - name: Write App Store Connect API key
+      shell: bash
+      env:
+        API_KEY_BASE64: ${{ inputs.api-key-base64 }}
+      run: |
+        set -euo pipefail
+        [ -n "$API_KEY_BASE64" ] || { echo "::error::APPLE_API_KEY_BASE64 secret not set"; exit 1; }
+        mkdir -p "$RUNNER_TEMP/private_keys"
+        echo "$API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/private_keys/AuthKey.p8"

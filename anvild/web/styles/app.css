@@ -418,6 +418,27 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .queued-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--muted); margin-top: 4px; }
 .queued-badge .msym { font-size: 13px; }
 
+/* Skeleton-first conversation load: structural shimmer shown while the resume watermark verifies the
+   cached transcript (incremental-offline-resilience.md D3/D4). Never persisted. */
+.convo-skeleton { display: flex; flex-direction: column; gap: 12px; padding: 8px 0; width: 100%; }
+.skel-bubble { height: 44px; border-radius: 14px; max-width: min(760px, 82%);
+  background: linear-gradient(100deg, color-mix(in srgb, var(--muted) 12%, transparent) 30%, color-mix(in srgb, var(--muted) 22%, transparent) 50%, color-mix(in srgb, var(--muted) 12%, transparent) 70%);
+  background-size: 200% 100%; animation: skel-shimmer 1.3s infinite linear; }
+.skel-bubble.user { align-self: flex-end; width: 44%; }
+.skel-bubble.asst { align-self: flex-start; width: 66%; }
+.skel-bubble.asst.wide { width: 80%; height: 72px; }
+@keyframes skel-shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .skel-bubble { animation: none; } }
+
+/* Resilience diagnostics panel (#diag or Ctrl/Cmd+Shift+D) — §5.7 telemetry readout. */
+#diag-panel { position: fixed; right: 12px; bottom: 12px; z-index: 9999; max-width: 460px; background: var(--panel, var(--bg)); color: var(--fg); border: 1px solid var(--border, var(--muted)); border-radius: 10px; padding: 10px 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.28); font-size: 12px; }
+#diag-panel .diag-head { display: flex; align-items: center; justify-content: space-between; font-weight: 600; margin-bottom: 6px; }
+#diag-panel .diag-cols { display: flex; gap: 18px; }
+#diag-panel h4 { margin: 0 0 4px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+#diag-panel table { border-collapse: collapse; }
+#diag-panel td { padding: 1px 8px 1px 0; font-variant-numeric: tabular-nums; }
+#diag-panel td:last-child { text-align: right; }
+
 #conversation { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
 /* Chat text is selectable/copyable — on Android this is what surfaces the selection handles. */
 #conversation, #conversation * { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
@@ -602,7 +623,7 @@ details.tool-result.error > summary { color: var(--danger); }
 #send[hidden], #stop[hidden] { display: none; }
 
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 16px; animation: modal-fade 0.15s ease; }
-.modal-box { background: var(--bg); border: 1px solid var(--border); padding: 20px; border-radius: 14px; min-width: min(360px, 100%); width: min(560px, 100%); box-shadow: 0 16px 48px rgba(0, 0, 0, 0.28); animation: modal-pop 0.18s cubic-bezier(0.2, 0.8, 0.3, 1.05); }
+.modal-box { background: var(--bg); border: 1px solid var(--border); padding: 20px; border-radius: 14px; min-width: min(360px, 100%); width: min(560px, 100%); max-height: calc(100dvh - 32px); overflow-y: auto; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.28); animation: modal-pop 0.18s cubic-bezier(0.2, 0.8, 0.3, 1.05); }
 .modal-box h3 { margin-top: 0; }
 @keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes modal-pop { from { opacity: 0; transform: translateY(10px) scale(0.97); } to { opacity: 1; transform: none; } }
@@ -1020,6 +1041,14 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
   #sidebar:not(.collapsed) { position: absolute; z-index: 10; height: 100%; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.25); }
   /* panes are full-bleed / overlaid on a phone — no room to drag-resize */
   .resizer { display: none; }
+  #panel-pin { display: none; } /* pin is desktop-only — phone keeps overlay + dismiss untouched */
+}
+
+/* Pinned side panel (desktop-only split, design 2026-08-08): the conversation column reflows
+   beside the open panel instead of being covered. Width tracks the existing --panel-w resizer. */
+@media (min-width: 701px) {
+  body.panel-pinned #convo-col { margin-right: var(--panel-w, 460px); }
+  body.panel-pinned #side-panel { box-shadow: none; }
 }
 
 /* ── Safe-area insets (iOS notch / Dynamic Island / home indicator) ──────────────
@@ -1143,3 +1172,20 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .goal-chip.paused {
   opacity: 0.6;
 }
+
+/* Terminal chip strip (multi-terminal, design 2026-08-08) */
+.term-wrap { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.term-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.term-chip { display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.term-chip.active { border-color: var(--accent); }
+.term-chip button { background: none; border: none; color: var(--text); cursor: pointer; font: inherit; font-size: 12px; padding: 3px 8px; }
+.term-chip .term-kill { padding: 3px 5px; color: var(--muted); }
+.term-chip .term-kill .msym { font-size: 14px; }
+.term-chip.term-new { padding: 3px 6px; color: var(--muted); }
+#term-host { flex: 1; min-height: 0; }
+
+/* Pin state is readable from the icon itself (UX-6): tilted = loose, upright + filled + accent =
+   pinned. The web font is the variable Material Symbols cut (FILL axis in the CDN URL); on a
+   static native bundle the fill no-ops and the tilt still carries the state. */
+#panel-pin .msym { transform: rotate(45deg); transition: transform 0.12s ease; }
+#panel-pin.active .msym { transform: none; font-variation-settings: "FILL" 1; color: var(--accent); }

@@ -12,20 +12,23 @@ export interface TeamToolDeps {
   /** The lead session these tools belong to. */
   leadId: string;
   /** Propose a decomposition. Routes through the autonomy gate: auto-approves at `bypass`, otherwise
-   *  parks a reviewable team-plan card. Returns a human-readable summary of what happened. */
-  proposePlan(members: TeamPlanMember[], integration: "combined-pr" | "pr-per-member"): string;
-  /** Spawn one member session off the lead (its own worktree + git lifecycle). Throws on bad args. */
+   *  parks a reviewable team-plan card. Returns a human-readable summary of what happened.
+   *  [BE2-2] May resolve asynchronously (auto-approve spawns members via async git). */
+  proposePlan(members: TeamPlanMember[], integration: "combined-pr" | "pr-per-member"): string | Promise<string>;
+  /** Spawn one member session off the lead (its own worktree + git lifecycle). Throws/rejects on bad
+   *  args. [BE2-2] May resolve asynchronously (worktree creation runs async git). */
   createMember(args: {
     title: string;
     task: string;
     source: "fresh-worktree" | "existing-dir";
     base?: string;
     brief: string;
-  }): { id: string; title: string; cwd: string };
+  }): { id: string; title: string; cwd: string } | Promise<{ id: string; title: string; cwd: string }>;
   /** This lead's live team rollup (members + status + git), or null if it has none yet. */
   listMembers(): TeamInfo | null;
-  /** Integrate member branches per the team's policy (combined-pr / pr-per-member). Returns a summary. */
-  integrate(): string;
+  /** Integrate member branches per the team's policy (combined-pr / pr-per-member). Returns a summary.
+   *  [BE2-3] May resolve asynchronously (merges/push/PR run async git so the daemon stays live). */
+  integrate(): string | Promise<string>;
   /** Tear a member down: stop it and remove its worktree + branch + state. Returns a summary. */
   dismissMember(sessionId: string): string;
   /** Send a steering message to a member (lead→member; queues for the member's next turn). Returns a
@@ -79,7 +82,7 @@ export function teamTools(deps: TeamToolDeps): SdkMcpToolDefinition<any>[] {
         },
         async ({ members, integration }) => {
           try {
-            return ok(deps.proposePlan(members as TeamPlanMember[], integration));
+            return ok(await deps.proposePlan(members as TeamPlanMember[], integration));
           } catch (e) {
             return fail(e instanceof Error ? e.message : String(e));
           }
@@ -102,7 +105,7 @@ export function teamTools(deps: TeamToolDeps): SdkMcpToolDefinition<any>[] {
         },
         async (a) => {
           try {
-            const { id, title, cwd } = deps.createMember({
+            const { id, title, cwd } = await deps.createMember({
               title: a.title,
               task: a.task,
               source: a.source as "fresh-worktree" | "existing-dir",
@@ -130,7 +133,7 @@ export function teamTools(deps: TeamToolDeps): SdkMcpToolDefinition<any>[] {
         {},
         async () => {
           try {
-            return ok(deps.integrate());
+            return ok(await deps.integrate());
           } catch (e) {
             return fail(e instanceof Error ? e.message : String(e));
           }
