@@ -703,14 +703,19 @@ export class Supervisor {
   loopsSnapshotEvent(cid?: string): LoopsSnapshotEvent {
     const goals = this.list()
       .filter((s) => s.goal)
-      .map((s) => ({
-        sessionId: s.id,
-        title: s.title,
-        condition: s.goal!.condition,
-        iterations: s.goal!.iterations,
-        ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
-        ...(s.goal!.paused ? { paused: true } : {}),
-      }));
+      .map((s) => {
+        const envName = s.environmentId ? this.envStore.get(s.environmentId)?.name : undefined;
+        return {
+          sessionId: s.id,
+          title: s.title,
+          condition: s.goal!.condition,
+          iterations: s.goal!.iterations,
+          ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
+          ...(s.goal!.paused ? { paused: true } : {}),
+          ...(s.environmentId ? { environmentId: s.environmentId } : {}),
+          ...(envName ? { environmentName: envName } : {}),
+        };
+      });
     const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals });
     return { v: PROTOCOL_VERSION, type: "loops.snapshot", ts: now(), ...(cid ? { cid } : {}), loops };
   }

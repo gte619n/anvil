@@ -150,11 +150,13 @@ Vertical slices; each independently shippable. `☐` not started · `◐` in pro
 ### Phase 1 — Loops home over existing state (projection-first)
 | Task | Implemented | Tested | Pushed |
 |---|---|---|---|
-| `#loops` overlay + sidebar entry + deep link; overlay registration | ☐ | ☐ | ☐ |
-| Circuit renderer module (full + mini glyph) ported from mock | ☐ | ☐ | ☐ |
-| Projection: schedule/goals/pipelines/proposals/work-unit drafts → circuit rows (extends `buildLoopsSnapshot` with drafts + richer fields) | ☐ | ☐ | ☐ |
-| Detail pages for projected loops (goal loop: live laps + condition; proposal: approve/reject verbs; draft: open reader) | ☐ | ☐ | ☐ |
-| **Acceptance:** with an armed schedule, one armed `/goal`, and one pending proposal, `#loops` lists 3 circuit rows with correct runner/lock/lap state; tapping the goal row's detail shows the live lap count that increments on an unmet stop; the proposal is approvable from its detail page and leaves the list | ☐ | ☐ | ☐ |
+| `#loops` overlay + sidebar entry + deep link; overlay registration | ☑ | ☑ | ☐ |
+| Circuit renderer module (full + mini glyph) ported from mock | ☑ | ☑ | ☐ |
+| Projection: schedule/goals/pipelines/proposals/work-unit drafts → circuit rows (extends `buildLoopsSnapshot` with drafts + richer fields) | ☑ | ☑ | ☐ |
+| Detail pages for projected loops (goal loop: live laps + condition; proposal: approve/reject verbs; draft: open reader) | ☑ | ☑ | ☐ |
+| **Acceptance:** with an armed schedule, one armed `/goal`, and one pending proposal, `#loops` lists 3 circuit rows with correct runner/lock/lap state; tapping the goal row's detail shows the live lap count that increments on an unmet stop; the proposal is approvable from its detail page and leaves the list | ☑ | ☑ | ☐ |
+
+> **Phase 1 evidence** (2026-08-11, branch `loops-circuit`). `bun test` → 908 pass / 1 skip / 0 fail (150 files). `bunx typescript@5.9 --noEmit` (daemon) → exit 0. `bunx typescript@5.9 --noEmit -p web/tsconfig.json` (web) → exit 0. `bun run web/build.ts` → built OK. Protocol golden unchanged (only union members + optional `LoopSummary` fields added — no new `type:` wire literals; `protocol-surface.test` passes). New tests: `test/unit/loops.test.ts` (projection: 3 rows + circuit fields + drafts + ordering), `test/web/circuit.test.ts` (renderer: stations, gate-by-rung, runner, laps, scope, `loopToCircuit` defaults), `test/web/loops.test.ts` (acceptance: 3 rows w/ status chips, gate badge, goal detail live lap count 2→3 on new snapshot, proposal approvable). Fresh-context adversarial review: 1 MAJOR (status-rename left Autopilot panel's proposal/paused rows unstyled + drafts leaked into it) — **resolved** (added `.loop-gated`/`.loop-paused` CSS + filtered `draft` kind from the Autopilot panel; see decision D-005). *Pushed left ☐: committed to the feature branch, not merged to `main`.*
 
 ### Phase 2 — Loop entity, engine v1, gate verbs
 | Task | Implemented | Tested | Pushed |

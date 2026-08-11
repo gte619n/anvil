@@ -395,7 +395,9 @@ let apGridScroll = 0;
 /** Every active loop across the connected fleet, in server order (schedule → goals → pipelines → proposals). */
 function activeLoops(): LoopSummary[] {
   const out: LoopSummary[] = [];
-  for (const s of orderedServers()) out.push(...(serverLoops.get(s.url) ?? []));
+  // The "draft" kind is a Loops-home affordance ("drafts at your gate"); the Autopilot panel keeps its
+  // original set (schedule/goal/pipeline/proposal) so this coexisting surface stays unchanged (spec §3).
+  for (const s of orderedServers()) out.push(...(serverLoops.get(s.url) ?? []).filter((l) => l.kind !== "draft"));
   return out;
 }
 const LOOP_ICON: Record<string, string> = { schedule: "schedule", goal: "target", pipeline: "hub", trigger: "bolt" };

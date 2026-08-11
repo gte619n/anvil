@@ -811,10 +811,20 @@ export interface AutopilotScheduleEvent extends Envelope {
 }
 
 // ── Loops (loop-engineering: one surface naming every active loop) ────────────────────
-export type LoopKind = "schedule" | "goal" | "pipeline" | "trigger";
-export type LoopStatus = "idle" | "armed" | "running" | "waiting";
+// The "draft" kind is a work-unit draft awaiting a human (proposed/planned) — it shows in the Loops
+// home's "drafts at your gate" section and converts to a real Loop (Phase 2). "gated"/"paused" statuses
+// let a projected row read as at-gate / held.
+export type LoopKind = "schedule" | "goal" | "pipeline" | "trigger" | "draft";
+export type LoopStatus = "idle" | "armed" | "running" | "waiting" | "gated" | "paused";
+/** Autonomy rung = where the human gate sits on the circuit (concept §2). Suggest (report only) → Draft
+ *  (writes a branch) → PR (opens a verified PR) → Ship (merges on green, no gate). */
+export type LoopRung = "suggest" | "draft" | "pr" | "ship";
+/** Where the runner sits on the Trigger → Act ⇄ Check → gate → Ship circuit (for the glyph/SVG). */
+export type LoopStation = "trigger" | "act" | "check" | "gate" | "ship";
 /** One active loop, projected for the Loops panel. Answers the four questions a loop is framed around:
- *  what triggers it, what stops it, where it is now, and (run-until-done loops) which iteration it's on. */
+ *  what triggers it, what stops it, where it is now, and (run-until-done loops) which iteration it's on.
+ *  The optional `act`/`rung`/`runnerAt`/`scope` fields feed the circuit renderer (Loops home); when a
+ *  daemon omits them the client derives sensible defaults from `kind`/`status`. */
 export interface LoopSummary {
   kind: LoopKind;
   id: string; // stable per-loop id (session id, work-unit id, or the synthetic "schedule")
@@ -823,9 +833,15 @@ export interface LoopSummary {
   stopCondition: string; // when it stops
   status: LoopStatus;
   nextFireAt?: Iso8601; // schedule only
-  iteration?: { current: number; max: number }; // goal loops (and pipeline loopbacks)
+  iteration?: { current: number; max: number }; // goal loops (and pipeline loopbacks) — the lap count
   sessionId?: SessionId; // jump target when the loop owns a session
   detail?: string; // the judge's last blocker, the phase reached, etc.
+  act?: string; // the Act-station label (what the loop does), distinct from trigger/stop
+  rung?: LoopRung; // autonomy rung → the circuit's gate position (default derived from kind)
+  runnerAt?: LoopStation; // where the runner currently sits (default derived from status)
+  scope?: string; // scope note for the circuit's shield line (Contract v2)
+  environmentId?: string; // owning environment (for env grouping in the Loops home)
+  environmentName?: string; // display name of the owning environment
 }
 /** The set of active loops — answer to `loops.get` (cid) and broadcast (no cid) whenever the set changes
  *  (a run starts/ends, a goal arms/resolves, an event proposes a unit). */

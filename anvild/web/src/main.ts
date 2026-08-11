@@ -31,6 +31,7 @@ import {
   dismissOverlay,
   dismissTopOverlay,
   autopilotFromHash,
+  loopsFromHash,
   openOverlay,
   overlayOpen,
   overlays,
@@ -98,6 +99,9 @@ import {
 // integrations, and the Settings → Models providers) lives in settings.ts (P7 decomposition).
 // Importing it here makes its module body — including the settings-owned scalars — evaluate before
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
+// The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
+// Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
+import { initLoops, onLoopsHome, openLoops, openLoopsDeepLink } from "./loops";
 import {
   closeSettings,
   initSettings,
@@ -313,6 +317,13 @@ initAutopilot({
   selectSession,
   renderTodoistPanel,
 });
+// Loops home deps (same timing contract as initAutopilot — runs during module init before any socket
+// connects or the #loops deep link fires).
+initLoops({
+  environments,
+  sendAwait,
+  selectSession,
+});
 // Settings deps (P7 — see settings.ts). Same timing contract as initFleet/initSidebar/initAutopilot
 // above: this runs during module init, BEFORE any socket connects or the settings overlay can open —
 // so every settings entry point sees its deps assigned. The function references are hoisted
@@ -415,6 +426,8 @@ const deepLinkedSession = sessionFromHash() || new URLSearchParams(location.sear
 const deepLinkedPlan = planFromHash();
 // Likewise captured before canonicalization: a bare `#autopilot` deep link opens the grid on boot.
 const deepLinkedAutopilot = autopilotFromHash();
+// A `#loops` (or `#loops/<id>`) deep link opens the Loops home on boot (notification tap / shared link).
+const deepLinkedLoops = loopsFromHash();
 let activeId: string | null = deepLinkedSession || localStorage.getItem("anvil.active");
 setSessionHash(activeId, false); // canonicalize the URL (also strips any ?session=)
 // The cid of a session.create we kicked off from the new-session dialog now lives on
@@ -454,6 +467,10 @@ window.addEventListener("hashchange", () => {
   }
   if (autopilotFromHash()) {
     if (!overlayOpen("autopilot")) openAutopilot(); // external #autopilot deep link → open the grid
+    return;
+  }
+  if (loopsFromHash()) {
+    openLoopsDeepLink(); // external #loops (or #loops/<id>) deep link → open the Loops home
     return;
   }
   const id = sessionFromHash();
@@ -988,6 +1005,7 @@ void loadFleetMembers();
 // after the rest of module init — e.g. the settings/menu wiring below — has finished).
 if (deepLinkedPlan) queueMicrotask(() => openPlanDeepLink(deepLinkedPlan));
 else if (deepLinkedAutopilot) queueMicrotask(() => openAutopilot()); // bare #autopilot deep link → open the grid
+else if (deepLinkedLoops) queueMicrotask(() => openLoopsDeepLink()); // #loops / #loops/<id> deep link → open the Loops home
 
 // A daemon with no Claude login can't run a single turn, so the session list would be a lie — take the
 // screen over with the pairing/setup flow instead (headless-join §5.1). No-op on a healthy daemon.
@@ -1253,7 +1271,8 @@ function onEvent(url: string, e: ServerEvent): void {
       onAutopilotPlans(url, e.plans);
       return;
     case "loops.snapshot":
-      onLoopsSnapshot(url, e.loops);
+      onLoopsSnapshot(url, e.loops); // Autopilot Loops panel (writes the shared serverLoops cache)
+      onLoopsHome(); // Loops home re-renders from that cache (coexists through Phases 1–3)
       return;
     case "autopilot.plan":
       return; // resolved via cidWaiter (reassignPlan); the matching autopilot.plans broadcast refreshes state
@@ -2063,4 +2082,5 @@ wirePanelOutsideDismiss();
 initSortables(); // wire up drag-to-reorder on the (always-present) session + finished lists
 $("#open-settings").addEventListener("click", openSettings);
 $("#open-autopilot").addEventListener("click", openAutopilot);
+$("#open-loops").addEventListener("click", openLoops);
 $("#new-session-top").addEventListener("click", () => showNewSession());
