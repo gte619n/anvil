@@ -132,13 +132,21 @@ import { autoGrow, initComposer, input, restoreDraft, saveDraft, updateSendState
 import {
   closePanel,
   initPanel,
+  activeTermId,
+  closePanelForDeselect,
+  flushPinnedBoot,
+  noteTerminalData,
+  noteTerminalExit,
   openPanel,
   panel,
+  resyncTerminal,
   panelView,
   readerPath,
   renderFiles,
   renderLinks,
   renderReader,
+  renderTermStrip,
+  reopenPanelForSession,
   requestGitStatus,
   resetPanelForSession,
   showGitResult,
@@ -1091,6 +1099,8 @@ function onEvent(url: string, e: ServerEvent): void {
       // page-load, delta-resume without wiping the pane; otherwise run a full skeleton→cache→attach load.
       if (activeId && sessions.has(activeId) && sessionServer.get(activeId) === url) {
         setHeaderTitle(sessions.get(activeId));
+        flushPinnedBoot(); // restore a pinned panel now that this socket is provably live (one-shot)
+        resyncTerminal(); // daemon restart / dropped open: heal a mounted terminal (no-op when healthy)
         if (snapshotLoaded.has(activeId)) attachReconnect(activeId);
         else if (pendingLoadId === activeId) { /* a fresh load is already resolving; it will attach itself */ }
         else void loadConversation(activeId);
@@ -1121,6 +1131,7 @@ function onEvent(url: string, e: ServerEvent): void {
       renderSessions();
       if (e.session.id === activeId) {
         updateGitPanelMeta();
+        renderTermStrip(); // roster changes (open/exit/kill on any device) refresh the chip strip
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
         updateHeaderAccount(e.session); // reflect an account switch + the idle/mid-turn tooltip
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
@@ -1388,10 +1399,16 @@ function handleSessionEvent(e: ServerEvent): void {
       if (panel.classList.contains("open") && e.content.path === readerPath) renderReader(e.content);
       return;
     case "terminal.data":
-      xterm?.write(b64ToBytes(e.data));
+      if ((e.termId ?? "1") === activeTermId) {
+        noteTerminalData(); // feeds the lost-replay watchdog + reconnect resync in panel.ts
+        xterm?.write(b64ToBytes(e.data));
+      }
       return;
     case "terminal.exit":
-      xterm?.write(`\r\n\x1b[90m[process exited: ${e.code}]\x1b[0m\r\n`);
+      if ((e.termId ?? "1") === activeTermId) {
+        noteTerminalExit(); // an on-screen exit means "restart is the chip's job" — resync must not respawn
+        xterm?.write(`\r\n\x1b[90m[process exited: ${e.code}] — click the terminal's chip to restart\x1b[0m\r\n`);
+      }
       return;
     case "error":
       toast(e.message);
@@ -1453,6 +1470,7 @@ function renderSnapshotEvents(events: ConversationEvent[]): void {
 /** No session selected: reset the title, show the empty state, drop the persisted active id. */
 function deselectSession(): void {
   saveDraft(activeId, input.value); // keep the unsent draft with the session we're leaving
+  closePanelForDeselect(); // don't leave a (pinned) panel showing the dead session's terminal (BUG-3)
   activeId = null;
   localStorage.removeItem("anvil.active");
   setSessionHash(null, false);
@@ -1878,7 +1896,7 @@ export function selectSession(id: string, push = true): void {
   }
   // reset the side panel for the new session's worktree
   resetPanelForSession();
-  if (panelView) openPanel("files");
+  reopenPanelForSession(); // pinned → same tab, new session; unpinned open panel → files (as before)
 }
 
 // ── Composer (moved to composer.ts — P7 decomposition) ───────────────────────────────────────────

@@ -298,6 +298,15 @@ export interface Session {
   accountLabel?: string;
   /** The bound account no longer resolves; the session fell back to the default (§5.4). */
   accountMissing?: boolean;
+  /** Live terminal roster for this session's chip strip (multi-terminal, design 2026-08-08).
+   *  Runtime-only — cleared on daemon restart (the PTYs die with the process). Additive. */
+  terminals?: TerminalInfo[];
+}
+
+/** One live PTY of a session (multi-terminal). */
+export interface TerminalInfo {
+  id: string; // client-chosen, numeric-string ("1", "2", …); "1" is the default terminal
+  title: string; // shell basename, e.g. "zsh"
 }
 
 /** A team's policy. Lives on the lead `Session`; a team is otherwise derived from `parentId`. */
@@ -990,10 +999,12 @@ export interface FsChangedEvent extends Envelope, SessionScoped {
 export interface TerminalDataEvent extends Envelope, SessionScoped {
   type: "terminal.data";
   data: string; // base64 PTY bytes
+  termId?: string; // multi-terminal (design 2026-08-08); absent = "1", the pre-multi-term default
 }
 export interface TerminalExitEvent extends Envelope, SessionScoped {
   type: "terminal.exit";
   code: number;
+  termId?: string; // multi-terminal (design 2026-08-08); absent = "1", the pre-multi-term default
 }
 
 /** The full set of messages the server may send. */
@@ -1443,21 +1454,27 @@ export interface TerminalOpenCmd extends Envelope, Correlated {
   sessionId: SessionId;
   cols: number;
   rows: number;
+  termId?: string; // multi-terminal (design 2026-08-08); absent = "1", the pre-multi-term default
 }
 export interface TerminalInputCmd extends Envelope {
   type: "terminal.input";
   sessionId: SessionId;
   data: string; // base64
+  termId?: string; // multi-terminal (design 2026-08-08); absent = "1", the pre-multi-term default
 }
 export interface TerminalResizeCmd extends Envelope {
   type: "terminal.resize";
   sessionId: SessionId;
   cols: number;
   rows: number;
+  termId?: string; // multi-terminal (design 2026-08-08); absent = "1", the pre-multi-term default
 }
+/** Kills that PTY (the kill/respawn escape hatch, design 2026-08-08) — previously a documented
+ *  client-side no-op that no released client ever sent, so the repurpose is not a breaking change. */
 export interface TerminalCloseCmd extends Envelope, Correlated {
   type: "terminal.close";
   sessionId: SessionId;
+  termId?: string; // multi-terminal (design 2026-08-08); absent = "1", the pre-multi-term default
 }
 
 // 5e. Notifications (§6.7)
