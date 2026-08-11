@@ -307,6 +307,30 @@
     </div>
   </section>
 
+  <!-- where it lives -->
+  <section>
+    <h2>Where does all this live?</h2>
+    <table>
+      <tr><th>Layer</th><th>What</th><th>Where</th></tr>
+      <tr><td><b>UI</b></td><td><b>Loops home</b> — a new top-level view (<span class="kbd">#loops</span>)</td><td>replaces the “Autopilot” sidebar button</td></tr>
+      <tr><td><b>Entity</b></td><td><span class="kbd">Loop</span> + <span class="kbd">LoopRun</span> in a hub-authoritative store, synced fleet-wide</td><td>new <span class="kbd">loops</span> capability</td></tr>
+      <tr><td><b>Engine</b></td><td>trigger ticks · laps · checks · gates · hard stops</td><td>runs on the daemon that <b>owns the environment</b></td></tr>
+      <tr><td><b>Execution</b></td><td>a lap <b>is a session</b> (own worktree, transcript); light checks are run-records</td><td>existing session infra, unchanged</td></tr>
+    </table>
+    <p class="callout"><b>Sessions are the hands, loops are the manager.</b> A lap spawns a normal sidebar session — tap a lap to open its transcript. Your interactive chat workflow doesn't change; Loops is where standing work is reviewed, not where you work.</p>
+  </section>
+
+  <!-- migration -->
+  <section>
+    <h2>Migration: retire the concept, keep the machinery</h2>
+    <ul class="small">
+      <li><b>1 · Coexist</b> — Loops home ships alongside the Autopilot view, reading the same stores (work units project as loop drafts).</li>
+      <li><b>2 · Retire the card grid</b> <span class="pill" style="color:var(--ok);border-color:var(--ok)">decided</span> — plan review moves <b>into the loop detail page</b>: a draft is a loop whose circuit isn't fully lit; reviewing = lighting the remaining stations through the intake chat, then arming. The home list's <b>drafts-at-your-gate</b> section covers the grid's scan job.</li>
+      <li><b>3 · Flip the entry point</b> — the sidebar button becomes <b>Loops</b>; <span class="kbd">autoStart</span>/<span class="kbd">usePipeline</span>/<span class="kbd">maxAutoStart</span>/propose-flags are absorbed by the autonomy rung and removed from Settings.</li>
+    </ul>
+    <p class="callout">The planner, work-unit store, pipeline, and Todoist tagging all survive as internals — the word “autopilot” retires from the UI, not the code. No flag-day rewrite.</p>
+  </section>
+
   <!-- recap -->
   <section>
     <h2>Recap</h2>

@@ -74,26 +74,53 @@ No form wizard. The user starts with **a prompt (or a Todoist task flows in)** a
 - **Loop page:** the full circuit with the runner animating between Act ⇄ Check; the three hard-stop bars (laps, budget, no-progress); **lap history** (one row per lap: what it did + the check's verdict); the autonomy ladder; and a loop-scoped "Ask Claude" chat for tuning (widen budget, change the check…).
 - **Gate moments are the notification surface:** "at your gate" is the one state that needs you; failure/auto-pause pushes and a daily digest cover the rest.
 
-## 6. Research grounding
+## 6. Where it lives — architecture & migration
+
+### 6.1 The layering
+
+| Layer | What | Where |
+|---|---|---|
+| **UI** | **Loops home** — a new top-level view (`#loops`), same rank as Sessions and Settings | replaces the "Autopilot" sidebar button |
+| **Entity** | `Loop` + `LoopRun` in a hub-authoritative `LoopStore` (`<stateDir>/loops/`), synced fleet-wide | new `loops` capability (older members degrade gracefully) |
+| **Engine** | `LoopEngine` — trigger ticks, laps, checks, gates, hard stops | runs on the daemon that **owns the loop's environment** (fixes the hub-only-schedule limitation) |
+| **Execution** | a lap **is a session** (own worktree, transcript) for heavy bodies; a lightweight run-record for shell/skill checks | existing session infrastructure, unchanged |
+
+### 6.2 Loops vs sessions: the hands and the manager
+
+Sessions remain the workspace; loops are the management layer above them. Nothing about the interactive, chat-first workflow changes:
+
+- A loop's lap **spawns** a session — it appears in the sidebar like any other (badged as loop-owned); tapping a lap in the history opens that session's transcript. Same worktrees, same permission model, same transcript UI.
+- The Loops screen is the **standing-work surface** — what fires on its own, where each runner is, what's waiting at your gate. You visit it to review and approve, not to work.
+- A `/goal` armed in an ordinary interactive session surfaces as a row in Loops too — same anatomy, so the monitoring home covers it for free.
+
+### 6.3 Migration: retire the concept, keep the machinery
+
+The word "autopilot" retires from the UI; the planner, work-unit store, pipeline, and Todoist tagging all survive as internals (per the §3 mapping). Phased, no flag-day:
+
+1. **Coexist** — the Loops home ships alongside the Autopilot view, reading the same stores (work units project as loop drafts).
+2. **Retire the card grid** *(decided 2026-08-12)* — plan-review moves **into the loop detail page**: a draft is simply a loop whose circuit isn't fully lit, and reviewing it = lighting the remaining stations through the intake chat, then arming. The card grid's job (scan pending plans) is covered by the home list's **drafts-at-your-gate** section.
+3. **Flip the entry point** — the sidebar button becomes **Loops**; the old flags (`autoStart`/`usePipeline`/`maxAutoStart`/propose-don't-run) are absorbed by the autonomy rung and removed from Settings.
+
+## 7. Research grounding
 
 - **Loop anatomy + hard stops + maker–checker:** the [agentic-loop field guide](https://dev.to/truongpx396/the-agentic-loop-a-practical-field-guide-mnc) (trigger/inputs/action/check/stop; max-iterations + budget + no-progress as non-negotiable; verifier separate from maker — our Check judge/deterministic checks stay independent of the acting session).
 - **[Anthropic's loop-engineering guide](https://claude.com/blog/getting-started-with-loops):** clear success/stop criteria; second-agent review; start with the simplest loop and add machinery only when a failure forces it — hence dry-run-first and manual-trigger-first defaults.
 - **Agentic UX patterns:** Intent Preview, Autonomy Dial, Explainable Rationale, Action Audit, Escalation Pathway ([Smashing Magazine](https://www.smashingmagazine.com/2026/02/designing-agentic-ai-practical-ux-patterns/)); progressive delegation — autonomy earned through demonstrated reliability ([agent UX surveys](https://fuselabcreative.com/ui-design-for-ai-agents/)).
 - **Specification engineering:** the 8-component spec framework and specification-gaming failure mode ([KDnuggets](https://www.kdnuggets.com/specification-engineering-the-new-skill-after-prompt-engineering), backed by the 2024 ROPE study) — drives Contract v2 (§2.1: the Scope slot + check integrity) and the intake's "still ambiguous" step. The catalog incident was this failure mode in the wild.
 
-## 7. What carries over from the v1 spec
+## 8. What carries over from the v1 spec
 
 The v1 spec's **infrastructure decisions stand** (LoopStore atomic persistence, hub-authoritative catalog + execute-where-the-env-lives, `loops` capability, checkpoint/resume semantics, the deterministic functional test harness, and the executable done-gate + adversarial reviewer). What changes is the **product model on top**:
 
 - One entity (`Loop`) replaces the work-unit-vs-loop split; work units become loop drafts.
 - The wizard becomes the **Claude-led intake conversation** with the live circuit.
-- The Loops view becomes the **home surface**; the autopilot grid folds into it.
+- The Loops view becomes the **home surface**; the autopilot card grid is retired — plan review happens on the loop detail page (§6.3).
 - The autonomy rung replaces autoStart/usePipeline/propose flags.
 - The v1 phase tables get re-cut against this model before build (Phase 1 = circuit renderer + Loop entity + manual lap + check verdicts + gate; then intake conversation; then triggers; then fleet/resume).
 - The re-cut spec follows **`docs/plans/SPEC-TEMPLATE.md`** (the specification-engineering standard): explicit inputs/scope, systematic edge-case enumeration, and a **spec-critique gate before Phase 1** in addition to the per-phase done-gate.
 
-## 8. Open questions for Evan
+## 9. Open questions for Evan
 
 1. Naming: "laps" for iterations — keep, or plain "attempts"?
-2. Does the Todoist-intake loop *replace* the autopilot card grid outright, or do cards remain as the drafts' detail view inside the Loops home?
+2. ~~Does the Todoist-intake loop *replace* the autopilot card grid outright, or do cards remain as the drafts' detail view inside the Loops home?~~ **Decided 2026-08-12: retire the cards.** Plan review moves into the loop detail page; drafts appear in the home list as loops with unlit circuits (§6.3).
 3. Gate-promotion cadence: suggest after 3 clean laps — right threshold?
