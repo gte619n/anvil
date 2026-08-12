@@ -726,12 +726,42 @@ function askClaude(instruction: string): void {
   closePanel(); // jump to the conversation to watch it work
 }
 type Stage = "commit" | "push" | "pr" | "merge";
-// Each stage tells Claude to do EVERYTHING up to and including that stage.
+// Each stage tells Claude to do EVERYTHING up to and including that stage. Structured markdown
+// (bulleted steps), not walls of text — these render as message.user bubbles in the transcript.
 const STAGE_PROMPT: Record<Stage, string> = {
-  commit: "In this worktree, stage and commit all current changes with a clear, conventional commit message based on what changed. If there's nothing to commit, say so.",
-  push: "In this worktree: commit all current changes with a clear conventional message (if any are uncommitted), then push the branch to its origin remote (set the upstream with -u if needed).",
-  pr: "In this worktree, take the branch to an open PR: commit any uncommitted changes (good conventional message), push to origin, then create a GitHub pull request with the gh CLI (concise title + summary) if one doesn't already exist. Give me the PR URL.",
-  merge: "In this worktree, take the branch all the way to merged: commit any uncommitted changes (good message), push to origin, create a GitHub PR with gh if none exists, then merge it with `gh pr merge --squash` (NOT `--delete-branch`). IMPORTANT: this is a git worktree and the repo's default branch is checked out by another worktree, so do NOT try to switch this worktree to the default branch and do NOT use `--delete-branch` — it switches the checkout before deleting the remote branch, fails on the occupied default, and aborts, leaving the worktree stranded and the remote branch undeleted. After the merge succeeds, delete the remote branch yourself with `git push origin --delete <branch>` (a plain push that never touches the checkout), and leave this worktree on its current branch — staying on the merged branch is expected and correct. Report each step and confirm when it's merged.",
+  commit: [
+    "In this worktree:",
+    "",
+    "- Stage and commit all current changes with a clear, conventional commit message based on what changed.",
+    "- If there's nothing to commit, say so.",
+  ].join("\n"),
+  push: [
+    "In this worktree:",
+    "",
+    "- Commit all current changes with a clear conventional message (if any are uncommitted).",
+    "- Push the branch to its origin remote (set the upstream with `-u` if needed).",
+  ].join("\n"),
+  pr: [
+    "In this worktree, take the branch to an open PR:",
+    "",
+    "- Commit any uncommitted changes (good conventional message).",
+    "- Push to origin.",
+    "- Create a GitHub pull request with the `gh` CLI (concise title + summary) if one doesn't already exist.",
+    "- Give me the PR URL.",
+  ].join("\n"),
+  merge: [
+    "In this worktree, take the branch all the way to merged:",
+    "",
+    "- Commit any uncommitted changes (good message).",
+    "- Push to origin.",
+    "- Create a GitHub PR with `gh` if none exists.",
+    "- Merge it with `gh pr merge --squash` — **NOT** `--delete-branch` (see below).",
+    "- After the merge succeeds, delete the remote branch yourself with `git push origin --delete <branch>` (a plain push that never touches the checkout).",
+    "- Leave this worktree on its current branch — staying on the merged branch is expected and correct.",
+    "- Report each step and confirm when it's merged.",
+    "",
+    "**Why not `--delete-branch`:** this is a git worktree and the repo's default branch is checked out by another worktree. `--delete-branch` switches the checkout before deleting the remote branch, fails on the occupied default, and aborts — leaving the worktree stranded and the remote branch undeleted. Do NOT try to switch this worktree to the default branch.",
+  ].join("\n"),
 };
 const STAGE_META: { key: Stage; icon: string; label: string }[] = [
   { key: "commit", icon: "commit", label: "Commit" },
