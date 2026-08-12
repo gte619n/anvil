@@ -9,7 +9,7 @@
  * is rejected on user-created loops.
  */
 import { BadCommand } from "../session/errors";
-import type { Loop, LoopAct, LoopCheck, LoopInput, LoopRung, LoopState } from "@protocol";
+import type { Loop, LoopAct, LoopCheck, LoopInput, LoopMerge, LoopRung, LoopState } from "@protocol";
 
 export const PROMOTION_THRESHOLD = 3; // consecutive clean gated laps before Claude suggests the next rung
 const RUNG_ORDER: LoopRung[] = ["suggest", "draft", "pr", "ship"];
@@ -28,6 +28,34 @@ export function promotionSuggestion(loop: Pick<Loop, "rung" | "cleanGatedLaps">)
 /** Whether the `ship` rung is unlocked for this loop (earned via promotion from `pr`). */
 export function shipUnlocked(loop: Pick<Loop, "rung" | "cleanGatedLaps">): boolean {
   return loop.rung === "ship" || (loop.rung === "pr" && loop.cleanGatedLaps >= PROMOTION_THRESHOLD);
+}
+
+const MERGE_METHODS: LoopMerge["method"][] = ["squash", "merge", "rebase"];
+/** The auto-merge method a `ship`-rung loop uses (FU-3). Defaults to `squash` — the historical
+ *  hardcoded behaviour — so a loop with no `merge` config merges exactly as before. Pure/testable. */
+export function mergeMethodFor(loop: Pick<Loop, "merge">): LoopMerge["method"] {
+  const m = loop.merge?.method;
+  return m && MERGE_METHODS.includes(m) ? m : "squash";
+}
+/** Whether a `ship`-rung merge must wait for green CI (`gh pr checks`) before merging (FU-3). */
+export function mergeRequiresGreen(loop: Pick<Loop, "merge">): boolean {
+  return loop.merge?.requireGreen === true;
+}
+/** Validate/normalize a merge config off a LoopInput, or undefined when absent/invalid. */
+function normalizeMerge(merge: LoopMerge | undefined): LoopMerge | undefined {
+  if (!merge || !MERGE_METHODS.includes(merge.method)) return undefined;
+  return { method: merge.method, ...(merge.requireGreen ? { requireGreen: true } : {}) };
+}
+
+/** Ensure a `metric` check's command prints ONLY the number the threshold compares against (FU-3
+ *  metric-command action, closing D-023's last-number misparse): if the command emits more than a bare
+ *  number it's piped through `tail -1` so the last line is the value. Idempotent, pure. */
+export function singleNumberCommand(command: string): string {
+  const c = command.trim();
+  if (!c) return c;
+  if (/\|\s*tail\b/.test(c)) return c; // already narrowed to a single line
+  if (/^-?\d+(\.\d+)?$/.test(c)) return c; // already a bare number
+  return `${c} | tail -1`;
 }
 
 export const DEFAULT_MAX_LAPS = 10;
@@ -82,13 +110,16 @@ export function completeLoop(input: LoopInput, opts: CompleteOpts): CompleteResu
   if (input.act.kind === "session-prompt" && isBlank(input.act.prompt)) throw new BadCommand("a session-prompt act needs a prompt");
   if (input.act.kind === "skill-check" && isBlank(input.act.command)) throw new BadCommand("a skill-check act needs a command");
 
-  const checks = input.checks ?? [];
-  for (const c of checks) {
+  // Validate + normalize checks. A `metric` check compares the LAST number in its output to a threshold,
+  // so its command must print just the number (FU-3 metric-command action / D-023): narrow it to a single
+  // line here so any authoring path — heuristic, model intake, or hand-written — parses cleanly.
+  const checks = (input.checks ?? []).map((c) => {
     if (c.kind === "judge" && isBlank(c.condition)) throw new BadCommand("a judge check needs a condition");
     if (c.kind === "command" && isBlank(c.command)) throw new BadCommand("a command check needs a command");
     if (c.kind === "metric" && isBlank(c.command)) throw new BadCommand("a metric check needs a command");
     if (c.kind === "http" && isBlank(c.url)) throw new BadCommand("an http check needs a url");
-  }
+    return c.kind === "metric" ? { ...c, command: singleNumberCommand(c.command) } : c;
+  });
 
   // Earned autonomy: the Ship rung (auto-merge) can't be requested until a loop has earned it (3 clean
   // gated laps). A loop already promoted to Ship keeps it across edits.
@@ -126,6 +157,10 @@ export function completeLoop(input: LoopInput, opts: CompleteOpts): CompleteResu
     ...(input.scope && input.scope.allow.length ? { scope: input.scope } : existing?.scope ? { scope: existing.scope } : {}),
     rung: input.rung ?? existing?.rung ?? "pr", // new loops start gated at PR (concept §2)
     hardStops: { maxLaps, tokenBudget, noProgressLaps, ...(hs.timeBudgetMs ? { timeBudgetMs: hs.timeBudgetMs } : existing?.hardStops.timeBudgetMs ? { timeBudgetMs: existing.hardStops.timeBudgetMs } : {}) },
+    ...((): { merge?: LoopMerge } => {
+      const merge = normalizeMerge(input.merge) ?? existing?.merge;
+      return merge ? { merge } : {};
+    })(),
     assumptions: input.assumptions ?? existing?.assumptions ?? [],
     notify,
     cleanGatedLaps: existing?.cleanGatedLaps ?? 0,

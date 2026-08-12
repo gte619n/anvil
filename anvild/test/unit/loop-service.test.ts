@@ -13,7 +13,7 @@ import { LoopService } from "../../src/session/loop-service";
 import { EnvironmentStore } from "../../src/env/store";
 import type { ConnectionRegistry } from "../../src/server/registry";
 
-function harness() {
+function harness(overrides?: { intakeModel?: (ctx: { prompt: string; isFeature: boolean; testScript?: string }) => Promise<import("../../src/loops/intake-model").IntakeOverlay | undefined> }) {
   const stateDir = mkdtempSync(join(tmpdir(), "anvil-loopsvc-"));
   const repo = mkdtempSync(join(tmpdir(), "anvil-loopsvc-repo-"));
   spawnSync("git", ["init", "-q"], { cwd: repo });
@@ -34,14 +34,15 @@ function harness() {
     onCatalogChange: () => {},
     autopilotRun: async () => { autopilotCalls++; return { created: 3, summary: "3 new" }; },
     notify: (title, body, tag, hash) => notes.push({ title, body, tag, ...(hash ? { hash } : {}) }),
+    ...(overrides?.intakeModel ? { intakeModel: overrides.intakeModel } : {}),
   });
   return { svc, env, events, runEvents, notes, autopilotCalls: () => autopilotCalls, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
 }
 
-test("intakeSuggest is repo-aware: reads the env's test script and narrows by a keyword", () => {
+test("intakeSuggest is repo-aware: reads the env's test script and narrows by a keyword", async () => {
   const h = harness();
   try {
-    const ev = h.svc.intakeSuggest("Fix the flaky upload test", h.env.id);
+    const ev = await h.svc.intakeSuggest("Fix the flaky upload test", h.env.id);
     expect(ev.type).toBe("loop.intake.result");
     expect(ev.suggestion.isFeature).toBe(false); // "fix"/"flaky" → a fix
     expect(ev.suggestion.checkCommand).toBe("bun test upload"); // repo test script + keyword
@@ -54,13 +55,43 @@ test("intakeSuggest is repo-aware: reads the env's test script and narrows by a 
   }
 });
 
-test("intakeSuggest flags a feature (build-something-new) with a wider budget", () => {
+test("intakeSuggest flags a feature (build-something-new) with a wider budget", async () => {
   const h = harness();
   try {
-    const ev = h.svc.intakeSuggest("Add CSV export to the reports page", h.env.id);
+    const ev = await h.svc.intakeSuggest("Add CSV export to the reports page", h.env.id);
     expect(ev.suggestion.isFeature).toBe(true);
     expect(ev.suggestion.maxLaps).toBe(12);
     expect(ev.suggestion.tokenBudget).toBeGreaterThan(300_000);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("FU-1: a wired intakeModel overlays the heuristic (sharper check/scope/name)", async () => {
+  const h = harness({
+    intakeModel: async () => ({ name: "CSV export for reports", checkCommand: "bun test export", scopeAllow: ["src/reports/"], assumptions: ["comma delimiter, UTF-8"], rung: "draft" }),
+  });
+  try {
+    const ev = await h.svc.intakeSuggest("Add export to the reports page", h.env.id);
+    expect(ev.suggestion.name).toBe("CSV export for reports");
+    expect(ev.suggestion.checkCommand).toBe("bun test export"); // model's, not the heuristic default
+    expect(ev.suggestion.scopeAllow).toEqual(["src/reports/"]);
+    expect(ev.suggestion.assumptions).toEqual(["comma delimiter, UTF-8"]);
+    expect(ev.suggestion.rung).toBe("draft");
+    // Structural fields stay heuristic-driven (the model never sets budgets).
+    expect(ev.suggestion.tokenBudget).toBeGreaterThan(0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("FU-1: a throwing intakeModel silently falls back to the heuristic", async () => {
+  const h = harness({ intakeModel: async () => { throw new Error("model unreachable"); } });
+  try {
+    const ev = await h.svc.intakeSuggest("Fix the flaky upload test", h.env.id);
+    expect(ev.type).toBe("loop.intake.result");
+    expect(ev.suggestion.checkCommand).toBe("bun test upload"); // heuristic value survives
+    expect(ev.suggestion.isFeature).toBe(false);
   } finally {
     h.cleanup();
   }

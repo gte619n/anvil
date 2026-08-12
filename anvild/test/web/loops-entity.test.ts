@@ -139,6 +139,28 @@ test("not-yet-earned loop shows no promotion banner and Ship stays locked", () =
   expect(ship.disabled).toBe(true);
 });
 
+test("FU-3: a ship-rung loop shows the merge-method control reflecting its config", () => {
+  const shipLoop: Loop = { ...loop, status: "paused", rung: "ship", cleanGatedLaps: 3, merge: { method: "rebase", requireGreen: true } };
+  fleet.serverLoopEntities.set(fleet.HUB_URL, [shipLoop]);
+  fleet.loopRuns.set("loop_1", []);
+  loops.openLoops();
+  (document.querySelector("#loops-root .lc-row[data-entity='1']") as HTMLElement).click();
+  const method = document.getElementById("lc-merge-method") as HTMLSelectElement | null;
+  const green = document.getElementById("lc-merge-green") as HTMLInputElement | null;
+  expect(method).not.toBeNull();
+  expect(method!.value).toBe("rebase"); // reflects loop.merge.method
+  expect(green!.checked).toBe(true); // reflects requireGreen
+});
+
+test("FU-3: a pr-rung loop shows no merge control (only Ship auto-merges)", () => {
+  const prLoop: Loop = { ...loop, status: "paused", rung: "pr", cleanGatedLaps: 0 };
+  fleet.serverLoopEntities.set(fleet.HUB_URL, [prLoop]);
+  fleet.loopRuns.set("loop_1", []);
+  loops.openLoops();
+  (document.querySelector("#loops-root .lc-row[data-entity='1']") as HTMLElement).click();
+  expect(document.getElementById("lc-merge-method")).toBeNull();
+});
+
 test("live loop.run updates the cache and re-renders the open detail", () => {
   fleet.serverLoopEntities.set(fleet.HUB_URL, [loop]);
   fleet.loopRuns.set("loop_1", [{ ...gateRun, status: "running", laps: [gateRun.laps[0]!] }]);

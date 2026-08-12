@@ -483,7 +483,10 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
       case "loop.intake":
-        send(deps.supervisor.loops.intakeSuggest(cmd.prompt, cmd.environmentId, cid));
+        deps.supervisor.loops
+          .intakeSuggest(cmd.prompt, cmd.environmentId, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
       case "autopilot.tags.reset":

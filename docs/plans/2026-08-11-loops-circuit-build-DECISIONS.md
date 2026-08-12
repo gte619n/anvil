@@ -8,6 +8,84 @@ Review after implementation to tweak as needed.
 
 ---
 
+## Interview outcomes (2026-08-11, post-build review with Evan)
+
+Confirmed **as built** (no change):
+- **Crash resume** → keep `interrupted` + rerun on next trigger (D-022). Full `--resume` reattach not needed now.
+- **Iteration word** → keep "laps" (spec §10 resolved).
+- **Token accounting** → keep the ÷4 length approximation for the budget ceiling (D-009); exact SDK usage not worth the plumbing.
+- **Metric parse** → keep last-number extraction (D-023); **action:** document that a metric command should print just the number (e.g. `… | tail -1`), and have intake generate such commands.
+- **New-loop dialog** → keep as the power-user escape hatch alongside intake (D-011).
+
+Changes requested (become follow-up work items):
+- **FU-1 — Real LLM intake** (revises D-014): replace the deterministic heuristic with a genuine Sonnet-led intake conversation (Haiku for per-answer circuit updates). Keep the heuristic as the offline/CI fallback (`localSuggestion`). Needs: a daemon-side intake session, non-determinism handling in tests (mock the SDK like `goal-flow`), model-spend note.
+- **FU-2 — Hub re-broadcast / `loop.run.assign`** (revises D-025): implement the spec's hub-authoritative forwarding so a hub-only client also sees a member loop's live runs. Adds `loop.run.assign` (hub→member) + member→hub re-broadcast of `loop.run`; 60s assign-ack → `interrupted` (spec §4.2).
+- **FU-3 — Configurable Ship merge** (revises D-024/D-026): let each loop choose the merge method (squash/merge/rebase) and whether to wait for green CI before merging (`gh pr checks`). Adds a small config field + UI; currently hardcoded squash-on-open.
+
+## Follow-up implementation (2026-08-11, second build pass — "implement everything")
+
+Scope of this pass = the three requested follow-ups (FU-1/2/3) + the metric-command action item. The
+`◐` Phase-5 full `--resume` reattach is deliberately **not** implemented — the interview outcome above
+confirms "keep interrupted + rerun; full --resume reattach not needed now" (D-022). Decisions D-027+.
+
+- **D-027** (FU-3, scope): Implement configurable Ship merge as an optional `Loop.merge` field
+  (`{ method: "squash"|"merge"|"rebase"; requireGreen?: boolean }`), defaulting to `{ method: "squash" }`
+  (preserves today's hardcoded squash-on-open). Pure helpers (`mergeMethodFor`/`mergeRequiresGreen`) are
+  unit-tested; the git wiring reuses the existing `mergePr(method)` + a new `prChecksGreen` gh op (shell
+  op, untested like its `createPr`/`mergePr` siblings). Additive protocol field — no golden version bump.
+- **D-028** (FU-1, intake): The real-model intake is an **injected port** (`LoopServiceDeps.intakeModel`)
+  so tests stay model-free. `intakeSuggest` becomes async: it computes the deterministic heuristic
+  (renamed `localIntakeSuggestion`, still the offline/CI fallback), then, when `intakeModel` is wired,
+  overlays the model's validated fields. Any throw/timeout/parse-failure falls back to the heuristic — a
+  loop can always be intaked. The Supervisor wires `intakeModel` to a one-shot Sonnet call
+  (`src/loops/intake-model.ts`, no tools, 25s timeout, JSON reply) mirroring `judgeGoal`'s SDK shape.
+  Dispatch's `loop.intake` case becomes async (`.then(send).catch(cmdError)`).
+- **D-029** (FU-1, metric-command action): Closes the D-023 metric misparse two ways: (1) the intake
+  model prompt instructs that a `metric` check's command must print ONLY the number (append `| tail -1`),
+  and (2) `completeLoop` runs every `metric` check's command through a pure, idempotent
+  `singleNumberCommand()` (appends `| tail -1` when not already narrowed) — so a metric check created by
+  ANY path (heuristic, model, hand-written, the New-loop dialog) is narrowed to a single line before it
+  ever runs. Not vacuous: the normalization is at the one validation choke point, unit-tested both as the
+  pure helper and through `completeLoop`.
+- **D-030** (FU-2, fleet — DEFERRED, needs owner review): FU-2's hub-authoritative `loop.run.assign`
+  forwarding + member→hub re-broadcast is **not implemented**, deliberately. Investigation (Explore sweep
+  of `src/server/{registry,fleet,dispatch}.ts`, `src/session/{supervisor,loop-service}.ts`,
+  `web/src/fleet.ts`) established that **no persistent hub↔member WebSocket exists anywhere in the
+  product** — all hub↔member traffic is REST (`/api/health` probes, Todoist/token propagation) plus
+  Tailscale discovery. `ConnectionRegistry` only reaches a daemon's *own* directly-connected clients
+  (`toAll`/`toAttached`); there is no `toMember`/`forward`. Implementing FU-2 therefore means building a
+  new persistent hub→member socket transport (connection lifecycle, reconnect, backpressure, auth, and
+  dedup against clients already directly connected to the member). Critically, a daemon-opened socket to
+  a peer would hit the **SEC-H3 WS origin gate** (see memory `fleet-member-disconnected-on-web-origin-gate`:
+  the origin gate 403s exactly this kind of cross-origin socket) — i.e. the product's security posture is
+  built on the assumption that daemons do NOT open sockets to each other. Building that transport is a
+  core-fleet change far exceeding a follow-up's risk budget, and the current direct-connect model (the web
+  opens a socket per fleet member and aggregates `serverLoopEntities`/`loopRuns`) already satisfies the
+  Phase-5 acceptance ("a loop on an M1-owned env executes on M1 with live updates on all clients") for the
+  standard topology where every client adopts every member. The only residual gap — a client connected
+  *only* to the hub — stays the documented, accepted limitation of D-025. The spec §7 "member offline →
+  interrupted after 60s assign-ack" durability guarantee is already met without assignment: a member owns
+  its own runs and `recoverInterruptedRuns` marks them `interrupted` on its restart. **Recommendation for
+  review:** if hub relay is genuinely wanted, scope it as a dedicated transport project (with an
+  ANVIL_ALLOWED_ORIGINS / origin-gate carve-out for daemon-to-daemon sockets), not a loops follow-up.
+
+**Follow-up pass evidence** (2026-08-11, branch `loops-circuit`). Delivered: FU-1 (real Sonnet-led intake
+with heuristic fallback), FU-3 (configurable Ship merge method + green-CI gate), the D-029 metric-command
+normalization. Deferred with rationale: FU-2 (D-030). Not touched by design: the `◐` full `--resume`
+reattach (interview-confirmed to keep `interrupted`+rerun). `bun test` → **990 pass / 1 skip / 0 fail**
+(160 files; +14 new tests). Daemon + web `bunx typescript@5.9 --noEmit` → exit 0. `bun run web/build.ts`
+→ built OK. Protocol golden unchanged (`LoopMerge` is a non-`type:` interface + `merge?`/async intake are
+additive; `protocol-surface.test` passes; PROTOCOL_VERSION stays 4). New/changed: protocol `LoopMerge` +
+`Loop.merge?`/`LoopInput.merge?`; `contract.ts` `mergeMethodFor`/`mergeRequiresGreen`/`singleNumberCommand`
++ metric normalization + merge carry; `git/ops.ts` `prChecksState`; `loop-service.ts` async `intakeSuggest`
+overlay + `intakeModel` port + `openGateAction` merge wiring + `localIntakeSuggestion`/`applyIntakeOverlay`;
+new `loops/intake-model.ts`; `dispatch.ts` async `loop.intake`; `supervisor.ts` `intakeModel` wiring;
+`web/src/loops.ts` ship-merge control (`mergeConfigHtml`/`setMerge`). New tests: `loop-intake-model.test.ts`
+(6), `loop-contract.test.ts` (+FU-3/D-029: merge defaults/carry, singleNumberCommand, metric normalize),
+`loop-service.test.ts` (+FU-1 overlay + throw-fallback), `loops-entity.test.ts` (+ship merge control shows
+/ pr-rung hides). CWD caveat noted for the reviewer: a fresh shell defaults to the canonical checkout
+`~/Development/anvil`; all verification above was run anchored to this worktree's `anvild/`.
+
 ## Decisions
 
 - **D-001** (P1, protocol): `anvild/protocol.ts` is a symlink to `docs/plans/anvil-protocol.ts`. Edited the real target (the source of truth). Confirms the spec's "in scope: docs/plans/anvil-protocol.ts".

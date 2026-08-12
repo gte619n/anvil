@@ -897,6 +897,13 @@ export interface LoopNotify {
   onSuccess: boolean;
   dailyDigest: boolean;
 }
+/** How the `ship` rung auto-merges (loops-circuit follow-up FU-3). `method` mirrors `gh pr merge`;
+ *  `requireGreen` gates the merge on `gh pr checks` passing (a red/pending CI leaves the PR open, no
+ *  merge). Absent ⇒ the historical default: squash, no CI wait. */
+export interface LoopMerge {
+  method: "squash" | "merge" | "rebase";
+  requireGreen?: boolean;
+}
 export interface Loop {
   id: string; // "loop_…"
   name: string;
@@ -909,6 +916,7 @@ export interface Loop {
   scope?: LoopScope; // Contract v2: allowed globs + implicit check-file locks
   rung: LoopRung; // gate position = autonomy
   hardStops: LoopHardStops;
+  merge?: LoopMerge; // `ship`-rung auto-merge method + optional green-CI gate (FU-3; default squash)
   assumptions: string[]; // logged at intake ("still ambiguous" acceptances)
   notify: LoopNotify;
   cleanGatedLaps: number; // consecutive human-approved laps → promotion suggestion
@@ -930,6 +938,7 @@ export interface LoopInput {
   scope?: LoopScope;
   rung?: LoopRung;
   hardStops?: Partial<LoopHardStops>;
+  merge?: LoopMerge; // ship-rung merge method + green-CI gate (FU-3)
   assumptions?: string[];
   notify?: Partial<LoopNotify>;
   workUnitId?: string; // link to the autopilot draft this loop was set up from (intake convert path)

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { completeLoop, defaultTokenBudget, checkLocks, chainCycleReason, chainedTargets, eventTargets, promotionSuggestion, shipUnlocked, PROMOTION_THRESHOLD, SESSION_TOKEN_BUDGET, PIPELINE_TOKEN_BUDGET, DEFAULT_MAX_LAPS, DEFAULT_NO_PROGRESS_LAPS } from "../../src/loops/contract";
+import { completeLoop, defaultTokenBudget, checkLocks, chainCycleReason, chainedTargets, eventTargets, promotionSuggestion, shipUnlocked, mergeMethodFor, mergeRequiresGreen, singleNumberCommand, PROMOTION_THRESHOLD, SESSION_TOKEN_BUDGET, PIPELINE_TOKEN_BUDGET, DEFAULT_MAX_LAPS, DEFAULT_NO_PROGRESS_LAPS } from "../../src/loops/contract";
 import type { Loop, LoopInput } from "../../protocol";
 
 const opts = { now: "2026-08-11T00:00:00.000Z", genId: () => "loop_1" };
@@ -138,4 +138,46 @@ test("the Ship rung must be earned — completeLoop rejects it below the thresho
 test("checkLocks is the union of every check's locks", () => {
   expect(checkLocks([{ kind: "command", command: "a", locks: ["x", "y"] }, { kind: "command", command: "b", locks: ["y", "z"] }])).toEqual(["x", "y", "z"]);
   expect(checkLocks([{ kind: "judge", condition: "c" }])).toEqual([]);
+});
+
+// ── FU-3: configurable Ship merge ────────────────────────────────────────────────────────────────────
+test("mergeMethodFor defaults to squash (historical behaviour) and honours a valid method", () => {
+  expect(mergeMethodFor({})).toBe("squash");
+  expect(mergeMethodFor({ merge: { method: "merge" } })).toBe("merge");
+  expect(mergeMethodFor({ merge: { method: "rebase" } })).toBe("rebase");
+  // A bogus method falls back to squash rather than passing garbage to `gh pr merge`.
+  expect(mergeMethodFor({ merge: { method: "bogus" as "squash" } })).toBe("squash");
+});
+
+test("mergeRequiresGreen is opt-in (false unless explicitly set)", () => {
+  expect(mergeRequiresGreen({})).toBe(false);
+  expect(mergeRequiresGreen({ merge: { method: "squash" } })).toBe(false);
+  expect(mergeRequiresGreen({ merge: { method: "squash", requireGreen: true } })).toBe(true);
+});
+
+test("completeLoop carries a valid merge config and drops an invalid one; update preserves it", () => {
+  const withMerge = completeLoop({ ...base, merge: { method: "rebase", requireGreen: true } }, opts).loop;
+  expect(withMerge.merge).toEqual({ method: "rebase", requireGreen: true });
+  const noMerge = completeLoop({ ...base, merge: { method: "nope" as "squash" } }, opts).loop;
+  expect(noMerge.merge).toBeUndefined();
+  // An update that omits merge keeps the existing one (edit a paused ship loop without re-stating merge).
+  const kept = completeLoop({ ...base, name: "renamed" }, { ...opts, existing: withMerge }).loop;
+  expect(kept.merge).toEqual({ method: "rebase", requireGreen: true });
+});
+
+test("singleNumberCommand narrows a metric command to its last line (idempotent)", () => {
+  expect(singleNumberCommand("wc -l < f")).toBe("wc -l < f | tail -1");
+  expect(singleNumberCommand("bun test | grep -c pass | tail -1")).toBe("bun test | grep -c pass | tail -1"); // already piped to tail
+  expect(singleNumberCommand("42")).toBe("42"); // already a bare number
+  expect(singleNumberCommand("")).toBe("");
+});
+
+test("completeLoop normalizes a metric check's command to a single number line (D-029)", () => {
+  const { loop } = completeLoop({ ...base, checks: [{ kind: "metric", command: "wc -l < out", op: "lte", threshold: 5 }] }, opts);
+  const c = loop.checks[0]!;
+  expect(c.kind).toBe("metric");
+  expect((c as { command: string }).command).toBe("wc -l < out | tail -1");
+  // A command/judge check is left untouched.
+  const { loop: l2 } = completeLoop({ ...base, checks: [{ kind: "command", command: "bun test" }] }, opts);
+  expect((l2.checks[0] as { command: string }).command).toBe("bun test");
 });

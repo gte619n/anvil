@@ -16,10 +16,11 @@ import { createWorktree, removeWorktree } from "./worktree";
 import { runAgentQuery } from "../agent/query";
 import { judgeGoal } from "../agent/goal";
 import { sdkModelId } from "../agent/models";
-import { commit as gitCommit, push as gitPush, createPr as gitCreatePr, mergePr as gitMergePr } from "../git/ops";
+import { commit as gitCommit, push as gitPush, createPr as gitCreatePr, mergePr as gitMergePr, prChecksState } from "../git/ops";
 import { LoopStore } from "../loops/store";
 import { LoopEngine, type LapExecution, type LoopEngineDeps } from "../loops/engine";
-import { completeLoop, chainCycleReason, chainedTargets, eventTargets } from "../loops/contract";
+import { completeLoop, chainCycleReason, chainedTargets, eventTargets, mergeMethodFor, mergeRequiresGreen } from "../loops/contract";
+import type { IntakeOverlay } from "../loops/intake-model";
 import { scheduledFireDue } from "../integrations/schedule";
 import { BadCommand } from "./errors";
 import { PROTOCOL_VERSION } from "@protocol";
@@ -78,6 +79,10 @@ export interface LoopServiceDeps {
   autopilotRun?: () => Promise<{ created: number; summary: string }>;
   /** Run the autonomous dev pipeline for a `pipeline`-body loop in its worktree; returns a summary. */
   runPipeline?: (loop: Loop, cwd: string) => Promise<string>;
+  /** Real-model intake overlay (FU-1). Given the outcome + repo hint, returns fields that sharpen the
+   *  deterministic heuristic. Throwing / returning undefined falls back to the heuristic — injected so
+   *  tests stay model-free; the Supervisor wires the SDK-backed `modelIntake`. */
+  intakeModel?: (ctx: { prompt: string; isFeature: boolean; testScript?: string }) => Promise<IntakeOverlay | undefined>;
 }
 
 const LOOP_SCHEDULE_WINDOW_MS = 10 * 60_000; // edge-trigger window (matches the autopilot scheduler)
@@ -234,8 +239,15 @@ export class LoopService {
     const pr = gitCreatePr(wt.cwd, loop.name, `Automated by loop ${loop.id}. Assumptions:\n${loop.assumptions.map((a) => `- ${a}`).join("\n") || "(none)"}`);
     if (!pr.ok) return { summary: `PR failed: ${lastLine(pr.output)}` };
     if (loop.rung === "ship") {
-      const merged = gitMergePr(wt.cwd, "squash", wt.branch);
-      return { summary: merged.ok ? "Merged (Ship rung)" : `PR opened; merge failed: ${lastLine(merged.output)}`, ...(pr.url ? { url: pr.url } : {}) };
+      // FU-3: honour the loop's configured merge method + optional green-CI gate. A `requireGreen` loop
+      // whose checks aren't green leaves the PR open (no merge) — the human ships once CI is green.
+      if (mergeRequiresGreen(loop)) {
+        const ci = prChecksState(wt.cwd);
+        if (ci !== "green") return { summary: `PR opened; holding the merge until CI is green (checks: ${ci})`, ...(pr.url ? { url: pr.url } : {}) };
+      }
+      const method = mergeMethodFor(loop);
+      const merged = gitMergePr(wt.cwd, method, wt.branch);
+      return { summary: merged.ok ? `Merged (Ship rung, ${method})` : `PR opened; merge failed: ${lastLine(merged.output)}`, ...(pr.url ? { url: pr.url } : {}) };
     }
     return { summary: "Opened PR", ...(pr.url ? { url: pr.url } : {}) };
   }
@@ -493,32 +505,23 @@ export class LoopService {
     return this.runEvent(run, cid);
   }
 
-  /** Repo-aware intake proposal (spec §4.4): a heuristic check/scope/stops/gate + logged assumptions for
-   *  an outcome. Reads the env's package.json test script so the check matches the repo. (A small-model
-   *  enhancement is a follow-up — this deterministic core keeps intake CI-reproducible.) */
-  intakeSuggest(prompt: string, environmentId?: string, cid?: string): LoopIntakeResultEvent {
-    const p = prompt.trim();
-    const isFeature = !/\b(fix|flak|bug|broke|broken|fail|regress)/i.test(p) && /\b(add|export|feature|build|create|new|implement)/i.test(p);
-    // A repo-relative noun to narrow the check + scope (e.g. "upload", "reports").
-    const keyword = (p.toLowerCase().match(/\b(upload|report|reports|export|auth|payment|search|api|sync|login|cache)\w*/) ?? [])[0];
+  /** Repo-aware intake proposal (spec §4.4, FU-1): the deterministic heuristic, sharpened by a real
+   *  Sonnet call when one is wired + reachable. The heuristic is the always-available floor (keeps intake
+   *  CI-reproducible and works offline); the model overlays a tighter check/scope/name/assumptions on top.
+   *  Any model failure (timeout, transport, unparseable) silently falls back to the heuristic. */
+  async intakeSuggest(prompt: string, environmentId?: string, cid?: string): Promise<LoopIntakeResultEvent> {
     const env = environmentId ? this.deps.envStore.get(environmentId) : undefined;
     const testScript = env ? readTestScript(env.repoRoot) : undefined;
-    const base = testScript ?? "bun test";
-    const checkCommand = keyword ? `${base} ${keyword}` : base;
-    const scopeAllow = keyword ? [`src/${keyword}/`] : [];
-    const suggestion: LoopIntakeSuggestion = {
-      isFeature,
-      name: p.replace(/^\(from Todoist\)\s*/i, "").slice(0, 60) || "New loop",
-      checkCommand,
-      ...(keyword ? { checkLocks: [] } : {}),
-      scopeAllow,
-      maxLaps: isFeature ? 12 : 10,
-      tokenBudget: isFeature ? PIPELINE_INTAKE_BUDGET : SESSION_INTAKE_BUDGET,
-      rung: "pr",
-      assumptions: isFeature
-        ? ["Comma delimiter, UTF-8 where output format is unstated", "Streams all rows — no hard cap"]
-        : ["The failure is deterministic/timing-related, not environment-specific"],
-    };
+    const suggestion = localIntakeSuggestion(prompt, testScript);
+    // Overlay the real-model proposal when available — never let it break intake.
+    if (this.deps.intakeModel) {
+      try {
+        const overlay = await this.deps.intakeModel({ prompt: prompt.trim(), isFeature: suggestion.isFeature, ...(testScript ? { testScript } : {}) });
+        if (overlay) applyIntakeOverlay(suggestion, overlay);
+      } catch (e) {
+        console.warn(`[loops] model intake fell back to heuristic:`, e instanceof Error ? e.message : e);
+      }
+    }
     return { v: PROTOCOL_VERSION, type: "loop.intake.result", ts: now(), ...(cid ? { cid } : {}), suggestion };
   }
 
@@ -563,6 +566,42 @@ export class LoopService {
     for (const loop of this.store.list()) if (this.store.runById(loop.id, runId)) return loop.id;
     throw new BadCommand(`no such run: ${runId}`);
   }
+}
+
+/** The deterministic intake heuristic (FU-1 fallback / offline floor). Reads the repo's test script to
+ *  match the check to the repo, narrows check + scope by a repo-relative keyword, and picks a
+ *  fix-vs-feature framing. Pure — no I/O, no model — so intake is always available + CI-reproducible. */
+export function localIntakeSuggestion(prompt: string, testScript?: string): LoopIntakeSuggestion {
+  const p = prompt.trim();
+  const isFeature = !/\b(fix|flak|bug|broke|broken|fail|regress)/i.test(p) && /\b(add|export|feature|build|create|new|implement)/i.test(p);
+  const keyword = (p.toLowerCase().match(/\b(upload|report|reports|export|auth|payment|search|api|sync|login|cache)\w*/) ?? [])[0];
+  const base = testScript ?? "bun test";
+  const checkCommand = keyword ? `${base} ${keyword}` : base;
+  const scopeAllow = keyword ? [`src/${keyword}/`] : [];
+  return {
+    isFeature,
+    name: p.replace(/^\(from Todoist\)\s*/i, "").slice(0, 60) || "New loop",
+    checkCommand,
+    ...(keyword ? { checkLocks: [] } : {}),
+    scopeAllow,
+    maxLaps: isFeature ? 12 : 10,
+    tokenBudget: isFeature ? PIPELINE_INTAKE_BUDGET : SESSION_INTAKE_BUDGET,
+    rung: "pr",
+    assumptions: isFeature
+      ? ["Comma delimiter, UTF-8 where output format is unstated", "Streams all rows — no hard cap"]
+      : ["The failure is deterministic/timing-related, not environment-specific"],
+  };
+}
+
+/** Merge a real-model overlay onto the heuristic suggestion in place (FU-1). Only fields the model
+ *  actually returned replace the heuristic's; the budgets/maxLaps stay heuristic-driven (structural). */
+export function applyIntakeOverlay(base: LoopIntakeSuggestion, overlay: IntakeOverlay): void {
+  if (overlay.name) base.name = overlay.name;
+  if (overlay.checkCommand) base.checkCommand = overlay.checkCommand;
+  if (overlay.checkLocks) base.checkLocks = overlay.checkLocks;
+  if (overlay.scopeAllow) base.scopeAllow = overlay.scopeAllow;
+  if (overlay.assumptions && overlay.assumptions.length) base.assumptions = overlay.assumptions;
+  if (overlay.rung && overlay.rung !== "ship") base.rung = overlay.rung;
 }
 
 function placeholderRun(loop: Loop): LoopRun {

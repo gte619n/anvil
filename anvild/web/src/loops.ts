@@ -290,7 +290,8 @@ function renderEntityDetail(): void {
         return `<button data-rung="${x.k}" class="${loop.rung === x.k ? "on" : ""}"${disabled ? ` disabled title="${esc(title)}"` : ""}><b>${x.name}</b>${esc(x.desc.split(".")[0]!)}</button>`;
       }).join("")}</div>
       ${promoteBannerHtml(loop)}
-      <p class="lc-ladder-note">${icon("trending_up")} Loops <b>earn</b> autonomy: after 3 clean gated laps, Claude suggests moving the gate right. ${loop.cleanGatedLaps ? `(${loop.cleanGatedLaps} clean so far)` : ""}</p></div>
+      <p class="lc-ladder-note">${icon("trending_up")} Loops <b>earn</b> autonomy: after 3 clean gated laps, Claude suggests moving the gate right. ${loop.cleanGatedLaps ? `(${loop.cleanGatedLaps} clean so far)` : ""}</p>
+      ${mergeConfigHtml(loop)}</div>
     ${assumptions}
     <div class="lc-card"><h3>Lap history</h3><div class="lc-laps">${runsHtml || `<p class="small muted">No laps yet — Run now to start.</p>`}</div></div>`;
 
@@ -308,6 +309,36 @@ function renderEntityDetail(): void {
     }),
   );
   document.getElementById("lc-promote-accept")?.addEventListener("click", () => void promoteRung(loop, (document.getElementById("lc-promote-accept") as HTMLElement).dataset.rung as Loop["rung"]));
+  const mergeMethodEl = document.getElementById("lc-merge-method") as HTMLSelectElement | null;
+  const mergeGreenEl = document.getElementById("lc-merge-green") as HTMLInputElement | null;
+  const applyMerge = (): void => void setMerge(loop, (mergeMethodEl?.value as MergeMethod) ?? "squash", mergeGreenEl?.checked ?? false);
+  mergeMethodEl?.addEventListener("change", applyMerge);
+  mergeGreenEl?.addEventListener("change", applyMerge);
+}
+
+type MergeMethod = "squash" | "merge" | "rebase";
+/** Ship-rung merge config (FU-3): how the loop auto-merges + whether it waits for green CI. Shown only
+ *  on the Ship rung; editing needs a paused loop (like every other edit). */
+function mergeConfigHtml(loop: Loop): string {
+  if (loop.rung !== "ship") return "";
+  const method = loop.merge?.method ?? "squash";
+  const green = loop.merge?.requireGreen === true;
+  const disabled = loop.status === "armed";
+  const opt = (v: MergeMethod, label: string): string => `<option value="${v}"${v === method ? " selected" : ""}>${label}</option>`;
+  return `<div class="lc-merge-cfg"${disabled ? ' title="Pause to change how Ship merges"' : ""}>
+    <label class="ap-field-row"><span>${icon("merge")} Ship merges by</span>
+      <select id="lc-merge-method"${disabled ? " disabled" : ""}>${opt("squash", "Squash")}${opt("merge", "Merge commit")}${opt("rebase", "Rebase")}</select></label>
+    <label class="lc-merge-green"><input type="checkbox" id="lc-merge-green"${green ? " checked" : ""}${disabled ? " disabled" : ""}/> Wait for green CI before merging (<code>gh pr checks</code>)</label></div>`;
+}
+/** Persist a merge-config change (pause→save→re-arm, like promoteRung — an explicit user edit). */
+async function setMerge(loop: Loop, method: MergeMethod, requireGreen: boolean): Promise<void> {
+  const wasArmed = loop.status === "armed";
+  if (wasArmed && !(await loopSend(loop.id, { type: "loop.pause", loopId: loop.id }))) return;
+  const input = loopToInput(loop);
+  input.merge = { method, ...(requireGreen ? { requireGreen: true } : {}) };
+  if (!(await loopSend(loop.id, { type: "loop.save", loop: input }))) return;
+  if (wasArmed) await loopSend(loop.id, { type: "loop.arm", loopId: loop.id });
+  toast(`Ship merges by ${method}${requireGreen ? " on green CI" : ""}`);
 }
 
 /** Accept a promotion suggestion: pause if armed, move the gate one rung, re-arm — an explicit user tap. */
@@ -475,6 +506,7 @@ function loopToInput(loop: Loop): LoopInput {
     ...(loop.scope ? { scope: loop.scope } : {}),
     rung: loop.rung,
     hardStops: loop.hardStops,
+    ...(loop.merge ? { merge: loop.merge } : {}),
     assumptions: loop.assumptions,
     notify: loop.notify,
   };

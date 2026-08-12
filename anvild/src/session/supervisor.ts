@@ -86,6 +86,7 @@ import { EnvironmentService } from "./environment-service";
 import { GitProjectionService } from "./git-projection-service";
 import { AutopilotService } from "./autopilot-service";
 import { LoopService } from "./loop-service";
+import { modelIntake } from "../loops/intake-model";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
 import type { WorkUnit } from "../integrations/workunit";
@@ -380,6 +381,9 @@ export class Supervisor {
         const outcome = await this.autopilot.runDevPipeline(loop.workUnitId, {});
         return `pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}`;
       },
+      // FU-1: real-model intake overlay (Sonnet, no tools). Falls back to the heuristic in LoopService on
+      // any failure, so an unreachable model or missing token never breaks intake.
+      intakeModel: (ctx) => modelIntake(ctx, this.agentEnv()),
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
