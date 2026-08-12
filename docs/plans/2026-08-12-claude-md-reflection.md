@@ -13,10 +13,10 @@ user about each candidate (description + exact text, accept/skip) and amends the
 with the accepted additions. If nothing clears the bar, it says so in one sentence and stops.
 
 **Non-goals** (each an explicit decision, see §9):
-- **Out-of-band PR creation does not trigger.** Only the git panel's Create PR button (the
-  `git` command's `create-pr` op through `Supervisor.gitOp`) fires the reflection. A PR created
-  by the agent via `gh pr create` in Bash, or by the user in the side-panel terminal, is out of
-  scope by design.
+- **PRs created in the side-panel terminal do not trigger.** A user typing `gh pr create` into
+  the PTY produces `terminal.data` bytes, not tool events — out of scope by design. (Agent-run
+  `gh pr create` in Bash DOES trigger — that is the git panel PR button's actual mechanism, see
+  §4 and critique round 2.)
 - **The autonomous dev-pipeline (P6 Transfer) is untouched.** It runs unattended; an interview
   there has no one to answer.
 - **No daemon-side enforcement of the guardrails.** "Only touch CLAUDE.md, no new PR" is
@@ -61,11 +61,24 @@ the agent's own reply announces the automated step).
   short-circuit → AskUserQuestion interview (≤4 questions per call, batch if more) → for accepted
   items only: edit + `git add CLAUDE.md` + commit + push onto the open PR → confirm with link;
   guardrails: no new PR, no file but CLAUDE.md, no unrelated pushes).
-- `supervisor.ts` `gitOp` — after delegating to `GitProjectionService`:
+- **Trigger, primary path — the PR-activity watcher.** The web git panel's PR/Merge buttons do
+  NOT send the protocol's `create-pr`/`merge-pr` git commands: they PROMPT the session agent
+  (web `panel.ts` `STAGE_PROMPT`) to run `gh pr create` / `gh pr merge` itself. So the daemon
+  detects the PR step from the session's own tool traffic: `PrActivityWatcher` (one per session,
+  fed from the emit sink in `Supervisor.wrap`) observes `tool.use`/`tool.result`/`result` events.
+  - Bash `tool.use` matching `gh pr create` whose `tool.result` succeeds AND contains a
+    `/pull/<n>` URL arms a reflection — **deferred to the turn's `result` event**, because the
+    Merge button's single turn may run create AND merge; reflecting on an already-merged PR
+    would tell the agent to push to a deleted remote branch. A same-turn successful
+    `gh pr merge` cancels the pending reflection and (any turn) resets the PR-cycle guard.
+- **Trigger, secondary path — the protocol command.** `supervisor.ts` `gitOp`, after delegating
+  to `GitProjectionService`:
   - `create-pr && result.ok` → `maybeReflectOnClaudeMd(sessionId)`. Gated on `ok` alone: `url`
     is regex-scraped from `gh` output and a miss must not silently drop the reflection.
   - `merge-pr && result.ok` → clear the session's reflected flag (a merge rolls the worktree onto
     a `_followup` branch — a new PR cycle begins).
+  Kept for protocol completeness (a client MAY send these ops); the once-per-cycle guard dedupes
+  if both paths ever fire for the same PR.
 - `maybeReflectOnClaudeMd` guards, in order: env gate → auth-degraded (mirrors `prompt()`) →
   once-per-PR-cycle (`reflectedSessions` in-memory Set) → session exists → **plain interactive
   sessions only** (skip `teamRole` and `workUnitId` sessions — nobody is watching those cards).
@@ -103,7 +116,10 @@ hook never corrupts the `git.result` reply.
 | Reflection injected while a turn is in flight | Queues behind it (`AgentDriver.prompt` input-stream push); runs next. | driver behavior |
 | `gh` output yields no parseable URL | Reflection still fires (gate is `ok`, not `url`). | unit test |
 | Duplicate Create PR click | Once-per-PR-cycle guard: second click no-ops. | unit test |
-| Merge → new PR in same session | Guard cleared on `merge-pr` ok; next create-pr reflects. | unit test |
+| Merge → new PR in same session | Guard cleared on `merge-pr` ok / agent `gh pr merge` ok; next create reflects. | unit test |
+| Merge button: create + merge in ONE turn | Same-turn merge cancels the pending reflection (nothing left to amend). | unit test |
+| Turn aborted after `gh pr create` succeeded | No `result` event → the armed reflection fires when the NEXT turn settles. Accepted (late but still useful). | documented only |
+| Session killed with a live watcher | Watcher + guard entries removed in `kill()` ([BE2-24] block). | code |
 | Team lead/member, autopilot work-unit session | Skipped entirely. | unit test |
 | Degraded auth (no usable token) | Skipped (mirrors `prompt()`'s gate). | unit test |
 | No CLAUDE.md in the project | Agent proposes creating one in the interview. | prompt text |
@@ -137,6 +153,14 @@ hook never corrupts the `git.result` reply.
   7. Goal-judge overlap burns an iteration on the automated turn → **accepted & documented**.
   8. AskUserQuestion 4-question cap could truncate large interviews → **fixed**, batching
      instruction in the prompt.
+- **Critique round 2 (2026-08-12):** the round-1 "button-only" decision (finding 3) rested on a
+  FALSE premise: the git panel's PR button was described as dispatching the `create-pr` git
+  command, but the web client only sends `git` commands for status/diff — the PR/Merge buttons
+  prompt the agent to run `gh` itself, so the shipped hook never fired from the UI. Resolution
+  (owner): detect the PR step by watching the session's Bash tool results (`PrActivityWatcher`,
+  §4), keeping every daemon gate intact; the protocol hook stays as a secondary path; the
+  terminal PTY remains the (corrected) non-goal. Merge detection moved to the same watcher so
+  the PR-cycle guard also resets on agent-driven merges.
 
 ## 10. Open decisions
 

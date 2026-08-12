@@ -11,6 +11,74 @@
  * which updates the already-open PR on the same branch. No new PR, no bespoke daemon pipeline.
  */
 
+/** Matches a Bash command that creates/merges a PR via gh. The web git panel's PR and Merge
+ *  buttons work by PROMPTING the session agent to run these (see web panel STAGE_PROMPT) — they
+ *  never send the protocol's create-pr/merge-pr git command — so the daemon detects the PR step
+ *  by watching the session's own Bash tool traffic. */
+export function classifyPrCommand(input: unknown): "create" | "merge" | undefined {
+  const cmd = (input as { command?: unknown } | null)?.command;
+  if (typeof cmd !== "string") return undefined;
+  if (/\bgh\s+pr\s+create\b/.test(cmd)) return "create";
+  if (/\bgh\s+pr\s+merge\b/.test(cmd)) return "merge";
+  return undefined;
+}
+
+/** Minimal slice of the session events the watcher inspects. */
+export interface PrWatchEvent {
+  type: string;
+  toolUseId?: string;
+  name?: string;
+  input?: unknown;
+  content?: string;
+  isError?: boolean;
+}
+
+/**
+ * Per-session PR-activity watcher: observes the session's tool.use/tool.result/result events and
+ * says when the PR step actually happened. Reflection is deferred to the turn's `result` event —
+ * NOT fired on the create's tool.result — because the Merge button's single turn may run
+ * `gh pr create` AND `gh pr merge`: reflecting on an already-merged PR would tell the agent to
+ * push to a deleted remote branch. A same-turn merge therefore cancels the pending reflection.
+ * Pure state machine, no daemon deps — the Supervisor maps the returned action onto its gates.
+ */
+export class PrActivityWatcher {
+  private readonly uses = new Map<string, "create" | "merge">();
+  private pendingReflect = false;
+
+  /** Feed one session event. Returns "reflect" when a turn that opened a PR (and didn't merge it)
+   *  settles, "pr-merged" the moment a merge succeeds (the caller resets its PR-cycle guard). */
+  onEvent(e: PrWatchEvent): "reflect" | "pr-merged" | undefined {
+    if (e.type === "tool.use") {
+      if (e.name !== "Bash" || !e.toolUseId) return undefined;
+      const kind = classifyPrCommand(e.input);
+      if (kind) this.uses.set(e.toolUseId, kind);
+      return undefined;
+    }
+    if (e.type === "tool.result") {
+      const kind = e.toolUseId ? this.uses.get(e.toolUseId) : undefined;
+      if (!kind || !e.toolUseId) return undefined;
+      this.uses.delete(e.toolUseId);
+      if (e.isError) return undefined;
+      // A created PR must show its URL in the output (gh prints it) — belt & braces against a
+      // zero-exit run that didn't actually open one.
+      if (kind === "create" && /\/pull\/\d+/.test(e.content ?? "")) this.pendingReflect = true;
+      if (kind === "merge") {
+        this.pendingReflect = false; // same-turn merge: nothing left to amend
+        return "pr-merged";
+      }
+      return undefined;
+    }
+    if (e.type === "result") {
+      this.uses.clear(); // aborted tool calls from this turn can't resolve any more
+      if (this.pendingReflect) {
+        this.pendingReflect = false;
+        return "reflect";
+      }
+    }
+    return undefined;
+  }
+}
+
 /** Whether the post-PR CLAUDE.md reflection is enabled. On by default; disabled only when
  *  `ANVIL_CLAUDEMD_REFLECT` is explicitly a falsy word (`0`/`false`/`off`/`no`). Follows the
  *  existing `process.env.ANVIL_*` convention (e.g. agent/file-offer.ts). */

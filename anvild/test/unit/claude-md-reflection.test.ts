@@ -20,6 +20,8 @@ import { AccountStore } from "../../src/auth/accounts";
 import {
   CLAUDE_MD_REFLECTION_PROMPT,
   claudeMdReflectionEnabled,
+  classifyPrCommand,
+  PrActivityWatcher,
 } from "../../src/session/claude-md-reflection";
 
 // ── env gate ────────────────────────────────────────────────────────────────────────────────
@@ -154,6 +156,70 @@ test("the env off-switch and the degraded gate both suppress the reflection", ()
     expect(deg.prompts).toHaveLength(0);
   } finally {
     deg.cleanup();
+  }
+});
+
+// ── PR-activity watcher (the web PR/Merge buttons prompt the agent to run gh) ───────────────
+const use = (id: string, command: string) => ({ type: "tool.use", toolUseId: id, name: "Bash", input: { command } });
+const okResult = (id: string, content: string) => ({ type: "tool.result", toolUseId: id, content, isError: false });
+const PR_URL = "https://github.com/o/r/pull/7";
+
+test("classifyPrCommand recognises gh pr create/merge inside larger commands, nothing else", () => {
+  expect(classifyPrCommand({ command: "gh pr create --title x --body y" })).toBe("create");
+  expect(classifyPrCommand({ command: "git push -u origin b && gh pr create --fill" })).toBe("create");
+  expect(classifyPrCommand({ command: "gh pr merge --squash" })).toBe("merge");
+  expect(classifyPrCommand({ command: "gh pr view --json url" })).toBeUndefined();
+  expect(classifyPrCommand({ command: "echo gh && git commit" })).toBeUndefined();
+  expect(classifyPrCommand({})).toBeUndefined();
+  expect(classifyPrCommand(undefined)).toBeUndefined();
+});
+
+test("watcher: create → ok result with URL → turn settles ⇒ reflect (deferred to result)", () => {
+  const w = new PrActivityWatcher();
+  expect(w.onEvent(use("t1", "gh pr create --fill"))).toBeUndefined();
+  expect(w.onEvent(okResult("t1", `Created PR ${PR_URL}`))).toBeUndefined(); // NOT yet — waits for the turn
+  expect(w.onEvent({ type: "result" })).toBe("reflect");
+  expect(w.onEvent({ type: "result" })).toBeUndefined(); // one-shot per turn
+});
+
+test("watcher: a same-turn merge cancels the reflection (Merge button runs create AND merge)", () => {
+  const w = new PrActivityWatcher();
+  w.onEvent(use("t1", "gh pr create --fill"));
+  w.onEvent(okResult("t1", PR_URL));
+  expect(w.onEvent(use("t2", "gh pr merge --squash"))).toBeUndefined();
+  expect(w.onEvent(okResult("t2", "merged"))).toBe("pr-merged"); // guard reset, reflection dropped
+  expect(w.onEvent({ type: "result" })).toBeUndefined();
+});
+
+test("watcher: failed create, url-less create, and non-Bash tools never arm a reflection", () => {
+  const w = new PrActivityWatcher();
+  w.onEvent(use("t1", "gh pr create --fill"));
+  w.onEvent({ type: "tool.result", toolUseId: "t1", content: "boom", isError: true });
+  w.onEvent(use("t2", "gh pr create --fill"));
+  w.onEvent(okResult("t2", "exited 0 but printed nothing")); // no /pull/ URL — belt & braces
+  w.onEvent({ type: "tool.use", toolUseId: "t3", name: "Read", input: { command: "gh pr create" } });
+  w.onEvent(okResult("t3", PR_URL));
+  expect(w.onEvent({ type: "result" })).toBeUndefined();
+});
+
+test("supervisor: agent-driven gh pr create reflects via the emit sink at turn end", () => {
+  const h = harness({ ok: true, url: PR_URL });
+  const watch = (e: object) => (h.anySup as unknown as { maybeWatchPrActivity: (id: string, e: object) => void }).maybeWatchPrActivity("s1", e);
+  try {
+    watch(use("t1", "gh pr create --title t"));
+    watch(okResult("t1", PR_URL));
+    expect(h.prompts).toHaveLength(0); // deferred until the turn settles
+    watch({ type: "result" });
+    expect(h.prompts).toEqual([CLAUDE_MD_REFLECTION_PROMPT]);
+    // an agent-driven merge later resets the PR-cycle guard, so the next created PR reflects again
+    watch(use("t2", "gh pr merge --squash"));
+    watch(okResult("t2", "merged"));
+    watch(use("t3", "gh pr create --fill"));
+    watch(okResult("t3", PR_URL));
+    watch({ type: "result" });
+    expect(h.prompts).toHaveLength(2);
+  } finally {
+    h.cleanup();
   }
 });
 
