@@ -83,6 +83,7 @@ import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
 import { GitProjectionService } from "./git-projection-service";
+import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled, PrActivityWatcher } from "./claude-md-reflection";
 import { AutopilotService } from "./autopilot-service";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
@@ -1154,7 +1155,67 @@ export class Supervisor {
 
   // Git lifecycle + PR projection (arch §8) — delegated to GitProjectionService (P7 extraction).
   gitOp(cmd: GitCmd): GitResultEvent {
-    return this.gitProjection.gitOp(cmd);
+    const result = this.gitProjection.gitOp(cmd);
+    // Post-PR learning loop: after a successful interactive PR creation, have the session's own
+    // agent reflect on what it learned and interview the user about CLAUDE.md additions (best-
+    // effort; must never break the PR result the client is waiting on). Gated on `ok` alone —
+    // `url` is regex-scraped from gh output and a miss must not silently drop the reflection.
+    if (cmd.op === "create-pr" && result.ok) this.maybeReflectOnClaudeMd(cmd.sessionId);
+    // A merged PR rolls the worktree onto a fresh follow-up branch: a new PR cycle begins, so the
+    // next create-pr in this session deserves its own reflection (spec: once per PR cycle).
+    if (cmd.op === "merge-pr" && result.ok) this.reflectedSessions.delete(cmd.sessionId);
+    return result;
+  }
+
+  /** In-memory: sessions that already ran their post-PR CLAUDE.md reflection THIS PR cycle, so a
+   *  re-click of "Create PR" doesn't re-interview. Cleared on merge-pr rollover (new cycle).
+   *  Re-arming on a daemon restart is acceptable. */
+  private readonly reflectedSessions = new Set<string>();
+
+  /** Per-session PR-activity watchers. The web PR/Merge buttons prompt the AGENT to run
+   *  `gh pr create` / `gh pr merge` (they never send the protocol's create-pr git command), so the
+   *  PR step is detected from the session's own Bash tool events, observed on the emit sink. */
+  private readonly prWatchers = new Map<string, PrActivityWatcher>();
+
+  /** Emit-sink observer: feed tool.use/tool.result/result events to the session's PR watcher and
+   *  apply its verdicts — reflect when a turn that opened a PR settles; reset the PR-cycle guard
+   *  the moment a merge succeeds. Cheap for the non-tool event torrent (one type check). */
+  private maybeWatchPrActivity(sessionId: string, event: ServerEvent): void {
+    const t = event.type;
+    if (t !== "tool.use" && t !== "tool.result" && t !== "result") return;
+    try {
+      let w = this.prWatchers.get(sessionId);
+      if (!w) {
+        w = new PrActivityWatcher();
+        this.prWatchers.set(sessionId, w);
+      }
+      const action = w.onEvent(event as never);
+      if (action === "reflect") this.maybeReflectOnClaudeMd(sessionId);
+      else if (action === "pr-merged") this.reflectedSessions.delete(sessionId);
+    } catch (e) {
+      console.error(`[claude-md ${sessionId}] pr watcher failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  /** Inject the one-shot CLAUDE.md reflection turn (see claude-md-reflection.ts). Gated by env,
+   *  skipped when degraded (no usable token), already run this PR cycle, or not a plain interactive
+   *  session (team leads/members and autopilot work-unit sessions have nobody watching for the
+   *  interview card — spec decision 2026-08-12). Fully guarded — no failure here may propagate out
+   *  of gitOp. Uses the daemon-initiated driver.prompt path (like /compact): the turn runs without
+   *  echoing a message.user bubble. */
+  private maybeReflectOnClaudeMd(id: string): void {
+    try {
+      if (!claudeMdReflectionEnabled()) return;
+      if (this.authDegrade.degraded()) return;
+      if (this.reflectedSessions.has(id)) return;
+      const s = this.sessions.get(id);
+      if (!s) return; // session gone (e.g. killed between call and here)
+      if (s.data.teamRole || s.data.workUnitId) return; // interactive sessions only
+      this.reflectedSessions.add(id);
+      this.ensureDriver(id).prompt(CLAUDE_MD_REFLECTION_PROMPT);
+    } catch (e) {
+      console.error(`[claude-md ${id}] reflection injection failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
   refreshPrState(id: string): Promise<void> {
     return this.gitProjection.refreshPrState(id);
@@ -1560,6 +1621,8 @@ export class Supervisor {
     // the daemon's lifetime (a slow leak keyed by every session ever killed).
     this.awaitingAnnounced.delete(id);
     this.goalPushSuppressed.delete(id);
+    this.reflectedSessions.delete(id);
+    this.prWatchers.delete(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
@@ -1815,6 +1878,7 @@ export class Supervisor {
         this.maybeNotify(sessionId, event);
         this.maybeBroadcastAwaiting(sessionId, event);
         this.maybeBroadcastTeamStatus(sessionId, event);
+        this.maybeWatchPrActivity(sessionId, event);
       },
       () => this.persistSoon(), // [BE-1] high-frequency emit path is debounced; lifecycle ops flush now
       (event) => log.append(event),

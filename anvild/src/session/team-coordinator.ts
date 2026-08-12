@@ -148,7 +148,12 @@ export class TeamCoordinator {
     const lead = this.deps.getSession(leadId);
     if (!lead || lead.data.teamRole !== "lead") throw new BadCommand("this member has no lead to message");
     this.chargeRelay(leadId);
-    this.deps.prompt(leadId, `Member "${member.data.title}" (${memberId}) says: ${text}`);
+    // Blockquote the relayed text so it renders as an attributed quote, not a run-on line.
+    const quoted = text
+      .split("\n")
+      .map((l) => `> ${l}`)
+      .join("\n");
+    this.deps.prompt(leadId, `Member "${member.data.title}" (${memberId}) says:\n\n${quoted}`);
     return `Relayed to your lead "${lead.data.title}"; it will see your message next turn.`;
   }
 
@@ -452,8 +457,13 @@ export class TeamCoordinator {
       // A real conflict: hand it to the lead as an agent turn; a re-run of integrate() continues past it.
       this.deps.prompt(
         leadId,
-        `Integration hit a merge conflict pulling in member "${result.failedMember}". ` +
-          `Resolve the conflicts in this worktree, commit the merge, then call the integrate tool again to continue.`,
+        [
+          `Integration hit a merge conflict pulling in member "${result.failedMember}".`,
+          "",
+          "- Resolve the conflicts in this worktree.",
+          "- Commit the merge.",
+          "- Call the `integrate` tool again to continue.",
+        ].join("\n"),
       );
     }
     // #8: a completed integrate consumes the active plan (no stale dependsOn lingering for a re-run).
