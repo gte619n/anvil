@@ -83,6 +83,7 @@ import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
 import { GitProjectionService } from "./git-projection-service";
+import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled } from "./claude-md-reflection";
 import { AutopilotService } from "./autopilot-service";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
@@ -1154,7 +1155,42 @@ export class Supervisor {
 
   // Git lifecycle + PR projection (arch §8) — delegated to GitProjectionService (P7 extraction).
   gitOp(cmd: GitCmd): GitResultEvent {
-    return this.gitProjection.gitOp(cmd);
+    const result = this.gitProjection.gitOp(cmd);
+    // Post-PR learning loop: after a successful interactive PR creation, have the session's own
+    // agent reflect on what it learned and interview the user about CLAUDE.md additions (best-
+    // effort; must never break the PR result the client is waiting on). Gated on `ok` alone —
+    // `url` is regex-scraped from gh output and a miss must not silently drop the reflection.
+    if (cmd.op === "create-pr" && result.ok) this.maybeReflectOnClaudeMd(cmd.sessionId);
+    // A merged PR rolls the worktree onto a fresh follow-up branch: a new PR cycle begins, so the
+    // next create-pr in this session deserves its own reflection (spec: once per PR cycle).
+    if (cmd.op === "merge-pr" && result.ok) this.reflectedSessions.delete(cmd.sessionId);
+    return result;
+  }
+
+  /** In-memory: sessions that already ran their post-PR CLAUDE.md reflection THIS PR cycle, so a
+   *  re-click of "Create PR" doesn't re-interview. Cleared on merge-pr rollover (new cycle).
+   *  Re-arming on a daemon restart is acceptable. */
+  private readonly reflectedSessions = new Set<string>();
+
+  /** Inject the one-shot CLAUDE.md reflection turn (see claude-md-reflection.ts). Gated by env,
+   *  skipped when degraded (no usable token), already run this PR cycle, or not a plain interactive
+   *  session (team leads/members and autopilot work-unit sessions have nobody watching for the
+   *  interview card — spec decision 2026-08-12). Fully guarded — no failure here may propagate out
+   *  of gitOp. Uses the daemon-initiated driver.prompt path (like /compact): the turn runs without
+   *  echoing a message.user bubble. */
+  private maybeReflectOnClaudeMd(id: string): void {
+    try {
+      if (!claudeMdReflectionEnabled()) return;
+      if (this.authDegrade.degraded()) return;
+      if (this.reflectedSessions.has(id)) return;
+      const s = this.sessions.get(id);
+      if (!s) return; // session gone (e.g. killed between call and here)
+      if (s.data.teamRole || s.data.workUnitId) return; // interactive sessions only
+      this.reflectedSessions.add(id);
+      this.ensureDriver(id).prompt(CLAUDE_MD_REFLECTION_PROMPT);
+    } catch (e) {
+      console.error(`[claude-md ${id}] reflection injection failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
   refreshPrState(id: string): Promise<void> {
     return this.gitProjection.refreshPrState(id);
