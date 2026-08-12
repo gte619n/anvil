@@ -101,11 +101,14 @@ export function buildAutopilotGoal(u: WorkUnit): string | undefined {
   return `the plan for “${u.title}” is fully implemented in this worktree and the project's build and tests pass`;
 }
 
-/** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task. */
+/** The opening brief handed to a plan's build session: the rationale + plan, framed as a build task.
+ *  Structured markdown (headings + bullets) — this renders as the session's opening message. */
 export function buildAutopilotBrief(u: WorkUnit): string {
-  const head = `You are implementing the autopilot work unit “${u.title}”.${u.rationale ? `\n\n${u.rationale}` : ""}`;
-  const body = u.plan ? `\n\nHere is the plan to implement:\n\n${u.plan}` : "";
-  return `${head}${body}\n\nImplement it end to end in this worktree, then summarize what you changed.`;
+  const parts: string[] = [`You are implementing the autopilot work unit “${u.title}”.`];
+  if (u.rationale) parts.push(`## Why\n\n${u.rationale}`);
+  if (u.plan) parts.push(`## The plan\n\n${u.plan}`);
+  parts.push(["## Your job", "", "- Implement it end to end in this worktree.", "- Then summarize what you changed."].join("\n"));
+  return parts.join("\n\n");
 }
 
 /**
@@ -118,9 +121,8 @@ export function buildAutopilotBrief(u: WorkUnit): string {
  */
 export function buildPlanningBrief(u: WorkUnit, todoistPrompt: string): string {
   const held = u.status === "needs-clarification";
-  const parts: string[] = [
-    `You are planning the autopilot work unit “${u.title}” with the user, in this worktree.${u.rationale ? `\n\n${u.rationale}` : ""}`,
-  ];
+  const parts: string[] = [`You are planning the autopilot work unit “${u.title}” with the user, in this worktree.`];
+  if (u.rationale) parts.push(`## Why\n\n${u.rationale}`);
   if (todoistPrompt.trim()) {
     parts.push(`## The original request (from Todoist)\n\n${todoistPrompt.trim()}`);
   }

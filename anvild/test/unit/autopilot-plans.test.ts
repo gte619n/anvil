@@ -115,5 +115,6 @@ test("buildAutopilotBrief frames the unit as a build task, including rationale +
 
   const minimal = buildAutopilotBrief(wu({ title: "Bare", rationale: undefined, plan: undefined }));
   expect(minimal).toContain("Bare");
-  expect(minimal).not.toContain("Here is the plan");
+  expect(minimal).not.toContain("## The plan");
+  expect(minimal).not.toContain("## Why");
 });
