@@ -81,7 +81,9 @@ test("[WEB2-6] a 1000-bubble transcript saves a bounded slice (cap = 200)", () =
   expect(bubbles.length).toBe(200);
   expect(bubbles[0]!.textContent).toContain("msg 800");
   expect(bubbles[199]!.textContent).toContain("msg 999");
-});
+}, 30_000); // fill(1000) is ~1.2s locally (appendUser × 1000); a loaded CI runner can exceed the 5s
+// default even though the asserted work (serialize ≤200 clones) is trivial — match the sibling
+// conversation-replay 1000-event tests' 30s guard so the heavy fixture setup can't flake the suite.
 
 test("[WEB2-6] the common case (under the cap) is byte-identical to the old full clone", () => {
   fill(50);
