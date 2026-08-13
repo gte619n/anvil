@@ -24,6 +24,7 @@ function harness(overrides?: { intakeModel?: (ctx: { prompt: string; isFeature: 
   const runEvents: { type: string; run?: { loopId: string; status: string } }[] = [];
   const registry = { toAll: (e: { type: string; run?: { loopId: string; status: string } }) => { events.push(e.type); if (e.type === "loop.run") runEvents.push(e); } } as unknown as ConnectionRegistry;
   let autopilotCalls = 0;
+  const resolveCalls: { workUnitId: string; status: string; closeTodoist: boolean }[] = [];
   const notes: { title: string; body: string; tag: string; hash?: string }[] = [];
   const svc = new LoopService({
     registry,
@@ -33,10 +34,11 @@ function harness(overrides?: { intakeModel?: (ctx: { prompt: string; isFeature: 
     judgeEnv: () => ({}),
     onCatalogChange: () => {},
     autopilotRun: async () => { autopilotCalls++; return { created: 3, summary: "3 new" }; },
+    resolveWorkUnit: async (workUnitId, status, closeTodoist) => { resolveCalls.push({ workUnitId, status, closeTodoist }); },
     notify: (title, body, tag, hash) => notes.push({ title, body, tag, ...(hash ? { hash } : {}) }),
     ...(overrides?.intakeModel ? { intakeModel: overrides.intakeModel } : {}),
   });
-  return { svc, env, events, runEvents, notes, autopilotCalls: () => autopilotCalls, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
+  return { svc, env, events, runEvents, notes, resolveCalls, autopilotCalls: () => autopilotCalls, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
 }
 
 test("intakeSuggest is repo-aware: reads the env's test script and narrows by a keyword", async () => {
@@ -225,6 +227,56 @@ test("edit-while-armed is rejected (pause to edit); configRevision bumps on save
     const edited = h.svc.save({ id: created.id, name: "L2", trigger: created.trigger, act: created.act, checks: [] }).loop;
     expect(edited.configRevision).toBe(2);
     expect(edited.name).toBe("L2");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("complete: sets `completed`, resolves the linked work unit, and passes the closeTodoist choice through", async () => {
+  const h = harness();
+  try {
+    const loop = h.svc.save({ name: "Fix upload", environmentId: h.env.id, trigger: { kind: "manual" }, act: { kind: "session-prompt", prompt: "x" }, checks: [], workUnitId: "wu7" }).loop;
+    const ev = await h.svc.complete(loop.id, true);
+    expect(ev.loop.status).toBe("completed");
+    expect(h.svc.list().loops.find((l) => l.id === loop.id)?.status).toBe("completed");
+    expect(h.resolveCalls).toEqual([{ workUnitId: "wu7", status: "completed", closeTodoist: true }]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("complete: a loop with no linked work unit skips the Todoist resolve entirely", async () => {
+  const h = harness();
+  try {
+    const loop = h.svc.save({ name: "Standalone", environmentId: h.env.id, trigger: { kind: "manual" }, act: { kind: "session-prompt", prompt: "x" }, checks: [] }).loop;
+    const ev = await h.svc.complete(loop.id, true);
+    expect(ev.loop.status).toBe("completed");
+    expect(h.resolveCalls).toEqual([]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("archive retires a loop to `archived` (no Todoist side effects); restore re-pauses it", () => {
+  const h = harness();
+  try {
+    const loop = h.svc.save({ name: "Old", environmentId: h.env.id, trigger: { kind: "manual" }, act: { kind: "session-prompt", prompt: "x" }, checks: [] }).loop;
+    expect(h.svc.archive(loop.id).loop.status).toBe("archived");
+    expect(h.resolveCalls).toEqual([]);
+    // "Restore" is a plain pause back to an editable, inactive loop.
+    expect(h.svc.pause(loop.id).loop.status).toBe("paused");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the daemon-managed Todoist-intake singleton can't be completed or archived", async () => {
+  const h = harness();
+  try {
+    h.svc.startScheduler(); // ensures the loop_autopilot singleton exists
+    h.svc.stopScheduler();
+    expect(() => h.svc.archive("loop_autopilot")).toThrow(/can't be archived/i);
+    await expect(h.svc.complete("loop_autopilot", false)).rejects.toThrow(/can't be completed/i);
   } finally {
     h.cleanup();
   }

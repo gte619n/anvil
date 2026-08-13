@@ -173,7 +173,8 @@ export function loopEntityToCircuit(loop: Loop, run?: LoopRun): CircuitView {
 export function entityStatus(loop: Loop, run?: LoopRun): LoopStatus {
   if (run?.status === "at-gate") return "gated";
   if (run && (run.status === "running" || run.status === "sent-back")) return "running";
-  if (loop.status === "paused" || loop.status === "disabled") return "paused";
+  // completed/archived are inactive → render muted like paused (the row chip labels them distinctly).
+  if (loop.status === "paused" || loop.status === "disabled" || loop.status === "completed" || loop.status === "archived") return "paused";
   if (loop.status === "armed") return "armed";
   return "idle";
 }
