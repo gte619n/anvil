@@ -78,10 +78,17 @@ let panelView: ConversationDeps["panelView"];
 let renderLinks: ConversationDeps["renderLinks"];
 export function initConversation(deps: ConversationDeps): void {
   ({ activeId, activeServer, sessions, environments, snapshotLoaded, saveConvoCache, setStatus, panelView, renderLinks } = deps);
+  // Re-bind the import-time DOM captures (`conversation`/`stopBtn`) to the LIVE document before wiring.
+  // In production this is a no-op — the elements are present when the bundle loads. But the test harness
+  // shares one module registry across files (bun), so conversation.ts may have been first imported before
+  // a given test installed its DOM, leaving the captures null; re-resolving here makes init order-independent
+  // (a null capture would otherwise throw at `conversation.addEventListener` below).
+  conversation = $("#conversation") ?? conversation;
+  stopBtn = $<HTMLButtonElement>("#stop") ?? stopBtn;
   wireConversationDom();
 }
 
-export const conversation = $("#conversation");
+export let conversation = $("#conversation");
 // Scroll lock: only auto-follow new content when the user is already at the bottom.
 // `ui.stickToBottom` lives in state.ts — main's selectSession also re-pins it on session open.
 export const scrollDown = (force = false): void => {
@@ -728,7 +735,7 @@ function maybeShowAttachDiagnostic(id: string): void {
 }
 
 // ── Stop the running turn (§stop) ────────────────────────────────────────────────
-const stopBtn = $<HTMLButtonElement>("#stop");
+let stopBtn = $<HTMLButtonElement>("#stop");
 /** While a turn is actively running, a subtle Stop appears to the left of Send. Send itself stays
  *  enabled-when-there's-input (it was getting stuck disabled) — you can queue a follow-up either way. */
 export function updateComposerMode(status: string): void {
