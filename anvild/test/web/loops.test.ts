@@ -14,9 +14,10 @@ let fleet: typeof import("../../web/src/fleet");
 let overlays: typeof import("../../web/src/overlays");
 const sent: { type: string }[] = [];
 const approved: string[] = [];
+const resolves: Record<string, unknown>[] = [];
 
 beforeAll(async () => {
-  installDom({ html: `<!doctype html><html><body><div id="loops-root"></div><span id="loops-badge" hidden></span><div id="toast"></div></body></html>` });
+  installDom({ html: `<!doctype html><html><body><div id="loops-root"></div><span id="loops-badge" hidden></span><div id="toast"></div><div id="modal-root"></div></body></html>` });
   fleet = await import("../../web/src/fleet");
   overlays = await import("../../web/src/overlays");
   loops = await import("../../web/src/loops");
@@ -27,6 +28,7 @@ beforeAll(async () => {
     environments: new Map(),
     sendAwait: async (_s, cmd) => {
       if (cmd.type === "autopilot.approve") approved.push(String(cmd.workUnitId));
+      if (cmd.type === "autopilot.resolve") resolves.push(cmd);
       return { type: "autopilot.approved" } as never;
     },
     selectSession: () => {},
@@ -40,6 +42,7 @@ beforeEach(() => {
   overlays.overlays.length = 0;
   sent.length = 0;
   approved.length = 0;
+  resolves.length = 0;
   fleet.serverLoops.clear(); // module Maps are shared across test files — clear all loop caches
   fleet.serverLoopEntities.clear();
   fleet.loopRuns.clear();
@@ -98,6 +101,22 @@ test("tapping the goal row opens a detail with the live lap count that a new sna
   fleet.serverLoops.set(fleet.HUB_URL, SNAPSHOT.map((l) => (l.id === "s1" ? { ...l, iteration: { current: 3, max: 10 } } : l)));
   loops.onLoopsHome();
   expect(document.querySelector("#loops-root")!.innerHTML).toContain("Lap 3 / 10");
+});
+
+test("a draft can be marked done — resolves its work unit completed and closes the Todoist source task", async () => {
+  const draft: LoopSummary = { kind: "draft", id: "wuD", environmentName: "Website", title: "Share presenter notes in Slates", trigger: "(from Todoist)", act: "Review & convert to a loop", stopCondition: "Waiting at your gate", status: "gated", rung: "suggest", runnerAt: "gate" };
+  fleet.serverLoops.set(fleet.HUB_URL, [draft]);
+  loops.openLoops();
+  [...document.querySelectorAll<HTMLElement>("#loops-root .lc-row")].find((r) => r.dataset.id === "wuD")!.click();
+  const doneBtn = document.getElementById("lc-draft-done") as HTMLButtonElement;
+  expect(doneBtn).toBeTruthy();
+  doneBtn.click();
+  await new Promise((r) => setTimeout(r, 0)); // let the confirm-with-option modal mount
+  const ok = document.getElementById("cd-ok") as HTMLButtonElement; // option ("close Todoist") defaults checked
+  expect(ok).toBeTruthy();
+  ok.click();
+  await new Promise((r) => setTimeout(r, 0)); // let markDraftDone's send resolve
+  expect(resolves).toEqual([{ type: "autopilot.resolve", workUnitId: "wuD", status: "completed", closeTodoist: true, cid: expect.any(String) }]);
 });
 
 test("the proposal is approvable from its detail page", async () => {

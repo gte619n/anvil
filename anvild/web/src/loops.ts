@@ -421,6 +421,7 @@ function renderProjectedDetail(): void {
       <button class="mini danger" id="lc-reject">${icon("close")} Reject</button>`;
   else if (l.kind === "draft")
     actions = `<button class="primary" id="lc-convert">${icon("all_inclusive")} Convert to a loop</button>
+      <button class="mini" id="lc-draft-done">${icon("check_circle")} Mark done</button>
       <button class="mini" id="lc-open-draft">${icon("open_in_new")} Open the draft</button>`;
   else if (l.sessionId) actions = `<button class="mini" id="lc-jump">${icon("open_in_new")} Open its session</button>`;
   const iterCard = l.iteration
@@ -450,6 +451,7 @@ function renderProjectedDetail(): void {
   document.getElementById("lc-convert")?.addEventListener("click", () =>
     void openIntake(l.title, { workUnitId: l.id, ...(l.environmentId ? { environmentId: l.environmentId } : {}) }),
   );
+  document.getElementById("lc-draft-done")?.addEventListener("click", () => void markDraftDone(l.id, l.title));
   document.getElementById("lc-approve")?.addEventListener("click", () => void approveProposal(l.id));
   document.getElementById("lc-reject")?.addEventListener("click", () => void rejectProposal(l.id, l.title));
 }
@@ -545,6 +547,30 @@ async function approveProposal(id: string): Promise<void> {
     backHome();
   } catch (err) {
     toast(`Approve failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+/** Draft is "done" — the work was already finished elsewhere. Resolves the draft's work unit as
+ *  completed (drops the card) and, by default, closes its Todoist source task(s). Same `autopilot.resolve`
+ *  path the Autopilot grid uses; on a draft `l.id` is the work-unit id. */
+async function markDraftDone(id: string, title: string): Promise<void> {
+  const r = await confirmDialogWithOption({
+    title: `Mark “${title}” done?`,
+    body: "Removes the draft — use this when the work was already finished elsewhere.",
+    confirmLabel: "Mark done",
+    icon: "check_circle",
+    optionLabel: "Also complete the Todoist source task",
+    optionChecked: true,
+  });
+  if (!r.ok) return;
+  const srv = projSock(id);
+  if (!srv?.sock.isOpen()) return void toast("That loop's server is offline");
+  try {
+    const res = await sendAwait(srv, { type: "autopilot.resolve", workUnitId: id, status: "completed", closeTodoist: r.checked, cid: newCid() }, 60_000);
+    if (res.type === "command.error") return void toast(res.message);
+    toast(r.checked ? "Marked done · Todoist task completed" : "Marked done");
+    backHome();
+  } catch (err) {
+    toast(`Mark done failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 async function rejectProposal(id: string, title: string): Promise<void> {
