@@ -385,6 +385,8 @@ export class Supervisor {
       // FU-1: real-model intake overlay (Sonnet, no tools). Falls back to the heuristic in LoopService on
       // any failure, so an unreachable model or missing token never breaks intake.
       intakeModel: (ctx) => modelIntake(ctx, this.agentEnv()),
+      // Completing a loop that came from an autopilot draft relabels/closes its Todoist source task(s).
+      resolveWorkUnit: (workUnitId, status, closeTodoist) => this.autopilot.resolvePlan(workUnitId, status, closeTodoist),
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);

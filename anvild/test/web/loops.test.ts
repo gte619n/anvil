@@ -1,6 +1,7 @@
 /**
  * Phase 1 acceptance (loops-circuit spec §5): with an armed schedule, one armed /goal, and one pending
- * proposal, #loops lists 3 circuit rows with correct runner/lock/lap state; the goal detail shows the
+ * proposal, #loops renders the actionable rows (goal + proposal) with correct runner/lock/lap state and
+ * filters out the autopilot `schedule` heartbeat (no gate the user operates); the goal detail shows the
  * live lap count (and re-renders when a new snapshot bumps it); the proposal is approvable from its
  * detail page. Driven over jsdom with a seeded serverLoops cache + a fake hub socket.
  */
@@ -51,15 +52,34 @@ const SNAPSHOT: LoopSummary[] = [
   { kind: "trigger", id: "wu1", title: "CI build broke", trigger: "CI #1421", act: "Approve to plan & build", stopCondition: "Awaiting your approval", status: "gated", rung: "suggest", runnerAt: "gate" },
 ];
 
-test("the home lists 3 circuit rows with the right status chips", () => {
+test("the home lists the actionable rows and filters out the autopilot schedule heartbeat", () => {
   fleet.serverLoops.set(fleet.HUB_URL, SNAPSHOT);
   loops.openLoops();
   const rows = document.querySelectorAll("#loops-root .lc-row");
-  expect(rows.length).toBe(3);
-  // schedule armed, goal lap 2/10, proposal at your gate
-  expect(document.querySelector("#loops-root")!.innerHTML).toContain("lap 2/10");
-  expect(document.querySelector("#loops-root")!.innerHTML).toContain("at your gate");
+  // The `schedule` row (the nightly-autopilot conveyor — no gate the user operates) is not rendered here;
+  // only the goal + proposal, both of which have something to act on, remain.
+  expect(rows.length).toBe(2);
+  const html = document.querySelector("#loops-root")!.innerHTML;
+  expect(html).not.toContain("Nightly autopilot");
+  expect(html).toContain("lap 2/10"); // goal
+  expect(html).toContain("at your gate"); // proposal
   expect(sent.some((m) => m.type === "loops.get")).toBe(true); // pulled fresh on open
+});
+
+test("project-first: rows group by project, and within a project sort by status (gate-blockers lead)", () => {
+  const two: LoopSummary[] = [
+    { kind: "goal", id: "a-run", environmentName: "Alpha", title: "A running", trigger: "t", act: "a", stopCondition: "s", status: "running", rung: "pr", sessionId: "a-run" },
+    { kind: "trigger", id: "a-gate", environmentName: "Alpha", title: "A gated", trigger: "t", act: "a", stopCondition: "s", status: "gated", rung: "suggest", runnerAt: "gate" },
+    { kind: "goal", id: "b-run", environmentName: "Beta", title: "B running", trigger: "t", act: "a", stopCondition: "s", status: "running", rung: "pr", sessionId: "b-run" },
+  ];
+  fleet.serverLoops.set(fleet.HUB_URL, two);
+  loops.openLoops();
+  const heads = [...document.querySelectorAll("#loops-root .lc-envsep")].map((h) => h.textContent);
+  expect(heads.some((t) => t!.includes("Alpha"))).toBe(true);
+  expect(heads.some((t) => t!.includes("Beta"))).toBe(true);
+  const order = [...document.querySelectorAll<HTMLElement>("#loops-root .lc-row")].map((r) => r.dataset.id);
+  // Alpha's gated row precedes Alpha's running row; Beta is its own section after Alpha (alphabetical).
+  expect(order).toEqual(["a-gate", "a-run", "b-run"]);
 });
 
 test("the badge counts loops waiting at the gate", () => {
