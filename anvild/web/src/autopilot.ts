@@ -395,7 +395,9 @@ let apGridScroll = 0;
 /** Every active loop across the connected fleet, in server order (schedule → goals → pipelines → proposals). */
 function activeLoops(): LoopSummary[] {
   const out: LoopSummary[] = [];
-  for (const s of orderedServers()) out.push(...(serverLoops.get(s.url) ?? []));
+  // The "draft" kind is a Loops-home affordance ("drafts at your gate"); the Autopilot panel keeps its
+  // original set (schedule/goal/pipeline/proposal) so this coexisting surface stays unchanged (spec §3).
+  for (const s of orderedServers()) out.push(...(serverLoops.get(s.url) ?? []).filter((l) => l.kind !== "draft"));
   return out;
 }
 const LOOP_ICON: Record<string, string> = { schedule: "schedule", goal: "target", pipeline: "hub", trigger: "bolt" };
@@ -414,15 +416,13 @@ function loopRowHtml(l: LoopSummary): string {
     <span class="loop-meta">${iter}<span class="loop-status-chip loop-${esc(l.status)}">${esc(l.status)}</span>${next}</span>
   </div>`;
 }
-/** The Loops panel — one surface naming every active loop (empty string when nothing is looping). */
+/** The Loops panel is retired at the Phase 4 flip — the first-class Loops home (#loops) replaces it, so
+ *  the Autopilot view no longer duplicates it. Kept as a no-op to preserve the render call sites. */
 function loopsPanelHtml(): string {
-  const loops = activeLoops();
-  if (!loops.length) return "";
-  return `<section class="loops-panel">
-    <div class="loops-head">${icon("all_inclusive")} <b>Loops</b> <span class="small muted">${loops.length} active</span></div>
-    <div class="loops-list">${loops.map(loopRowHtml).join("")}</div>
-  </section>`;
+  return "";
 }
+void activeLoops;
+void loopRowHtml;
 /** A loop row that owns a session jumps into it on click/Enter. */
 function wireLoopRows(host: HTMLElement): void {
   host.querySelectorAll<HTMLElement>(".loop-row[data-loop-session]").forEach((r) => {

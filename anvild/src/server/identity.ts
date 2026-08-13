@@ -96,6 +96,9 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   // the `updateApiVersion` field) to drive a member through the stable path vs the legacy daemon.update
   // (stable-update-service spec §4.3).
   "stable-update",
+  // First-class Loop entity + engine + gate verbs (loops-circuit spec). A client gates every loop.*
+  // send on this so an older daemon (projection-only) degrades to the Phase 0 loops.snapshot panel.
+  "loops",
 ];
 
 /** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */

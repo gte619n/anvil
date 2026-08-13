@@ -811,10 +811,20 @@ export interface AutopilotScheduleEvent extends Envelope {
 }
 
 // ── Loops (loop-engineering: one surface naming every active loop) ────────────────────
-export type LoopKind = "schedule" | "goal" | "pipeline" | "trigger";
-export type LoopStatus = "idle" | "armed" | "running" | "waiting";
+// The "draft" kind is a work-unit draft awaiting a human (proposed/planned) — it shows in the Loops
+// home's "drafts at your gate" section and converts to a real Loop (Phase 2). "gated"/"paused" statuses
+// let a projected row read as at-gate / held.
+export type LoopKind = "schedule" | "goal" | "pipeline" | "trigger" | "draft";
+export type LoopStatus = "idle" | "armed" | "running" | "waiting" | "gated" | "paused";
+/** Autonomy rung = where the human gate sits on the circuit (concept §2). Suggest (report only) → Draft
+ *  (writes a branch) → PR (opens a verified PR) → Ship (merges on green, no gate). */
+export type LoopRung = "suggest" | "draft" | "pr" | "ship";
+/** Where the runner sits on the Trigger → Act ⇄ Check → gate → Ship circuit (for the glyph/SVG). */
+export type LoopStation = "trigger" | "act" | "check" | "gate" | "ship";
 /** One active loop, projected for the Loops panel. Answers the four questions a loop is framed around:
- *  what triggers it, what stops it, where it is now, and (run-until-done loops) which iteration it's on. */
+ *  what triggers it, what stops it, where it is now, and (run-until-done loops) which iteration it's on.
+ *  The optional `act`/`rung`/`runnerAt`/`scope` fields feed the circuit renderer (Loops home); when a
+ *  daemon omits them the client derives sensible defaults from `kind`/`status`. */
 export interface LoopSummary {
   kind: LoopKind;
   id: string; // stable per-loop id (session id, work-unit id, or the synthetic "schedule")
@@ -823,9 +833,15 @@ export interface LoopSummary {
   stopCondition: string; // when it stops
   status: LoopStatus;
   nextFireAt?: Iso8601; // schedule only
-  iteration?: { current: number; max: number }; // goal loops (and pipeline loopbacks)
+  iteration?: { current: number; max: number }; // goal loops (and pipeline loopbacks) — the lap count
   sessionId?: SessionId; // jump target when the loop owns a session
   detail?: string; // the judge's last blocker, the phase reached, etc.
+  act?: string; // the Act-station label (what the loop does), distinct from trigger/stop
+  rung?: LoopRung; // autonomy rung → the circuit's gate position (default derived from kind)
+  runnerAt?: LoopStation; // where the runner currently sits (default derived from status)
+  scope?: string; // scope note for the circuit's shield line (Contract v2)
+  environmentId?: string; // owning environment (for env grouping in the Loops home)
+  environmentName?: string; // display name of the owning environment
 }
 /** The set of active loops — answer to `loops.get` (cid) and broadcast (no cid) whenever the set changes
  *  (a run starts/ends, a goal arms/resolves, an event proposes a unit). */
@@ -834,6 +850,174 @@ export interface LoopsSnapshotEvent extends Envelope {
   cid?: Cid;
   loops: LoopSummary[];
 }
+
+// ── Loop entity (loops-circuit spec §4.1) — the persisted, first-class Loop + its runs ──────────────
+// The spec names the loop's lifecycle field `LoopStatus`; that identifier is already taken by the
+// projection `LoopSummary.status` above, so the entity lifecycle is `LoopState` here (Loop.status:
+// LoopState). Same four values as the spec.
+export type LoopState = "draft" | "armed" | "paused" | "disabled";
+
+/** External event channels an `event`-triggered loop can subscribe to (mirrors event-trigger.ts). */
+export type TriggerKind = "ci-failure" | "github" | "todoist-label" | "webhook" | "manual";
+
+export type LoopTrigger =
+  | { kind: "manual" }
+  | { kind: "schedule"; timeOfDay: string; days?: number[] } // per-loop AutopilotScheduleStore due-logic
+  | { kind: "event"; eventKind: TriggerKind; dedupeKey?: string }
+  | { kind: "chained"; onLoopId: string; on: "success" | "failure" | "any" };
+
+export type LoopAct =
+  | { kind: "session-prompt"; prompt: string; model?: Model; autonomy?: AutonomyPolicy }
+  | { kind: "autopilot" } // RESERVED: only the daemon-managed Todoist-intake singleton (contract rejects it on user loops)
+  | { kind: "pipeline" } // §4 dev pipeline over the linked unit
+  | { kind: "skill-check"; command: string }; // deterministic body, no model
+
+// `locks`: globs the acting lap may NOT touch (its own check inputs). The guard denies the union of
+// every check's `locks`. Explicit config — intake auto-suggests for command/metric checks.
+export type LoopCheck = { locks?: string[] } & (
+  | { kind: "judge"; condition: string } // judgeGoal, maker–checker separated
+  | { kind: "command"; command: string; expectExit?: number }
+  | { kind: "metric"; command: string; op: "gte" | "lte" | "eq"; threshold: number } // Phase 5
+  | { kind: "http"; url: string; expectStatus?: number } // Phase 5
+);
+
+export interface LoopScope {
+  allow: string[]; // globs relative to repo root
+  note?: string;
+}
+export interface LoopHardStops {
+  maxLaps: number; // default 10 — hard lap ceiling
+  tokenBudget: number; // REQUIRED (contract defaults: 300k session/skill, 500k autopilot/pipeline)
+  timeBudgetMs?: number; // optional extra ceiling
+  noProgressLaps: number; // default 2 — N identical no-progress laps ends the run terminal
+}
+export interface LoopNotify {
+  onGate: boolean;
+  onFailure: boolean;
+  onSuccess: boolean;
+  dailyDigest: boolean;
+}
+/** How the `ship` rung auto-merges (loops-circuit follow-up FU-3). `method` mirrors `gh pr merge`;
+ *  `requireGreen` gates the merge on `gh pr checks` passing (a red/pending CI leaves the PR open, no
+ *  merge). Absent ⇒ the historical default: squash, no CI wait. */
+export interface LoopMerge {
+  method: "squash" | "merge" | "rebase";
+  requireGreen?: boolean;
+}
+export interface Loop {
+  id: string; // "loop_…"
+  name: string;
+  environmentId?: string; // owning env → executing daemon; absent = hub
+  status: LoopState;
+  trigger: LoopTrigger;
+  act: LoopAct;
+  checks: LoopCheck[]; // ≥1 to arm without warning
+  checksMode: "all" | "any";
+  scope?: LoopScope; // Contract v2: allowed globs + implicit check-file locks
+  rung: LoopRung; // gate position = autonomy
+  hardStops: LoopHardStops;
+  merge?: LoopMerge; // `ship`-rung auto-merge method + optional green-CI gate (FU-3; default squash)
+  assumptions: string[]; // logged at intake ("still ambiguous" acceptances)
+  notify: LoopNotify;
+  cleanGatedLaps: number; // consecutive human-approved laps → promotion suggestion
+  configRevision: number; // bumped on every edit; a run pins the revision it started with
+  workUnitId?: string; // set when converted from an autopilot draft
+  createdAt: Iso8601;
+  updatedAt: Iso8601;
+}
+/** User-editable subset accepted by `loop.save` (id present → update, absent → create). contract.ts
+ *  validates + defaults this into a full Loop. */
+export interface LoopInput {
+  id?: string;
+  name: string;
+  environmentId?: string;
+  trigger: LoopTrigger;
+  act: LoopAct;
+  checks: LoopCheck[];
+  checksMode?: "all" | "any";
+  scope?: LoopScope;
+  rung?: LoopRung;
+  hardStops?: Partial<LoopHardStops>;
+  merge?: LoopMerge; // ship-rung merge method + green-CI gate (FU-3)
+  assumptions?: string[];
+  notify?: Partial<LoopNotify>;
+  workUnitId?: string; // link to the autopilot draft this loop was set up from (intake convert path)
+}
+
+export type LapVerdict = "pass" | "fail" | "check-error" | "scope-violation" | "check-tampering";
+export interface LapCheckResult {
+  check: string; // the check's label
+  v: LapVerdict;
+  detail?: string;
+}
+export interface Lap {
+  n: number;
+  summary: string;
+  verdicts: LapCheckResult[];
+  tokens?: number;
+  at: Iso8601;
+}
+export type LoopRunStatus = "running" | "at-gate" | "shipped" | "failed" | "over-budget" | "no-progress" | "interrupted" | "sent-back";
+export interface LoopRun {
+  id: string;
+  loopId: string;
+  configRevision: number;
+  trigger: { kind: string; source?: string; at: Iso8601 };
+  status: LoopRunStatus;
+  laps: Lap[];
+  sessionId?: SessionId; // heavy bodies; tapping a lap opens this transcript
+  checkpoint?: { lap: number; claudeSessionId?: string; pipelinePhase?: string };
+  gate?: { openedAt?: Iso8601; sentBackNote?: string };
+  reason?: string; // terminal explanation (budget, no-progress, error)
+  dryRun?: boolean; // a throwaway first lap (Phase 3 intake) — report only, gate verbs refuse it
+  startedAt: Iso8601;
+  endedAt?: Iso8601;
+}
+// ── Loop entity events (loops-circuit spec §4.3) ────────────────────────────────────────────────────
+/** All persisted loops — answer to `loops.list` (cid) and broadcast (no cid) on any catalog change. */
+export interface LoopsListEvent extends Envelope {
+  type: "loops.list";
+  cid?: Cid;
+  loops: Loop[];
+}
+/** A single loop changed (save/arm/pause/convert). Carries the full loop. */
+export interface LoopUpdatedEvent extends Envelope {
+  type: "loop.updated";
+  cid?: Cid;
+  loop: Loop;
+}
+/** A live run/lap update — streamed as laps advance, the run parks at the gate, or reaches a terminal. */
+export interface LoopRunEvent extends Envelope {
+  type: "loop.run";
+  cid?: Cid;
+  run: LoopRun;
+}
+/** Run history for a loop — answer to `loop.runs.get`. */
+export interface LoopRunsEvent extends Envelope {
+  type: "loop.runs";
+  cid?: Cid;
+  loopId: string;
+  runs: LoopRun[];
+}
+/** A repo-aware intake proposal (loops-circuit spec §4.4) — Claude's suggested check/scope/stops/gate for
+ *  an outcome, plus the "still ambiguous" assumptions. The web's intake conversation drives off this. */
+export interface LoopIntakeSuggestion {
+  isFeature: boolean; // fix-something-broken vs build-something-new (drives the check-first framing)
+  name: string;
+  checkCommand?: string; // the proposed command check (e.g. "bun test upload")
+  checkLocks?: string[]; // its on-disk inputs to lock (check-tampering guard)
+  scopeAllow: string[]; // proposed scope globs
+  maxLaps: number;
+  tokenBudget: number;
+  rung: LoopRung;
+  assumptions: string[]; // the "still ambiguous" acceptances to log
+}
+export interface LoopIntakeResultEvent extends Envelope {
+  type: "loop.intake.result";
+  cid?: Cid;
+  suggestion: LoopIntakeSuggestion;
+}
+
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
 export type GitOp = "status" | "diff" | "commit" | "push" | "create-pr" | "merge-pr";
 export interface GitResultEvent extends Envelope {
@@ -1080,6 +1264,11 @@ export type ServerEvent =
   | AutopilotMaintenanceResultEvent
   | AutopilotScheduleEvent
   | LoopsSnapshotEvent
+  | LoopsListEvent
+  | LoopUpdatedEvent
+  | LoopRunEvent
+  | LoopRunsEvent
+  | LoopIntakeResultEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent
@@ -1490,7 +1679,57 @@ export interface AutopilotScheduleGetCmd extends Envelope, Correlated {
   type: "autopilot.schedule.get"; // current schedule → autopilot.schedule
 }
 export interface LoopsGetCmd extends Envelope, Correlated {
-  type: "loops.get"; // the current set of active loops → loops.snapshot
+  type: "loops.get"; // the current set of active loops (Phase 0 projection) → loops.snapshot
+}
+// ── Loop entity commands (loops-circuit spec §4.3) ──────────────────────────────────────────────────
+export interface LoopsListCmd extends Envelope, Correlated {
+  type: "loops.list"; // all persisted loops → loops.list
+}
+export interface LoopSaveCmd extends Envelope, Correlated {
+  type: "loop.save"; // create (no id) or update (id) → loop.updated + loops.list broadcast
+  loop: LoopInput;
+}
+export interface LoopRemoveCmd extends Envelope, Correlated {
+  type: "loop.remove";
+  loopId: string;
+}
+export interface LoopArmCmd extends Envelope, Correlated {
+  type: "loop.arm"; // draft/paused → armed → loop.updated
+  loopId: string;
+}
+export interface LoopPauseCmd extends Envelope, Correlated {
+  type: "loop.pause"; // armed → paused (edit-when-paused) → loop.updated
+  loopId: string;
+}
+export interface LoopRunCmd extends Envelope, Correlated {
+  type: "loop.run"; // start a manual run (or a lap now) → loop.run stream
+  loopId: string;
+}
+export interface LoopDryRunCmd extends Envelope, Correlated {
+  type: "loop.dryrun"; // first lap in a throwaway worktree, report only (Phase 3) → loop.run stream
+  loopId: string;
+}
+export interface LoopGateOpenCmd extends Envelope, Correlated {
+  type: "loop.gate.open"; // ship per rung (Suggest report / Draft branch / PR PR) → loop.run
+  runId: string;
+}
+export interface LoopGateSendbackCmd extends Envelope, Correlated {
+  type: "loop.gate.sendback"; // record the note + run exactly one more lap with it injected → loop.run
+  runId: string;
+  note: string;
+}
+export interface LoopRunsGetCmd extends Envelope, Correlated {
+  type: "loop.runs.get"; // run history for a loop → loop.runs
+  loopId: string;
+}
+export interface LoopConvertCmd extends Envelope, Correlated {
+  type: "loop.convert"; // an autopilot draft → a real Loop (keeps the unit; drives its tags) → loop.updated
+  workUnitId: string;
+}
+export interface LoopIntakeCmd extends Envelope, Correlated {
+  type: "loop.intake"; // repo-aware intake proposal for an outcome → loop.intake.result
+  prompt: string;
+  environmentId?: string;
 }
 export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   type: "autopilot.schedule.set"; // update fields (omitted fields unchanged) → autopilot.schedule
@@ -1643,6 +1882,18 @@ export type ClientCommand =
   | AutopilotScheduleGetCmd
   | AutopilotScheduleSetCmd
   | LoopsGetCmd
+  | LoopsListCmd
+  | LoopSaveCmd
+  | LoopRemoveCmd
+  | LoopArmCmd
+  | LoopPauseCmd
+  | LoopRunCmd
+  | LoopDryRunCmd
+  | LoopGateOpenCmd
+  | LoopGateSendbackCmd
+  | LoopRunsGetCmd
+  | LoopConvertCmd
+  | LoopIntakeCmd
   | DaemonUpdateCmd
   // terminal
   | TerminalOpenCmd

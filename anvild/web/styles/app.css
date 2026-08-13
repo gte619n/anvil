@@ -968,6 +968,96 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .loop-status-chip.loop-running { color: #f2c037; }
 .loop-status-chip.loop-armed { color: #2196c9; }
 .loop-status-chip.loop-waiting { color: #b07cc3; }
+/* Richer projection statuses (proposal → gated at the gate, paused goal) — the Autopilot Loops panel
+   consumes the same loops.snapshot, so it needs these too (a proposal reads as purple, as "waiting" did). */
+.loop-row.loop-gated { border-left-color: #b07cc3; }
+.loop-row.loop-paused { border-left-color: var(--muted); }
+.loop-status-chip.loop-gated { color: #b07cc3; }
+.loop-status-chip.loop-paused { color: var(--muted); }
+
+/* ── Loops home (#loops) — the circuit surface (ported from web/preview/loops-preview.html) ────────── */
+.loops-view .lc-app { max-width: 780px; margin: 0 auto; padding: 18px 14px 90px; height: 100%; overflow-y: auto; box-sizing: border-box; }
+.lc-top { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+.lc-top h1 { font-size: 20px; margin: 0; flex: 1; display: flex; align-items: center; gap: 8px; }
+.lc-top h1 .msym { color: var(--accent); }
+.lc-sub { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; line-height: 1.5; }
+.lc-intake { border: 1px solid var(--border); border-radius: 14px; background: var(--panel); padding: 14px; margin-bottom: 20px; }
+.lc-intake-row { display: flex; gap: 8px; }
+.lc-intake input { flex: 1; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); font: inherit; font-size: 14px; }
+.lc-intake .primary { white-space: nowrap; }
+.lc-envsep { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); margin: 14px 2px 8px; }
+.lc-envsep-count { margin-left: 4px; opacity: 0.7; }
+.lc-envsep .env-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.lc-rows { display: flex; flex-direction: column; gap: 8px; }
+.lc-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); cursor: pointer; }
+.lc-row:hover { border-color: var(--accent); }
+.lc-row .lc-mini { flex-shrink: 0; }
+.lc-row .m { flex: 1; min-width: 0; }
+.lc-row .t { display: block; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lc-row .s { display: block; font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.lc-row .lc-chev { color: var(--muted); flex-shrink: 0; }
+.lc-chip { font-size: 11px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.lc-chip.running { color: #f2c037; border-color: #f2c03766; }
+.lc-chip.armed { color: #2196c9; border-color: #2196c966; }
+.lc-chip.gated { color: #b07cc3; border-color: #b07cc366; }
+.lc-chip.paused { color: var(--muted); }
+.lc-circuit-card { border: 1px solid var(--border); border-radius: 14px; background: var(--panel); padding: 10px 8px 4px; margin-bottom: 14px; }
+.lc-circuit { width: 100%; height: auto; display: block; }
+.lc-st-circle { fill: var(--bg); stroke: var(--border); stroke-width: 2; }
+.lc-st.on .lc-st-circle { stroke: var(--accent); }
+.lc-st.done .lc-st-circle { stroke: #21ba45; }
+.lc-st-ico { font-family: "Material Symbols Rounded"; font-size: 20px; fill: var(--muted); }
+.lc-st.on .lc-st-ico { fill: var(--accent); }
+.lc-st.done .lc-st-ico { fill: #21ba45; }
+.lc-st-lbl { font-size: 11px; fill: var(--muted); }
+.lc-st-sub { font-size: 9.5px; fill: var(--muted); opacity: 0.8; }
+.lc-track { stroke: var(--border); stroke-width: 2; fill: none; }
+.lc-return { stroke: var(--accent); stroke-width: 2; fill: none; stroke-dasharray: 5 5; opacity: 0.75; }
+.lc-lap { font-size: 11px; fill: var(--accent); }
+.lc-gate-d { fill: var(--panel); stroke: #b07cc3; stroke-width: 2; }
+.lc-gate-ico { font-family: "Material Symbols Rounded"; font-size: 13px; fill: #b07cc3; }
+.lc-gate-lbl { font-size: 9.5px; fill: #b07cc3; }
+.lc-runner { fill: #f2c037; filter: drop-shadow(0 0 5px #f2c037); }
+.lc-runner-g { transition: transform 0.9s cubic-bezier(0.5, 0, 0.4, 1); }
+.lc-scope { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); padding: 2px 12px 8px; }
+.lc-scope .msym { font-size: 14px; color: #21ba45; }
+.lc-scope b { color: var(--text); font-weight: 600; }
+.lc-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.lc-head h2 { font-size: 16.5px; margin: 0; flex: 1; min-width: 140px; }
+.lc-actions { display: inline-flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.lc-card { border: 1px solid var(--border); border-radius: 12px; background: var(--panel); padding: 12px 14px; margin-bottom: 12px; }
+.lc-card > h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 10px; }
+.lc-caps { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; }
+.lc-caps .cap { min-width: 130px; flex: 1; }
+.lc-caps .cap b { display: block; font-size: 12px; margin-bottom: 4px; }
+.lc-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.lc-bar i { display: block; height: 100%; background: var(--accent); }
+.lc-bar i.warn { background: #e8730c; }
+.lc-caps .cap span { color: var(--muted); font-size: 11px; }
+.lc-ladder { display: flex; gap: 6px; }
+.lc-ladder button { flex: 1; padding: 9px 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--muted); cursor: pointer; font: inherit; font-size: 11.5px; text-align: center; }
+.lc-ladder button b { display: block; font-size: 12px; color: var(--text); margin-bottom: 2px; }
+.lc-ladder button.on { border-color: #b07cc3; background: color-mix(in srgb, #b07cc3 12%, transparent); }
+.lc-ladder button.on b { color: #b07cc3; }
+.lc-ladder button:disabled { cursor: default; opacity: 0.85; }
+.lc-ladder-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; }
+.lc-promote { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding: 8px 10px; border: 1px solid #b07cc3; border-radius: 10px; background: color-mix(in srgb, #b07cc3 10%, transparent); font-size: 12px; }
+.lc-promote .msym { color: #b07cc3; }
+.lc-promote span { flex: 1; }
+.lc-promote button { white-space: nowrap; }
+.lc-assume { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+.lc-assume li { margin: 3px 0; }
+/* Claude-led intake conversation */
+.lc-chat { display: flex; flex-direction: column; gap: 10px; }
+.lc-bub { max-width: 92%; padding: 10px 13px; border-radius: 13px; font-size: 13px; line-height: 1.55; }
+.lc-bub.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.lc-bub.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+.lc-bub code { background: color-mix(in srgb, var(--muted) 22%, transparent); padding: 0 4px; border-radius: 4px; }
+.lc-bub ul { margin: 6px 0 0; padding-left: 18px; }
+.lc-chips { display: flex; flex-wrap: wrap; gap: 7px; align-self: flex-start; }
+.lc-chips button { border: 1px solid var(--accent); background: transparent; color: var(--accent); border-radius: 999px; padding: 6px 13px; font: inherit; font-size: 12.5px; cursor: pointer; }
+.lc-chips button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.lc-new-modal textarea, .lc-new-modal input, .lc-new-modal select { width: 100%; box-sizing: border-box; }
 
 /* Plan reader. The plan reads full-width; `position: relative` anchors the pipeline-trace card and
    `overflow: hidden` clips nothing here (the body owns the vertical scroll). */

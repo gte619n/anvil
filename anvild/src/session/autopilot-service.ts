@@ -303,22 +303,42 @@ export class AutopilotService {
     this.deps.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid
   }
 
+  /** Seed a loop.convert with a draft work unit's request (name / env / prompt), or undefined if gone. */
+  workUnitSeed(id: string): { name: string; environmentId?: string; prompt: string } | undefined {
+    const u = this.workUnits.get(id);
+    if (!u) return undefined;
+    return { name: u.title, ...(u.environmentId ? { environmentId: u.environmentId } : {}), prompt: workUnitTaskText(u) };
+  }
+
   /** The autopilot-owned slice of the Loops panel snapshot (the Supervisor adds the goal rows). */
   loopsInputs(): Omit<LoopsInput, "goals"> {
     const schedule = this.autopilotSchedule.get();
     const next = nextScheduledFire(schedule, new Date());
+    const envName = (id?: string): { environmentId?: string; environmentName?: string } => {
+      if (!id) return {};
+      const name = this.deps.envStore.get(id)?.name;
+      return { environmentId: id, ...(name ? { environmentName: name } : {}) };
+    };
     const pipelines = [...this.runningPipelines].map(([id, title]) => {
-      const phaseReached = this.workUnits.get(id)?.devPipeline?.phaseReached;
-      return { id, title, ...(phaseReached ? { phaseReached } : {}) };
+      const u = this.workUnits.get(id);
+      const phaseReached = u?.devPipeline?.phaseReached;
+      return { id, title, ...(phaseReached ? { phaseReached } : {}), ...envName(u?.environmentId) };
     });
     const proposals = this.workUnits
       .list()
       .filter((u) => u.status === "proposed")
-      .map((u) => ({ id: u.id, title: u.title, source: u.trigger?.source ?? "event" }));
+      .map((u) => ({ id: u.id, title: u.title, source: u.trigger?.source ?? "event", ...envName(u.environmentId) }));
+    // Drafts a human owns next: planned/needs-clarification units not yet building (Loops home's
+    // "drafts at your gate" section). Excludes proposed (its own row above), building, and terminal states.
+    const drafts = this.workUnits
+      .list()
+      .filter((u) => u.status === "planned" || u.status === "needs-clarification")
+      .map((u) => ({ id: u.id, title: u.title, status: u.status, source: u.trigger?.source ?? "Todoist", ...envName(u.environmentId) }));
     return {
       schedule: { enabled: schedule.enabled, timeOfDay: schedule.timeOfDay, running: this.autopilotRunning, autoStart: schedule.autoStart, ...(next ? { nextRunAt: next.toISOString() } : {}) },
       pipelines,
       proposals,
+      drafts,
     };
   }
 

@@ -31,6 +31,7 @@ import {
   type AutopilotRunSnapshotEvent,
   type AutopilotMaintenanceResultEvent,
   type LoopsSnapshotEvent,
+  type LoopUpdatedEvent,
   type AuthProvider,
   type AuthStatusEvent,
   type AuthAccountsEvent,
@@ -85,6 +86,8 @@ import { EnvironmentService } from "./environment-service";
 import { GitProjectionService } from "./git-projection-service";
 import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled, PrActivityWatcher } from "./claude-md-reflection";
 import { AutopilotService } from "./autopilot-service";
+import { LoopService } from "./loop-service";
+import { modelIntake } from "../loops/intake-model";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
 import type { WorkUnit } from "../integrations/workunit";
@@ -225,6 +228,7 @@ export class Supervisor {
   private readonly teams: TeamCoordinator;
   /** Autopilot domain — work-unit plans, runs, dev pipeline, schedule, Todoist/lapo sync (P7 extraction). */
   private readonly autopilot: AutopilotService;
+  readonly loops: LoopService;
   private prSweepTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
@@ -353,6 +357,35 @@ export class Supervisor {
         this.broadcastUpdated(built.data);
       },
     });
+    this.loops = new LoopService({
+      registry: this.registry,
+      stateDir: cfg.stateDir,
+      envStore: this.envStore,
+      worktreeRoot: () => this.store.worktreeRoot(),
+      judgeEnv: () => this.agentEnv(),
+      accounts: this.accounts,
+      accountId: () => undefined,
+      notify: (title, body, tag, hash) => {
+        const payload = { title, body, tag, ...(hash ? { hash } : {}) };
+        void this.webpush.notify(payload);
+        void this.fcm.notify(payload);
+        void this.apns.notify(payload);
+      },
+      onCatalogChange: () => this.broadcastLoops(),
+      autopilotRun: async () => {
+        const r = await this.autopilot.runAutopilot({ notify: false, autoStart: false });
+        return { created: r.created, summary: `${r.created} new · ${r.skipped} already in pipeline` };
+      },
+      runPipeline: async (loop) => {
+        // A `pipeline`-body loop runs the autonomous dev pipeline over its linked work unit.
+        if (!loop.workUnitId) return "no linked work unit for the pipeline body";
+        const outcome = await this.autopilot.runDevPipeline(loop.workUnitId, {});
+        return `pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}`;
+      },
+      // FU-1: real-model intake overlay (Sonnet, no tools). Falls back to the heuristic in LoopService on
+      // any failure, so an unreachable model or missing token never breaks intake.
+      intakeModel: (ctx) => modelIntake(ctx, this.agentEnv()),
+    });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);
     this.fcm = new Fcm(cfg.stateDir);
@@ -364,6 +397,7 @@ export class Supervisor {
     });
     this.restore();
     this.autopilot.startScheduler();
+    this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
     this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
@@ -704,22 +738,35 @@ export class Supervisor {
   loopsSnapshotEvent(cid?: string): LoopsSnapshotEvent {
     const goals = this.list()
       .filter((s) => s.goal)
-      .map((s) => ({
-        sessionId: s.id,
-        title: s.title,
-        condition: s.goal!.condition,
-        iterations: s.goal!.iterations,
-        ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
-        ...(s.goal!.paused ? { paused: true } : {}),
-      }));
-    const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals });
+      .map((s) => {
+        const envName = s.environmentId ? this.envStore.get(s.environmentId)?.name : undefined;
+        return {
+          sessionId: s.id,
+          title: s.title,
+          condition: s.goal!.condition,
+          iterations: s.goal!.iterations,
+          ...(s.goal!.lastReason ? { lastReason: s.goal!.lastReason } : {}),
+          ...(s.goal!.paused ? { paused: true } : {}),
+          ...(s.environmentId ? { environmentId: s.environmentId } : {}),
+          ...(envName ? { environmentName: envName } : {}),
+        };
+      });
+    const loops = buildLoopsSnapshot({ ...this.autopilot.loopsInputs(), goals, excludeSessionIds: this.loops.activeRunSessionIds() });
     return { v: PROTOCOL_VERSION, type: "loops.snapshot", ts: now(), ...(cid ? { cid } : {}), loops };
   }
   private broadcastLoops(): void {
     this.registry.toAll(this.loopsSnapshotEvent());
   }
-  /** Ingest an external event as a proposed work unit (loop-engineering: Channels). */
+  /** Convert an autopilot draft (work unit) into a real Loop, seeded from the unit's request. */
+  convertDraftToLoop(workUnitId: string, cid?: string): LoopUpdatedEvent {
+    const seed = this.autopilot.workUnitSeed(workUnitId);
+    if (!seed) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    return this.loops.convert(workUnitId, seed, cid);
+  }
+  /** Ingest an external event as a proposed work unit (loop-engineering: Channels). Also routes the event
+   *  to any armed `event`-triggered Loop subscribed to this kind (spec §4 Phase 4 event routing). */
   ingestTrigger(input: TriggerEvent): Promise<AutopilotPlanInfo> {
+    this.loops.handleEvent(input.kind, input.source, input.dedupeKey);
     return this.autopilot.ingestTrigger(input);
   }
   /** Approve a proposed (event-triggered) unit — promote to planned and optionally start. */

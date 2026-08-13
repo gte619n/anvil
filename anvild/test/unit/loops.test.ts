@@ -44,23 +44,69 @@ test("a goal loop carries its condition, live iteration count, and last blocker"
   });
 });
 
-test("a paused goal reads as armed (re-arms next turn)", () => {
+test("a paused goal reads as paused (no runner on the circuit)", () => {
   const rows = buildLoopsSnapshot({ ...empty, goals: [{ sessionId: "s1", title: "t", condition: "c", iterations: 0, paused: true }] });
-  expect(rows[0]!.status).toBe("armed");
+  expect(rows[0]!.status).toBe("paused");
+  expect(rows[0]!.runnerAt).toBeUndefined();
 });
 
-test("proposals are waiting-on-a-human loops keyed by their source", () => {
+test("proposals sit at your gate keyed by their source", () => {
   const rows = buildLoopsSnapshot({ ...empty, proposals: [{ id: "wu1", title: "Fix build", source: "CI build #1421" }] });
-  expect(rows[0]).toMatchObject({ kind: "trigger", status: "waiting", trigger: "CI build #1421", stopCondition: "Awaiting your approval" });
+  expect(rows[0]).toMatchObject({ kind: "trigger", status: "gated", runnerAt: "gate", rung: "suggest", trigger: "CI build #1421", stopCondition: "Awaiting your approval" });
 });
 
-test("rows are ordered schedule → goals → pipelines → proposals (most-active first)", () => {
+test("work-unit drafts render as gated draft rows in the drafts section", () => {
+  const rows = buildLoopsSnapshot({
+    ...empty,
+    drafts: [
+      { id: "wu1", title: "Add export", status: "planned", source: "Todoist" },
+      { id: "wu2", title: "Unclear ask", status: "needs-clarification" },
+    ],
+  });
+  expect(rows.map((r) => r.kind)).toEqual(["draft", "draft"]);
+  expect(rows[0]).toMatchObject({ kind: "draft", status: "gated", runnerAt: "gate" });
+  expect(rows[1]!.act).toMatch(/open questions/i);
+});
+
+test("circuit fields: schedule is a suggest-rung heartbeat; a live goal laps at Check", () => {
+  const rows = buildLoopsSnapshot({
+    ...empty,
+    schedule: { enabled: true, timeOfDay: "02:00", running: false, autoStart: true },
+    goals: [{ sessionId: "s1", title: "g", condition: "c", iterations: 2 }],
+  });
+  expect(rows[0]).toMatchObject({ kind: "schedule", rung: "suggest", act: expect.any(String) });
+  expect(rows[0]!.runnerAt).toBeUndefined(); // armed → no runner
+  expect(rows[1]).toMatchObject({ kind: "goal", rung: "pr", runnerAt: "check" });
+});
+
+test("excludeSessionIds drops goal rows owned by a live LoopRun (no double-vision)", () => {
+  const rows = buildLoopsSnapshot({
+    ...empty,
+    goals: [
+      { sessionId: "s1", title: "owned by a loop", condition: "c", iterations: 1 },
+      { sessionId: "s2", title: "free goal", condition: "c", iterations: 1 },
+    ],
+    excludeSessionIds: ["s1"],
+  });
+  expect(rows.map((r) => r.id)).toEqual(["s2"]);
+});
+
+test("environment id/name flow through to rows for grouping", () => {
+  const rows = buildLoopsSnapshot({
+    ...empty,
+    goals: [{ sessionId: "s1", title: "g", condition: "c", iterations: 0, environmentId: "env_1", environmentName: "anvil-web" }],
+  });
+  expect(rows[0]).toMatchObject({ environmentId: "env_1", environmentName: "anvil-web" });
+});
+
+test("rows are ordered schedule → goals → pipelines → proposals → drafts (most-active first)", () => {
   const rows = buildLoopsSnapshot({
     schedule: { enabled: true, timeOfDay: "02:00", running: false, autoStart: false },
     goals: [{ sessionId: "s1", title: "g", condition: "c", iterations: 1 }],
     pipelines: [{ id: "wu1", title: "p", phaseReached: "verification" }],
     proposals: [{ id: "wu2", title: "pr", source: "GH #9" }],
+    drafts: [{ id: "wu3", title: "d", status: "planned" }],
   });
-  expect(rows.map((r) => r.kind)).toEqual(["schedule", "goal", "pipeline", "trigger"]);
+  expect(rows.map((r) => r.kind)).toEqual(["schedule", "goal", "pipeline", "trigger", "draft"]);
   expect(rows[2]!.detail).toBe("Phase: verification");
 });

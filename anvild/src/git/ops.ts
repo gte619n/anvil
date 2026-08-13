@@ -360,6 +360,21 @@ export async function prStatusAsync(cwd: string): Promise<{ state?: "open" | "me
   }
 }
 
+/** CI status for the current branch's PR via `gh pr checks` (FU-3 `requireGreen` gate). Returns:
+ *  `green` when every required check passed; `pending` when some are still running; `failing` when any
+ *  failed; `unknown` when there's no PR / no checks / `gh` errored. `gh pr checks` exits 0 (all pass),
+ *  8 (pending), or non-zero (failing) — we read the exit plus a light output sniff so a red merge is
+ *  never green-lit. */
+export function prChecksState(cwd: string): "green" | "pending" | "failing" | "unknown" {
+  const r = run(["gh", "pr", "checks"], cwd, NET_TIMEOUT_MS);
+  if (r.code === 0) return "green";
+  // gh uses exit 8 for "some checks are still pending". Anything else with output is a real failure.
+  if (r.code === 8 || /pending|in progress|queued/i.test(r.out)) return "pending";
+  if (/no checks reported|no pull requests found|no open pull request/i.test(r.out)) return "unknown";
+  if (/fail|error|✗|X\b/i.test(r.out)) return "failing";
+  return "unknown";
+}
+
 /** Best-effort delete of the remote branch (for abandon/cleanup). */
 export function deleteRemoteBranch(cwd: string, branch: string): void {
   run(["git", "push", "origin", "--delete", branch], cwd, NET_TIMEOUT_MS);

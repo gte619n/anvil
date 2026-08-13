@@ -28,6 +28,8 @@ export interface PushPayload {
   dir?: string;
   /** One-line summary of what the session is asking for (e.g. "Run: git push"). */
   ask?: string;
+  /** A deep-link hash for a non-session notification (e.g. "#loops/<id>" for a loop at the gate). */
+  hash?: string;
 }
 
 /**

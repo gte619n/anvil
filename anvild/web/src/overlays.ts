@@ -25,8 +25,15 @@ export const planFromHash = (): string | null => {
 // `#autopilot` opens the Autopilot grid directly (the deep link the lapo run report posts). Handled on
 // cold load and on warm hashchange, like #p/ and #s/.
 export const autopilotFromHash = (): boolean => location.hash === "#autopilot";
+// `#loops` opens the Loops home directly (the first-class autonomy surface). Handled on cold load and
+// warm hashchange, like #autopilot. `#loops/<loopId>` deep-links straight to a loop's detail page.
+export const loopsFromHash = (): boolean => location.hash === "#loops" || location.hash.startsWith("#loops/");
+export const loopFromHash = (): string | null => {
+  const m = location.hash.match(/^#loops\/(.+)$/);
+  return m ? decodeURIComponent(m[1]!) : null;
+};
 
-type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader" | "menu";
+type OverlayName = "modal" | "settings" | "autopilot" | "plan" | "sidebar" | "panel" | "reader" | "menu" | "loops";
 interface Overlay {
   name: OverlayName;
   close: () => void; // pure DOM/state teardown — must NOT touch history itself
