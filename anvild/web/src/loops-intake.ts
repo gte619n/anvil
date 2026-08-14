@@ -14,6 +14,9 @@ import type { Environment, LoopInput, LoopIntakeSuggestion, LoopRung, ServerEven
 export interface IntakeDeps {
   environments: Map<string, Environment>;
   sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
+  /** Subscribe to the repo-analysis lines the daemon streams for this intake (cid-tagged). Returns an
+   *  unsubscribe. Fires between send and the terminal loop.intake.result. */
+  subscribeIntakeProgress(cid: string, onLine: (line: string) => void): () => void;
   rootId: string; // the element the conversation renders into (#lc-root)
   onArmed(loopId: string): void; // open the new loop's detail
   onCancel(): void; // back to the home
@@ -73,27 +76,54 @@ function resolveEnv(fromDraft?: { environmentId?: string }): string | undefined 
   return ids[0]; // undefined when the fleet has no environments (arm is blocked with a clear message)
 }
 
-export async function openIntake(prompt: string, fromDraft?: { workUnitId: string; environmentId?: string }): Promise<void> {
-  const app = document.getElementById(deps.rootId);
-  if (!app) return;
-  const environmentId = resolveEnv(fromDraft);
-  const envName = environmentId ? deps.environments.get(environmentId)?.name : undefined;
-  // Ask the daemon for a repo-aware suggestion (loops-capable server; else fall back to a local heuristic).
-  const srv = targetServer(environmentId);
-  let suggestion: LoopIntakeSuggestion | undefined;
-  if (srv?.sock.isOpen()) {
-    try {
-      const res = await deps.sendAwait(srv, { type: "loop.intake", prompt, ...(environmentId ? { environmentId } : {}), cid: newCid() }, 30_000);
-      if (res.type === "loop.intake.result") suggestion = res.suggestion;
-    } catch {
-      /* fall through to the local default */
-    }
-  }
-  const s: LoopIntakeSuggestion = suggestion ?? localSuggestion(prompt);
-  const draft: Draft = {
+interface IntakeActivity {
+  push(line: string): void; // append one streamed analysis step
+  finalize(grounded: boolean): void; // collapse; check if repo-grounded, else "quick defaults"
+}
+
+/** A collapsible live panel (reuses the conversation `.activity` styling) that lists the intake agent's
+ *  repo-analysis steps as they stream in, then settles to a summary. */
+function renderIntakeActivity(chat: HTMLElement): IntakeActivity {
+  const el = document.createElement("details");
+  el.className = "activity live";
+  el.open = true;
+  el.innerHTML =
+    `<summary><span class="activity-row"><span class="activity-ind"><i></i><i></i><i></i></span>` +
+    `<span class="activity-title">Studying your codebase</span><span class="activity-count"></span>` +
+    `<span class="msym activity-chevron">expand_more</span></span></summary><div class="activity-full"></div>`;
+  chat.appendChild(el);
+  el.scrollIntoView?.({ behavior: "smooth", block: "end" });
+  const full = el.querySelector<HTMLElement>(".activity-full")!;
+  let n = 0;
+  return {
+    push(line) {
+      n++;
+      const row = document.createElement("div");
+      row.className = "lc-step";
+      row.textContent = line;
+      full.appendChild(row);
+      const count = el.querySelector(".activity-count");
+      if (count) count.textContent = ` · ${n}`;
+      el.scrollIntoView?.({ behavior: "smooth", block: "end" });
+    },
+    finalize(grounded) {
+      el.classList.remove("live");
+      el.open = false;
+      const ind = el.querySelector(".activity-ind");
+      if (ind) ind.innerHTML = icon(grounded ? "check" : "bolt");
+      const title = el.querySelector(".activity-title");
+      if (title) title.textContent = grounded ? "Studied your codebase" : "Used quick defaults";
+      // Nothing streamed (e.g. no repo, or an older server) — a blank panel is noise, so drop it.
+      if (n === 0) el.remove();
+    },
+  };
+}
+
+function draftFrom(s: LoopIntakeSuggestion, prompt: string, environmentId?: string, workUnitId?: string): Draft {
+  return {
     name: s.name,
     ...(environmentId ? { environmentId } : {}),
-    ...(fromDraft?.workUnitId ? { workUnitId: fromDraft.workUnitId } : {}),
+    ...(workUnitId ? { workUnitId } : {}),
     prompt: prompt.replace(/^\(from Todoist\)\s*/i, "") || s.name,
     checkLocks: s.checkLocks ?? [],
     scopeAllow: [],
@@ -103,6 +133,61 @@ export async function openIntake(prompt: string, fromDraft?: { workUnitId: strin
     assumptions: [],
     runnerAt: null,
   };
+}
+
+export async function openIntake(prompt: string, fromDraft?: { workUnitId: string; environmentId?: string }): Promise<void> {
+  const app = document.getElementById(deps.rootId);
+  if (!app) return;
+  const environmentId = resolveEnv(fromDraft);
+  const envName = environmentId ? deps.environments.get(environmentId)?.name : undefined;
+  const srv = targetServer(environmentId);
+
+  // Paint the intake shell IMMEDIATELY so the click has instant feedback. The daemon's repo-aware
+  // suggestion (loop.intake) is a live model call that can take several seconds — we must never sit on
+  // the previous screen while it runs. Start from the local heuristic, then refine in place once it lands.
+  const localDraft = draftFrom(localSuggestion(prompt), prompt, environmentId, fromDraft?.workUnitId);
+  app.innerHTML = `
+    <div class="lc-head"><button class="mini" id="lc-cancel">${icon("close")} Cancel</button><h2>New loop</h2></div>
+    <div class="lc-circuit-card" id="lc-live-circuit">${circuitSvg(draftCircuit(localDraft))}</div>
+    <p class="lc-sub" style="text-align:center">${icon("auto_awesome")} Claude is building the circuit with you — watch the stations light up.</p>
+    <div class="lc-chat" id="lc-chat"></div>`;
+  document.getElementById("lc-cancel")?.addEventListener("click", () => deps.onCancel());
+  const chat = document.getElementById("lc-chat")!;
+  const bubble = (cls: string, html: string): HTMLElement => {
+    const d = document.createElement("div");
+    d.className = "lc-bub " + cls;
+    d.innerHTML = html;
+    chat.appendChild(d);
+    d.scrollIntoView?.({ behavior: "smooth", block: "end" });
+    return d;
+  };
+  bubble("user", esc(prompt || localDraft.name));
+
+  // A live "studying your codebase" panel: the daemon reads the repo (CLAUDE.md/docs + the real code) to
+  // ground the loop, and streams each step (loop.intake.progress) here so the ~15–40s wait is transparent.
+  const activity = renderIntakeActivity(chat);
+
+  // Now do the slow part in the background. Falls back to the local heuristic on offline / timeout / error.
+  let suggestion: LoopIntakeSuggestion | undefined;
+  if (srv?.sock.isOpen()) {
+    const cid = newCid();
+    const unsub = deps.subscribeIntakeProgress(cid, (line) => activity.push(line));
+    try {
+      const res = await deps.sendAwait(srv, { type: "loop.intake", prompt, ...(environmentId ? { environmentId } : {}), cid }, 90_000);
+      if (res.type === "loop.intake.result") suggestion = res.suggestion;
+    } catch {
+      /* fall through to the local default */
+    } finally {
+      unsub();
+    }
+  }
+  // The user may have cancelled (or navigated) while the suggestion was in flight — bail if so.
+  if (!chat.isConnected) return;
+  activity.finalize(!!suggestion);
+  const s: LoopIntakeSuggestion = suggestion ?? localSuggestion(prompt);
+  const draft = draftFrom(s, prompt, environmentId, fromDraft?.workUnitId);
+  const live = document.getElementById("lc-live-circuit");
+  if (live) live.innerHTML = circuitSvg(draftCircuit(draft));
 
   const steps: Step[] = [
     {
@@ -149,22 +234,6 @@ export async function openIntake(prompt: string, fromDraft?: { workUnitId: strin
     },
   ];
 
-  app.innerHTML = `
-    <div class="lc-head"><button class="mini" id="lc-cancel">${icon("close")} Cancel</button><h2>New loop</h2></div>
-    <div class="lc-circuit-card" id="lc-live-circuit">${circuitSvg(draftCircuit(draft))}</div>
-    <p class="lc-sub" style="text-align:center">${icon("auto_awesome")} Claude is building the circuit with you — watch the stations light up.</p>
-    <div class="lc-chat" id="lc-chat"></div>`;
-  document.getElementById("lc-cancel")?.addEventListener("click", () => deps.onCancel());
-  const chat = document.getElementById("lc-chat")!;
-  const bubble = (cls: string, html: string): HTMLElement => {
-    const d = document.createElement("div");
-    d.className = "lc-bub " + cls;
-    d.innerHTML = html;
-    chat.appendChild(d);
-    d.scrollIntoView?.({ behavior: "smooth", block: "end" });
-    return d;
-  };
-  bubble("user", esc(prompt || s.name));
   let step = 0;
   const ask = (): void => {
     const st = steps[step];

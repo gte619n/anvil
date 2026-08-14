@@ -13,7 +13,12 @@ import { LoopService } from "../../src/session/loop-service";
 import { EnvironmentStore } from "../../src/env/store";
 import type { ConnectionRegistry } from "../../src/server/registry";
 
-function harness(overrides?: { intakeModel?: (ctx: { prompt: string; isFeature: boolean; testScript?: string }) => Promise<import("../../src/loops/intake-model").IntakeOverlay | undefined> }) {
+type IntakeModelFn = (
+  ctx: { prompt: string; isFeature: boolean; testScript?: string; repoRoot?: string },
+  opts: { onStep?: (step: { tool: string; detail: string }) => void; signal?: AbortSignal },
+) => Promise<import("../../src/loops/intake-model").IntakeOverlay | undefined>;
+
+function harness(overrides?: { intakeModel?: IntakeModelFn }) {
   const stateDir = mkdtempSync(join(tmpdir(), "anvil-loopsvc-"));
   const repo = mkdtempSync(join(tmpdir(), "anvil-loopsvc-repo-"));
   spawnSync("git", ["init", "-q"], { cwd: repo });
@@ -21,8 +26,9 @@ function harness(overrides?: { intakeModel?: (ctx: { prompt: string; isFeature: 
   const envStore = new EnvironmentStore(stateDir);
   const env = envStore.add("proj", repo);
   const events: string[] = [];
+  const progress: string[] = []; // loop.intake.progress lines (streamed analysis steps)
   const runEvents: { type: string; run?: { loopId: string; status: string } }[] = [];
-  const registry = { toAll: (e: { type: string; run?: { loopId: string; status: string } }) => { events.push(e.type); if (e.type === "loop.run") runEvents.push(e); } } as unknown as ConnectionRegistry;
+  const registry = { toAll: (e: { type: string; run?: { loopId: string; status: string }; line?: string }) => { events.push(e.type); if (e.type === "loop.run") runEvents.push(e); if (e.type === "loop.intake.progress" && e.line) progress.push(e.line); } } as unknown as ConnectionRegistry;
   let autopilotCalls = 0;
   const resolveCalls: { workUnitId: string; status: string; closeTodoist: boolean }[] = [];
   const notes: { title: string; body: string; tag: string; hash?: string }[] = [];
@@ -38,7 +44,7 @@ function harness(overrides?: { intakeModel?: (ctx: { prompt: string; isFeature: 
     notify: (title, body, tag, hash) => notes.push({ title, body, tag, ...(hash ? { hash } : {}) }),
     ...(overrides?.intakeModel ? { intakeModel: overrides.intakeModel } : {}),
   });
-  return { svc, env, events, runEvents, notes, resolveCalls, autopilotCalls: () => autopilotCalls, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
+  return { svc, env, events, progress, runEvents, notes, resolveCalls, autopilotCalls: () => autopilotCalls, cleanup: () => { rmSync(stateDir, { recursive: true, force: true }); rmSync(repo, { recursive: true, force: true }); } };
 }
 
 test("intakeSuggest is repo-aware: reads the env's test script and narrows by a keyword", async () => {
@@ -94,6 +100,37 @@ test("FU-1: a throwing intakeModel silently falls back to the heuristic", async 
     expect(ev.type).toBe("loop.intake.result");
     expect(ev.suggestion.checkCommand).toBe("bun test upload"); // heuristic value survives
     expect(ev.suggestion.isFeature).toBe(false);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("intakeSuggest gets the repo root and streams each analysis step as loop.intake.progress", async () => {
+  const h = harness({
+    intakeModel: async (ctx, opts) => {
+      expect(ctx.repoRoot).toBe(h.env.repoRoot); // the model can actually read the checkout
+      opts.onStep?.({ tool: "Read", detail: `${ctx.repoRoot}/CLAUDE.md` }); // repo-relative in the line
+      opts.onStep?.({ tool: "Grep", detail: "export" });
+      return { checkCommand: "bun test export" };
+    },
+  });
+  try {
+    const ev = await h.svc.intakeSuggest("Add export to reports", h.env.id, "cid-1");
+    expect(ev.suggestion.checkCommand).toBe("bun test export");
+    expect(h.events).toContain("loop.intake.progress");
+    expect(h.progress).toEqual(["Reading CLAUDE.md", "Searching for “export”"]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("intakeSuggest skips the model entirely when there is no repo (heuristic only)", async () => {
+  let called = false;
+  const h = harness({ intakeModel: async () => { called = true; return {}; } });
+  try {
+    const ev = await h.svc.intakeSuggest("Fix the flaky upload test"); // no environmentId → no repo to read
+    expect(called).toBe(false);
+    expect(ev.suggestion.checkCommand).toBe("bun test upload"); // heuristic floor
   } finally {
     h.cleanup();
   }

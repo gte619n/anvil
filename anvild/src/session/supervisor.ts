@@ -88,6 +88,7 @@ import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled, PrActivityWatch
 import { AutopilotService } from "./autopilot-service";
 import { LoopService } from "./loop-service";
 import { modelIntake } from "../loops/intake-model";
+import { CLAUDE } from "../agent/model-roster";
 import { TeamCoordinator } from "./team-coordinator";
 import { slugify } from "./slug";
 import type { WorkUnit } from "../integrations/workunit";
@@ -382,9 +383,15 @@ export class Supervisor {
         const outcome = await this.autopilot.runDevPipeline(loop.workUnitId, {});
         return `pipeline ${outcome.status} at ${outcome.phaseReached}${outcome.reason ? ` — ${outcome.reason}` : ""}`;
       },
-      // FU-1: real-model intake overlay (Sonnet, no tools). Falls back to the heuristic in LoopService on
-      // any failure, so an unreachable model or missing token never breaks intake.
-      intakeModel: (ctx) => modelIntake(ctx, this.agentEnv()),
+      // FU-1 (extended): codebase-grounded intake overlay — a read-only repo agent (Sonnet) that infers
+      // the project's goals and grounds the check/scope in real files, streaming each step. Falls back to
+      // the heuristic in LoopService on any failure, so an unreachable model/token never breaks intake.
+      intakeModel: (ctx, opts) =>
+        modelIntake(ctx, {
+          model: { ...CLAUDE, sdkModel: "sonnet", label: "Claude Sonnet" },
+          accounts: this.accounts,
+          ...opts,
+        }),
       // Completing a loop that came from an autopilot draft relabels/closes its Todoist source task(s).
       resolveWorkUnit: (workUnitId, status, closeTodoist) => this.autopilot.resolvePlan(workUnitId, status, closeTodoist),
     });

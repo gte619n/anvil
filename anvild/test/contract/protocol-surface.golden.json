@@ -76,6 +76,7 @@
     "loop.gate.open",
     "loop.gate.sendback",
     "loop.intake",
+    "loop.intake.progress",
     "loop.intake.result",
     "loop.pause",
     "loop.remove",

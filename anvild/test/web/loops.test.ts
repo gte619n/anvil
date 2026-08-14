@@ -31,6 +31,7 @@ beforeAll(async () => {
       if (cmd.type === "autopilot.resolve") resolves.push(cmd);
       return { type: "autopilot.approved" } as never;
     },
+    subscribeIntakeProgress: () => () => {},
     selectSession: () => {},
   });
 });

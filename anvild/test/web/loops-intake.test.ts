@@ -13,6 +13,12 @@ let fleet: typeof import("../../web/src/fleet");
 const sent: { type: string; loop?: LoopInput; loopId?: string }[] = [];
 let armedId: string | null = null;
 let failArm = false;
+// When set, loop.intake blocks until releaseIntake() is called — simulates the live model call that
+// makes the real daemon's suggestion take seconds (the reason the shell must paint before it resolves).
+let hangIntake = false;
+let releaseIntake: (() => void) | null = null;
+// The streamed-progress subscriber openIntake registers for the current run (mirrors main.ts's cid map).
+let progressListener: ((line: string) => void) | null = null;
 
 const suggestion: LoopIntakeSuggestion = {
   isFeature: false,
@@ -37,11 +43,18 @@ beforeAll(async () => {
     environments: envs,
     sendAwait: async (_s, cmd) => {
       sent.push(cmd as never);
-      if (cmd.type === "loop.intake") return { type: "loop.intake.result", suggestion } as never;
+      if (cmd.type === "loop.intake") {
+        if (hangIntake) await new Promise<void>((r) => (releaseIntake = r));
+        return { type: "loop.intake.result", suggestion } as never;
+      }
       if (cmd.type === "loop.save") return { type: "loop.updated", loop: { id: "loop_new", ...(cmd as unknown as { loop: LoopInput }).loop } } as never;
       if (cmd.type === "loop.arm") return (failArm ? { type: "command.error", message: "this loop is disabled" } : { type: "ack" }) as never;
       if (cmd.type === "loop.dryrun") return { type: "loop.run", run: { id: "run_dry", dryRun: true } } as never;
       return { type: "ack" } as never;
+    },
+    subscribeIntakeProgress: (_cid, onLine) => {
+      progressListener = onLine;
+      return () => { progressListener = null; };
     },
     rootId: "lc-root",
     onArmed: (id) => (armedId = id),
@@ -56,6 +69,9 @@ beforeEach(() => {
   sent.length = 0;
   armedId = null;
   failArm = false;
+  hangIntake = false;
+  releaseIntake = null;
+  progressListener = null;
 });
 
 /** Click the first suggested-answer chip; returns after the DOM settles. */
@@ -108,6 +124,41 @@ test("if arm fails, the dry-run is NOT fired (no false 'armed' side effects)", a
   await new Promise((r) => setTimeout(r, 0));
   expect(sent.some((c) => c.type === "loop.arm")).toBe(true);
   expect(sent.some((c) => c.type === "loop.dryrun")).toBe(false); // arm failed → no dry-run
+});
+
+test("the intake shell paints immediately — before the (slow) repo suggestion resolves", async () => {
+  hangIntake = true;
+  const done = intake.openIntake("Fix the flaky upload test"); // do NOT await — the suggestion is blocked
+  await Promise.resolve(); // flush the synchronous prefix / microtasks
+  // The circuit + a live "studying your codebase" panel are on screen even though loop.intake hasn't returned.
+  expect(document.getElementById("lc-live-circuit")).toBeTruthy();
+  expect(document.querySelector("#lc-chat .activity.live")).toBeTruthy();
+  expect(sent.some((c) => c.type === "loop.intake")).toBe(true);
+  // The conversation itself waits for the suggestion — no question chips yet.
+  expect(document.querySelector("#lc-chat .lc-chips button")).toBeFalsy();
+  // Once the suggestion lands, the first question renders.
+  releaseIntake?.();
+  await done;
+  expect(document.querySelector("#lc-chat .lc-chips button")).toBeTruthy();
+});
+
+test("streamed repo-analysis steps render live before the suggestion resolves, then the flow runs", async () => {
+  hangIntake = true;
+  const done = intake.openIntake("Fix the flaky upload test"); // suggestion blocked (simulating the repo read)
+  await Promise.resolve();
+  // The daemon streams analysis lines while we wait — they land in the live activity panel.
+  progressListener?.("Reading CLAUDE.md");
+  progressListener?.("Searching for “upload”");
+  const steps = document.querySelectorAll("#lc-chat .activity .lc-step");
+  expect(steps.length).toBe(2);
+  expect(steps[0]?.textContent).toBe("Reading CLAUDE.md");
+  // No questions yet — the conversation still waits for the terminal result.
+  expect(document.querySelector("#lc-chat .lc-chips button")).toBeFalsy();
+  // Release: the panel settles and the 5-step flow begins.
+  releaseIntake?.();
+  await done;
+  expect(document.querySelector("#lc-chat .activity.live")).toBeFalsy(); // finalized (no longer "live")
+  expect(document.querySelector("#lc-chat .lc-chips button")).toBeTruthy();
 });
 
 test("a Todoist draft converts through the same flow, linking the work unit", async () => {

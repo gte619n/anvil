@@ -1019,6 +1019,14 @@ export interface LoopIntakeResultEvent extends Envelope {
   cid?: Cid;
   suggestion: LoopIntakeSuggestion;
 }
+/** Live progress from the repo-reading intake agent (each file it reads / grep it runs), streamed while
+ *  the caller awaits the single `loop.intake.result`. Broadcast (no strict correlation), but carries the
+ *  request `cid` so the originating client can show only its own run's steps. */
+export interface LoopIntakeProgressEvent extends Envelope {
+  type: "loop.intake.progress";
+  cid?: Cid;
+  line: string;
+}
 
 /** Result of a git/gh operation (arch §8) — carries combined output for display. */
 export type GitOp = "status" | "diff" | "commit" | "push" | "create-pr" | "merge-pr";
@@ -1271,6 +1279,7 @@ export type ServerEvent =
   | LoopRunEvent
   | LoopRunsEvent
   | LoopIntakeResultEvent
+  | LoopIntakeProgressEvent
   | GitResultEvent
   | DaemonUpdateResultEvent
   | AckEvent

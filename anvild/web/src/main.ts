@@ -321,6 +321,7 @@ initAutopilot({
 initLoops({
   environments,
   sendAwait,
+  subscribeIntakeProgress,
   selectSession,
 });
 // Settings deps (P7 — see settings.ts). Same timing contract as initFleet/initSidebar/initAutopilot
@@ -886,6 +887,14 @@ function sendAwait(server: Server, cmd: Record<string, unknown> & { type: string
     }
   });
 }
+// Live intake-analysis lines stream as `loop.intake.progress` frames tagged with the request's cid —
+// separate from `cidWaiters` (which resolves the single terminal `loop.intake.result`), since many
+// progress frames arrive before that response and must NOT resolve the awaiting promise.
+const intakeProgressWaiters = new Map<string, (line: string) => void>();
+function subscribeIntakeProgress(cid: string, onLine: (line: string) => void): () => void {
+  intakeProgressWaiters.set(cid, onLine);
+  return () => intakeProgressWaiters.delete(cid);
+}
 const tempMap = new Map<string, string>(); // optimistic id → real id
 let flushing = false;
 async function flushOutbox(): Promise<void> {
@@ -1084,6 +1093,12 @@ function refreshConnDot(): void {
 // `url` is the server the frame arrived from — used to tag sessions/environments for routing.
 function onEvent(url: string, e: ServerEvent): void {
   if ("seq" in e && "sessionId" in e && typeof e.seq === "number") seqStore.set(e.sessionId, e.seq);
+  // Intake progress shares the request cid but is NOT its terminal response — route it to the intake
+  // subscriber and return before the cidWaiters resolution, so it never settles the sendAwait promise.
+  if (e.type === "loop.intake.progress") {
+    if (e.cid) intakeProgressWaiters.get(e.cid)?.(e.line);
+    return;
+  }
   const cid = (e as { cid?: string }).cid;
   let awaited = false;
   if (cid && cidWaiters.has(cid)) {

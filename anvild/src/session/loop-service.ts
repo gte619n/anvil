@@ -82,7 +82,10 @@ export interface LoopServiceDeps {
   /** Real-model intake overlay (FU-1). Given the outcome + repo hint, returns fields that sharpen the
    *  deterministic heuristic. Throwing / returning undefined falls back to the heuristic — injected so
    *  tests stay model-free; the Supervisor wires the SDK-backed `modelIntake`. */
-  intakeModel?: (ctx: { prompt: string; isFeature: boolean; testScript?: string }) => Promise<IntakeOverlay | undefined>;
+  intakeModel?: (
+    ctx: { prompt: string; isFeature: boolean; testScript?: string; repoRoot?: string },
+    opts: { onStep?: (step: { tool: string; detail: string }) => void; signal?: AbortSignal },
+  ) => Promise<IntakeOverlay | undefined>;
   /** Resolve a completed loop's linked autopilot work unit (relabel its Todoist source tasks, optionally
    *  close them). The Supervisor wires this to `autopilot.resolvePlan`; absent ⇒ Todoist side is skipped. */
   resolveWorkUnit?: (workUnitId: string, status: "completed", closeTodoist: boolean) => Promise<void>;
@@ -547,16 +550,31 @@ export class LoopService {
     const env = environmentId ? this.deps.envStore.get(environmentId) : undefined;
     const testScript = env ? readTestScript(env.repoRoot) : undefined;
     const suggestion = localIntakeSuggestion(prompt, testScript);
-    // Overlay the real-model proposal when available — never let it break intake.
-    if (this.deps.intakeModel) {
+    // Overlay a codebase-grounded proposal when both a repo checkout and a model are available. The repo
+    // read is slower, so it's only worth doing with a real checkout to inspect; otherwise the heuristic
+    // above stands. Each file the agent reads streams to the requesting client (loop.intake.progress) so
+    // the wait is transparent, and ANY failure/timeout silently falls back to the heuristic.
+    if (this.deps.intakeModel && env?.repoRoot) {
+      const repoRoot = env.repoRoot;
       try {
-        const overlay = await this.deps.intakeModel({ prompt: prompt.trim(), isFeature: suggestion.isFeature, ...(testScript ? { testScript } : {}) });
+        const overlay = await this.deps.intakeModel(
+          { prompt: prompt.trim(), isFeature: suggestion.isFeature, repoRoot, ...(testScript ? { testScript } : {}) },
+          { onStep: (step) => this.broadcastIntakeStep(step, repoRoot, cid) },
+        );
         if (overlay) applyIntakeOverlay(suggestion, overlay);
       } catch (e) {
         console.warn(`[loops] model intake fell back to heuristic:`, e instanceof Error ? e.message : e);
       }
     }
     return { v: PROTOCOL_VERSION, type: "loop.intake.result", ts: now(), ...(cid ? { cid } : {}), suggestion };
+  }
+
+  /** Fan a single intake-agent step out as a `loop.intake.progress` line (cid-tagged so the requesting
+   *  client shows only its own run). Broadcast, matching the loop.run / autopilot.run.progress pattern. */
+  private broadcastIntakeStep(step: { tool: string; detail: string }, repoRoot: string, cid?: string): void {
+    const line = intakeStepLine(step, repoRoot);
+    if (!line) return;
+    this.deps.registry.toAll({ v: PROTOCOL_VERSION, type: "loop.intake.progress", ts: now(), ...(cid ? { cid } : {}), line });
   }
 
   async gateOpen(runId: string, cid?: string): Promise<LoopRunEvent> {
@@ -599,6 +617,21 @@ export class LoopService {
   private loopIdForRun(runId: string): string {
     for (const loop of this.store.list()) if (this.store.runById(loop.id, runId)) return loop.id;
     throw new BadCommand(`no such run: ${runId}`);
+  }
+}
+
+/** Turn one intake-agent tool call into a short, user-facing progress line (repo-relative paths). */
+function intakeStepLine(step: { tool: string; detail: string }, repoRoot: string): string {
+  const rel = step.detail.startsWith(repoRoot) ? step.detail.slice(repoRoot.length).replace(/^\/+/, "") : step.detail;
+  switch (step.tool) {
+    case "Read":
+      return rel ? `Reading ${rel}` : "Reading a file";
+    case "Grep":
+      return rel ? `Searching for “${rel}”` : "Searching the code";
+    case "Glob":
+      return rel ? `Scanning ${rel}` : "Scanning the tree";
+    default:
+      return rel ? `${step.tool}: ${rel}` : step.tool;
   }
 }
 
