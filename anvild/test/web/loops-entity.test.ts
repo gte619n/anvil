@@ -25,6 +25,7 @@ beforeAll(async () => {
       sent.push(cmd as never);
       return { type: "loop.run", run: gateRun } as never;
     },
+    subscribeIntakeProgress: () => () => {},
     selectSession: () => {},
   });
 });

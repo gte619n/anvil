@@ -34,6 +34,9 @@ export async function runAgentQuery(
      *  pre-roster env-var path. */
     accounts?: AccountStore;
     accountId?: string;
+    /** Fired once per tool the model invokes (Read/Grep/Glob/…), so a caller can stream the run's real
+     *  activity as it happens. `tool` is the SDK tool name; `detail` is a short target (a path/pattern). */
+    onStep?: (step: { tool: string; detail: string }) => void;
   },
 ): Promise<AgentQueryResult> {
   // Bridge the run-level signal to the SDK's AbortController so a cancelled/timed-out run tears down the
@@ -71,14 +74,23 @@ export async function runAgentQuery(
   for await (const raw of q) {
     const msg = raw as { type?: string; message?: { content?: unknown[] }; result?: unknown };
     if (msg.type === "assistant" && Array.isArray(msg.message?.content)) {
-      for (const block of msg.message.content as { type?: string; name?: string; input?: { plan?: unknown } }[]) {
+      for (const block of msg.message.content as { type?: string; name?: string; input?: Record<string, unknown> }[]) {
         if (block.type === "tool_use" && block.name === "ExitPlanMode") {
           const p = block.input?.plan;
           if (typeof p === "string" && p.trim()) plan = p.trim();
+        } else if (block.type === "tool_use" && block.name && opts.onStep) {
+          opts.onStep({ tool: block.name, detail: toolDetail(block.input) });
         }
       }
     }
     if (msg.type === "result" && typeof msg.result === "string") text = msg.result;
   }
   return { text: text.trim(), ...(plan ? { plan } : {}) };
+}
+
+/** Best-effort one-liner for what a tool call is targeting (a path/pattern), for progress streaming. */
+function toolDetail(input?: Record<string, unknown>): string {
+  if (!input) return "";
+  const pick = input.file_path ?? input.path ?? input.pattern ?? input.command ?? input.query ?? input.url;
+  return typeof pick === "string" ? pick : "";
 }

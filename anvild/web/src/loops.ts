@@ -20,6 +20,7 @@ import type { Environment, Loop, LoopInput, LoopRun, LoopSummary, ServerEvent } 
 export interface LoopsDeps {
   environments: Map<string, Environment>;
   sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs?: number): Promise<ServerEvent>;
+  subscribeIntakeProgress(cid: string, onLine: (line: string) => void): () => void;
   selectSession(id: string, push?: boolean): void;
 }
 let environments: LoopsDeps["environments"];
@@ -32,6 +33,7 @@ export function initLoops(deps: LoopsDeps): void {
   initIntake({
     environments: deps.environments,
     sendAwait: deps.sendAwait,
+    subscribeIntakeProgress: deps.subscribeIntakeProgress,
     rootId: "lc-root",
     onArmed: (loopId) => openDetail(loopId, true),
     onCancel: () => renderHome(),

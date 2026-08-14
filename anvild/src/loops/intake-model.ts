@@ -1,16 +1,19 @@
 /**
- * Real-model loop intake (loops-circuit follow-up FU-1). A one-shot Sonnet call that reads the outcome
- * the user typed and proposes the loop's check / scope / assumptions — the seed the web intake
- * conversation drives off. Mirrors `judgeGoal`'s SDK shape (no tools, one turn, hard timeout) so it
- * never wedges the daemon, and THROWS on timeout / transport failure / an unparseable reply — every one
- * of those is caught at the call site (LoopService.intakeSuggest), which falls back to the deterministic
- * heuristic. So intake is always available; the model just makes it sharper when it's reachable.
+ * Real-model loop intake (loops-circuit follow-up FU-1, extended). A read-only repo agent that evaluates
+ * the outcome the user typed IN THE CONTEXT OF THE CODEBASE — it infers the project's goals from the
+ * repo's own docs (CLAUDE.md / README / docs/), verifies the check against the real test setup, and
+ * confirms scope against directories that actually exist — then proposes the loop's check / scope /
+ * assumptions: the seed the web intake conversation drives off.
  *
- * The daemon is the permission authority: this runs with no tools and no settingSources, exactly like
- * the goal judge, so it can't touch the repo — it only reads the prompt text we pass it.
+ * It runs through `runAgentQuery` in read-only plan mode (Read/Grep/Glob allowed, edits blocked, gated by
+ * the danger-list guard), so the daemon stays the permission authority. It THROWS on timeout / transport
+ * failure / an unparseable reply — each caught at the call site (LoopService.intakeSuggest), which falls
+ * back to the deterministic heuristic. So intake is always available; the model just makes it sharper
+ * (and codebase-grounded) when a repo + reachable model are present. `onStep` streams each file it reads.
  */
-import { query } from "@anthropic-ai/claude-agent-sdk";
-import { claudeCliOptions } from "../agent/cli";
+import { runAgentQuery, type QueryLike } from "../agent/query";
+import type { ModelSpec } from "../agent/model-roster";
+import type { AccountStore } from "../auth/accounts";
 import type { LoopRung } from "@protocol";
 
 /** What the model may sharpen on top of the heuristic base. Every field is optional + validated; a
@@ -27,50 +30,52 @@ export interface IntakeOverlay {
 export interface IntakeModelContext {
   prompt: string;
   isFeature: boolean;
+  repoRoot?: string; // the environment's checkout — read-only, gives the agent real codebase context
   testScript?: string; // the repo's configured test command, if known
 }
 
+export interface IntakeModelOptions {
+  model: ModelSpec; // which model authors the intake (the Supervisor wires Sonnet)
+  accounts?: AccountStore;
+  accountId?: string;
+  onStep?: (step: { tool: string; detail: string }) => void; // fired per file read / grep, for streaming
+  signal?: AbortSignal;
+  queryFn?: QueryLike; // injectable so tests script the reply without a subprocess
+}
+
 /** The minimal SDK `query` shape — injectable so tests can script the reply without a subprocess. */
-export type IntakeQueryLike = (args: { prompt: string; options: Record<string, unknown> }) => AsyncIterable<unknown>;
+export type IntakeQueryLike = QueryLike;
 
 const RUNGS: LoopRung[] = ["suggest", "draft", "pr", "ship"];
+const INTAKE_TIMEOUT_MS = 60_000; // reading a few files is slower than a one-shot; still bounded
 
 /**
- * Ask the model for an intake overlay. Resolves with the validated overlay, or throws on any failure
- * (the caller falls back to the heuristic). 25s hard timeout, Sonnet, no tools.
+ * Ask the model for a codebase-grounded intake overlay. Resolves with the validated overlay, or throws
+ * on any failure (the caller falls back to the heuristic). Read-only plan mode with a hard timeout, so it
+ * can inspect the repo but never edits it or wedges the daemon. In plan mode the agent delivers its
+ * answer via `ExitPlanMode` (captured as `plan`); we parse the JSON object out of that (or the final text).
  */
-export async function modelIntake(
-  ctx: IntakeModelContext,
-  env: Record<string, string>,
-  queryFn?: IntakeQueryLike,
-): Promise<IntakeOverlay> {
+export async function modelIntake(ctx: IntakeModelContext, opts: IntakeModelOptions): Promise<IntakeOverlay> {
   const prompt = buildPrompt(ctx);
+  // Bound the run, and also honor a caller-supplied signal (both abort the underlying subprocess).
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 25_000);
+  const timer = setTimeout(() => ac.abort(), INTAKE_TIMEOUT_MS);
+  if (opts.signal) {
+    if (opts.signal.aborted) ac.abort();
+    else opts.signal.addEventListener("abort", () => ac.abort(), { once: true });
+  }
   try {
-    const run = queryFn ?? (query as unknown as IntakeQueryLike);
-    const q = run({
-      prompt,
-      options: {
-        model: "sonnet",
-        settingSources: [],
-        allowedTools: [],
-        permissionMode: "bypassPermissions",
-        maxTurns: 1,
-        ...claudeCliOptions(),
-        abortController: ac,
-        env,
-      },
+    const res = await runAgentQuery(prompt, {
+      model: opts.model,
+      ...(ctx.repoRoot ? { cwd: ctx.repoRoot } : {}),
+      readonly: true, // plan mode: reads/greps allowed, edits blocked, danger-list guarded
+      signal: ac.signal,
+      ...(opts.accounts ? { accounts: opts.accounts } : {}),
+      ...(opts.accountId ? { accountId: opts.accountId } : {}),
+      ...(opts.onStep ? { onStep: opts.onStep } : {}),
+      ...(opts.queryFn ? { queryFn: opts.queryFn } : {}),
     });
-    let text = "";
-    for await (const m of q) {
-      const msg = m as { type: string; message?: { content?: Array<{ type: string; text?: string }> } };
-      if (msg.type === "assistant") {
-        for (const b of msg.message?.content ?? []) if (b.type === "text" && b.text) text += b.text;
-      }
-      if (msg.type === "result") break;
-    }
-    return parseOverlay(text, ctx);
+    return parseOverlay(res.plan ?? res.text, ctx);
   } finally {
     clearTimeout(timer);
   }
@@ -78,22 +83,30 @@ export async function modelIntake(
 
 function buildPrompt(ctx: IntakeModelContext): string {
   return (
-    `You are helping set up an autonomous coding "loop". The user stated this outcome:\n\n` +
+    `You are setting up an autonomous coding "loop" for THIS repository. The user stated this outcome, ` +
+    `most likely an underspecified task pulled from their to-do list:\n\n` +
     `"""${ctx.prompt.slice(0, 1000)}"""\n\n` +
     `This is a ${ctx.isFeature ? "FEATURE (build something new)" : "FIX (repair something broken)"}.\n` +
     (ctx.testScript ? `The repo's test command is: ${ctx.testScript}\n` : "") +
-    `\nPropose how the loop should PROVE it's done. Reply with ONE JSON object, nothing else:\n` +
+    `\nInspect the codebase read-only to ground your proposal in what's actually here:\n` +
+    `1. Infer the PROJECT'S GOALS from its own docs — read CLAUDE.md, README, and anything under docs/ ` +
+    `that exists. Understand what this project is trying to be before you shape the loop.\n` +
+    `2. Evaluate the outcome AGAINST THE REAL CODE: find the files/areas it touches, confirm the check ` +
+    `command actually exercises them (a real test file or script — not a guess), and confirm every scope ` +
+    `path is a directory/glob that truly exists in the tree.\n` +
+    `3. Surface the genuine AMBIGUITIES — where the task is underspecified relative to how this codebase ` +
+    `works, name the concrete decision you had to make (these become logged assumptions the user reviews).\n` +
+    `\nThen finish by calling ExitPlanMode with ONLY this JSON object as the plan (no prose):\n` +
     `{\n` +
     `  "name": "<≤60-char loop name>",\n` +
-    `  "checkCommand": "<a shell command that exits 0 iff the outcome is met; prefer the repo test command narrowed to the relevant area>",\n` +
+    `  "checkCommand": "<a shell command that exits 0 iff the outcome is met; prefer the repo test command narrowed to the relevant area, verified to exist>",\n` +
     `  "checkLocks": ["<repo-relative file the check reads and the lap must NOT edit>", ...],\n` +
-    `  "scopeAllow": ["<repo-relative glob the lap may touch>", ...],\n` +
-    `  "assumptions": ["<a decision you had to make because the outcome is still ambiguous>", ...],\n` +
+    `  "scopeAllow": ["<repo-relative glob the lap may touch — must exist>", ...],\n` +
+    `  "assumptions": ["<a decision you made because the outcome was ambiguous for this codebase>", ...],\n` +
     `  "rung": "suggest" | "draft" | "pr"\n` +
     `}\n\n` +
     `Rules: If a check is a METRIC (a number vs a threshold), its command must print ONLY the number ` +
-    `(append " | tail -1" if needed). Keep scope tight. New loops start gated — never propose "ship". ` +
-    `Output ONLY the JSON object.`
+    `(append " | tail -1" if needed). Keep scope tight and real. New loops start gated — never propose "ship".`
   );
 }
 

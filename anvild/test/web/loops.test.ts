@@ -28,6 +28,7 @@ beforeAll(async () => {
       if (cmd.type === "autopilot.approve") approved.push(String(cmd.workUnitId));
       return { type: "autopilot.approved" } as never;
     },
+    subscribeIntakeProgress: () => () => {},
     selectSession: () => {},
   });
 });
