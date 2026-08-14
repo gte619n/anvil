@@ -854,8 +854,10 @@ export interface LoopsSnapshotEvent extends Envelope {
 // ── Loop entity (loops-circuit spec §4.1) — the persisted, first-class Loop + its runs ──────────────
 // The spec names the loop's lifecycle field `LoopStatus`; that identifier is already taken by the
 // projection `LoopSummary.status` above, so the entity lifecycle is `LoopState` here (Loop.status:
-// LoopState). Same four values as the spec.
-export type LoopState = "draft" | "armed" | "paused" | "disabled";
+// LoopState). `completed` = the outcome this loop chased is done (possibly finished elsewhere) —
+// terminal, stops firing, moved out of the active view but kept for history. `archived` = retired/hidden
+// by the human, recoverable (restore → paused). Both are inactive; the scheduler only fires `armed` loops.
+export type LoopState = "draft" | "armed" | "paused" | "disabled" | "completed" | "archived";
 
 /** External event channels an `event`-triggered loop can subscribe to (mirrors event-trigger.ts). */
 export type TriggerKind = "ci-failure" | "github" | "todoist-label" | "webhook" | "manual";
@@ -1710,6 +1712,15 @@ export interface LoopPauseCmd extends Envelope, Correlated {
   type: "loop.pause"; // armed → paused (edit-when-paused) → loop.updated
   loopId: string;
 }
+export interface LoopCompleteCmd extends Envelope, Correlated {
+  type: "loop.complete"; // → completed (work done, possibly elsewhere); optionally close the linked Todoist source task(s) → loop.updated
+  loopId: string;
+  closeTodoist?: boolean; // when the loop has a linked work unit, also close its Todoist task(s)
+}
+export interface LoopArchiveCmd extends Envelope, Correlated {
+  type: "loop.archive"; // retire a loop out of the active view (recoverable: restore → paused) → loop.updated
+  loopId: string;
+}
 export interface LoopRunCmd extends Envelope, Correlated {
   type: "loop.run"; // start a manual run (or a lap now) → loop.run stream
   loopId: string;
@@ -1896,6 +1907,8 @@ export type ClientCommand =
   | LoopRemoveCmd
   | LoopArmCmd
   | LoopPauseCmd
+  | LoopCompleteCmd
+  | LoopArchiveCmd
   | LoopRunCmd
   | LoopDryRunCmd
   | LoopGateOpenCmd

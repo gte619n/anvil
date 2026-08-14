@@ -392,6 +392,8 @@ export class Supervisor {
           accounts: this.accounts,
           ...opts,
         }),
+      // Completing a loop that came from an autopilot draft relabels/closes its Todoist source task(s).
+      resolveWorkUnit: (workUnitId, status, closeTodoist) => this.autopilot.resolvePlan(workUnitId, status, closeTodoist),
     });
     this.attachStore = new AttachmentStore(cfg.stateDir);
     this.webpush = new WebPush(cfg.stateDir);

@@ -86,8 +86,12 @@ export interface LoopServiceDeps {
     ctx: { prompt: string; isFeature: boolean; testScript?: string; repoRoot?: string },
     opts: { onStep?: (step: { tool: string; detail: string }) => void; signal?: AbortSignal },
   ) => Promise<IntakeOverlay | undefined>;
+  /** Resolve a completed loop's linked autopilot work unit (relabel its Todoist source tasks, optionally
+   *  close them). The Supervisor wires this to `autopilot.resolvePlan`; absent ⇒ Todoist side is skipped. */
+  resolveWorkUnit?: (workUnitId: string, status: "completed", closeTodoist: boolean) => Promise<void>;
 }
 
+const AUTOPILOT_LOOP_ID = "loop_autopilot"; // the daemon-managed Todoist-intake singleton (re-homed nightly)
 const LOOP_SCHEDULE_WINDOW_MS = 10 * 60_000; // edge-trigger window (matches the autopilot scheduler)
 const TICK_MS = 60_000; // per-loop trigger tick
 
@@ -357,6 +361,36 @@ export class LoopService {
     this.broadcastCatalog();
     return this.loopUpdatedEvent(loop, cid);
   }
+  /** Mark a loop done (the outcome it chased was reached, possibly elsewhere). Terminal + stops firing.
+   *  When the loop was converted from an autopilot draft, its linked Todoist source task(s) are relabelled
+   *  `anvil:completed` and — if `closeTodoist` — closed. Best-effort on the Todoist side; the local status
+   *  change is authoritative, so a Todoist hiccup never blocks completion. */
+  async complete(loopId: string, closeTodoist: boolean, cid?: string): Promise<LoopUpdatedEvent> {
+    const loop = this.require(loopId);
+    if (loop.id === AUTOPILOT_LOOP_ID) throw new BadCommand("the Todoist-intake loop can't be completed");
+    loop.status = "completed";
+    loop.updatedAt = now();
+    this.store.save(loop);
+    this.broadcastCatalog();
+    if (loop.workUnitId && this.deps.resolveWorkUnit) {
+      try {
+        await this.deps.resolveWorkUnit(loop.workUnitId, "completed", closeTodoist);
+      } catch (e) {
+        console.error(`[loops] complete: work-unit resolve failed for ${loop.id}:`, e);
+      }
+    }
+    return this.loopUpdatedEvent(loop, cid);
+  }
+  /** Retire a loop out of the active view (recoverable — restore re-pauses it). No Todoist side effects. */
+  archive(loopId: string, cid?: string): LoopUpdatedEvent {
+    const loop = this.require(loopId);
+    if (loop.id === AUTOPILOT_LOOP_ID) throw new BadCommand("the Todoist-intake loop can't be archived");
+    loop.status = "archived";
+    loop.updatedAt = now();
+    this.store.save(loop);
+    this.broadcastCatalog();
+    return this.loopUpdatedEvent(loop, cid);
+  }
 
   /** Start a manual run (fire-and-forget; the run streams via loop.run). Returns the initial run event. */
   run(loopId: string, cid?: string): LoopRunEvent {
@@ -468,7 +502,7 @@ export class LoopService {
 
   /** Ensure the daemon-managed Todoist-intake singleton exists (the re-homed nightly autopilot). */
   private ensureAutopilotLoop(): void {
-    const id = "loop_autopilot";
+    const id = AUTOPILOT_LOOP_ID;
     if (this.store.get(id)) return;
     const nowIso = now();
     const loop: Loop = {

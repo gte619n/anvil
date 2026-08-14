@@ -455,6 +455,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       case "loop.pause":
         send(deps.supervisor.loops.pause(cmd.loopId, cid));
         return;
+      case "loop.complete":
+        deps.supervisor.loops
+          .complete(cmd.loopId, cmd.closeTodoist ?? false, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+      case "loop.archive":
+        send(deps.supervisor.loops.archive(cmd.loopId, cid));
+        return;
       case "loop.run":
         send(deps.supervisor.loops.run(cmd.loopId, cid));
         return;

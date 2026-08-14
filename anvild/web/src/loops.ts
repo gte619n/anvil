@@ -5,7 +5,7 @@
 // autonomy ladder — alongside the Phase-0 projection rows (schedule/goals/pipelines/proposals/drafts),
 // which still show until Phase 4 retires them. Deps injected via initLoops(...) (mirrors autopilot.ts).
 import { $, esc, icon } from "./dom";
-import { confirmDialog, closeModal, promptDialog, showModal, toast } from "./dialogs";
+import { confirmDialog, confirmDialogWithOption, closeModal, promptDialog, showModal, toast } from "./dialogs";
 import { dismissOverlay, loopFromHash, openOverlay, overlayOpen } from "./overlays";
 import { newCid } from "./outbox";
 import { HUB_URL, envServer, loopEntityServer, loopRuns, orderedServers, serverByUrl, serverLoopEntities, serverLoops, serverSupports, servers, type Server } from "./fleet";
@@ -52,16 +52,22 @@ let detail: { id: string; entity: boolean } | null = null;
 const projServer = new Map<string, string>(); // projected loopId → server url (approve/convert routing)
 
 // ── Data gathering ──────────────────────────────────────────────────────────────────────────────────
+// The daemon-managed Todoist-intake singleton (`loop_autopilot`) and the autopilot `schedule` projection
+// are the conveyor that *fills* the gate — a nightly scan that plans linked Todoist projects into drafts.
+// They have no lock the user operates (the schedule row has zero detail actions; the intake loop only
+// exposes arm/pause + run-now, which live in Autopilot/Settings). Loops is "where you sit at the gate",
+// so we don't render them here — their actionable output is the "Drafts at your gate" band. The daemon
+// keeps running the job; this is purely a presentation choice.
+const INTAKE_LOOP_ID = "loop_autopilot";
 function entities(): Loop[] {
   const out: Loop[] = [];
   loopEntityServer.clear();
   for (const s of orderedServers())
     for (const l of serverLoopEntities.get(s.url) ?? []) {
+      if (l.id === INTAKE_LOOP_ID) continue; // the nightly intake runner — not a loop you gate
       out.push(l);
       loopEntityServer.set(l.id, s.url);
     }
-  // Pin the daemon-managed Todoist-intake singleton to the top (spec §5 headline: "appears as row #1").
-  out.sort((a, b) => (a.id === "loop_autopilot" ? -1 : b.id === "loop_autopilot" ? 1 : 0));
   return out;
 }
 function projected(): LoopSummary[] {
@@ -69,6 +75,7 @@ function projected(): LoopSummary[] {
   projServer.clear();
   for (const s of orderedServers())
     for (const l of serverLoops.get(s.url) ?? []) {
+      if (l.kind === "schedule") continue; // the autopilot heartbeat — surfaced in Autopilot/Settings, not here
       out.push(l);
       projServer.set(l.id, s.url);
     }
@@ -116,14 +123,23 @@ function closeLoops(): void {
   $("#loops-root").innerHTML = "";
 }
 
+// A loop with no environment has no project to name it by. When the fleet has >1 connected member we
+// group those rows under the owning member's name (this is what separates the otherwise-identical
+// per-member rows — e.g. three "Todoist intake" singletons); a single-machine fleet keeps "Fleet".
+function fallbackGroup(serverUrl: string | undefined): string {
+  const multi = orderedServers().filter((s) => s.sock.isOpen()).length > 1;
+  return (multi && serverUrl ? serverByUrl(serverUrl)?.name : undefined) ?? "Fleet";
+}
 function envNameOfEntity(l: Loop): string {
-  return (l.environmentId ? environments.get(l.environmentId)?.name : undefined) ?? "Fleet";
+  return (l.environmentId ? environments.get(l.environmentId)?.name : undefined) ?? fallbackGroup(loopEntityServer.get(l.id));
 }
 function envNameOfProjected(l: LoopSummary): string {
-  return l.environmentName ?? (l.environmentId ? environments.get(l.environmentId)?.name : undefined) ?? "Fleet";
+  return l.environmentName ?? (l.environmentId ? environments.get(l.environmentId)?.name : undefined) ?? fallbackGroup(projServer.get(l.id));
 }
 
 function entityChip(l: Loop): string {
+  if (l.status === "completed") return `<span class="lc-chip completed">${icon("check_circle")} completed</span>`;
+  if (l.status === "archived") return `<span class="lc-chip archived">${icon("inventory_2")} archived</span>`;
   const run = latestRun(l.id);
   const st = entityStatus(l, run);
   if (st === "gated") return `<span class="lc-chip gated">${icon("lock")} at your gate</span>`;
@@ -163,10 +179,24 @@ function groupByEnv<T>(items: T[], nameOf: (t: T) => string): { name: string; it
     .sort((a, b) => (a === "Fleet" ? -1 : b === "Fleet" ? 1 : a.localeCompare(b)))
     .map((name) => ({ name, items: groups.get(name)! }));
 }
-function envSep(name: string): string {
+function envSep(name: string, note = ""): string {
   const env = [...environments.values()].find((e) => e.name === name);
   const dot = env ? stripeColor(env, 0, currentTheme()) : "var(--muted)";
-  return `<div class="lc-envsep"><span class="env-dot" style="background:${dot}"></span>${esc(name)}</div>`;
+  return `<div class="lc-envsep"><span class="env-dot" style="background:${dot}"></span>${esc(name)}${note}</div>`;
+}
+
+// Status priority within a project — smaller sorts higher, so what needs YOU rides to the top and the
+// terminal loops sink: at-your-gate → running → armed → paused/draft → completed → archived. Real loops
+// and projected rows (goals/pipelines/proposals/drafts) share one ranking so they interleave sensibly.
+function entityRank(l: Loop): number {
+  if (l.status === "completed") return 4;
+  if (l.status === "archived") return 5;
+  const st = entityStatus(l, latestRun(l.id)); // gated | running | armed | paused | idle
+  return st === "gated" ? 0 : st === "running" ? 1 : st === "armed" ? 2 : 3;
+}
+function projRank(l: LoopSummary): number {
+  // Projected rows are never completed/archived (that's an entity lifecycle); drafts/proposals are "gated".
+  return l.status === "gated" ? 0 : l.status === "running" ? 1 : l.status === "armed" ? 2 : 3;
 }
 
 function renderHome(): void {
@@ -174,25 +204,25 @@ function renderHome(): void {
   updateLoopsBadge();
   const app = document.getElementById("lc-root");
   if (!app) return;
-  const ents = entities();
-  const proj = projected();
-  const activity = proj.filter((l) => l.kind !== "draft");
-  const drafts = proj.filter((l) => l.kind === "draft");
-
-  const entHtml = ents.length
-    ? groupByEnv(ents, envNameOfEntity)
-        .map((g) => `${envSep(g.name)}<div class="lc-rows">${g.items.map(entityRowHtml).join("")}</div>`)
-        .join("")
+  // Project-first: every loop — real entities and projected goals/pipelines/proposals/drafts — folds into
+  // its owning project (env; member/"Fleet" fallback), then sorts by status so the gate-blockers lead and
+  // the done/retired ones trail. One project's whole footprint lives in one section.
+  type Card = { env: string; rank: number; html: string };
+  const cards: Card[] = [
+    ...entities().map((l) => ({ env: envNameOfEntity(l), rank: entityRank(l), html: entityRowHtml(l) })),
+    ...projected().map((l) => ({ env: envNameOfProjected(l), rank: projRank(l), html: projRowHtml(l) })),
+  ];
+  const sectionsHtml = groupByEnv(cards, (c) => c.env)
+    .map((g) => {
+      const items = g.items.slice().sort((a, b) => a.rank - b.rank); // stable → equal ranks keep server order
+      const gated = items.filter((c) => c.rank === 0).length; // preserves the old "at your gate" signal per project
+      const note = gated ? ` <span class="lc-envsep-count">${gated} ${icon("lock")}</span>` : "";
+      return `${envSep(g.name, note)}<div class="lc-rows">${items.map((c) => c.html).join("")}</div>`;
+    })
+    .join("");
+  const empty = !cards.length
+    ? `<div class="ap-empty">${icon("all_inclusive")}<p>No loops yet.</p><p class="small muted">Describe an outcome above — Claude builds the loop with you.</p></div>`
     : "";
-  const activityHtml = activity.length
-    ? `<div class="lc-envsep">${icon("bolt")} Activity <span class="lc-envsep-count">${activity.length}</span></div>
-       <div class="lc-rows">${activity.map(projRowHtml).join("")}</div>`
-    : "";
-  const draftsHtml = drafts.length
-    ? `<div class="lc-envsep">${icon("lock")} Drafts at your gate <span class="lc-envsep-count">${drafts.length}</span></div>
-       <div class="lc-rows">${drafts.map(projRowHtml).join("")}</div>`
-    : "";
-  const empty = !ents.length && !activity.length && !drafts.length ? `<div class="ap-empty">${icon("all_inclusive")}<p>No loops yet.</p><p class="small muted">Describe an outcome above — Claude builds the loop with you.</p></div>` : "";
 
   app.innerHTML = `
     <div class="lc-top"><h1>${icon("all_inclusive")} Loops</h1>
@@ -204,7 +234,7 @@ function renderHome(): void {
         <button class="primary" id="lc-go">${icon("auto_awesome")} Build my loop</button>
       </div>
     </div>
-    ${entHtml}${activityHtml}${draftsHtml}${empty}`;
+    ${sectionsHtml}${empty}`;
   $("#lc-close").addEventListener("click", () => dismissOverlay("loops"));
   const go = (): void => {
     const v = (document.getElementById("lc-prompt") as HTMLInputElement | null)?.value.trim();
@@ -243,7 +273,8 @@ function renderEntityDetail(): void {
   const run = latestRun(loop.id);
   const view = loopEntityToCircuit(loop, run);
   const r = rung(loop.rung);
-  const atGate = run?.status === "at-gate";
+  const terminal = loop.status === "completed" || loop.status === "archived";
+  const atGate = !terminal && run?.status === "at-gate";
   const running = run?.status === "running" || run?.status === "sent-back";
   const hs = loop.hardStops;
   const tokensUsed = run ? run.laps.reduce((n, l) => n + (l.tokens ?? 0), 0) : 0;
@@ -254,11 +285,16 @@ function renderEntityDetail(): void {
     ? `<button class="primary" id="lc-open">${icon("lock_open")} Open the gate ${loop.rung === "draft" ? "(push branch)" : loop.rung === "pr" ? "(open PR)" : loop.rung === "ship" ? "(merge)" : "(publish)"}</button>
        <button class="mini danger" id="lc-sendback">${icon("replay")} Send back a lap</button>`
     : "";
-  const controls = `
-    <button class="mini" id="lc-run"${running ? " disabled" : ""}>${icon("play_arrow")} Run now</button>
-    <button class="mini" id="lc-toggle">${icon(loop.status === "armed" ? "pause" : "bolt")} ${loop.status === "armed" ? "Pause" : "Arm"}</button>
-    ${loop.status !== "armed" ? `<button class="mini" id="lc-edit">${icon("edit")} Edit</button>` : ""}
-    <button class="mini danger" id="lc-delete">${icon("delete")} Delete</button>`;
+  // A terminal loop (completed/archived) offers only Restore + Delete; an active one adds Complete/Archive.
+  const controls = terminal
+    ? `<button class="mini" id="lc-restore">${icon("undo")} Restore</button>
+       <button class="mini danger" id="lc-delete">${icon("delete")} Delete</button>`
+    : `<button class="mini" id="lc-run"${running ? " disabled" : ""}>${icon("play_arrow")} Run now</button>
+       <button class="mini" id="lc-toggle">${icon(loop.status === "armed" ? "pause" : "bolt")} ${loop.status === "armed" ? "Pause" : "Arm"}</button>
+       ${loop.status !== "armed" ? `<button class="mini" id="lc-edit">${icon("edit")} Edit</button>` : ""}
+       <button class="mini" id="lc-complete">${icon("check_circle")} Complete</button>
+       <button class="mini" id="lc-archive">${icon("inventory_2")} Archive</button>
+       <button class="mini danger" id="lc-delete">${icon("delete")} Delete</button>`;
 
   const runsHtml = runsFor(loop.id)
     .slice(0, 5)
@@ -273,7 +309,7 @@ function renderEntityDetail(): void {
     <div class="lc-head">
       <button class="mini" id="lc-back">${icon("arrow_back")} Loops</button>
       <h2>${esc(loop.name)}</h2>
-      <span class="lc-chip ${esc(entityStatus(loop, run))}">${esc(run?.status ?? loop.status)}</span>
+      <span class="lc-chip ${terminal ? esc(loop.status) : esc(entityStatus(loop, run))}">${esc(terminal ? loop.status : (run?.status ?? loop.status))}</span>
     </div>
     <div class="lc-circuit-card">${circuitSvg(view)}</div>
     ${reasonNote}
@@ -301,6 +337,9 @@ function renderEntityDetail(): void {
   document.getElementById("lc-run")?.addEventListener("click", () => void runLoop(loop.id));
   document.getElementById("lc-toggle")?.addEventListener("click", () => void toggleArm(loop));
   document.getElementById("lc-edit")?.addEventListener("click", () => openNewLoopDialog("", loop));
+  document.getElementById("lc-complete")?.addEventListener("click", () => void completeLoopEntity(loop));
+  document.getElementById("lc-archive")?.addEventListener("click", () => void archiveLoop(loop));
+  document.getElementById("lc-restore")?.addEventListener("click", () => void restoreLoop(loop));
   document.getElementById("lc-delete")?.addEventListener("click", () => void deleteLoop(loop));
   document.getElementById("lc-open")?.addEventListener("click", () => void openGate(loop.id, run!.id));
   document.getElementById("lc-sendback")?.addEventListener("click", () => void sendBack(loop.id, run!.id));
@@ -384,6 +423,7 @@ function renderProjectedDetail(): void {
       <button class="mini danger" id="lc-reject">${icon("close")} Reject</button>`;
   else if (l.kind === "draft")
     actions = `<button class="primary" id="lc-convert">${icon("all_inclusive")} Convert to a loop</button>
+      <button class="mini" id="lc-draft-done">${icon("check_circle")} Mark done</button>
       <button class="mini" id="lc-open-draft">${icon("open_in_new")} Open the draft</button>`;
   else if (l.sessionId) actions = `<button class="mini" id="lc-jump">${icon("open_in_new")} Open its session</button>`;
   const iterCard = l.iteration
@@ -413,6 +453,7 @@ function renderProjectedDetail(): void {
   document.getElementById("lc-convert")?.addEventListener("click", () =>
     void openIntake(l.title, { workUnitId: l.id, ...(l.environmentId ? { environmentId: l.environmentId } : {}) }),
   );
+  document.getElementById("lc-draft-done")?.addEventListener("click", () => void markDraftDone(l.id, l.title));
   document.getElementById("lc-approve")?.addEventListener("click", () => void approveProposal(l.id));
   document.getElementById("lc-reject")?.addEventListener("click", () => void rejectProposal(l.id, l.title));
 }
@@ -460,6 +501,36 @@ async function deleteLoop(loop: Loop): Promise<void> {
     backHome();
   }
 }
+async function completeLoopEntity(loop: Loop): Promise<void> {
+  const body = "Marks the loop done and moves it to Completed. Reversible.";
+  let closeTodoist = false;
+  if (loop.workUnitId) {
+    // Converted-from-a-draft loops carry a Todoist source task — offer to close it out too.
+    const r = await confirmDialogWithOption({ title: `Complete “${loop.name}”?`, body, confirmLabel: "Complete", icon: "check_circle", optionLabel: "Also complete the linked Todoist task", optionChecked: true });
+    if (!r.ok) return;
+    closeTodoist = r.checked;
+  } else if (!(await confirmDialog({ title: `Complete “${loop.name}”?`, body, confirmLabel: "Complete", icon: "check_circle" }))) {
+    return;
+  }
+  if (await loopSend(loop.id, { type: "loop.complete", loopId: loop.id, closeTodoist })) {
+    toast("Loop completed");
+    backHome();
+  }
+}
+async function archiveLoop(loop: Loop): Promise<void> {
+  const ok = await confirmDialog({ title: `Archive “${loop.name}”?`, body: "Retires the loop out of the active view. Restore it anytime.", confirmLabel: "Archive", icon: "inventory_2" });
+  if (!ok) return;
+  if (await loopSend(loop.id, { type: "loop.archive", loopId: loop.id })) {
+    toast("Loop archived");
+    backHome();
+  }
+}
+async function restoreLoop(loop: Loop): Promise<void> {
+  if (await loopSend(loop.id, { type: "loop.pause", loopId: loop.id })) {
+    toast("Restored — paused; arm it when ready");
+    backHome();
+  }
+}
 async function openGate(loopId: string, runId: string): Promise<void> {
   if (await loopSend(loopId, { type: "loop.gate.open", runId })) toast("Gate opened");
 }
@@ -478,6 +549,30 @@ async function approveProposal(id: string): Promise<void> {
     backHome();
   } catch (err) {
     toast(`Approve failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+/** Draft is "done" — the work was already finished elsewhere. Resolves the draft's work unit as
+ *  completed (drops the card) and, by default, closes its Todoist source task(s). Same `autopilot.resolve`
+ *  path the Autopilot grid uses; on a draft `l.id` is the work-unit id. */
+async function markDraftDone(id: string, title: string): Promise<void> {
+  const r = await confirmDialogWithOption({
+    title: `Mark “${title}” done?`,
+    body: "Removes the draft — use this when the work was already finished elsewhere.",
+    confirmLabel: "Mark done",
+    icon: "check_circle",
+    optionLabel: "Also complete the Todoist source task",
+    optionChecked: true,
+  });
+  if (!r.ok) return;
+  const srv = projSock(id);
+  if (!srv?.sock.isOpen()) return void toast("That loop's server is offline");
+  try {
+    const res = await sendAwait(srv, { type: "autopilot.resolve", workUnitId: id, status: "completed", closeTodoist: r.checked, cid: newCid() }, 60_000);
+    if (res.type === "command.error") return void toast(res.message);
+    toast(r.checked ? "Marked done · Todoist task completed" : "Marked done");
+    backHome();
+  } catch (err) {
+    toast(`Mark done failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 async function rejectProposal(id: string, title: string): Promise<void> {

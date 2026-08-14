@@ -1001,6 +1001,8 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .lc-chip.armed { color: #2196c9; border-color: #2196c966; }
 .lc-chip.gated { color: #b07cc3; border-color: #b07cc366; }
 .lc-chip.paused { color: var(--muted); }
+.lc-chip.completed { color: #4caf72; border-color: #4caf7266; }
+.lc-chip.archived { color: var(--muted); border-style: dashed; }
 .lc-circuit-card { border: 1px solid var(--border); border-radius: 14px; background: var(--panel); padding: 10px 8px 4px; margin-bottom: 14px; }
 .lc-circuit { width: 100%; height: auto; display: block; }
 .lc-st-circle { fill: var(--bg); stroke: var(--border); stroke-width: 2; }
