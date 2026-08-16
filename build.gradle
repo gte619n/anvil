@@ -5,5 +5,5 @@ plugins {
     // Gradle Play Publisher: can publish a signed AAB to the Play Store production track. Kept
     // configured but DORMANT — no workflow invokes it (the full release ships Android via Firebase).
     // Wire it into release.yml only for a public Play launch. See docs/CI-CD.md.
-    id 'com.github.triplet.play' version '4.0.0' apply false
+    id 'com.github.triplet.play' version '4.1.1' apply false
 }
