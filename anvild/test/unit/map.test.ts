@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { mapMessage, extractSessionId, extractResultUsage, askUserQuestionToolIds } from "../../src/agent/map";
+import { mapMessage, extractSessionId, extractResultUsage, askUserQuestionToolIds, toolResultImages } from "../../src/agent/map";
 import { PassthroughRenderer } from "../../src/render/markdown";
 
 const r = new PassthroughRenderer();
@@ -65,6 +65,36 @@ test("user tool_result → tool.result (string + array content)", () => {
   expect(s).toEqual([{ type: "tool.result", toolUseId: "tu_1", content: "ok", isError: false }]);
   const a = map({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_2", content: [{ type: "text", text: "li" }, { type: "text", text: "ne" }], is_error: true }] } });
   expect(a).toEqual([{ type: "tool.result", toolUseId: "tu_2", content: "line", isError: true }]);
+});
+
+test("tool_result with an image block: base64 stays out of the text, extracted separately", () => {
+  const m = {
+    type: "user",
+    message: {
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "tu_shot",
+          is_error: false,
+          content: [
+            { type: "text", text: "captured" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAAbase64AAAA" } },
+          ],
+        },
+      ],
+    },
+  };
+  // The emitted tool.result carries only the text — never the megabyte of base64.
+  expect(map(m)).toEqual([{ type: "tool.result", toolUseId: "tu_shot", content: "captured", isError: false }]);
+  // …and the image is surfaced for the driver to persist, keyed by tool_use id.
+  expect(toolResultImages(m as unknown as SDKMessage)).toEqual([
+    { toolUseId: "tu_shot", images: [{ mediaType: "image/png", dataBase64: "AAAAbase64AAAA" }] },
+  ]);
+});
+
+test("toolResultImages: nothing to extract from text-only / non-user messages", () => {
+  expect(toolResultImages({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] } } as unknown as SDKMessage)).toEqual([]);
+  expect(toolResultImages({ type: "assistant", message: { content: [] } } as unknown as SDKMessage)).toEqual([]);
 });
 
 test("result → result event + usage extraction", () => {

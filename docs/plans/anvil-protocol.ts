@@ -372,7 +372,7 @@ export type ContentBlock =
 export type ConversationEvent =
   | { kind: "user"; ts?: Iso8601; rendered: RenderedMarkdown; attachments: AttachmentRef[] }
   | { kind: "assistant"; ts?: Iso8601; blocks: ContentBlock[] }
-  | { kind: "tool_result"; ts?: Iso8601; toolUseId: ToolUseId; content: string; isError: boolean }
+  | { kind: "tool_result"; ts?: Iso8601; toolUseId: ToolUseId; content: string; isError: boolean; images?: ToolResultImage[] }
   | { kind: "result"; ts?: Iso8601; stopReason: string; usage: Usage }
   | { kind: "file_offer"; ts?: Iso8601; file: FileOffer };
 
@@ -381,6 +381,18 @@ export interface AttachmentRef {
   kind: "image" | "file";
   name: string;
   path: string; // server-side path under <cwd>/.anvil/attachments/
+}
+
+/**
+ * An image the agent surfaced inside a tool result — a screenshot it captured, a chart it rendered,
+ * an image file it Read. The SDK delivers these as base64 image blocks; the daemon persists the bytes
+ * as a session attachment (so the event log stays small and survives restarts) and references them by
+ * id. Clients fetch the bytes from `/api/sessions/<id>/attachments/<attachmentId>` and render a
+ * thumbnail that opens full-size. (§6.5)
+ */
+export interface ToolResultImage {
+  attachmentId: AttachmentId;
+  mediaType: string; // e.g. "image/png"
 }
 
 /**
@@ -1134,6 +1146,9 @@ export interface ToolResultEvent extends Envelope, SessionScoped {
   toolUseId: ToolUseId;
   content: string;
   isError: boolean;
+  /** Screenshots / images the agent surfaced in this result — persisted as attachments, referenced
+   *  by id, and rendered inline as thumbnails that open full-size. Absent when the result is text-only. */
+  images?: ToolResultImage[];
 }
 export interface PermissionRequestEvent extends Envelope, SessionScoped {
   type: "permission.request";

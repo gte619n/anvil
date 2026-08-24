@@ -1414,7 +1414,7 @@ function handleSessionEvent(e: ServerEvent): void {
       commitAssistant(e.blocks, e.ts);
       return;
     case "tool.result":
-      appendToolResult(e.content, e.isError);
+      appendToolResult(e.content, e.isError, e.images);
       return;
     case "file.offer":
       appendFileOffer(e.file);
@@ -1474,7 +1474,7 @@ function handleSessionEvent(e: ServerEvent): void {
 function renderConversationEvent(ev: ConversationEvent): void {
   if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments, ev.ts);
   else if (ev.kind === "assistant") commitAssistant(ev.blocks, ev.ts);
-  else if (ev.kind === "tool_result") appendToolResult(ev.content, ev.isError);
+  else if (ev.kind === "tool_result") appendToolResult(ev.content, ev.isError, ev.images);
   else if (ev.kind === "file_offer") appendFileOffer(ev.file);
 }
 
