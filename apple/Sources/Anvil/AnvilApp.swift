@@ -25,10 +25,15 @@ struct AnvilApp: App {
         .defaultSize(width: 1180, height: 800)
         .commands {
             CommandGroup(after: .appInfo) {
-                // Updates the app shell itself (Sparkle, off the GitHub appcast).
+                // Two DIFFERENT update targets, kept visually apart (divider) with distinct labels so
+                // they're not mistaken for each other:
+                //   • "Check for Updates…" → the Mac app shell itself (Sparkle, off the GitHub appcast).
+                //     This is the one that moves the app version, e.g. 4.1.59 → 4.1.60.
+                //   • "Update Server…"     → the daemon (git pull + rebuild + restart) via
+                //     /api/daemon/update. Does NOT touch the app version.
                 Button("Check for Updates…") { AnvilSparkle.checkForUpdates() }
-                // Updates the daemon (git pull + rebuild) — the dev "Update Button". Unchanged.
-                Button("Update Anvil…") { Updater.runUpdate() }
+                Divider()
+                Button("Update Server…") { Updater.runUpdate() }
                     .keyboardShortcut("u", modifiers: .command)
             }
             CommandGroup(after: .toolbar) {
