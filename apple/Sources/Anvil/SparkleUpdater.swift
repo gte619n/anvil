@@ -5,7 +5,7 @@ import Sparkle
 /// outside the Mac App Store. This is deliberately separate from `Updater.swift`:
 ///
 ///   • "Check for Updates…" (here)      → updates Anvil.app itself off the GitHub-hosted appcast.
-///   • "Update Anvil…" (Updater.swift)  → git-pulls + rebuilds the **daemon** (the dev "Update
+///   • "Update Server…" (Updater.swift) → git-pulls + rebuilds the **daemon** (the dev "Update
 ///                                         Button"), via the server's /api/daemon/update endpoint.
 ///
 /// Both coexist; they update different things. The updater reads SUFeedURL / SUPublicEDKey /
