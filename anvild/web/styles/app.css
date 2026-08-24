@@ -586,7 +586,18 @@ details.tool-result.error > summary { color: var(--danger); }
 .attach-chip.file { width: auto; max-width: 180px; height: 56px; display: flex; align-items: center; gap: 6px; padding: 0 10px; background: var(--surface, rgba(127,127,127,.08)); }
 .attach-chip.file .msym { font-size: 22px; opacity: .8; }
 .attach-chip.file .att-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.att-img { max-width: 280px; max-height: 280px; border-radius: 8px; margin-top: 6px; display: block; }
+.att-img { max-width: 280px; max-height: 280px; border-radius: 8px; margin-top: 6px; display: block; cursor: zoom-in; }
+/* Screenshots the agent returned in a tool result: a row of medium thumbnails, always visible
+   (not buried in the collapsed activity block), each opening full-size on click. */
+.tool-shots { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 10px; }
+.tool-shots .tool-shot { margin-top: 0; max-width: 200px; max-height: 200px; border: 1px solid var(--border); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12); background: var(--panel); }
+/* Full-screen image viewer (a modal layer — Back/Escape/backdrop dismiss it). */
+.shot-modal { padding: 0; cursor: zoom-out; }
+.shot-stage { position: relative; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; padding: 24px; box-sizing: border-box; }
+.shot-full { max-width: 94vw; max-height: 94dvh; border-radius: 10px; box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5); cursor: default; object-fit: contain; }
+.shot-actions { position: fixed; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); display: flex; gap: 8px; }
+.shot-btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border: none; border-radius: 50%; background: rgba(0, 0, 0, 0.55); color: #fff; cursor: pointer; }
+.shot-btn:hover { background: rgba(0, 0, 0, 0.75); }
 /* a non-image attachment shown in a sent user message → downloadable chip */
 .att-file { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; text-decoration: none; color: inherit; max-width: 280px; }
 .att-file .att-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

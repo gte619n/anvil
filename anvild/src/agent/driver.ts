@@ -4,7 +4,7 @@ import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
 import type { CommandInfo, ContextUsage, Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
-import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage } from "./map";
+import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage, toolResultImages } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
@@ -101,6 +101,10 @@ export class AgentDriver {
     private readonly onGoalResolved?: GoalResolved,
     /** Called after each unmet attempt so the supervisor can persist + broadcast the count. */
     private readonly onGoalProgress?: GoalProgress,
+    /** Persist a base64 image the agent surfaced in a tool result, returning its attachment id (served
+     *  by the existing /attachments GET route). Injected by the supervisor, which owns the store. When
+     *  absent (e.g. unit tests), tool-result screenshots simply aren't surfaced as thumbnails. */
+    private readonly saveToolImage?: (mediaType: string, dataBase64: string) => string,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -318,6 +322,9 @@ export class AgentDriver {
           if (text) this.session.recordTurnLine(`assistant: ${text}`, GOAL_TRANSCRIPT_LINES);
         }
         const bodies = mapMessage(m, this.renderer);
+        // Screenshots (and any image blocks) the tool returned, keyed by tool_use id. Persisted below
+        // as attachments and stitched onto the matching tool.result so the client can render thumbnails.
+        const imagesByTool = new Map(toolResultImages(m).map((g) => [g.toolUseId, g.images]));
         let sawToolUse = false;
         let sawToolResult = false;
         for (const body of bodies) {
@@ -329,7 +336,13 @@ export class AgentDriver {
             const p = deliverablePath(body.name, body.input);
             if (p) this.pendingOffers.set(body.toolUseId, p);
           }
-          if (body.type === "tool.result") sawToolResult = true;
+          if (body.type === "tool.result") {
+            sawToolResult = true;
+            const imgs = imagesByTool.get(body.toolUseId);
+            if (imgs?.length && this.saveToolImage) {
+              body.images = imgs.map((im) => ({ attachmentId: this.saveToolImage!(im.mediaType, im.dataBase64), mediaType: im.mediaType }));
+            }
+          }
           this.session.emit(body);
           // A successful write of a deliverable file → surface it as a download card.
           if (body.type === "tool.result" && this.pendingOffers.has(body.toolUseId)) {

@@ -78,6 +78,37 @@ export function mapMessage(m: SDKMessage, renderer: MarkdownRenderer): SessionEv
   }
 }
 
+/** A base64 image block pulled off a tool_result, awaiting persistence by the driver. */
+export interface ExtractedToolImage {
+  mediaType: string;
+  dataBase64: string;
+}
+
+/**
+ * Image blocks carried in this message's tool_results, grouped by tool_use id (SDK-shape knowledge
+ * stays here, mirroring {@link askUserQuestionToolIds}). A tool that returns a screenshot — Read on
+ * an image, a Playwright/Puppeteer capture, any MCP screenshot tool — delivers it as a base64 image
+ * block. The driver persists these as attachments and stitches the ids onto the matching tool.result
+ * event; we deliberately keep the base64 OUT of the emitted/persisted event (it would bloat the log).
+ */
+export function toolResultImages(m: SDKMessage): { toolUseId: string; images: ExtractedToolImage[] }[] {
+  if (m.type !== "user") return [];
+  const content = (m as any).message?.content;
+  if (!Array.isArray(content)) return [];
+  const out: { toolUseId: string; images: ExtractedToolImage[] }[] = [];
+  for (const b of content) {
+    if (b?.type !== "tool_result" || !Array.isArray(b.content)) continue;
+    const images: ExtractedToolImage[] = [];
+    for (const c of b.content) {
+      if (c?.type === "image" && c.source?.type === "base64" && typeof c.source.data === "string") {
+        images.push({ mediaType: typeof c.source.media_type === "string" ? c.source.media_type : "image/png", dataBase64: c.source.data });
+      }
+    }
+    if (images.length) out.push({ toolUseId: b.tool_use_id, images });
+  }
+  return out;
+}
+
 /** The SDK session id (used as `claudeSessionId` for resume). */
 export function extractSessionId(m: SDKMessage): string | undefined {
   const sid = (m as any).session_id;
@@ -99,6 +130,15 @@ function resultUsage(r: any): Usage {
 
 function stringifyContent(c: unknown): string {
   if (typeof c === "string") return c;
-  if (Array.isArray(c)) return c.map((b: any) => (typeof b?.text === "string" ? b.text : JSON.stringify(b))).join("");
+  if (Array.isArray(c))
+    return c
+      .map((b: any) => {
+        if (typeof b?.text === "string") return b.text;
+        // Image blocks are surfaced as inline thumbnails (see toolResultImages) — never dump the
+        // base64 into the text body, or a screenshot becomes a megabyte of gibberish in the transcript.
+        if (b?.type === "image") return "";
+        return JSON.stringify(b);
+      })
+      .join("");
   return c == null ? "" : JSON.stringify(c);
 }

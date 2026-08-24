@@ -30,13 +30,13 @@ import { currentTheme } from "./theme";
 import { ui } from "./state";
 // dialogs.ts is a leaf, so toast + the permission/question card-map reset are direct imports —
 // they used to arrive via initConversation(deps).
-import { clearCardMaps, toast } from "./dialogs";
+import { clearCardMaps, closeModal, showModal, toast } from "./dialogs";
 import { envOrdinal, sessionBg, stripeColor } from "./sessionColor";
 import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serverByUrl, serverOf, servers, sessionServer, wireSessionId, type Server } from "./fleet";
 import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
-import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session } from "../../protocol";
+import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session, ToolResultImage } from "../../protocol";
 
 // ── Injected dependencies (initConversation) ─────────────────────────────────────────────────────
 // What conversation code calls back into main.ts for. Each field documents the main.ts state it
@@ -126,6 +126,14 @@ function wireConversationDom(): void {
     $("#scroll-bottom").hidden = true;
   });
   stopBtn.addEventListener("click", cancelThinking);
+  // Click (or tap) any conversation image — a tool screenshot or a user attachment — to pop it
+  // full-size. On desktop the hover bar still offers copy/download; on Android long-press does.
+  conversation.addEventListener("click", (e) => {
+    const img = (e.target as HTMLElement).closest<HTMLImageElement>("#conversation .att-img");
+    if (!img) return;
+    e.preventDefault();
+    openImageLightbox(img.src, fileNameFromUrl(img.src, "image.png"));
+  });
   // Flag the platform on <html> so CSS can suppress the native long-press callout on links/attachments.
   document.documentElement.classList.toggle("is-android", isAndroidApp);
   wireLinkActions();
@@ -471,17 +479,66 @@ export function finalizeActivity(): void {
   if (ind) ind.innerHTML = icon("check");
   updateActivityHead();
 }
-export function appendToolResult(content: string, isError: boolean): void {
+export function appendToolResult(content: string, isError: boolean, images: ToolResultImage[] = []): void {
   const text = content.trim();
   const lineCount = text ? text.split("\n").length : 0;
-  const first = text.split("\n").find((l) => l.trim()) ?? "(no output)";
-  const summary = `${icon(isError ? "error" : "check")} ${isError ? "error" : "result"} · ${lineCount} line${lineCount === 1 ? "" : "s"} · ${esc(first.slice(0, 80))}`;
+  const shotNote = images.length ? `${images.length} image${images.length === 1 ? "" : "s"}` : "";
+  const first = text.split("\n").find((l) => l.trim()) ?? (shotNote || "(no output)");
+  const summary = `${icon(isError ? "error" : images.length ? "image" : "check")} ${isError ? "error" : "result"} · ${lineCount} line${lineCount === 1 ? "" : "s"}${shotNote ? ` · ${shotNote}` : ""} · ${esc(first.slice(0, 80))}`;
   const preview = `<div class="tool ${isError ? "result-error" : ""}">${summary}</div>`;
   const full =
     `<details class="tool-result ${isError ? "error" : ""}">` +
     `<summary>${summary}</summary>` +
     `<pre>${esc(text.slice(0, 8000))}${text.length > 8000 ? "\n… (truncated)" : ""}</pre></details>`;
   appendActivityStep(preview, full);
+  // Screenshots the tool returned are shown as always-visible thumbnails (not buried inside the
+  // collapsed activity block) — the whole point is to SEE them. Each opens full-size on click.
+  if (images.length) appendToolShots(images);
+}
+/** A row of medium thumbnails for the screenshots a tool result carried. Reuses `.att-img` so the
+ *  copy/download affordances (hover bar + Android long-press) and the click-to-lightbox handler apply. */
+function appendToolShots(images: ToolResultImage[]): void {
+  const id = activeId();
+  if (!id) return;
+  const row = document.createElement("div");
+  row.className = "tool-shots";
+  for (const im of images) {
+    // wireSessionId + owning server: mirror appendUser so a member's namespaced session resolves right.
+    const url = serverApiUrl(activeServer().url, `/api/sessions/${wireSessionId(id)}/attachments/${im.attachmentId}`);
+    const img = document.createElement("img");
+    img.className = "att-img tool-shot";
+    img.loading = "lazy";
+    img.src = url;
+    img.alt = "screenshot";
+    row.appendChild(img);
+  }
+  conversation.appendChild(row);
+  scrollDown();
+  saveConvoCache();
+}
+/** Pop an image into its own full-screen view (device/browser Back closes it — it's a modal layer). */
+export function openImageLightbox(url: string, name = "image.png"): void {
+  const wrap = document.createElement("div");
+  wrap.className = "modal shot-modal";
+  wrap.innerHTML =
+    `<div class="shot-stage">` +
+    `<img class="shot-full" src="${esc(url)}" alt="${esc(name)}" />` +
+    `<div class="shot-actions">` +
+    `<button type="button" class="shot-btn" data-act="download" title="Download">${icon("download")}</button>` +
+    `<button type="button" class="shot-btn" data-act="close" title="Close">${icon("close")}</button>` +
+    `</div></div>`;
+  wrap.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    if (t.closest('[data-act="download"]')) {
+      void downloadTarget({ host: wrap, url, name, isImage: true });
+      return;
+    }
+    // A click on the image itself keeps the viewer open (so you can right-click / long-press to save);
+    // the backdrop or the close button dismisses it.
+    if (t.closest(".shot-full")) return;
+    closeModal();
+  });
+  showModal(wrap);
 }
 
 // ── Links panel (§links) — the reference MODEL; the panel chrome (renderLinks) lives in panel.ts ──

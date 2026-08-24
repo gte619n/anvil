@@ -106,7 +106,7 @@ export class EventLog {
           events.push({ kind: "assistant", ts: a.ts, blocks: a.blocks });
           break;
         case "tool.result":
-          events.push({ kind: "tool_result", ts: a.ts, toolUseId: a.toolUseId, content: a.content, isError: a.isError });
+          events.push({ kind: "tool_result", ts: a.ts, toolUseId: a.toolUseId, content: a.content, isError: a.isError, ...(a.images ? { images: a.images } : {}) });
           break;
         case "result":
           events.push({ kind: "result", ts: a.ts, stopReason: a.stopReason, usage: a.usage });

@@ -1485,6 +1485,9 @@ export class Supervisor {
           this.broadcastUpdated(s.data);
           this.broadcastLoops(); // each unmet attempt bumps the loop's live iteration count
         },
+        // Persist a screenshot the agent surfaced in a tool result as a session attachment, reusing the
+        // upload store (and its GET route) so the client can fetch + thumbnail it by id (§6.5).
+        (mediaType, dataBase64) => this.attachStore.add(id, "screenshot", mediaType, dataBase64).id,
       );
       this.drivers.set(id, driver);
     }
