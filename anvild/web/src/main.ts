@@ -1577,21 +1577,32 @@ function setHeaderTitle(s: Session | undefined): void {
   renderTeamBoard(s); // show the member board when a lead is active; hide it otherwise
   void setFavicon(s);
 }
-/** Show the active session's git branch as a chip in the header; tap it to open the Git panel. */
+/** Show the active session's git branch as a chip in the header; tap it to copy the full branch name. */
 function updateHeaderBranch(s: Session | undefined): void {
   const el = document.getElementById("header-branch");
   if (!el) return;
   const branch = s && !s.isDefault ? s.git?.branch : undefined;
   if (branch) {
     el.innerHTML = `${icon("account_tree")}<span class="hb-name">${esc(branch)}</span>`;
-    el.title = `On branch ${branch} — open Git`;
+    el.title = `On branch ${branch} — click to copy`;
+    el.dataset.branch = branch;
     el.hidden = false;
   } else {
     el.innerHTML = "";
+    delete el.dataset.branch;
     el.hidden = true;
   }
 }
-$("#header-branch").addEventListener("click", () => (panelView === "git" ? closePanel() : openPanel("git")));
+$("#header-branch").addEventListener("click", async (e) => {
+  const branch = (e.currentTarget as HTMLElement).dataset.branch;
+  if (!branch) return;
+  try {
+    await navigator.clipboard.writeText(branch);
+    toast(`Copied ${branch}`);
+  } catch {
+    toast("Couldn't copy branch name");
+  }
+});
 
 /** Show the active session's Claude account as a chip in the header (multi-account §5). Omitted
  *  entirely when the roster has ≤1 account — there's nothing to distinguish. When the session's bound
