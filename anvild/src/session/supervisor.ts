@@ -61,7 +61,7 @@ import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
 import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
-import { AgentDriver, type TurnUsage } from "../agent/driver";
+import { AgentDriver, externalMcpServers, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
@@ -1457,6 +1457,19 @@ export class Supervisor {
       const isLead = s.data.teamRole === "lead";
       const isMember = s.data.teamRole === "member" && !!s.data.parentId;
       const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
+      // This session's in-process role tool server, merged with any EXTERNAL MCP servers the
+      // operator configured (e.g. a Playwright browser). External servers are opt-in via
+      // ANVIL_EXTERNAL_MCP and passed explicitly, so `settingSources: []` stays authoritative.
+      const roleServer = isDefault
+        ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
+        : isLead
+          ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
+          : isMember
+            ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
+            : isPlanner
+              ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
+              : {};
+      const mcpServers = { ...roleServer, ...externalMcpServers() };
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -1464,15 +1477,7 @@ export class Supervisor {
         this.questionBroker,
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
-        isDefault
-          ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
-          : isLead
-            ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
-            : isMember
-              ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
-              : isPlanner
-                ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-                : undefined,
+        Object.keys(mcpServers).length ? mcpServers : undefined,
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default

@@ -1,4 +1,4 @@
-import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type McpServerConfig, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliOptions } from "./cli";
 import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
@@ -54,6 +54,28 @@ export function isResumeRejectedError(e: unknown): boolean {
 }
 
 /**
+ * External MCP servers (stdio/http) the operator wants exposed to sessions — for example a browser
+ * via `@playwright/mcp`. Read from the `ANVIL_EXTERNAL_MCP` env var, a JSON map of
+ * name -> McpServerConfig, which the launcher already sources from `~/.config/anvil/env` alongside
+ * the other daemon config. Unset or unparseable -> `{}`, so this is fully opt-in: nothing changes
+ * unless an operator adds the var, and `settingSources: []` (ambient Claude Code config is NOT
+ * loaded) is untouched because these servers are passed explicitly, not discovered.
+ *
+ * Example (`~/.config/anvil/env`):
+ *   export ANVIL_EXTERNAL_MCP='{"playwright":{"type":"stdio","command":"npx","args":["-y","@playwright/mcp@latest"]}}'
+ */
+export function externalMcpServers(): Record<string, McpServerConfig> {
+  const raw = process.env.ANVIL_EXTERNAL_MCP;
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, McpServerConfig>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Drives one Claude Code session via the Agent SDK in streaming-input mode (arch §2).
  * One long-lived `query()` for the session's life; pushes user turns into an InputQueue;
  * the consume loop maps `SDKMessage`s → session events. (impl plan 1 §4.4)
@@ -78,8 +100,11 @@ export class AgentDriver {
     private readonly questionBroker: QuestionBroker,
     private readonly env: Record<string, string>,
     private readonly onResult: ResultRecorder,
-    /** In-process MCP servers exposed to this session — set ONLY for the default concierge chat (§0.6). */
-    private readonly mcpServers?: Record<string, McpSdkServerConfigWithInstance>,
+    /** MCP servers exposed to this session. Historically only the in-process concierge/team/member/
+     *  planning tool servers (§0.6); now also accepts EXTERNAL servers (stdio/http) so a session can
+     *  be given a tool like a Playwright browser. `McpServerConfig` is the SDK union and includes the
+     *  in-process instance type, so this is a widening — existing callers are unaffected. */
+    private readonly mcpServers?: Record<string, McpServerConfig>,
     /** Extra `allowedTools` (the concierge's `mcp__anvil__*` ids) auto-allowed by the SDK layer. */
     private readonly extraAllowedTools?: string[],
     /** Runs the adversarial plan review when the model calls ExitPlanMode (advisory). Set by the
