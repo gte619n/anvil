@@ -773,6 +773,13 @@ input:focus, select:focus, textarea:not(#input):focus {
 .ts-ic { font-size: 18px; color: var(--muted); flex: none; }
 .ts-control .item .ts-ic { color: var(--text); }
 .ts-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; border: 1px solid rgba(0, 0, 0, 0.18); }
+/* Searchable single-selects (e.g. the env picker): on focus, Tom Select keeps the selected .item
+   rendered AND adds the filter <input> as a second flex child. The input's min-width: 7rem plus the
+   item overflows the control, so the base library's flex-wrap drops the input to a second line — the
+   item then reads like a selected chip. While the input is active, hide the item so the filter box
+   owns the single line; it reappears (with the new selection) on blur. */
+.ts-wrapper.single.input-active .ts-control .item { display: none; }
+.ts-wrapper.single.input-active .ts-control > input { min-width: 0 !important; }
 
 /* icon picker (add/edit environment) — mirrors the color swatch grid */
 .icon-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; max-height: 170px; overflow-y: auto; }
