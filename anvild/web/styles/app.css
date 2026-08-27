@@ -712,67 +712,64 @@ input:focus, select:focus, textarea:not(#input):focus {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-/* ── Tom Select (stylized selectors) ──────────────────────────────────────────
-   tom-select.css ships the structure; these rules repaint it in the app's theme so the
-   dropdowns match every other control (and carry a Material Symbol icon + color dot per option).
-   Loaded after tom-select.css (see index.html) so equal-specificity rules win. */
-.ts-wrapper { margin-top: 4px; }
-.modal-box .ts-wrapper { width: 100%; }
-.env-row .ts-wrapper { flex: 1; margin-top: 0; }
-.ts-control {
-  background-color: var(--bg) !important;
-  color: var(--text);
-  border: 1px solid var(--border) !important;
-  border-radius: 8px !important;
-  padding: 6px 9px !important;
-  box-shadow: none !important;
-  font: inherit;
+/* ── Combobox (stylized selectors) ────────────────────────────────────────────
+   A hidden native <select> is mirrored by this control (built in web/src/dom.ts) so each option can
+   carry a Material Symbol icon + color dot, groups get styled headers, and long lists get a search
+   box. Painted to match every other field. NOTE: the `[hidden]` rules below are load-bearing — the
+   UA `[hidden]{display:none}` loses to our `display:flex`, so hiding the panel/filtered rows needs
+   an explicit same-selector override (see the "hidden attr defeated by CSS" gotcha). */
+.cbx { position: relative; margin-top: 4px; }
+.modal-box .cbx { width: 100%; }
+.env-row .cbx { flex: 1; margin-top: 0; }
+/* `.cbx .cbx-control` (not a bare `.cbx-control`) so it outranks `.env-row button` — that rule's
+   `padding: 0 12px` would otherwise zero the vertical padding and shrink the control below the
+   sibling text inputs. */
+.cbx .cbx-control {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  /* 6px vertical (not the inputs' 7px) so the 18px icon's taller line box lands at the same 32px
+     total height as the sibling text inputs — this is the padding the old .ts-control used too. */
+  padding: 6px 30px 6px 9px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: var(--text); font: inherit; text-align: left; cursor: pointer;
 }
-/* reuse the exact chevron the native selects draw, for a seamless look */
-.ts-wrapper.single .ts-control {
-  cursor: pointer;
-  padding-right: 30px !important;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23888c92' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 9px center;
-  background-size: 13px;
+.cbx-control:hover { border-color: var(--muted); }
+.cbx-control[aria-expanded="true"], .cbx-control:focus-visible {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
-.ts-wrapper.single .ts-control::after { display: none !important; } /* hide the default triangle */
-.ts-wrapper.focus .ts-control {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent) !important;
+.cbx-value { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+.cbx-chev { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-size: 20px; color: var(--muted); pointer-events: none; }
+.cbx-panel {
+  position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 1200;
+  display: flex; flex-direction: column; max-height: 260px; padding: 4px; overflow: hidden;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
 }
-.ts-control input { color: var(--text) !important; }
-.ts-control input::placeholder { color: var(--muted) !important; }
-.ts-wrapper.disabled .ts-control { opacity: 0.6; }
-.ts-dropdown {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-  margin-top: 4px;
-  z-index: 1200;
-}
-.ts-dropdown .option { padding: 8px 10px; border-radius: 6px; }
-.ts-dropdown .active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--text); }
-.ts-dropdown .optgroup-header {
-  background: transparent;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+.cbx-panel[hidden] { display: none; }
+.cbx--up .cbx-panel { top: auto; bottom: calc(100% + 4px); }
+.cbx-search { display: flex; align-items: center; gap: 6px; padding: 2px 6px 6px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+.cbx-search-ic { font-size: 18px; color: var(--muted); flex: none; }
+/* two classes so it beats `.modal-box input` / `input:focus` (which would re-add a border + ring —
+   the whole control already shows focus, so the inner field must stay flat) */
+.cbx-search .cbx-search-input,
+.cbx-search .cbx-search-input:focus { flex: 1; min-width: 0; width: auto; margin: 0; padding: 2px; border: 0; background: transparent; color: var(--text); font: inherit; outline: none; box-shadow: none; }
+.cbx-search .cbx-search-input::placeholder { color: var(--muted); }
+.cbx-list { overflow-y: auto; min-height: 0; }
+.cbx-group {
+  color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
   padding: 8px 10px 2px;
 }
-.ts-dropdown .optgroup:not(:first-child) .optgroup-header { border-top: 1px solid var(--border); margin-top: 4px; }
-.ts-dropdown [aria-disabled="true"] { opacity: 0.45; }
-/* the icon + color dot + label rendered inside each option/selected item */
-.ts-opt { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.ts-opt .ts-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ts-ic { font-size: 18px; color: var(--muted); flex: none; }
-.ts-control .item .ts-ic { color: var(--text); }
-.ts-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; border: 1px solid rgba(0, 0, 0, 0.18); }
+.cbx-group:not(:first-child) { border-top: 1px solid var(--border); margin-top: 4px; }
+.cbx-item { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+.cbx-item[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.cbx-item.cbx-active { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--text); }
+.cbx-item--disabled { opacity: 0.45; cursor: default; }
+.cbx-item[hidden], .cbx-group[hidden] { display: none; }
+/* the icon + color dot + label rendered inside the control's value and each list option */
+.cbx-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cbx-ic { font-size: 18px; color: var(--muted); flex: none; }
+.cbx-value .cbx-ic { color: var(--text); }
+.cbx-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; border: 1px solid rgba(0, 0, 0, 0.18); }
 
 /* icon picker (add/edit environment) — mirrors the color swatch grid */
 .icon-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; max-height: 170px; overflow-y: auto; }
