@@ -48,10 +48,24 @@ class MainActivity : ComponentActivity() {
 
     private val fileChooser =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-            filePathCallback?.onReceiveValue(uris ?: emptyArray())
+            // The picker returns a multi-select in `intent.getClipData()` and a single pick in
+            // `intent.getData()`. WebChromeClient.FileChooserParams.parseResult() reads only the latter,
+            // so selecting several files at once handed the WebView an empty array — nothing uploaded.
+            // Read both ourselves so multi-select works (one-by-one already did, via getData()).
+            filePathCallback?.onReceiveValue(chooserUris(result.resultCode, result.data))
             filePathCallback = null
         }
+
+    /** Every Uri a file-picker result carries: multi-select lands in ClipData, a single pick in
+     *  getData(). Empty on cancel/none so the WebView callback is always fulfilled (a null would
+     *  otherwise wedge the picker for the rest of the session). */
+    private fun chooserUris(resultCode: Int, data: Intent?): Array<Uri> {
+        if (resultCode != RESULT_OK || data == null) return emptyArray()
+        data.clipData?.let { clip ->
+            return (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }.toTypedArray()
+        }
+        return data.data?.let { arrayOf(it) } ?: emptyArray()
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
