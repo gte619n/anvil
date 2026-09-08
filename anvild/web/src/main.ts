@@ -1405,7 +1405,7 @@ function handleSessionEvent(e: ServerEvent): void {
       saveConvoCache();
       return;
     case "message.user":
-      appendUser(e.rendered.html, e.attachments, e.ts, e.cid); // cid retires the matching optimistic bubble
+      appendUser(e.rendered.html, e.attachments, e.ts, e.cid, e.rendered.source); // cid retires the matching optimistic bubble
       return;
     case "assistant.delta":
       appendDelta(e.text);
@@ -1472,7 +1472,7 @@ function handleSessionEvent(e: ServerEvent): void {
 
 // replay/snapshot events fold into the same renderers
 function renderConversationEvent(ev: ConversationEvent): void {
-  if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments, ev.ts);
+  if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments, ev.ts, undefined, ev.rendered.source);
   else if (ev.kind === "assistant") commitAssistant(ev.blocks, ev.ts);
   else if (ev.kind === "tool_result") appendToolResult(ev.content, ev.isError, ev.images);
   else if (ev.kind === "file_offer") appendFileOffer(ev.file);
