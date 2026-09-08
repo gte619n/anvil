@@ -138,6 +138,7 @@ function wireConversationDom(): void {
   document.documentElement.classList.toggle("is-android", isAndroidApp);
   wireLinkActions();
   wireLinkMenu();
+  wireMessageMenu();
 }
 
 // ── Conversation rendering ─────────────────────────────────────────────────────
@@ -199,7 +200,7 @@ function timeEl(ts?: string): HTMLElement | null {
   return el;
 }
 
-export function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string, cid?: string): void {
+export function appendUser(html: string, attachments: AttachmentRef[] = [], ts?: string, cid?: string, source?: string): void {
   // Exactly-once reconciliation (v4, spec A6): the authoritative echo carries the send's cid — retire
   // the matching optimistic bubble, and drop a true duplicate echo so exactly-once holds in the UI too.
   if (cid && reconcileOptimistic(conversation, cid) === "duplicate") {
@@ -211,6 +212,7 @@ export function appendUser(html: string, attachments: AttachmentRef[] = [], ts?:
   pendingAnswerRefs = []; // don't carry a prior turn's un-committed links across
   const b = bubble("user");
   if (cid) b.dataset.cid = cid; // tag so a later duplicate echo is recognised
+  if (source) b.dataset.md = source; // raw prompt markdown for copy-as-markdown (see commitAssistant)
   const md = document.createElement("div");
   md.className = "md";
   md.innerHTML = html; // daemon-sanitized (arch §8.3)
@@ -250,6 +252,7 @@ export function appendOptimisticUser(text: string, cid: string): void {
   const b = bubble("user");
   b.classList.add("queued");
   b.dataset.cid = cid; // matched against the authoritative message.user's cid on flush
+  b.dataset.md = text; // the typed source, ready for copy-as-markdown even before the daemon echo
   const md = document.createElement("div");
   md.className = "md";
   md.textContent = text; // plain text is safe; full markdown render comes from the daemon on flush
@@ -333,6 +336,10 @@ export function commitAssistant(blocks: ContentBlock[], ts?: string): void {
     md.className = "md";
     md.innerHTML = mdBlocks.map((blk) => blk.rendered.html).join("");
     b.appendChild(md);
+    // Stash the raw markdown on the bubble so right-click / long-press can copy the source (not the
+    // rendered HTML). Survives the convo cache round-trip: serializeTranscript persists innerHTML, and
+    // a data-* attribute rides along in that HTML.
+    b.dataset.md = mdBlocks.map((blk) => blk.rendered.source).join("\n\n");
     const t = timeEl(ts);
     if (t) b.appendChild(t);
     addCopyButtons(md);
@@ -1145,6 +1152,111 @@ function wireLinkMenu(): void {
     hideLinkActions();
     hideLinkMenu();
   });
+}
+
+// ── Message actions: copy a whole message as raw markdown ──────────────────────────
+// Right-click (desktop) or long-press (Android) any user/assistant bubble to copy its source
+// markdown — the raw text the model produced / the user typed, not the rendered HTML. The source is
+// stashed on the bubble as data-md (see commitAssistant / appendUser). Links, images and file chips
+// keep their own copy/download menu (handled above); this only fires on message prose.
+const msgMenu = document.createElement("div");
+let msgMenuMd = "";
+
+/** The bubble under `el` and its stashed markdown, or null when there's nothing to copy. */
+function msgTargetFor(el: EventTarget | null): { host: HTMLElement; md: string } | null {
+  const start = el instanceof HTMLElement ? el : null;
+  const bubble = start?.closest<HTMLElement>("#conversation .bubble");
+  const md = bubble?.dataset.md;
+  return bubble && md ? { host: bubble, md } : null;
+}
+
+function hideMsgMenu(): void {
+  msgMenu.hidden = true;
+  msgMenuMd = "";
+}
+function openMsgMenu(md: string, x: number, y: number): void {
+  msgMenuMd = md;
+  msgMenu.innerHTML = `<button type="button" class="lm-item" data-act="copy-md">${icon("content_copy")}<span>Copy as Markdown</span></button>`;
+  msgMenu.hidden = false;
+  const w = msgMenu.offsetWidth;
+  const h = msgMenu.offsetHeight;
+  msgMenu.style.left = `${Math.min(Math.max(8, x), window.innerWidth - w - 8)}px`;
+  msgMenu.style.top = `${Math.min(Math.max(8, y), window.innerHeight - h - 8)}px`;
+}
+
+let msgPressTimer = 0;
+let msgPressMd = "";
+let msgPressX = 0;
+let msgPressY = 0;
+
+function wireMessageMenu(): void {
+  msgMenu.id = "msg-menu";
+  msgMenu.hidden = true;
+  document.body.appendChild(msgMenu);
+
+  msgMenu.addEventListener("click", (e) => {
+    const item = (e.target as HTMLElement).closest<HTMLElement>(".lm-item");
+    if (!item) return;
+    const md = msgMenuMd;
+    hideMsgMenu();
+    if (item.dataset.act === "copy-md") void copyText(md).then((ok) => toast(ok ? "Copied as Markdown" : "Couldn't copy"));
+  });
+
+  // Right-click (desktop) / long-press (Android fires contextmenu too) opens the menu. A link or image
+  // keeps its own handling; on desktop an active text selection defers to the native "Copy" menu.
+  conversation.addEventListener("contextmenu", (e) => {
+    if (actionTargetFor(e.target)) return;
+    const sel = window.getSelection();
+    if (!isAndroidApp && sel && !sel.isCollapsed && sel.toString().trim()) return;
+    const t = msgTargetFor(e.target);
+    if (!t) return;
+    e.preventDefault();
+    openMsgMenu(t.md, (e as MouseEvent).clientX, (e as MouseEvent).clientY);
+  });
+
+  // Android: a press timer opens the menu reliably (mirrors the link menu), since a bare contextmenu
+  // on prose isn't dependable across WebView versions. touchmove past a small slop cancels it.
+  conversation.addEventListener(
+    "touchstart",
+    (e) => {
+      const touch = e.touches[0];
+      if (!isAndroidApp || e.touches.length !== 1 || !touch || actionTargetFor(e.target)) return;
+      const t = msgTargetFor(e.target);
+      if (!t) return;
+      msgPressMd = t.md;
+      msgPressX = touch.clientX;
+      msgPressY = touch.clientY;
+      clearTimeout(msgPressTimer);
+      msgPressTimer = window.setTimeout(() => {
+        if (msgPressMd) openMsgMenu(msgPressMd, msgPressX, msgPressY);
+      }, 500);
+    },
+    { passive: true },
+  );
+  conversation.addEventListener(
+    "touchmove",
+    (e) => {
+      const touch = e.touches[0];
+      if (!msgPressMd || !touch) return;
+      if (Math.abs(touch.clientX - msgPressX) > 10 || Math.abs(touch.clientY - msgPressY) > 10) {
+        clearTimeout(msgPressTimer);
+        msgPressMd = "";
+      }
+    },
+    { passive: true },
+  );
+  conversation.addEventListener("touchend", () => {
+    clearTimeout(msgPressTimer);
+    msgPressMd = "";
+  });
+
+  // Tap/click elsewhere dismisses; scrolling does too.
+  const dismissOnOutside = (e: Event): void => {
+    if (!msgMenu.hidden && !(e.target as HTMLElement).closest("#msg-menu")) hideMsgMenu();
+  };
+  document.addEventListener("touchstart", dismissOnOutside, { capture: true });
+  document.addEventListener("mousedown", dismissOnOutside, { capture: true });
+  conversation.addEventListener("scroll", hideMsgMenu);
 }
 
 // ── Mermaid (lazy) ──────────────────────────────────────────────────────────────
