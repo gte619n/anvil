@@ -98,3 +98,39 @@ test("attach WITH lastSeq → a delta (status), never a full snapshot", async ()
   const status = frames.find((f) => f.type === "status" && f.sessionId === sid);
   expect(status.status).toBe("idle"); // a fresh session re-asserts idle — spinner self-heals (D6)
 });
+
+// ── session.history (Phase 2): non-attaching prefetch read ────────────────────────────────────────
+test("session.history without sinceSeq → a session.history.snapshot carrying an epoch, NO attach side effects", async () => {
+  const created = await session([{ ...base, type: "session.create", cid: "c3", source: "existing-dir", cwd: stateDir }], (f) =>
+    f.some((x) => x.type === "session.created" && x.cid === "c3"),
+  );
+  const sid = created.find((f) => f.type === "session.created").session.id as string;
+
+  const frames = await session([{ ...base, type: "session.history", cid: "h1", sessionId: sid }], (f) => f.some((x) => x.type === "session.history.snapshot" && x.cid === "h1"));
+  const resp = frames.find((f) => f.type === "session.history.snapshot");
+  expect(resp.sessionId).toBe(sid);
+  expect(resp.snapshot.type).toBe("conversation.snapshot");
+  expect(typeof resp.snapshot.epoch).toBe("string");
+  // Purity: history must NOT append a live `status` the way attach/resume does.
+  expect(frames.some((f) => f.type === "status" && f.sessionId === sid)).toBe(false);
+});
+
+test("session.history WITH sinceSeq → a session.history.events delta (raw seq'd frames), never a snapshot", async () => {
+  const created = await session([{ ...base, type: "session.create", cid: "c4", source: "existing-dir", cwd: stateDir }], (f) =>
+    f.some((x) => x.type === "session.created" && x.cid === "c4"),
+  );
+  const sid = created.find((f) => f.type === "session.created").session.id as string;
+  const wm = created.find((f) => f.type === "resume.watermarks").watermarks.find((w: any) => w.sessionId === sid);
+
+  const frames = await session([{ ...base, type: "session.history", cid: "h2", sessionId: sid, sinceSeq: wm?.lastSeq ?? 0 }], (f) => f.some((x) => x.type === "session.history.events" && x.cid === "h2"));
+  const resp = frames.find((f) => f.type === "session.history.events");
+  expect(resp.sessionId).toBe(sid);
+  expect(Array.isArray(resp.events)).toBe(true);
+  expect(typeof resp.epoch).toBe("string");
+  expect(frames.some((f) => f.type === "session.history.snapshot")).toBe(false);
+});
+
+test("session.history for an unknown session → command.error", async () => {
+  const frames = await session([{ ...base, type: "session.history", cid: "h3", sessionId: "sess_nope" }], (f) => f.some((x) => x.type === "command.error" && x.cid === "h3"));
+  expect(frames.find((f) => f.type === "command.error").message).toContain("no such session");
+});

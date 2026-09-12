@@ -91,6 +91,18 @@ class MainActivity : ComponentActivity() {
                     startActivity(Intent(Intent.ACTION_VIEW, request.url)) // external/daemon links → browser
                     return true
                 }
+
+                override fun onPageFinished(view: WebView, url: String) {
+                    // Hand any history staged by the background sync (comprehensive-offline §4.4a) to the
+                    // web layer, which applies it to the offline mirror. Idempotent, so a duplicate with a
+                    // live delta is harmless.
+                    HistorySync.drain(this@MainActivity)?.let { staged ->
+                        view.evaluateJavascript(
+                            "window.__anvilApplyStagedHistory && window.__anvilApplyStagedHistory(${JSONObject.quote(staged)});",
+                            null,
+                        )
+                    }
+                }
             }
             // Inject the daemon URL before any page script runs, so the bundled UI knows where the
             // daemon is (the page itself is served locally, not from the daemon).

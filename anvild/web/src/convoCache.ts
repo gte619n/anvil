@@ -54,6 +54,13 @@ function saveIndex(s: Set<string>): void {
     /* quota — the in-memory/IDB copy is still authoritative */
   }
 }
+function addToIndex(id: string): void {
+  const index = loadIndex();
+  if (!index.has(id)) {
+    index.add(id);
+    saveIndex(index);
+  }
+}
 
 export const convoCache = {
   /** Synchronous hint (from the localStorage index) — does a cached transcript exist for this session?
@@ -74,16 +81,17 @@ export const convoCache = {
   },
 
   async set(id: string, html: string): Promise<void> {
-    const index = loadIndex();
-    index.add(id);
-    saveIndex(index);
+    // Claim `has(id)` only AFTER the bytes are stored — otherwise a failed/evicted IDB write leaves the
+    // index saying "we have a cache" (→ skeleton) while `get` returns null (→ nothing ever paints).
     if (!hasIndexedDb) {
       memFallback.set(id, html);
+      addToIndex(id);
       return;
     }
     try {
       const store = await tx("readwrite");
       await wrap(store.put(html, id));
+      addToIndex(id);
     } catch {
       /* durable cache is best-effort — a snapshot still loads from the daemon */
     }

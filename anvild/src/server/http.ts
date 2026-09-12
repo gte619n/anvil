@@ -1,6 +1,6 @@
 import type { ServerWebSocket } from "bun";
 import type { rest, PermissionDecision } from "@protocol";
-import { UPDATE_API_VERSION } from "@protocol";
+import { UPDATE_API_VERSION, PROTOCOL_VERSION } from "@protocol";
 import { AccountStore, resolveAuthStatus } from "../auth/accounts";
 import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
@@ -1173,6 +1173,27 @@ export function createServer(opts: ServerOptions): ServerHandle {
       return new Response(Bun.file(b.path), { headers: { "Content-Type": b.mediaType, "Cache-Control": "max-age=31536000" } });
     }
     return new Response("method not allowed", { status: 405 });
+  });
+
+  // Non-attaching history read over REST (comprehensive-offline §4.2/§4.4a): the socketless caller —
+  // Android's WorkManager background-sync job — pulls a session's delta/snapshot the same way the WS
+  // `session.history` command does (reusing supervisor.history, so identical semantics + no side
+  // effects). GET-only, so it rides the same Tailscale trust boundary as the attachments GET above.
+  routeRe("GET", /^\/api\/sessions\/([^/]+)\/history$/, (req, url, m) => {
+    const sessionId = m![1]!;
+    const raw = url.searchParams.get("sinceSeq");
+    const parsed = raw === null ? undefined : Number(raw);
+    const sinceSeq = typeof parsed === "number" && Number.isFinite(parsed) ? parsed : undefined;
+    const h = supervisor.history(sessionId, sinceSeq);
+    if (!h) return new Response("no such session", { status: 404 });
+    // Return the SAME wire-event shape as the WS `session.history` response so the client's
+    // applyHistoryToMirror path is identical whether the batch arrived over WS or this REST endpoint.
+    const ts = new Date().toISOString();
+    const resp =
+      h.kind === "snapshot"
+        ? { v: PROTOCOL_VERSION, type: "session.history.snapshot" as const, ts, sessionId, snapshot: h.snapshot }
+        : { v: PROTOCOL_VERSION, type: "session.history.events" as const, ts, sessionId, events: h.events, lastSeq: h.lastSeq, epoch: h.epoch };
+    return Response.json(resp);
   });
 
   async function handle(req: Request, srv: Srv, url: URL): Promise<Response | undefined> {

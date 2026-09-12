@@ -208,6 +208,8 @@ import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
 import { telemetry } from "./telemetry";
 import { canDeltaResume } from "./resume";
 import { convoCache, migrateLegacyConvoCache } from "./convoCache";
+import { mirror, MIRROR_MAX_SESSIONS } from "./mirror";
+import { applyHistoryToMirror, createPrefetcher, PREFETCH_MAX_SESSIONS, type PrefetchSessionInfo } from "./prefetch";
 
 // App version, replaced at build time (native: the APK versionName; PWA: package.json version).
 declare const __APP_VERSION__: string;
@@ -411,6 +413,16 @@ function persistEnvironments(): void {
     }
     for (const k of stale) localStorage.removeItem(k);
     for (const id of convoCache.keys()) if (!known.has(id)) void convoCache.delete(id);
+    // Drop mirrors for sessions we no longer know about (synchronous index reads only — safe here).
+    for (const id of mirror.keys()) if (!known.has(id)) void mirror.delete(id);
+    // Enforce the LRU caps (spec §4.1) AFTER module init: evictLRU + telemetry + pinning read consts
+    // declared far below (activeId/outboxQueue/telemetry), so defer past the temporal dead zone — the
+    // same declare-up-top rule that defers loadConversation (see memory: web-early-init-decl-order-crash).
+    queueMicrotask(() => {
+      void mirror.evictLRU(mirrorPinnedSessions()).then((n) => {
+        if (n > 0) telemetry.mark("mirrorEvictions", n);
+      });
+    });
   } catch {
     /* best-effort — quota reclamation must never block boot */
   }
@@ -567,19 +579,77 @@ function canResumeIncrementally(id: string): boolean {
 // we never flash a stale frame online. Offline, availability of the last-viewed conversation is the
 // whole point (D1), so we paint the cache immediately once it loads.
 let pendingCache: { id: string; html: string } | null = null;
+// The event mirror (spec §4.1) is the source of truth for offline paint; the HTML cache above is just
+// a paint accelerator. When no HTML accelerator exists but a mirror does, we hold its events here and
+// render them through the same replay path the wire snapshot uses.
+let pendingMirror: { id: string; events: ConversationEvent[] } | null = null;
 let pendingLoadId: string | null = null; // a fresh load whose async cache read is still resolving
+// Flaky-link fallback budget (spec D1): when we hold a cached transcript but the socket is half-open
+// (readyState OPEN yet no frames flowing), the snapshot we asked for may never arrive and the heartbeat
+// takes ~25s to give up — so we'd sit on a skeleton the whole time. If nothing validates the cache within
+// this budget, paint it anyway; a real snapshot/delta supersedes it the instant it lands. Kept short: a
+// healthy daemon answers in tens of ms (the cheap watermark frame arrives first), so this only ever
+// delays the paint on a genuinely stalled link — where we want the cached transcript up fast.
+const CACHE_PAINT_BUDGET_MS = 500;
+let cacheBudgetTimer = 0;
+function disarmCacheBudget(): void {
+  if (cacheBudgetTimer) {
+    clearTimeout(cacheBudgetTimer);
+    cacheBudgetTimer = 0;
+  }
+}
 /** Paint the deferred cached transcript for `id` (validated online, or shown offline). */
 function fillCache(id: string): void {
   if (!pendingCache || pendingCache.id !== id || id !== activeId) return;
+  disarmCacheBudget();
   conversation.innerHTML = pendingCache.html;
   scrollDown(true);
   snapshotLoaded.add(id); // we have content on screen — suppress the "no history" diagnostic
   pendingCache = null;
+  pendingMirror = null; // the HTML accelerator won — the mirror fallback is moot
+}
+/** Paint the deferred mirror transcript for `id` by replaying its events (the offline fallback when no
+ *  HTML accelerator exists). Same replay path as a wire snapshot, so rendering is byte-identical. */
+function fillFromMirror(id: string): void {
+  if (!pendingMirror || pendingMirror.id !== id || id !== activeId) return;
+  disarmCacheBudget();
+  clearConversation();
+  ui.replayingSnapshot = true;
+  renderSnapshotEvents(pendingMirror.events);
+  ui.replayingSnapshot = false;
+  scrollDown();
+  finalizeActivity(); // a replayed history has no live `result` — settle the last activity block
+  snapshotLoaded.add(id);
+  telemetry.mark("offlineMirrorOpens");
+  pendingMirror = null;
+}
+/** Whether either paint source (HTML accelerator or mirror) is staged for `id`. */
+function haveContentFor(id: string): boolean {
+  return pendingCache?.id === id || pendingMirror?.id === id;
+}
+/** Paint whichever source is staged — HTML accelerator first (instant), else the mirror replay. */
+function fillContent(id: string): void {
+  if (pendingCache?.id === id) fillCache(id);
+  else if (pendingMirror?.id === id) fillFromMirror(id);
+}
+/** Paint the held cache after a short budget if nothing validated it first (half-open / slow link). A
+ *  real snapshot/delta that lands earlier nulls pendingCache, so the timer then no-ops. */
+function armCachePaintBudget(id: string): void {
+  disarmCacheBudget();
+  cacheBudgetTimer = window.setTimeout(() => {
+    cacheBudgetTimer = 0;
+    if (haveContentFor(id) && id === activeId) {
+      if (pendingCache?.id === id) telemetry.mark("offlineReloads"); // mirror path marks offlineMirrorOpens itself
+      fillContent(id);
+    }
+  }, CACHE_PAINT_BUDGET_MS);
 }
 /** Forget everything cached for a session that's gone (killed/purged): transcript + resume watermark.
  *  Prevents a recreated id from ever delta-resuming against stale state. */
 function forgetConvoState(id: string): void {
   void convoCache.delete(id);
+  void mirror.delete(id); // drop the durable event mirror too (also clears the resume watermark, [D1.2])
+  navigator.serviceWorker?.controller?.postMessage({ type: "forget-session", sessionId: id }); // drop cached artifacts (§4.4b)
   serverWatermarks.delete(id);
   snapshotLoaded.delete(id);
   pendingSeq.delete(id); // [WEB2-11] the throttled in-memory seq (WEB2-10) must go too
@@ -590,10 +660,31 @@ function forgetConvoState(id: string): void {
   localStorage.removeItem(`anvil.history.${id}`);
   localStorage.removeItem(`anvil.draft.${id}`);
 }
+/** Sessions the mirror LRU must never evict: the active one, plus any with queued offline writes (their
+ *  optimistic transcript would be orphaned if their mirror vanished mid-flush). Read lazily at call time
+ *  (never during module init — activeId/outboxQueue are declared far below). */
+function mirrorPinnedSessions(): Set<string> {
+  const keep = new Set<string>();
+  if (activeId) keep.add(activeId);
+  for (const item of outboxQueue.list()) {
+    const sid = item.cmd.sessionId;
+    if (typeof sid === "string") keep.add(sid);
+    if (item.tempId) keep.add(item.tempId);
+  }
+  return keep;
+}
+/** Enforce the mirror LRU caps when the count grows past the ceiling. The count check is a synchronous
+ *  index read, so this is cheap to call on every session.list; the async sweep only runs when needed. */
+function maybeEvictMirror(): void {
+  if (mirror.keys().length <= MIRROR_MAX_SESSIONS) return;
+  void mirror.evictLRU(mirrorPinnedSessions()).then((n) => {
+    if (n > 0) telemetry.mark("mirrorEvictions", n);
+  });
+}
 /** Fill the cache the moment the watermark validates it (called from the resume.watermarks handler). */
 function maybeFillValidatedCache(id: string | null): void {
   if (!id || id !== activeId) return;
-  if (pendingCache?.id === id && canResumeIncrementally(id)) fillCache(id);
+  if (haveContentFor(id) && canResumeIncrementally(id)) fillContent(id);
 }
 /** A lightweight shimmer skeleton shown while we verify the cache (never persisted). */
 function renderSkeleton(): void {
@@ -613,14 +704,26 @@ async function loadConversation(id: string): Promise<void> {
   clearConversation();
   snapshotLoaded.delete(id); // a fresh load — re-derive "content shown" below
   pendingCache = null;
-  if (convoCache.has(id)) renderSkeleton();
-  else maybeShowSessionHero(); // no cache → straight to the title card (no skeleton flash)
+  pendingMirror = null;
+  disarmCacheBudget(); // a prior load's fallback timer must not paint into this one
+  if (convoCache.has(id) || mirror.has(id)) renderSkeleton();
+  else maybeShowSessionHero(); // no cached source → straight to the title card (no skeleton flash)
   const html = await convoCache.get(id).catch(() => null);
   if (id !== activeId) {
     if (pendingLoadId === id) pendingLoadId = null;
     return; // switched away mid-load
   }
   pendingCache = html ? { id, html } : null;
+  // No HTML accelerator but a durable mirror exists → stage its events as the paint source. The mirror
+  // is the source of truth (spec §4.1); the HTML blob is only a faster first paint when present.
+  if (!pendingCache && mirror.has(id)) {
+    const events = await mirror.read(id).catch(() => null);
+    if (id !== activeId) {
+      if (pendingLoadId === id) pendingLoadId = null;
+      return;
+    }
+    if (events && events.length) pendingMirror = { id, events };
+  }
   attachConversation(id);
   if (pendingLoadId === id) pendingLoadId = null;
 }
@@ -628,16 +731,33 @@ async function loadConversation(id: string): Promise<void> {
  *  offline, show the last-known cache and let the reconnect re-attach re-sync. */
 function attachConversation(id: string): void {
   const online = serverOf(id)?.sock.isOpen() ?? false;
-  if (canResumeIncrementally(id) && pendingCache?.id === id) {
-    fillCache(id); // paint the validated cache FIRST, then request only what we're missing
+  const haveCache = haveContentFor(id); // HTML accelerator OR durable mirror
+  if (canResumeIncrementally(id) && haveCache) {
+    fillContent(id); // paint the validated content FIRST, then request only what we're missing
     telemetry.mark("resumeDelta");
     sendTo(id, { type: "session.attach", sessionId: id, lastSeq: seqStore.get(id) });
-  } else if (!online && pendingCache?.id === id) {
-    telemetry.mark("offlineReloads");
-    fillCache(id); // offline: last-known content now; session.list on reconnect re-runs the attach
+  } else if (!online && haveCache) {
+    const fromHtml = pendingCache?.id === id;
+    fillContent(id); // offline: last-known content now; session.list on reconnect re-runs the attach
+    if (fromHtml) telemetry.mark("offlineReloads"); // the mirror path marks offlineMirrorOpens itself
+  } else if (haveCache && !serverWatermarks.has(id)) {
+    // We hold a cached transcript but the server hasn't reported this session yet: the socket is
+    // half-open (readyState OPEN, nothing flowing) or still connecting. A cold `session.attach` now
+    // would only earn a full-snapshot repaint whenever the link recovers — so DON'T send one. Paint the
+    // cache (behind the budget, so a fast-arriving watermark can still upgrade us to a delta) and let the
+    // (re)connect's session.list drive attachReconnect → a clean delta-resume that APPENDS the missing
+    // tail. This also fixes the cold-boot race where a premature attach beat the watermark and forced a
+    // full snapshot on every reload.
+    telemetry.mark("resumeDeferred");
+    armCachePaintBudget(id);
   } else {
+    // No cache to show, OR the server reported this session but the epoch changed (watermark present yet
+    // canResumeIncrementally false) → we genuinely need a fresh snapshot now. It repaints the skeleton
+    // (or supersedes the stale cache) when it lands; behind a budget so a held cache stays readable
+    // during a slow fetch.
     telemetry.mark("resumeSnapshot");
-    sendTo(id, { type: "session.attach", sessionId: id }); // cold → the snapshot repaints the skeleton
+    sendTo(id, { type: "session.attach", sessionId: id });
+    if (haveCache) armCachePaintBudget(id);
   }
 }
 /** Re-attach a session that already has content on screen (reconnect mid-session): delta-resume without
@@ -895,6 +1015,120 @@ function subscribeIntakeProgress(cid: string, onLine: (line: string) => void): (
   intakeProgressWaiters.set(cid, onLine);
   return () => intakeProgressWaiters.delete(cid);
 }
+// ── Greedy background prefetch (comprehensive-offline §4.2) — fill the mirror for sessions we aren't
+// viewing, so they're readable offline too. Deps are lazy closures over module state; the run() itself
+// is capability-gated, single-flight per server, idle-scheduled, and aborts on a stalled link.
+function prefetchGateAllows(): boolean {
+  let mode = "all";
+  try {
+    mode = localStorage.getItem("anvil.prefetch") || "all";
+  } catch {
+    /* ignore */
+  }
+  if (mode === "off") return false;
+  const conn = (navigator as unknown as { connection?: { saveData?: boolean; type?: string } }).connection;
+  if (conn?.saveData) return false; // honour Data Saver regardless of the mode
+  if (mode === "wifi-only" && conn?.type && conn.type !== "wifi" && conn.type !== "ethernet") return false;
+  return true;
+}
+function prefetchSessionsForServer(url: string): PrefetchSessionInfo[] {
+  const out: PrefetchSessionInfo[] = [];
+  for (const [id, s] of sessions) {
+    if (id === activeId) continue; // the active session is handled by attach
+    if (!sameServerUrl(sessionServer.get(id), url)) continue;
+    const wm = serverWatermarks.get(id);
+    if (!wm) continue; // server didn't report a watermark — can't prefetch safely
+    out.push({ sessionId: id, lastActivityAt: s.lastActivityAt ?? "", serverEpoch: wm.epoch, serverLastSeq: wm.lastSeq });
+  }
+  return out;
+}
+function idleTick(): Promise<void> {
+  return new Promise((resolve) => {
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void }).requestIdleCallback;
+    if (typeof ric === "function") ric(() => resolve(), { timeout: 2000 });
+    else setTimeout(resolve, 0);
+  });
+}
+/** The durable content frames a shadow subscription delivers for non-viewed sessions (mirrors the
+ *  server's isShadowable) — used only to attribute the shadowEvents telemetry counter. */
+function isShadowContentType(t: string): boolean {
+  return t === "message.user" || t === "assistant.message" || t === "tool.result" || t === "result" || t === "file.offer";
+}
+const prefetcher = createPrefetcher({
+  supportsHistory: (url) => serverSupports(servers.get(url), "history"),
+  gateAllows: prefetchGateAllows,
+  sessionsForServer: prefetchSessionsForServer,
+  sessionServerUrl: (id) => sessionServer.get(id) ?? "",
+  fetchHistory: async (url, item) => {
+    const srv = servers.get(url);
+    if (!srv || !srv.sock.isOpen()) return null;
+    try {
+      return await sendAwait(srv, { type: "session.history", sessionId: item.sessionId, ...(item.sinceSeq !== undefined ? { sinceSeq: item.sinceSeq } : {}), cid: newCid() });
+    } catch {
+      return null; // timeout / offline — the controller aborts the rest of the list
+    }
+  },
+  setWatermark: (id, epoch, lastSeq) => {
+    epochStore.set(id, epoch);
+    seqStore.set(id, lastSeq);
+  },
+  nextTick: idleTick,
+  now: () => new Date().toISOString(),
+  mark: (k, n) => telemetry.mark(k, n),
+});
+/** Kick a background prefetch for `url` once the connection is live (idle-scheduled so the active
+ *  session's attach/snapshot always wins the socket first). Single-flight is enforced inside run(). */
+function schedulePrefetch(url: string): void {
+  void idleTick().then(() => prefetcher.run(url));
+}
+// Native → web bridge for Android's closed-app background sync (§4.4a): the WorkManager/Thread job
+// fetches session history over REST while the app is backgrounded and stages it; on next load the
+// native shell calls this with the staged responses, which we apply to the mirror via the SAME write
+// path prefetch uses. Idempotent (keyed mirror writes), so double-delivery is harmless. Best-effort:
+// wrapped so a malformed payload can never break boot.
+(window as unknown as { __anvilApplyStagedHistory?: (payload: unknown) => void }).__anvilApplyStagedHistory = (payload) => {
+  try {
+    const items = (typeof payload === "string" ? JSON.parse(payload) : payload) as { response: ServerEvent }[];
+    if (!Array.isArray(items)) return;
+    const deps = {
+      sessionServerUrl: (id: string) => sessionServer.get(id) ?? "",
+      setWatermark: (id: string, epoch: string, lastSeq: number) => {
+        epochStore.set(id, epoch);
+        seqStore.set(id, lastSeq);
+      },
+      now: () => new Date().toISOString(),
+    };
+    for (const it of items) if (it?.response) void applyHistoryToMirror(it.response, deps);
+  } catch {
+    /* best-effort — a bad staged payload must never break the app */
+  }
+};
+/** Subscribe to shadow updates for a server's non-viewed sessions (spec §4.3) so the mirror stays warm
+ *  live, not just at connect. Scope: "all" normally; a bounded top-N on a metered/save-data link;
+ *  nothing when prefetch is off. Capability-gated — an older daemon never sees this command. */
+function subscribeShadow(url: string): void {
+  const srv = servers.get(url);
+  if (!srv || !serverSupports(srv, "shadow")) return;
+  let mode = "all";
+  try {
+    mode = localStorage.getItem("anvil.prefetch") || "all";
+  } catch {
+    /* ignore */
+  }
+  if (mode === "off") return; // user opted out of background sync entirely
+  const conn = (navigator as unknown as { connection?: { saveData?: boolean; type?: string } }).connection;
+  const metered = !!conn?.saveData || (mode === "wifi-only" && !!conn?.type && conn.type !== "wifi" && conn.type !== "ethernet");
+  let sessionIds: string[] | "all" = "all";
+  if (metered) {
+    sessionIds = [...sessions.values()]
+      .filter((s) => sameServerUrl(sessionServer.get(s.id), url))
+      .sort((a, b) => ((a.lastActivityAt ?? "") < (b.lastActivityAt ?? "") ? 1 : -1))
+      .slice(0, PREFETCH_MAX_SESSIONS)
+      .map((s) => s.id);
+  }
+  srv.sock.send({ type: "shadow.subscribe", sessionIds });
+}
+
 const tempMap = new Map<string, string>(); // optimistic id → real id
 let flushing = false;
 async function flushOutbox(): Promise<void> {
@@ -951,6 +1185,7 @@ async function flushOutbox(): Promise<void> {
 /** A created-offline session was realized on the daemon: migrate its cache + active selection. */
 function reconcileTemp(tempId: string, realId: string): void {
   void convoCache.move(tempId, realId); // carry the optimistic transcript over to the real session id
+  void mirror.move(tempId, realId); // …and the durable event mirror, so the realized session stays cached
   // Carry the resume watermark/seq too, so the reconciled session stays delta-resumable.
   const ep = epochStore.get(tempId);
   if (ep) epochStore.set(realId, ep);
@@ -1059,6 +1294,15 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
     // after open and carries the server's capabilities, so we only probe servers that support autopilot.
   }
   if (status === "disconnected") {
+    // If we were holding the active session's cached transcript waiting for THIS (now-dead) server to
+    // validate it, paint it now — a half-open socket that just dropped would otherwise leave a skeleton
+    // up until the next reconnect (the flaky-link "blank pane" bug). The budget timer covers the case
+    // where the socket never reports the drop; this covers the case where it does.
+    if (activeId && sameServerUrl(sessionServer.get(activeId), url) && haveContentFor(activeId)) {
+      const fromHtml = pendingCache?.id === activeId;
+      fillContent(activeId);
+      if (fromHtml) telemetry.mark("offlineReloads"); // mirror path marks offlineMirrorOpens itself
+    }
     // A disconnected server can't be mid-run from our point of view, so clear any stale `running` it
     // left behind. Without this the autopilot spinner latches on forever when a daemon drops mid-run
     // before its `running: false` broadcast lands — e.g. a forced exit skips the run's finally. The
@@ -1092,7 +1336,16 @@ function refreshConnDot(): void {
 // ── Event routing ──────────────────────────────────────────────────────────────
 // `url` is the server the frame arrived from — used to tag sessions/environments for routing.
 function onEvent(url: string, e: ServerEvent): void {
-  if ("seq" in e && "sessionId" in e && typeof e.seq === "number") seqStore.set(e.sessionId, e.seq);
+  if ("seq" in e && "sessionId" in e && typeof e.seq === "number") {
+    seqStore.set(e.sessionId, e.seq);
+    // Extend the durable mirror with any persistable event (live, delta-resume, OR shadow) — the same
+    // tail the server's log keeps. foldEvent inside applyEvent ignores transient frames, and a lone
+    // delta with no base is skipped ([D1.4]), so this is safe to call unconditionally for every seq'd
+    // frame. Epoch source: the server's live watermark first (authoritative this connect), else our
+    // cached epoch — so a shadow frame for a non-active session applies under the right lineage.
+    const applyEpoch = serverWatermarks.get(e.sessionId)?.epoch ?? epochStore.get(e.sessionId);
+    void mirror.applyEvent(e.sessionId, e.seq, e, applyEpoch, url, sessions.get(e.sessionId)?.lastActivityAt ?? e.ts ?? "");
+  }
   // Intake progress shares the request cid but is NOT its terminal response — route it to the intake
   // subscriber and return before the cidWaiters resolution, so it never settles the sendAwait promise.
   if (e.type === "loop.intake.progress") {
@@ -1111,8 +1364,13 @@ function onEvent(url: string, e: ServerEvent): void {
     case "session.list": {
       // This server is the source of truth for ITS OWN sessions only — drop the ones it used to
       // own and no longer lists (not other servers' sessions, not optimistic pending locals).
+      const listed = new Set(e.sessions.map((s) => s.id));
       for (const id of [...sessions.keys()]) {
-        if (sameServerUrl(sessionServer.get(id), url) && !sessions.get(id)?.pending) {
+        // Only forget sessions this server owned and NO LONGER lists. A re-listed session MUST keep its
+        // resume state (cached transcript + epoch/seq/watermark): forgetting it here would force the
+        // reattach below into a full snapshot on every connect (session.list is sent on every connect),
+        // wiping and repainting the pane instead of delta-resuming the missing tail.
+        if (sameServerUrl(sessionServer.get(id), url) && !sessions.get(id)?.pending && !listed.has(id)) {
           sessions.delete(id);
           sessionServer.delete(id);
           // [WEB2-11] A session this server owned and no longer lists was deleted (possibly while we were
@@ -1129,6 +1387,8 @@ function onEvent(url: string, e: ServerEvent): void {
       persistSessions();
       persistRouting();
       renderSessions();
+      maybeEvictMirror(); // enforce mirror LRU caps on connect (cheap sync count check gates the sweep)
+      schedulePrefetch(url); // greedily pull other sessions' history into the mirror (spec §4.2)
       // (re)attach the active session only if it lives on THIS server. If it's already on screen this
       // page-load, delta-resume without wiping the pane; otherwise run a full skeleton→cache→attach load.
       if (activeId && sessions.has(activeId) && sessionServer.get(activeId) === url) {
@@ -1212,6 +1472,9 @@ function onEvent(url: string, e: ServerEvent): void {
         srv.role = e.role;
         srv.hubServerId = e.hubServerId;
       }
+      // Keep this server's non-viewed sessions warm in the mirror via a shadow subscription (§4.3).
+      // First frame per connect → re-subscribes on every reconnect, as the protocol expects.
+      subscribeShadow(url);
       // Now that we know this server's capabilities, pull its autopilot state — but only if it's new
       // enough to handle these commands. An older member (no "autopilot" capability) is skipped, so it
       // never gets `unknown command type` and just sits out the federated plan view until it's updated.
@@ -1346,7 +1609,13 @@ function onEvent(url: string, e: ServerEvent): void {
     case "ack":
       return;
     default:
-      if ("sessionId" in e && e.sessionId !== activeId) return; // not the open pane
+      if ("sessionId" in e && e.sessionId !== activeId) {
+        // A shadow frame (spec §4.3) for a session we're not viewing: the mirror was already updated at
+        // the top of onEvent; it must not touch the DOM (which shows the active session). Count durable
+        // content frames as shadow deliveries.
+        if (isShadowContentType(e.type)) telemetry.mark("shadowEvents");
+        return;
+      }
       handleSessionEvent(e);
   }
 }
@@ -1373,7 +1642,13 @@ function handleSessionEvent(e: ServerEvent): void {
       // v4 (§6.4): cache the per-session {epoch,lastSeq} this connection reports, then — if we were
       // holding a skeleton waiting to verify the active session's cache — paint it now that it's valid.
       if (connectStartedAt) telemetry.verifyMs = Date.now() - connectStartedAt; // §5.7 verify latency
-      for (const w of e.watermarks) serverWatermarks.set(w.sessionId, { epoch: w.epoch, lastSeq: w.lastSeq });
+      for (const w of e.watermarks) {
+        // A changed epoch means the session's log lineage reset — the mirror (and HTML cache) for it are
+        // stale and will be dropped/re-snapshotted. Count it before overwriting our cached watermark.
+        const cachedEpoch = epochStore.get(w.sessionId);
+        if (cachedEpoch && cachedEpoch !== w.epoch) telemetry.mark("mirrorEpochResets");
+        serverWatermarks.set(w.sessionId, { epoch: w.epoch, lastSeq: w.lastSeq });
+      }
       maybeFillValidatedCache(activeId);
       return;
     case "telemetry.snapshot":
@@ -1382,8 +1657,11 @@ function handleSessionEvent(e: ServerEvent): void {
       return;
     case "conversation.snapshot":
       if (e.sessionId === activeId) clearAttachDiagnostic(); // history arrived — retire the blank-pane note
-      // A snapshot supersedes any deferred cache for this session — we're repainting authoritative state.
+      // A snapshot supersedes any deferred paint source for this session — we're repainting authoritative state.
       if (pendingCache?.id === e.sessionId) pendingCache = null;
+      if (pendingMirror?.id === e.sessionId) pendingMirror = null;
+      // Refresh the durable mirror base (spec §4.1): the source of truth for future offline opens.
+      void mirror.applySnapshot(e.sessionId, { events: e.events, lastSeq: e.lastSeq, epoch: e.epoch }, sessionServer.get(e.sessionId) ?? "", sessions.get(e.sessionId)?.lastActivityAt ?? e.ts);
       clearConversation();
       ui.replayingSnapshot = true;
       renderSnapshotEvents(e.events);

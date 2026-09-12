@@ -1116,6 +1116,26 @@ export interface ConversationSnapshotEvent extends Envelope, SessionScoped {
   lastSeq: Seq; // highest seq represented by this snapshot
   epoch: Epoch; // resume lineage token — the client caches it and only delta-resumes while it matches (v4)
 }
+/** Response to `session.history` (capability `"history"`, comprehensive-offline spec §4.2). Same resume
+ *  data as `session.attach` but with NO subscription side effects — background prefetch fills the
+ *  client's event mirror for sessions it isn't viewing, so they're readable offline too. Delta variant:
+ *  the raw persisted events with `seq > sinceSeq` (the client applies them to its mirror tail by seq). */
+export interface SessionHistoryEventsEvent extends Envelope {
+  type: "session.history.events";
+  sessionId: SessionId;
+  events: ServerEvent[]; // raw persisted frames (message.user / assistant.message / tool.result / result / file.offer), each carrying seq
+  lastSeq: Seq;
+  epoch: Epoch;
+  cid?: Cid;
+}
+/** Snapshot variant of a `session.history` response (no cached watermark, or an epoch mismatch): a full
+ *  folded snapshot the client stores as its mirror base. */
+export interface SessionHistorySnapshotEvent extends Envelope {
+  type: "session.history.snapshot";
+  sessionId: SessionId;
+  snapshot: ConversationSnapshotEvent;
+  cid?: Cid;
+}
 export interface MessageUserEvent extends Envelope, SessionScoped {
   type: "message.user";
   rendered: RenderedMarkdown;
@@ -1304,6 +1324,8 @@ export type ServerEvent =
   | ResumeWatermarksEvent
   | TelemetrySnapshotEvent
   | ConversationSnapshotEvent
+  | SessionHistoryEventsEvent
+  | SessionHistorySnapshotEvent
   | MessageUserEvent
   | AssistantDeltaEvent
   | AssistantMessageEvent
@@ -1365,6 +1387,26 @@ export interface SessionAttachCmd extends Envelope, Correlated {
 export interface SessionDetachCmd extends Envelope, Correlated {
   type: "session.detach";
   sessionId: SessionId;
+}
+/** Fetch a session's history WITHOUT attaching (capability `"history"`, comprehensive-offline §4.2).
+ *  Unlike `session.attach` it does not add the conn to the session's attached set, append a live
+ *  `status`, or re-surface parked permission/question prompts — it's a pure read for background
+ *  prefetch. `sinceSeq` given (and epoch-compatible) → a `session.history.events` delta; else a
+ *  `session.history.snapshot`. */
+export interface SessionHistoryCmd extends Envelope, Correlated {
+  type: "session.history";
+  sessionId: SessionId;
+  sinceSeq?: Seq;
+}
+/** Subscribe this connection to durable events for sessions it is NOT attached to (capability
+ *  `"shadow"`, comprehensive-offline §4.3), so its offline mirror stays warm without opening them. The
+ *  daemon sends only persistable frames (never `assistant.delta`), and every shadow copy is droppable
+ *  under back-pressure — pull reconciliation (Phase 2) is the safety net, so a shed frame is harmless.
+ *  Re-sent on every reconnect; `"all"` subscribes to every session (desktop default), or a bounded id
+ *  list (mobile). */
+export interface ShadowSubscribeCmd extends Envelope, Correlated {
+  type: "shadow.subscribe";
+  sessionIds: SessionId[] | "all";
 }
 export interface SessionKillCmd extends Envelope, Correlated {
   type: "session.kill"; // delete: reap the agent, remove the worktree + branch + state
@@ -1850,6 +1892,8 @@ export type ClientCommand =
   | SessionCreateCmd
   | SessionAttachCmd
   | SessionDetachCmd
+  | SessionHistoryCmd
+  | ShadowSubscribeCmd
   | SessionKillCmd
   | SessionArchiveCmd
   | SessionUnarchiveCmd

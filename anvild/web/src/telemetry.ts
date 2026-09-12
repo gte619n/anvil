@@ -9,10 +9,19 @@ export interface TelemetryCounters {
   reconnects: number; // disconnected → connected transitions
   resumeDelta: number; // attaches served by an incremental delta (seq > lastSeq)
   resumeSnapshot: number; // attaches that needed a full conversation.snapshot
+  resumeDeferred: number; // cold opens with a cache but no watermark yet — attach deferred to the reconnect's session.list (→ a clean delta) instead of a premature cold attach
   flushOk: number; // outbox items acknowledged by the server
   flushFail: number; // outbox items that errored (command.error) on flush
   sendDuplicates: number; // optimistic bubbles retired by a matching authoritative message (should stay 0-ish)
-  offlineReloads: number; // cold opens painted from cache with no server reachable
+  offlineReloads: number; // cold opens painted from the HTML accelerator with no server reachable
+  offlineMirrorOpens: number; // sessions opened offline from the durable event mirror (comprehensive-offline §4.5)
+  mirrorEvictions: number; // sessions dropped from the mirror by the LRU sweep
+  mirrorEpochResets: number; // mirrors invalidated by a lineage (epoch) change
+  prefetchSessions: number; // background sessions pulled to the mirror on connect
+  prefetchEvents: number; // events pulled by background prefetch
+  prefetchAborts: number; // prefetch work-lists abandoned on a stalled/errored link
+  shadowEvents: number; // durable events landed in the mirror via a shadow subscription (no attach)
+  shadowDegraded: number; // reconciliations that found the mirror behind (shadow frame shed / missed)
 }
 
 export type TelemetryKey = keyof TelemetryCounters;
@@ -21,10 +30,19 @@ const ZERO: TelemetryCounters = {
   reconnects: 0,
   resumeDelta: 0,
   resumeSnapshot: 0,
+  resumeDeferred: 0,
   flushOk: 0,
   flushFail: 0,
   sendDuplicates: 0,
   offlineReloads: 0,
+  offlineMirrorOpens: 0,
+  mirrorEvictions: 0,
+  mirrorEpochResets: 0,
+  prefetchSessions: 0,
+  prefetchEvents: 0,
+  prefetchAborts: 0,
+  shadowEvents: 0,
+  shadowDegraded: 0,
 };
 
 const STORAGE_KEY = "anvil.telemetry";

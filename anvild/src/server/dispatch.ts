@@ -96,6 +96,25 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "shadow.subscribe":
+        // Keep the offline mirror warm for sessions this conn isn't viewing (comprehensive-offline §4.3).
+        conn.shadow = cmd.sessionIds === "all" ? "all" : new Set(cmd.sessionIds);
+        if (cid) send(ack(cid));
+        return;
+
+      case "session.history": {
+        // Non-attaching read for background prefetch (comprehensive-offline §4.2): NO attached-set
+        // change, NO live status, NO re-surfaced prompts — a pure history fetch into the client's mirror.
+        const h = deps.supervisor.history(cmd.sessionId, cmd.sinceSeq);
+        if (!h) {
+          send(cmdError(`no such session: ${cmd.sessionId}`, cid));
+          return;
+        }
+        if (h.kind === "snapshot") send({ v: PROTOCOL_VERSION, type: "session.history.snapshot", ts: now(), sessionId: cmd.sessionId, snapshot: h.snapshot, cid });
+        else send({ v: PROTOCOL_VERSION, type: "session.history.events", ts: now(), sessionId: cmd.sessionId, events: h.events, lastSeq: h.lastSeq, epoch: h.epoch, cid });
+        return;
+      }
+
       case "session.kill":
         ackWhenDone(deps.supervisor.kill(cmd.sessionId), send, cid);
         return;
