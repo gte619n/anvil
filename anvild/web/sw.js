@@ -8,6 +8,12 @@
 // only exists for an unstamped source checkout; production dist is always stamped.
 const BUILD = self.__ANVIL_BUILD || { version: "dev", assets: ["/", "/index.html", "/anvil.svg", "/manifest.json"] };
 const CACHE = "anvil-shell-" + BUILD.version;
+// Immutable session artifacts (screenshots / images the agent surfaced) live in a SEPARATE, version-
+// independent cache (comprehensive-offline §4.4b): they're content-addressed by attachmentId and served
+// `max-age=31536000`, so they must survive shell-version rolls and only leave when their session is
+// forgotten. Everything else under /api/* stays uncached (the control plane).
+const ARTIFACTS = "anvil-artifacts";
+const ARTIFACT_RE = /^\/api\/sessions\/[^/]+\/attachments\/[^/]+$/;
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -25,7 +31,8 @@ self.addEventListener("activate", (event) => {
       // Old versions die wholesale (their cache key != ours) — a stale shell and its orphaned
       // hashed chunks are gone the moment this version activates…
       const keys = await caches.keys();
-      await Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)));
+      // Keep the current shell cache AND the version-independent artifact cache; sweep everything else.
+      await Promise.all(keys.filter((k) => k !== CACHE && k !== ARTIFACTS).map((k) => caches.delete(k)));
       // …and anything in OUR cache that isn't in the manifest (e.g. runtime-cached strays from the
       // waiting window) is pruned, so the cache converges to exactly the shipped asset set.
       const manifest = new Set(BUILD.assets);
@@ -44,6 +51,25 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  // Immutable session artifacts: cache-first from the dedicated artifact cache, so an offline transcript
+  // still shows its screenshots (comprehensive-offline §4.4b). This is the ONLY /api/* path we cache.
+  if (ARTIFACT_RE.test(url.pathname)) {
+    event.respondWith(
+      (async () => {
+        const cache = await caches.open(ARTIFACTS);
+        const hit = await cache.match(req);
+        if (hit) return hit;
+        try {
+          const res = await fetch(req);
+          if (res.ok) cache.put(req, res.clone());
+          return res;
+        } catch {
+          return (await cache.match(req)) || Response.error();
+        }
+      })(),
+    );
+    return;
+  }
   if (url.pathname.startsWith("/api/") || url.pathname === "/ws") return;
   const key = req.mode === "navigate" ? "/index.html" : req;
   event.respondWith(
@@ -109,7 +135,19 @@ async function closeSessionNotifications(sessionId) {
 self.addEventListener("message", (event) => {
   const m = event.data;
   if (m && m.type === "close-notifications") event.waitUntil(closeSessionNotifications(m.sessionId));
+  // The app forgot a session (killed/purged/evicted) — drop its cached artifacts so they don't leak
+  // (comprehensive-offline §4.4b; hooked from forgetConvoState).
+  if (m && m.type === "forget-session" && m.sessionId) event.waitUntil(forgetSessionArtifacts(m.sessionId));
 });
+
+/** Delete every cached artifact belonging to a forgotten session. */
+async function forgetSessionArtifacts(sessionId) {
+  const prefix = "/api/sessions/" + sessionId + "/attachments/";
+  const cache = await caches.open(ARTIFACTS);
+  for (const req of await cache.keys()) {
+    if (new URL(req.url).pathname.startsWith(prefix)) await cache.delete(req);
+  }
+}
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();

@@ -21,6 +21,10 @@ class AnvilMessagingService : FirebaseMessagingService() {
             message.data["sessionId"]?.let { NotificationManagerCompat.from(this).cancel(it.hashCode()) }
             return
         }
+        // Closed-app background sync (comprehensive-offline §4.4a): any push carrying a sessionId means
+        // that session had activity — pull its history into a staging area so the mirror is warm on next
+        // open, even if the app was backgrounded. Best-effort, in addition to the notification below.
+        message.data["sessionId"]?.let { HistorySync.stage(this, BuildConfig.ANVIL_BASE_URL, it) }
         // All pushes are data-only (so this always fires, even backgrounded), routing every reminder
         // through the same session-keyed notification: it supersedes prior reminders for the session,
         // deep-links to it on tap, and clears when the app opens it. Permission pushes additionally

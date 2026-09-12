@@ -99,6 +99,14 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   // First-class Loop entity + engine + gate verbs (loops-circuit spec). A client gates every loop.*
   // send on this so an older daemon (projection-only) degrades to the Phase 0 loops.snapshot panel.
   "loops",
+  // Non-attaching history fetch (`session.history`) for background prefetch into the client's offline
+  // event mirror (comprehensive-offline spec §4.2). A client only prefetches against servers that
+  // advertise this; an older daemon simply serves nothing extra and the client stays last-viewed-only.
+  "history",
+  // Shadow subscriptions (`shadow.subscribe`, comprehensive-offline §4.3): the daemon pushes durable
+  // events for non-attached sessions to a subscribed client so its mirror stays warm live. Gated so an
+  // older daemon simply never fans out shadow copies and the client falls back to connect-time prefetch.
+  "shadow",
 ];
 
 /** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */

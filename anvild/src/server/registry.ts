@@ -22,6 +22,17 @@ function isDroppable(type: string): boolean {
   return type === "assistant.delta";
 }
 
+/** The durable event kinds a shadow subscriber receives for non-attached sessions (comprehensive-offline
+ *  §4.3) — exactly the set the client's mirror stores (matches the eventlog snapshot fold). Never
+ *  `assistant.delta`, never transient control frames. */
+function isShadowable(type: string): boolean {
+  return type === "message.user" || type === "assistant.message" || type === "tool.result" || type === "result" || type === "file.offer";
+}
+function isShadowing(ws: ServerWebSocket<ConnState>, sessionId: string): boolean {
+  const sh = ws.data.shadow;
+  return sh === "all" || (sh instanceof Set && sh.has(sessionId));
+}
+
 export class ConnectionRegistry {
   private readonly conns = new Set<ServerWebSocket<ConnState>>();
 
@@ -61,8 +72,12 @@ export class ConnectionRegistry {
   toAttached(sessionId: string, event: ServerEvent): void {
     const json = JSON.stringify(event);
     const droppable = isDroppable(event.type);
+    const shadowable = isShadowable(event.type); // eligible to also fan out to shadow subscribers
     for (const ws of this.conns) {
       if (ws.data.attached.has(sessionId)) this.sendBp(ws, json, droppable);
+      // Shadow copy for a NOT-attached subscriber — always droppable (spec §4.3): if back-pressure sheds
+      // it, the client's next connect-time prefetch reconciles the exact miss. This is by design.
+      else if (shadowable && isShadowing(ws, sessionId)) this.sendBp(ws, json, true);
     }
   }
 }

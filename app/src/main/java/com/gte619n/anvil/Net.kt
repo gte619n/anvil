@@ -24,4 +24,21 @@ object Net {
             }
         }.start()
     }
+
+    /** Synchronous JSON GET (call off the main thread). Returns the body on 2xx, else null. Used by the
+     *  background history-sync job (comprehensive-offline §4.4a). */
+    fun getString(base: String, path: String): String? =
+        try {
+            val conn = (URL(base.trimEnd('/') + path).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 8_000
+                readTimeout = 15_000
+            }
+            val code = conn.responseCode
+            val body = if (code in 200..299) conn.inputStream.bufferedReader().use { it.readText() } else null
+            conn.disconnect()
+            body
+        } catch (_: Exception) {
+            null
+        }
 }

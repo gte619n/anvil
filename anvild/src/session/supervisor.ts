@@ -43,6 +43,9 @@ import {
   type PermissionDecision,
   type QuestionAnswer,
   type ServerEvent,
+  type ConversationSnapshotEvent,
+  type Seq,
+  type Epoch,
   type Session as SessionData,
   type SessionCreateCmd,
   type SessionListEvent,
@@ -882,6 +885,20 @@ export class Supervisor {
     // (a session can hold several at once, like permissions). (arch §6.6).
     for (const pendingQuestion of s.questionRequestEvents()) events.push(pendingQuestion);
     return events;
+  }
+
+  /** Non-attaching history read for background prefetch (comprehensive-offline §4.2). Reuses the SAME
+   *  log access as `resume` — `since(sinceSeq)` for a delta, else a full `snapshot` — but with NONE of
+   *  resume's subscription side effects: it does not add the conn to `attached`, does not append a live
+   *  `status`, and does not re-surface parked permission/question prompts. It's a pure read that fills a
+   *  client's offline mirror for sessions it isn't viewing. Returns null for an unknown session. */
+  history(id: string, sinceSeq?: number): { kind: "events"; events: ServerEvent[]; lastSeq: Seq; epoch: Epoch } | { kind: "snapshot"; snapshot: ConversationSnapshotEvent } | null {
+    const s = this.sessions.get(id);
+    const log = this.logs.get(id);
+    if (!s || !log) return null;
+    this.noteServerCounter(sinceSeq === undefined ? "resumeSnapshot" : "resumeDelta");
+    if (sinceSeq === undefined) return { kind: "snapshot", snapshot: log.snapshot(id, s.lastSeq, s.epoch) };
+    return { kind: "events", events: log.since(sinceSeq), lastSeq: s.lastSeq, epoch: s.epoch };
   }
 
   list(): SessionData[] {
