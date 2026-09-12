@@ -90,7 +90,7 @@ test("cold OFFLINE boot renders the full transcript from the mirror (base ++ tai
   expect(r.offline).toContain(M_BASE); // base snapshot event rendered
   expect(r.offline).toContain(M_TAIL); // tail delta event rendered on top
   expect(r.offline).not.toContain("convo-skeleton"); // the mirror replaced the skeleton
-});
+}, 30_000); // spawns node+JSDOM and parses the full web bundle — well over bun's 5s default under CI load
 
 test("cold ONLINE boot with a matching watermark paints the mirror AND delta-resumes (append, no wipe)", () => {
   // Socket OPEN + cached epoch/seq match the seed → attachConversation's delta branch: paint mirror,
@@ -102,4 +102,4 @@ test("cold ONLINE boot with a matching watermark paints the mirror AND delta-res
   expect(r.offline).toContain(M_TAIL);
   // Crucially: we never sent a cold (no-lastSeq) attach that would force a full-snapshot repaint.
   expect(r.attaches.filter((a) => a.lastSeq === null)).toEqual([]);
-});
+}, 30_000); // the ONLINE branch runs the full attach/delta path — the slowest of the mirror-boot tests
