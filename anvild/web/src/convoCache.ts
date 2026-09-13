@@ -12,7 +12,17 @@ const DB_NAME = "anvil";
 const STORE = "conversations";
 const INDEX_KEY = "anvil.convo.index"; // sync hint: which session ids currently have a cached transcript
 
-const memFallback = new Map<string, string>();
+/** A cached transcript stamped with the resume watermark it was rendered at. The stamp is what makes a
+ *  delta-resume against a painted cache SOUND: attach must ask for `seq > <what's on screen>`, and the
+ *  global seq store can run ahead of the pane (mirror prefetch / staged background sync), so the pane's
+ *  own coverage has to travel with the bytes. seq 0 / epoch "" = a legacy unstamped entry. */
+export interface CachedConvo {
+  html: string;
+  seq: number;
+  epoch: string;
+}
+
+const memFallback = new Map<string, CachedConvo>();
 const hasIndexedDb = typeof indexedDB !== "undefined";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -69,28 +79,32 @@ export const convoCache = {
     return loadIndex().has(id);
   },
 
-  async get(id: string): Promise<string | null> {
+  async get(id: string): Promise<CachedConvo | null> {
     if (!hasIndexedDb) return memFallback.get(id) ?? null;
     try {
       const store = await tx("readonly");
-      const v = await wrap(store.get(id) as IDBRequest<string | undefined>);
-      return v ?? null;
+      const v = await wrap(store.get(id) as IDBRequest<CachedConvo | string | undefined>);
+      if (v === undefined) return null;
+      // Legacy entry (pre-stamping): a bare HTML string. seq 0 marks its coverage unknown, so the load
+      // path prefers the mirror over it and never delta-resumes from a seq the pane can't prove.
+      return typeof v === "string" ? { html: v, seq: 0, epoch: "" } : v;
     } catch {
       return null; // a blocked/failed IDB read must never break the load — fall back to a snapshot
     }
   },
 
-  async set(id: string, html: string): Promise<void> {
+  async set(id: string, html: string, seq: number, epoch: string): Promise<void> {
+    const entry: CachedConvo = { html, seq, epoch };
     // Claim `has(id)` only AFTER the bytes are stored — otherwise a failed/evicted IDB write leaves the
     // index saying "we have a cache" (→ skeleton) while `get` returns null (→ nothing ever paints).
     if (!hasIndexedDb) {
-      memFallback.set(id, html);
+      memFallback.set(id, entry);
       addToIndex(id);
       return;
     }
     try {
       const store = await tx("readwrite");
-      await wrap(store.put(html, id));
+      await wrap(store.put(entry, id));
       addToIndex(id);
     } catch {
       /* durable cache is best-effort — a snapshot still loads from the daemon */
@@ -118,8 +132,8 @@ export const convoCache = {
 
   /** Migrate an optimistic (offline-created) session's cache to its real id once the server realizes it. */
   async move(from: string, to: string): Promise<void> {
-    const html = await this.get(from);
-    if (html) await this.set(to, html);
+    const entry = await this.get(from);
+    if (entry) await this.set(to, entry.html, entry.seq, entry.epoch);
     await this.delete(from);
   },
 };
