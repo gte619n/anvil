@@ -578,11 +578,14 @@ function canResumeIncrementally(id: string): boolean {
 // cached transcript (now durable in IndexedDB, spec D8) until the watermark confirms it's current — so
 // we never flash a stale frame online. Offline, availability of the last-viewed conversation is the
 // whole point (D1), so we paint the cache immediately once it loads.
-let pendingCache: { id: string; html: string } | null = null;
+let pendingCache: { id: string; html: string; seq: number; epoch: string } | null = null;
 // The event mirror (spec §4.1) is the source of truth for offline paint; the HTML cache above is just
-// a paint accelerator. When no HTML accelerator exists but a mirror does, we hold its events here and
-// render them through the same replay path the wire snapshot uses.
-let pendingMirror: { id: string; events: ConversationEvent[] } | null = null;
+// a paint accelerator. When the mirror's coverage is ahead of the HTML stamp (background prefetch /
+// staged sync ran while the pane wasn't looking), we hold its events here and render them through the
+// same replay path the wire snapshot uses. Both sources carry the seq/epoch their content covers, and
+// the fill clamps the resume watermark to that stamp — an attach must only ever ask for events beyond
+// WHAT'S ON SCREEN, never beyond what some background write pushed into seqStore.
+let pendingMirror: { id: string; events: ConversationEvent[]; lastSeq: number; epoch: string } | null = null;
 let pendingLoadId: string | null = null; // a fresh load whose async cache read is still resolving
 // Flaky-link fallback budget (spec D1): when we hold a cached transcript but the socket is half-open
 // (readyState OPEN yet no frames flowing), the snapshot we asked for may never arrive and the heartbeat
@@ -605,6 +608,15 @@ function fillCache(id: string): void {
   conversation.innerHTML = pendingCache.html;
   scrollDown(true);
   snapshotLoaded.add(id); // we have content on screen — suppress the "no history" diagnostic
+  // Clamp the resume watermark to what this cache actually covers. seqStore can be AHEAD of the pane —
+  // the staged background sync / prefetch advance it after writing only to the mirror — and attaching
+  // from that inflated seq yields an empty delta that permanently hides the missing tail (the
+  // "backgrounded response never renders" bug). A legacy unstamped entry (seq 0) is left alone: it
+  // predates the background writers, so the old seqStore-equals-pane invariant still holds for it.
+  if (pendingCache.seq > 0) {
+    seqStore.set(id, pendingCache.seq);
+    if (pendingCache.epoch) epochStore.set(id, pendingCache.epoch);
+  }
   pendingCache = null;
   pendingMirror = null; // the HTML accelerator won — the mirror fallback is moot
 }
@@ -621,6 +633,10 @@ function fillFromMirror(id: string): void {
   finalizeActivity(); // a replayed history has no live `result` — settle the last activity block
   snapshotLoaded.add(id);
   telemetry.mark("offlineMirrorOpens");
+  // The pane now shows the mirror's coverage — make the resume watermark say exactly that, so the attach
+  // that follows requests `seq > lastSeq` and appends precisely the tail the mirror is missing.
+  seqStore.set(id, pendingMirror.lastSeq);
+  if (pendingMirror.epoch) epochStore.set(id, pendingMirror.epoch);
   pendingMirror = null;
 }
 /** Whether either paint source (HTML accelerator or mirror) is staged for `id`. */
@@ -708,21 +724,35 @@ async function loadConversation(id: string): Promise<void> {
   disarmCacheBudget(); // a prior load's fallback timer must not paint into this one
   if (convoCache.has(id) || mirror.has(id)) renderSkeleton();
   else maybeShowSessionHero(); // no cached source → straight to the title card (no skeleton flash)
-  const html = await convoCache.get(id).catch(() => null);
+  const cached = await convoCache.get(id).catch(() => null);
   if (id !== activeId) {
     if (pendingLoadId === id) pendingLoadId = null;
     return; // switched away mid-load
   }
-  pendingCache = html ? { id, html } : null;
-  // No HTML accelerator but a durable mirror exists → stage its events as the paint source. The mirror
-  // is the source of truth (spec §4.1); the HTML blob is only a faster first paint when present.
-  if (!pendingCache && mirror.has(id)) {
-    const events = await mirror.read(id).catch(() => null);
+  pendingCache = cached ? { id, ...cached } : null;
+  // The mirror is the source of truth (spec §4.1); the HTML blob is only a faster first paint. Use the
+  // accelerator ONLY when its stamp proves it covers at least the mirror's coverage — the mirror keeps
+  // advancing while the pane isn't looking (shadow frames, greedy prefetch, Android's staged background
+  // sync), and painting an older HTML blob while resuming from the newer watermark would permanently
+  // hide the difference (the delta comes back empty). A legacy unstamped blob (seq 0) always loses to
+  // an existing mirror for the same reason: its coverage is unprovable.
+  if (mirror.has(id)) {
+    const meta = await mirror.getMeta(id);
     if (id !== activeId) {
       if (pendingLoadId === id) pendingLoadId = null;
       return;
     }
-    if (events && events.length) pendingMirror = { id, events };
+    if (meta && (!pendingCache || meta.lastSeq > pendingCache.seq)) {
+      const events = await mirror.read(id).catch(() => null);
+      if (id !== activeId) {
+        if (pendingLoadId === id) pendingLoadId = null;
+        return;
+      }
+      if (events && events.length) {
+        pendingMirror = { id, events, lastSeq: meta.lastSeq, epoch: meta.epoch };
+        pendingCache = null; // the mirror is provably fresher — the stale accelerator must not win the paint
+      }
+    }
   }
   attachConversation(id);
   if (pendingLoadId === id) pendingLoadId = null;
@@ -887,8 +917,11 @@ function saveConvoCache(): void {
       // Persist to IndexedDB (spec D8) — no 1.5MB cliff, so a long transcript stays cached and
       // delta-resumable instead of silently dropping to a full snapshot on the next reload.
       // serializeTranscript strips transient UI (thinking / empty state) and freezes any live
-      // activity block to "Worked" — the cache is a snapshot, not a running turn.
-      void convoCache.set(id, serializeTranscript(CONVO_CACHE_MAX_NODES));
+      // activity block to "Worked" — the cache is a snapshot, not a running turn. Stamped with the
+      // resume watermark AS OF THIS PANE: every frame that advanced seqStore for the active session
+      // also rendered here, so the stamp is exactly the seq this HTML covers — the proof the next
+      // load needs before it may delta-resume on top of this cache.
+      void convoCache.set(id, serializeTranscript(CONVO_CACHE_MAX_NODES), seqStore.get(id), epochStore.get(id));
     } catch {
       /* best-effort — the snapshot still loads from the daemon */
     }
@@ -1069,6 +1102,11 @@ const prefetcher = createPrefetcher({
     }
   },
   setWatermark: (id, epoch, lastSeq) => {
+    // Never stomp the ACTIVE session's resume watermark: it must track what the PANE has rendered, and
+    // prefetch writes only to the mirror. Advancing it here would make the next attach skip the very
+    // events the pane hasn't shown (empty delta → content permanently missing). Prefetch excludes the
+    // active session when planning, so this only guards the plan-races-a-session-switch window.
+    if (id === activeId) return;
     epochStore.set(id, epoch);
     seqStore.set(id, lastSeq);
   },
@@ -1088,17 +1126,35 @@ function schedulePrefetch(url: string): void {
 // wrapped so a malformed payload can never break boot.
 (window as unknown as { __anvilApplyStagedHistory?: (payload: unknown) => void }).__anvilApplyStagedHistory = (payload) => {
   try {
-    const items = (typeof payload === "string" ? JSON.parse(payload) : payload) as { response: ServerEvent }[];
+    const items = (typeof payload === "string" ? JSON.parse(payload) : payload) as { sessionId?: string; response: ServerEvent }[];
     if (!Array.isArray(items)) return;
     const deps = {
       sessionServerUrl: (id: string) => sessionServer.get(id) ?? "",
       setWatermark: (id: string, epoch: string, lastSeq: number) => {
+        // The ACTIVE session's watermark tracks what the PANE has rendered — a staged batch lands only
+        // in the mirror, so advancing seqStore here would make the reconnect attach delta-resume PAST
+        // the response the pane never showed (empty delta → the response never renders, on this and
+        // every later open). The repaint below surfaces the staged content instead.
+        if (id === activeId) return;
         epochStore.set(id, epoch);
         seqStore.set(id, lastSeq);
       },
       now: () => new Date().toISOString(),
     };
-    for (const it of items) if (it?.response) void applyHistoryToMirror(it.response, deps);
+    void (async () => {
+      let touchedActive = false;
+      for (const it of items) {
+        if (!it?.response) continue;
+        const sid = it.sessionId ?? (it.response as { sessionId?: string }).sessionId;
+        if (sid && sid === activeId) touchedActive = true;
+        await applyHistoryToMirror(it.response, deps);
+      }
+      // The staged batch covered the session on screen: re-run the load so the now-complete mirror wins
+      // the paint-source pick and the backgrounded response actually shows. Skip only when the pane is
+      // already painted AND the socket is live — there the attach pulls the same tail off the wire.
+      const id = activeId;
+      if (touchedActive && id && !(snapshotLoaded.has(id) && (serverOf(id)?.sock.isOpen() ?? false))) void loadConversation(id);
+    })();
   } catch {
     /* best-effort — a bad staged payload must never break the app */
   }
