@@ -37,6 +37,10 @@ needs via an `initX(deps)` call from main.ts (no seam imports main.ts); scalars 
 modules live on the `ui` object in `state.ts` (read its header — this is the TDZ/WEB2-1 discipline),
 while in-place Maps/Sets are `const` exports of their owning module. New dialog code should use
 `modalPromise`/`showModal` (focus-trapped, aria-correct) and the `busy()` button helper in `dom.ts`.
+DOM-free client logic is extracted out of the seams into small pure modules (e.g. `resume.ts`,
+`sendReconcile.ts`, `outbox.ts`) and unit-tested under `anvild/test/web/` (jsdom via
+`test/web/dom-env.ts` for the few that need a DOM) — prefer extracting a testable predicate over
+asserting through `main.ts`.
 
 The wire protocol is the source of truth for daemon↔client contracts:
 `docs/plans/anvil-protocol.ts` (symlinked as `anvild/protocol.ts`, imported as `@protocol`;
@@ -62,6 +66,10 @@ bun run start            # run the daemon (src/main.ts)
 
 CI (`.github/workflows/ci.yml`) gates every PR on `typecheck` + `typecheck:web` + `build:web` +
 `bun test`; the release workflows re-run the same checks before shipping. Keep all four green.
+
+The user-visible version is `MAJOR.MINOR` from the repo-root `VERSION` file (patch = CI run number);
+a merge to `main` cuts a full release via `.github/workflows/release.yml`. Bump `VERSION` to start a
+new minor/major.
 
 **Auth model (read carefully — the docs used to overstate this).** A missing `CLAUDE_CODE_OAUTH_TOKEN`
 is NOT fatal: the daemon boots **degraded** (it serves the UI + pairing/takeover flow so a headless

@@ -42,6 +42,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var web: WebView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private val adbWifi by lazy { AdbWifi(this) }
+    // True once the bundled UI has finished loading at least once, so the web bridge
+    // (window.__anvilApplyStagedHistory) exists. Gates the onResume drain below — draining before the
+    // page is ready would discard staged history the onPageFinished drain is about to apply.
+    private var webReady = false
 
     private val notifPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* result ignored */ }
@@ -110,12 +114,8 @@ class MainActivity : ComponentActivity() {
                     // Hand any history staged by the background sync (comprehensive-offline §4.4a) to the
                     // web layer, which applies it to the offline mirror. Idempotent, so a duplicate with a
                     // live delta is harmless.
-                    HistorySync.drain(this@MainActivity)?.let { staged ->
-                        view.evaluateJavascript(
-                            "window.__anvilApplyStagedHistory && window.__anvilApplyStagedHistory(${JSONObject.quote(staged)});",
-                            null,
-                        )
-                    }
+                    webReady = true
+                    drainStagedHistory()
                 }
             }
             // Inject the daemon URL before any page script runs, so the bundled UI knows where the
@@ -218,6 +218,28 @@ class MainActivity : ComponentActivity() {
             android.content.res.Configuration.UI_MODE_NIGHT_YES
 
     private fun themeBackground(): Int = if (isDark()) 0xFF1A1B1E.toInt() else 0xFFFFFFFF.toInt()
+
+    /** Apply any history staged by the background sync (comprehensive-offline §4.4a) to the web layer's
+     *  offline mirror. Idempotent (keyed mirror writes), so applying a batch that also arrives as a live
+     *  delta is harmless. No-op until the bundled UI is ready (the bridge wouldn't exist yet). */
+    private fun drainStagedHistory() {
+        if (!webReady) return
+        HistorySync.drain(this)?.let { staged ->
+            web.evaluateJavascript(
+                "window.__anvilApplyStagedHistory && window.__anvilApplyStagedHistory(${JSONObject.quote(staged)});",
+                null,
+            )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // A response that completed while the app was backgrounded is staged by the FCM handler but,
+        // before this, only drained on a full page load (onPageFinished). A plain Activity resume — the
+        // common case when the user reopens the app — left it sitting in SharedPreferences, so the
+        // backgrounded turn didn't surface until a reload. Drain here too so it applies on every resume.
+        drainStagedHistory()
+    }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)

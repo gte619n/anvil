@@ -45,6 +45,10 @@ export interface ComposerDeps {
   activeServer(): Server;
   /** Queue a write into main's outbox (badge + flush kick stay in main with the flush machinery). */
   enqueue(item: OutboxItem): void;
+  /** Register an online prompt.send as awaiting the daemon's confirmation (ack / message.user echo).
+   *  A half-open socket accepts the frame (send() returns true) but never delivers it; main re-queues
+   *  any still-unconfirmed prompt into the outbox when that socket drops, so it's never silently lost. */
+  trackPrompt(item: OutboxItem): void;
   /** The side-panel reader's open file (main's `readerPath` — a reassigned scalar, read at call
    *  time; select-to-quote prefixes a reader quote with its path). */
   readerPath(): string;
@@ -57,9 +61,10 @@ let sessions: ComposerDeps["sessions"];
 let activeId: ComposerDeps["activeId"];
 let activeServer: ComposerDeps["activeServer"];
 let enqueue: ComposerDeps["enqueue"];
+let trackPrompt: ComposerDeps["trackPrompt"];
 let readerPath: ComposerDeps["readerPath"];
 export function initComposer(deps: ComposerDeps): void {
-  ({ sessions, activeId, activeServer, enqueue, readerPath } = deps);
+  ({ sessions, activeId, activeServer, enqueue, trackPrompt, readerPath } = deps);
   wireComposerDom();
 }
 
@@ -163,7 +168,9 @@ async function sendComposer(): Promise<void> {
   // idempotency key the server dedupes on flush.
   const cid = newCid();
   if (serverOf(activeId())?.sock.isOpen() && !s?.pending) {
-    sendTo(activeId(), { type: "prompt.send", sessionId: activeId()!, text, attachmentIds: pendingAttachments.map((a) => a.id), cid });
+    const cmd = { type: "prompt.send", sessionId: activeId()!, text, attachmentIds: pendingAttachments.map((a) => a.id) };
+    sendTo(activeId(), { ...cmd, cid });
+    trackPrompt({ cid, cmd }); // half-open safety net: re-queued into the outbox if the daemon never confirms
   } else {
     // offline, or a session that itself hasn't been created yet → queue it.
     if (pendingAttachments.length) toast("Attachments need a connection — sent text only");
