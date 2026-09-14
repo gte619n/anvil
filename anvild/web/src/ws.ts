@@ -26,6 +26,14 @@ export class AnvilSocket {
   // an outbox write hangs on "Syncing…" until a real network transition finally fires `onclose`.
   private static readonly HEARTBEAT_MS = 15000;
   private static readonly PONG_GRACE_MS = 10000;
+  // A far tighter deadline used only for an EXPLICITLY-triggered probe (foreground, network-return,
+  // Retry) — never the steady-state heartbeat. Coming back to the foreground on Android, a socket
+  // frozen through Doze routinely survives as readyState === OPEN even though its transport was reaped,
+  // so the 10s grace above would strand the UI on stale state (a frozen "Thinking…", or a stale idle
+  // pane while a turn ran) for that whole window. A dead socket never pongs, so a short deadline just
+  // detects it ~3× faster; a healthy socket pongs in milliseconds, and the worst case for a
+  // briefly-slow-but-alive link is one cheap, idempotent reconnect (session.list delta-resumes).
+  private static readonly WAKE_PONG_GRACE_MS = 3000;
 
   constructor(
     private readonly url: string,
@@ -109,8 +117,10 @@ export class AnvilSocket {
     // A socket that *claims* to be open may be half-open — the very case that returning to the
     // foreground / regaining the network is a hint for. Don't trust readyState: send a ping and let
     // the pong deadline force a reconnect if the transport is actually dead, instead of no-op'ing.
+    // Use the SHORT wake deadline: these triggers are exactly when a Doze-frozen socket is likeliest
+    // to be silently dead, and the UI should re-sync in ~3s, not wait out the 10s steady-state grace.
     if (this.isOpen()) {
-      this.ping();
+      this.ping(AnvilSocket.WAKE_PONG_GRACE_MS);
       return;
     }
     clearTimeout(this.reconnectTimer);
@@ -135,8 +145,9 @@ export class AnvilSocket {
     this.pongDeadline = 0;
   }
 
-  /** Send a heartbeat ping and arm the deadline; any inbound frame (onmessage) disarms it. */
-  private ping(): void {
+  /** Send a heartbeat ping and arm the deadline; any inbound frame (onmessage) disarms it. `grace`
+   *  defaults to the steady-state window; the foreground/network-return probe passes the short one. */
+  private ping(grace: number = AnvilSocket.PONG_GRACE_MS): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     try {
       this.ws.send(JSON.stringify({ v: PROTOCOL_VERSION, ts: new Date().toISOString(), type: "ping" }));
@@ -145,7 +156,7 @@ export class AnvilSocket {
       return;
     }
     clearTimeout(this.pongDeadline);
-    this.pongDeadline = window.setTimeout(() => this.forceReconnect(), AnvilSocket.PONG_GRACE_MS);
+    this.pongDeadline = window.setTimeout(() => this.forceReconnect(), grace);
   }
 
   /**

@@ -57,6 +57,7 @@ import {
   appendDelta,
   appendFileOffer,
   appendToolResult,
+  appendOptimisticUser,
   appendUser,
   armAttachDiagnostic,
   clearAttachDiagnostic,
@@ -205,8 +206,9 @@ import type {
 } from "../../protocol";
 import { envOrdinal, sessionBg } from "./sessionColor";
 import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
+import { isDaemonHandledCommand } from "./sendReconcile";
 import { telemetry } from "./telemetry";
-import { canDeltaResume } from "./resume";
+import { canDeltaResume, shouldRelightStatus } from "./resume";
 import { convoCache, migrateLegacyConvoCache } from "./convoCache";
 import { mirror, MIRROR_MAX_SESSIONS } from "./mirror";
 import { applyHistoryToMirror, createPrefetcher, PREFETCH_MAX_SESSIONS, type PrefetchSessionInfo } from "./prefetch";
@@ -718,6 +720,7 @@ function renderSkeleton(): void {
 async function loadConversation(id: string): Promise<void> {
   pendingLoadId = id; // a load is in flight for `id` — session.list must not start a competing one
   clearConversation();
+  paneStatus = null; // fresh pane — the incoming snapshot/attach trailing status re-establishes it
   snapshotLoaded.delete(id); // a fresh load — re-derive "content shown" below
   pendingCache = null;
   pendingMirror = null;
@@ -1021,6 +1024,18 @@ function enqueue(item: OutboxItem): void {
   // disconnected→connected transition, so without this kick the item sits forever behind a
   // "Syncing…" banner that never drains. Try now if we're online (no-op if nothing can route yet).
   if (anyOpen()) void flushOutbox();
+}
+// Online prompt.sends dispatched to a socket that CLAIMED to be open but the daemon hasn't confirmed
+// yet (no `ack` / `message.user` echo carrying the cid). A half-open socket (Android Doze reaps the
+// transport while readyState stays OPEN) accepts the frame — `send()` returns true — but it never
+// reaches the daemon, so the prompt would be silently lost: the online fast path shows no optimistic
+// bubble, queues no outbox entry, and the composer already cleared the input. We hold each here until
+// its cid is confirmed; if the socket drops first, onStatus re-queues it into the outbox (the daemon's
+// exactly-once cid dedupe, spec A5, makes a redundant re-send a no-op re-ack).
+const pendingSends = new Map<string, { item: OutboxItem; url: string }>();
+function trackOnlinePrompt(item: OutboxItem): void {
+  const url = sessionServer.get(item.cmd.sessionId as string);
+  if (url) pendingSends.set(item.cid, { item, url });
 }
 const cidWaiters = new Map<string, (e: ServerEvent) => void>();
 function sendAwait(server: Server, cmd: Record<string, unknown> & { type: string; cid: string }, timeoutMs = 20_000): Promise<ServerEvent> {
@@ -1359,6 +1374,20 @@ function onStatus(url: string, status: "connecting" | "connected" | "disconnecte
       fillContent(activeId);
       if (fromHtml) telemetry.mark("offlineReloads"); // mirror path marks offlineMirrorOpens itself
     }
+    // Any online prompt.send to THIS server the daemon never confirmed died with the socket (a
+    // half-open Doze drop accepts the frame but never delivers it). Re-queue it into the outbox so the
+    // reconnect flush re-sends it — the daemon's exactly-once cid dedupe drops it if it did land — and
+    // paint the optimistic bubble the online fast path skipped, so the user sees their message now
+    // instead of it vanishing (the "tapped Send, nothing happened" regression).
+    for (const [pcid, pending] of [...pendingSends]) {
+      if (!sameServerUrl(pending.url, url)) continue;
+      pendingSends.delete(pcid);
+      enqueue(pending.item);
+      const text = pending.item.cmd.text;
+      if (pending.item.cmd.sessionId === activeId && typeof text === "string" && !isDaemonHandledCommand(text)) {
+        appendOptimisticUser(text, pcid);
+      }
+    }
     // A disconnected server can't be mid-run from our point of view, so clear any stale `running` it
     // left behind. Without this the autopilot spinner latches on forever when a daemon drops mid-run
     // before its `running: false` broadcast lands — e.g. a forced exit skips the run's finally. The
@@ -1410,6 +1439,11 @@ function onEvent(url: string, e: ServerEvent): void {
   }
   const cid = (e as { cid?: string }).cid;
   let awaited = false;
+  // Any frame carrying this cid (the daemon's `ack`, the `message.user` echo, or a `command.error`)
+  // proves the online prompt.send reached the daemon — clear its half-open safety-net entry so a later
+  // socket drop doesn't re-queue an already-delivered prompt. Cids are unique, so this can only ever
+  // match the prompt we tracked.
+  if (cid) pendingSends.delete(cid);
   if (cid && cidWaiters.has(cid)) {
     cidWaiters.get(cid)!(e); // hand the frame to the sendAwait promise tracking this cid
     cidWaiters.delete(cid);
@@ -1451,6 +1485,7 @@ function onEvent(url: string, e: ServerEvent): void {
         setHeaderTitle(sessions.get(activeId));
         flushPinnedBoot(); // restore a pinned panel now that this socket is provably live (one-shot)
         resyncTerminal(); // daemon restart / dropped open: heal a mounted terminal (no-op when healthy)
+        relightActiveStatus(activeId, sessions.get(activeId)?.status); // sync the indicator NOW, ahead of the attach's trailing status
         if (snapshotLoaded.has(activeId)) attachReconnect(activeId);
         else if (pendingLoadId === activeId) { /* a fresh load is already resolving; it will attach itself */ }
         else void loadConversation(activeId);
@@ -1480,6 +1515,7 @@ function onEvent(url: string, e: ServerEvent): void {
       persistSessions();
       renderSessions();
       if (e.session.id === activeId) {
+        relightActiveStatus(e.session.id, e.session.status); // keep the pane indicator in step with the sidebar
         updateGitPanelMeta();
         renderTermStrip(); // roster changes (open/exit/kill on any device) refresh the chip strip
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
@@ -1877,7 +1913,13 @@ function applyActiveTint(): void {
     main.style.removeProperty("--session-active-bg");
   }
 }
+// The status currently reflected by the CONVERSATION PANE's indicator (thinking dots + composer
+// mode) — as distinct from `session.status`, which drives the sidebar. setStatus is its only writer;
+// relightActiveStatus reads it so an authoritative status from session.list/session.updated repaints
+// the indicator ONLY when it actually differs (no per-update churn). Reset on a fresh load.
+let paneStatus: string | null = null;
 function setStatus(status: string): void {
+  paneStatus = status;
   // Permission AND question cards are retired individually by their `*.resolved` events (a session
   // can hold several at once during sub-agent fan-out, so a status flip to running_tool/thinking
   // must NOT clear a still-parked sibling). Only a terminal status sweeps any straggler that somehow
@@ -1896,6 +1938,18 @@ function setStatus(status: string): void {
     s.status = status as Session["status"];
     renderSessions();
     updateHeaderAccount(s); // the account chip's switch tooltip depends on idle vs mid-turn
+  }
+}
+/** Re-assert the active session's live status onto the PANE from an authoritative session.list /
+ *  session.updated. Those carry each session's status and drive the sidebar, but never drove the
+ *  thinking indicator — so on an Android resume the pane sat on its frozen pre-drop state (a stale
+ *  "Thinking…", or a stale idle pane while a turn actually ran) until the attach round-trip's trailing
+ *  `status` finally landed 10–25s later. Relighting here masks that whole reconnect window. No-op
+ *  unless it's the active, on-screen session, the status actually changed, and no local cancel is
+ *  still draining (which would otherwise re-light a stale "thinking"). */
+function relightActiveStatus(id: string, status: string | undefined): void {
+  if (shouldRelightStatus({ status, isActive: id === activeId, onScreen: snapshotLoaded.has(id), turnCanceled: ui.turnCanceled, paneStatus })) {
+    setStatus(status!);
   }
 }
 
@@ -2310,6 +2364,7 @@ initComposer({
   activeId: () => activeId,
   activeServer,
   enqueue,
+  trackPrompt: trackOnlinePrompt,
   readerPath: () => readerPath,
 });
 
