@@ -113,6 +113,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
+        # Override the default `tools platform-tools`: the legacy `tools` package was removed from the SDK
+        # repo, so `sdkmanager tools` now fails and kills the job. Install only `platform-tools`; Gradle/AGP
+        # fetches the rest on demand. (Same fix as release.yml.)
+        with: { packages: platform-tools }
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
