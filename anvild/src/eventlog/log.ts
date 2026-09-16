@@ -106,7 +106,9 @@ export class EventLog {
           events.push({ kind: "assistant", ts: a.ts, blocks: a.blocks });
           break;
         case "tool.result":
-          events.push({ kind: "tool_result", ts: a.ts, toolUseId: a.toolUseId, content: a.content, isError: a.isError, ...(a.images ? { images: a.images } : {}) });
+          // `subagent` (§sub-agents, D10) rides through so a Task sub-agent's settled row survives a cold
+          // attach / offline replay — the durable counterpart to the ephemeral subagent.activity channel.
+          events.push({ kind: "tool_result", ts: a.ts, toolUseId: a.toolUseId, content: a.content, isError: a.isError, ...(a.images ? { images: a.images } : {}), ...(a.subagent ? { subagent: a.subagent } : {}) });
           break;
         case "result":
           events.push({ kind: "result", ts: a.ts, stopReason: a.stopReason, usage: a.usage });

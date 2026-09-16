@@ -36,7 +36,7 @@ import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serve
 import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
-import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session, ToolResultImage } from "../../protocol";
+import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session, SubAgentView, ToolResultImage } from "../../protocol";
 
 // ── Injected dependencies (initConversation) ─────────────────────────────────────────────────────
 // What conversation code calls back into main.ts for. Each field documents the main.ts state it
@@ -109,6 +109,12 @@ let activityEl: HTMLDetailsElement | null = null; // consolidated per-turn tool/
 let activityCount = 0;
 let activityLive = false;
 const activityTail: string[] = [];
+// Sub-agent (`Task`/`Agent`) rows for the current turn, keyed by the launching Task tool_use id
+// (§sub-agents). Reset with the activity block each user turn. `subAgentRows` holds the live DOM node;
+// `subAgentModel` holds the merged view (so a partial live snapshot never clobbers info the durable
+// Task tool_use / tool.result already provided, and a settled row never regresses to "running").
+const subAgentRows = new Map<string, HTMLElement>();
+const subAgentModel = new Map<string, SubAgentView>();
 export const references = new Map<string, string>(); // url → display label, insertion-ordered (Links panel)
 let pendingAnswerRefs: string[] = []; // links seen in the latest assistant prose, promoted on `result`
 
@@ -352,8 +358,12 @@ export function commitAssistant(blocks: ContentBlock[], ts?: string): void {
   }
   ui.streaming = null;
   streamText = "";
-  // Tool calls fold into the consolidated activity block, not inline in the prose.
-  for (const b of toolBlocks) appendActivityStep(toolHtml(b));
+  // Tool calls fold into the consolidated activity block, not inline in the prose. A `Task`/`Agent`
+  // launch becomes a sub-agent row (its own group) instead of a generic step (§sub-agents, ID16).
+  for (const b of toolBlocks) {
+    if (AGENT_TOOL_NAMES.has(b.name)) beginSubAgentFromToolUse(b);
+    else appendActivityStep(toolHtml(b));
+  }
   scrollDown();
 }
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -433,22 +443,29 @@ export function resetActivity(): void {
   activityCount = 0;
   activityLive = false;
   activityTail.length = 0;
+  subAgentRows.clear();
+  subAgentModel.clear();
 }
 function ensureActivity(): HTMLDetailsElement {
   if (activityEl && activityEl.isConnected) return activityEl;
   dropSessionHero(); // a turn's activity block is appearing — retire the blank-session title card
   const d = document.createElement("details");
   d.className = "activity live";
+  // `.subagents` lives inside <summary> so the fan-out stays visible even while the block is collapsed
+  // (§sub-agents, ID15 — the whole point is that a sub-agent turn never looks frozen).
   d.innerHTML =
     `<summary><span class="activity-row"><span class="activity-ind"><i></i><i></i><i></i></span>` +
     `<span class="activity-title">Working</span><span class="activity-count"></span>` +
     `<span class="msym activity-chevron">expand_more</span></span>` +
+    `<div class="subagents"></div>` +
     `<div class="activity-tail"></div></summary><div class="activity-full"></div>`;
   conversation.appendChild(d);
   activityEl = d;
   activityLive = true;
   activityTail.length = 0;
   activityCount = 0;
+  subAgentRows.clear();
+  subAgentModel.clear();
   hideThinking(); // the activity block's spinner is now the running indicator
   return d;
 }
@@ -457,7 +474,10 @@ function updateActivityHead(): void {
   const title = activityEl.querySelector(".activity-title");
   if (title) title.textContent = activityLive ? "Working" : "Worked";
   const count = activityEl.querySelector(".activity-count");
-  if (count) count.textContent = activityCount ? `· ${activityCount} step${activityCount === 1 ? "" : "s"}` : "";
+  if (!count) return;
+  // Sub-agent fan-out takes the headline (D2/D13): "· 3 sub-agents". Otherwise fall back to the step count.
+  if (subAgentRows.size) count.textContent = `· ${subAgentRows.size} sub-agent${subAgentRows.size === 1 ? "" : "s"}`;
+  else count.textContent = activityCount ? `· ${activityCount} step${activityCount === 1 ? "" : "s"}` : "";
 }
 /** Append one step to the current activity block. `preview` is a single-line form shown in the
  *  collapsed tail; `full` (defaults to preview) is the rich form shown when expanded. */
@@ -485,6 +505,97 @@ export function finalizeActivity(): void {
   const ind = activityEl.querySelector(".activity-ind");
   if (ind) ind.innerHTML = icon("check");
   updateActivityHead();
+}
+
+// ── Sub-agent activity (§sub-agents) ──────────────────────────────────────────────
+// The SDK's `Task`/`Agent` tool fans out sub-agents. Each launching tool_use becomes a row inside the
+// activity block's always-visible <summary> (ID15) so a fan-out never looks frozen. Rows are fed from
+// three places, all funneling through `upsertSubAgentRow` (which merges, never regressing a settled row):
+//   • the durable Task tool_use block (commitAssistant) → creates the row on live AND on reload/replay;
+//   • the ephemeral `subagent.activity` live snapshot → ticks steps / current tool / elapsed;
+//   • the durable Task `tool.result.subagent` → settles the row (done/error), surviving reload (D10).
+export const AGENT_TOOL_NAMES = new Set(["Agent", "Task"]);
+const SA_TERMINAL_ICON: Record<string, string> = { done: "check", error: "error", canceled: "cancel" };
+
+function fmtElapsed(s: number): string {
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem ? `${m}m ${rem}s` : `${m}m`;
+}
+
+function mergeView(prev: SubAgentView | undefined, inc: SubAgentView): SubAgentView {
+  if (!prev) return { ...inc };
+  const settled = prev.state === "done" || prev.state === "error" || prev.state === "canceled";
+  return {
+    id: inc.id,
+    label: inc.label || prev.label,
+    type: inc.type ?? prev.type,
+    // never regress a settled row back to "running" (a late live heartbeat must not un-finish it)
+    state: settled && inc.state === "running" ? prev.state : inc.state,
+    steps: Math.max(prev.steps ?? 0, inc.steps ?? 0),
+    currentTool: inc.state === "running" ? (inc.currentTool ?? prev.currentTool) : undefined,
+    elapsedSeconds: inc.elapsedSeconds ?? prev.elapsedSeconds,
+    error: inc.error ?? prev.error,
+  };
+}
+
+function renderSubAgentRow(row: HTMLElement, view: SubAgentView): void {
+  row.dataset.state = view.state; // CSS colours by state; NEVER uses the `hidden` attr (ID15 / .msym quirk)
+  const type = esc(view.type || "Sub-agent");
+  const label = esc(view.label);
+  const bits: string[] = [];
+  if (view.steps) bits.push(`${view.steps} step${view.steps === 1 ? "" : "s"}`);
+  if (view.state === "running" && view.currentTool) bits.push(esc(view.currentTool));
+  if (typeof view.elapsedSeconds === "number" && view.elapsedSeconds > 0) bits.push(fmtElapsed(view.elapsedSeconds));
+  if (view.state === "error") bits.push(esc(view.error || "error"));
+  if (view.state === "canceled") bits.push("canceled");
+  const detail = bits.length ? `<span class="sa-detail">· ${bits.join(" · ")}</span>` : "";
+  const ind =
+    view.state === "running"
+      ? `<span class="sa-ind"><i></i><i></i><i></i></span>`
+      : `<span class="msym sa-icon">${SA_TERMINAL_ICON[view.state] ?? "check"}</span>`;
+  row.innerHTML = `${ind}<span class="sa-type">${type}</span><span class="sa-label" title="${label}">${label}</span>${detail}`;
+}
+
+/** Create or update a sub-agent row (merging with any prior view). The single funnel for all sources. */
+function upsertSubAgentRow(incoming: SubAgentView): void {
+  const d = ensureActivity();
+  const container = d.querySelector<HTMLElement>(".subagents");
+  if (!container) return;
+  const merged = mergeView(subAgentModel.get(incoming.id), incoming);
+  subAgentModel.set(incoming.id, merged);
+  let row = subAgentRows.get(incoming.id);
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "subagent-row";
+    row.dataset.id = incoming.id;
+    container.appendChild(row);
+    subAgentRows.set(incoming.id, row);
+  }
+  renderSubAgentRow(row, merged);
+  updateActivityHead();
+  scrollDown();
+}
+
+/** A `Task`/`Agent` tool_use committed (live or on replay): open its sub-agent row from the launch
+ *  input (description/type) — so the row exists even before the first live heartbeat / on reload. */
+function beginSubAgentFromToolUse(b: Extract<ContentBlock, { kind: "tool_use" }>): void {
+  const input = (b.input ?? {}) as Record<string, unknown>;
+  const type = typeof input.subagent_type === "string" ? input.subagent_type : undefined;
+  const label = typeof input.description === "string" && input.description ? input.description : type || "Sub-agent";
+  upsertSubAgentRow({ id: b.toolUseId, label, type, state: "running", steps: 0 });
+}
+
+/** Apply an ephemeral `subagent.activity` live snapshot (full replace, idempotent). Ticks the rows. */
+export function updateSubAgents(agents: SubAgentView[]): void {
+  if (!agents.length) return;
+  for (const v of agents) upsertSubAgentRow(v);
+}
+
+/** Settle a sub-agent row from the DURABLE Task tool.result (survives reload/offline replay, D10). */
+export function finalizeSubAgentResult(view: SubAgentView): void {
+  upsertSubAgentRow(view);
 }
 export function appendToolResult(content: string, isError: boolean, images: ToolResultImage[] = []): void {
   const text = content.trim();
@@ -688,6 +799,12 @@ export function serializeTranscript(maxNodes: number): string {
     if (ind) ind.innerHTML = `<span class="msym">check</span>`;
     const title = a.querySelector(".activity-title");
     if (title) title.textContent = "Worked";
+  });
+  // A still-"running" sub-agent row would keep its dots animating forever off the cache (no socket on
+  // reload) — same trap as the activity spinner above. Freeze its indicator to a static glyph; the live
+  // status/snapshot that follows a reconnect re-lights the real state (§sub-agents, ID15).
+  clone.querySelectorAll('.subagent-row[data-state="running"] .sa-ind').forEach((ind) => {
+    (ind as HTMLElement).outerHTML = `<span class="msym sa-icon">more_horiz</span>`;
   });
   return clone.innerHTML;
 }

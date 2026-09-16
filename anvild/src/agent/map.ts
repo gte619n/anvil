@@ -1,10 +1,16 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlock, Usage } from "@protocol";
 import type { SessionEventBody } from "../session/session";
+import type { SubAgentSignal } from "./subagents";
 import type { MarkdownRenderer } from "../render/markdown";
 
 /** Handled via the question card (canUseTool), not the normal tool_use/tool.result path. */
 const ASK_USER_QUESTION = "AskUserQuestion";
+
+/** The sub-agent launcher tool: the SDK names it "Agent"; older CLIs used "Task" (see supervisor.ts). */
+const AGENT_TOOLS = new Set(["Agent", "Task"]);
+/** The launching message's `parent_tool_use_id` (null on the main turn, an ancestor id when nested). */
+const parentToolUseId = (m: SDKMessage): string | null => (m as any).parent_tool_use_id ?? null;
 
 /** The ids of any AskUserQuestion tool_use blocks in this message — so the driver can drop the
  *  matching tool.result (the answers echo), keeping all SDK-shape knowledge in this module. */
@@ -30,6 +36,10 @@ export function mapMessage(m: SDKMessage, renderer: MarkdownRenderer): SessionEv
     }
 
     case "assistant": {
+      // A sub-agent's INTERNAL messages carry `parent_tool_use_id` (ID1). Suppress them from the normal
+      // conversation flow — otherwise a sub-agent's tool churn flattens indistinguishably into the parent's
+      // activity block (today's bug). Their signal lives on `subAgentSignals` → the sub-agent tracker instead.
+      if (parentToolUseId(m) != null) return [];
       const content: any[] = (m as any).message?.content ?? [];
       const blocks: ContentBlock[] = [];
       const toolUses: SessionEventBody[] = [];
@@ -52,6 +62,9 @@ export function mapMessage(m: SDKMessage, renderer: MarkdownRenderer): SessionEv
     }
 
     case "user": {
+      // Sub-agent tool_results (parent_tool_use_id set) are suppressed like the assistant side (ID1) —
+      // the main-turn Task tool_result (parent null) is the durable sub-agent completion, handled in the driver.
+      if (parentToolUseId(m) != null) return [];
       const content = (m as any).message?.content;
       if (!Array.isArray(content)) return [];
       const out: SessionEventBody[] = [];
@@ -76,6 +89,70 @@ export function mapMessage(m: SDKMessage, renderer: MarkdownRenderer): SessionEv
     default:
       return [];
   }
+}
+
+/**
+ * Extract the sub-agent tracker signals from one `SDKMessage` (§sub-agents, ID2/ID3/ID7/ID8). The
+ * SECOND SDK-shape seam alongside `mapMessage` — all knowledge of `parent_tool_use_id`, the
+ * `Agent`/`Task` launcher, and `task_progress` lives here and is fixture-tested offline. Returns []
+ * for anything sub-agents don't care about (the common case), so the driver can call it on every message.
+ */
+export function subAgentSignals(m: SDKMessage): SubAgentSignal[] {
+  const out: SubAgentSignal[] = [];
+  if (m.type === "assistant") {
+    const parent = parentToolUseId(m);
+    const content: any[] = (m as any).message?.content ?? [];
+    for (const b of content) {
+      if (b?.type !== "tool_use") continue;
+      if (AGENT_TOOLS.has(b.name)) {
+        // A sub-agent launch — main-turn (parent null → new row) or nested (parent set → rolled up, ID7).
+        const input = (b.input ?? {}) as Record<string, unknown>;
+        out.push({
+          kind: "start",
+          taskId: b.id,
+          launchedBy: parent,
+          type: typeof input.subagent_type === "string" ? input.subagent_type : undefined,
+          label: typeof input.description === "string" ? input.description : undefined,
+        });
+      } else if (parent != null) {
+        // A (non-Task) tool the sub-agent is running → a step on it, and its current tool.
+        out.push({ kind: "step", parent, tool: typeof b.name === "string" ? b.name : undefined });
+      }
+    }
+    // Message-level metadata the SDK stamps on sub-agent messages (best label/type source).
+    if (parent != null) {
+      const type = (m as any).subagent_type;
+      const label = (m as any).task_description;
+      if (typeof type === "string" || typeof label === "string") {
+        out.push({ kind: "meta", parent, type: typeof type === "string" ? type : undefined, label: typeof label === "string" ? label : undefined });
+      }
+    }
+  } else if (m.type === "user") {
+    const parent = parentToolUseId(m);
+    if (parent != null) {
+      const content = (m as any).message?.content;
+      if (Array.isArray(content)) {
+        for (const b of content) if (b?.type === "tool_result") out.push({ kind: "step_done", parent });
+      }
+    }
+  } else if (m.type === "system" && (m as any).subtype === "task_progress") {
+    // SDKTaskProgressMessage — a rich per-agent heartbeat overlay (ID8). Keyed by the Task tool_use id.
+    const p = m as any;
+    const taskId = typeof p.tool_use_id === "string" ? p.tool_use_id : undefined;
+    if (taskId) {
+      const dur = p.usage?.duration_ms;
+      out.push({
+        kind: "progress",
+        taskId,
+        type: typeof p.subagent_type === "string" ? p.subagent_type : undefined,
+        label: typeof p.description === "string" ? p.description : undefined,
+        steps: typeof p.usage?.tool_uses === "number" ? p.usage.tool_uses : undefined,
+        currentTool: typeof p.last_tool_name === "string" ? p.last_tool_name : undefined,
+        elapsedSeconds: typeof dur === "number" ? Math.round(dur / 1000) : undefined,
+      });
+    }
+  }
+  return out;
 }
 
 /** A base64 image block pulled off a tool_result, awaiting persistence by the driver. */

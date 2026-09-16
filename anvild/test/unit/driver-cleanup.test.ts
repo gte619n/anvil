@@ -36,6 +36,12 @@ function fakeSession(id: string) {
     emitError() {},
     requestPermission() {},
     requestQuestion() {},
+    resetSubAgents() {},
+    applySubAgentSignals() {},
+    finishSubAgent() {
+      return undefined;
+    },
+    cancelRunningSubAgents() {},
   } as unknown as Session;
 }
 

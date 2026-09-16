@@ -4,7 +4,7 @@ import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
 import type { CommandInfo, ContextUsage, Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
-import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage, toolResultImages } from "./map";
+import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
@@ -109,6 +109,7 @@ export class AgentDriver {
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
     this.ensureStarted();
+    this.session.resetSubAgents(); // a new user turn → drop the prior turn's sub-agent rows (ID12)
     this.session.setStatus("thinking");
     this.input.push(userMessage(text, attachments));
   }
@@ -321,6 +322,9 @@ export class AgentDriver {
           if (text) this.session.lastAssistantText = text;
           if (text) this.session.recordTurnLine(`assistant: ${text}`, GOAL_TRANSCRIPT_LINES);
         }
+        // Feed the sub-agent tracker (§sub-agents): a `Task`/`Agent` launch, a sub-agent's tool step,
+        // or a task_progress heartbeat. Broadcasts a live snapshot on structural change (ephemeral, no seq).
+        this.session.applySubAgentSignals(subAgentSignals(m));
         const bodies = mapMessage(m, this.renderer);
         // Screenshots (and any image blocks) the tool returned, keyed by tool_use id. Persisted below
         // as attachments and stitched onto the matching tool.result so the client can render thumbnails.
@@ -338,6 +342,10 @@ export class AgentDriver {
           }
           if (body.type === "tool.result") {
             sawToolResult = true;
+            // If this result is a sub-agent (`Task`/`Agent`) completing, settle its tracker row and stamp
+            // the settled summary onto the DURABLE tool.result so the row survives reload/offline (D10/ID6).
+            const view = this.session.finishSubAgent(body.toolUseId, body.isError, body.isError ? body.content : undefined);
+            if (view) body.subagent = view;
             const imgs = imagesByTool.get(body.toolUseId);
             if (imgs?.length && this.saveToolImage) {
               body.images = imgs.map((im) => ({ attachmentId: this.saveToolImage!(im.mediaType, im.dataBase64), mediaType: im.mediaType }));
@@ -420,6 +428,9 @@ export class AgentDriver {
       this.questionBroker.resolveSession(this.session.id);
       this.pendingOffers.clear();
       this.askQuestionIds.clear();
+      // Any sub-agent still "running" at teardown (turn error, or a stop that drained here) never got its
+      // Task tool.result — mark it canceled so the indicator shows a terminal ⊘, not an eternal spinner (D7).
+      this.session.cancelRunningSubAgents();
       if (this.session.data.status !== "idle") this.session.setStatus("idle");
       this.q = undefined;
     }

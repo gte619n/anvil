@@ -130,6 +130,7 @@
     "session.updated",
     "shadow.subscribe",
     "status",
+    "subagent.activity",
     "team.info",
     "team.integrate",
     "team.plan",
