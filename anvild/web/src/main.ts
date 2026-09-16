@@ -66,6 +66,7 @@ import {
   conversation,
   dropSessionHero,
   finalizeActivity,
+  finalizeSubAgentResult,
   hideThinking,
   initConversation,
   maybeShowSessionHero,
@@ -75,6 +76,7 @@ import {
   showThinking,
   streamMd,
   updateComposerMode,
+  updateSubAgents,
 } from "./conversation";
 // The autopilot seam (plan grid/reader, run log + status, badge, schedule controls) lives in
 // autopilot.ts (P7 decomposition). Importing it here makes its module body — including the
@@ -1688,7 +1690,8 @@ function handleSessionEvent(e: ServerEvent): void {
       e.type === "assistant.message" ||
       e.type === "tool.result" ||
       e.type === "file.offer" ||
-      e.type === "status"
+      e.type === "status" ||
+      e.type === "subagent.activity" // after a local Stop the activity block is already gone — drop live churn
     ) {
       return;
     }
@@ -1748,7 +1751,13 @@ function handleSessionEvent(e: ServerEvent): void {
       commitAssistant(e.blocks, e.ts);
       return;
     case "tool.result":
-      appendToolResult(e.content, e.isError, e.images);
+      // A sub-agent (`Task`/`Agent`) completing: settle its row (§sub-agents, D10) instead of dumping a
+      // generic result — the sub-agent group IS the display. Ordinary tool results render as before.
+      if (e.subagent) finalizeSubAgentResult(e.subagent);
+      else appendToolResult(e.content, e.isError, e.images);
+      return;
+    case "subagent.activity":
+      updateSubAgents(e.agents); // ephemeral live snapshot (no seq): tick the sub-agent rows (D5/D9)
       return;
     case "file.offer":
       appendFileOffer(e.file);
@@ -1808,7 +1817,10 @@ function handleSessionEvent(e: ServerEvent): void {
 function renderConversationEvent(ev: ConversationEvent): void {
   if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments, ev.ts, undefined, ev.rendered.source);
   else if (ev.kind === "assistant") commitAssistant(ev.blocks, ev.ts);
-  else if (ev.kind === "tool_result") appendToolResult(ev.content, ev.isError, ev.images);
+  else if (ev.kind === "tool_result") {
+    if (ev.subagent) finalizeSubAgentResult(ev.subagent); // durable sub-agent completion (reload/offline replay, D10)
+    else appendToolResult(ev.content, ev.isError, ev.images);
+  }
   else if (ev.kind === "file_offer") appendFileOffer(ev.file);
 }
 

@@ -48,7 +48,9 @@ export function foldEvent(e: ServerEvent): ConversationEvent | null {
     case "assistant.message":
       return { kind: "assistant", ts: e.ts, blocks: e.blocks };
     case "tool.result":
-      return { kind: "tool_result", ts: e.ts, toolUseId: e.toolUseId, content: e.content, isError: e.isError, ...(e.images ? { images: e.images } : {}) };
+      // `subagent` (§sub-agents, D10) rides into the mirror so a sub-agent's settled row survives an
+      // OFFLINE reopen too — must mirror eventlog/log.ts `snapshot()`, which also carries it.
+      return { kind: "tool_result", ts: e.ts, toolUseId: e.toolUseId, content: e.content, isError: e.isError, ...(e.images ? { images: e.images } : {}), ...(e.subagent ? { subagent: e.subagent } : {}) };
     case "result":
       return { kind: "result", ts: e.ts, stopReason: e.stopReason, usage: e.usage };
     case "file.offer":

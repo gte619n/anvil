@@ -5,8 +5,10 @@ import {
   type ServerEvent,
   type Session as SessionData,
   type SessionStatus,
+  type SubAgentView,
 } from "@protocol";
 import { now } from "../util/envelope";
+import { SubAgentTracker, type SubAgentSignal } from "../agent/subagents";
 import { killGroup, type Group } from "./procgroup";
 
 /** The session-scoped subset of ServerEvent (carries `sessionId` + `seq`). */
@@ -53,6 +55,10 @@ export class Session {
    *  judge (design D2 — judge evidence, not the last claim). In memory only; a restart drops it,
    *  which is correct: a restored goal is paused until the user prompts again anyway (D5). */
   readonly recentTurns: string[] = [];
+  /** Per-turn sub-agent (`Task`/`Agent`) activity (§sub-agents). In memory only + broadcast on the
+   *  EPHEMERAL live channel (`emitLive`); never seq'd or persisted — the durable per-agent summary
+   *  rides the Task tool.result instead (D5/D10). Reset at the start of each user turn. */
+  readonly subAgents = new SubAgentTracker();
   /** The session's opening user prompt (plain text, trimmed) — the raw brief that reveals the goal,
    *  fed to the branch-kind classifier to prefix the remote branch (arch §8). Captured once, in
    *  memory only; a restart drops it, which is fine (the remote branch is classified & persisted by
@@ -136,6 +142,68 @@ export class Session {
       console.error(`[session ${this.data.id}] persist failed: ${e instanceof Error ? e.message : e}`);
     }
     return event;
+  }
+
+  /** Broadcast an EPHEMERAL, live-only event (§sub-agents, D5/ID5): NO `seq` is minted, nothing is
+   *  appended to the durable log, and `onChange` is NOT marked dirty. It rides `sink()` straight to
+   *  attached clients and vanishes — a reconnect re-derives it from a fresh snapshot (`subAgentActivityEvents`).
+   *  This is what keeps high-frequency sub-agent heartbeats from poisoning the offline resume watermark
+   *  (the seq'd log stays untouched). Distinct from `emit()`, which is the ONLY minter of `seq`. */
+  private emitLive(event: ServerEvent): void {
+    if (this.disposed) return;
+    try {
+      this.sink(this.data.id, event);
+    } catch (e) {
+      console.error(`[session ${this.data.id}] live broadcast failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  /** The current sub-agent set as a live `subagent.activity` event (no seq). */
+  private subAgentActivityEvent(): ServerEvent {
+    return {
+      v: PROTOCOL_VERSION,
+      type: "subagent.activity",
+      ts: now(),
+      sessionId: this.data.id,
+      live: true,
+      agents: this.subAgents.snapshot(),
+    } as ServerEvent;
+  }
+
+  /** Feed the sub-agent tracker the signals from one SDK message; broadcast a fresh snapshot iff a
+   *  STRUCTURAL change occurred (ID11 — elapsed-only refreshes don't broadcast). */
+  applySubAgentSignals(signals: SubAgentSignal[]): void {
+    let changed = false;
+    for (const sig of signals) changed = this.subAgents.apply(sig) || changed;
+    if (changed) this.emitLive(this.subAgentActivityEvent());
+  }
+
+  /** A sub-agent's launching Task tool.result arrived → settle it, broadcast, and return the settled
+   *  view so the driver can stamp it onto the DURABLE tool.result (D10). Undefined if `taskId` isn't a
+   *  tracked sub-agent (an ordinary tool result). */
+  finishSubAgent(taskId: string, isError: boolean, error?: string): SubAgentView | undefined {
+    if (!this.subAgents.isTracked(taskId)) return undefined;
+    const view = this.subAgents.finish(taskId, isError, error);
+    this.emitLive(this.subAgentActivityEvent());
+    return view;
+  }
+
+  /** Turn interrupted/errored → mark every still-running sub-agent canceled and broadcast (D7). */
+  cancelRunningSubAgents(): void {
+    if (this.subAgents.cancelRunning()) this.emitLive(this.subAgentActivityEvent());
+  }
+
+  /** New user turn → clear the prior turn's sub-agents (ID12). No broadcast: the client's own
+   *  new-turn reset (resetActivity) drops the old rows. */
+  resetSubAgents(): void {
+    this.subAgents.reset();
+  }
+
+  /** Re-surfaced on (re)attach so a client that joins mid fan-out immediately sees the running
+   *  sub-agents (D9/ID13) — the live channel is ephemeral, so without this the pane would look frozen
+   *  until the next heartbeat. Empty (no event) when no sub-agents ran this turn. */
+  subAgentActivityEvents(): ServerEvent[] {
+    return this.subAgents.hasAny() ? [this.subAgentActivityEvent()] : [];
   }
 
   /** Append a transcript line for the goal judge, trimming to the cap. Cheap and allocation-free

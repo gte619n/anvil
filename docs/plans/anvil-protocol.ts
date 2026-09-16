@@ -372,7 +372,7 @@ export type ContentBlock =
 export type ConversationEvent =
   | { kind: "user"; ts?: Iso8601; rendered: RenderedMarkdown; attachments: AttachmentRef[] }
   | { kind: "assistant"; ts?: Iso8601; blocks: ContentBlock[] }
-  | { kind: "tool_result"; ts?: Iso8601; toolUseId: ToolUseId; content: string; isError: boolean; images?: ToolResultImage[] }
+  | { kind: "tool_result"; ts?: Iso8601; toolUseId: ToolUseId; content: string; isError: boolean; images?: ToolResultImage[]; subagent?: SubAgentView }
   | { kind: "result"; ts?: Iso8601; stopReason: string; usage: Usage }
   | { kind: "file_offer"; ts?: Iso8601; file: FileOffer };
 
@@ -1169,6 +1169,11 @@ export interface ToolResultEvent extends Envelope, SessionScoped {
   /** Screenshots / images the agent surfaced in this result — persisted as attachments, referenced
    *  by id, and rendered inline as thumbnails that open full-size. Absent when the result is text-only. */
   images?: ToolResultImage[];
+  /** Present ONLY when this tool.result is a sub-agent (`Task`/`Agent`) completing (§sub-agents, D10).
+   *  Carries the settled per-agent summary (final state + step count + label) so the sub-agent row
+   *  survives a page reload / offline replay — the DURABLE counterpart to the ephemeral
+   *  `subagent.activity` live channel. `toolUseId` equals the launching Task tool_use id. */
+  subagent?: SubAgentView;
 }
 export interface PermissionRequestEvent extends Envelope, SessionScoped {
   type: "permission.request";
@@ -1207,6 +1212,48 @@ export interface QuestionResolvedEvent extends Envelope, SessionScoped {
 export interface StatusEvent extends Envelope, SessionScoped {
   type: "status";
   status: SessionStatus;
+}
+
+// ── Sub-agent activity (§sub-agents) ──────────────────────────────────────────────
+// The SDK's `Task`/`Agent` tool fans out sub-agents whose work otherwise renders as a frozen pane.
+// These types surface each running sub-agent: one `SubAgentView` per launching `Task` tool_use.
+
+/** Terminal/running state of one sub-agent, mapped to a distinct icon on the client (D7). */
+export type SubAgentState = "running" | "done" | "error" | "canceled";
+
+/** A single sub-agent's live/settled snapshot. `id` is the launching `Task`/`Agent` tool_use id —
+ *  stable for the sub-agent's life and shared with the durable Task tool.result, so the client can
+ *  anchor the live row to the persisted launch block. */
+export interface SubAgentView {
+  id: ToolUseId;
+  /** Human label — the Task tool's `description` (falls back to `"{type} #{n}"`). (D6) */
+  label: string;
+  /** The `subagent_type` (e.g. "Explore", "general-purpose"), when known. */
+  type?: string;
+  state: SubAgentState;
+  /** Tool calls made so far, INCLUDING rolled-up grandchildren (D12). */
+  steps: number;
+  /** The tool currently executing inside the sub-agent, if any (cleared between steps). */
+  currentTool?: string;
+  /** Secondary detail only — wall-clock so far. Never a predicted finish/ETA (D3). */
+  elapsedSeconds?: number;
+  /** Failure reason, present only when `state === "error"`. */
+  error?: string;
+}
+
+/**
+ * EPHEMERAL live-only broadcast of the current turn's sub-agents (§sub-agents, D5). Carries NO `seq`
+ * and is NEVER persisted or replayed from the durable log — it rides the socket via `Session.emitLive`
+ * straight to attached clients and is re-sent as a full snapshot on attach/reconnect (D9). `live: true`
+ * marks it so a client never advances its resume watermark from it. `agents` is a FULL replace of the
+ * live set (idempotent) — a dropped/late frame self-heals from the next snapshot. The DURABLE record of
+ * an agent's final state travels separately on the Task `tool.result.subagent` field (D10).
+ */
+export interface SubAgentActivityEvent extends Envelope {
+  type: "subagent.activity";
+  sessionId: SessionId;
+  live: true;
+  agents: SubAgentView[];
 }
 export interface UsageEvent extends Envelope, SessionScoped {
   type: "usage";
@@ -1336,6 +1383,7 @@ export type ServerEvent =
   | QuestionRequestEvent
   | QuestionResolvedEvent
   | StatusEvent
+  | SubAgentActivityEvent
   | UsageEvent
   | ResultEvent
   | SessionErrorEvent

@@ -884,6 +884,10 @@ export class Supervisor {
     // attach would otherwise never see them and the session would look stuck. Re-surface all of them
     // (a session can hold several at once, like permissions). (arch §6.6).
     for (const pendingQuestion of s.questionRequestEvents()) events.push(pendingQuestion);
+    // Re-surface the live sub-agent set so a client attaching MID fan-out sees the running sub-agents at
+    // once (§sub-agents, D9/ID13) — the subagent.activity channel is ephemeral (no seq), so without this
+    // a reconnect would show a frozen pane until the next heartbeat. Empty when no sub-agents ran this turn.
+    for (const live of s.subAgentActivityEvents()) events.push(live);
     return events;
   }
 

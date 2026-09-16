@@ -61,6 +61,12 @@ function fakeSession(id: string, claudeSessionId: string | undefined): { session
     },
     requestPermission() {},
     requestQuestion() {},
+    resetSubAgents() {},
+    applySubAgentSignals() {},
+    finishSubAgent() {
+      return undefined;
+    },
+    cancelRunningSubAgents() {},
   } as unknown as Session;
   return { session, emitted, errors };
 }
