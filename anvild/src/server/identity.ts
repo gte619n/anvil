@@ -107,6 +107,11 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   // events for non-attached sessions to a subscribed client so its mirror stays warm live. Gated so an
   // older daemon simply never fans out shadow copies and the client falls back to connect-time prefetch.
   "shadow",
+  // Fleet-concierge repo access (/api/fleet/environments|repo|handoff): this member answers the hub
+  // concierge's read-only repo ops and cross-machine handoffs. The hub probes this off the member's
+  // /api/health before relaying, so a pre-capability member just degrades to "not reachable from the
+  // hub's Claude" instead of a 404.
+  "fleet-repo",
 ];
 
 /** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */

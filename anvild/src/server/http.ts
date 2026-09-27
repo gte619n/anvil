@@ -7,7 +7,8 @@ import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
 import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
-import { ackPair, discoverFleet, invitePeer, peerIPv4, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import type { ConciergeFleetOps } from "../agent/default-tools";
 import {
   DEFAULT_ARM_TTL_MS,
   isLocalNoIdentityCaller,
@@ -219,6 +220,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
   const pairedHub = new PairedHubStore(opts.stateDir);
   const registry = new ConnectionRegistry();
   const push = new PushRegistry();
+  // The concierge's reach into the fleet (anvil-fleet-concierge): the hub's default "Claude" chat
+  // lists/browses member repos and hands work off to sessions ON those members, so ONE chat fronts
+  // every repo in the fleet. Backed by the FleetStore roster + the member's /api/fleet repo surface;
+  // on a member/standalone daemon the roster is empty and the tools stay local-only.
+  const conciergeFleet: ConciergeFleetOps = {
+    self: () => ({ serverId: identity.serverId, serverName: identity.serverName }),
+    members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName })),
+    memberEnvironments: (serverId) => fetchMemberEnvironments(requireFleetMember(serverId), identity.serverId),
+    memberRepo: (serverId, req) => memberRepoOp(requireFleetMember(serverId), { ...req, hubServerId: identity.serverId }),
+    memberHandoff: (serverId, args) => memberHandoff(requireFleetMember(serverId), { ...args, hubServerId: identity.serverId }),
+  };
+  function requireFleetMember(serverId: string): rest.FleetMember {
+    const m = fleet.list().find((x) => x.serverId === serverId);
+    if (!m) throw new Error(`unknown fleet member: ${serverId}`);
+    return m;
+  }
   const supervisor = new Supervisor(
     {
       stateDir: opts.stateDir,
@@ -237,6 +254,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adversarialModels: opts.adversarialModels,
       adversarialProvider: opts.adversarialProvider,
       refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
+      fleet: conciergeFleet,
     },
     registry,
   );
@@ -881,6 +899,67 @@ export function createServer(opts: ServerOptions): ServerHandle {
     if (failure) return Response.json({ ok: false, error: failure }, { status: 400 });
     console.log(`[fleet] token rotated by hub ${hub.hubServerId}`);
     return Response.json({ ok: true, serverId: identity.serverId, serverName: identity.serverName } satisfies rest.FleetPairResponse);
+  });
+
+  // ── Fleet concierge: this member answers the hub concierge's repo calls (capability "fleet-repo",
+  // anvil-fleet-concierge). What makes the HUB's "Claude" chat the whole fleet's front door: the hub
+  // relays list_environments / repo_list / repo_read / repo_grep / create_session here for repos that
+  // live on THIS machine's disk. Repo ops are read-only and scoped under a registered environment's
+  // repoRoot (src/fleet/repo-access.ts); real work arrives as a normal session via /api/fleet/handoff.
+  // Gate = /api/fleet/token's shape minus strict-sameUser: a PROVEN different tailnet user is always
+  // rejected, and the caller must name the hub this member is actually paired to. `unknown` trust is
+  // tolerated (whois momentarily down) like the hub-side fan-out routes, so a flaky whois degrades a
+  // concierge answer instead of intermittently failing it.
+  const fleetRepoGate = async (ctx: ReqCtx, hubServerId: string | null | undefined): Promise<Response | null> => {
+    const who = await ctx.callerIdentity();
+    // Same shape as /api/update/v1/apply: a PROVEN different tailnet user is out; a purely-local
+    // no-identity caller is inside the trust boundary already (see ReqCtx.localNoIdentityCaller).
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const hub = pairedHub.get();
+    if (!hub || !hubServerId || hubServerId !== hub.hubServerId) return Response.json({ ok: false, error: "unknown hub" }, { status: 403 });
+    return null;
+  };
+  route("GET", "/api/fleet/environments", async (_req, url, _m, ctx) => {
+    const gate = await fleetRepoGate(ctx, url.searchParams.get("hub"));
+    if (gate) return gate;
+    return Response.json({
+      ok: true,
+      serverId: identity.serverId,
+      serverName: identity.serverName,
+      environments: supervisor.fleetRepoSurface.environments(),
+    } satisfies rest.FleetEnvironmentsResponse);
+  });
+  route("POST", "/api/fleet/repo", async (req, _url, _m, ctx) => {
+    const body = await jsonBody<rest.FleetRepoRequest>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    if (!body.environmentId || !body.op) return Response.json({ ok: false, error: "environmentId and op required" } satisfies rest.FleetRepoResponse, { status: 400 });
+    // Op-level failures (bad path, escape attempt, binary file) answer 200 + ok:false on purpose:
+    // the hub's transport helper treats a non-2xx as "try the other scheme", and a genuine op error
+    // must not burn a second attempt (or get masked by the fallback's different failure).
+    const r = await supervisor.fleetRepoSurface.repo({ environmentId: body.environmentId, op: body.op, path: body.path, pattern: body.pattern });
+    return Response.json(r satisfies rest.FleetRepoResponse);
+  });
+  route("POST", "/api/fleet/handoff", async (req, _url, _m, ctx) => {
+    const body = await jsonBody<rest.FleetHandoffRequest>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    if (!body.source || !body.title || !body.brief) return Response.json({ ok: false, error: "source, title and brief required" } satisfies rest.FleetHandoffResponse, { status: 400 });
+    try {
+      const r = await supervisor.fleetRepoSurface.handoff({
+        environmentId: body.environmentId,
+        source: body.source,
+        cwd: body.cwd,
+        base: body.base,
+        title: body.title,
+        model: body.model,
+        autonomy: body.autonomy,
+        brief: body.brief,
+      });
+      return Response.json({ ok: true, ...r } satisfies rest.FleetHandoffResponse);
+    } catch (e) {
+      return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies rest.FleetHandoffResponse, { status: 400 });
+    }
   });
 
   // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token

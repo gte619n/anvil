@@ -1,6 +1,9 @@
 import type { rest } from "@protocol";
 import { tailnetIPv4 } from "../config";
 
+// (fleet-concierge helpers live at the bottom of this file — hub-side clients for the member's
+// /api/fleet/environments|repo|handoff surface, transport-resilient via memberBases.)
+
 /**
  * Fleet discovery (anvil-multi-server.md §4.1). The tailnet already knows every device, so we
  * enumerate Tailscale peers (`tailscale status --json`) and probe each one's `/api/health`; any
@@ -725,4 +728,67 @@ export async function rotateToken(opts: {
       return { host: m.host, ok: r.ok, error: r.error, ...(sendsRoster && r.ok ? { accountsRev: opts.accounts!.rev } : {}) };
     }),
   );
+}
+
+// ── Fleet concierge: hub-side clients for a member's repo-access surface ─────────────────────────
+// What lets the HUB's default "Claude" chat be the fleet's single front door (see the concierge
+// tools in src/agent/default-tools.ts): each helper POSTs/GETs a member's /api/fleet/* repo surface,
+// trying https-then-http exactly like propagateTodoist so a stale stored scheme self-corrects.
+// Failures come back as `{ ok:false, error }`, never a throw — the concierge tool relays the message.
+
+/** The slice of a FleetMember these calls need (url for transport, host for the scheme fallback). */
+export interface ConciergeMemberTarget {
+  url: string;
+  host?: string;
+}
+
+async function memberApi<T extends { ok?: boolean; error?: string }>(
+  m: ConciergeMemberTarget,
+  path: string,
+  init: { method: string; body?: string },
+  timeoutMs: number,
+  fetchImpl?: typeof fetch,
+): Promise<T | { ok: false; error: string }> {
+  const doFetch = fetchImpl ?? fetch;
+  let lastError = "no reachable transport";
+  for (const base of memberBases(m)) {
+    try {
+      const res = await doFetch(`${base}${path}`, {
+        method: init.method,
+        ...(init.body !== undefined ? { headers: { "content-type": "application/json" }, body: init.body } : {}),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const data = (await res.json().catch(() => ({}))) as T;
+      if (res.ok) return data;
+      // A 404 on this path = a pre-"fleet-repo" member; say so instead of parroting "HTTP 404".
+      lastError = data.error ?? (res.status === 404 ? "this member's Anvil predates fleet repo access — update it" : `HTTP ${res.status}`);
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+/** GET a member's registered environments (its project repos). */
+export async function fetchMemberEnvironments(
+  m: ConciergeMemberTarget,
+  hubServerId: string,
+  fetchImpl?: typeof fetch,
+): Promise<rest.FleetEnvironmentsResponse> {
+  const r = await memberApi<rest.FleetEnvironmentsResponse>(m, `/api/fleet/environments?hub=${encodeURIComponent(hubServerId)}`, { method: "GET" }, 8_000, fetchImpl);
+  return { ...r, ok: r.ok === true }; // a garbled body parses to {} — normalize to a failed result
+}
+
+/** Run one read-only repo op (list/read/grep) inside a member environment's repoRoot. */
+export async function memberRepoOp(m: ConciergeMemberTarget, body: rest.FleetRepoRequest, fetchImpl?: typeof fetch): Promise<rest.FleetRepoResponse> {
+  // 20s: comfortably past the member's own 15s grep backstop, so its error text wins over a timeout.
+  const r = await memberApi<rest.FleetRepoResponse>(m, "/api/fleet/repo", { method: "POST", body: JSON.stringify(body) }, 20_000, fetchImpl);
+  return { ...r, ok: r.ok === true }; // a garbled body parses to {} — normalize to a failed result
+}
+
+/** Create + start a session ON the member — the concierge's cross-machine handoff. */
+export async function memberHandoff(m: ConciergeMemberTarget, body: rest.FleetHandoffRequest, fetchImpl?: typeof fetch): Promise<rest.FleetHandoffResponse> {
+  // Generous: a fresh-worktree create runs real git ops on the member before the id comes back.
+  const r = await memberApi<rest.FleetHandoffResponse>(m, "/api/fleet/handoff", { method: "POST", body: JSON.stringify(body) }, 60_000, fetchImpl);
+  return { ...r, ok: r.ok === true }; // a garbled body parses to {} — normalize to a failed result
 }

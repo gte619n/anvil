@@ -2395,4 +2395,57 @@ export namespace rest {
     behind?: number;
     willRestart?: boolean;
   }
+
+  // ── Fleet concierge: hub → member repo access (capability "fleet-repo") ─────────────────────────
+  // The hub's default "Claude" chat is the fleet's single front door, but a repo registered on a
+  // member exists only on that member's disk. These endpoints are what the hub's concierge tools
+  // call so ONE chat can browse every repo in the fleet: list a member's environments, run a
+  // read-only repo op there, or hand real work off to a session created ON the member. All three
+  // are gated like /api/fleet/token: never a provably-different tailnet user, and the caller's
+  // hubServerId must match the hub this member is paired to.
+
+  /** GET /api/fleet/environments?hub=<hubServerId> → this member's registered environments. */
+  export interface FleetEnvironmentsResponse {
+    ok: boolean;
+    serverId?: string; // echoed so the hub can heal a stale fleet record off the same call
+    serverName?: string;
+    environments?: Environment[];
+    error?: string;
+  }
+  /** POST /api/fleet/repo → one read-only op inside a registered environment's repoRoot. */
+  export interface FleetRepoRequest {
+    hubServerId: string;
+    environmentId: string;
+    op: "list" | "read" | "grep";
+    path?: string; // repo-relative: dir to list, file to read, or subtree to grep
+    pattern?: string; // ERE, grep only
+  }
+  export interface FleetRepoResponse {
+    ok: boolean;
+    error?: string;
+    entries?: { name: string; kind: "dir" | "file" | "symlink" | "other"; size?: number }[]; // list
+    text?: string; // read
+    matches?: string[]; // grep — file:line:text
+    truncated?: boolean; // a cap (entries/bytes/lines) trimmed the result
+  }
+  /** POST /api/fleet/handoff → create a session on THIS member and start it on a brief — the
+   *  cross-machine twin of the concierge's local create_session handoff. */
+  export interface FleetHandoffRequest {
+    hubServerId: string;
+    environmentId?: string;
+    source: SessionSource;
+    cwd?: string;
+    base?: string;
+    title: string;
+    model?: Model;
+    autonomy?: AutonomyPolicy;
+    brief: string;
+  }
+  export interface FleetHandoffResponse {
+    ok: boolean;
+    id?: string;
+    title?: string;
+    cwd?: string;
+    error?: string;
+  }
 }
