@@ -239,9 +239,17 @@ is where the worktree branches from. Environments are managed from the client (`
 
 The daemon also keeps one persistent **concierge** session — a pinned, whole-fleet chat that
 never dies. It has a small in-process tool surface (`list_sessions`, `get_session`,
-`list_environments`, `create_session`) so you can ask it about work in flight anywhere and
-have it hand off a fresh worktree session. `session.new_topic` gives it a clean Claude context
-while keeping the visible scrollback.
+`list_environments`, `create_session`, `repo_list`, `repo_read`, `repo_grep`) so you can ask
+it about work in flight anywhere and have it hand off a fresh worktree session.
+`session.new_topic` gives it a clean Claude context while keeping the visible scrollback.
+
+On a hub, the concierge's reach is the **whole fleet**, not just its own disk: members expose a
+read-only repo surface (`/api/fleet/environments`, `/api/fleet/repo`, `/api/fleet/handoff` —
+capability `"fleet-repo"`, gated like token rotation), and the hub's concierge tools route by
+which machine owns the environment. `list_environments` aggregates every machine's repos, the
+`repo_*` tools browse/search a member-hosted repo from the hub chat, and `create_session`
+creates the session ON the member that has the checkout — so one Claude fronts every repo in
+the fleet while real work still runs where the repo lives.
 
 ---
 

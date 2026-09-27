@@ -67,7 +67,8 @@ import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWork
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
-import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS } from "../agent/default-tools";
+import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS, type ConciergeFleetOps } from "../agent/default-tools";
+import { repoOp, type RepoRequest, type RepoResult } from "../fleet/repo-access";
 import { TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
 import { MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
 import { PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
@@ -160,6 +161,10 @@ export interface SupervisorConfig {
   adversarialModels?: string[];
   /** Preferred OpenRouter provider slug for the panel (see `Config.adversarialProvider`). */
   adversarialProvider?: string;
+  /** The concierge's reach into the fleet (anvil-fleet-concierge): member roster + REST-backed
+   *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
+   *  omitted in unit tests and the concierge degrades to this machine only. */
+  fleet?: ConciergeFleetOps;
 }
 
 /**
@@ -204,13 +209,31 @@ export class Supervisor {
     return this.agentEnv(s, { requireToken: false });
   }
   /** In-process MCP tools for the concierge chat (§0.6). The handlers are lazy closures over `this`,
-   *  so this initializer is safe even though `envStore` is assigned in the constructor body. */
+   *  so this initializer is safe even though `envStore` (and `fleetOps`) are assigned in the
+   *  constructor body. */
   private readonly defaultToolsServer = buildDefaultToolsServer({
     listSessions: () => this.list(),
     getSession: (id) => this.sessions.get(id)?.data,
     listEnvironments: () => this.envStore.list(),
+    localRepo: (req) => this.localRepoOp(req),
+    fleet: () => this.fleetOps,
     handoff: (a) => this.handoffCreate(a),
   });
+  /** The concierge's fleet reach (anvil-fleet-concierge) — undefined off-hub / in unit tests. */
+  private fleetOps?: ConciergeFleetOps;
+  /** One read-only repo op inside a LOCAL environment's repoRoot — the concierge's own-machine half
+   *  of repo_list/repo_read/repo_grep, and what a member serves the hub via /api/fleet/repo. */
+  private async localRepoOp(req: RepoRequest & { environmentId: string }): Promise<RepoResult> {
+    const env = this.envStore.get(req.environmentId);
+    if (!env) return { ok: false, error: `no such environment: ${req.environmentId}` };
+    return repoOp(env.repoRoot, req);
+  }
+  /** Member-side handlers for the hub concierge's /api/fleet repo surface (http.ts routes). */
+  readonly fleetRepoSurface = {
+    environments: (): Environment[] => this.envStore.list(),
+    repo: (req: RepoRequest & { environmentId: string }): Promise<RepoResult> => this.localRepoOp(req),
+    handoff: (a: { environmentId?: string; source: SessionSource; cwd?: string; base?: string; title: string; model?: Model; autonomy?: AutonomyPolicy; brief: string }): Promise<{ id: string; title: string; cwd: string }> => this.handoffCreate(a),
+  };
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
@@ -271,6 +294,7 @@ export class Supervisor {
     this.pairedHub = cfg.pairedHub;
     this.onRosterChanged = cfg.onRosterChanged;
     this.envFile = cfg.envFile;
+    this.fleetOps = cfg.fleet;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
     // stateDir is known. The push registries aren't constructed yet, so notify lazily through `this`.
     (this as { authDegrade: AuthDegradeTracker }).authDegrade = new AuthDegradeTracker(cfg.stateDir, (marker) =>
