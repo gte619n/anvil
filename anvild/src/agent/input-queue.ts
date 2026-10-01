@@ -40,8 +40,8 @@ export interface InlineAttachment {
   data: string; // base64
 }
 
-/** Largest text file we inline into the prompt (bytes). Bigger files would blow the context. */
-const MAX_INLINE_TEXT = 256 * 1024;
+/** Largest text file we inline into the prompt (bytes). Bigger files get truncated with a note. */
+const MAX_INLINE_TEXT = 2 * 1024 * 1024;
 
 /** Heuristic: bytes are "text" if they decode as UTF-8 with no NUL bytes. */
 function looksTextual(mediaType: string, buf: Buffer): boolean {
