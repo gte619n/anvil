@@ -131,3 +131,17 @@ test("permission and question cards carry role=alert", () => {
   expect(q!.getAttribute("role")).toBe("alert");
   dialogs.resolveQuestionUI("q1", "A");
 });
+
+test("showQuestion parks the scroll lock at the card top; answering restores follow-the-bottom", async () => {
+  // The card pins its TOP into view, but stickToBottom is only cleared by the pane's scroll
+  // listener on the NEXT frame — events in the same batch (the tool_use commit, re-attach
+  // subagent.activity) call scrollDown() before then and would slam the pane back to the bottom.
+  // showQuestion must drop the lock itself; a local answer/skip re-pins it.
+  const { ui } = await import("../../web/src/state");
+  ui.stickToBottom = true;
+  dialogs.showQuestion("q-scroll", [{ question: "Pick one", options: [{ label: "A" }, { label: "B" }] }] as unknown as Question[]);
+  expect(ui.stickToBottom).toBe(false);
+  // One-tap answer (single single-select question): choosing an option resumes the turn.
+  document.querySelector<HTMLButtonElement>('.bubble.question[data-req="q-scroll"] .q-option')!.click();
+  expect(ui.stickToBottom).toBe(true);
+});
