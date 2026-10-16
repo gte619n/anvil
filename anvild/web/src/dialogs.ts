@@ -848,6 +848,7 @@ export function showQuestion(requestId: string, questions: Question[]): void {
     // Resolve the card and surface "Working" up front so the tap feels instant — the turn
     // resumes on the daemon's next event. The send happens after (and is queued if we're offline).
     resolveQuestionUI(requestId, summarizeAnswers(answers));
+    ui.stickToBottom = true; // answering un-parks the view — follow the resuming turn again
     showThinking("running_tool");
     respondToQuestion({ type: "question.respond", requestId, answers });
   };
@@ -912,6 +913,7 @@ export function showQuestion(requestId: string, questions: Question[]): void {
   skip.textContent = "Skip";
   skip.onclick = () => {
     resolveQuestionUI(requestId, "Skipped");
+    ui.stickToBottom = true; // skipping un-parks the view — follow the resuming turn again
     showThinking("running_tool");
     respondToQuestion({ type: "question.respond", requestId, answers: [], cancelled: true });
   };
@@ -929,6 +931,12 @@ export function showQuestion(requestId: string, questions: Question[]): void {
   conversation.appendChild(card);
   // Bring the *top* of the question block to the top of the view (not the bottom) so a tall
   // multi-question block starts at its first question instead of scrolling past the title.
+  // Drop the scroll lock FIRST: stickToBottom is normally cleared by the pane's scroll listener,
+  // but that only fires on the next render frame — events landing in the same batch right after
+  // this one (the late-rendered assistant.message carrying the AskUserQuestion tool_use, or the
+  // subagent.activity re-surfaced after the question on re-attach) call scrollDown() before the
+  // listener runs and would yank the pane back to the bottom (why the #149 fix alone didn't hold).
+  ui.stickToBottom = false;
   card.scrollIntoView({ block: "start" });
 }
 
