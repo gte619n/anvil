@@ -188,6 +188,8 @@ class MainActivity : ComponentActivity() {
             Net.postJson(BuildConfig.ANVIL_BASE_URL, "/api/push/fcm/register", JSONObject().put("token", token))
         }
 
+        maybeAutoAdb() // silent ADB reconnect if the user has opted in (pinned port survives until reboot)
+
         if (savedInstanceState != null) {
             web.restoreState(savedInstanceState)
         } else {
@@ -284,7 +286,43 @@ class MainActivity : ComponentActivity() {
                     onError = { msg -> replyBridge(reply, false, msg, "pair") },
                 )
             }
+            "adb.auto" -> {
+                val host = tailscaleIp()
+                if (host == null) replyBridge(reply, false, "Tailscale isn't up on this phone — connect to your tailnet, then retry.", "auto")
+                else adbAuto(host, reply)
+            }
+            "adb.disconnect" -> {
+                val body = JSONObject().apply { tailscaleIp()?.let { put("host", it) } }
+                postJson("/api/adb/disconnect", body) { ok, out -> replyBridge(reply, ok, out.ifBlank { "Disconnected" }, "disconnect") }
+            }
             else -> replyBridge(reply, false, "Unknown native command", "")
+        }
+    }
+
+    /** One-tap connect. Try the fast path first (the daemon reaches us on the pinned port with no
+     *  phone-side action); only if that misses do we discover the current wireless-debugging port and
+     *  let the daemon bootstrap the pin (which shows a one-time "Allow debugging?" prompt). On success
+     *  we remember opt-in so every later launch can silently reconnect — see [maybeAutoAdb]. */
+    private fun adbAuto(host: String, reply: JavaScriptReplyProxy) {
+        postAdbAuto(host, null) { ok, out ->
+            if (ok) {
+                prefs().edit().putBoolean(PREF_ADB_AUTO, true).apply()
+                replyBridge(reply, true, out.ifBlank { "Connected $host:5555" }, "auto") // daemon summary (pin/auth state)
+            } else runOnUiThread {
+                // Not pinned yet — discover the current wireless-debugging port and let the daemon
+                // bootstrap the pin. discover() drives NsdManager, so keep it on the UI thread (this
+                // callback arrives on a background HTTP thread).
+                adbWifi.discover(
+                    AdbWifi.CONNECT,
+                    onResult = { _, port ->
+                        postAdbAuto(host, port) { ok2, out2 ->
+                            if (ok2) prefs().edit().putBoolean(PREF_ADB_AUTO, true).apply()
+                            replyBridge(reply, ok2, out2.ifBlank { if (ok2) "Connected $host:5555" else "Couldn't reach $host" }, "auto")
+                        }
+                    },
+                    onError = { msg -> replyBridge(reply, false, msg, "auto") },
+                )
+            }
         }
     }
 
@@ -301,6 +339,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun postAdb(path: String, body: JSONObject, reply: JavaScriptReplyProxy, stage: String, host: String, port: Int) {
+        postJson(path, body) { ok, out ->
+            val verb = if (stage == "pair") "Paired" else "Connected"
+            replyBridge(reply, ok, if (ok) "$verb $host:$port — $out" else "$host:$port → $out", stage)
+        }
+    }
+
+    private fun postAdbAuto(host: String, port: Int?, cb: (ok: Boolean, output: String) -> Unit) {
+        val body = JSONObject().put("host", host)
+        if (port != null) body.put("port", port)
+        postJson("/api/adb/auto", body, cb)
+    }
+
+    /** POST `body` to the daemon and hand the `{ok, output}` result to `cb` (off the UI thread). The
+     *  bootstrap pin chains several adb calls server-side, so the read timeout is generous. */
+    private fun postJson(path: String, body: JSONObject, cb: (ok: Boolean, output: String) -> Unit) {
         Thread {
             try {
                 val base = BuildConfig.ANVIL_BASE_URL.trimEnd('/')
@@ -308,7 +361,7 @@ class MainActivity : ComponentActivity() {
                     requestMethod = "POST"
                     doOutput = true
                     connectTimeout = 8_000
-                    readTimeout = 20_000
+                    readTimeout = 45_000
                     setRequestProperty("Content-Type", "application/json")
                 }
                 conn.outputStream.use { it.write(body.toString().toByteArray()) }
@@ -317,12 +370,23 @@ class MainActivity : ComponentActivity() {
                 val parsed = runCatching { JSONObject(resp) }.getOrNull()
                 val out = parsed?.optString("output", resp) ?: resp
                 val ok = code in 200..299 && (parsed?.optBoolean("ok") ?: false)
-                val verb = if (stage == "pair") "Paired" else "Connected"
-                replyBridge(reply, ok, if (ok) "$verb $host:$port — $out" else "$host:$port → $out", stage)
+                cb(ok, out)
             } catch (e: Exception) {
-                replyBridge(reply, false, "Couldn't reach the server: ${e.message}", stage)
+                cb(false, "Couldn't reach the server: ${e.message}")
             }
         }.start()
+    }
+
+    private fun prefs() = getSharedPreferences("anvil.adb", MODE_PRIVATE)
+
+    /** Silent fast-path reconnect on launch: once the user has set up ADB auto-connect (the pin
+     *  survives on the phone until reboot, and the Mac stays RSA-trusted), the daemon can reach the
+     *  phone again with no prompt. No discovery, no toast — bootstrapping the pin is the explicit
+     *  "Auto-connect" button in settings, never fired silently. */
+    private fun maybeAutoAdb() {
+        if (!prefs().getBoolean(PREF_ADB_AUTO, false)) return
+        val host = tailscaleIp() ?: return
+        postAdbAuto(host, null) { _, _ -> /* silent: a miss just means "not reconnected yet" */ }
     }
 
     private fun replyBridge(reply: JavaScriptReplyProxy, ok: Boolean, message: String, stage: String) {
@@ -336,6 +400,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val ASSET_HOST = "appassets.androidplatform.net" // WebViewAssetLoader's secure origin
         const val APP_URL = "https://$ASSET_HOST/index.html"
+        const val PREF_ADB_AUTO = "adbAutoConnect" // set once the user succeeds at ADB auto-connect
     }
 }
 

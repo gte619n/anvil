@@ -1030,18 +1030,30 @@ export function renderServerCards(): void {
       "beforeend",
       `<div class="card"><div class="card-main">${icon("smartphone")} <b>This phone (ADB over wifi)</b></div>
       <div class="small muted" id="adb-info">Loading device info…</div>
-      <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-connect">${icon("wifi")} Connect</button></div>
-      <hr />
-      <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
-      <div class="git-row" style="margin-top:8px">
-        <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
-        <button id="adb-pair">${icon("link")} Pair this Mac</button>
+      <div class="git-row" style="margin-top:10px" id="adb-install-row" hidden><button class="primary" id="adb-install">${icon("download")} Install platform-tools on server</button></div>
+      <div id="adb-controls">
+        <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-auto">${icon("wifi")} Auto-connect</button><button id="adb-connect">${icon("wifi")} Connect once</button><button id="adb-disconnect">${icon("wifi_off")} Disconnect</button></div>
+        <div class="small muted" style="margin-top:6px">Auto-connect pins debugging to a stable port, so every later launch reconnects on its own (until the phone reboots). Approve the one-time “Allow debugging?” prompt on the phone the first time.</div>
+        <hr />
+        <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
+        <div class="git-row" style="margin-top:8px">
+          <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
+          <button id="adb-pair">${icon("link")} Pair this Mac</button>
+        </div>
       </div>
       <pre class="git-output" id="adb-output"></pre></div>`,
     );
+    $("#adb-auto").addEventListener("click", () => {
+      setOut("Connecting… (first time: approve the “Allow debugging?” prompt on the phone)");
+      bridge.postMessage(JSON.stringify({ type: "adb.auto" }));
+    });
     $("#adb-connect").addEventListener("click", () => {
       setOut("Discovering phone…");
       bridge.postMessage(JSON.stringify({ type: "adb.connect" }));
+    });
+    $("#adb-disconnect").addEventListener("click", () => {
+      setOut("Disconnecting…");
+      bridge.postMessage(JSON.stringify({ type: "adb.disconnect" }));
     });
     $("#adb-pair").addEventListener("click", () => {
       const code = $<HTMLInputElement>("#adb-pair-code").value.trim();
@@ -1052,15 +1064,46 @@ export function renderServerCards(): void {
       setOut("Pairing… (keep the pairing dialog open on the phone)");
       bridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
     });
-    void apiFetch("/api/adb/info")
-      .then((r) => r.json())
-      .then((d: { serverIps?: string[]; devices?: string }) => {
-        const el = document.getElementById("adb-info");
-        if (!el) return;
-        const devs = (d.devices ?? "").split("\n").filter((l) => l.trim() && !/list of devices/i.test(l));
-        el.innerHTML = `Mac IP: <code>${esc((d.serverIps ?? []).join(", ") || "?")}</code> — uses Tailscale when both are on your tailnet (works across networks); else same LAN.<br/>adb devices: <code>${esc(devs.length ? devs.join("; ") : "none connected")}</code>`;
-      })
-      .catch(() => {});
+    // Probe the server for adb; swap the connect UI for an install prompt when it's missing. Re-run
+    // after a successful install so the connect controls appear without a settings reopen.
+    const loadAdbInfo = (): void => {
+      void apiFetch("/api/adb/info")
+        .then((r) => r.json())
+        .then((d: { serverIps?: string[]; devices?: string; adbInstalled?: boolean }) => {
+          const el = document.getElementById("adb-info");
+          if (!el) return;
+          const controls = document.getElementById("adb-controls");
+          const installRow = document.getElementById("adb-install-row");
+          if (d.adbInstalled === false) {
+            el.innerHTML = `⚠ <b>adb isn't installed on the server.</b> Anvil can fetch Google's official Android platform-tools (~15&nbsp;MB) into <code>~/.anvil/platform-tools</code> — no admin rights needed.`;
+            if (controls) controls.hidden = true;
+            if (installRow) installRow.hidden = false;
+            return;
+          }
+          if (controls) controls.hidden = false;
+          if (installRow) installRow.hidden = true;
+          const devs = (d.devices ?? "").split("\n").filter((l) => l.trim() && !/list of devices/i.test(l));
+          el.innerHTML = `Mac IP: <code>${esc((d.serverIps ?? []).join(", ") || "?")}</code> — uses Tailscale when both are on your tailnet (works across networks); else same LAN.<br/>adb devices: <code>${esc(devs.length ? devs.join("; ") : "none connected")}</code>`;
+        })
+        .catch(() => {});
+    };
+    $("#adb-install").addEventListener("click", () => {
+      const btn = $<HTMLButtonElement>("#adb-install");
+      btn.disabled = true;
+      setOut("Installing Android platform-tools on the server… downloading ~15 MB, this can take a moment.");
+      void apiFetch("/api/adb/install", { method: "POST" })
+        .then((r) => r.json())
+        .then((r: { ok?: boolean; output?: string }) => {
+          setOut(`${r.ok ? "✓ " : "⚠ "}${r.output ?? ""}`);
+          btn.disabled = false;
+          if (r.ok) loadAdbInfo(); // adb present now — reveal the connect controls
+        })
+        .catch((e) => {
+          setOut(`Install failed: ${String(e)}`);
+          btn.disabled = false;
+        });
+    });
+    loadAdbInfo();
   }
 }
 // (Fleet administration + pinned fleet-update rollout moved to fleet.ts — P7 decomposition.)
