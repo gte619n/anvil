@@ -2,7 +2,7 @@
  * Git / gh operations on a session worktree (arch §8). All shell out and return combined
  * stdout+stderr so the UI can show exactly what happened. PR ops use the `gh` CLI.
  */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { CLONE_TIMEOUT_MS, GIT_ENV, gitSpawn, gitSpawnAsync, LOCAL_TIMEOUT_MS, NET_TIMEOUT_MS } from "./spawn";
 
@@ -55,6 +55,29 @@ export function assertSafeCloneUrl(url: string): void {
   throw new Error(`unsupported git URL scheme (use https://, ssh://, or user@host:path): ${url}`);
 }
 
+// Pull host + repo path out of an http(s) web/clone URL. Captures an optional `user[:pass]@` prefix
+// (dropped — SSH auth is by key, not the pasted token), an optional `:port`, and the remaining path.
+const HTTPS_HOST_PATH = /^https?:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/i;
+
+/**
+ * Normalize any pasted git URL to the scp-style SSH form `git@host:path.git`, so a GitHub/GitLab web
+ * URL (or an https clone URL) clones over SSH using the host's keys — what the user wants when they
+ * paste `https://github.com/owner/repo` and expect `git@github.com:owner/repo.git`. Only http(s) is
+ * rewritten; `ssh://` and scp-form URLs already clone over SSH and are returned unchanged, as is any
+ * string we can't parse into host+path (the caller's `assertSafeCloneUrl` guard still vets the raw
+ * input first). The repo path is preserved whole — including GitLab subgroups (`group/sub/repo`) —
+ * with any `.git` suffix and trailing slashes stripped before re-appending a single `.git`.
+ */
+export function toSshCloneUrl(url: string): string {
+  const u = url.trim();
+  const m = u.match(HTTPS_HOST_PATH);
+  if (!m) return u;
+  const host = m[1];
+  const path = m[2]?.replace(/\/+$/, "").replace(/\.git$/i, "");
+  if (!host || !path) return u;
+  return `git@${host}:${path}.git`;
+}
+
 /**
  * Clone `url` into `<parent>/<repo-name>` using the host's git auth (SSH keys,
  * credential helpers). `parent` is caller-supplied (configurable; see `Config.clonesDir`) so the
@@ -62,9 +85,13 @@ export function assertSafeCloneUrl(url: string): void {
  * URL, an existing destination, or a git failure (message carries git's combined output for the UI).
  */
 export function cloneRepo(url: string, parent: string): { dest: string; output: string } {
-  assertSafeCloneUrl(url); // [SEC-H5] before any name derivation / mkdir / spawn
-  const trimmed = url.trim();
-  const name = repoNameFromUrl(trimmed);
+  assertSafeCloneUrl(url); // [SEC-H5] vet the RAW input before any rewrite / name derivation / spawn
+  const raw = url.trim();
+  // Prefer SSH: an https/web URL is rewritten to `git@host:path.git` so the clone uses the host's SSH
+  // keys. The rewrite's output is derived from the already-vetted input via a strict host/path regex,
+  // so it can't reintroduce option-injection or remote-helper syntax.
+  const sshUrl = toSshCloneUrl(raw);
+  const name = repoNameFromUrl(sshUrl);
   if (!name) throw new Error(`could not derive a repo name from URL: ${url}`);
   const dest = join(parent, name);
   if (existsSync(dest)) {
@@ -73,7 +100,16 @@ export function cloneRepo(url: string, parent: string): { dest: string; output: 
   mkdirSync(parent, { recursive: true });
   // `-c protocol.ext.allow=never` neutralizes the ext remote helper even if the allowlist is ever
   // loosened; `--` stops any dash-leading value from being read as an option.
-  const r = run(["git", "-c", "protocol.ext.allow=never", "clone", "--", trimmed, dest], parent, CLONE_TIMEOUT_MS);
+  const clone = (target: string) =>
+    run(["git", "-c", "protocol.ext.allow=never", "clone", "--", target, dest], parent, CLONE_TIMEOUT_MS);
+  let r = clone(sshUrl);
+  // SSH failed (commonly: no SSH key for this host) and we had rewritten an https/web URL — fall back
+  // to the original URL so https (credential-helper/token or anonymous) still works. Clear any partial
+  // checkout the aborted attempt left behind first so the retry starts clean.
+  if (r.code !== 0 && sshUrl !== raw) {
+    if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
+    r = clone(raw);
+  }
   if (r.code !== 0) {
     throw new Error(`git clone failed: ${r.out || `exit ${r.code}`}`);
   }
