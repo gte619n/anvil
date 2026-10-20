@@ -604,8 +604,8 @@ export function showAddEnvironment(): void {
   m.className = "modal";
   m.innerHTML = `<div class="modal-box"><h3>Add environment</h3>
     ${serverPickerMarkup()}
-    <label>Clone from URL<input id="ae-url" placeholder="e.g. git@github.com:owner/repo.git" /></label>
-    <p class="small muted">Cloned into <code>~/Development/&lt;repo&gt;</code> using this machine's git/SSH credentials. Leave blank to use an existing local repo instead.</p>
+    <label>Clone from URL<input id="ae-url" placeholder="e.g. https://github.com/owner/repo or git@github.com:owner/repo.git" /></label>
+    <p class="small muted">Paste an https, ssh, or repo web URL — Anvil clones over SSH using this machine's keys, falling back to https if SSH isn't set up. Cloned into <code>~/Development/&lt;repo&gt;</code>. Leave blank to use an existing local repo instead.</p>
     <label>Name (optional)<input id="ae-name" placeholder="defaults to the repo name" /></label>
     <label>Default branch (optional)<input id="ae-base" placeholder="e.g. main or dev — leave blank for HEAD" /></label>
     ${swatchPickerMarkup()}
