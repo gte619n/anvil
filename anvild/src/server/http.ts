@@ -36,6 +36,7 @@ import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
+import { adbAuto, adbDisconnect, adbTarget, connectedOk, findAdb, installPlatformTools, runAdb } from "./adb";
 import { VERSION } from "../version";
 
 export { VERSION };
@@ -75,32 +76,6 @@ function lanIPv4(): string[] {
     for (const a of addrs ?? []) if (a.family === "IPv4" && !a.internal) out.push(a.address);
   }
   return out;
-}
-const adbTarget = (host: string, port: number): string => (host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`);
-
-// [BE-14] adb connect/pair reach out over the network and can hang for seconds. Run async with a
-// timeout so an ADB call can't freeze the single-threaded daemon (and every other client) — the old
-// Bun.spawnSync blocked the whole event loop for the call's duration.
-const ADB_TIMEOUT_MS = 15_000;
-
-/** Run `adb` (from PATH or the common SDK locations); returns its combined output. */
-async function runAdb(args: string[]): Promise<{ ok: boolean; output: string }> {
-  const home = process.env.HOME ?? "";
-  const candidates = ["adb", "/opt/homebrew/bin/adb", "/usr/local/bin/adb", join(home, "Library/Android/sdk/platform-tools/adb"), join(home, "Android/Sdk/platform-tools/adb")];
-  for (const adb of candidates) {
-    try {
-      // A missing binary throws synchronously (ENOENT) → try the next path. A present-but-slow adb is
-      // killed by the timeout signal; its reads still resolve with whatever it emitted (ok=false).
-      const p = Bun.spawn([adb, ...args], { stdout: "pipe", stderr: "pipe", signal: AbortSignal.timeout(ADB_TIMEOUT_MS) });
-      const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
-      await p.exited;
-      const output = `${out}${err}`.trim();
-      return { ok: /connected to/i.test(output) && !/failed|cannot|unable/i.test(output), output: output || "(no output)" };
-    } catch {
-      /* not at this path — try the next */
-    }
-  }
-  return { ok: false, output: "adb not found on the server (install Android platform-tools)" };
 }
 
 /**
@@ -1048,13 +1023,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
   });
 
   // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint
-  route("GET", "/api/adb/info", async () => Response.json({ serverIps: lanIPv4(), devices: (await runAdb(["devices", "-l"])).output }));
+  route("GET", "/api/adb/info", async () => {
+    const adb = findAdb();
+    return Response.json({
+      serverIps: lanIPv4(),
+      adbInstalled: !!adb,
+      ...(adb ? { adbPath: adb } : {}),
+      devices: adb ? (await runAdb(["devices", "-l"])).output : "",
+    });
+  });
+  // Install platform-tools on the server (headless-friendly): downloads Google's official zip.
+  route("POST", "/api/adb/install", async () => Response.json(await installPlatformTools()));
   route(
     "POST",
     "/api/adb/connect",
     withJsonBody<{ host?: string; port?: number }>(async ({ host, port }) => {
       if (!host || !port) return new Response("host and port required", { status: 400 });
-      return Response.json(await runAdb(["connect", adbTarget(host, port)]));
+      const r = await runAdb(["connect", adbTarget(host, port)]); // adb connect exits 0 even on failure
+      return Response.json({ ok: connectedOk(r.output), output: r.output });
     }),
   );
   route(
@@ -1065,6 +1051,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
       const r = await runAdb(["pair", adbTarget(host, port), String(code)]);
       return Response.json({ ok: /success/i.test(r.output), output: r.output });
     }),
+  );
+  // One-tap auto-connect: reach the phone on its pinned port, bootstrapping the pin from a
+  // freshly-discovered wireless-debugging port when `port` is supplied (see adbAuto).
+  route(
+    "POST",
+    "/api/adb/auto",
+    withJsonBody<{ host?: string; port?: number }>(async ({ host, port }) => {
+      if (!host) return new Response("host required", { status: 400 });
+      return Response.json(await adbAuto(host, port));
+    }),
+  );
+  // Drop the connection (clean reset). `host` targets the pinned port; omit it to disconnect all.
+  route(
+    "POST",
+    "/api/adb/disconnect",
+    withJsonBody<{ host?: string }>(async ({ host }) => Response.json(await adbDisconnect(host))),
   );
 
   // Daemon self-update (arch §5): GET checks whether an update is available; POST applies it
