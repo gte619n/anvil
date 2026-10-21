@@ -91,23 +91,22 @@ each device pairs with the hub once, and the whole fleet inherits it the same wa
 
 `adb connect` state lives only in a machine's adb-server process (`127.0.0.1:5037`), and only while the
 link holds. A build/debug **session** (an agent) on a machine shares that adb server, so once the
-machine is connected the session sees the phone — the job is keeping each machine connected without the
-phone, whose app only ever re-dials the hub. So each daemon:
+machine is connected the session sees the phone — and both apps on the phone at once, since a device
+hosts many packages (`adb install com.appA` / `com.appB` coexist with no `-s` needed while it's the
+only device attached).
+
+**Connection is manual, by design.** Nothing re-dials in the background. Each daemon:
 
 - **remembers** the last phone it reached (`<stateDir>/adb-device.json`), written on every connect and
-  on a key-push that carries a host;
-- **self-heals** on status load (`GET /api/adb/info` runs an ensure-connected first) and on an explicit
-  `POST /api/adb/reconnect`;
-- **re-dials on a timer** — a keepalive runs one `adb connect` only while a phone is remembered and
-  nothing's attached, using the shared key (no prompt). It's a no-op on a healthy link, so in steady
-  state nothing dials. The interval is **jittered (30–60s per tick), not fixed**, so a shared event
-  (phone reboot, or a fleet update that restarts every daemon at once) doesn't align the whole fleet
-  into re-dialing the phone in the same instant — the machines drift apart and spread the load.
+  on a key-push that carries a host — so reconnecting never needs the pairing code again;
+- **reconnects on demand** via `POST /api/adb/reconnect` (re-dials the remembered phone with the shared
+  key, no prompt) or the card's **Connect fleet** / **Re-sync servers** buttons.
 
-So after the one-time hub fan-out, a member that drops the link (adb restart, phone reboot, network
-blip) reconnects itself within ~a minute, and a session on the project's machine keeps seeing the
-device. (Several servers holding a live connection at once is expected — the shared key is built for
-every server to debug simultaneously; the jitter is just hygiene on the phone's adbd, not correctness.)
+A connection stays up until you disconnect or the phone drops it (reboot, sleep, network blip). To get
+it back, tap **Re-sync servers** (reconnects every server to this phone) or, from a session, have the
+agent hit its own daemon: `curl -XPOST http://localhost:7701/api/adb/reconnect`. Several servers
+holding a live connection at once is expected and fine — the shared key is built for every server to
+debug simultaneously.
 If you ever need to force it, **Re-sync servers** on the card reconnects the whole fleet to this phone,
 or an agent can `curl -XPOST http://localhost:7701/api/adb/reconnect` on its own host.
 
