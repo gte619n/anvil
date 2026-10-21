@@ -549,7 +549,13 @@ export async function startFleetUpdate(): Promise<void> {
     toast("This Mac isn't the hub — start a fleet update from the hub instead.");
     return;
   }
-  if (!confirm("Update every machine in the fleet to one pinned build? Members update first, then this hub last.")) return;
+  const ok = await confirmDialog({
+    title: "Update the whole fleet?",
+    body: "Every machine updates to one pinned build — members first, then this hub last. Sessions on each machine pause while it restarts.",
+    confirmLabel: "Update fleet",
+    icon: "cloud_sync",
+  });
+  if (!ok) return;
   toast("Starting fleet update…");
   try {
     const r = (await (await apiFetch("/api/fleet/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) })).json()) as rest.FleetUpdateResponse;

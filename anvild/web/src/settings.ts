@@ -1042,11 +1042,11 @@ export function renderServerCards(): void {
         <div class="small muted" style="margin-top:8px">Pair this phone with <b>this server only</b> — every other server in the fleet inherits the trust automatically. On the phone, open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the code while the dialog is open:</div>
         <div class="git-row" style="margin-top:8px">
           <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
-          <button id="adb-pair">${icon("link")} Pair</button>
+          <button class="mini" id="adb-pair">${icon("link")} Pair</button>
         </div>
         <div class="git-row" style="margin-top:8px">
-          <button id="adb-sync">${icon("sync")} Re-sync servers</button>
-          <button id="adb-disconnect">${icon("wifi_off")} Disconnect</button>
+          <button class="mini" id="adb-sync">${icon("sync")} Re-sync servers</button>
+          <button class="mini" id="adb-disconnect">${icon("wifi_off")} Disconnect</button>
         </div>
       </details>
       <pre class="git-output" id="adb-output"></pre></div>`,
