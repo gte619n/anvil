@@ -22,6 +22,8 @@ if (nativeBridge) {
       const out = document.getElementById("adb-output");
       if (out) out.textContent = `${r.ok ? "✓ " : "⚠ "}${r.message ?? ""}`;
       else toast(r.message ?? "done");
+      // Let the ADB card's status dot track the outcome (the hook exists only while the card does).
+      (window as unknown as { __anvilAdbRefresh?: () => void }).__anvilAdbRefresh?.();
     } catch {
       /* ignore */
     }

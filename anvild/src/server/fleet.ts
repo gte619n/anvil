@@ -653,6 +653,50 @@ export async function propagateTodoist(opts: {
 }
 
 /**
+ * Replicate the hub's adb client identity (~/.android/adbkey pair) to member daemons, so every server
+ * presents the identity the phone already paired with and RSA-trusts — "pair with the hub once, debug
+ * from any server" (docs/adb-debugging.md). When `connectHost` is set, each member also runs
+ * `adb connect <connectHost>:5555` right away, so the device shows up in `adb devices` fleet-wide
+ * instead of waiting for a session to need it. Same transport rules as {@link propagateTodoist}
+ * (https-then-http per member, tailnet-gated, WireGuard-encrypted hop); best-effort + idempotent —
+ * an unreachable member heals on the next sync, which fires on every successful auto-connect.
+ */
+export async function propagateAdbIdentity(opts: {
+  members: { url: string; host?: string; serverId?: string; serverName?: string }[];
+  key: string;
+  pub: string;
+  connectHost?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ url: string; serverName?: string; ok: boolean; connected?: boolean; output?: string; error?: string }[]> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  return Promise.all(
+    opts.members.map(async (m) => {
+      let lastError = "no reachable transport";
+      for (const base of memberBases(m)) {
+        try {
+          const res = await doFetch(`${base}/api/adb/key`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ key: opts.key, pub: opts.pub, ...(opts.connectHost ? { host: opts.connectHost } : {}) }),
+            // Generous: the member may run a live `adb connect` (hard-capped at ADB_TIMEOUT_MS) before answering.
+            signal: AbortSignal.timeout(20_000),
+          });
+          const data = (await res.json().catch(() => ({}))) as { ok?: boolean; output?: string; connected?: boolean; error?: string; serverName?: string };
+          if (res.ok && data.ok !== false) {
+            return { url: m.url, serverName: data.serverName ?? m.serverName, ok: true, connected: data.connected, output: data.output };
+          }
+          // A 404 on this path = a member daemon from before the adb-identity sync; say so.
+          lastError = data.error ?? (res.status === 404 ? "this member's Anvil predates fleet debug sync — update it" : `HTTP ${res.status}`);
+        } catch (e) {
+          lastError = e instanceof Error ? e.message : String(e);
+        }
+      }
+      return { url: m.url, serverName: m.serverName, ok: false, error: lastError };
+    }),
+  );
+}
+
+/**
  * Rotate: push the current hub token to every member, identity-gated (no code). First-join and
  * rotation are the same push differing only in gate — the split macOS already makes.
  *

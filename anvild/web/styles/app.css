@@ -367,6 +367,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .git-panel label { display: block; }
 .git-panel textarea, .git-panel input, .git-panel select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background-color: var(--bg); color: var(--text); resize: vertical; }
 .git-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.git-row[hidden] { display: none; } /* [hidden] loses to display:flex without this — the ADB card toggles rows */
 .git-row select { width: auto; }
 .git-stages { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .git-stages button { flex-direction: column; gap: 5px; padding: 13px 8px; border-radius: 12px; font-weight: 600; transition: border-color 0.12s, background 0.12s, transform 0.08s; }

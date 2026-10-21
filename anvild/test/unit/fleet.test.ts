@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseTailscalePeers, peerBases, peerIPv4, planMemberUrlHeals, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
+import { parseTailscalePeers, peerBases, peerIPv4, planMemberUrlHeals, discoverFleet, discoverSelfBaseUrl, tailnetPeers, resolveMember, propagateAdbIdentity, propagateTodoist, invitePeer, rotateToken, ackPair, type ProbeResult } from "../../src/server/fleet";
 
 const SELF_STATUS = JSON.stringify({ Self: { DNSName: "mymac.tail-scale.ts.net." } });
 
@@ -303,6 +303,42 @@ test("propagateTodoist: no token → ok:false without any network calls", async 
   const [r] = await propagateTodoist({ members: [{ url: "https://m1.ts.net:7701/", host: "m1.ts.net" }], token: "", fetchImpl: fn });
   expect(r!.ok).toBe(false);
   expect(calls).toEqual([]);
+});
+
+test("propagateAdbIdentity: posts the key pair, echoes the member's name and connect outcome", async () => {
+  const { fn, calls } = fakeFetch((u) =>
+    u.startsWith("https://m1.ts.net:7701") ? { body: { ok: true, output: "fleet adb identity installed; connected to 100.64.0.9:5555", connected: true, serverName: "M1" } } : "throw",
+  );
+  const [r] = await propagateAdbIdentity({
+    members: [{ url: "http://m1.ts.net:7701/", host: "m1.ts.net" }], // stale http record — https must still win
+    key: "KEY",
+    pub: "PUB",
+    connectHost: "100.64.0.9",
+    fetchImpl: fn,
+  });
+  expect(r!.ok).toBe(true);
+  expect(r!.serverName).toBe("M1");
+  expect(r!.connected).toBe(true);
+  expect(calls[0]).toBe("https://m1.ts.net:7701/api/adb/key");
+});
+
+test("propagateAdbIdentity: falls back to http and reports an unreachable member without throwing", async () => {
+  const { fn, calls } = fakeFetch((u) => (u.startsWith("http://plain.ts.net") ? { body: { ok: true } } : "throw"));
+  const [okR] = await propagateAdbIdentity({ members: [{ url: "http://plain.ts.net:7701/", host: "plain.ts.net" }], key: "K", pub: "P", fetchImpl: fn });
+  expect(okR!.ok).toBe(true);
+  expect(calls).toEqual(["https://plain.ts.net:7701/api/adb/key", "http://plain.ts.net:7701/api/adb/key"]);
+  const { fn: dead } = fakeFetch(() => "throw");
+  const [badR] = await propagateAdbIdentity({ members: [{ url: "http://gone.ts.net:7701/", host: "gone.ts.net", serverName: "Gone" }], key: "K", pub: "P", fetchImpl: dead });
+  expect(badR!.ok).toBe(false);
+  expect(badR!.serverName).toBe("Gone");
+  expect(badR!.error).toBeTruthy();
+});
+
+test("propagateAdbIdentity: a pre-sync member (404) gets the update-it message", async () => {
+  const { fn } = fakeFetch(() => ({ status: 404, body: {} })); // a live daemon without the /api/adb/key route
+  const [r] = await propagateAdbIdentity({ members: [{ url: "https://old.ts.net:7701/", host: "old.ts.net" }], key: "K", pub: "P", fetchImpl: fn });
+  expect(r!.ok).toBe(false);
+  expect(r!.error).toContain("update it");
 });
 
 test("discoverFleet: same server reachable twice is deduped by serverId", async () => {

@@ -10,7 +10,7 @@
 // so this works on a headless server.
 
 import { join } from "node:path";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 // [BE-14] adb calls reach out over the network and can hang for seconds. Every spawn carries a
 // timeout so a wedged adb can't freeze the single-threaded daemon (and every other client).
@@ -94,6 +94,26 @@ export interface AdbAutoResult {
   pinned: boolean; // reachable on ADB_PIN_PORT
   persistent: boolean; // pin survives a reboot (persist.adb.tcp.port honored by the device)
   authorized: boolean; // false when the phone still needs the "Allow debugging?" tap
+  selfToggle: boolean; // the Anvil app holds WRITE_SECURE_SETTINGS, so it can re-enable Wireless debugging itself
+}
+
+/** The Android client's application id — granted WRITE_SECURE_SETTINGS after a successful connect so
+ *  the app can flip the Wireless-debugging toggle itself from then on (AdbToggle.kt). */
+export const ANDROID_APP_ID = "com.gte619n.anvil";
+
+/** `pm grant` prints nothing on success and a one-line exception on failure (unknown permission on
+ *  APKs older than the manifest entry, "not allowed", etc.). Pure, so the phrasing is unit-tested. */
+export function grantOk(run: AdbRun): boolean {
+  return run.ok && !/exception|error|failed|not allowed|unknown/i.test(run.output.replace("(no output)", ""));
+}
+
+/** Best-effort: let the Anvil app flip the Wireless-debugging toggle itself. The grant survives
+ *  reboots and app updates, which closes the automation loop — after a reboot the app re-enables
+ *  Wireless debugging on launch and the daemon re-pins without any Settings round-trip. Failure is
+ *  fine: an APK without the manifest entry just rejects the grant and the manual toggle keeps working. */
+async function grantSelfToggle(target: string): Promise<boolean> {
+  const r = await runAdb(["-s", target, "shell", "pm", "grant", ANDROID_APP_ID, "android.permission.WRITE_SECURE_SETTINGS"]);
+  return grantOk(r);
 }
 
 async function deviceState(target: string): Promise<string> {
@@ -114,10 +134,15 @@ async function makePersistent(target: string): Promise<boolean> {
 }
 
 /** Compose the user-facing summary for an auto-connect outcome. Pure, so the phrasing is unit-tested. */
-export function summarizeAuto(target: string, state: string, persistent: boolean): string {
+export function summarizeAuto(target: string, state: string, persistent: boolean, selfToggle = false): string {
   if (state === "unauthorized") return `Connected ${target}, but the phone shows "unauthorized" — approve the "Allow debugging?" prompt on the phone.`;
   if (state !== "device") return `Connected ${target}, but it's "${state}" — give it a moment, then retry.`;
-  return `Connected ${target} — debugging ready${persistent ? ", pinned across reboots." : ", pinned until the phone reboots."}`;
+  const survival = persistent
+    ? ", pinned across reboots."
+    : selfToggle
+      ? ". After a reboot, just open Anvil on the phone — it re-enables Wireless debugging and reconnects by itself."
+      : ", pinned until the phone reboots.";
+  return `Connected ${target} — debugging ready${survival}`;
 }
 
 /**
@@ -134,10 +159,11 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   if (connectedOk(fast.output)) {
     const state = await deviceState(pin);
     const persistent = await isPersistent(pin); // report only; the pin already exists on the fast path
-    return { ok: true, output: [summarizeAuto(pin, state, persistent), fast.output].join("\n"), pinned: true, persistent, authorized: state === "device" };
+    const selfToggle = state === "device" && (await grantSelfToggle(pin));
+    return { ok: true, output: [summarizeAuto(pin, state, persistent, selfToggle), fast.output].join("\n"), pinned: true, persistent, authorized: state === "device", selfToggle };
   }
   if (!port) {
-    return { ok: false, output: `Not reachable on :${ADB_PIN_PORT} yet — open Anvil on the phone and tap Auto-connect.\n${fast.output}`, pinned: false, persistent: false, authorized: false };
+    return { ok: false, output: `Not reachable on :${ADB_PIN_PORT} yet — open Anvil on the phone and tap Auto-connect.\n${fast.output}`, pinned: false, persistent: false, authorized: false, selfToggle: false };
   }
 
   // Bootstrap: connect on the live wireless-debugging port the phone just discovered, pin adbd to the
@@ -145,7 +171,7 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   const target = adbTarget(host, port);
   const conn = await runAdb(["connect", target]);
   if (!connectedOk(conn.output)) {
-    return { ok: false, output: conn.output, pinned: false, persistent: false, authorized: false };
+    return { ok: false, output: conn.output, pinned: false, persistent: false, authorized: false, selfToggle: false };
   }
   const tcp = await runAdb(["-s", target, "tcpip", String(ADB_PIN_PORT)]);
   await Bun.sleep(1500); // adbd restarts on the pinned port; give it a beat before reconnecting
@@ -153,7 +179,73 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   const ok = connectedOk(re.output);
   const state = ok ? await deviceState(pin) : "offline";
   const persistent = ok ? await makePersistent(pin) : false;
-  return { ok, output: [summarizeAuto(pin, state, persistent), conn.output, tcp.output, re.output].join("\n"), pinned: ok, persistent, authorized: state === "device" };
+  const selfToggle = state === "device" && (await grantSelfToggle(pin));
+  return { ok, output: [summarizeAuto(pin, state, persistent, selfToggle), conn.output, tcp.output, re.output].join("\n"), pinned: ok, persistent, authorized: state === "device", selfToggle };
+}
+
+// ── Fleet-shared adb identity ─────────────────────────────────────────────────────────────────────
+// A phone's debugging trust (the "Allow debugging?" approval AND the wireless pairing) is bound to
+// the adb KEY, not the machine. So instead of pairing every server with every device, the hub pushes
+// its ~/.android/adbkey pair to the members — they present the identity the phone already trusts,
+// and `adb connect phone:5555` is authorized everywhere with zero per-member setup.
+
+/** Where adb keeps its client identity for a given HOME. Pure, so it's unit-testable. */
+export const adbKeyPaths = (home: string): { key: string; pub: string } => ({
+  key: join(home, ".android", "adbkey"),
+  pub: join(home, ".android", "adbkey.pub"),
+});
+
+export interface AdbIdentity {
+  key: string; // PEM private key (~/.android/adbkey)
+  pub: string; // one-line public key (~/.android/adbkey.pub)
+}
+
+/** Sanity-check a pushed identity before it lands on disk: the private key must be PEM and the public
+ *  key adb's single-line base64 form — not swapped, truncated, or arbitrary junk. Pure. */
+export function looksLikeAdbIdentity(key?: string, pub?: string): boolean {
+  if (!key || !pub) return false;
+  if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+-----END [A-Z ]*PRIVATE KEY-----/.test(key)) return false;
+  return /^[A-Za-z0-9+/=]{64,}/.test(pub.trim()); // base64 blob, optionally followed by " user@host"
+}
+
+/** Read this server's adb identity, generating one first (`adb keygen`) when the box has never run
+ *  adb — a freshly-installed headless hub has no ~/.android until something creates it. */
+export async function readAdbIdentity(): Promise<AdbIdentity | null> {
+  const home = process.env.HOME;
+  if (!home) return null;
+  const p = adbKeyPaths(home);
+  if (!existsSync(p.key) || !existsSync(p.pub)) {
+    mkdirSync(join(home, ".android"), { recursive: true });
+    await runAdb(["keygen", p.key]); // writes both FILE and FILE.pub; no device needed
+  }
+  try {
+    return { key: readFileSync(p.key, "utf8"), pub: readFileSync(p.pub, "utf8") };
+  } catch {
+    return null;
+  }
+}
+
+/** Adopt a fleet-shared adb identity pushed by the hub. The previous key (if any, and different) is
+ *  kept at adbkey.bak for a one-step undo. `adb kill-server` afterwards so a running adb server stops
+ *  using its cached copy of the old key (best-effort — adb may not even be installed yet, which is
+ *  fine: the key is plain files, usable whenever adb arrives). */
+export async function installAdbIdentity(key: string, pub: string): Promise<{ ok: boolean; output: string; changed: boolean }> {
+  if (!looksLikeAdbIdentity(key, pub)) return { ok: false, output: "that doesn't look like an adb key pair — refusing to install it", changed: false };
+  const home = process.env.HOME;
+  if (!home) return { ok: false, output: "the daemon's user has no HOME set, so there's nowhere to install the adb key", changed: false };
+  const p = adbKeyPaths(home);
+  try {
+    mkdirSync(join(home, ".android"), { recursive: true });
+    const current = existsSync(p.key) ? readFileSync(p.key, "utf8") : null;
+    if (current === key) return { ok: true, output: "already on the fleet adb identity", changed: false };
+    if (current !== null) copyFileSync(p.key, `${p.key}.bak`);
+    writeFileSync(p.key, key, { mode: 0o600 }); // adb refuses group/world-readable private keys
+    writeFileSync(p.pub, pub, { mode: 0o644 });
+    await runAdb(["kill-server"]);
+    return { ok: true, output: "fleet adb identity installed", changed: true };
+  } catch (e) {
+    return { ok: false, output: `couldn't install the adb key: ${(e as Error).message}`, changed: false };
+  }
 }
 
 /** Drop the adb connection to the phone's pinned port (or all connections when no host is given). */

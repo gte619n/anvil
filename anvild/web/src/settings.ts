@@ -1026,34 +1026,76 @@ export function renderServerCards(): void {
       const el = document.getElementById("adb-output");
       if (el) el.textContent = t;
     };
+    // Status-first card: one primary action (Connect fleet), a live status line with a dot, and the
+    // first-time plumbing (pairing, re-sync, disconnect) folded away under <details> — the new
+    // paradigm is "pair the hub once, everything else is automatic", so the default face of the card
+    // is a single button, not a wall of them.
     host.insertAdjacentHTML(
       "beforeend",
-      `<div class="card"><div class="card-main">${icon("smartphone")} <b>This phone (ADB over wifi)</b></div>
-      <div class="small muted" id="adb-info">Loading device info…</div>
-      <div class="git-row" style="margin-top:10px" id="adb-install-row" hidden><button class="primary" id="adb-install">${icon("download")} Install platform-tools on server</button></div>
-      <div id="adb-controls">
-        <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-auto">${icon("wifi")} Auto-connect</button><button id="adb-connect">${icon("wifi")} Connect once</button><button id="adb-disconnect">${icon("wifi_off")} Disconnect</button></div>
-        <div class="small muted" style="margin-top:6px">Auto-connect pins debugging to a stable port, so every later launch reconnects on its own (until the phone reboots). Approve the one-time “Allow debugging?” prompt on the phone the first time.</div>
-        <hr />
-        <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
+      `<div class="card"><div class="card-main" style="display:flex;align-items:center;gap:8px">${icon("smartphone")} <b>Debug this phone</b>
+        <button class="mini" id="adb-help" style="margin-left:auto">${icon("help")} How it works</button></div>
+      <div class="small muted" style="display:flex;align-items:center;gap:7px;margin-top:6px"><span class="conn-dot" id="adb-dot"></span><span id="adb-status">Checking…</span></div>
+      <div class="git-row" style="margin-top:10px" id="adb-install-row" hidden><button class="primary" id="adb-install">${icon("download")} Install adb on this server</button></div>
+      <div class="git-row" style="margin-top:10px" id="adb-main-row" hidden><button class="primary" id="adb-auto">${icon("bolt")} Connect fleet</button></div>
+      <details id="adb-setup" style="margin-top:10px">
+        <summary class="small muted" style="cursor:pointer">First-time setup &amp; tools</summary>
+        <div class="small muted" style="margin-top:8px">Pair this phone with <b>this server only</b> — every other server in the fleet inherits the trust automatically. On the phone, open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the code while the dialog is open:</div>
         <div class="git-row" style="margin-top:8px">
           <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
-          <button id="adb-pair">${icon("link")} Pair this Mac</button>
+          <button id="adb-pair">${icon("link")} Pair</button>
         </div>
-      </div>
+        <div class="git-row" style="margin-top:8px">
+          <button id="adb-sync">${icon("sync")} Re-sync servers</button>
+          <button id="adb-disconnect">${icon("wifi_off")} Disconnect</button>
+        </div>
+      </details>
       <pre class="git-output" id="adb-output"></pre></div>`,
     );
-    $("#adb-auto").addEventListener("click", () => {
-      setOut("Connecting… (first time: approve the “Allow debugging?” prompt on the phone)");
-      bridge.postMessage(JSON.stringify({ type: "adb.auto" }));
+    const setStatus = (state: "connected" | "connecting" | "disconnected" | "", text: string): void => {
+      const dot = document.getElementById("adb-dot");
+      const status = document.getElementById("adb-status");
+      if (dot) dot.className = `conn-dot${state ? ` ${state}` : ""}`;
+      if (status) status.innerHTML = text;
+    };
+    $("#adb-help").addEventListener("click", () => {
+      const m = document.createElement("div");
+      m.className = "modal";
+      m.innerHTML = `<div class="modal-box"><h3>${icon("smartphone")} Debugging this phone from the fleet</h3>
+        <p class="small">Any Anvil server can run <code>adb</code> against this phone over Tailscale — logcat, install, shell — as if it were plugged in by USB. You pair <b>once, with this server</b>; the whole fleet inherits the trust (the servers share one adb identity), and after the first connect the app can switch Wireless debugging on by itself.</p>
+        <b class="small">One-time setup, per device</b>
+        <ol class="small" style="margin:6px 0 12px;padding-left:20px;line-height:1.7">
+          <li>If the card offers it, tap <b>Install adb on this server</b> (one tap, no admin rights).</li>
+          <li>On this phone, enable <b>Developer options</b>, then open <b>Wireless debugging → Pair device with pairing code</b>.</li>
+          <li>Under <b>First-time setup</b>, type the 6-digit code and tap <b>Pair</b> while the dialog is still open.</li>
+          <li>Tap <b>Connect fleet</b>, then approve the phone's one-time “Allow debugging?” prompt — check <i>Always allow</i>.</li>
+        </ol>
+        <b class="small">After that, it's automatic</b>
+        <ul class="small" style="margin:6px 0 12px;padding-left:20px;line-height:1.7">
+          <li>Opening Anvil reconnects <b>every server</b> — even after a reboot. The first successful connect grants the app permission to flip Wireless debugging back on by itself, so Settings never reopens.</li>
+          <li>A new server in the fleet needs no pairing: the next connect (or <b>Re-sync servers</b>) makes it debug-ready.</li>
+          <li>More devices (tablet, second phone): repeat the one-time setup on each — still only ever pairing with this server.</li>
+        </ul>
+        <div class="btns"><button type="button" class="primary" id="adb-help-close">Got it</button></div>
+      </div>`;
+      showModal(m);
+      $("#adb-help-close").onclick = closeModal;
     });
-    $("#adb-connect").addEventListener("click", () => {
-      setOut("Discovering phone…");
-      bridge.postMessage(JSON.stringify({ type: "adb.connect" }));
+    $("#adb-auto").addEventListener("click", () => {
+      setOut("Connecting this phone to every server… (first time: approve the “Allow debugging?” prompt on this phone)");
+      bridge.postMessage(JSON.stringify({ type: "adb.auto" }));
     });
     $("#adb-disconnect").addEventListener("click", () => {
       setOut("Disconnecting…");
       bridge.postMessage(JSON.stringify({ type: "adb.disconnect" }));
+    });
+    // Push this server's adb identity to every fleet member (no device connect — that rides the next
+    // Connect fleet, which syncs automatically). Useful right after adding a server to the fleet.
+    $("#adb-sync").addEventListener("click", () => {
+      setOut("Syncing debug access to every server…");
+      void apiFetch("/api/adb/sync", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+        .then((r) => r.json())
+        .then((r: { ok?: boolean; output?: string }) => setOut(`${r.ok ? "✓ " : "⚠ "}${r.output ?? ""}`))
+        .catch((e) => setOut(`Sync failed: ${String(e)}`));
     });
     $("#adb-pair").addEventListener("click", () => {
       const code = $<HTMLInputElement>("#adb-pair-code").value.trim();
@@ -1064,29 +1106,41 @@ export function renderServerCards(): void {
       setOut("Pairing… (keep the pairing dialog open on the phone)");
       bridge.postMessage(JSON.stringify({ type: "adb.pair", code }));
     });
-    // Probe the server for adb; swap the connect UI for an install prompt when it's missing. Re-run
-    // after a successful install so the connect controls appear without a settings reopen.
+    // Probe the server for adb and summarize the connection into the status line. Re-run after an
+    // install and after every bridge adb.result (push.ts calls the hook), so the dot tracks reality.
     const loadAdbInfo = (): void => {
       void apiFetch("/api/adb/info")
         .then((r) => r.json())
-        .then((d: { serverIps?: string[]; devices?: string; adbInstalled?: boolean }) => {
-          const el = document.getElementById("adb-info");
-          if (!el) return;
-          const controls = document.getElementById("adb-controls");
+        .then((d: { devices?: string; adbInstalled?: boolean }) => {
           const installRow = document.getElementById("adb-install-row");
+          const mainRow = document.getElementById("adb-main-row");
+          const setup = document.getElementById("adb-setup") as HTMLDetailsElement | null;
           if (d.adbInstalled === false) {
-            el.innerHTML = `⚠ <b>adb isn't installed on the server.</b> Anvil can fetch Google's official Android platform-tools (~15&nbsp;MB) into <code>~/.anvil/platform-tools</code> — no admin rights needed.`;
-            if (controls) controls.hidden = true;
+            setStatus("disconnected", `adb isn't on this server yet — install it below (≈15&nbsp;MB from Google, no admin rights).`);
             if (installRow) installRow.hidden = false;
+            if (mainRow) mainRow.hidden = true;
             return;
           }
-          if (controls) controls.hidden = false;
           if (installRow) installRow.hidden = true;
-          const devs = (d.devices ?? "").split("\n").filter((l) => l.trim() && !/list of devices/i.test(l));
-          el.innerHTML = `Mac IP: <code>${esc((d.serverIps ?? []).join(", ") || "?")}</code> — uses Tailscale when both are on your tailnet (works across networks); else same LAN.<br/>adb devices: <code>${esc(devs.length ? devs.join("; ") : "none connected")}</code>`;
+          if (mainRow) mainRow.hidden = false;
+          const lines = (d.devices ?? "").split("\n").filter((l) => l.trim() && !/list of devices/i.test(l));
+          // `adb devices -l`: "<serial> <state> product:… device:…" — judge by the STATE column only
+          // (a ready line also contains a literal "device:<board>" field that a word-match would hit).
+          const stateOf = (l: string): string => l.trim().split(/\s+/)[1] ?? "";
+          const ready = lines.filter((l) => stateOf(l) === "device");
+          const pending = lines.filter((l) => stateOf(l) === "unauthorized");
+          if (ready.length > 0) {
+            setStatus("connected", `Debug-ready — this server sees <code>${esc(ready[0]!.split(/\s+/)[0] ?? "")}</code>${ready.length > 1 ? ` +${ready.length - 1} more` : ""}. The fleet re-syncs on every connect.`);
+          } else if (pending.length > 0) {
+            setStatus("connecting", `Connected, waiting for the “Allow debugging?” approval on this phone.`);
+          } else {
+            setStatus("", `Not connected — tap <b>Connect fleet</b>. First time on this phone? Open <b>First-time setup</b> below.`);
+            if (setup && lines.length === 0) setup.open = true; // never-set-up: surface the pairing steps
+          }
         })
-        .catch(() => {});
+        .catch(() => setStatus("disconnected", "Couldn't reach the server."));
     };
+    (window as unknown as { __anvilAdbRefresh?: () => void }).__anvilAdbRefresh = loadAdbInfo;
     $("#adb-install").addEventListener("click", () => {
       const btn = $<HTMLButtonElement>("#adb-install");
       btn.disabled = true;
@@ -1096,7 +1150,7 @@ export function renderServerCards(): void {
         .then((r: { ok?: boolean; output?: string }) => {
           setOut(`${r.ok ? "✓ " : "⚠ "}${r.output ?? ""}`);
           btn.disabled = false;
-          if (r.ok) loadAdbInfo(); // adb present now — reveal the connect controls
+          if (r.ok) loadAdbInfo(); // adb present now — reveal the connect button
         })
         .catch((e) => {
           setOut(`Install failed: ${String(e)}`);
