@@ -88,6 +88,73 @@ export function parseDeviceState(output: string): string {
   return m?.[1] ?? "unknown";
 }
 
+// ── Remembered device + self-healing reconnect ──────────────────────────────────────────────────
+// `adb connect` state lives only in the host's adb-server process, and only while the connection
+// holds. A session (agent) on this machine shares that adb server (127.0.0.1:5037), so once THIS
+// daemon is connected the session sees the phone — the trick is keeping this machine connected
+// without the phone's app, which only ever talks to the hub. So every daemon remembers the last
+// phone it reached and re-dials it (using the fleet-shared key — no prompt, no phone interaction)
+// whenever nothing's connected: on status load, on an explicit reconnect, and on a quiet timer.
+
+/** `<stateDir>/adb-device.json` — the last phone tailnet address this daemon connected to. */
+const adbStatePath = (stateDir: string): string => join(stateDir, "adb-device.json");
+
+/** Remember the phone's host so this machine can reconnect on its own later. Best-effort. */
+export function rememberAdbDevice(stateDir: string, host: string): void {
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(adbStatePath(stateDir), JSON.stringify({ host }), "utf8");
+  } catch {
+    /* non-fatal: losing the hint just means this machine waits for the next fleet sync */
+  }
+}
+
+/** The last phone host this daemon connected to, or null if it never has. */
+export function rememberedAdbHost(stateDir: string): string | null {
+  try {
+    const h = (JSON.parse(readFileSync(adbStatePath(stateDir), "utf8")) as { host?: string }).host;
+    return h && h.trim() ? h.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Count the devices in `adb devices -l` output that are in the ready "device" state. The STATE is
+ *  the second whitespace-field on each device line ("<serial> device product:… device:<board> …") —
+ *  judge by that column, not a substring, since a ready line also contains a literal "device:<board>"
+ *  field. Pure, so it's unit-tested against real adb phrasings. */
+export function readyDeviceCount(devicesOutput: string): number {
+  return devicesOutput
+    .split("\n")
+    .slice(1) // drop the "List of devices attached" header
+    .filter((l) => l.trim().split(/\s+/)[1] === "device").length;
+}
+
+export interface AdbEnsureResult {
+  connected: boolean; // a ready device is present (already, or after a reconnect)
+  reconnected: boolean; // we actually re-dialed this call
+  host: string | null; // the remembered host, if any
+  output: string;
+}
+
+/**
+ * Make sure this machine can see the phone, reconnecting with the shared key if it can't. No-op (fast)
+ * when a device is already ready. When nothing's connected and we remember a phone, `adb connect
+ * host:5555` — the fleet-shared RSA key is already trusted, so this never prompts. This is what lets a
+ * session on the project's machine keep seeing the phone after the hub's one-time fan-out.
+ */
+export async function adbEnsureConnected(stateDir: string): Promise<AdbEnsureResult> {
+  if (!findAdb()) return { connected: false, reconnected: false, host: rememberedAdbHost(stateDir), output: "adb isn't installed on this server" };
+  if (readyDeviceCount((await runAdb(["devices", "-l"])).output) > 0) {
+    return { connected: true, reconnected: false, host: rememberedAdbHost(stateDir), output: "already connected" };
+  }
+  const host = rememberedAdbHost(stateDir);
+  if (!host) return { connected: false, reconnected: false, host: null, output: "no phone has connected to this server yet — tap Connect fleet on the phone" };
+  const r = await runAdb(["connect", adbTarget(host, ADB_PIN_PORT)]);
+  const connected = connectedOk(r.output) && readyDeviceCount((await runAdb(["devices", "-l"])).output) > 0;
+  return { connected, reconnected: true, host, output: r.output };
+}
+
 export interface AdbAutoResult {
   ok: boolean;
   output: string; // human-readable summary + the raw adb logs

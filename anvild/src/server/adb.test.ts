@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { ADB_PIN_PORT, ANDROID_APP_ID, adbCandidatePaths, adbKeyPaths, adbTarget, connectedOk, grantOk, looksLikeAdbIdentity, parseDeviceState, platformToolsUrl, summarizeAuto } from "./adb";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ADB_PIN_PORT, ANDROID_APP_ID, adbCandidatePaths, adbKeyPaths, adbTarget, connectedOk, grantOk, looksLikeAdbIdentity, parseDeviceState, platformToolsUrl, readyDeviceCount, rememberAdbDevice, rememberedAdbHost, summarizeAuto } from "./adb";
 
 // These guard the string/URL/parsing logic the ADB passthrough depends on — the parts that are easy
 // to get subtly wrong (adb connect exits 0 even when it failed; get-state phrasing varies) and that
@@ -73,6 +76,49 @@ describe("grantOk", () => {
 
 describe("ANDROID_APP_ID", () => {
   test("matches the app's applicationId", () => expect(ANDROID_APP_ID).toBe("com.gte619n.anvil"));
+});
+
+describe("readyDeviceCount", () => {
+  const header = "List of devices attached";
+  test("counts only lines in the 'device' state", () => {
+    const out = [header, "100.64.0.9:5555       device product:x device:raven transport_id:3", "emulator-5554         offline"].join("\n");
+    expect(readyDeviceCount(out)).toBe(1);
+  });
+  test("does not miscount an unauthorized device as ready", () => {
+    expect(readyDeviceCount([header, "100.64.0.9:5555       unauthorized"].join("\n"))).toBe(0);
+  });
+  test("is not fooled by the literal 'device:<board>' field on a ready line", () => {
+    // The word 'device' appears twice on a ready line; only the STATE column must count.
+    expect(readyDeviceCount([header, "100.64.0.9:5555  device  product:bluejay device:bluejay"].join("\n"))).toBe(1);
+  });
+  test("empty / header-only → 0", () => {
+    expect(readyDeviceCount(header)).toBe(0);
+    expect(readyDeviceCount("")).toBe(0);
+  });
+});
+
+describe("remembered adb device", () => {
+  test("round-trips the host through the state dir", () => {
+    const dir = mkdtempSync(join(tmpdir(), "adb-state-"));
+    try {
+      expect(rememberedAdbHost(dir)).toBeNull(); // nothing saved yet
+      rememberAdbDevice(dir, "100.75.167.61");
+      expect(rememberedAdbHost(dir)).toBe("100.75.167.61");
+      rememberAdbDevice(dir, "100.64.0.9"); // overwrite with the newest phone
+      expect(rememberedAdbHost(dir)).toBe("100.64.0.9");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("a blank host reads back as null", () => {
+    const dir = mkdtempSync(join(tmpdir(), "adb-state-"));
+    try {
+      rememberAdbDevice(dir, "   ");
+      expect(rememberedAdbHost(dir)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("adbKeyPaths", () => {

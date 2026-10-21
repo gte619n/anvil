@@ -58,7 +58,8 @@ port was lost.
 | `POST /api/adb/pair` | `{ host, port, code }` | `{ ok, output }` |
 | `POST /api/adb/disconnect` | `{ host? }` | `{ ok, output }` |
 | `POST /api/adb/key` | `{ key, pub, host? }` | member landing point: install the fleet adb identity; with `host`, also connect the device |
-| `POST /api/adb/sync` | `{ host? }` | hub: push the identity to every member → `{ ok, output, results }` |
+| `POST /api/adb/sync` | `{ host? }` | hub: push the identity to every member (defaults `host` to the phone this hub last saw) → `{ ok, output, results }` |
+| `POST /api/adb/reconnect` | — | re-dial the phone this server last saw, using the shared key → `{ connected, reconnected, host, output }` |
 
 These sit behind the same Tailscale boundary as the rest of the daemon (no app-layer auth, by design —
 see `tailscale-is-accepted-security-boundary`).
@@ -85,6 +86,29 @@ bound to the adb **key**, not the machine. So the fleet shares one identity inst
 Members never pair, never prompt, and never need the phone's pairing dialog. Adding a fourth server =
 pair nothing; the next app launch (or Sync to fleet) makes it debug-ready. More devices (tablet etc.):
 each device pairs with the hub once, and the whole fleet inherits it the same way.
+
+### Staying connected (why a session sees the phone)
+
+`adb connect` state lives only in a machine's adb-server process (`127.0.0.1:5037`), and only while the
+link holds. A build/debug **session** (an agent) on a machine shares that adb server, so once the
+machine is connected the session sees the phone — and both apps on the phone at once, since a device
+hosts many packages (`adb install com.appA` / `com.appB` coexist with no `-s` needed while it's the
+only device attached).
+
+**Connection is manual, by design.** Nothing re-dials in the background. Each daemon:
+
+- **remembers** the last phone it reached (`<stateDir>/adb-device.json`), written on every connect and
+  on a key-push that carries a host — so reconnecting never needs the pairing code again;
+- **reconnects on demand** via `POST /api/adb/reconnect` (re-dials the remembered phone with the shared
+  key, no prompt) or the card's **Connect fleet** / **Re-sync servers** buttons.
+
+A connection stays up until you disconnect or the phone drops it (reboot, sleep, network blip). To get
+it back, tap **Re-sync servers** (reconnects every server to this phone) or, from a session, have the
+agent hit its own daemon: `curl -XPOST http://localhost:7701/api/adb/reconnect`. Several servers
+holding a live connection at once is expected and fine — the shared key is built for every server to
+debug simultaneously.
+If you ever need to force it, **Re-sync servers** on the card reconnects the whole fleet to this phone,
+or an agent can `curl -XPOST http://localhost:7701/api/adb/reconnect` on its own host.
 
 ## Headless servers: self-installing adb
 

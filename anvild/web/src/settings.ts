@@ -1042,11 +1042,11 @@ export function renderServerCards(): void {
         <div class="small muted" style="margin-top:8px">Pair this phone with <b>this server only</b> — every other server in the fleet inherits the trust automatically. On the phone, open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the code while the dialog is open:</div>
         <div class="git-row" style="margin-top:8px">
           <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
-          <button id="adb-pair">${icon("link")} Pair</button>
+          <button class="mini" id="adb-pair">${icon("link")} Pair</button>
         </div>
         <div class="git-row" style="margin-top:8px">
-          <button id="adb-sync">${icon("sync")} Re-sync servers</button>
-          <button id="adb-disconnect">${icon("wifi_off")} Disconnect</button>
+          <button class="mini" id="adb-sync">${icon("sync")} Re-sync servers</button>
+          <button class="mini" id="adb-disconnect">${icon("wifi_off")} Disconnect</button>
         </div>
       </details>
       <pre class="git-output" id="adb-output"></pre></div>`,
@@ -1069,12 +1069,14 @@ export function renderServerCards(): void {
           <li>Under <b>First-time setup</b>, type the 6-digit code and tap <b>Pair</b> while the dialog is still open.</li>
           <li>Tap <b>Connect fleet</b>, then approve the phone's one-time “Allow debugging?” prompt — check <i>Always allow</i>.</li>
         </ol>
-        <b class="small">After that, it's automatic</b>
+        <b class="small">After the first time</b>
         <ul class="small" style="margin:6px 0 12px;padding-left:20px;line-height:1.7">
-          <li>Opening Anvil reconnects <b>every server</b> — even after a reboot. The first successful connect grants the app permission to flip Wireless debugging back on by itself, so Settings never reopens.</li>
-          <li>A new server in the fleet needs no pairing: the next connect (or <b>Re-sync servers</b>) makes it debug-ready.</li>
-          <li>More devices (tablet, second phone): repeat the one-time setup on each — still only ever pairing with this server.</li>
+          <li><b>Connect fleet</b> connects this phone to every server at once — the first connect also grants the app permission to flip Wireless debugging back on by itself, so Settings never reopens.</li>
+          <li>Each server remembers this phone, so reconnecting is one tap — no pairing code, no prompt. A connection stays up until you disconnect or the phone drops it (reboot / sleep); nothing re-dials in the background.</li>
+          <li>A new server in the fleet needs no pairing: <b>Re-sync servers</b> hands it the key and connects it.</li>
         </ul>
+        <b class="small">A session can't see the phone?</b>
+        <p class="small" style="margin:6px 0 12px">Tap <b>Re-sync servers</b> — every server reconnects to this phone with the shared key (no prompt). Give it a few seconds to appear in that session's <code>adb devices</code>. (An agent can also reconnect its own machine directly: <code>curl -XPOST localhost:7701/api/adb/reconnect</code>.)</p>
         <div class="btns"><button type="button" class="primary" id="adb-help-close">Got it</button></div>
       </div>`;
       showModal(m);

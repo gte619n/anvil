@@ -36,7 +36,7 @@ import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
-import { ADB_PIN_PORT, adbAuto, adbDisconnect, adbTarget, connectedOk, findAdb, installAdbIdentity, installPlatformTools, readAdbIdentity, runAdb } from "./adb";
+import { ADB_PIN_PORT, adbAuto, adbDisconnect, adbEnsureConnected, adbTarget, connectedOk, findAdb, installAdbIdentity, installPlatformTools, readAdbIdentity, rememberAdbDevice, rememberedAdbHost, runAdb } from "./adb";
 import { VERSION } from "../version";
 
 export { VERSION };
@@ -1022,7 +1022,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
     return Response.json({ ok: true });
   });
 
-  // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint
+  // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint.
+  // Read-only status — reports what's attached and the phone this server last saw, but never dials on
+  // its own (connecting is a manual action: Connect fleet, or POST /api/adb/reconnect).
   route("GET", "/api/adb/info", async () => {
     const adb = findAdb();
     return Response.json({
@@ -1030,8 +1032,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adbInstalled: !!adb,
       ...(adb ? { adbPath: adb } : {}),
       devices: adb ? (await runAdb(["devices", "-l"])).output : "",
+      knownDevice: rememberedAdbHost(opts.stateDir),
     });
   });
+  // Manual reconnect: re-dial the phone THIS machine last saw, using the fleet-shared key (no phone
+  // needed). The one-tap lever for "my project session's machine can't see the phone" — the card's
+  // Reconnect button hits it, or an agent in a session can curl it on its own host. Deliberately
+  // on-demand only: nothing re-dials in the background (see the manual-connect design).
+  route("POST", "/api/adb/reconnect", async () => Response.json(await adbEnsureConnected(opts.stateDir)));
   // Install platform-tools on the server (headless-friendly): downloads Google's official zip.
   route("POST", "/api/adb/install", async () => Response.json(await installPlatformTools()));
   route(
@@ -1067,6 +1075,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       let output = inst.output;
       let connected: boolean | undefined;
       if (host) {
+        rememberAdbDevice(opts.stateDir, host); // remember even if adb installs later, so a manual Reconnect/Re-sync can re-dial it
         if (findAdb()) {
           const r = await runAdb(["connect", adbTarget(host, ADB_PIN_PORT)]);
           connected = connectedOk(r.output);
@@ -1091,7 +1100,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
     if (members.length === 0) return { ok: true, output: "No fleet members on this server — nothing to sync.", results: [] };
     const id = await readAdbIdentity();
     if (!id) return { ok: false, output: "This server has no adb identity yet (adb never ran and keygen failed) — connect once, then retry.", results: [] };
-    const results = await propagateAdbIdentity({ members, ...id, ...(connectHost ? { connectHost } : {}) });
+    // Default to the phone this hub last saw, so "Re-sync servers" (no host) still makes members
+    // actually connect — not just receive the key. Sharing the key without connecting is why a member
+    // could hold trust yet show no device.
+    const host = connectHost ?? rememberedAdbHost(opts.stateDir) ?? undefined;
+    const results = await propagateAdbIdentity({ members, ...id, ...(host ? { connectHost: host } : {}) });
     const okCount = results.filter((r) => r.ok).length;
     const lines = results.map((r) => `  ${r.serverName ?? r.url}: ${r.ok ? (r.output ?? "ok") : `failed — ${r.error ?? "unknown"}`}`);
     return { ok: okCount === results.length, output: [`Fleet debug sync — ${okCount}/${results.length} server(s) ready:`, ...lines].join("\n"), results };
@@ -1112,6 +1125,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     withJsonBody<{ host?: string; port?: number }>(async ({ host, port }) => {
       if (!host) return new Response("host required", { status: 400 });
       const r = await adbAuto(host, port);
+      if (r.ok && r.authorized) rememberAdbDevice(opts.stateDir, host); // so this hub re-dials on its own later
       if (!r.ok || !r.authorized || fleet.list().length === 0) return Response.json(r);
       const sync = await adbFleetSync(host);
       return Response.json({ ...r, fleet: sync.results, output: `${r.output}\n${sync.output}` });
