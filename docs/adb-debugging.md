@@ -14,7 +14,7 @@ server side is pure CLI, so this works on a box with nothing but Anvil installed
 |-------|--------------|
 | Android app (`app/.../MainActivity.kt`, `AdbWifi.kt`) | Discovers the phone's own wireless-debugging port via mDNS (local — mDNS doesn't cross the tailnet), finds the phone's Tailscale IP, and drives the daemon over HTTP. Silently reconnects on launch once set up. |
 | Daemon (`anvild/src/server/adb.ts`) | Resolves/installs `adb`, runs connect/pair/pin, reports device state. Routes live in `http.ts` under `/api/adb/*`. A hub also replicates its adb identity to members (`propagateAdbIdentity` in `fleet.ts`) so any server can debug any paired device. |
-| Web UI (`anvild/web/src/settings.ts`) | The **Servers → This phone (ADB over wifi)** card: install, auto-connect, pair, disconnect. |
+| Web UI (`anvild/web/src/settings.ts`) | The **Servers → Debug this phone** card: a status dot + one primary **Connect fleet** button, a "How it works" instructions modal, and first-time tools (pair / re-sync / disconnect / install) folded under *First-time setup*. |
 
 ## How a connection is made
 
