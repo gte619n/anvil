@@ -7,7 +7,7 @@ import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
 import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
-import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateAdbIdentity, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import type { ConciergeFleetOps } from "../agent/default-tools";
 import {
   DEFAULT_ARM_TTL_MS,
@@ -36,7 +36,7 @@ import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
-import { adbAuto, adbDisconnect, adbTarget, connectedOk, findAdb, installPlatformTools, runAdb } from "./adb";
+import { ADB_PIN_PORT, adbAuto, adbDisconnect, adbTarget, connectedOk, findAdb, installAdbIdentity, installPlatformTools, readAdbIdentity, runAdb } from "./adb";
 import { VERSION } from "../version";
 
 export { VERSION };
@@ -1052,14 +1052,69 @@ export function createServer(opts: ServerOptions): ServerHandle {
       return Response.json({ ok: /success/i.test(r.output), output: r.output });
     }),
   );
+  // Hub→member adb-identity landing point (fleet debug sync): the hub POSTs its ~/.android/adbkey
+  // pair here so this daemon presents the SAME adb client identity the phone already paired with and
+  // trusts — members never pair, never prompt. With `host`, also connect the device right away so it
+  // shows up in `adb devices` without waiting for a session to need it. Tailnet-gated like the rest
+  // of the daemon API; the hop is WireGuard-encrypted.
+  route(
+    "POST",
+    "/api/adb/key",
+    withJsonBody<{ key?: string; pub?: string; host?: string }>(async ({ key, pub, host }) => {
+      if (!key || !pub) return new Response("key and pub required", { status: 400 });
+      const inst = await installAdbIdentity(key, pub);
+      if (!inst.ok) return Response.json({ ok: false, error: inst.output, serverId: identity.serverId, serverName: identity.serverName });
+      let output = inst.output;
+      let connected: boolean | undefined;
+      if (host) {
+        if (findAdb()) {
+          const r = await runAdb(["connect", adbTarget(host, ADB_PIN_PORT)]);
+          connected = connectedOk(r.output);
+          output += `; ${r.output}`;
+        } else {
+          // A ~15 MB download can't finish inside the hub's fan-out timeout — install in the
+          // background; the next sync (any app launch / auto-connect) does the actual connect.
+          void installPlatformTools().then((r) => console.log(`[adb] self-install ${r.ok ? "done" : `failed: ${r.output}`}`));
+          output += "; adb isn't installed here yet — installing in the background, the next sync will connect";
+        }
+      }
+      // Echo this daemon's identity so the hub's summary can name the member (same trick as the
+      // Todoist landing point).
+      return Response.json({ ok: true, output, ...(connected !== undefined ? { connected } : {}), serverId: identity.serverId, serverName: identity.serverName });
+    }),
+  );
+  // Fleet debug sync, hub side: push this server's adb identity to every member (and, with `host`,
+  // have each one connect the device too). Explicit trigger for the settings-card button; the same
+  // helper fires automatically after every successful auto-connect below.
+  async function adbFleetSync(connectHost?: string): Promise<{ ok: boolean; output: string; results: Awaited<ReturnType<typeof propagateAdbIdentity>> }> {
+    const members = fleet.list();
+    if (members.length === 0) return { ok: true, output: "No fleet members on this server — nothing to sync.", results: [] };
+    const id = await readAdbIdentity();
+    if (!id) return { ok: false, output: "This server has no adb identity yet (adb never ran and keygen failed) — connect once, then retry.", results: [] };
+    const results = await propagateAdbIdentity({ members, ...id, ...(connectHost ? { connectHost } : {}) });
+    const okCount = results.filter((r) => r.ok).length;
+    const lines = results.map((r) => `  ${r.serverName ?? r.url}: ${r.ok ? (r.output ?? "ok") : `failed — ${r.error ?? "unknown"}`}`);
+    return { ok: okCount === results.length, output: [`Fleet debug sync — ${okCount}/${results.length} server(s) ready:`, ...lines].join("\n"), results };
+  }
+  route(
+    "POST",
+    "/api/adb/sync",
+    withJsonBody<{ host?: string }>(async ({ host }) => Response.json(await adbFleetSync(host))),
+  );
   // One-tap auto-connect: reach the phone on its pinned port, bootstrapping the pin from a
-  // freshly-discovered wireless-debugging port when `port` is supplied (see adbAuto).
+  // freshly-discovered wireless-debugging port when `port` is supplied (see adbAuto). A success on a
+  // hub fans out to the fleet — key first time, then just `adb connect` — so opening the app makes the
+  // device debuggable from EVERY server, not only this one. Awaited (members answer in parallel,
+  // bounded by the per-member timeout) so the phone's toast can say which servers are ready.
   route(
     "POST",
     "/api/adb/auto",
     withJsonBody<{ host?: string; port?: number }>(async ({ host, port }) => {
       if (!host) return new Response("host required", { status: 400 });
-      return Response.json(await adbAuto(host, port));
+      const r = await adbAuto(host, port);
+      if (!r.ok || !r.authorized || fleet.list().length === 0) return Response.json(r);
+      const sync = await adbFleetSync(host);
+      return Response.json({ ...r, fleet: sync.results, output: `${r.output}\n${sync.output}` });
     }),
   );
   // Drop the connection (clean reset). `host` targets the pinned port; omit it to disconnect all.

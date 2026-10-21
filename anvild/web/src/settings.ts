@@ -1032,10 +1032,10 @@ export function renderServerCards(): void {
       <div class="small muted" id="adb-info">Loading device info…</div>
       <div class="git-row" style="margin-top:10px" id="adb-install-row" hidden><button class="primary" id="adb-install">${icon("download")} Install platform-tools on server</button></div>
       <div id="adb-controls">
-        <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-auto">${icon("wifi")} Auto-connect</button><button id="adb-connect">${icon("wifi")} Connect once</button><button id="adb-disconnect">${icon("wifi_off")} Disconnect</button></div>
-        <div class="small muted" style="margin-top:6px">Auto-connect pins debugging to a stable port and lets Anvil flip the Wireless-debugging toggle itself from then on — after a reboot, just open the app and it reconnects on its own. Approve the one-time “Allow debugging?” prompt on the phone the first time.</div>
+        <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-auto">${icon("wifi")} Auto-connect</button><button id="adb-connect">${icon("wifi")} Connect once</button><button id="adb-sync">${icon("sync")} Sync to fleet</button><button id="adb-disconnect">${icon("wifi_off")} Disconnect</button></div>
+        <div class="small muted" style="margin-top:6px">Auto-connect pins debugging to a stable port, lets Anvil flip the Wireless-debugging toggle itself from then on, and shares debug access with every server in the fleet — after a reboot, just open the app and the whole fleet reconnects on its own. Approve the one-time “Allow debugging?” prompt on the phone the first time.</div>
         <hr />
-        <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
+        <div class="small muted">First time? Pair this phone with the <b>hub only</b> — the fleet sync makes every other server trusted automatically. On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
         <div class="git-row" style="margin-top:8px">
           <input id="adb-pair-code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="6-digit code" style="max-width:140px" />
           <button id="adb-pair">${icon("link")} Pair this Mac</button>
@@ -1054,6 +1054,15 @@ export function renderServerCards(): void {
     $("#adb-disconnect").addEventListener("click", () => {
       setOut("Disconnecting…");
       bridge.postMessage(JSON.stringify({ type: "adb.disconnect" }));
+    });
+    // Push this server's adb identity to every fleet member (no device connect — that rides the next
+    // Auto-connect, which syncs automatically). Useful after adding a server to the fleet.
+    $("#adb-sync").addEventListener("click", () => {
+      setOut("Syncing debug access to the fleet…");
+      void apiFetch("/api/adb/sync", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+        .then((r) => r.json())
+        .then((r: { ok?: boolean; output?: string }) => setOut(`${r.ok ? "✓ " : "⚠ "}${r.output ?? ""}`))
+        .catch((e) => setOut(`Sync failed: ${String(e)}`));
     });
     $("#adb-pair").addEventListener("click", () => {
       const code = $<HTMLInputElement>("#adb-pair-code").value.trim();

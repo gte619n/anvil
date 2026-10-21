@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ADB_PIN_PORT, ANDROID_APP_ID, adbCandidatePaths, adbTarget, connectedOk, grantOk, parseDeviceState, platformToolsUrl, summarizeAuto } from "./adb";
+import { ADB_PIN_PORT, ANDROID_APP_ID, adbCandidatePaths, adbKeyPaths, adbTarget, connectedOk, grantOk, looksLikeAdbIdentity, parseDeviceState, platformToolsUrl, summarizeAuto } from "./adb";
 
 // These guard the string/URL/parsing logic the ADB passthrough depends on — the parts that are easy
 // to get subtly wrong (adb connect exits 0 even when it failed; get-state phrasing varies) and that
@@ -73,6 +73,25 @@ describe("grantOk", () => {
 
 describe("ANDROID_APP_ID", () => {
   test("matches the app's applicationId", () => expect(ANDROID_APP_ID).toBe("com.gte619n.anvil"));
+});
+
+describe("adbKeyPaths", () => {
+  test("points at ~/.android", () => {
+    expect(adbKeyPaths("/home/anvil")).toEqual({ key: "/home/anvil/.android/adbkey", pub: "/home/anvil/.android/adbkey.pub" });
+  });
+});
+
+describe("looksLikeAdbIdentity", () => {
+  const PEM = `-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----\n`;
+  const PUB = `QAAAAJ3h${"A".repeat(120)}= anvil@hub`;
+  test("accepts a real-shaped pair", () => expect(looksLikeAdbIdentity(PEM, PUB)).toBe(true));
+  test("rejects a missing half", () => {
+    expect(looksLikeAdbIdentity(PEM, "")).toBe(false);
+    expect(looksLikeAdbIdentity(undefined, PUB)).toBe(false);
+  });
+  test("rejects swapped halves", () => expect(looksLikeAdbIdentity(PUB, PEM)).toBe(false));
+  test("rejects junk in place of the private key", () => expect(looksLikeAdbIdentity("not a key", PUB)).toBe(false));
+  test("rejects a truncated PEM (no END marker)", () => expect(looksLikeAdbIdentity("-----BEGIN PRIVATE KEY-----\nabc", PUB)).toBe(false));
 });
 
 describe("ADB_PIN_PORT", () => {

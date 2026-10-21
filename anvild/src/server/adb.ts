@@ -10,7 +10,7 @@
 // so this works on a headless server.
 
 import { join } from "node:path";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 // [BE-14] adb calls reach out over the network and can hang for seconds. Every spawn carries a
 // timeout so a wedged adb can't freeze the single-threaded daemon (and every other client).
@@ -181,6 +181,71 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   const persistent = ok ? await makePersistent(pin) : false;
   const selfToggle = state === "device" && (await grantSelfToggle(pin));
   return { ok, output: [summarizeAuto(pin, state, persistent, selfToggle), conn.output, tcp.output, re.output].join("\n"), pinned: ok, persistent, authorized: state === "device", selfToggle };
+}
+
+// ── Fleet-shared adb identity ─────────────────────────────────────────────────────────────────────
+// A phone's debugging trust (the "Allow debugging?" approval AND the wireless pairing) is bound to
+// the adb KEY, not the machine. So instead of pairing every server with every device, the hub pushes
+// its ~/.android/adbkey pair to the members — they present the identity the phone already trusts,
+// and `adb connect phone:5555` is authorized everywhere with zero per-member setup.
+
+/** Where adb keeps its client identity for a given HOME. Pure, so it's unit-testable. */
+export const adbKeyPaths = (home: string): { key: string; pub: string } => ({
+  key: join(home, ".android", "adbkey"),
+  pub: join(home, ".android", "adbkey.pub"),
+});
+
+export interface AdbIdentity {
+  key: string; // PEM private key (~/.android/adbkey)
+  pub: string; // one-line public key (~/.android/adbkey.pub)
+}
+
+/** Sanity-check a pushed identity before it lands on disk: the private key must be PEM and the public
+ *  key adb's single-line base64 form — not swapped, truncated, or arbitrary junk. Pure. */
+export function looksLikeAdbIdentity(key?: string, pub?: string): boolean {
+  if (!key || !pub) return false;
+  if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+-----END [A-Z ]*PRIVATE KEY-----/.test(key)) return false;
+  return /^[A-Za-z0-9+/=]{64,}/.test(pub.trim()); // base64 blob, optionally followed by " user@host"
+}
+
+/** Read this server's adb identity, generating one first (`adb keygen`) when the box has never run
+ *  adb — a freshly-installed headless hub has no ~/.android until something creates it. */
+export async function readAdbIdentity(): Promise<AdbIdentity | null> {
+  const home = process.env.HOME;
+  if (!home) return null;
+  const p = adbKeyPaths(home);
+  if (!existsSync(p.key) || !existsSync(p.pub)) {
+    mkdirSync(join(home, ".android"), { recursive: true });
+    await runAdb(["keygen", p.key]); // writes both FILE and FILE.pub; no device needed
+  }
+  try {
+    return { key: readFileSync(p.key, "utf8"), pub: readFileSync(p.pub, "utf8") };
+  } catch {
+    return null;
+  }
+}
+
+/** Adopt a fleet-shared adb identity pushed by the hub. The previous key (if any, and different) is
+ *  kept at adbkey.bak for a one-step undo. `adb kill-server` afterwards so a running adb server stops
+ *  using its cached copy of the old key (best-effort — adb may not even be installed yet, which is
+ *  fine: the key is plain files, usable whenever adb arrives). */
+export async function installAdbIdentity(key: string, pub: string): Promise<{ ok: boolean; output: string; changed: boolean }> {
+  if (!looksLikeAdbIdentity(key, pub)) return { ok: false, output: "that doesn't look like an adb key pair — refusing to install it", changed: false };
+  const home = process.env.HOME;
+  if (!home) return { ok: false, output: "the daemon's user has no HOME set, so there's nowhere to install the adb key", changed: false };
+  const p = adbKeyPaths(home);
+  try {
+    mkdirSync(join(home, ".android"), { recursive: true });
+    const current = existsSync(p.key) ? readFileSync(p.key, "utf8") : null;
+    if (current === key) return { ok: true, output: "already on the fleet adb identity", changed: false };
+    if (current !== null) copyFileSync(p.key, `${p.key}.bak`);
+    writeFileSync(p.key, key, { mode: 0o600 }); // adb refuses group/world-readable private keys
+    writeFileSync(p.pub, pub, { mode: 0o644 });
+    await runAdb(["kill-server"]);
+    return { ok: true, output: "fleet adb identity installed", changed: true };
+  } catch (e) {
+    return { ok: false, output: `couldn't install the adb key: ${(e as Error).message}`, changed: false };
+  }
 }
 
 /** Drop the adb connection to the phone's pinned port (or all connections when no host is given). */

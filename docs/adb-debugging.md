@@ -13,7 +13,7 @@ server side is pure CLI, so this works on a box with nothing but Anvil installed
 | Where | What it does |
 |-------|--------------|
 | Android app (`app/.../MainActivity.kt`, `AdbWifi.kt`) | Discovers the phone's own wireless-debugging port via mDNS (local — mDNS doesn't cross the tailnet), finds the phone's Tailscale IP, and drives the daemon over HTTP. Silently reconnects on launch once set up. |
-| Daemon (`anvild/src/server/adb.ts`) | Resolves/installs `adb`, runs connect/pair/pin, reports device state. Routes live in `http.ts` under `/api/adb/*`. |
+| Daemon (`anvild/src/server/adb.ts`) | Resolves/installs `adb`, runs connect/pair/pin, reports device state. Routes live in `http.ts` under `/api/adb/*`. A hub also replicates its adb identity to members (`propagateAdbIdentity` in `fleet.ts`) so any server can debug any paired device. |
 | Web UI (`anvild/web/src/settings.ts`) | The **Servers → This phone (ADB over wifi)** card: install, auto-connect, pair, disconnect. |
 
 ## How a connection is made
@@ -29,12 +29,15 @@ server side is pure CLI, so this works on a box with nothing but Anvil installed
    - reconnects on `:5555` and, best-effort, sets `persist.adb.tcp.port` so the pin survives a reboot
    - The phone shows **"Allow debugging?"** once (RSA trust); approve it and the server is trusted
      from then on.
-3. **Self-toggle grant.** Riding the connection it just made, the daemon runs
+3. **Fleet fan-out.** After a successful auto-connect, a hub pushes its adb identity
+   (`~/.android/adbkey` pair) to every fleet member and has each one `adb connect <phone>:5555` too —
+   see *One pairing, whole fleet* below. The phone's toast lists which servers are ready.
+4. **Self-toggle grant.** Riding the connection it just made, the daemon runs
    `pm grant com.gte619n.anvil android.permission.WRITE_SECURE_SETTINGS`. That permission (not
    grantable at runtime, but a `pm grant` sticks across reboots and app updates) lets the Anvil app
    flip the **Wireless debugging toggle itself** (`AdbToggle.kt` writes `Settings.Global
    adb_wifi_enabled`) — so from now on nobody ever opens Developer options again.
-4. **Every later launch** reconnects to `:5555` silently — no discovery, no code, no prompt. (The app
+5. **Every later launch** reconnects to `:5555` silently — no discovery, no code, no prompt. (The app
    only does this after you've succeeded once; it records that in `anvil.adb` prefs.) When the fast
    path misses *and* the app holds the self-toggle grant — the reboot case: Android cleared both the
    pin and the Wireless-debugging toggle — the app silently turns the toggle back on, discovers the
@@ -54,9 +57,34 @@ port was lost.
 | `POST /api/adb/connect` | `{ host, port }` | `{ ok, output }` |
 | `POST /api/adb/pair` | `{ host, port, code }` | `{ ok, output }` |
 | `POST /api/adb/disconnect` | `{ host? }` | `{ ok, output }` |
+| `POST /api/adb/key` | `{ key, pub, host? }` | member landing point: install the fleet adb identity; with `host`, also connect the device |
+| `POST /api/adb/sync` | `{ host? }` | hub: push the identity to every member → `{ ok, output, results }` |
 
 These sit behind the same Tailscale boundary as the rest of the daemon (no app-layer auth, by design —
 see `tailscale-is-accepted-security-boundary`).
+
+## One pairing, whole fleet
+
+adb trust — both the Android-11 wireless pairing and the legacy "Allow debugging?" RSA approval — is
+bound to the adb **key**, not the machine. So the fleet shares one identity instead of pairing N×M:
+
+- The phone pairs with the **hub only**, through the app's ADB card. Nothing interactive ever happens
+  on a server: the pairing dialog and the 6-digit code live on the phone, the code is typed into the
+  Anvil app, and the daemon just runs `adb pair` — closet-friendly.
+- On every successful auto-connect, the hub POSTs its `~/.android/adbkey` pair to each member's
+  `/api/adb/key` (same transport rules as Todoist token propagation: https-then-http per member,
+  tailnet-gated, WireGuard-encrypted hop). Members back up any prior key to `adbkey.bak`, install the
+  fleet key (0600), and `adb kill-server` so it takes effect. A member without adb self-installs
+  platform-tools in the background.
+- The same POST carries the phone's tailnet IP, so each member immediately runs
+  `adb connect <phone>:5555` — the shared key is already trusted, so no prompt appears anywhere. The
+  device shows up in `adb devices` on **every server** each time the app opens.
+- The settings card's **Sync to fleet** button pushes the key on demand (e.g. right after adding a
+  new server) without needing the phone connected.
+
+Members never pair, never prompt, and never need the phone's pairing dialog. Adding a fourth server =
+pair nothing; the next app launch (or Sync to fleet) makes it debug-ready. More devices (tablet etc.):
+each device pairs with the hub once, and the whole fleet inherits it the same way.
 
 ## Headless servers: self-installing adb
 
