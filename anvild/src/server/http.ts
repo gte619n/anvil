@@ -36,7 +36,7 @@ import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
-import { ADB_PIN_PORT, adbAuto, adbDisconnect, adbTarget, connectedOk, findAdb, installAdbIdentity, installPlatformTools, readAdbIdentity, runAdb } from "./adb";
+import { ADB_PIN_PORT, adbAuto, adbDisconnect, adbEnsureConnected, adbTarget, connectedOk, findAdb, installAdbIdentity, installPlatformTools, readAdbIdentity, rememberAdbDevice, rememberedAdbHost, runAdb } from "./adb";
 import { VERSION } from "../version";
 
 export { VERSION };
@@ -1025,13 +1025,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // ADB wifi (Android client): connect / pair the Mac with a phone's wireless-debugging endpoint
   route("GET", "/api/adb/info", async () => {
     const adb = findAdb();
+    // Self-heal: if this machine has connected before but nothing's attached now (dropped link, adb
+    // server restart, phone reboot), silently re-dial the remembered phone with the shared key before
+    // reporting — so just viewing the card reconnects. No-op when already connected or never set up.
+    if (adb) await adbEnsureConnected(opts.stateDir);
     return Response.json({
       serverIps: lanIPv4(),
       adbInstalled: !!adb,
       ...(adb ? { adbPath: adb } : {}),
       devices: adb ? (await runAdb(["devices", "-l"])).output : "",
+      knownDevice: rememberedAdbHost(opts.stateDir),
     });
   });
+  // Reconnect THIS machine to the phone it last saw, using the fleet-shared key (no phone needed).
+  // The lever for "my project session's machine can't see the phone" — hit it against that server
+  // (the per-server base URL), or an agent in a session can curl it on its own host.
+  route("POST", "/api/adb/reconnect", async () => Response.json(await adbEnsureConnected(opts.stateDir)));
   // Install platform-tools on the server (headless-friendly): downloads Google's official zip.
   route("POST", "/api/adb/install", async () => Response.json(await installPlatformTools()));
   route(
@@ -1067,6 +1076,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       let output = inst.output;
       let connected: boolean | undefined;
       if (host) {
+        rememberAdbDevice(opts.stateDir, host); // remember even if adb installs later — the keepalive re-dials
         if (findAdb()) {
           const r = await runAdb(["connect", adbTarget(host, ADB_PIN_PORT)]);
           connected = connectedOk(r.output);
@@ -1091,7 +1101,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
     if (members.length === 0) return { ok: true, output: "No fleet members on this server — nothing to sync.", results: [] };
     const id = await readAdbIdentity();
     if (!id) return { ok: false, output: "This server has no adb identity yet (adb never ran and keygen failed) — connect once, then retry.", results: [] };
-    const results = await propagateAdbIdentity({ members, ...id, ...(connectHost ? { connectHost } : {}) });
+    // Default to the phone this hub last saw, so "Re-sync servers" (no host) still makes members
+    // actually connect — not just receive the key. Sharing the key without connecting is why a member
+    // could hold trust yet show no device.
+    const host = connectHost ?? rememberedAdbHost(opts.stateDir) ?? undefined;
+    const results = await propagateAdbIdentity({ members, ...id, ...(host ? { connectHost: host } : {}) });
     const okCount = results.filter((r) => r.ok).length;
     const lines = results.map((r) => `  ${r.serverName ?? r.url}: ${r.ok ? (r.output ?? "ok") : `failed — ${r.error ?? "unknown"}`}`);
     return { ok: okCount === results.length, output: [`Fleet debug sync — ${okCount}/${results.length} server(s) ready:`, ...lines].join("\n"), results };
@@ -1112,6 +1126,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     withJsonBody<{ host?: string; port?: number }>(async ({ host, port }) => {
       if (!host) return new Response("host required", { status: 400 });
       const r = await adbAuto(host, port);
+      if (r.ok && r.authorized) rememberAdbDevice(opts.stateDir, host); // so this hub re-dials on its own later
       if (!r.ok || !r.authorized || fleet.list().length === 0) return Response.json(r);
       const sync = await adbFleetSync(host);
       return Response.json({ ...r, fleet: sync.results, output: `${r.output}\n${sync.output}` });
@@ -1381,10 +1396,36 @@ export function createServer(opts: ServerOptions): ServerHandle {
     return new Response("not found", { status: 404 });
   }
 
+  // ADB keepalive: once this machine has ever connected to a phone, keep itself connected so a session
+  // (agent) running here always sees the device — the phone's app only ever re-dials the hub, so
+  // members would otherwise go stale after any drop. Self-limiting: `adbEnsureConnected` is a no-op
+  // when a device is already attached, so in steady state this never dials — it only reconnects an
+  // actually-dropped link.
+  //
+  // Jittered, not a fixed interval: a shared event (phone reboot, or a fleet update that restarts every
+  // daemon together) would otherwise align all machines' timers and make them re-dial the phone in the
+  // same instant. A random 30–60s gap per tick lets the fleet drift apart, spreading reconnects across
+  // the window. (Concurrent connections themselves are fine — the shared key is designed for every
+  // server to debug at once — this is just load hygiene on the phone's adbd.) `unref` so it never holds
+  // the process (or a test) open.
+  let adbKeepalive: ReturnType<typeof setTimeout> | undefined;
+  const scheduleAdbKeepalive = (): void => {
+    adbKeepalive = setTimeout(
+      () => {
+        if (rememberedAdbHost(opts.stateDir)) void adbEnsureConnected(opts.stateDir);
+        scheduleAdbKeepalive();
+      },
+      30_000 + Math.floor(Math.random() * 30_000),
+    );
+    adbKeepalive.unref?.();
+  };
+  scheduleAdbKeepalive();
+
   return {
     port: server.port ?? opts.port,
     stop: () => server.stop(true),
     shutdown: async () => {
+      if (adbKeepalive) clearTimeout(adbKeepalive);
       await supervisor.shutdown();
       server.stop(true);
     },

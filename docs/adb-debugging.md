@@ -58,7 +58,8 @@ port was lost.
 | `POST /api/adb/pair` | `{ host, port, code }` | `{ ok, output }` |
 | `POST /api/adb/disconnect` | `{ host? }` | `{ ok, output }` |
 | `POST /api/adb/key` | `{ key, pub, host? }` | member landing point: install the fleet adb identity; with `host`, also connect the device |
-| `POST /api/adb/sync` | `{ host? }` | hub: push the identity to every member → `{ ok, output, results }` |
+| `POST /api/adb/sync` | `{ host? }` | hub: push the identity to every member (defaults `host` to the phone this hub last saw) → `{ ok, output, results }` |
+| `POST /api/adb/reconnect` | — | re-dial the phone this server last saw, using the shared key → `{ connected, reconnected, host, output }` |
 
 These sit behind the same Tailscale boundary as the rest of the daemon (no app-layer auth, by design —
 see `tailscale-is-accepted-security-boundary`).
@@ -85,6 +86,30 @@ bound to the adb **key**, not the machine. So the fleet shares one identity inst
 Members never pair, never prompt, and never need the phone's pairing dialog. Adding a fourth server =
 pair nothing; the next app launch (or Sync to fleet) makes it debug-ready. More devices (tablet etc.):
 each device pairs with the hub once, and the whole fleet inherits it the same way.
+
+### Staying connected (why a session sees the phone)
+
+`adb connect` state lives only in a machine's adb-server process (`127.0.0.1:5037`), and only while the
+link holds. A build/debug **session** (an agent) on a machine shares that adb server, so once the
+machine is connected the session sees the phone — the job is keeping each machine connected without the
+phone, whose app only ever re-dials the hub. So each daemon:
+
+- **remembers** the last phone it reached (`<stateDir>/adb-device.json`), written on every connect and
+  on a key-push that carries a host;
+- **self-heals** on status load (`GET /api/adb/info` runs an ensure-connected first) and on an explicit
+  `POST /api/adb/reconnect`;
+- **re-dials on a timer** — a keepalive runs one `adb connect` only while a phone is remembered and
+  nothing's attached, using the shared key (no prompt). It's a no-op on a healthy link, so in steady
+  state nothing dials. The interval is **jittered (30–60s per tick), not fixed**, so a shared event
+  (phone reboot, or a fleet update that restarts every daemon at once) doesn't align the whole fleet
+  into re-dialing the phone in the same instant — the machines drift apart and spread the load.
+
+So after the one-time hub fan-out, a member that drops the link (adb restart, phone reboot, network
+blip) reconnects itself within ~a minute, and a session on the project's machine keeps seeing the
+device. (Several servers holding a live connection at once is expected — the shared key is built for
+every server to debug simultaneously; the jitter is just hygiene on the phone's adbd, not correctness.)
+If you ever need to force it, **Re-sync servers** on the card reconnects the whole fleet to this phone,
+or an agent can `curl -XPOST http://localhost:7701/api/adb/reconnect` on its own host.
 
 ## Headless servers: self-installing adb
 

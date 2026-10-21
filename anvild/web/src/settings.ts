@@ -1072,9 +1072,12 @@ export function renderServerCards(): void {
         <b class="small">After that, it's automatic</b>
         <ul class="small" style="margin:6px 0 12px;padding-left:20px;line-height:1.7">
           <li>Opening Anvil reconnects <b>every server</b> — even after a reboot. The first successful connect grants the app permission to flip Wireless debugging back on by itself, so Settings never reopens.</li>
+          <li>Each server remembers this phone and quietly re-dials it, so a build/debug session on any server keeps seeing the device without you doing anything.</li>
           <li>A new server in the fleet needs no pairing: the next connect (or <b>Re-sync servers</b>) makes it debug-ready.</li>
           <li>More devices (tablet, second phone): repeat the one-time setup on each — still only ever pairing with this server.</li>
         </ul>
+        <b class="small">A session can't see the phone?</b>
+        <p class="small" style="margin:6px 0 12px">Tap <b>Re-sync servers</b> — every server reconnects to this phone with the shared key (no prompt). It takes a few seconds for the device to appear in that session's <code>adb devices</code>.</p>
         <div class="btns"><button type="button" class="primary" id="adb-help-close">Got it</button></div>
       </div>`;
       showModal(m);
