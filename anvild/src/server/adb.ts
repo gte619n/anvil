@@ -94,6 +94,26 @@ export interface AdbAutoResult {
   pinned: boolean; // reachable on ADB_PIN_PORT
   persistent: boolean; // pin survives a reboot (persist.adb.tcp.port honored by the device)
   authorized: boolean; // false when the phone still needs the "Allow debugging?" tap
+  selfToggle: boolean; // the Anvil app holds WRITE_SECURE_SETTINGS, so it can re-enable Wireless debugging itself
+}
+
+/** The Android client's application id — granted WRITE_SECURE_SETTINGS after a successful connect so
+ *  the app can flip the Wireless-debugging toggle itself from then on (AdbToggle.kt). */
+export const ANDROID_APP_ID = "com.gte619n.anvil";
+
+/** `pm grant` prints nothing on success and a one-line exception on failure (unknown permission on
+ *  APKs older than the manifest entry, "not allowed", etc.). Pure, so the phrasing is unit-tested. */
+export function grantOk(run: AdbRun): boolean {
+  return run.ok && !/exception|error|failed|not allowed|unknown/i.test(run.output.replace("(no output)", ""));
+}
+
+/** Best-effort: let the Anvil app flip the Wireless-debugging toggle itself. The grant survives
+ *  reboots and app updates, which closes the automation loop — after a reboot the app re-enables
+ *  Wireless debugging on launch and the daemon re-pins without any Settings round-trip. Failure is
+ *  fine: an APK without the manifest entry just rejects the grant and the manual toggle keeps working. */
+async function grantSelfToggle(target: string): Promise<boolean> {
+  const r = await runAdb(["-s", target, "shell", "pm", "grant", ANDROID_APP_ID, "android.permission.WRITE_SECURE_SETTINGS"]);
+  return grantOk(r);
 }
 
 async function deviceState(target: string): Promise<string> {
@@ -114,10 +134,15 @@ async function makePersistent(target: string): Promise<boolean> {
 }
 
 /** Compose the user-facing summary for an auto-connect outcome. Pure, so the phrasing is unit-tested. */
-export function summarizeAuto(target: string, state: string, persistent: boolean): string {
+export function summarizeAuto(target: string, state: string, persistent: boolean, selfToggle = false): string {
   if (state === "unauthorized") return `Connected ${target}, but the phone shows "unauthorized" — approve the "Allow debugging?" prompt on the phone.`;
   if (state !== "device") return `Connected ${target}, but it's "${state}" — give it a moment, then retry.`;
-  return `Connected ${target} — debugging ready${persistent ? ", pinned across reboots." : ", pinned until the phone reboots."}`;
+  const survival = persistent
+    ? ", pinned across reboots."
+    : selfToggle
+      ? ". After a reboot, just open Anvil on the phone — it re-enables Wireless debugging and reconnects by itself."
+      : ", pinned until the phone reboots.";
+  return `Connected ${target} — debugging ready${survival}`;
 }
 
 /**
@@ -134,10 +159,11 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   if (connectedOk(fast.output)) {
     const state = await deviceState(pin);
     const persistent = await isPersistent(pin); // report only; the pin already exists on the fast path
-    return { ok: true, output: [summarizeAuto(pin, state, persistent), fast.output].join("\n"), pinned: true, persistent, authorized: state === "device" };
+    const selfToggle = state === "device" && (await grantSelfToggle(pin));
+    return { ok: true, output: [summarizeAuto(pin, state, persistent, selfToggle), fast.output].join("\n"), pinned: true, persistent, authorized: state === "device", selfToggle };
   }
   if (!port) {
-    return { ok: false, output: `Not reachable on :${ADB_PIN_PORT} yet — open Anvil on the phone and tap Auto-connect.\n${fast.output}`, pinned: false, persistent: false, authorized: false };
+    return { ok: false, output: `Not reachable on :${ADB_PIN_PORT} yet — open Anvil on the phone and tap Auto-connect.\n${fast.output}`, pinned: false, persistent: false, authorized: false, selfToggle: false };
   }
 
   // Bootstrap: connect on the live wireless-debugging port the phone just discovered, pin adbd to the
@@ -145,7 +171,7 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   const target = adbTarget(host, port);
   const conn = await runAdb(["connect", target]);
   if (!connectedOk(conn.output)) {
-    return { ok: false, output: conn.output, pinned: false, persistent: false, authorized: false };
+    return { ok: false, output: conn.output, pinned: false, persistent: false, authorized: false, selfToggle: false };
   }
   const tcp = await runAdb(["-s", target, "tcpip", String(ADB_PIN_PORT)]);
   await Bun.sleep(1500); // adbd restarts on the pinned port; give it a beat before reconnecting
@@ -153,7 +179,8 @@ export async function adbAuto(host: string, port?: number): Promise<AdbAutoResul
   const ok = connectedOk(re.output);
   const state = ok ? await deviceState(pin) : "offline";
   const persistent = ok ? await makePersistent(pin) : false;
-  return { ok, output: [summarizeAuto(pin, state, persistent), conn.output, tcp.output, re.output].join("\n"), pinned: ok, persistent, authorized: state === "device" };
+  const selfToggle = state === "device" && (await grantSelfToggle(pin));
+  return { ok, output: [summarizeAuto(pin, state, persistent, selfToggle), conn.output, tcp.output, re.output].join("\n"), pinned: ok, persistent, authorized: state === "device", selfToggle };
 }
 
 /** Drop the adb connection to the phone's pinned port (or all connections when no host is given). */

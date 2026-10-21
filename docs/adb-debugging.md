@@ -29,8 +29,16 @@ server side is pure CLI, so this works on a box with nothing but Anvil installed
    - reconnects on `:5555` and, best-effort, sets `persist.adb.tcp.port` so the pin survives a reboot
    - The phone shows **"Allow debugging?"** once (RSA trust); approve it and the server is trusted
      from then on.
-3. **Every later launch** reconnects to `:5555` silently — no discovery, no code, no prompt. (The app
-   only does this after you've succeeded once; it records that in `anvil.adb` prefs.)
+3. **Self-toggle grant.** Riding the connection it just made, the daemon runs
+   `pm grant com.gte619n.anvil android.permission.WRITE_SECURE_SETTINGS`. That permission (not
+   grantable at runtime, but a `pm grant` sticks across reboots and app updates) lets the Anvil app
+   flip the **Wireless debugging toggle itself** (`AdbToggle.kt` writes `Settings.Global
+   adb_wifi_enabled`) — so from now on nobody ever opens Developer options again.
+4. **Every later launch** reconnects to `:5555` silently — no discovery, no code, no prompt. (The app
+   only does this after you've succeeded once; it records that in `anvil.adb` prefs.) When the fast
+   path misses *and* the app holds the self-toggle grant — the reboot case: Android cleared both the
+   pin and the Wireless-debugging toggle — the app silently turns the toggle back on, discovers the
+   fresh port, and asks the daemon to re-pin. The server is already RSA-trusted, so no prompt.
 
 The pin (`adb tcpip`) uses the old RSA-key trust, which is **independent of the Android-11 wifi
 pairing** — that's why you don't re-enter a 6-digit code after a reboot, only re-approve/re-pin if the
@@ -70,6 +78,14 @@ one-time approval stick).
   it (varies by OEM / Android version, and may need root), adbd comes back on `:5555` after a reboot
   and the silent launch reconnect just works. `adbAuto` reports this as `persistent` so the UI can tell
   the user which case they're in.
+- Where `persist.adb.tcp.port` does **not** stick (most unrooted phones), the self-toggle grant covers
+  it: on the next app launch the fast path misses, the app flips Wireless debugging back on via
+  `WRITE_SECURE_SETTINGS`, rediscovers the port, and the daemon re-pins — all silent. `adbAuto`
+  reports the grant as `selfToggle`. Net effect: after a reboot, *opening the Anvil app once* is the
+  only step; no Settings, no prompts.
+- Manual fallback (e.g. to pre-grant from a laptop before the daemon ever connects):
+  `adb shell pm grant com.gte619n.anvil android.permission.WRITE_SECURE_SETTINGS`. Revoke with
+  `pm revoke` — everything degrades back to the manual toggle.
 
 ## Troubleshooting
 
@@ -78,6 +94,7 @@ one-time approval stick).
 | Card says "adb isn't installed" | Tap Install, or `brew install android-platform-tools` on the server. |
 | "unauthorized" after connect | Approve the "Allow debugging?" prompt on the phone (tap "always allow"). |
 | Re-prompted every connect | Daemon user has no writable `HOME`; set it so `~/.android/adbkey` persists. |
-| Works, then dies after reboot | `persist.adb.tcp.port` wasn't honored; tap Auto-connect again to re-pin. |
+| Works, then dies after reboot | Open the Anvil app — with the self-toggle grant it recovers on its own. Still dead? Tap Auto-connect (re-grants too). |
 | "Not reachable on :5555 yet" on launch | Normal before first setup, or after a reboot that dropped the pin — tap Auto-connect. |
+| "Wireless debugging is off" message | The app lacks the self-toggle grant (old APK, or first run). Flip the toggle once in Developer options and tap Auto-connect — the server grants the permission over that connection. |
 | Install fails at unzip | No `unzip`/`ditto`/`tar` on the box — install `unzip`. |

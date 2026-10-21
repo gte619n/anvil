@@ -267,14 +267,20 @@ class MainActivity : ComponentActivity() {
     private fun handleBridge(data: String, reply: JavaScriptReplyProxy) {
         val json = runCatching { JSONObject(data) }.getOrNull()
         when (json?.optString("type")) {
-            "adb.connect" -> adbWifi.discover(
-                AdbWifi.CONNECT,
-                onResult = { lanHost, port ->
-                    val host = tailscaleIp() ?: lanHost // prefer the tailnet IP (LAN subnets often differ)
-                    postAdb("/api/adb/connect", JSONObject().put("host", host).put("port", port), reply, "connect", host, port)
-                },
-                onError = { msg -> replyBridge(reply, false, msg, "connect") },
-            )
+            "adb.connect" -> {
+                if (!AdbToggle.ensureOn(this)) {
+                    replyBridge(reply, false, wirelessOffMessage(), "connect")
+                    return
+                }
+                adbWifi.discover(
+                    AdbWifi.CONNECT,
+                    onResult = { lanHost, port ->
+                        val host = tailscaleIp() ?: lanHost // prefer the tailnet IP (LAN subnets often differ)
+                        postAdb("/api/adb/connect", JSONObject().put("host", host).put("port", port), reply, "connect", host, port)
+                    },
+                    onError = { msg -> replyBridge(reply, false, msg, "connect") },
+                )
+            }
             "adb.pair" -> {
                 val code = json.optString("code")
                 adbWifi.discover(
@@ -309,9 +315,15 @@ class MainActivity : ComponentActivity() {
                 prefs().edit().putBoolean(PREF_ADB_AUTO, true).apply()
                 replyBridge(reply, true, out.ifBlank { "Connected $host:5555" }, "auto") // daemon summary (pin/auth state)
             } else runOnUiThread {
-                // Not pinned yet — discover the current wireless-debugging port and let the daemon
-                // bootstrap the pin. discover() drives NsdManager, so keep it on the UI thread (this
-                // callback arrives on a background HTTP thread).
+                // Not pinned yet — make sure Wireless debugging is even on (reboots reset it; with
+                // the WRITE_SECURE_SETTINGS grant we flip it back ourselves), then discover the
+                // current wireless-debugging port and let the daemon bootstrap the pin. discover()
+                // drives NsdManager, so keep it on the UI thread (this callback arrives on a
+                // background HTTP thread).
+                if (!AdbToggle.ensureOn(this)) {
+                    replyBridge(reply, false, wirelessOffMessage(), "auto")
+                    return@runOnUiThread
+                }
                 adbWifi.discover(
                     AdbWifi.CONNECT,
                     onResult = { _, port ->
@@ -379,15 +391,35 @@ class MainActivity : ComponentActivity() {
 
     private fun prefs() = getSharedPreferences("anvil.adb", MODE_PRIVATE)
 
-    /** Silent fast-path reconnect on launch: once the user has set up ADB auto-connect (the pin
-     *  survives on the phone until reboot, and the Mac stays RSA-trusted), the daemon can reach the
-     *  phone again with no prompt. No discovery, no toast — bootstrapping the pin is the explicit
-     *  "Auto-connect" button in settings, never fired silently. */
+    /** Silent reconnect on launch, once the user has set up ADB auto-connect. Fast path: the pin
+     *  survives on the phone until reboot and the Mac stays RSA-trusted, so a plain connect works.
+     *  When the fast path misses — typically a reboot cleared both the pin and the Wireless-debugging
+     *  toggle — and we hold the WRITE_SECURE_SETTINGS grant, recover without any user action: flip
+     *  the toggle back on, discover the fresh port, and let the daemon re-pin. The server is already
+     *  RSA-trusted, so no prompt appears. Without the grant, stay silent as before (re-pinning is
+     *  the explicit "Auto-connect" button). */
     private fun maybeAutoAdb() {
         if (!prefs().getBoolean(PREF_ADB_AUTO, false)) return
         val host = tailscaleIp() ?: return
-        postAdbAuto(host, null) { _, _ -> /* silent: a miss just means "not reconnected yet" */ }
+        postAdbAuto(host, null) { ok, _ ->
+            if (ok) return@postAdbAuto
+            if (!AdbToggle.canToggle(this)) return@postAdbAuto // silent: a miss just means "not reconnected yet"
+            runOnUiThread {
+                if (!AdbToggle.ensureOn(this)) return@runOnUiThread
+                adbWifi.discover(
+                    AdbWifi.CONNECT,
+                    onResult = { _, port -> postAdbAuto(host, port) { _, _ -> /* silent */ } },
+                    onError = { /* silent */ },
+                )
+            }
+        }
     }
+
+    /** Actionable message when Wireless debugging is off and we can't flip it ourselves. */
+    private fun wirelessOffMessage(): String =
+        "Wireless debugging is off. Turn it on in Settings → Developer options, or run Auto-connect once with it on — " +
+            "the server then grants Anvil the toggle (pm grant $packageName android.permission.WRITE_SECURE_SETTINGS) " +
+            "so this becomes automatic."
 
     private fun replyBridge(reply: JavaScriptReplyProxy, ok: Boolean, message: String, stage: String) {
         val json = JSONObject().put("type", "adb.result").put("ok", ok).put("stage", stage).put("message", message).toString()

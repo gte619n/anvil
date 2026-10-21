@@ -1033,7 +1033,7 @@ export function renderServerCards(): void {
       <div class="git-row" style="margin-top:10px" id="adb-install-row" hidden><button class="primary" id="adb-install">${icon("download")} Install platform-tools on server</button></div>
       <div id="adb-controls">
         <div class="git-row" style="margin-top:10px"><button class="primary" id="adb-auto">${icon("wifi")} Auto-connect</button><button id="adb-connect">${icon("wifi")} Connect once</button><button id="adb-disconnect">${icon("wifi_off")} Disconnect</button></div>
-        <div class="small muted" style="margin-top:6px">Auto-connect pins debugging to a stable port, so every later launch reconnects on its own (until the phone reboots). Approve the one-time “Allow debugging?” prompt on the phone the first time.</div>
+        <div class="small muted" style="margin-top:6px">Auto-connect pins debugging to a stable port and lets Anvil flip the Wireless-debugging toggle itself from then on — after a reboot, just open the app and it reconnects on its own. Approve the one-time “Allow debugging?” prompt on the phone the first time.</div>
         <hr />
         <div class="small muted">First time on this Mac? On the phone open <b>Settings → Developer options → Wireless debugging → Pair device with pairing code</b>, then enter the 6-digit code here:</div>
         <div class="git-row" style="margin-top:8px">

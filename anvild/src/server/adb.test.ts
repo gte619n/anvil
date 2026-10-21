@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ADB_PIN_PORT, adbCandidatePaths, adbTarget, connectedOk, parseDeviceState, platformToolsUrl, summarizeAuto } from "./adb";
+import { ADB_PIN_PORT, ANDROID_APP_ID, adbCandidatePaths, adbTarget, connectedOk, grantOk, parseDeviceState, platformToolsUrl, summarizeAuto } from "./adb";
 
 // These guard the string/URL/parsing logic the ADB passthrough depends on — the parts that are easy
 // to get subtly wrong (adb connect exits 0 even when it failed; get-state phrasing varies) and that
@@ -50,9 +50,29 @@ describe("summarizeAuto", () => {
   test("ready + non-persistent says until reboot", () => {
     expect(summarizeAuto("100.64.0.1:5555", "device", false)).toContain("until the phone reboots");
   });
+  test("ready + self-toggle says reopening the app recovers", () => {
+    const s = summarizeAuto("100.64.0.1:5555", "device", false, true);
+    expect(s).toContain("debugging ready");
+    expect(s).toContain("re-enables Wireless debugging");
+  });
   test("unauthorized points the user at the Allow prompt", () => {
     expect(summarizeAuto("100.64.0.1:5555", "unauthorized", false)).toContain("Allow debugging");
   });
+});
+
+describe("grantOk", () => {
+  // `pm grant` exits 0 and prints nothing on success; failures print a one-line exception.
+  test("silent success", () => expect(grantOk({ ok: true, output: "(no output)", code: 0 })).toBe(true));
+  test("unknown permission (old APK without the manifest entry)", () => {
+    expect(grantOk({ ok: false, output: "java.lang.IllegalArgumentException: Unknown permission: android.permission.WRITE_SECURE_SETTINGS", code: 255 })).toBe(false);
+  });
+  test("exit 0 but exception text still fails", () => {
+    expect(grantOk({ ok: true, output: "java.lang.SecurityException: Permission android.permission.WRITE_SECURE_SETTINGS is not a changeable permission type", code: 0 })).toBe(false);
+  });
+});
+
+describe("ANDROID_APP_ID", () => {
+  test("matches the app's applicationId", () => expect(ANDROID_APP_ID).toBe("com.gte619n.anvil"));
 });
 
 describe("ADB_PIN_PORT", () => {
