@@ -78,3 +78,15 @@ test("a background sub-agent's subagent.settled is persisted and folds into the 
   expect(log.snapshot("s1", 1, "ep").events).toEqual([{ kind: "subagent_settled", ts: expect.anything(), agent }]);
   rmSync(d, { recursive: true, force: true });
 });
+
+test("orphanedBackgroundAgents: launch acks still running with no later settle", () => {
+  const d = mkdtempSync(join(tmpdir(), "anvil-log-"));
+  const log = new EventLog(d);
+  const bg = (id: string): SubAgentView => ({ id, label: id, state: "running", steps: 0, background: true });
+  log.append(ev(1, "tool.result", { toolUseId: "a", content: "", isError: false, subagent: bg("a") }));
+  log.append(ev(2, "tool.result", { toolUseId: "b", content: "", isError: false, subagent: bg("b") }));
+  log.append(ev(3, "tool.result", { toolUseId: "c", content: "", isError: false, subagent: { id: "c", label: "c", state: "done", steps: 1 } }));
+  log.append(ev(4, "subagent.settled", { agent: { ...bg("a"), state: "done" } }));
+  expect(log.orphanedBackgroundAgents().map((a) => a.id)).toEqual(["b"]);
+  rmSync(d, { recursive: true, force: true });
+});

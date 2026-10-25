@@ -318,6 +318,9 @@ What changed:
   `subagent.settled` event, folded into snapshots as `subagent_settled` and mirrored offline. This is
   what a client that slept or was closed through the whole run settles the row from. Foreground agents
   are unchanged and still settle via `tool.result.subagent`.
+- **Daemon restart**: a background agent in flight when the daemon stops dies with its CLI process, so
+  no notification can arrive. `restore()` finds them (`EventLog.orphanedBackgroundAgents`: a running
+  launch ack with no later settle) and persists a `canceled` settle, once.
 - **Status and push**: the driver flips `idle → thinking` on main-thread activity it didn't prompt
   (`signalsTurnActivity`; `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` adds the CLI's own
   `session_state_changed: running`). The "your turn" push is suppressed while a background agent still

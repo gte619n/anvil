@@ -66,3 +66,26 @@ test("after a restart, a cold client (no lastSeq) gets a full snapshot", async (
   expect(snap!.epoch).toBe(s.epoch); // snapshot seeds the client's epoch for future delta resumes
   rmSync(dir, { recursive: true, force: true });
 });
+
+// A background sub-agent in flight at restart died with the old CLI process — its task_notification can
+// never arrive. Restore must settle it durably (canceled) so a reconnecting client's row stops spinning,
+// and must not re-settle it on the NEXT restart.
+test("restart cancels an in-flight background sub-agent durably, exactly once", async () => {
+  const dir = tempState();
+  const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = await createExisting(sup1, dir);
+  const bg = { id: "toolu_bg", label: "Long audit", state: "running" as const, steps: 2, background: true };
+  sup1.get(s.id)!.emit({ type: "tool.result", toolUseId: "toolu_bg", content: "Async agent launched successfully.", isError: false, subagent: bg });
+  const before = sup1.get(s.id)!.lastSeq;
+  await sup1.shutdown(); // a real restart flushes the registry (SIGTERM handler)
+
+  const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const settled = sup2.resume(s.id, before).filter((e) => e.type === "subagent.settled") as any[];
+  expect(settled).toHaveLength(1);
+  expect(settled[0].agent).toMatchObject({ id: "toolu_bg", label: "Long audit", state: "canceled", background: true });
+
+  await sup2.shutdown();
+  const sup3 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  expect(sup3.resume(s.id, 0).filter((e) => e.type === "subagent.settled")).toHaveLength(1); // not duplicated
+  rmSync(dir, { recursive: true, force: true });
+});

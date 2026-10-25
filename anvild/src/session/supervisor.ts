@@ -2173,6 +2173,12 @@ export class Supervisor {
         const session = this.wrap(p.data, p.lastSeq, p.epoch);
         this.sessions.set(p.data.id, session);
 
+        // Background sub-agents in flight when the daemon went down died with its CLI process — no
+        // task_notification can ever arrive. Settle them durably as canceled so no device shows a row
+        // spinning forever (§sub-agents, background).
+        for (const agent of this.logs.get(p.data.id)?.orphanedBackgroundAgents() ?? []) {
+          session.emit({ type: "subagent.settled", agent: { ...agent, state: "canceled", currentTool: undefined } });
+        }
         if (interrupted) {
           session.emit({
             type: "assistant.message",

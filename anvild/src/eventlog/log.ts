@@ -5,6 +5,7 @@ import {
   type ConversationEvent,
   type ConversationSnapshotEvent,
   type ServerEvent,
+  type SubAgentView,
 } from "@protocol";
 import { now } from "../util/envelope";
 
@@ -91,6 +92,19 @@ export class EventLog {
       if (typeof cid === "string") out.push(cid);
     }
     return out;
+  }
+
+  /** Background sub-agents the log last saw RUNNING (their launch ack) with no `subagent.settled` after —
+   *  i.e. still in flight when the daemon went down. Their CLI process died with it, so no settle can
+   *  ever arrive; restore cancels them durably so the row doesn't spin forever (§sub-agents, background). */
+  orphanedBackgroundAgents(): SubAgentView[] {
+    const open = new Map<string, SubAgentView>();
+    for (const e of this.readAll()) {
+      const a = e as any;
+      if (e.type === "tool.result" && a.subagent?.background && a.subagent.state === "running") open.set(a.subagent.id, a.subagent);
+      else if (e.type === "subagent.settled" && a.agent?.id) open.delete(a.agent.id);
+    }
+    return [...open.values()];
   }
 
   /** Compacted snapshot for a cold attach (no/stale lastSeq), arch §6.4. */
