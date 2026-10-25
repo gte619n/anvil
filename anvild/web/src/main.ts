@@ -211,6 +211,7 @@ import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
 import { isDaemonHandledCommand } from "./sendReconcile";
 import { telemetry } from "./telemetry";
 import { canDeltaResume, shouldRelightStatus } from "./resume";
+import { gaugesOf, mergeGauges, renderUsage, startUsageTicker } from "./usage";
 import { convoCache, migrateLegacyConvoCache } from "./convoCache";
 import { mirror, MIRROR_MAX_SESSIONS } from "./mirror";
 import { applyHistoryToMirror, createPrefetcher, PREFETCH_MAX_SESSIONS, type PrefetchSessionInfo } from "./prefetch";
@@ -1595,7 +1596,11 @@ function onEvent(url: string, e: ServerEvent): void {
     }
     case "budget": {
       const srv = servers.get(url);
-      if (srv) srv.budget = e.budget; // stored for any future use; no longer surfaced in the UI
+      if (srv) {
+        srv.budget = e.budget;
+        srv.budgets = gaugesOf(e);
+      }
+      paintUsage();
       return;
     }
     case "environments":
@@ -2524,3 +2529,9 @@ $("#open-settings").addEventListener("click", openSettings);
 // draft's "Open the draft" (openPlanDeepLink) and Settings → Todoist; its sidebar entry is retired.
 $("#open-loops").addEventListener("click", openLoops);
 $("#new-session-top").addEventListener("click", () => showNewSession());
+
+// ── Plan-usage gauge (arch §3) — per Claude account, merged across every server (see usage.ts) ──
+function paintUsage(): void {
+  renderUsage(document.getElementById("usage-gauge"), mergeGauges([...servers.values()].map((s) => s.budgets ?? [])));
+  startUsageTicker(paintUsage); // keep "resets in" / "updated …ago" current between budget events
+}

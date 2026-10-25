@@ -228,6 +228,11 @@ export interface Budget {
   weekSonnet?: RateWindow; // 7-day, Sonnet only
   warn: boolean;
   updatedAt?: Iso8601; // when these numbers were last refreshed from the SDK
+  /** The roster account these windows belong to (multi-account §3). Rate limits are per Claude
+   *  account, so a daemon with several accounts reports one Budget each. Absent for a pre-roster
+   *  daemon or the bare env-var token. */
+  accountId?: string;
+  accountLabel?: string; // the account's display label at send time
 }
 
 /** Ceiling on unmet stop attempts before a goal auto-clears (design D4). Shared with the web client. */
@@ -515,7 +520,10 @@ export interface TeamPlanResolvedEvent extends Envelope {
 }
 export interface BudgetEvent extends Envelope {
   type: "budget";
-  budget: Budget;
+  budget: Budget; // the most recently refreshed account's gauge (what autopilot/teams gate on)
+  /** One gauge per Claude account this daemon has a reading for, newest first. Absent on a
+   *  pre-per-account daemon — fall back to `budget`. */
+  budgets?: Budget[];
 }
 export interface EnvironmentsEvent extends Envelope {
   type: "environments";

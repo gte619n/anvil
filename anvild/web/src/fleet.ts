@@ -103,6 +103,7 @@ export interface Server {
   version?: string; // anvild version (from server.hello)
   capabilities?: string[]; // feature flags from server.hello; undefined on pre-capability builds
   budget?: Budget; // last budget snapshot (aggregate gauge, §7)
+  budgets?: Budget[]; // per-account plan-usage gauges from this server (see usage.ts)
   /** This daemon's fleet position (multi-account §7.2). Undefined on a pre-role build. */
   role?: "hub" | "member" | "standalone";
   /** Set when role === "member": the serverId of the hub that owns this machine's account roster. */

@@ -61,6 +61,7 @@ const server = ((): ReturnType<typeof createServer> => {
       clonesDir: config.clonesDir,
       warnFraction: config.warnFraction,
       softStopFraction: config.softStopFraction,
+      usagePollMs: config.usagePollMs,
       adversarialModels: config.adversarialModels,
       adversarialProvider: config.adversarialProvider,
       renderer,

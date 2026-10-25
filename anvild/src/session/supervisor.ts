@@ -151,6 +151,8 @@ export interface SupervisorConfig {
   clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
+  /** How often (ms) to re-read each account's plan windows between turns; 0 disables. Default 5 min. */
+  usagePollMs?: number;
   /** Fire one model-label refresh shortly after construction. The real daemon (main.ts) sets this; it
    *  defaults off so tests that spin up a Supervisor never make a live Models API call. The recurring
    *  ~4h refresh is always armed regardless (it just never fires within a test's lifetime). */
@@ -257,6 +259,7 @@ export class Supervisor {
   private readonly autopilot: AutopilotService;
   readonly loops: LoopService;
   private prSweepTimer?: ReturnType<typeof setInterval>;
+  private usagePollTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
@@ -435,6 +438,7 @@ export class Supervisor {
     this.autopilot.startScheduler();
     this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
+    this.startUsagePoll(cfg.usagePollMs ?? 5 * 60_000);
     this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
     // the lapo status once discovery completes so an already-connected client sees the callback URL.
@@ -481,10 +485,54 @@ export class Supervisor {
   }
 
   budget(): Budget {
-    return this.rateLimits.snapshot();
+    return this.labelBudget(this.rateLimits.snapshot());
   }
+  /** The latest gauge plus one per Claude account (rate limits are per account, not per session). */
   budgetEvent(): BudgetEvent {
-    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.rateLimits.snapshot() };
+    // A removed account's gauge would otherwise linger forever; "" (the bare env token) always stays.
+    this.rateLimits.retain((k) => k === "" || this.accounts.has(k));
+    const budgets = this.rateLimits.snapshots().map((b) => this.labelBudget(b));
+    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.budget(), budgets };
+  }
+  /** Stamp the account's CURRENT label at send time (labels are renameable; the tracker keeps ids). */
+  private labelBudget(b: Budget): Budget {
+    const label = b.accountId ? this.accounts.labelOf(b.accountId) : undefined;
+    return label ? { ...b, accountLabel: label } : b;
+  }
+  /** The tracker key for the account a session's turns bill to ("" = bare env token, no roster). */
+  private usageKey(s: Session | undefined): string {
+    return s?.data.accountId ?? this.accounts.defaultId() ?? "";
+  }
+
+  /**
+   * Keep the per-account gauge live between turns (the per-turn read only fires when a turn ends, so
+   * usage from claude.ai / another machine / an idle stretch would otherwise go unseen). Every tick,
+   * each account with a live session is re-read through ONE of its drivers — a control request, not
+   * a model turn. Skipped while no client is attached (nobody is watching). An account with no live
+   * session keeps its last-known reading; its `updatedAt` tells the client how stale it is.
+   */
+  private startUsagePoll(periodMs: number): void {
+    if (periodMs <= 0) return;
+    this.usagePollTimer = setInterval(() => {
+      if (this.registry.all().length > 0) void this.pollUsage();
+    }, periodMs);
+    this.usagePollTimer.unref?.();
+  }
+  /** One usage-poll pass (exposed for tests). Broadcasts once if any account produced a reading. */
+  async pollUsage(): Promise<void> {
+    const byAccount = new Map<string, AgentDriver>();
+    for (const [id, d] of this.drivers) {
+      const key = this.usageKey(this.sessions.get(id));
+      if (d.started && !byAccount.has(key)) byAccount.set(key, d);
+    }
+    let any = false;
+    for (const [key, d] of byAccount) {
+      const u = await d.readUsage();
+      if (!u?.rateLimits) continue;
+      this.rateLimits.update(key, u.rateLimits, u.subscriptionType);
+      any = true;
+    }
+    if (any) this.registry.toAll(this.budgetEvent());
   }
 
   // ── Environments (projects) — delegated to EnvironmentService (P7 extraction). environmentsEvent is
@@ -2086,14 +2134,14 @@ export class Supervisor {
     // The goal is now on the record — classify the remote branch prefix from the opening brief once
     // (arch §8). Fire-and-forget: a slow/failed LLM call must never hold up the turn's completion.
     if (s?.data.worktree && !s.data.worktree.remoteBranch) void this.ensureRemoteBranch(s);
-    const { budget, crossedSoftStop } = this.rateLimits.update(usage.rateLimits, usage.subscriptionType);
-    this.registry.toAll({ v: PROTOCOL_VERSION, type: "budget", ts: now(), budget });
+    const { budget, crossedSoftStop } = this.rateLimits.update(this.usageKey(s), usage.rateLimits, usage.subscriptionType);
+    this.registry.toAll(this.budgetEvent());
     if (crossedSoftStop) {
       const pct = Math.round(budget.week?.utilization ?? 0);
       this.sessions
         .get(sessionId)
         ?.emitError(
-          `Heads up: weekly plan usage is at ~${pct}% of the limit. Consider switching sessions to Sonnet or pausing nonessential work.`,
+          `Heads up: weekly plan usage${budget.accountId ? ` on "${this.accounts.labelOf(budget.accountId) ?? budget.accountId}"` : ""} is at ~${pct}% of the limit. Consider switching sessions to Sonnet or pausing nonessential work.`,
           false,
         );
     }

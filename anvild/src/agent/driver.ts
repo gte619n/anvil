@@ -122,6 +122,27 @@ export class AgentDriver {
     }
   }
 
+  /** Whether this driver has a live SDK query (so `readUsage()` can answer). */
+  get started(): boolean {
+    return !!this.q;
+  }
+
+  /**
+   * Read the plan's real rate-limit windows (the same numbers as claude.ai → Usage) through this
+   * session's live query. A control request to the CLI, not a model turn, so it costs no plan usage
+   * and is safe to call while idle — the supervisor's poll uses it to keep the gauge live between
+   * turns. The endpoint is flagged experimental by the SDK: null when not started, absent or throwing.
+   */
+  async readUsage(): Promise<{ rateLimits: unknown; subscriptionType: string | null } | null> {
+    if (!this.q) return null;
+    try {
+      const u = await this.q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+      return { rateLimits: u?.rate_limits_available ? u.rate_limits : null, subscriptionType: u?.subscription_type ?? null };
+    } catch {
+      return null; // experimental usage endpoint unavailable — keep the last-known gauge
+    }
+  }
+
   async setModel(model: Model): Promise<void> {
     try {
       await this.q?.setModel(sdkModelId(model));
@@ -380,15 +401,7 @@ export class AgentDriver {
           // Read the plan's real rate-limit windows (the same numbers as claude.ai → Usage). This
           // is the authoritative budget signal for an OAuth subscription. The endpoint is flagged
           // experimental by the SDK, so tolerate it being absent or throwing.
-          let rateLimits: unknown = null;
-          let subscriptionType: string | null = null;
-          try {
-            const u = await this.q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
-            if (u?.rate_limits_available) rateLimits = u.rate_limits;
-            subscriptionType = u?.subscription_type ?? null;
-          } catch {
-            /* experimental usage endpoint unavailable — keep the last-known gauge */
-          }
+          const { rateLimits, subscriptionType } = (await this.readUsage()) ?? { rateLimits: null, subscriptionType: null };
           // Read the live context-window occupancy (the same breakdown Claude Code's context bar shows).
           // Best-effort like the usage endpoint: absent/throwing leaves the last-known meter in place.
           let contextUsage: ContextUsage | null = null;
