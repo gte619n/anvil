@@ -1795,6 +1795,8 @@ function handleSessionEvent(e: ServerEvent): void {
     case "tool.result":
       // A sub-agent (`Task`/`Agent`) completing: settle its row (§sub-agents, D10) instead of dumping a
       // generic result — the sub-agent group IS the display. Ordinary tool results render as before.
+      // A background SHELL task (kind "shell", e.g. a CI watcher) keeps its output AND gets a tracked row.
+      if (e.subagent?.kind === "shell") appendToolResult(e.content, e.isError, e.images);
       if (e.subagent) finalizeSubAgentResult(e.subagent);
       else appendToolResult(e.content, e.isError, e.images);
       return;
@@ -1863,6 +1865,7 @@ function renderConversationEvent(ev: ConversationEvent): void {
   if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments, ev.ts, undefined, ev.rendered.source);
   else if (ev.kind === "assistant") commitAssistant(ev.blocks, ev.ts);
   else if (ev.kind === "tool_result") {
+    if (ev.subagent?.kind === "shell") appendToolResult(ev.content, ev.isError, ev.images); // background shell: output + row
     if (ev.subagent) finalizeSubAgentResult(ev.subagent); // durable sub-agent completion (reload/offline replay, D10)
     else appendToolResult(ev.content, ev.isError, ev.images);
   }

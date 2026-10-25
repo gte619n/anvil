@@ -22,13 +22,26 @@ export function mergeView(prev: SubAgentView | undefined, inc: SubAgentView): Su
     error: inc.error ?? prev.error,
   };
   if (inc.background || prev.background) out.background = true;
+  if (inc.kind ?? prev.kind) out.kind = inc.kind ?? prev.kind;
   return out;
 }
 
-/** The activity block's title: live → "Working"; ended but a background sub-agent is still running →
- *  "Background agents running" (the turn is over, the work isn't); otherwise "Worked". */
+/** The activity block's count: "· 2 sub-agents · 1 background task", else "· N steps", else "". */
+export function activityCountText(rows: Iterable<{ kind?: string }>, steps: number): string {
+  let agents = 0;
+  let shells = 0;
+  for (const r of rows) r.kind === "shell" ? shells++ : agents++;
+  const parts: string[] = [];
+  if (agents) parts.push(`${agents} sub-agent${agents === 1 ? "" : "s"}`);
+  if (shells) parts.push(`${shells} background task${shells === 1 ? "" : "s"}`);
+  if (parts.length) return `· ${parts.join(" · ")}`;
+  return steps ? `· ${steps} step${steps === 1 ? "" : "s"}` : "";
+}
+
+/** The activity block's title: live → "Working"; ended but a background sub-agent or shell task is still
+ *  running → "Background tasks running" (the turn is over, the work isn't); otherwise "Worked". */
 export function activityTitle(live: boolean, rowStates: Iterable<string | undefined>): string {
   if (live) return "Working";
-  for (const s of rowStates) if (s === "running") return "Background agents running";
+  for (const s of rowStates) if (s === "running") return "Background tasks running";
   return "Worked";
 }

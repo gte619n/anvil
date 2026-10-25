@@ -153,7 +153,8 @@ test("subAgentSignals: task_progress → a progress overlay keyed by tool_use_id
 });
 
 test("subAgentSignals: ordinary main-turn messages produce no signals", () => {
-  expect(sig({ type: "assistant", message: { content: [{ type: "text", text: "hi" }, { type: "tool_use", id: "b", name: "Bash", input: {} }] } })).toEqual([]);
+  // (A main-turn Bash/Monitor yields an inert `shell_use` candidate — see the background-shell tests below.)
+  expect(sig({ type: "assistant", message: { content: [{ type: "text", text: "hi" }, { type: "tool_use", id: "b", name: "Read", input: {} }] } })).toEqual([]);
 });
 
 test("result → result event + usage extraction", () => {
@@ -207,4 +208,21 @@ test("signalsTurnActivity: main-thread assistant/stream + session_state_changed 
   expect(t({ type: "system", subtype: "session_state_changed", state: "idle" })).toBe(false);
   expect(t({ type: "system", subtype: "task_notification", status: "completed" })).toBe(false);
   expect(t({ type: "result", subtype: "success" })).toBe(false);
+});
+
+test("a main-turn Bash/Monitor tool_use is a shell candidate; inside a sub-agent it stays a step", () => {
+  expect(sig({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "gh run watch 4021 --exit-status", description: "Watch CI", run_in_background: true } }] } })).toEqual([
+    { kind: "shell_use", taskId: "b1", tool: "Bash", label: "Watch CI" },
+  ]);
+  expect(sig({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "b2", name: "Bash", input: { command: "x".repeat(200) } }] } })[0]).toMatchObject({ label: `${"x".repeat(79)}…` });
+  expect(sig({ type: "assistant", parent_tool_use_id: "agent", message: { content: [{ type: "tool_use", id: "b3", name: "Bash", input: { command: "ls" } }] } })).toEqual([{ kind: "step", parent: "agent", tool: "Bash" }]);
+});
+
+test("asyncLaunchedToolIds: a backgrounded shell command (structured id, or the trailer after output)", () => {
+  const ids = (m: unknown) => [...asyncLaunchedToolIds(m as SDKMessage)];
+  const tr = (content: unknown, extra: Record<string, unknown> = {}) => ({ type: "user", parent_tool_use_id: null, message: { content: [{ type: "tool_result", tool_use_id: "b1", content }] }, ...extra });
+  expect(ids(tr("", { tool_use_result: { stdout: "", backgroundTaskId: "bx1" } }))).toEqual(["b1"]);
+  expect(ids(tr("Command running in background with ID: bx1. Output is being written to: /tmp/o"))).toEqual(["b1"]);
+  expect(ids(tr("building…\nCommand was manually backgrounded by user with ID: bx2. Output is being written to: /tmp/o"))).toEqual(["b1"]);
+  expect(ids(tr("total 0", { tool_use_result: { stdout: "total 0" } }))).toEqual([]);
 });

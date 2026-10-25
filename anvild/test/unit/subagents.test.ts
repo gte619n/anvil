@@ -146,3 +146,35 @@ test("reset() keeps running background agents (and their task-id binding), drops
   expect(t.snapshot().map((v) => v.id)).toEqual(["bg", "next"]); // stable order after the kept one
   expect(t.apply({ kind: "settle", sdkTaskId: "k1", status: "completed" })).toBe(true);
 });
+
+// ── Background shell tasks (§sub-agents, background shell — e.g. a `gh run watch` CI watcher) ────────
+test("a backgrounded Bash becomes a running shell row; a foreground one never does", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "shell_use", taskId: "fg", tool: "Bash", label: "ls" });
+  t.apply({ kind: "shell_use", taskId: "ci", tool: "Bash", label: "Watch CI run 4021" });
+  expect(t.finish("fg", false)).toBeUndefined(); // ordinary result → forgotten, no row
+  expect(t.finish("ci", false, undefined, true)).toEqual({ id: "ci", label: "Watch CI run 4021", type: "Shell", state: "running", steps: 0, background: true, kind: "shell" });
+  expect(t.snapshot().map((v) => v.id)).toEqual(["ci"]);
+  expect(t.hasRunningBackground()).toBe(true);
+  t.apply({ kind: "settle", taskId: "ci", status: "failed", error: "run failed" });
+  expect(t.drainSettled()).toEqual([{ id: "ci", label: "Watch CI run 4021", type: "Shell", state: "error", steps: 0, error: "run failed", background: true, kind: "shell" }]);
+});
+
+test("Monitor is always background; an errored shell launch makes no row", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "shell_use", taskId: "m", tool: "Monitor", label: "tail deploy log" });
+  t.apply({ kind: "shell_use", taskId: "bad", tool: "Bash" });
+  expect(t.finish("m", false)?.type).toBe("Monitor");
+  expect(t.finish("bad", true, "boom", true)).toBeUndefined();
+  expect(t.snapshot().map((v) => v.id)).toEqual(["m"]);
+});
+
+test("a shell candidate never outlives its turn; a running background shell row does", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "shell_use", taskId: "pending", tool: "Bash" });
+  t.apply({ kind: "shell_use", taskId: "ci", tool: "Bash" });
+  t.finish("ci", false, undefined, true);
+  t.reset();
+  expect(t.isTracked("pending")).toBe(false);
+  expect(t.snapshot().map((v) => v.id)).toEqual(["ci"]);
+});

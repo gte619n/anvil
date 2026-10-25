@@ -9,6 +9,8 @@ const ASK_USER_QUESTION = "AskUserQuestion";
 
 /** The sub-agent launcher tool: the SDK names it "Agent"; older CLIs used "Task" (see supervisor.ts). */
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
+/** Main-turn shell tools whose background runs are tracked as rows (§sub-agents, background shell). */
+const SHELL_TOOLS = new Set(["Bash", "Monitor"]);
 /** The launching message's `parent_tool_use_id` (null on the main turn, an ancestor id when nested). */
 const parentToolUseId = (m: SDKMessage): string | null => (m as any).parent_tool_use_id ?? null;
 
@@ -118,6 +120,12 @@ export function subAgentSignals(m: SDKMessage): SubAgentSignal[] {
       } else if (parent != null) {
         // A (non-Task) tool the sub-agent is running → a step on it, and its current tool.
         out.push({ kind: "step", parent, tool: typeof b.name === "string" ? b.name : undefined });
+      } else if (SHELL_TOOLS.has(b.name)) {
+        // A main-turn shell command — a candidate background task (a CI watcher, a long build). It becomes
+        // a row only if its tool.result says it went to the background (asyncLaunchedToolIds).
+        const input = (b.input ?? {}) as Record<string, unknown>;
+        const label = [input.description, input.command].find((x): x is string => typeof x === "string" && x.trim().length > 0);
+        out.push({ kind: "shell_use", taskId: b.id, tool: b.name, ...(label ? { label: label.length > 80 ? `${label.slice(0, 79)}…` : label } : {}) });
       }
     }
     // Message-level metadata the SDK stamps on sub-agent messages (best label/type source).
@@ -193,22 +201,28 @@ export function signalsTurnActivity(m: SDKMessage): boolean {
   return (m.type === "assistant" || m.type === "stream_event") && parentToolUseId(m) == null;
 }
 
-/** Async-launch acks the CLI returns for an `Agent`/`Task` that runs in the background — at launch
- *  (`run_in_background`) or when backgrounded mid-run. These tool.results are NOT the agent's end, so
- *  the sub-agent row must stay running (§sub-agents, background). Prefers the structured
- *  `tool_use_result.status` the CLI stamps on the message; falls back to the ack's fixed wording. */
+/** Tool results that are a BACKGROUND launch ack, not the work's end (§sub-agents, background):
+ *  - an `Agent`/`Task` launched in the background (at launch via `run_in_background`, or backgrounded
+ *    mid-run) — structured `tool_use_result.status: "async_launched"`, else the ack's fixed wording;
+ *  - a shell command running in the background (`Bash` with `run_in_background`, or backgrounded
+ *    mid-run) — structured `tool_use_result.backgroundTaskId`, else the CLI's "running in background"
+ *    trailer (appended after any output, so matched anywhere). (`Monitor` is always background — the
+ *    tracker knows that from the tool name, see SubAgentTracker.finish.)
+ *  Callers only act on ids they track, so a stray match on an unrelated tool is inert. */
 const ASYNC_ACK = /^(Async agent launched successfully|Cloud agent launched)\b/;
+const SHELL_BG = /Command running in background with ID:|Command was manually backgrounded by user with ID:/;
 export function asyncLaunchedToolIds(m: SDKMessage): Set<string> {
   const out = new Set<string>();
   if (m.type !== "user" || parentToolUseId(m) != null) return out;
   const content = (m as any).message?.content;
   if (!Array.isArray(content)) return out;
   const r = (m as any).tool_use_result;
-  const structured = r && typeof r === "object" && (r.status === "async_launched" || r.status === "remote_launched" || r.isAsync === true);
+  const structured =
+    r && typeof r === "object" && (r.status === "async_launched" || r.status === "remote_launched" || r.isAsync === true || (typeof r.backgroundTaskId === "string" && r.backgroundTaskId.length > 0));
   for (const b of content) {
     if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string" || b.is_error) continue;
     const text = typeof b.content === "string" ? b.content : Array.isArray(b.content) ? b.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("") : "";
-    if (structured || ASYNC_ACK.test(text.trimStart())) out.add(b.tool_use_id);
+    if (structured || ASYNC_ACK.test(text.trimStart()) || SHELL_BG.test(text)) out.add(b.tool_use_id);
   }
   return out;
 }

@@ -327,4 +327,22 @@ What changed:
   runs, so the follow-up turn's `result` is the one that notifies.
 - **Client**: rows are matched by id across the whole transcript, so a later turn's tick or settle lands
   on the original row instead of creating a duplicate. An ended block whose background agents are still
-  running reads "Background agents running". Merge rules live in `web/src/subagentView.ts`.
+  running reads "Background tasks running". Merge rules live in `web/src/subagentView.ts`.
+
+### 12.1 Background shell tasks and "I'll wait" (2026-10-25)
+
+The same machinery covers **background shell commands**: `Bash` with `run_in_background` (or
+backgrounded mid-run), and `Monitor`. These are how an agent can genuinely wait on CI, a build or a
+deploy. A main-turn shell tool_use is an inert `shell_use` candidate. It becomes a row
+(`kind: "shell"`, `type` "Shell"/"Monitor") only if its tool.result shows it went to the background
+(structured `tool_use_result.backgroundTaskId`, else the CLI's "Command running in background" trailer).
+From there it gets the background-agent behavior: the turn's "your turn" push is held, the block reads
+"Background tasks running", the CLI's `task_notification` settles it durably, a restart cancels it,
+and the CLI's self-started follow-up turn shows as thinking. Unlike an agent row, the shell's tool.result
+output still renders.
+
+The common failure, though, is an agent that *says* "I'll report when it completes" and ends its turn
+with nothing running. Nothing can resume it. `AgentDriver.TOOLING_GUIDANCE` now carries a WAITING rule:
+never promise to wait without starting a background watcher (`gh run watch … --exit-status`, a bounded
+`until …; do sleep 30; done`), and otherwise say plainly that no notification will come. This is
+model guidance, not a guarantee.

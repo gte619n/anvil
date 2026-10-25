@@ -168,7 +168,15 @@ export class AgentDriver {
     `environment (check PATH with \`command -v\`/\`which\`, look at the project's package manifests / lockfiles, ` +
     `try the obvious invocation) before concluding a tool is missing. Do NOT stop to ask the user whether a ` +
     `common tool is available — just look. Only ask the user when a tool genuinely needs to be installed or ` +
-    `downloaded first, or when it truly cannot be found after searching.`;
+    `downloaded first, or when it truly cannot be found after searching.` +
+    `\n\nWAITING ON SOMETHING (CI runs, builds, deploys, uploads): you cannot wait by ending your turn — once ` +
+    `you stop, nothing resumes you until the user writes again. NEVER end a turn saying you'll wait, check back, ` +
+    `or "report the moment it completes" unless something is ACTUALLY running that will wake you. To wait, start ` +
+    `a watcher with the Bash tool's \`run_in_background: true\` that exits when the thing finishes — e.g. ` +
+    `\`gh run watch <run-id> --exit-status\`, or a poll loop like \`until <check>; do sleep 30; done\` — then end ` +
+    `your turn; you are notified automatically when that command exits, and you continue from there. Give the ` +
+    `watcher a timeout so it can't hang forever. If you can't set up a watcher, say plainly that you will NOT ` +
+    `be notified and the user should ask for a status later.`;
 
   /**
    * Keep Claude Code's default system prompt, but for worktree sessions pin it to the worktree

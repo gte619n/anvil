@@ -134,3 +134,85 @@ test("the query dying cancels a background agent durably", () => {
   s.cancelRunningSubAgents();
   expect((appended.find((e) => e.type === "subagent.settled") as any)?.agent.state).toBe("canceled");
 });
+
+// The "I'll report the moment it completes" case (CI, a long build): the agent starts a BACKGROUND Bash
+// watcher, says it will report, and ends its turn. The watcher's exit is what wakes it.
+test("a background CI watcher stays tracked past the turn, settles durably, and its exit wakes the session", async () => {
+  const { s, appended, statuses } = makeSession();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let firstTurnDone!: () => void;
+  const firstTurn = new Promise<void>((r) => (firstTurnDone = r));
+  let systemAppend = "";
+  const q: any = {
+    async *[Symbol.asyncIterator]() {
+      yield assistant([{ type: "tool_use", id: "toolu_ci", name: "Bash", input: { command: "gh run watch 40212314146 --exit-status", description: "Watch Android APK run", run_in_background: true } }]);
+      yield { type: "system", subtype: "task_started", task_id: "bx1", tool_use_id: "toolu_ci", description: "Watch Android APK run", task_type: "local_bash" };
+      yield {
+        type: "user",
+        parent_tool_use_id: null,
+        message: { content: [{ type: "tool_result", tool_use_id: "toolu_ci", content: "Command running in background with ID: bx1. Output is being written to: /tmp/bx1.output. You will be notified when it completes." }] },
+        tool_use_result: { stdout: "", stderr: "", interrupted: false, backgroundTaskId: "bx1" },
+      };
+      yield assistant([{ type: "text", text: "Build is ~9 min in. I'll report the moment it completes." }]);
+      yield result();
+      firstTurnDone();
+      await gate; // … CI runs …
+      yield { type: "system", subtype: "task_notification", task_id: "bx1", tool_use_id: "toolu_ci", status: "completed", output_file: "/tmp/bx1.output", summary: "Watch Android APK run" };
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield assistant([{ type: "text", text: "APK uploaded to Firebase App Distribution." }]);
+      yield result();
+      await new Promise(() => {});
+    },
+    interrupt: async () => {},
+    setModel: async () => {},
+  };
+  const driver = new AgentDriver(
+    s,
+    { render: (t: string) => ({ source: t, html: t }) } as never,
+    new PermissionBroker(),
+    new QuestionBroker(),
+    {},
+    () => {},
+    undefined,
+    undefined,
+    undefined,
+    ((args: { options: { systemPrompt: { append?: string } } }) => {
+      systemAppend = args.options.systemPrompt.append ?? "";
+      return q;
+    }) as never,
+  );
+
+  driver.prompt("ship the android build and tell me when it's up");
+  await firstTurn;
+  await new Promise((r) => setTimeout(r, 5));
+
+  // Every session is told how to wait for real (a background watcher), not by promising and stopping.
+  expect(systemAppend).toContain("WAITING ON SOMETHING");
+  expect(systemAppend).toContain("run_in_background");
+
+  // Turn 1 ended with the watcher still running: tracked as a background SHELL row, output kept.
+  expect(s.data.status).toBe("idle");
+  expect(s.hasRunningBackgroundSubAgents()).toBe(true);
+  const ack = appended.find((e) => e.type === "tool.result") as any;
+  expect(ack.content).toContain("Command running in background");
+  expect(ack.subagent).toMatchObject({ id: "toolu_ci", label: "Watch Android APK run", type: "Shell", kind: "shell", state: "running", background: true });
+
+  release();
+  for (let i = 0; i < 100 && appended.filter((e) => e.type === "result").length < 2; i++) await new Promise((r) => setTimeout(r, 2));
+  await new Promise((r) => setTimeout(r, 5));
+
+  const settled = appended.find((e) => e.type === "subagent.settled") as any;
+  expect(settled?.agent).toMatchObject({ id: "toolu_ci", kind: "shell", state: "done" });
+  expect(s.hasRunningBackgroundSubAgents()).toBe(false);
+  expect(statuses.slice(statuses.indexOf("idle") + 1, statuses.lastIndexOf("idle"))).toContain("thinking");
+  await driver.stop();
+});
+
+test("a foreground Bash leaves no trace in the sub-agent tracker", () => {
+  const { s, appended } = makeSession();
+  s.applySubAgentSignals([{ kind: "shell_use", taskId: "b", tool: "Bash", label: "ls" }]);
+  expect(s.finishSubAgent("b", false)).toBeUndefined();
+  expect(s.subAgents.hasAny()).toBe(false);
+  expect(appended).toHaveLength(0);
+});

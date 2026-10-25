@@ -236,7 +236,7 @@ test("background: the turn ends with the agent still running, and the block says
   expect(r.initErr).toBeNull();
   expect(r.rows).toBe(1);
   expect(r.states).toEqual(["running"]);
-  expect(r.html).toContain("Background agents running");
+  expect(r.html).toContain("Background tasks running");
   expect(r.html).toContain("background");
 }, 30_000);
 
@@ -257,7 +257,7 @@ test("background: a later turn's live tick + durable settle land on the ORIGINAL
   expect(r.states).toEqual(["done"]);
   expect(r.html).toContain("9 steps");
   expect(r.html).toContain("ran in background");
-  expect(r.html).not.toContain("Background agents running");
+  expect(r.html).not.toContain("Background tasks running");
 }, 30_000);
 
 test("background: a client that slept through it settles the row from the reload snapshot", () => {
@@ -282,4 +282,20 @@ test("background: a client that slept through it settles the row from the reload
   expect(r.rows).toBe(1);
   expect(r.states).toEqual(["error"]);
   expect(r.html).toContain("rate limited");
+}, 30_000);
+
+test("background shell (CI watcher): its output still renders AND a running 'background task' row tracks it", () => {
+  const r = runBoot([
+    status(1, "thinking"),
+    bashLaunch(2, "toolu_ci"),
+    env({ type: "tool.result", toolUseId: "toolu_ci", content: "Command running in background with ID: bx1.", isError: false, subagent: { id: "toolu_ci", label: "Watch Android APK run", type: "Shell", state: "running", steps: 0, background: true, kind: "shell" } }, 3),
+    result(4),
+  ]);
+  expect(r.initErr).toBeNull();
+  expect(r.rows).toBe(1);
+  expect(r.states).toEqual(["running"]);
+  expect(r.html).toContain("Command running in background"); // the output isn't swallowed by the row
+  expect(r.html).toContain("Watch Android APK run");
+  expect(r.html).toContain("1 background task");
+  expect(r.html).toContain("Background tasks running");
 }, 30_000);

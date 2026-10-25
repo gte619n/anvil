@@ -1254,6 +1254,10 @@ export interface SubAgentView {
    *  tool.result returned at once, the turn may already have ended, and it settles later via
    *  `subagent.settled`. */
   background?: boolean;
+  /** "shell": a background SHELL task (a `Bash` command run in the background — e.g. a `gh run watch` CI
+   *  watcher — or a `Monitor`), tracked like a background sub-agent so the session never looks finished
+   *  while it runs. Absent = a `Task`/`Agent` sub-agent. A shell row's tool.result still renders its output. */
+  kind?: "shell";
 }
 
 /**

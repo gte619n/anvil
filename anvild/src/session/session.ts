@@ -194,11 +194,12 @@ export class Session {
   /** A sub-agent's launching Task tool.result arrived → settle it (or, for a background launch ack, just
    *  flag it background and leave it running), broadcast, and return the settled
    *  view so the driver can stamp it onto the DURABLE tool.result (D10). Undefined if `taskId` isn't a
-   *  tracked sub-agent (an ordinary tool result). */
+   *  tracked sub-agent (an ordinary tool result) — including a foreground shell command, which is only
+   *  promoted to a (background shell) row when `launchedAsync` says it went to the background. */
   finishSubAgent(taskId: string, isError: boolean, error?: string, launchedAsync = false): SubAgentView | undefined {
     if (!this.subAgents.isTracked(taskId)) return undefined;
     const view = this.subAgents.finish(taskId, isError, error, launchedAsync);
-    this.emitLive(this.subAgentActivityEvent());
+    if (view) this.emitLive(this.subAgentActivityEvent());
     return view;
   }
 

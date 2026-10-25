@@ -36,7 +36,7 @@ import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serve
 import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
-import { activityTitle, isSettled, mergeView } from "./subagentView";
+import { activityCountText, activityTitle, isSettled, mergeView } from "./subagentView";
 import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session, SubAgentView, ToolResultImage } from "../../protocol";
 
 // ── Injected dependencies (initConversation) ─────────────────────────────────────────────────────
@@ -471,7 +471,7 @@ function ensureActivity(): HTMLDetailsElement {
   return d;
 }
 /** Retitle any activity block from its rows' states (an ended turn whose background sub-agents still run
- *  reads "Background agents running"). Works on earlier turns' blocks too — a background agent's
+ *  reads "Background tasks running"). Works on earlier turns' blocks too — a background agent's
  *  settle can land on a row several turns back. */
 function retitleBlock(block: Element, live: boolean): void {
   const title = block.querySelector(".activity-title");
@@ -482,9 +482,9 @@ function updateActivityHead(): void {
   retitleBlock(activityEl, activityLive);
   const count = activityEl.querySelector(".activity-count");
   if (!count) return;
-  // Sub-agent fan-out takes the headline (D2/D13): "· 3 sub-agents". Otherwise fall back to the step count.
-  if (subAgentRows.size) count.textContent = `· ${subAgentRows.size} sub-agent${subAgentRows.size === 1 ? "" : "s"}`;
-  else count.textContent = activityCount ? `· ${activityCount} step${activityCount === 1 ? "" : "s"}` : "";
+  // Sub-agent fan-out (and background shell tasks) take the headline (D2/D13): "· 3 sub-agents · 1 background
+  // task". Otherwise fall back to the step count.
+  count.textContent = activityCountText([...subAgentRows.keys()].map((id) => subAgentModel.get(id) ?? {}), activityCount);
 }
 /** Append one step to the current activity block. `preview` is a single-line form shown in the
  *  collapsed tail; `full` (defaults to preview) is the rich form shown when expanded. */

@@ -35,7 +35,10 @@ export type SubAgentSignal =
   | { kind: "backgrounded"; taskId?: string; sdkTaskId?: string }
   // `task_notification` (or a terminal `task_updated`): the agent ended. The authoritative settle for a
   // background agent; harmless for a foreground one (its tool.result settles it the same way).
-  | { kind: "settle"; taskId?: string; sdkTaskId?: string; status: "completed" | "failed" | "stopped"; error?: string };
+  | { kind: "settle"; taskId?: string; sdkTaskId?: string; status: "completed" | "failed" | "stopped"; error?: string }
+  // A main-turn shell tool_use (`Bash`/`Monitor`). Not a row yet — it becomes one only if its tool.result
+  // shows it went to the background (see `finish`). Foreground commands are forgotten at their result.
+  | { kind: "shell_use"; taskId: string; tool: string; label?: string };
 
 interface Agent {
   id: string;
@@ -48,6 +51,7 @@ interface Agent {
   elapsedSeconds?: number;
   error?: string;
   background?: boolean;
+  shell?: boolean;
 }
 
 const SETTLED_STATE = { completed: "done", failed: "error", stopped: "canceled" } as const;
@@ -60,6 +64,8 @@ export class SubAgentTracker {
   private readonly bySdkTask = new Map<string, string>();
   /** Background agents settled since the last `drainSettled()` — the session persists these. */
   private settledQueue: Agent[] = [];
+  /** Main-turn shell tool_uses awaiting their result (tool_use id → display info). */
+  private readonly shellCandidates = new Map<string, { tool: string; label?: string }>();
   private nextOrder = 0;
 
   /** Apply one signal. Returns true iff it caused a STRUCTURAL change worth broadcasting (ID11) —
@@ -95,6 +101,10 @@ export class SubAgentTracker {
       }
       case "task": {
         this.bySdkTask.set(sig.sdkTaskId, sig.taskId);
+        return false;
+      }
+      case "shell_use": {
+        this.shellCandidates.set(sig.taskId, { tool: sig.tool, label: sig.label });
         return false;
       }
       case "backgrounded": {
@@ -151,6 +161,16 @@ export class SubAgentTracker {
   /** `launchedAsync`: the tool.result is the CLI's "launched in the background" ack, not the agent's end —
    *  flag it background and leave it running; its `task_notification` settles it later. */
   finish(taskId: string, isError: boolean, error?: string, launchedAsync = false): SubAgentView | undefined {
+    const shell = this.shellCandidates.get(taskId);
+    if (shell) {
+      // A shell tool's result: a row only if it went to the background (a CI watcher etc.).
+      this.shellCandidates.delete(taskId);
+      // `Monitor` has no foreground mode: a successful result always means it is now streaming in the background.
+      if (isError || !(launchedAsync || shell.tool === "Monitor")) return undefined;
+      const row: Agent = { id: taskId, order: this.nextOrder++, label: shell.label, type: shell.tool === "Monitor" ? "Monitor" : "Shell", state: "running", steps: 0, background: true, shell: true };
+      this.agents.set(taskId, row);
+      return toView(row);
+    }
     const a = this.agents.get(taskId);
     if (!a) return undefined;
     if (launchedAsync && !isError) {
@@ -207,7 +227,7 @@ export class SubAgentTracker {
 
   /** Whether `taskId` is a tracked depth-1 sub-agent (used by the driver to decide tool.result enrichment). */
   isTracked(taskId: string): boolean {
-    return this.agents.has(taskId);
+    return this.agents.has(taskId) || this.shellCandidates.has(taskId);
   }
 
   /** New user turn → drop the prior turn's sub-agents (ID12) — except background agents still running,
@@ -216,6 +236,7 @@ export class SubAgentTracker {
     const keep = [...this.agents.values()].filter((a) => a.background && a.state === "running");
     const keepIds = new Set(keep.map((a) => a.id));
     this.agents.clear();
+    this.shellCandidates.clear();
     for (const a of keep) this.agents.set(a.id, a);
     for (const [child, root] of this.ancestorOf) if (!keepIds.has(root)) this.ancestorOf.delete(child);
     for (const [sdk, id] of this.bySdkTask) if (!keepIds.has(id)) this.bySdkTask.delete(sdk);
@@ -268,11 +289,13 @@ export class SubAgentTracker {
 /** Snapshot an internal agent to the wire view, deriving the display label with fallbacks (D6/ID3). */
 function toView(a: Agent): SubAgentView {
   const label = a.label ?? (a.type ? `${a.type} #${a.order + 1}` : `Sub-agent #${a.order + 1}`);
+  // (shell rows: label = the command's description, else the command itself — see map.ts shell_use)
   const v: SubAgentView = { id: a.id, label, state: a.state, steps: a.steps };
   if (a.type) v.type = a.type;
   if (a.currentTool) v.currentTool = a.currentTool;
   if (typeof a.elapsedSeconds === "number") v.elapsedSeconds = a.elapsedSeconds;
   if (a.error) v.error = a.error;
   if (a.background) v.background = true;
+  if (a.shell) v.kind = "shell";
   return v;
 }
