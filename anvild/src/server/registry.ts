@@ -26,7 +26,7 @@ function isDroppable(type: string): boolean {
  *  §4.3) — exactly the set the client's mirror stores (matches the eventlog snapshot fold). Never
  *  `assistant.delta`, never transient control frames. */
 function isShadowable(type: string): boolean {
-  return type === "message.user" || type === "assistant.message" || type === "tool.result" || type === "result" || type === "file.offer";
+  return type === "message.user" || type === "assistant.message" || type === "tool.result" || type === "result" || type === "file.offer" || type === "subagent.settled";
 }
 function isShadowing(ws: ServerWebSocket<ConnState>, sessionId: string): boolean {
   const sh = ws.data.shadow;

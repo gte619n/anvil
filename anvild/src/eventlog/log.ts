@@ -116,6 +116,10 @@ export class EventLog {
         case "file.offer":
           events.push({ kind: "file_offer", ts: a.ts, file: a.file });
           break;
+        case "subagent.settled":
+          // A background sub-agent's real end (§sub-agents, background) — its tool.result was the launch ack.
+          events.push({ kind: "subagent_settled", ts: a.ts, agent: a.agent });
+          break;
         default:
           break; // status / usage / tool.use / permission.request|resolved / error are not part of the snapshot
       }

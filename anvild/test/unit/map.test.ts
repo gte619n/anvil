@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { mapMessage, extractSessionId, extractResultUsage, askUserQuestionToolIds, subAgentSignals, toolResultImages } from "../../src/agent/map";
+import { mapMessage, extractSessionId, extractResultUsage, askUserQuestionToolIds, asyncLaunchedToolIds, signalsTurnActivity, subAgentSignals, toolResultImages } from "../../src/agent/map";
 import { PassthroughRenderer } from "../../src/render/markdown";
 
 const r = new PassthroughRenderer();
@@ -166,4 +166,45 @@ test("result → result event + usage extraction", () => {
 test("extractSessionId pulls session_id when present", () => {
   expect(extractSessionId({ type: "system", session_id: "abc" } as unknown as SDKMessage)).toBe("abc");
   expect(extractSessionId({ type: "system" } as unknown as SDKMessage)).toBeUndefined();
+});
+
+// ── Background sub-agents (§sub-agents, background) ──────────────────────────────────────────────
+test("a run_in_background Agent launch is flagged background", () => {
+  const out = sig({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t1", name: "Agent", input: { description: "d", run_in_background: true } }] } });
+  expect(out).toEqual([{ kind: "start", taskId: "t1", launchedBy: null, type: undefined, label: "d", background: true }]);
+});
+
+test("task_started / task_updated / task_notification → task, backgrounded, settle signals", () => {
+  expect(sig({ type: "system", subtype: "task_started", task_id: "k1", tool_use_id: "t1", description: "d" })).toEqual([{ kind: "task", taskId: "t1", sdkTaskId: "k1" }]);
+  expect(sig({ type: "system", subtype: "task_updated", task_id: "k1", patch: { is_backgrounded: true } })).toEqual([{ kind: "backgrounded", sdkTaskId: "k1" }]);
+  expect(sig({ type: "system", subtype: "task_updated", task_id: "k1", patch: { status: "killed" } })).toEqual([{ kind: "settle", sdkTaskId: "k1", status: "stopped" }]);
+  expect(sig({ type: "system", subtype: "task_notification", task_id: "k1", tool_use_id: "t1", status: "failed", summary: "boom", output_file: "" })).toEqual([
+    { kind: "settle", taskId: "t1", sdkTaskId: "k1", status: "failed", error: "boom" },
+  ]);
+  expect(sig({ type: "system", subtype: "task_notification", task_id: "k1", tool_use_id: "t1", status: "completed", summary: "ok", output_file: "" })).toEqual([
+    { kind: "settle", taskId: "t1", sdkTaskId: "k1", status: "completed" },
+  ]);
+  expect(sig({ type: "system", subtype: "task_updated", task_id: "k1", patch: { status: "running" } })).toEqual([]);
+});
+
+test("asyncLaunchedToolIds: structured tool_use_result, the ack wording, and not an ordinary result", () => {
+  const ids = (m: unknown) => [...asyncLaunchedToolIds(m as SDKMessage)];
+  const tr = (content: unknown, extra: Record<string, unknown> = {}) => ({ type: "user", parent_tool_use_id: null, message: { content: [{ type: "tool_result", tool_use_id: "t1", content }] }, ...extra });
+  expect(ids(tr("whatever", { tool_use_result: { status: "async_launched", isAsync: true } }))).toEqual(["t1"]);
+  expect(ids(tr([{ type: "text", text: "Async agent launched successfully. agentId: a" }]))).toEqual(["t1"]);
+  expect(ids(tr("Cloud agent launched. taskId: x"))).toEqual(["t1"]);
+  expect(ids(tr("Found 3 files", { tool_use_result: { status: "completed" } }))).toEqual([]);
+  // a sub-agent's own inner tool results are never the launch ack
+  expect(ids({ ...tr("Async agent launched successfully."), parent_tool_use_id: "p" })).toEqual([]);
+});
+
+test("signalsTurnActivity: main-thread assistant/stream + session_state_changed running only", () => {
+  const t = (m: unknown) => signalsTurnActivity(m as SDKMessage);
+  expect(t({ type: "assistant", parent_tool_use_id: null, message: { content: [] } })).toBe(true);
+  expect(t({ type: "stream_event", parent_tool_use_id: null, event: { type: "message_start" } })).toBe(true);
+  expect(t({ type: "assistant", parent_tool_use_id: "sub", message: { content: [] } })).toBe(false); // a background agent's own chatter
+  expect(t({ type: "system", subtype: "session_state_changed", state: "running" })).toBe(true);
+  expect(t({ type: "system", subtype: "session_state_changed", state: "idle" })).toBe(false);
+  expect(t({ type: "system", subtype: "task_notification", status: "completed" })).toBe(false);
+  expect(t({ type: "result", subtype: "success" })).toBe(false);
 });

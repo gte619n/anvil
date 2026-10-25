@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROTOCOL_VERSION } from "@protocol";
+import { PROTOCOL_VERSION, type SubAgentView } from "@protocol";
 import { EventLog } from "../../src/eventlog/log";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "anvil-log-"));
@@ -66,5 +66,15 @@ test("[BE2-6] after hydration, reads are served from the in-memory tail (no re-p
   // A new append after hydration is reflected without touching disk on the read.
   log.append(ev(3, "result", { stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, turns: 1 } }));
   expect(log.since(2).map((e) => (e as any).seq)).toEqual([3]);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test("a background sub-agent's subagent.settled is persisted and folds into the snapshot", () => {
+  const d = mkdtempSync(join(tmpdir(), "anvil-log-"));
+  const log = new EventLog(d);
+  const agent: SubAgentView = { id: "toolu_bg", label: "Audit", state: "done", steps: 4, background: true };
+  log.append(ev(1, "subagent.settled", { agent }));
+  expect(log.since(0).map((e) => e.type)).toEqual(["subagent.settled"]);
+  expect(log.snapshot("s1", 1, "ep").events).toEqual([{ kind: "subagent_settled", ts: expect.anything(), agent }]);
   rmSync(d, { recursive: true, force: true });
 });

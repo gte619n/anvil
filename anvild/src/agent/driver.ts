@@ -4,7 +4,7 @@ import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
 import type { CommandInfo, ContextUsage, Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
-import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
+import { askUserQuestionToolIds, asyncLaunchedToolIds, extractResultUsage, signalsTurnActivity, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
@@ -328,6 +328,10 @@ export class AgentDriver {
           });
         }
 
+        // A turn the CLI started by itself (a background sub-agent finished and its notification was fed
+        // back to the model) never went through prompt() — flip out of idle so every device shows it working.
+        if (this.session.data.status === "idle" && signalsTurnActivity(m)) this.session.setStatus("thinking");
+
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
         // Tool results are the evidence the goal judge needs (design D2) — a claim of success that
         // the tool result contradicts must be visible to it.
@@ -354,6 +358,7 @@ export class AgentDriver {
         // or a task_progress heartbeat. Broadcasts a live snapshot on structural change (ephemeral, no seq).
         this.session.applySubAgentSignals(subAgentSignals(m));
         const bodies = mapMessage(m, this.renderer);
+        const asyncLaunched = asyncLaunchedToolIds(m); // background launch acks — not the sub-agent's end
         // Screenshots (and any image blocks) the tool returned, keyed by tool_use id. Persisted below
         // as attachments and stitched onto the matching tool.result so the client can render thumbnails.
         const imagesByTool = new Map(toolResultImages(m).map((g) => [g.toolUseId, g.images]));
@@ -372,7 +377,8 @@ export class AgentDriver {
             sawToolResult = true;
             // If this result is a sub-agent (`Task`/`Agent`) completing, settle its tracker row and stamp
             // the settled summary onto the DURABLE tool.result so the row survives reload/offline (D10/ID6).
-            const view = this.session.finishSubAgent(body.toolUseId, body.isError, body.isError ? body.content : undefined);
+            // A background launch ack instead stamps the still-running view; `subagent.settled` follows later.
+            const view = this.session.finishSubAgent(body.toolUseId, body.isError, body.isError ? body.content : undefined, asyncLaunched.has(body.toolUseId));
             if (view) body.subagent = view;
             const imgs = imagesByTool.get(body.toolUseId);
             if (imgs?.length && this.saveToolImage) {

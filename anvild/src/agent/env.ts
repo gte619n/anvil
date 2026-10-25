@@ -65,7 +65,9 @@ export function buildAgentEnv(
   const profile = opts.profile ?? "claude";
   // _ZO_DOCTOR=0 silences zoxide's "detected a configuration issue" banner in spawned shells
   // (the Bash tool + terminal PTY), which otherwise spams tool output and the terminal.
-  const out: Record<string, string> = { _ZO_DOCTOR: "0" };
+  // CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS makes the CLI emit `session_state_changed` (running/idle), which the
+  // driver uses to notice a turn the CLI starts on its own after a background sub-agent finishes.
+  const out: Record<string, string> = { _ZO_DOCTOR: "0", CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" };
   for (const k of BASE_KEEP) {
     const v = src[k];
     if (typeof v === "string" && v.length > 0) out[k] = v;

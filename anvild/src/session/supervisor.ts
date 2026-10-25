@@ -2096,6 +2096,9 @@ export class Supervisor {
       // the SDK emitted this `result`), so consume the marker `onGoalResolved` left instead — its
       // "Goal met" push already covered this turn.
       if (this.goalPushSuppressed.delete(sessionId)) return;
+      // Background sub-agents still running: this `result` ends the turn, not the work. The CLI starts a
+      // follow-up turn when they finish, and THAT turn's result is the real "your turn".
+      if (this.sessions.get(sessionId)?.hasRunningBackgroundSubAgents()) return;
       // A short, plain-text summary of what Claude said — no Markdown, no novel — so the reminder
       // carries real context at a glance instead of raw "## heading **bold**" glyphs.
       const snippet = summarize(this.sessions.get(sessionId)?.lastAssistantText ?? "");

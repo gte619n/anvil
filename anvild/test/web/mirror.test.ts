@@ -19,7 +19,7 @@ function snap(events: ConversationEvent[], lastSeq: number, epoch: string): { ev
 }
 const U = (t: string): ConversationEvent => ({ kind: "user", ts: "t", rendered: { source: t, html: `<p>${t}</p>` }, attachments: [] });
 
-test("foldEvent keeps the 5 durable kinds and drops transient frames", () => {
+test("foldEvent keeps the durable kinds and drops transient frames", () => {
   expect(foldEvent(userEvent("s", 1, "hi"))?.kind).toBe("user");
   expect(foldEvent({ v: 4, type: "assistant.delta", ts: "t", sessionId: "s", seq: 2, text: "x" } as unknown as ServerEvent)).toBeNull();
   expect(foldEvent({ v: 4, type: "status", ts: "t", sessionId: "s", seq: 3, status: "idle" } as unknown as ServerEvent)).toBeNull();
@@ -108,4 +108,10 @@ test("evictLRU enforces the session cap oldest-first and never evicts pinned ses
   expect(mirror.keys().length).toBe(MIRROR_MAX_SESSIONS);
   expect(mirror.has("e0")).toBe(true); // pinned survived
   expect(mirror.has("e1")).toBe(false); // next-oldest evicted instead
+});
+
+test("foldEvent keeps a background sub-agent's subagent.settled (mirrors the server snapshot fold)", () => {
+  const agent = { id: "toolu_bg", label: "Audit", state: "done", steps: 4, background: true };
+  const out = foldEvent({ v: 4, type: "subagent.settled", ts: "t", sessionId: "s", seq: 9, agent } as unknown as ServerEvent);
+  expect(out).toEqual({ kind: "subagent_settled", ts: "t", agent } as never);
 });

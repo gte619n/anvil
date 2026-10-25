@@ -131,6 +131,7 @@
     "shadow.subscribe",
     "status",
     "subagent.activity",
+    "subagent.settled",
     "team.info",
     "team.integrate",
     "team.plan",

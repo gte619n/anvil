@@ -43,6 +43,10 @@ const view = (id: string, label: string, type: string, state: string, extra: Rec
 const subResult = (seq: number, id: string, v: Record<string, unknown>) => env({ type: "tool.result", toolUseId: id, content: "", isError: v.state === "error", subagent: v }, seq);
 const toolResult = (seq: number, id: string, content: string) => env({ type: "tool.result", toolUseId: id, content, isError: false }, seq);
 const status = (seq: number, s: string) => env({ type: "status", status: s }, seq);
+const bgLaunch = (seq: number, id: string, description: string) =>
+  env({ type: "assistant.message", blocks: [{ kind: "tool_use", toolUseId: id, name: "Agent", input: { subagent_type: "Explore", description, run_in_background: true } }] }, seq);
+const settled = (seq: number, agent: Record<string, unknown>) => env({ type: "subagent.settled", agent }, seq);
+const user2 = (seq: number) => env({ type: "message.user", rendered: { html: "<p>next</p>", source: "next" }, attachments: [] }, seq);
 const result = (seq: number) => env({ type: "result", stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, turns: 1 } }, seq);
 
 interface Report {
@@ -218,4 +222,64 @@ test("regression: an ordinary turn with NO sub-agents renders no sub-agent rows"
   expect(r.rows).toBe(0);
   expect(r.html).not.toContain("subagent-row");
   expect(r.html).toContain("total 0"); // the normal tool result still renders
+}, 30_000);
+
+// ── Background sub-agents (§sub-agents, background) ───────────────────────────────────────────────
+test("background: the turn ends with the agent still running, and the block says so", () => {
+  const r = runBoot([
+    status(1, "thinking"),
+    bgLaunch(2, "task_bg", "Long audit"),
+    // the launch ack carries the STILL-RUNNING view (not a settle)
+    subResult(3, "task_bg", { id: "task_bg", label: "Long audit", type: "Explore", state: "running", steps: 0, background: true }),
+    result(4),
+  ]);
+  expect(r.initErr).toBeNull();
+  expect(r.rows).toBe(1);
+  expect(r.states).toEqual(["running"]);
+  expect(r.html).toContain("Background agents running");
+  expect(r.html).toContain("background");
+}, 30_000);
+
+test("background: a later turn's live tick + durable settle land on the ORIGINAL row (no duplicate)", () => {
+  const r = runBoot([
+    status(1, "thinking"),
+    bgLaunch(2, "task_bg", "Long audit"),
+    subResult(3, "task_bg", { id: "task_bg", label: "Long audit", type: "Explore", state: "running", steps: 0, background: true }),
+    result(4),
+    user2(5), // the user moved on — a new activity block
+    status(6, "thinking"),
+    activity([view("task_bg", "Long audit", "Explore", "running", { steps: 7, background: true })]),
+    settled(7, { id: "task_bg", label: "Long audit", type: "Explore", state: "done", steps: 9, background: true }),
+    result(8),
+  ]);
+  expect(r.initErr).toBeNull();
+  expect(r.rows).toBe(1);
+  expect(r.states).toEqual(["done"]);
+  expect(r.html).toContain("9 steps");
+  expect(r.html).toContain("ran in background");
+  expect(r.html).not.toContain("Background agents running");
+}, 30_000);
+
+test("background: a client that slept through it settles the row from the reload snapshot", () => {
+  const snapshot = env({
+    type: "conversation.snapshot",
+    seq: 9,
+    lastSeq: 9,
+    epoch: "ep1",
+    events: [
+      { kind: "user", ts: "t", rendered: { html: "<p>audit</p>", source: "audit" }, attachments: [] },
+      { kind: "assistant", ts: "t", blocks: [{ kind: "tool_use", toolUseId: "task_bg", name: "Agent", input: { subagent_type: "Explore", description: "Long audit", run_in_background: true } }] },
+      { kind: "tool_result", ts: "t", toolUseId: "task_bg", content: "", isError: false, subagent: { id: "task_bg", label: "Long audit", type: "Explore", state: "running", steps: 0, background: true } },
+      { kind: "result", ts: "t", stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, turns: 1 } },
+      { kind: "user", ts: "t", rendered: { html: "<p>next</p>", source: "next" }, attachments: [] },
+      { kind: "subagent_settled", ts: "t", agent: { id: "task_bg", label: "Long audit", type: "Explore", state: "error", steps: 3, error: "rate limited", background: true } },
+      { kind: "assistant", ts: "t", blocks: [{ kind: "markdown", rendered: { source: "x", html: "<p>the audit failed</p>" } }] },
+      { kind: "result", ts: "t", stopReason: "end_turn", usage: { inputTokens: 1, outputTokens: 1, turns: 1 } },
+    ],
+  });
+  const r = runBoot([snapshot]);
+  expect(r.initErr).toBeNull();
+  expect(r.rows).toBe(1);
+  expect(r.states).toEqual(["error"]);
+  expect(r.html).toContain("rate limited");
 }, 30_000);

@@ -108,3 +108,41 @@ test("snapshot preserves launch order; reset() clears everything (ID12)", () => 
   expect(t.hasAny()).toBe(false);
   expect(t.snapshot()).toHaveLength(0);
 });
+
+// ── Background sub-agents (§sub-agents, background) ──────────────────────────────────────────────
+test("a background launch ack does not settle; the notification does, and is queued once for persistence", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "start", taskId: "t1", launchedBy: null, label: "Audit" });
+  t.apply({ kind: "task", taskId: "t1", sdkTaskId: "k1" });
+  expect(t.finish("t1", false, undefined, true)).toMatchObject({ state: "running", background: true });
+  expect(t.hasRunningBackground()).toBe(true);
+  expect(t.drainSettled()).toEqual([]);
+  expect(t.apply({ kind: "settle", sdkTaskId: "k1", status: "completed" })).toBe(true); // resolved via the CLI task id
+  expect(t.hasRunningBackground()).toBe(false);
+  expect(t.drainSettled()).toEqual([{ id: "t1", label: "Audit", state: "done", steps: 0, background: true }]);
+  expect(t.drainSettled()).toEqual([]); // each settlement surfaces once
+  expect(t.apply({ kind: "settle", taskId: "t1", status: "failed" })).toBe(false); // idempotent once settled
+});
+
+test("backgrounded mid-run (task_updated) flips the flag; a foreground settle is never queued", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "start", taskId: "fg", launchedBy: null });
+  t.apply({ kind: "start", taskId: "bg", launchedBy: null });
+  t.apply({ kind: "task", taskId: "bg", sdkTaskId: "k2" });
+  expect(t.apply({ kind: "backgrounded", sdkTaskId: "k2" })).toBe(true);
+  t.apply({ kind: "settle", taskId: "fg", status: "completed" }); // foreground: its tool.result carries the durable record
+  t.apply({ kind: "settle", taskId: "bg", status: "stopped" });
+  expect(t.drainSettled().map((v) => [v.id, v.state])).toEqual([["bg", "canceled"]]);
+});
+
+test("reset() keeps running background agents (and their task-id binding), drops the rest", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "start", taskId: "bg", launchedBy: null, background: true });
+  t.apply({ kind: "task", taskId: "bg", sdkTaskId: "k1" });
+  t.apply({ kind: "start", taskId: "fg", launchedBy: null });
+  t.reset();
+  expect(t.snapshot().map((v) => v.id)).toEqual(["bg"]);
+  t.apply({ kind: "start", taskId: "next", launchedBy: null });
+  expect(t.snapshot().map((v) => v.id)).toEqual(["bg", "next"]); // stable order after the kept one
+  expect(t.apply({ kind: "settle", sdkTaskId: "k1", status: "completed" })).toBe(true);
+});

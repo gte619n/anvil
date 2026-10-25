@@ -36,6 +36,7 @@ import { ensureOwningServer, hostOf, orderedServers, sendTo, serverApiUrl, serve
 import { isAndroidApp } from "./platform";
 import { telemetry } from "./telemetry";
 import { reconcileOptimistic } from "./sendReconcile";
+import { activityTitle, isSettled, mergeView } from "./subagentView";
 import type { AttachmentRef, ContentBlock, Environment, FileOffer, Session, SubAgentView, ToolResultImage } from "../../protocol";
 
 // ── Injected dependencies (initConversation) ─────────────────────────────────────────────────────
@@ -469,10 +470,16 @@ function ensureActivity(): HTMLDetailsElement {
   hideThinking(); // the activity block's spinner is now the running indicator
   return d;
 }
+/** Retitle any activity block from its rows' states (an ended turn whose background sub-agents still run
+ *  reads "Background agents running"). Works on earlier turns' blocks too — a background agent's
+ *  settle can land on a row several turns back. */
+function retitleBlock(block: Element, live: boolean): void {
+  const title = block.querySelector(".activity-title");
+  if (title) title.textContent = activityTitle(live, [...block.querySelectorAll<HTMLElement>(".subagent-row")].map((r) => r.dataset.state));
+}
 function updateActivityHead(): void {
   if (!activityEl) return;
-  const title = activityEl.querySelector(".activity-title");
-  if (title) title.textContent = activityLive ? "Working" : "Worked";
+  retitleBlock(activityEl, activityLive);
   const count = activityEl.querySelector(".activity-count");
   if (!count) return;
   // Sub-agent fan-out takes the headline (D2/D13): "· 3 sub-agents". Otherwise fall back to the step count.
@@ -524,22 +531,6 @@ function fmtElapsed(s: number): string {
   return rem ? `${m}m ${rem}s` : `${m}m`;
 }
 
-function mergeView(prev: SubAgentView | undefined, inc: SubAgentView): SubAgentView {
-  if (!prev) return { ...inc };
-  const settled = prev.state === "done" || prev.state === "error" || prev.state === "canceled";
-  return {
-    id: inc.id,
-    label: inc.label || prev.label,
-    type: inc.type ?? prev.type,
-    // never regress a settled row back to "running" (a late live heartbeat must not un-finish it)
-    state: settled && inc.state === "running" ? prev.state : inc.state,
-    steps: Math.max(prev.steps ?? 0, inc.steps ?? 0),
-    currentTool: inc.state === "running" ? (inc.currentTool ?? prev.currentTool) : undefined,
-    elapsedSeconds: inc.elapsedSeconds ?? prev.elapsedSeconds,
-    error: inc.error ?? prev.error,
-  };
-}
-
 function renderSubAgentRow(row: HTMLElement, view: SubAgentView): void {
   row.dataset.state = view.state; // CSS colours by state; NEVER uses the `hidden` attr (ID15 / .msym quirk)
   const type = esc(view.type || "Sub-agent");
@@ -550,6 +541,7 @@ function renderSubAgentRow(row: HTMLElement, view: SubAgentView): void {
   if (typeof view.elapsedSeconds === "number" && view.elapsedSeconds > 0) bits.push(fmtElapsed(view.elapsedSeconds));
   if (view.state === "error") bits.push(esc(view.error || "error"));
   if (view.state === "canceled") bits.push("canceled");
+  if (view.background) bits.push(view.state === "running" ? "background" : "ran in background");
   const detail = bits.length ? `<span class="sa-detail">· ${bits.join(" · ")}</span>` : "";
   const ind =
     view.state === "running"
@@ -558,8 +550,25 @@ function renderSubAgentRow(row: HTMLElement, view: SubAgentView): void {
   row.innerHTML = `${ind}<span class="sa-type">${type}</span><span class="sa-label" title="${label}">${label}</span>${detail}`;
 }
 
+/** An existing row for `id` in an EARLIER turn's activity block (not the current one) — a background
+ *  sub-agent outlives its turn, so its live ticks and its settle must land on its original row. */
+function rowElsewhere(id: string): HTMLElement | null {
+  if (subAgentRows.has(id)) return null;
+  const sel = `.subagent-row[data-id="${typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id.replace(/["\\]/g, "\\$&")}"]`;
+  return conversation.querySelector<HTMLElement>(sel);
+}
+
 /** Create or update a sub-agent row (merging with any prior view). The single funnel for all sources. */
 function upsertSubAgentRow(incoming: SubAgentView): void {
+  const old = rowElsewhere(incoming.id);
+  if (old) {
+    // Never regress a settled row (e.g. a stale live tick after its settle already landed).
+    if (isSettled(old.dataset.state) && incoming.state === "running") return;
+    renderSubAgentRow(old, incoming);
+    const block = old.closest(".activity");
+    if (block) retitleBlock(block, block === activityEl && activityLive);
+    return;
+  }
   const d = ensureActivity();
   const container = d.querySelector<HTMLElement>(".subagents");
   if (!container) return;
@@ -595,6 +604,12 @@ export function updateSubAgents(agents: SubAgentView[]): void {
 
 /** Settle a sub-agent row from the DURABLE Task tool.result (survives reload/offline replay, D10). */
 export function finalizeSubAgentResult(view: SubAgentView): void {
+  upsertSubAgentRow(view);
+}
+
+/** A BACKGROUND sub-agent ended (durable `subagent.settled`, live or replayed) — settle its row, which
+ *  usually lives in an earlier turn's block. */
+export function settleSubAgent(view: SubAgentView): void {
   upsertSubAgentRow(view);
 }
 export function appendToolResult(content: string, isError: boolean, images: ToolResultImage[] = []): void {

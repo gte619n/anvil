@@ -68,6 +68,7 @@ import {
   dropSessionHero,
   finalizeActivity,
   finalizeSubAgentResult,
+  settleSubAgent,
   hideThinking,
   initConversation,
   maybeShowSessionHero,
@@ -1103,7 +1104,7 @@ function idleTick(): Promise<void> {
 /** The durable content frames a shadow subscription delivers for non-viewed sessions (mirrors the
  *  server's isShadowable) — used only to attribute the shadowEvents telemetry counter. */
 function isShadowContentType(t: string): boolean {
-  return t === "message.user" || t === "assistant.message" || t === "tool.result" || t === "result" || t === "file.offer";
+  return t === "message.user" || t === "assistant.message" || t === "tool.result" || t === "result" || t === "file.offer" || t === "subagent.settled";
 }
 const prefetcher = createPrefetcher({
   supportsHistory: (url) => serverSupports(servers.get(url), "history"),
@@ -1800,6 +1801,9 @@ function handleSessionEvent(e: ServerEvent): void {
     case "subagent.activity":
       updateSubAgents(e.agents); // ephemeral live snapshot (no seq): tick the sub-agent rows (D5/D9)
       return;
+    case "subagent.settled":
+      settleSubAgent(e.agent); // durable: a BACKGROUND sub-agent ended — settle its (possibly earlier-turn) row
+      return;
     case "file.offer":
       appendFileOffer(e.file);
       return;
@@ -1863,6 +1867,7 @@ function renderConversationEvent(ev: ConversationEvent): void {
     else appendToolResult(ev.content, ev.isError, ev.images);
   }
   else if (ev.kind === "file_offer") appendFileOffer(ev.file);
+  else if (ev.kind === "subagent_settled") settleSubAgent(ev.agent); // background sub-agent's end (replay)
 }
 
 /**

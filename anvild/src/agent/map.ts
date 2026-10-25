@@ -113,6 +113,7 @@ export function subAgentSignals(m: SDKMessage): SubAgentSignal[] {
           launchedBy: parent,
           type: typeof input.subagent_type === "string" ? input.subagent_type : undefined,
           label: typeof input.description === "string" ? input.description : undefined,
+          ...(input.run_in_background === true ? { background: true } : {}),
         });
       } else if (parent != null) {
         // A (non-Task) tool the sub-agent is running → a step on it, and its current tool.
@@ -151,6 +152,63 @@ export function subAgentSignals(m: SDKMessage): SubAgentSignal[] {
         elapsedSeconds: typeof dur === "number" ? Math.round(dur / 1000) : undefined,
       });
     }
+  } else if (m.type === "system" && (m as any).subtype === "task_started") {
+    // SDKTaskStartedMessage — binds the CLI's task id to the launching tool_use id.
+    const p = m as any;
+    if (typeof p.task_id === "string" && typeof p.tool_use_id === "string") out.push({ kind: "task", taskId: p.tool_use_id, sdkTaskId: p.task_id });
+  } else if (m.type === "system" && (m as any).subtype === "task_updated") {
+    // SDKTaskUpdatedMessage — a patch keyed only by the CLI's task id.
+    const p = m as any;
+    const sdkTaskId = typeof p.task_id === "string" ? p.task_id : undefined;
+    const patch = p.patch ?? {};
+    if (sdkTaskId && patch.is_backgrounded === true) out.push({ kind: "backgrounded", sdkTaskId });
+    const st = patch.status;
+    if (sdkTaskId && (st === "completed" || st === "failed" || st === "killed")) {
+      out.push({ kind: "settle", sdkTaskId, status: st === "killed" ? "stopped" : st, ...(typeof patch.error === "string" ? { error: patch.error } : {}) });
+    }
+  } else if (m.type === "system" && (m as any).subtype === "task_notification") {
+    // SDKTaskNotificationMessage — the CLI's authoritative "this task ended" (the ONLY end signal a
+    // background sub-agent gets; its tool.result was the instant launch ack).
+    const p = m as any;
+    const st = p.status;
+    if (st === "completed" || st === "failed" || st === "stopped") {
+      out.push({
+        kind: "settle",
+        ...(typeof p.tool_use_id === "string" ? { taskId: p.tool_use_id } : {}),
+        ...(typeof p.task_id === "string" ? { sdkTaskId: p.task_id } : {}),
+        status: st,
+        ...(st === "failed" && typeof p.summary === "string" && p.summary ? { error: p.summary } : {}),
+      });
+    }
+  }
+  return out;
+}
+
+/** Whether `m` is main-thread activity that can only mean a turn is underway: an assistant message or
+ *  stream frame with no `parent_tool_use_id`, or the CLI's own `session_state_changed: running`. Used
+ *  to catch a turn the CLI starts ON ITS OWN — after a background sub-agent's task_notification — which
+ *  never passes through `prompt()`, so nothing else would flip the session out of idle. */
+export function signalsTurnActivity(m: SDKMessage): boolean {
+  if (m.type === "system") return (m as any).subtype === "session_state_changed" && (m as any).state === "running";
+  return (m.type === "assistant" || m.type === "stream_event") && parentToolUseId(m) == null;
+}
+
+/** Async-launch acks the CLI returns for an `Agent`/`Task` that runs in the background — at launch
+ *  (`run_in_background`) or when backgrounded mid-run. These tool.results are NOT the agent's end, so
+ *  the sub-agent row must stay running (§sub-agents, background). Prefers the structured
+ *  `tool_use_result.status` the CLI stamps on the message; falls back to the ack's fixed wording. */
+const ASYNC_ACK = /^(Async agent launched successfully|Cloud agent launched)\b/;
+export function asyncLaunchedToolIds(m: SDKMessage): Set<string> {
+  const out = new Set<string>();
+  if (m.type !== "user" || parentToolUseId(m) != null) return out;
+  const content = (m as any).message?.content;
+  if (!Array.isArray(content)) return out;
+  const r = (m as any).tool_use_result;
+  const structured = r && typeof r === "object" && (r.status === "async_launched" || r.status === "remote_launched" || r.isAsync === true);
+  for (const b of content) {
+    if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string" || b.is_error) continue;
+    const text = typeof b.content === "string" ? b.content : Array.isArray(b.content) ? b.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("") : "";
+    if (structured || ASYNC_ACK.test(text.trimStart())) out.add(b.tool_use_id);
   }
   return out;
 }

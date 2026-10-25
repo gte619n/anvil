@@ -41,7 +41,7 @@ export interface MirrorMeta {
  *  Everything else (status, assistant.delta, tool.use, permission/question, error, usage) is transient
  *  and never mirrored, so client and server agree on what "durable" means. */
 export function foldEvent(e: ServerEvent): ConversationEvent | null {
-  // Mirrors eventlog/log.ts `snapshot()` exactly — same fields, same 5 kinds.
+  // Mirrors eventlog/log.ts `snapshot()` exactly — same fields, same 6 kinds.
   switch (e.type) {
     case "message.user":
       return { kind: "user", ts: e.ts, rendered: e.rendered, attachments: e.attachments ?? [] };
@@ -55,6 +55,9 @@ export function foldEvent(e: ServerEvent): ConversationEvent | null {
       return { kind: "result", ts: e.ts, stopReason: e.stopReason, usage: e.usage };
     case "file.offer":
       return { kind: "file_offer", ts: e.ts, file: e.file };
+    case "subagent.settled":
+      // A background sub-agent's end (§sub-agents, background) — mirrors eventlog/log.ts `snapshot()`.
+      return { kind: "subagent_settled", ts: e.ts, agent: e.agent };
     default:
       return null; // transient — not part of the durable mirror
   }

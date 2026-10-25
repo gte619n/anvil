@@ -137,3 +137,18 @@ test("a persisted goal comes back PAUSED after a restart (D5)", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a running BACKGROUND sub-agent suppresses the 'your turn' push until it settles (§sub-agents, background)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "anvil-goalpush-"));
+  try {
+    const { pushes, session } = await harness(dir);
+    session.applySubAgentSignals([{ kind: "start", taskId: "bg", launchedBy: null, background: true }]);
+    emitResult(session); // the launching turn ended, the work didn't
+    expect(pushes.length).toBe(0);
+    session.applySubAgentSignals([{ kind: "settle", taskId: "bg", status: "completed" }]);
+    emitResult(session); // the CLI's follow-up turn — the real "your turn"
+    expect(pushes.length).toBe(3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

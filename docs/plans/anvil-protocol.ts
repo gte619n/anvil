@@ -379,7 +379,10 @@ export type ConversationEvent =
   | { kind: "assistant"; ts?: Iso8601; blocks: ContentBlock[] }
   | { kind: "tool_result"; ts?: Iso8601; toolUseId: ToolUseId; content: string; isError: boolean; images?: ToolResultImage[]; subagent?: SubAgentView }
   | { kind: "result"; ts?: Iso8601; stopReason: string; usage: Usage }
-  | { kind: "file_offer"; ts?: Iso8601; file: FileOffer };
+  | { kind: "file_offer"; ts?: Iso8601; file: FileOffer }
+  // A BACKGROUND sub-agent settling after its launching turn moved on (§sub-agents, background). Its
+  // Task tool.result was the instant "launched" ack, so this is the durable record of how it ended.
+  | { kind: "subagent_settled"; ts?: Iso8601; agent: SubAgentView };
 
 export interface AttachmentRef {
   id: AttachmentId;
@@ -1247,6 +1250,10 @@ export interface SubAgentView {
   elapsedSeconds?: number;
   /** Failure reason, present only when `state === "error"`. */
   error?: string;
+  /** Running in the BACKGROUND (`run_in_background`, or backgrounded mid-run): its launching Task
+   *  tool.result returned at once, the turn may already have ended, and it settles later via
+   *  `subagent.settled`. */
+  background?: boolean;
 }
 
 /**
@@ -1262,6 +1269,17 @@ export interface SubAgentActivityEvent extends Envelope {
   sessionId: SessionId;
   live: true;
   agents: SubAgentView[];
+}
+/**
+ * DURABLE (seq'd, persisted, replayed) settlement of a BACKGROUND sub-agent (§sub-agents, background).
+ * A foreground sub-agent's final state rides its Task `tool.result.subagent`; a background one's
+ * tool.result is only the "launched" ack, so its real end (completed / failed / stopped, or canceled
+ * when the session's query died) is recorded here. Folded into the snapshot as `subagent_settled`.
+ * Clients settle the row with this `agent.id` wherever it lives in the transcript.
+ */
+export interface SubAgentSettledEvent extends Envelope, SessionScoped {
+  type: "subagent.settled";
+  agent: SubAgentView;
 }
 export interface UsageEvent extends Envelope, SessionScoped {
   type: "usage";
@@ -1392,6 +1410,7 @@ export type ServerEvent =
   | QuestionResolvedEvent
   | StatusEvent
   | SubAgentActivityEvent
+  | SubAgentSettledEvent
   | UsageEvent
   | ResultEvent
   | SessionErrorEvent
