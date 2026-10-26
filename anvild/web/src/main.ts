@@ -2540,6 +2540,11 @@ $("#new-session-top").addEventListener("click", () => showNewSession());
 
 // ── Plan-usage gauge (arch §3) — per Claude account, merged across every server (see usage.ts) ──
 function paintUsage(): void {
-  renderUsage(document.getElementById("usage-gauge"), mergeGauges([...servers.values()].map((s) => s.budgets ?? [])));
+  renderUsage(
+    document.getElementById("usage-gauge"),
+    mergeGauges([...servers.values()].map((s) => s.budgets ?? [])),
+    Date.now(),
+    servers.size > 0, // a server is connected → expect a reading soon; show "no reading yet" rather than hide
+  );
   startUsageTicker(paintUsage); // keep "resets in" / "updated …ago" current between budget events
 }

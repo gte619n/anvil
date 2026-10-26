@@ -28,6 +28,18 @@ test("claude profile carries the subscription token and NO Anthropic key/base-ur
   expect(env.PATH).toBe("/usr/bin");
 });
 
+test("claude profile declares the user:profile scope so the usage/rate-limit call returns plan windows", () => {
+  // A CLAUDE_CODE_OAUTH_TOKEN defaults to `user:inference` ONLY, which makes the CLI answer
+  // rate_limits_available:false and leaves the sidebar meter empty (docs/plans/2026-10-26-…§5).
+  const env = buildAgentEnv({ profile: "claude", src: DAEMON_ENV });
+  expect(env.CLAUDE_CODE_OAUTH_SCOPES).toBe("user:inference user:profile");
+});
+
+test("an explicit CLAUDE_CODE_OAUTH_SCOPES in the daemon env overrides the default", () => {
+  const env = buildAgentEnv({ profile: "claude", src: { ...DAEMON_ENV, CLAUDE_CODE_OAUTH_SCOPES: "user:inference" } });
+  expect(env.CLAUDE_CODE_OAUTH_SCOPES).toBe("user:inference");
+});
+
 test("glm profile points the SDK at OpenRouter with the OpenRouter key and drops the Claude token", () => {
   const env = buildAgentEnv({ profile: "glm", src: DAEMON_ENV });
   expect(env.ANTHROPIC_BASE_URL).toBe(OPENROUTER_ANTHROPIC_BASE_URL);

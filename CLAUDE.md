@@ -82,6 +82,13 @@ env var is the migration seed + the mirror for the default account, not the only
 security boundary is Tailscale itself — see [`SECURITY.md`](SECURITY.md) and
 [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
 
+**The OAuth token's scope gates the plan-usage meter.** A `CLAUDE_CODE_OAUTH_TOKEN` defaults to the
+`user:inference` scope only, which makes the SDK's usage call answer `rate_limits_available: false` —
+the sidebar meter stays empty. `buildAgentEnv` (`src/agent/env.ts`) therefore also declares
+`CLAUDE_CODE_OAUTH_SCOPES="user:inference user:profile"` for the claude profile; don't drop it. (The
+public Admin usage/cost API only covers metered-key orgs, which the §3 guard forbids, so it can't feed
+this.)
+
 **The frozen Update API v1 is load-bearing — do not casually refactor it.** `src/daemon/update-api.ts`
 and `src/daemon/updater/*` (watchdog) implement a STABLE contract (`UPDATE_API_VERSION`) that a hub and a
 partially-updated fleet coordinate over, and that the out-of-process watchdog reads to roll a bricked

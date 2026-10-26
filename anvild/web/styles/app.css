@@ -122,6 +122,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .usage-gauge[hidden] { display: none; }
 .usage-acct { display: flex; flex-direction: column; gap: 3px; }
 .usage-acct.stale { opacity: 0.65; }
+.usage-empty { color: var(--muted); font-size: 12px; font-style: italic; opacity: 0.75; }
 .usage-head { display: flex; justify-content: space-between; gap: 6px; font-weight: 600; }
 .usage-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-ago { color: var(--muted); font-weight: 400; flex-shrink: 0; }
