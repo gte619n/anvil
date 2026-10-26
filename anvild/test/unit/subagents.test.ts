@@ -108,3 +108,73 @@ test("snapshot preserves launch order; reset() clears everything (ID12)", () => 
   expect(t.hasAny()).toBe(false);
   expect(t.snapshot()).toHaveLength(0);
 });
+
+// ── Background sub-agents (§sub-agents, background) ──────────────────────────────────────────────
+test("a background launch ack does not settle; the notification does, and is queued once for persistence", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "start", taskId: "t1", launchedBy: null, label: "Audit" });
+  t.apply({ kind: "task", taskId: "t1", sdkTaskId: "k1" });
+  expect(t.finish("t1", false, undefined, true)).toMatchObject({ state: "running", background: true });
+  expect(t.hasRunningBackground()).toBe(true);
+  expect(t.drainSettled()).toEqual([]);
+  expect(t.apply({ kind: "settle", sdkTaskId: "k1", status: "completed" })).toBe(true); // resolved via the CLI task id
+  expect(t.hasRunningBackground()).toBe(false);
+  expect(t.drainSettled()).toEqual([{ id: "t1", label: "Audit", state: "done", steps: 0, background: true }]);
+  expect(t.drainSettled()).toEqual([]); // each settlement surfaces once
+  expect(t.apply({ kind: "settle", taskId: "t1", status: "failed" })).toBe(false); // idempotent once settled
+});
+
+test("backgrounded mid-run (task_updated) flips the flag; a foreground settle is never queued", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "start", taskId: "fg", launchedBy: null });
+  t.apply({ kind: "start", taskId: "bg", launchedBy: null });
+  t.apply({ kind: "task", taskId: "bg", sdkTaskId: "k2" });
+  expect(t.apply({ kind: "backgrounded", sdkTaskId: "k2" })).toBe(true);
+  t.apply({ kind: "settle", taskId: "fg", status: "completed" }); // foreground: its tool.result carries the durable record
+  t.apply({ kind: "settle", taskId: "bg", status: "stopped" });
+  expect(t.drainSettled().map((v) => [v.id, v.state])).toEqual([["bg", "canceled"]]);
+});
+
+test("reset() keeps running background agents (and their task-id binding), drops the rest", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "start", taskId: "bg", launchedBy: null, background: true });
+  t.apply({ kind: "task", taskId: "bg", sdkTaskId: "k1" });
+  t.apply({ kind: "start", taskId: "fg", launchedBy: null });
+  t.reset();
+  expect(t.snapshot().map((v) => v.id)).toEqual(["bg"]);
+  t.apply({ kind: "start", taskId: "next", launchedBy: null });
+  expect(t.snapshot().map((v) => v.id)).toEqual(["bg", "next"]); // stable order after the kept one
+  expect(t.apply({ kind: "settle", sdkTaskId: "k1", status: "completed" })).toBe(true);
+});
+
+// ── Background shell tasks (§sub-agents, background shell — e.g. a `gh run watch` CI watcher) ────────
+test("a backgrounded Bash becomes a running shell row; a foreground one never does", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "shell_use", taskId: "fg", tool: "Bash", label: "ls" });
+  t.apply({ kind: "shell_use", taskId: "ci", tool: "Bash", label: "Watch CI run 4021" });
+  expect(t.finish("fg", false)).toBeUndefined(); // ordinary result → forgotten, no row
+  expect(t.finish("ci", false, undefined, true)).toEqual({ id: "ci", label: "Watch CI run 4021", type: "Shell", state: "running", steps: 0, background: true, kind: "shell" });
+  expect(t.snapshot().map((v) => v.id)).toEqual(["ci"]);
+  expect(t.hasRunningBackground()).toBe(true);
+  t.apply({ kind: "settle", taskId: "ci", status: "failed", error: "run failed" });
+  expect(t.drainSettled()).toEqual([{ id: "ci", label: "Watch CI run 4021", type: "Shell", state: "error", steps: 0, error: "run failed", background: true, kind: "shell" }]);
+});
+
+test("Monitor is always background; an errored shell launch makes no row", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "shell_use", taskId: "m", tool: "Monitor", label: "tail deploy log" });
+  t.apply({ kind: "shell_use", taskId: "bad", tool: "Bash" });
+  expect(t.finish("m", false)?.type).toBe("Monitor");
+  expect(t.finish("bad", true, "boom", true)).toBeUndefined();
+  expect(t.snapshot().map((v) => v.id)).toEqual(["m"]);
+});
+
+test("a shell candidate never outlives its turn; a running background shell row does", () => {
+  const t = new SubAgentTracker();
+  t.apply({ kind: "shell_use", taskId: "pending", tool: "Bash" });
+  t.apply({ kind: "shell_use", taskId: "ci", tool: "Bash" });
+  t.finish("ci", false, undefined, true);
+  t.reset();
+  expect(t.isTracked("pending")).toBe(false);
+  expect(t.snapshot().map((v) => v.id)).toEqual(["ci"]);
+});

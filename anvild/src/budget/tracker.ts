@@ -17,6 +17,11 @@ import { writeFileAtomic } from "../util/atomic";
  * This replaces the previous cost→hours *estimate*, which invented an hours figure against a
  * configured cap and could read far from reality (e.g. "over" while the plan was at 5%).
  *
+ * Rate limits belong to a Claude ACCOUNT, not a session or a machine, so the gauge is keyed by roster
+ * account id: a daemon with two accounts keeps two independent gauges (and two soft-stop latches),
+ * instead of one gauge that flips between whichever account finished a turn last. The key "" holds
+ * the bare env-var token (no roster).
+ *
  * Thresholds (env, fractions of a window 0–1): ANVIL_BUDGET_WARN, ANVIL_BUDGET_SOFTSTOP.
  */
 
@@ -32,11 +37,21 @@ export interface BudgetConfig {
   softStopFraction: number; // 0–1 of the 7-day window
 }
 
-interface Persisted {
+interface AccountState {
   budget: Budget;
   softStopped: boolean; // latched so the soft-stop advisory fires once per 7-day window
   weekResetsAt?: string; // when this changes, the window rolled over → clear the latch
 }
+
+interface Persisted {
+  accounts: Record<string, AccountState>;
+  latest?: string; // key of the most recently refreshed account
+  /** A pre-per-account `budget.json`'s gauge, kept only as `snapshot()`'s fallback until a fresh
+   *  reading lands — we can't know which account it belonged to. */
+  legacy?: Budget;
+}
+
+const EMPTY: Budget = { available: false, warn: false };
 
 export class RateLimitTracker {
   private readonly file: string;
@@ -48,20 +63,44 @@ export class RateLimitTracker {
     this.state = this.load();
   }
 
-  /** The last-known gauge (also what a cold-attaching client / health check sees). */
+  /** The most recently refreshed account's gauge (also what a cold-attaching client / health check
+   *  sees, and what autopilot/teams gate on) — the pre-per-account behavior. */
   snapshot(): Budget {
-    return this.state.budget;
+    const k = this.state.latest;
+    return (k !== undefined ? this.state.accounts[k]?.budget : undefined) ?? this.state.legacy ?? EMPTY;
+  }
+
+  /** Every account's gauge, newest reading first. */
+  snapshots(): Budget[] {
+    return Object.values(this.state.accounts)
+      .map((a) => a.budget)
+      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  }
+
+  /** Drop accounts no longer in the roster so a removed account's gauge stops being reported. */
+  retain(keep: (accountKey: string) => boolean): void {
+    let changed = false;
+    for (const k of Object.keys(this.state.accounts)) {
+      if (keep(k)) continue;
+      delete this.state.accounts[k];
+      if (this.state.latest === k) delete this.state.latest;
+      changed = true;
+    }
+    if (changed) this.save();
   }
 
   /**
-   * Fold a fresh SDK `rate_limits` payload into the gauge. `raw` is null/undefined when the
-   * reading was unavailable this turn (API-key session, missing scope, or a transient failure) —
-   * we keep the last-known snapshot rather than blanking a real gauge. Returns the new snapshot
-   * and whether this crossed the weekly soft-stop (fires once per window).
+   * Fold a fresh SDK `rate_limits` payload into `accountKey`'s gauge ("" = no roster account). `raw`
+   * is null/undefined when the reading was unavailable this turn (API-key session, missing scope,
+   * or a transient failure) — we keep the last-known snapshot rather than blanking a real gauge.
+   * Returns that account's new snapshot and whether this crossed its weekly soft-stop (fires once
+   * per window, per account).
    */
-  update(raw: unknown, subscriptionType?: string | null): { budget: Budget; crossedSoftStop: boolean } {
+  update(accountKey: string, raw: unknown, subscriptionType?: string | null): { budget: Budget; crossedSoftStop: boolean } {
     const r = raw && typeof raw === "object" ? (raw as Record<string, Win>) : null;
-    if (!r) return { budget: this.state.budget, crossedSoftStop: false };
+    const prev = this.state.accounts[accountKey];
+    if (!r) return { budget: prev?.budget ?? this.snapshot(), crossedSoftStop: false };
+    const acct: AccountState = prev ?? { budget: EMPTY, softStopped: false };
 
     const win = (w: Win): RateWindow | undefined =>
       w && typeof w.utilization === "number"
@@ -76,18 +115,19 @@ export class RateLimitTracker {
     const warn = [session, week, weekOpus, weekSonnet].some((w) => (w?.utilization ?? 0) >= warnAt);
 
     // Clear the soft-stop latch when the 7-day window rolls over (its reset timestamp changes).
-    if (week?.resetsAt && week.resetsAt !== this.state.weekResetsAt) {
-      this.state.softStopped = false;
-      this.state.weekResetsAt = week.resetsAt;
+    if (week?.resetsAt && week.resetsAt !== acct.weekResetsAt) {
+      acct.softStopped = false;
+      acct.weekResetsAt = week.resetsAt;
     }
     let crossedSoftStop = false;
-    if (!this.state.softStopped && (week?.utilization ?? 0) >= this.cfg.softStopFraction * PCT) {
-      this.state.softStopped = true;
+    if (!acct.softStopped && (week?.utilization ?? 0) >= this.cfg.softStopFraction * PCT) {
+      acct.softStopped = true;
       crossedSoftStop = true;
     }
 
-    this.state.budget = {
+    acct.budget = {
       available: true,
+      ...(accountKey ? { accountId: accountKey } : {}),
       ...(subscriptionType ? { subscriptionType } : {}),
       ...(session ? { session } : {}),
       ...(week ? { week } : {}),
@@ -96,23 +136,27 @@ export class RateLimitTracker {
       warn,
       updatedAt: new Date().toISOString(),
     };
+    this.state.accounts[accountKey] = acct;
+    this.state.latest = accountKey;
+    delete this.state.legacy;
     this.save();
-    return { budget: this.state.budget, crossedSoftStop };
+    return { budget: acct.budget, crossedSoftStop };
   }
 
   private load(): Persisted {
     if (existsSync(this.file)) {
       try {
-        const p = JSON.parse(readFileSync(this.file, "utf8")) as Partial<Persisted>;
-        // Accept only the current shape; a legacy cost→hours file falls through to a fresh gauge.
-        if (p && typeof p === "object" && p.budget && typeof p.budget.available === "boolean") {
-          return { budget: p.budget, softStopped: Boolean(p.softStopped), weekResetsAt: p.weekResetsAt };
+        const p = JSON.parse(readFileSync(this.file, "utf8")) as Partial<Persisted> & { budget?: Budget };
+        if (p && typeof p === "object" && p.accounts && typeof p.accounts === "object") {
+          return { accounts: p.accounts, ...(p.latest !== undefined ? { latest: p.latest } : {}) };
         }
+        // Pre-per-account shape: keep its gauge as the fallback; a legacy cost→hours file is dropped.
+        if (p?.budget && typeof p.budget.available === "boolean") return { accounts: {}, legacy: p.budget };
       } catch {
         /* fall through to a fresh gauge */
       }
     }
-    return { budget: { available: false, warn: false }, softStopped: false };
+    return { accounts: {} };
   }
 
   private save(): void {

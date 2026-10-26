@@ -12,6 +12,8 @@ export interface Config {
   warnFraction: number;
   /** Soft-stop threshold as a fraction (0–1) of the 7-day window's utilization (arch §3). */
   softStopFraction: number;
+  /** How often (ms) the plan-usage gauge is re-read between turns; 0 disables (arch §3). */
+  usagePollMs: number;
   /** OpenRouter API key for the adversarial planning panel. Its own provider/key — NOT Anthropic — so
    *  it lives entirely outside the §3 subscription-auth guard. Absent → the panel is skipped. */
   openRouterApiKey?: string;
@@ -114,6 +116,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     clonesDir: expandHome(env.ANVIL_CLONES_DIR ?? "~/.anvil/repos", home),
     warnFraction: numEnv(env.ANVIL_BUDGET_WARN, 0.8, "ANVIL_BUDGET_WARN", { min: 0, max: 1 }),
     softStopFraction: numEnv(env.ANVIL_BUDGET_SOFTSTOP, 0.95, "ANVIL_BUDGET_SOFTSTOP", { min: 0, max: 1 }),
+    usagePollMs: numEnv(env.ANVIL_BUDGET_POLL_MS, 5 * 60_000, "ANVIL_BUDGET_POLL_MS", { min: 0, integer: true }),
     openRouterApiKey,
     adversarialModels: adversarialModels.length ? adversarialModels : DEFAULT_ADVERSARIAL_MODELS,
     // On when a key is present, unless explicitly killed via ANVIL_ADVERSARIAL=0.

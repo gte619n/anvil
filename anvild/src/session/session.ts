@@ -176,25 +176,41 @@ export class Session {
     let changed = false;
     for (const sig of signals) changed = this.subAgents.apply(sig) || changed;
     if (changed) this.emitLive(this.subAgentActivityEvent());
+    this.persistSettled();
   }
 
-  /** A sub-agent's launching Task tool.result arrived → settle it, broadcast, and return the settled
+  /** Persist every background sub-agent that settled since the last call (§sub-agents, background):
+   *  its tool.result was only the launch ack, so this durable `subagent.settled` is what a cold attach,
+   *  an offline replay, or a client that slept through the whole run settles the row from. */
+  private persistSettled(): void {
+    for (const agent of this.subAgents.drainSettled()) this.emit({ type: "subagent.settled", agent });
+  }
+
+  /** Whether a background sub-agent is still running — the turn may have ended, but work hasn't. */
+  hasRunningBackgroundSubAgents(): boolean {
+    return this.subAgents.hasRunningBackground();
+  }
+
+  /** A sub-agent's launching Task tool.result arrived → settle it (or, for a background launch ack, just
+   *  flag it background and leave it running), broadcast, and return the settled
    *  view so the driver can stamp it onto the DURABLE tool.result (D10). Undefined if `taskId` isn't a
-   *  tracked sub-agent (an ordinary tool result). */
-  finishSubAgent(taskId: string, isError: boolean, error?: string): SubAgentView | undefined {
+   *  tracked sub-agent (an ordinary tool result) — including a foreground shell command, which is only
+   *  promoted to a (background shell) row when `launchedAsync` says it went to the background. */
+  finishSubAgent(taskId: string, isError: boolean, error?: string, launchedAsync = false): SubAgentView | undefined {
     if (!this.subAgents.isTracked(taskId)) return undefined;
-    const view = this.subAgents.finish(taskId, isError, error);
-    this.emitLive(this.subAgentActivityEvent());
+    const view = this.subAgents.finish(taskId, isError, error, launchedAsync);
+    if (view) this.emitLive(this.subAgentActivityEvent());
     return view;
   }
 
   /** Turn interrupted/errored → mark every still-running sub-agent canceled and broadcast (D7). */
   cancelRunningSubAgents(): void {
     if (this.subAgents.cancelRunning()) this.emitLive(this.subAgentActivityEvent());
+    this.persistSettled();
   }
 
-  /** New user turn → clear the prior turn's sub-agents (ID12). No broadcast: the client's own
-   *  new-turn reset (resetActivity) drops the old rows. */
+  /** New user turn → clear the prior turn's sub-agents (ID12), keeping background ones still running.
+   *  No broadcast: the client's own new-turn reset (resetActivity) drops the old rows. */
   resetSubAgents(): void {
     this.subAgents.reset();
   }

@@ -146,6 +146,7 @@ export interface ServerOptions {
   clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
+  usagePollMs?: number;
   renderer?: MarkdownRenderer;
   /** OpenRouter key + models for the adversarial planning panel (see `Config`). */
   adversarialModels?: string[];
@@ -225,6 +226,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       clonesDir: opts.clonesDir,
       warnFraction: opts.warnFraction,
       softStopFraction: opts.softStopFraction,
+      usagePollMs: opts.usagePollMs,
       renderer: opts.renderer,
       adversarialModels: opts.adversarialModels,
       adversarialProvider: opts.adversarialProvider,

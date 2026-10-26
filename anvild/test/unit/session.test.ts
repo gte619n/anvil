@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
-import { Supervisor } from "../../src/session/supervisor";
+import { Supervisor, SEQ_CRASH_GAP } from "../../src/session/supervisor";
 import { ConnectionRegistry } from "../../src/server/registry";
 
 function tempState(): string {
@@ -174,8 +174,9 @@ test("supervisor persists sessions and a fresh instance restores them", async ()
   expect(sup2.list().map((x) => x.id)).toContain(id);
   // transient "thinking" is reset to idle on restore (no live agent after a restart)
   expect(restored!.data.status).toBe("idle");
-  // ...and the interrupted turn leaves a visible notice (seq 1 = status, seq 2 = notice)
-  expect(restored!.lastSeq).toBe(2);
+  // ...and the interrupted turn leaves a visible notice. This restart is a CRASH (no shutdown()), so
+  // restore skips SEQ_CRASH_GAP past the persisted seq 1 (status) before minting the notice.
+  expect(restored!.lastSeq).toBe(1 + SEQ_CRASH_GAP + 1);
   const snap = sup2.resume(id, undefined).find((e) => e.type === "conversation.snapshot") as any;
   const blocks = snap.events.at(-1).blocks;
   expect(blocks[0].rendered.source).toContain("interrupted");

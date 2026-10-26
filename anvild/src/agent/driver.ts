@@ -4,7 +4,7 @@ import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
 import type { CommandInfo, ContextUsage, Model } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
-import { askUserQuestionToolIds, extractResultUsage, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
+import { askUserQuestionToolIds, asyncLaunchedToolIds, extractResultUsage, signalsTurnActivity, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
@@ -122,6 +122,27 @@ export class AgentDriver {
     }
   }
 
+  /** Whether this driver has a live SDK query (so `readUsage()` can answer). */
+  get started(): boolean {
+    return !!this.q;
+  }
+
+  /**
+   * Read the plan's real rate-limit windows (the same numbers as claude.ai → Usage) through this
+   * session's live query. A control request to the CLI, not a model turn, so it costs no plan usage
+   * and is safe to call while idle — the supervisor's poll uses it to keep the gauge live between
+   * turns. The endpoint is flagged experimental by the SDK: null when not started, absent or throwing.
+   */
+  async readUsage(): Promise<{ rateLimits: unknown; subscriptionType: string | null } | null> {
+    if (!this.q) return null;
+    try {
+      const u = await this.q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+      return { rateLimits: u?.rate_limits_available ? u.rate_limits : null, subscriptionType: u?.subscription_type ?? null };
+    } catch {
+      return null; // experimental usage endpoint unavailable — keep the last-known gauge
+    }
+  }
+
   async setModel(model: Model): Promise<void> {
     try {
       await this.q?.setModel(sdkModelId(model));
@@ -147,7 +168,15 @@ export class AgentDriver {
     `environment (check PATH with \`command -v\`/\`which\`, look at the project's package manifests / lockfiles, ` +
     `try the obvious invocation) before concluding a tool is missing. Do NOT stop to ask the user whether a ` +
     `common tool is available — just look. Only ask the user when a tool genuinely needs to be installed or ` +
-    `downloaded first, or when it truly cannot be found after searching.`;
+    `downloaded first, or when it truly cannot be found after searching.` +
+    `\n\nWAITING ON SOMETHING (CI runs, builds, deploys, uploads): you cannot wait by ending your turn — once ` +
+    `you stop, nothing resumes you until the user writes again. NEVER end a turn saying you'll wait, check back, ` +
+    `or "report the moment it completes" unless something is ACTUALLY running that will wake you. To wait, start ` +
+    `a watcher with the Bash tool's \`run_in_background: true\` that exits when the thing finishes — e.g. ` +
+    `\`gh run watch <run-id> --exit-status\`, or a poll loop like \`until <check>; do sleep 30; done\` — then end ` +
+    `your turn; you are notified automatically when that command exits, and you continue from there. Give the ` +
+    `watcher a timeout so it can't hang forever. If you can't set up a watcher, say plainly that you will NOT ` +
+    `be notified and the user should ask for a status later.`;
 
   /**
    * Keep Claude Code's default system prompt, but for worktree sessions pin it to the worktree
@@ -307,6 +336,10 @@ export class AgentDriver {
           });
         }
 
+        // A turn the CLI started by itself (a background sub-agent finished and its notification was fed
+        // back to the model) never went through prompt() — flip out of idle so every device shows it working.
+        if (this.session.data.status === "idle" && signalsTurnActivity(m)) this.session.setStatus("thinking");
+
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
         // Tool results are the evidence the goal judge needs (design D2) — a claim of success that
         // the tool result contradicts must be visible to it.
@@ -333,6 +366,7 @@ export class AgentDriver {
         // or a task_progress heartbeat. Broadcasts a live snapshot on structural change (ephemeral, no seq).
         this.session.applySubAgentSignals(subAgentSignals(m));
         const bodies = mapMessage(m, this.renderer);
+        const asyncLaunched = asyncLaunchedToolIds(m); // background launch acks — not the sub-agent's end
         // Screenshots (and any image blocks) the tool returned, keyed by tool_use id. Persisted below
         // as attachments and stitched onto the matching tool.result so the client can render thumbnails.
         const imagesByTool = new Map(toolResultImages(m).map((g) => [g.toolUseId, g.images]));
@@ -351,7 +385,8 @@ export class AgentDriver {
             sawToolResult = true;
             // If this result is a sub-agent (`Task`/`Agent`) completing, settle its tracker row and stamp
             // the settled summary onto the DURABLE tool.result so the row survives reload/offline (D10/ID6).
-            const view = this.session.finishSubAgent(body.toolUseId, body.isError, body.isError ? body.content : undefined);
+            // A background launch ack instead stamps the still-running view; `subagent.settled` follows later.
+            const view = this.session.finishSubAgent(body.toolUseId, body.isError, body.isError ? body.content : undefined, asyncLaunched.has(body.toolUseId));
             if (view) body.subagent = view;
             const imgs = imagesByTool.get(body.toolUseId);
             if (imgs?.length && this.saveToolImage) {
@@ -380,15 +415,7 @@ export class AgentDriver {
           // Read the plan's real rate-limit windows (the same numbers as claude.ai → Usage). This
           // is the authoritative budget signal for an OAuth subscription. The endpoint is flagged
           // experimental by the SDK, so tolerate it being absent or throwing.
-          let rateLimits: unknown = null;
-          let subscriptionType: string | null = null;
-          try {
-            const u = await this.q?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
-            if (u?.rate_limits_available) rateLimits = u.rate_limits;
-            subscriptionType = u?.subscription_type ?? null;
-          } catch {
-            /* experimental usage endpoint unavailable — keep the last-known gauge */
-          }
+          const { rateLimits, subscriptionType } = (await this.readUsage()) ?? { rateLimits: null, subscriptionType: null };
           // Read the live context-window occupancy (the same breakdown Claude Code's context bar shows).
           // Best-effort like the usage endpoint: absent/throwing leaves the last-known meter in place.
           let contextUsage: ContextUsage | null = null;

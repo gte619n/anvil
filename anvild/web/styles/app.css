@@ -117,6 +117,22 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .sidebar-foot { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); cursor: pointer; font-weight: 600; }
 .sidebar-foot:hover { border-color: var(--accent); }
 .sidebar-foot .msym { font-size: 19px; }
+/* Plan-usage gauge (usage.ts): one block per Claude account, 5-hour + weekly bars. */
+.usage-gauge { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; margin-bottom: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 12px; flex-shrink: 0; }
+.usage-gauge[hidden] { display: none; }
+.usage-acct { display: flex; flex-direction: column; gap: 3px; }
+.usage-acct.stale { opacity: 0.65; }
+.usage-head { display: flex; justify-content: space-between; gap: 6px; font-weight: 600; }
+.usage-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-ago { color: var(--muted); font-weight: 400; flex-shrink: 0; }
+.usage-row { display: grid; grid-template-columns: 34px 1fr 34px; align-items: center; gap: 6px; color: var(--muted); }
+.usage-bar { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 22%, transparent); overflow: hidden; }
+.usage-bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.usage-row.warm .usage-bar i { background: var(--warn); }
+.usage-row.hot .usage-bar i { background: var(--danger); }
+.usage-row.warm .usage-pct { color: var(--warn); }
+.usage-row.hot .usage-pct { color: var(--danger); }
+.usage-pct { text-align: right; font-variant-numeric: tabular-nums; }
 
 
 /* Settings & servers — first-class management view */

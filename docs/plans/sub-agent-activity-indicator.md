@@ -297,3 +297,52 @@ A gate marked `☑` without its corresponding evidence (test output or screensho
 | `hidden`-attribute CSS quirk hides state icons silently | Use a display-toggling class, assert against computed style in the DOM harness ([[anvil-hidden-attr-css-override]]). |
 | Android not updated (daemon-only deploy) | D8 makes APK reship + on-device check an explicit done-gate ([[android-app-bundles-web-ui]]). |
 | Grandchild sub-agents create confusing/duplicated rows | D12 roll-up + idempotency test with nested fixture. |
+
+## 12. Addendum (2026-10-25): background sub-agents
+
+The original design assumed a sub-agent ends when its launching `Task`/`Agent` tool.result arrives. That
+is false for **background** sub-agents (`run_in_background: true`, or backgrounded mid-run): the CLI
+returns an instant `async_launched` ack ("Async agent launched successfully…"). Verified against the
+bundled CLI: in streaming-input mode (`inputClosed === false`) the CLI does **not** hold back `result`
+while background tasks run. So the turn ends, the agent keeps working, and when it settles the CLI emits
+`task_notification` and starts a follow-up turn **on its own** (no `prompt()`).
+
+What changed:
+
+- **Tracker** (`src/agent/subagents.ts`): the launch ack (`asyncLaunchedToolIds` in `map.ts`, which reads
+  `tool_use_result.status` with the ack wording as fallback) flags the agent `background` and leaves it
+  running. `task_notification` / terminal `task_updated` settle it. `task_started` binds the CLI task id
+  so `task_updated` (keyed only by that id) resolves. A new user turn keeps still-running background
+  agents, because their settle can arrive several turns later.
+- **Durable record**: a background settle (or a cancel when the query dies) is persisted as the seq'd
+  `subagent.settled` event, folded into snapshots as `subagent_settled` and mirrored offline. This is
+  what a client that slept or was closed through the whole run settles the row from. Foreground agents
+  are unchanged and still settle via `tool.result.subagent`.
+- **Daemon restart**: a background agent in flight when the daemon stops dies with its CLI process, so
+  no notification can arrive. `restore()` finds them (`EventLog.orphanedBackgroundAgents`: a running
+  launch ack with no later settle) and persists a `canceled` settle, once.
+- **Status and push**: the driver flips `idle → thinking` on main-thread activity it didn't prompt
+  (`signalsTurnActivity`; `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` adds the CLI's own
+  `session_state_changed: running`). The "your turn" push is suppressed while a background agent still
+  runs, so the follow-up turn's `result` is the one that notifies.
+- **Client**: rows are matched by id across the whole transcript, so a later turn's tick or settle lands
+  on the original row instead of creating a duplicate. An ended block whose background agents are still
+  running reads "Background tasks running". Merge rules live in `web/src/subagentView.ts`.
+
+### 12.1 Background shell tasks and "I'll wait" (2026-10-25)
+
+The same machinery covers **background shell commands**: `Bash` with `run_in_background` (or
+backgrounded mid-run), and `Monitor`. These are how an agent can genuinely wait on CI, a build or a
+deploy. A main-turn shell tool_use is an inert `shell_use` candidate. It becomes a row
+(`kind: "shell"`, `type` "Shell"/"Monitor") only if its tool.result shows it went to the background
+(structured `tool_use_result.backgroundTaskId`, else the CLI's "Command running in background" trailer).
+From there it gets the background-agent behavior: the turn's "your turn" push is held, the block reads
+"Background tasks running", the CLI's `task_notification` settles it durably, a restart cancels it,
+and the CLI's self-started follow-up turn shows as thinking. Unlike an agent row, the shell's tool.result
+output still renders.
+
+The common failure, though, is an agent that *says* "I'll report when it completes" and ends its turn
+with nothing running. Nothing can resume it. `AgentDriver.TOOLING_GUIDANCE` now carries a WAITING rule:
+never promise to wait without starting a background watcher (`gh run watch … --exit-status`, a bounded
+`until …; do sleep 30; done`), and otherwise say plainly that no notification will come. This is
+model guidance, not a guarantee.

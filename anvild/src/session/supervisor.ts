@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync as ensureDir } from "node:fs";
 import { basename, join } from "node:path";
 import {
@@ -127,6 +127,11 @@ export { BadCommand };
 /** Stable sentinel id for the single persistent "concierge" default chat (§0.6). `newId` is random
  *  so this can never collide with an ordinary session. */
 export const DEFAULT_SESSION_ID = "sess_default";
+/** Written by a clean `shutdown()` (after the final registry flush), consumed by the next `restore()`. */
+const CLEAN_SHUTDOWN_MARKER = "clean-shutdown";
+/** How far restore skips each session's seq after an unclean stop. Only ~100ms of mints can be missing
+ *  from the registry (its flush debounce), so this is orders of magnitude of headroom. */
+export const SEQ_CRASH_GAP = 10_000;
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -151,6 +156,8 @@ export interface SupervisorConfig {
   clonesDir?: string;
   warnFraction?: number;
   softStopFraction?: number;
+  /** How often (ms) to re-read each account's plan windows between turns; 0 disables. Default 5 min. */
+  usagePollMs?: number;
   /** Fire one model-label refresh shortly after construction. The real daemon (main.ts) sets this; it
    *  defaults off so tests that spin up a Supervisor never make a live Models API call. The recurring
    *  ~4h refresh is always armed regardless (it just never fires within a test's lifetime). */
@@ -257,6 +264,7 @@ export class Supervisor {
   private readonly autopilot: AutopilotService;
   readonly loops: LoopService;
   private prSweepTimer?: ReturnType<typeof setInterval>;
+  private usagePollTimer?: ReturnType<typeof setInterval>;
   private readonly attachStore: AttachmentStore;
   readonly webpush: WebPush;
   readonly fcm: Fcm;
@@ -435,6 +443,7 @@ export class Supervisor {
     this.autopilot.startScheduler();
     this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
+    this.startUsagePoll(cfg.usagePollMs ?? 5 * 60_000);
     this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
     // the lapo status once discovery completes so an already-connected client sees the callback URL.
@@ -481,10 +490,54 @@ export class Supervisor {
   }
 
   budget(): Budget {
-    return this.rateLimits.snapshot();
+    return this.labelBudget(this.rateLimits.snapshot());
   }
+  /** The latest gauge plus one per Claude account (rate limits are per account, not per session). */
   budgetEvent(): BudgetEvent {
-    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.rateLimits.snapshot() };
+    // A removed account's gauge would otherwise linger forever; "" (the bare env token) always stays.
+    this.rateLimits.retain((k) => k === "" || this.accounts.has(k));
+    const budgets = this.rateLimits.snapshots().map((b) => this.labelBudget(b));
+    return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.budget(), budgets };
+  }
+  /** Stamp the account's CURRENT label at send time (labels are renameable; the tracker keeps ids). */
+  private labelBudget(b: Budget): Budget {
+    const label = b.accountId ? this.accounts.labelOf(b.accountId) : undefined;
+    return label ? { ...b, accountLabel: label } : b;
+  }
+  /** The tracker key for the account a session's turns bill to ("" = bare env token, no roster). */
+  private usageKey(s: Session | undefined): string {
+    return s?.data.accountId ?? this.accounts.defaultId() ?? "";
+  }
+
+  /**
+   * Keep the per-account gauge live between turns (the per-turn read only fires when a turn ends, so
+   * usage from claude.ai / another machine / an idle stretch would otherwise go unseen). Every tick,
+   * each account with a live session is re-read through ONE of its drivers — a control request, not
+   * a model turn. Skipped while no client is attached (nobody is watching). An account with no live
+   * session keeps its last-known reading; its `updatedAt` tells the client how stale it is.
+   */
+  private startUsagePoll(periodMs: number): void {
+    if (periodMs <= 0) return;
+    this.usagePollTimer = setInterval(() => {
+      if (this.registry.all().length > 0) void this.pollUsage();
+    }, periodMs);
+    this.usagePollTimer.unref?.();
+  }
+  /** One usage-poll pass (exposed for tests). Broadcasts once if any account produced a reading. */
+  async pollUsage(): Promise<void> {
+    const byAccount = new Map<string, AgentDriver>();
+    for (const [id, d] of this.drivers) {
+      const key = this.usageKey(this.sessions.get(id));
+      if (d.started && !byAccount.has(key)) byAccount.set(key, d);
+    }
+    let any = false;
+    for (const [key, d] of byAccount) {
+      const u = await d.readUsage();
+      if (!u?.rateLimits) continue;
+      this.rateLimits.update(key, u.rateLimits, u.subscriptionType);
+      any = true;
+    }
+    if (any) this.registry.toAll(this.budgetEvent());
   }
 
   // ── Environments (projects) — delegated to EnvironmentService (P7 extraction). environmentsEvent is
@@ -1779,6 +1832,12 @@ export class Supervisor {
     this.terminalMgr.killAll();
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
+    // The registry now holds every minted seq — tell the next boot it needn't skip ahead (see restore).
+    try {
+      writeFileSync(join(this.stateDir, CLEAN_SHUTDOWN_MARKER), new Date().toISOString());
+    } catch (e) {
+      console.error(`[supervisor] couldn't write the clean-shutdown marker: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /**
@@ -1974,6 +2033,8 @@ export class Supervisor {
     ensureDir(dir, { recursive: true });
     const log = new EventLog(dir);
     this.logs.set(data.id, log);
+    // Never mint a seq the durable log already holds (the registry's lastSeq can lag it after a crash).
+    lastSeq = Math.max(lastSeq, log.maxSeq());
     const session = new Session(
       data,
       lastSeq,
@@ -2048,6 +2109,9 @@ export class Supervisor {
       // the SDK emitted this `result`), so consume the marker `onGoalResolved` left instead — its
       // "Goal met" push already covered this turn.
       if (this.goalPushSuppressed.delete(sessionId)) return;
+      // Background sub-agents still running: this `result` ends the turn, not the work. The CLI starts a
+      // follow-up turn when they finish, and THAT turn's result is the real "your turn".
+      if (this.sessions.get(sessionId)?.hasRunningBackgroundSubAgents()) return;
       // A short, plain-text summary of what Claude said — no Markdown, no novel — so the reminder
       // carries real context at a glance instead of raw "## heading **bold**" glyphs.
       const snippet = summarize(this.sessions.get(sessionId)?.lastAssistantText ?? "");
@@ -2086,14 +2150,14 @@ export class Supervisor {
     // The goal is now on the record — classify the remote branch prefix from the opening brief once
     // (arch §8). Fire-and-forget: a slow/failed LLM call must never hold up the turn's completion.
     if (s?.data.worktree && !s.data.worktree.remoteBranch) void this.ensureRemoteBranch(s);
-    const { budget, crossedSoftStop } = this.rateLimits.update(usage.rateLimits, usage.subscriptionType);
-    this.registry.toAll({ v: PROTOCOL_VERSION, type: "budget", ts: now(), budget });
+    const { budget, crossedSoftStop } = this.rateLimits.update(this.usageKey(s), usage.rateLimits, usage.subscriptionType);
+    this.registry.toAll(this.budgetEvent());
     if (crossedSoftStop) {
       const pct = Math.round(budget.week?.utilization ?? 0);
       this.sessions
         .get(sessionId)
         ?.emitError(
-          `Heads up: weekly plan usage is at ~${pct}% of the limit. Consider switching sessions to Sonnet or pausing nonessential work.`,
+          `Heads up: weekly plan usage${budget.accountId ? ` on "${this.accounts.labelOf(budget.accountId) ?? budget.accountId}"` : ""} is at ~${pct}% of the limit. Consider switching sessions to Sonnet or pausing nonessential work.`,
           false,
         );
     }
@@ -2103,8 +2167,28 @@ export class Supervisor {
    *  Restore itself no longer blocks on git — this is the deterministic hook for tests/shutdown. */
   worktreeRecoveriesSettled: Promise<void> = Promise.resolve();
 
+  /** Whether the previous run ended with a clean `shutdown()` (consumes the marker, so a later crash is
+   *  seen as one). Absent marker = a crash, a kill -9, or a pre-marker build: assume the worst. */
+  private consumeCleanShutdownMarker(): boolean {
+    const f = join(this.stateDir, CLEAN_SHUTDOWN_MARKER);
+    if (!existsSync(f)) return false;
+    try {
+      rmSync(f, { force: true });
+    } catch {
+      /* best-effort: a stale marker only costs one skipped gap on a later crash */
+    }
+    return true;
+  }
+
   private restore(): void {
     const transient: SessionData["status"][] = ["thinking", "running_tool", "awaiting_permission", "awaiting_question"];
+    // After an UNCLEAN stop the registry's lastSeq lags what was actually minted: it's flushed on a
+    // 100ms debounce (PERSIST_DEBOUNCE_MS), and transient frames (assistant.delta) mint seqs clients advance their
+    // resume watermark from but the log never stores — so neither the registry nor the log knows the true
+    // high-water mark. Re-minting those numbers would let a client that saw them delta-resume PAST the new
+    // events (silently dropping them) and could duplicate seqs in its offline mirror. Skip far ahead
+    // instead: seq gaps are legitimate everywhere (transient frames already leave them).
+    const seqSkip = this.consumeCleanShutdownMarker() ? 0 : SEQ_CRASH_GAP;
     let quarantined = 0;
     const recoveries: Promise<unknown>[] = [];
     for (const p of this.store.loadAll()) {
@@ -2119,9 +2203,15 @@ export class Supervisor {
         if (p.data.goal) p.data.goal.paused = true;
         // Reuse the persisted epoch so a client's cached transcript stays delta-resumable across a
         // daemon restart; a pre-v4 row has none → wrap mints one (forces one harmless full snapshot).
-        const session = this.wrap(p.data, p.lastSeq, p.epoch);
+        const session = this.wrap(p.data, p.lastSeq + seqSkip, p.epoch);
         this.sessions.set(p.data.id, session);
 
+        // Background sub-agents in flight when the daemon went down died with its CLI process — no
+        // task_notification can ever arrive. Settle them durably as canceled so no device shows a row
+        // spinning forever (§sub-agents, background).
+        for (const agent of this.logs.get(p.data.id)?.orphanedBackgroundAgents() ?? []) {
+          session.emit({ type: "subagent.settled", agent: { ...agent, state: "canceled", currentTool: undefined } });
+        }
         if (interrupted) {
           session.emit({
             type: "assistant.message",
@@ -2237,7 +2327,8 @@ export class Supervisor {
   // emitted event (status/prose/seq, many per turn) is the daemon's hottest path; this window batches
   // a burst into one write. Lifecycle ops (create/kill/shutdown) still call persist() for immediate
   // durability; the event log is the authoritative per-event stream, so at most PERSIST_DEBOUNCE_MS
-  // of status/seq updates are at risk on a hard crash (restart reconciles them anyway).
+  // of status/seq updates are at risk on a hard crash. restore() covers the seq half: it floors nextSeq
+  // at the log's max and, without a clean-shutdown marker, skips SEQ_CRASH_GAP ahead.
   private static readonly PERSIST_DEBOUNCE_MS = 100;
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private persistDirty = false;

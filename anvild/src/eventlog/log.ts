@@ -5,6 +5,7 @@ import {
   type ConversationEvent,
   type ConversationSnapshotEvent,
   type ServerEvent,
+  type SubAgentView,
 } from "@protocol";
 import { now } from "../util/envelope";
 
@@ -93,6 +94,31 @@ export class EventLog {
     return out;
   }
 
+  /** Highest `seq` persisted in this log (0 when empty). The session registry's `lastSeq` is flushed on a
+   *  debounce, so after a hard crash the log can be AHEAD of it — restore floors `nextSeq` here so a new
+   *  event can never reuse a persisted seq. */
+  maxSeq(): number {
+    let max = 0;
+    for (const e of this.readAll()) {
+      const seq = (e as { seq?: number }).seq;
+      if (typeof seq === "number" && seq > max) max = seq;
+    }
+    return max;
+  }
+
+  /** Background sub-agents the log last saw RUNNING (their launch ack) with no `subagent.settled` after —
+   *  i.e. still in flight when the daemon went down. Their CLI process died with it, so no settle can
+   *  ever arrive; restore cancels them durably so the row doesn't spin forever (§sub-agents, background). */
+  orphanedBackgroundAgents(): SubAgentView[] {
+    const open = new Map<string, SubAgentView>();
+    for (const e of this.readAll()) {
+      const a = e as any;
+      if (e.type === "tool.result" && a.subagent?.background && a.subagent.state === "running") open.set(a.subagent.id, a.subagent);
+      else if (e.type === "subagent.settled" && a.agent?.id) open.delete(a.agent.id);
+    }
+    return [...open.values()];
+  }
+
   /** Compacted snapshot for a cold attach (no/stale lastSeq), arch §6.4. */
   snapshot(sessionId: string, lastSeq: number, epoch: string): ConversationSnapshotEvent {
     const events: ConversationEvent[] = [];
@@ -115,6 +141,10 @@ export class EventLog {
           break;
         case "file.offer":
           events.push({ kind: "file_offer", ts: a.ts, file: a.file });
+          break;
+        case "subagent.settled":
+          // A background sub-agent's real end (§sub-agents, background) — its tool.result was the launch ack.
+          events.push({ kind: "subagent_settled", ts: a.ts, agent: a.agent });
           break;
         default:
           break; // status / usage / tool.use / permission.request|resolved / error are not part of the snapshot

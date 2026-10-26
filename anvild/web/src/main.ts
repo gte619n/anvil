@@ -68,6 +68,7 @@ import {
   dropSessionHero,
   finalizeActivity,
   finalizeSubAgentResult,
+  settleSubAgent,
   hideThinking,
   initConversation,
   maybeShowSessionHero,
@@ -211,6 +212,7 @@ import { OutboxQueue, newCid, type OutboxItem } from "./outbox";
 import { isDaemonHandledCommand } from "./sendReconcile";
 import { telemetry } from "./telemetry";
 import { canDeltaResume, shouldRelightStatus } from "./resume";
+import { gaugesOf, mergeGauges, renderUsage, startUsageTicker } from "./usage";
 import { convoCache, migrateLegacyConvoCache } from "./convoCache";
 import { mirror, MIRROR_MAX_SESSIONS } from "./mirror";
 import { applyHistoryToMirror, createPrefetcher, PREFETCH_MAX_SESSIONS, type PrefetchSessionInfo } from "./prefetch";
@@ -1102,7 +1104,7 @@ function idleTick(): Promise<void> {
 /** The durable content frames a shadow subscription delivers for non-viewed sessions (mirrors the
  *  server's isShadowable) — used only to attribute the shadowEvents telemetry counter. */
 function isShadowContentType(t: string): boolean {
-  return t === "message.user" || t === "assistant.message" || t === "tool.result" || t === "result" || t === "file.offer";
+  return t === "message.user" || t === "assistant.message" || t === "tool.result" || t === "result" || t === "file.offer" || t === "subagent.settled";
 }
 const prefetcher = createPrefetcher({
   supportsHistory: (url) => serverSupports(servers.get(url), "history"),
@@ -1595,7 +1597,11 @@ function onEvent(url: string, e: ServerEvent): void {
     }
     case "budget": {
       const srv = servers.get(url);
-      if (srv) srv.budget = e.budget; // stored for any future use; no longer surfaced in the UI
+      if (srv) {
+        srv.budget = e.budget;
+        srv.budgets = gaugesOf(e);
+      }
+      paintUsage();
       return;
     }
     case "environments":
@@ -1789,11 +1795,16 @@ function handleSessionEvent(e: ServerEvent): void {
     case "tool.result":
       // A sub-agent (`Task`/`Agent`) completing: settle its row (§sub-agents, D10) instead of dumping a
       // generic result — the sub-agent group IS the display. Ordinary tool results render as before.
+      // A background SHELL task (kind "shell", e.g. a CI watcher) keeps its output AND gets a tracked row.
+      if (e.subagent?.kind === "shell") appendToolResult(e.content, e.isError, e.images);
       if (e.subagent) finalizeSubAgentResult(e.subagent);
       else appendToolResult(e.content, e.isError, e.images);
       return;
     case "subagent.activity":
       updateSubAgents(e.agents); // ephemeral live snapshot (no seq): tick the sub-agent rows (D5/D9)
+      return;
+    case "subagent.settled":
+      settleSubAgent(e.agent); // durable: a BACKGROUND sub-agent ended — settle its (possibly earlier-turn) row
       return;
     case "file.offer":
       appendFileOffer(e.file);
@@ -1854,10 +1865,12 @@ function renderConversationEvent(ev: ConversationEvent): void {
   if (ev.kind === "user") appendUser(ev.rendered.html, ev.attachments, ev.ts, undefined, ev.rendered.source);
   else if (ev.kind === "assistant") commitAssistant(ev.blocks, ev.ts);
   else if (ev.kind === "tool_result") {
+    if (ev.subagent?.kind === "shell") appendToolResult(ev.content, ev.isError, ev.images); // background shell: output + row
     if (ev.subagent) finalizeSubAgentResult(ev.subagent); // durable sub-agent completion (reload/offline replay, D10)
     else appendToolResult(ev.content, ev.isError, ev.images);
   }
   else if (ev.kind === "file_offer") appendFileOffer(ev.file);
+  else if (ev.kind === "subagent_settled") settleSubAgent(ev.agent); // background sub-agent's end (replay)
 }
 
 /**
@@ -2524,3 +2537,9 @@ $("#open-settings").addEventListener("click", openSettings);
 // draft's "Open the draft" (openPlanDeepLink) and Settings → Todoist; its sidebar entry is retired.
 $("#open-loops").addEventListener("click", openLoops);
 $("#new-session-top").addEventListener("click", () => showNewSession());
+
+// ── Plan-usage gauge (arch §3) — per Claude account, merged across every server (see usage.ts) ──
+function paintUsage(): void {
+  renderUsage(document.getElementById("usage-gauge"), mergeGauges([...servers.values()].map((s) => s.budgets ?? [])));
+  startUsageTicker(paintUsage); // keep "resets in" / "updated …ago" current between budget events
+}
