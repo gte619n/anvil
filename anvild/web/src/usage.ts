@@ -78,10 +78,17 @@ function bar(name: string, w: RateWindow | undefined, nowMs: number): string {
   </div>`;
 }
 
-/** Paint the merged gauges into `el` (hidden when there's nothing to show). */
-export function renderUsage(el: HTMLElement | null, gauges: Budget[], nowMs = Date.now()): void {
+/** Paint the merged gauges into `el`. With no gauges, show a "no reading yet" placeholder while a
+ *  server is connected (the first poll can take a few minutes) and only fully hide when nothing is
+ *  attached — so the meter never silently vanishes on an account that simply hasn't been read yet. */
+export function renderUsage(el: HTMLElement | null, gauges: Budget[], nowMs = Date.now(), expectReading = false): void {
   if (!el) return;
-  el.hidden = gauges.length === 0;
+  if (gauges.length === 0) {
+    el.hidden = !expectReading;
+    el.innerHTML = expectReading ? `<div class="usage-acct usage-empty">No plan-usage reading yet…</div>` : "";
+    return;
+  }
+  el.hidden = false;
   el.innerHTML = gauges
     .map((g) => {
       const stale = isStale(g, nowMs);

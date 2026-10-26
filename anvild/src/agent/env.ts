@@ -102,7 +102,16 @@ export function buildAgentEnv(
       tok = (src.CLAUDE_CODE_OAUTH_TOKEN ?? "").trim();
     }
     if (!tok && opts.requireToken !== false) throw new Error(NO_CLAUDE_TOKEN_ERROR);
-    if (tok) out.CLAUDE_CODE_OAUTH_TOKEN = tok;
+    if (tok) {
+      out.CLAUDE_CODE_OAUTH_TOKEN = tok;
+      // Declare the profile scope so the CLI's usage call (usage_EXPERIMENTAL…) returns the plan's
+      // rate-limit windows that feed the sidebar meter. A token supplied via CLAUDE_CODE_OAUTH_TOKEN
+      // defaults to `user:inference` ONLY, which makes `rate_limits_available:false` and leaves the
+      // meter permanently empty. Verified on a real token: adding `user:profile` flips it to true with
+      // live 5h + weekly utilization and runs a normal turn cleanly (docs/plans/2026-10-26-usage-meter-…§5).
+      // An operator can override via the daemon env if a narrower scope is ever needed.
+      out.CLAUDE_CODE_OAUTH_SCOPES = (src.CLAUDE_CODE_OAUTH_SCOPES ?? "").trim() || "user:inference user:profile";
+    }
   }
   return out;
 }
