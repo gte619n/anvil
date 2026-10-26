@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import type { Budget } from "../../protocol";
-import { agoText, gaugeLabel, gaugesOf, isStale, level, mergeGauges, untilText } from "../../web/src/usage";
+import { agoText, gaugeLabel, gaugesOf, isStale, level, mergeGauges, untilText, weekProgress } from "../../web/src/usage";
 
 const g = (accountId: string | undefined, updatedAt: string, week: number, extra: Partial<Budget> = {}): Budget => ({
   available: true,
@@ -62,4 +62,16 @@ test("labels, levels, and relative times", () => {
   expect(agoText("2026-10-25T11:53:00Z", now)).toBe("7m ago");
   expect(isStale(g("a", "2026-10-25T11:50:00Z", 1), now)).toBe(false);
   expect(isStale(g("a", "2026-10-25T11:30:00Z", 1), now)).toBe(true);
+});
+
+test("weekProgress: prorated fraction elapsed through the 7-day window", () => {
+  const now = Date.parse("2026-10-25T12:00:00Z");
+  // reset exactly 3.5 days out → the window opened 3.5 days ago → half elapsed
+  expect(weekProgress("2026-10-29T00:00:00Z", now)).toBeCloseTo(50, 5);
+  // reset is now → the full week has elapsed
+  expect(weekProgress("2026-10-25T12:00:00Z", now)).toBeCloseTo(100, 5);
+  // reset a full 7 days out → the window just opened
+  expect(weekProgress("2026-11-01T12:00:00Z", now)).toBeCloseTo(0, 5);
+  expect(weekProgress(undefined, now)).toBeNull();
+  expect(weekProgress("not-a-date", now)).toBeNull();
 });

@@ -5,6 +5,7 @@
   --text: #1c2024;
   --muted: #6b7280;
   --accent: #3b6ef5;
+  --accent-week: #0d9488; /* usage gauge: weekly bar, teal to distinguish it from the blue 5h bar */
   --user-bg: #eef2ff;
   --tool-bg: #f3f4f6;
   --code-bg: #f6f8fa;
@@ -21,6 +22,7 @@
   --text: #e6e7e9;
   --muted: #9aa0a6;
   --accent: #6b9bff;
+  --accent-week: #2dd4bf; /* teal-400, lifted for contrast on the dark sidebar */
   --user-bg: #2a3350;
   --tool-bg: #2a2c30;
   --code-bg: #24292e;
@@ -127,10 +129,18 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .usage-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-ago { color: var(--muted); font-weight: 400; flex-shrink: 0; }
 .usage-row { display: grid; grid-template-columns: 34px 1fr 34px; align-items: center; gap: 6px; color: var(--muted); }
-.usage-bar { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 22%, transparent); overflow: hidden; }
+/* position:relative anchors the pace marker; overflow stays visible so the marker's circle can sit
+   proud of the 6px track. The fill <i> carries its own border-radius, so dropping overflow:hidden
+   doesn't square off its corners. */
+.usage-bar { position: relative; height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--muted) 22%, transparent); }
 .usage-bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.usage-row.usage-week .usage-bar i { background: var(--accent-week); }
 .usage-row.warm .usage-bar i { background: var(--warn); }
 .usage-row.hot .usage-bar i { background: var(--danger); }
+/* Prorated pace marker (week only): a dot at the fraction of the week that has elapsed. If the fill
+   trails the dot you're under pace; if it leads, you're on track to overshoot the quota. `left` is set
+   inline; the negative margins centre the 10px circle on that point. */
+.usage-mark { position: absolute; top: 50%; width: 10px; height: 10px; margin-top: -5px; margin-left: -5px; border-radius: 50%; background: var(--text); border: 2px solid var(--bg); box-sizing: border-box; pointer-events: none; }
 .usage-row.warm .usage-pct { color: var(--warn); }
 .usage-row.hot .usage-pct { color: var(--danger); }
 .usage-pct { text-align: right; font-variant-numeric: tabular-nums; }

@@ -69,13 +69,28 @@ function cap(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-function bar(name: string, w: RateWindow | undefined, nowMs: number): string {
+const WEEK_MS = 7 * 24 * 60 * 60_000;
+
+/** Elapsed fraction (0–100) of the current weekly window, measured back 7 days from its reset time.
+ *  This is the "prorated pace" marker: at 50% exactly half the week has passed, so usage below 50%
+ *  is on track and usage above it is heading for an overshoot. null when `resetsAt` is unknown. */
+export function weekProgress(resetsAt: string | undefined, nowMs: number): number | null {
+  if (!resetsAt) return null;
+  const end = Date.parse(resetsAt);
+  if (!Number.isFinite(end)) return null;
+  return Math.max(0, Math.min(100, ((nowMs - (end - WEEK_MS)) / WEEK_MS) * 100));
+}
+
+function bar(name: string, kind: "session" | "week", w: RateWindow | undefined, nowMs: number): string {
   if (!w) return "";
   const pct = Math.max(0, Math.min(100, w.utilization));
   const resets = untilText(w.resetsAt, nowMs);
-  return `<div class="usage-row ${level(w)}" title="${esc(`${name}: ${pct}% used${resets ? ` · resets in ${resets}` : ""}`)}">
+  const pace = kind === "week" ? weekProgress(w.resetsAt, nowMs) : null;
+  const marker = pace == null ? "" : `<b class="usage-mark" style="left:${pace}%"></b>`;
+  const pacePart = pace == null ? "" : ` · ${Math.round(pace)}% of week elapsed`;
+  return `<div class="usage-row usage-${kind} ${level(w)}" title="${esc(`${name}: ${pct}% used${resets ? ` · resets in ${resets}` : ""}${pacePart}`)}">
     <span class="usage-name">${esc(name)}</span>
-    <span class="usage-bar"><i style="width:${pct}%"></i></span>
+    <span class="usage-bar"><i style="width:${pct}%"></i>${marker}</span>
     <span class="usage-pct">${Math.round(pct)}%</span>
   </div>`;
 }
@@ -107,7 +122,7 @@ export function renderUsage(el: HTMLElement | null, gauges: Budget[], nowMs = Da
         (stale ? `<span class="usage-ago">${esc(agoText(g.updatedAt, nowMs))}</span>` : "");
       return `<div class="usage-acct${stale ? " stale" : ""}" title="${esc(extra.join(" · "))}">
         ${head ? `<div class="usage-head">${head}</div>` : ""}
-        ${bar("5h", g.session, nowMs)}${bar("Week", g.week, nowMs)}
+        ${bar("5h", "session", g.session, nowMs)}${bar("Week", "week", g.week, nowMs)}
       </div>`;
     })
     .join("");
