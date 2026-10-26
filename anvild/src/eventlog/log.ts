@@ -94,6 +94,18 @@ export class EventLog {
     return out;
   }
 
+  /** Highest `seq` persisted in this log (0 when empty). The session registry's `lastSeq` is flushed on a
+   *  debounce, so after a hard crash the log can be AHEAD of it — restore floors `nextSeq` here so a new
+   *  event can never reuse a persisted seq. */
+  maxSeq(): number {
+    let max = 0;
+    for (const e of this.readAll()) {
+      const seq = (e as { seq?: number }).seq;
+      if (typeof seq === "number" && seq > max) max = seq;
+    }
+    return max;
+  }
+
   /** Background sub-agents the log last saw RUNNING (their launch ack) with no `subagent.settled` after —
    *  i.e. still in flight when the daemon went down. Their CLI process died with it, so no settle can
    *  ever arrive; restore cancels them durably so the row doesn't spin forever (§sub-agents, background). */

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
-import { Supervisor } from "../../src/session/supervisor";
+import { Supervisor, SEQ_CRASH_GAP } from "../../src/session/supervisor";
 import { ConnectionRegistry } from "../../src/server/registry";
 
 const tempState = () => mkdtempSync(join(tmpdir(), "anvil-recover-"));
@@ -87,5 +87,63 @@ test("restart cancels an in-flight background sub-agent durably, exactly once", 
   await sup2.shutdown();
   const sup3 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
   expect(sup3.resume(s.id, 0).filter((e) => e.type === "subagent.settled")).toHaveLength(1); // not duplicated
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ── Seq high-water mark across an UNCLEAN restart ──────────────────────────────────────────────────
+// The registry's lastSeq is flushed on a 100ms debounce, so a hard crash can leave it behind both the
+// durable log and the transient frames (assistant.delta) clients advance their watermark from. Restore
+// must never re-mint those numbers. (No `shutdown()` before the restart = a crash.)
+const md = (text: string) => ({ type: "assistant.message" as const, blocks: [{ kind: "markdown" as const, rendered: { source: text, html: text } }] });
+
+test("after a crash, new events never reuse a seq already in the log", async () => {
+  const dir = tempState();
+  const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = await createExisting(sup1, dir);
+  await sup1.shutdown(); // registry flushed at the session's creation…
+  const sup1b = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  for (let i = 0; i < 5; i++) sup1b.get(s.id)!.emit(md(`m${i}`)); // …then events the debounced flush never saw
+  // ── crash (no shutdown) → restart ──
+  const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  sup2.get(s.id)!.emit(md("after the crash"));
+  const seqs = sup2.resume(s.id, 0).filter((e) => e.type === "assistant.message").map((e) => (e as { seq: number }).seq);
+  expect(new Set(seqs).size).toBe(seqs.length); // no duplicates
+  expect(seqs[seqs.length - 1]).toBeGreaterThan(Math.max(...seqs.slice(0, -1)));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("after a crash, a client whose watermark came from a transient frame still receives the new events", async () => {
+  const dir = tempState();
+  const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = await createExisting(sup1, dir);
+  await sup1.shutdown();
+  const sup1b = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const live = sup1b.get(s.id)!;
+  live.emit(md("start"));
+  let clientSeq = 0;
+  for (let i = 0; i < 20; i++) clientSeq = (live.emit({ type: "assistant.delta", text: "x" }) as { seq: number }).seq; // never persisted
+  // ── crash → restart; the agent's next message lands while the client is away ──
+  const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const wm = sup2.resumeWatermarksEvent().watermarks.find((w) => w.sessionId === s.id)!;
+  expect(wm.lastSeq).toBeGreaterThanOrEqual(clientSeq); // the client stays in delta mode…
+  sup2.get(s.id)!.emit(md("the answer"));
+  const delta = sup2.resume(s.id, clientSeq);
+  // …and its delta carries the new message (before the fix it reused a seq ≤ clientSeq and was skipped).
+  expect(delta.some((e) => e.type === "assistant.message" && (e as any).blocks[0].rendered.source === "the answer")).toBe(true);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a clean shutdown skips nothing; the marker is consumed so a later crash still skips", async () => {
+  const dir = tempState();
+  const sup1 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  const s = await createExisting(sup1, dir);
+  sup1.get(s.id)!.emit(md("a"));
+  const before = sup1.get(s.id)!.lastSeq;
+  await sup1.shutdown();
+  const sup2 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  expect(sup2.get(s.id)!.lastSeq).toBe(before); // clean → exact continuation
+  // sup2 "crashes" (no shutdown): the marker was consumed at its boot, so the next restart skips ahead.
+  const sup3 = new Supervisor({ stateDir: dir }, new ConnectionRegistry());
+  expect(sup3.get(s.id)!.lastSeq).toBeGreaterThanOrEqual(before + SEQ_CRASH_GAP);
   rmSync(dir, { recursive: true, force: true });
 });

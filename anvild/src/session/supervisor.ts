@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync as ensureDir } from "node:fs";
 import { basename, join } from "node:path";
 import {
@@ -127,6 +127,11 @@ export { BadCommand };
 /** Stable sentinel id for the single persistent "concierge" default chat (§0.6). `newId` is random
  *  so this can never collide with an ordinary session. */
 export const DEFAULT_SESSION_ID = "sess_default";
+/** Written by a clean `shutdown()` (after the final registry flush), consumed by the next `restore()`. */
+const CLEAN_SHUTDOWN_MARKER = "clean-shutdown";
+/** How far restore skips each session's seq after an unclean stop. Only ~100ms of mints can be missing
+ *  from the registry (its flush debounce), so this is orders of magnitude of headroom. */
+export const SEQ_CRASH_GAP = 10_000;
 
 export interface SupervisorConfig {
   stateDir: string;
@@ -1827,6 +1832,12 @@ export class Supervisor {
     this.terminalMgr.killAll();
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
+    // The registry now holds every minted seq — tell the next boot it needn't skip ahead (see restore).
+    try {
+      writeFileSync(join(this.stateDir, CLEAN_SHUTDOWN_MARKER), new Date().toISOString());
+    } catch (e) {
+      console.error(`[supervisor] couldn't write the clean-shutdown marker: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   /**
@@ -2022,6 +2033,8 @@ export class Supervisor {
     ensureDir(dir, { recursive: true });
     const log = new EventLog(dir);
     this.logs.set(data.id, log);
+    // Never mint a seq the durable log already holds (the registry's lastSeq can lag it after a crash).
+    lastSeq = Math.max(lastSeq, log.maxSeq());
     const session = new Session(
       data,
       lastSeq,
@@ -2154,8 +2167,28 @@ export class Supervisor {
    *  Restore itself no longer blocks on git — this is the deterministic hook for tests/shutdown. */
   worktreeRecoveriesSettled: Promise<void> = Promise.resolve();
 
+  /** Whether the previous run ended with a clean `shutdown()` (consumes the marker, so a later crash is
+   *  seen as one). Absent marker = a crash, a kill -9, or a pre-marker build: assume the worst. */
+  private consumeCleanShutdownMarker(): boolean {
+    const f = join(this.stateDir, CLEAN_SHUTDOWN_MARKER);
+    if (!existsSync(f)) return false;
+    try {
+      rmSync(f, { force: true });
+    } catch {
+      /* best-effort: a stale marker only costs one skipped gap on a later crash */
+    }
+    return true;
+  }
+
   private restore(): void {
     const transient: SessionData["status"][] = ["thinking", "running_tool", "awaiting_permission", "awaiting_question"];
+    // After an UNCLEAN stop the registry's lastSeq lags what was actually minted: it's flushed on a
+    // 100ms debounce (PERSIST_DEBOUNCE_MS), and transient frames (assistant.delta) mint seqs clients advance their
+    // resume watermark from but the log never stores — so neither the registry nor the log knows the true
+    // high-water mark. Re-minting those numbers would let a client that saw them delta-resume PAST the new
+    // events (silently dropping them) and could duplicate seqs in its offline mirror. Skip far ahead
+    // instead: seq gaps are legitimate everywhere (transient frames already leave them).
+    const seqSkip = this.consumeCleanShutdownMarker() ? 0 : SEQ_CRASH_GAP;
     let quarantined = 0;
     const recoveries: Promise<unknown>[] = [];
     for (const p of this.store.loadAll()) {
@@ -2170,7 +2203,7 @@ export class Supervisor {
         if (p.data.goal) p.data.goal.paused = true;
         // Reuse the persisted epoch so a client's cached transcript stays delta-resumable across a
         // daemon restart; a pre-v4 row has none → wrap mints one (forces one harmless full snapshot).
-        const session = this.wrap(p.data, p.lastSeq, p.epoch);
+        const session = this.wrap(p.data, p.lastSeq + seqSkip, p.epoch);
         this.sessions.set(p.data.id, session);
 
         // Background sub-agents in flight when the daemon went down died with its CLI process — no
@@ -2294,7 +2327,8 @@ export class Supervisor {
   // emitted event (status/prose/seq, many per turn) is the daemon's hottest path; this window batches
   // a burst into one write. Lifecycle ops (create/kill/shutdown) still call persist() for immediate
   // durability; the event log is the authoritative per-event stream, so at most PERSIST_DEBOUNCE_MS
-  // of status/seq updates are at risk on a hard crash (restart reconciles them anyway).
+  // of status/seq updates are at risk on a hard crash. restore() covers the seq half: it floors nextSeq
+  // at the log's max and, without a clean-shutdown marker, skips SEQ_CRASH_GAP ahead.
   private static readonly PERSIST_DEBOUNCE_MS = 100;
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private persistDirty = false;
