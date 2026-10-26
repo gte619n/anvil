@@ -21,6 +21,22 @@ test("one gauge per account across servers — the newest reading wins", () => {
   ]);
 });
 
+test("same subscription on two machines (different local ids) merges by subscriptionKey", () => {
+  // The real-world "two default meters" bug: one Claude account seeded on two daemons, each minting a
+  // random accountId, but the SAME token → the same subscriptionKey. These must collapse to one row.
+  const hub = [g("hub_id", "2026-10-25T10:00:00Z", 6, { accountLabel: "default", subscriptionKey: "k1" })];
+  const member = [g("mem_id", "2026-10-25T10:05:00Z", 6, { accountLabel: "default", subscriptionKey: "k1" })];
+  const out = mergeGauges([hub, member]);
+  expect(out.length).toBe(1);
+  expect(out[0]?.accountId).toBe("mem_id"); // newest reading wins
+});
+
+test("two real accounts both labelled 'default' stay separate (distinct subscriptionKeys)", () => {
+  const a = g("a", "2026-10-25T10:00:00Z", 6, { accountLabel: "default", subscriptionKey: "ka" });
+  const b = g("b", "2026-10-25T10:00:00Z", 9, { accountLabel: "default", subscriptionKey: "kb" });
+  expect(mergeGauges([[a], [b]]).length).toBe(2);
+});
+
 test("unavailable gauges are dropped; unattributed ones merge under one key", () => {
   const out = mergeGauges([[{ available: false, warn: false }, g(undefined, "2026-10-25T10:00:00Z", 5)], [g(undefined, "2026-10-25T11:00:00Z", 6)]]);
   expect(out.map((x) => x.week?.utilization)).toEqual([6]);

@@ -233,6 +233,12 @@ export interface Budget {
    *  daemon or the bare env-var token. */
   accountId?: string;
   accountLabel?: string; // the account's display label at send time
+  /** A stable, cross-machine fingerprint of the account's OAuth token (a one-way hash — never the
+   *  token itself). The SAME Claude subscription configured on two fleet machines mints different
+   *  local `accountId`s (they're random per machine), so the client merges gauges by this key instead
+   *  to avoid showing one account as two identical meters. Absent on an older daemon or when no token
+   *  backs the gauge. */
+  subscriptionKey?: string;
 }
 
 /** Ceiling on unmet stop attempts before a goal auto-clears (design D4). Shared with the web client. */

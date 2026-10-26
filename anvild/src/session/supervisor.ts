@@ -99,7 +99,7 @@ import type { WorkUnit } from "../integrations/workunit";
 import { buildLoopsSnapshot } from "../integrations/loops";
 import type { TriggerEvent } from "../integrations/event-trigger";
 import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/store";
-import { AccountStore } from "../auth/accounts";
+import { AccountStore, tokenFingerprint } from "../auth/accounts";
 import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
 import { OpenRouterClient } from "../integrations/openrouter";
@@ -499,10 +499,22 @@ export class Supervisor {
     const budgets = this.rateLimits.snapshots().map((b) => this.labelBudget(b));
     return { v: PROTOCOL_VERSION, type: "budget", ts: now(), budget: this.budget(), budgets };
   }
-  /** Stamp the account's CURRENT label at send time (labels are renameable; the tracker keeps ids). */
+  /** Stamp the account's CURRENT label plus a cross-machine subscription key at send time (labels are
+   *  renameable, so they're denormalized here; the key lets the client merge the same subscription seen
+   *  from two fleet machines, which mint different local account ids, into ONE gauge). */
   private labelBudget(b: Budget): Budget {
     const label = b.accountId ? this.accounts.labelOf(b.accountId) : undefined;
-    return label ? { ...b, accountLabel: label } : b;
+    const token = this.gaugeToken(b);
+    return {
+      ...b,
+      ...(label ? { accountLabel: label } : {}),
+      ...(token ? { subscriptionKey: tokenFingerprint(token) } : {}),
+    };
+  }
+  /** The OAuth token backing a gauge: the roster account's, else the default/bare env token. */
+  private gaugeToken(b: Budget): string | undefined {
+    if (b.accountId) return this.accounts.get(b.accountId)?.token;
+    return this.accounts.token(undefined) ?? ((process.env[CLAUDE_TOKEN_KEY] ?? "").trim() || undefined);
   }
   /** The tracker key for the account a session's turns bill to ("" = bare env token, no roster). */
   private usageKey(s: Session | undefined): string {
