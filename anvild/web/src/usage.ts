@@ -9,14 +9,16 @@ import { esc } from "./dom";
 export const STALE_MS = 15 * 60_000;
 
 /** Merge every server's per-account gauges: one per account, newest `updatedAt` wins, then sorted by
- *  label for a stable row order. A gauge with no accountId (bare env token / pre-roster daemon) merges
- *  under a single "" key. Unavailable gauges are dropped. */
+ *  label for a stable row order. Keyed by `subscriptionKey` (a token fingerprint) so the SAME account
+ *  seen from two fleet machines — which mint different local `accountId`s — collapses to one row;
+ *  older daemons without it fall back to `accountId`, then to a single "" key (bare env token /
+ *  pre-roster daemon). Unavailable gauges are dropped. */
 export function mergeGauges(perServer: Budget[][]): Budget[] {
   const best = new Map<string, Budget>();
   for (const list of perServer) {
     for (const g of list) {
       if (!g.available) continue;
-      const key = g.accountId ?? "";
+      const key = g.subscriptionKey ?? g.accountId ?? "";
       const cur = best.get(key);
       if (!cur || (g.updatedAt ?? "") > (cur.updatedAt ?? "")) best.set(key, g);
     }
@@ -89,6 +91,9 @@ export function renderUsage(el: HTMLElement | null, gauges: Budget[], nowMs = Da
     return;
   }
   el.hidden = false;
+  // With a single account the label is noise ("default"/"Claude plan") — show just the bars. The head
+  // is still emitted when a gauge is stale, to carry the "Xm ago" freshness hint.
+  const showLabel = gauges.length > 1;
   el.innerHTML = gauges
     .map((g) => {
       const stale = isStale(g, nowMs);
@@ -97,8 +102,11 @@ export function renderUsage(el: HTMLElement | null, gauges: Budget[], nowMs = Da
         g.weekSonnet ? `Sonnet week ${Math.round(g.weekSonnet.utilization)}%` : "",
         `updated ${agoText(g.updatedAt, nowMs)}`,
       ].filter(Boolean);
+      const head =
+        (showLabel ? `<span class="usage-label">${esc(gaugeLabel(g))}</span>` : "") +
+        (stale ? `<span class="usage-ago">${esc(agoText(g.updatedAt, nowMs))}</span>` : "");
       return `<div class="usage-acct${stale ? " stale" : ""}" title="${esc(extra.join(" · "))}">
-        <div class="usage-head"><span class="usage-label">${esc(gaugeLabel(g))}</span>${stale ? `<span class="usage-ago">${esc(agoText(g.updatedAt, nowMs))}</span>` : ""}</div>
+        ${head ? `<div class="usage-head">${head}</div>` : ""}
         ${bar("5h", g.session, nowMs)}${bar("Week", g.week, nowMs)}
       </div>`;
     })

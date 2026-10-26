@@ -58,6 +58,13 @@ test("pollUsage reads each account once and reports a labelled gauge per account
   expect(byLabel.work?.accountId).toBe(a.id);
   expect(byLabel.personal?.week?.utilization).toBe(7);
 
+  // Each gauge carries a stable, per-token subscription key — the client's cross-machine merge key.
+  // Two different tokens must not collide; the same account re-reports the same key.
+  expect(byLabel.work?.subscriptionKey).toBeTruthy();
+  expect(byLabel.personal?.subscriptionKey).toBeTruthy();
+  expect(byLabel.work?.subscriptionKey).not.toBe(byLabel.personal?.subscriptionKey);
+  expect(sup.budgetEvent().budgets?.find((g) => g.accountId === a.id)?.subscriptionKey).toBe(byLabel.work?.subscriptionKey);
+
   // A renamed account is relabelled at send time; a removed one drops out of the event.
   accounts.rename(b.id, "side");
   expect(sup.budgetEvent().budgets?.some((g) => g.accountLabel === "side")).toBe(true);
