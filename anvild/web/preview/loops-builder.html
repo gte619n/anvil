@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Loops — build on the circuit (prototype)</title>
+<style>
+  :root[data-theme="dark"] {
+    --bg:#14161a; --panel:#1b1e24; --panel2:#21252c; --border:#2c313b; --fg:#e6e9ef; --muted:#8b93a1;
+    --track:#2c313b; --run:#f2c037; --gate:#b07cc3; --rest:#2196c9; --ship:#3ac07a; --warn:#e0623a; --accent:#7c6cf0;
+  }
+  :root[data-theme="light"] {
+    --bg:#f7f8fa; --panel:#fff; --panel2:#f0f2f6; --border:#dfe3ea; --fg:#1b1e24; --muted:#6b7382;
+    --track:#dfe3ea; --run:#d79a00; --gate:#8e55a6; --rest:#1478a8; --ship:#1f9d5e; --warn:#c84a22; --accent:#5b4bd6;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:860px; margin:0 auto; padding:26px 20px 70px; }
+  h1 { font-size:20px; margin:0 0 2px; display:flex; align-items:center; gap:8px; }
+  .sub { color:var(--muted); margin:0 0 18px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:18px; margin-bottom:16px; }
+  .head-row { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
+  .head-row h2 { font-size:16px; margin:0; flex:1; }
+  .chip { font-size:12px; font-weight:600; padding:3px 10px; border-radius:999px; border:1px solid var(--border); }
+  .chip-idle{color:var(--muted);} .chip-running{color:var(--run);border-color:var(--run);}
+  .chip-gated{color:var(--gate);border-color:var(--gate);} .chip-shipped{color:var(--ship);border-color:var(--ship);}
+
+  /* seed row */
+  .seed { display:flex; gap:10px; margin-bottom:8px; }
+  .seed input { flex:1; background:var(--panel2); border:1px solid var(--border); border-radius:9px; color:var(--fg); padding:10px 12px; font:inherit; }
+
+  /* ── circuit ── */
+  .lc-circuit { width:100%; height:auto; }
+  .lc-track { stroke:var(--track); stroke-width:3; }
+  .lc-return{ stroke:var(--track); stroke-width:3; fill:none; stroke-dasharray:5 5; opacity:.6; transition:stroke .3s,opacity .3s; }
+  .lc-return.hot{ stroke:var(--run); opacity:1; }
+  .lc-st { cursor:pointer; }
+  .lc-st-circle{ fill:var(--panel2); stroke:var(--border); stroke-width:2.5; transition:stroke .25s, fill .25s; }
+  .lc-st:hover .lc-st-circle{ stroke:var(--accent); }
+  .lc-st.sel .lc-st-circle{ stroke:var(--accent); fill:color-mix(in srgb, var(--accent) 18%, var(--panel2)); }
+  .lc-st.on .lc-st-circle{ stroke:var(--run); }
+  .lc-st-ico{ font-size:20px; pointer-events:none; }
+  .lc-st-lbl{ fill:var(--fg); font-size:12px; font-weight:600; pointer-events:none; }
+  .lc-st-sub{ fill:var(--muted); font-size:10px; pointer-events:none; }
+  .lc-gate-d{ fill:var(--panel2); stroke:var(--gate); stroke-width:2.5; transition:stroke .25s; }
+  .lc-st.sel .lc-gate-d{ stroke:var(--accent); }
+  .lc-gate-lbl{ fill:var(--gate); font-size:11px; font-weight:600; pointer-events:none; }
+  .lc-lap{ fill:var(--muted); font-size:11px; }
+  .lc-scope-txt{ fill:var(--muted); font-size:11px; cursor:pointer; }
+  .lc-scope-txt:hover{ fill:var(--accent); }
+
+  #runner{ transition:transform .62s cubic-bezier(.5,.05,.2,1); }
+  #runner.hidden{ opacity:0; }
+  .lc-runner{ r:8; fill:var(--run); filter:drop-shadow(0 0 7px var(--run)); transition:fill .3s; }
+  .circuit-gated #runner .lc-runner{ fill:var(--gate); filter:drop-shadow(0 0 9px var(--gate)); }
+  .circuit-gated .lc-gate-d{ animation:pulse 1.2s ease-in-out infinite; }
+  .circuit-shipped #runner .lc-runner{ fill:var(--ship); filter:drop-shadow(0 0 9px var(--ship)); }
+  @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:.35;} }
+
+  /* ── editor ── */
+  #editor { background:var(--panel2); border:1px solid var(--border); border-radius:12px; padding:16px; margin-top:6px; min-height:70px; }
+  .ed-title { font-weight:700; margin:0 0 10px; display:flex; align-items:center; gap:8px; }
+  .ed-hint { color:var(--muted); font-size:12px; }
+  label.field { display:block; margin:10px 0 4px; font-weight:600; font-size:13px; }
+  input[type=text], textarea, select { width:100%; background:var(--panel); border:1px solid var(--border);
+    border-radius:8px; color:var(--fg); padding:9px 11px; font:inherit; }
+  textarea { resize:vertical; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .seg { display:flex; gap:6px; flex-wrap:wrap; }
+  .seg button { flex:1; min-width:90px; }
+  button { font:inherit; font-weight:600; border-radius:9px; padding:9px 14px; cursor:pointer;
+    border:1px solid var(--border); background:var(--panel); color:var(--fg); transition:all .15s; }
+  button:hover { border-color:var(--accent); }
+  button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary { background:var(--rest); border-color:var(--rest); color:#fff; }
+  button.gate { background:var(--gate); border-color:var(--gate); color:#fff; }
+  button.ai { background:linear-gradient(90deg,var(--accent),#9a7cf5); border:none; color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+  .theme-toggle{ margin-left:auto; }
+
+  /* grounding stream */
+  .ground { margin-top:12px; border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .ground-head { display:flex; align-items:center; gap:8px; padding:9px 12px; background:var(--panel);
+    font-weight:600; font-size:13px; }
+  .spin { width:13px; height:13px; border:2px solid var(--muted); border-top-color:var(--accent);
+    border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  .ground-body { padding:4px 12px 10px; font-size:12px; color:var(--muted); }
+  .gline { padding:3px 0; animation:slidein .3s ease; }
+  @keyframes slidein{ from{opacity:0; transform:translateX(-5px);} to{opacity:1;} }
+  .assumptions { margin:6px 0 0; padding-left:18px; color:var(--muted); font-size:12px; }
+
+  /* adaptive intake: stations awaiting a genuine-ambiguity answer pulse amber */
+  .lc-st.needs .lc-st-circle{ stroke:var(--run); animation:pulse 1.2s ease-in-out infinite; }
+  .badge{ font-size:12px; font-weight:600; padding:2px 8px; border-radius:999px; border:1px solid var(--border); margin-left:6px; }
+  .intake-sum{ margin-top:8px; }
+  .sum-row{ display:flex; gap:10px; align-items:center; padding:6px 0; border-top:1px solid var(--border); font-size:13px; }
+  .sum-row .k{ color:var(--muted); width:92px; flex:none; } .sum-row .v{ flex:1; }
+  .sum-row a{ color:var(--accent); cursor:pointer; font-size:12px; }
+  .q-bub{ background:var(--panel); border:1px solid var(--run); border-radius:10px; padding:11px 13px; margin-top:12px; animation:slidein .3s ease; }
+  .q-chips{ display:flex; gap:8px; flex-wrap:wrap; margin-top:9px; }
+  .ready{ margin-top:14px; padding:10px 13px; border:1px solid var(--ship); border-radius:10px; color:var(--ship); font-weight:600; animation:slidein .3s ease; }
+
+  /* lap history */
+  .laps { margin-top:4px; }
+  .lap-row { display:flex; align-items:center; gap:10px; padding:7px 0; border-top:1px solid var(--border); animation:slidein .35s ease; }
+  .lap-n { color:var(--muted); font-size:12px; width:48px; }
+  .lap-what { flex:1; }
+  .verdict { font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; }
+  .v-pass{ color:var(--ship); border:1px solid var(--ship);} .v-fail{ color:var(--warn); border:1px solid var(--warn);}
+  .gauges { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:12px; }
+  .gauge b{ display:block; font-size:13px; margin-bottom:5px; } .gauge span{ color:var(--muted); font-size:11px; }
+  .bar{ height:7px; background:var(--track); border-radius:4px; overflow:hidden; margin:2px 0 4px; }
+  .bar i{ display:block; height:100%; width:0; background:var(--rest); border-radius:4px; transition:width .5s ease,background .3s; }
+  .bar i.warn{ background:var(--warn); }
+  .note{ color:var(--muted); font-size:12px; margin-top:14px; }
+  code{ background:var(--track); padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚙️ Loops — build on the circuit <span class="chip chip-idle">prototype</span></h1>
+  <p class="sub">Click any station to define it. The diagram fills in live. Hit <b>✨ Ask Claude</b> to ground
+    the loop in your repo (mocked here — shows where the real agent plugs in).</p>
+
+  <div class="card">
+    <div class="seed">
+      <input id="seed" placeholder="What should get done? e.g. Fix the flaky upload test" />
+      <button class="ai" id="ground">✨ Ask Claude to ground it</button>
+    </div>
+
+    <div class="head-row">
+      <h2 id="loop-name">New loop</h2>
+      <span class="chip chip-idle" id="chip">draft</span>
+      <button class="theme-toggle" id="theme">◐ theme</button>
+    </div>
+
+    <svg class="lc-circuit" id="circuit" viewBox="0 0 710 180" xmlns="http://www.w3.org/2000/svg">
+      <line class="lc-track" x1="94" y1="74" x2="216" y2="74"/>
+      <line class="lc-track" x1="264" y1="74" x2="386" y2="74"/>
+      <line class="lc-track" id="track-cs" x1="434" y1="74" x2="616" y2="74"/>
+      <path class="lc-return" id="return" d="M 410 100 L 410 150 L 240 150 L 240 100"/>
+      <text class="lc-lap" id="lapcap" x="325" y="142" text-anchor="middle">Act ⇄ Check until the check passes</text>
+
+      <g class="lc-st" id="st-trigger" data-st="trigger"><circle class="lc-st-circle" cx="70" cy="74" r="24"/>
+        <text class="lc-st-ico" x="70" y="81" text-anchor="middle">⚡</text>
+        <text class="lc-st-lbl" x="70" y="118" text-anchor="middle">Trigger</text>
+        <text class="lc-st-sub" id="sub-trigger" x="70" y="132" text-anchor="middle">Manual</text></g>
+      <g class="lc-st" id="st-act" data-st="act"><circle class="lc-st-circle" cx="240" cy="74" r="24"/>
+        <text class="lc-st-ico" x="240" y="81" text-anchor="middle">🔧</text>
+        <text class="lc-st-lbl" x="240" y="118" text-anchor="middle">Act</text>
+        <text class="lc-st-sub" id="sub-act" x="240" y="132" text-anchor="middle">define me →</text></g>
+      <g class="lc-st" id="st-check" data-st="check"><circle class="lc-st-circle" cx="410" cy="74" r="24"/>
+        <text class="lc-st-ico" x="410" y="81" text-anchor="middle">✓</text>
+        <text class="lc-st-lbl" x="410" y="118" text-anchor="middle">Check</text>
+        <text class="lc-st-sub" id="sub-check" x="410" y="132" text-anchor="middle">define me →</text></g>
+      <g class="lc-st" id="st-gate" data-st="gate"><rect class="lc-gate-d" x="508" y="60" width="28" height="28" rx="6" transform="rotate(45 522 74)"/>
+        <text class="lc-st-ico" x="522" y="80" text-anchor="middle">🔒</text>
+        <text class="lc-gate-lbl" id="sub-gate" x="522" y="118" text-anchor="middle">you · stops before merge</text></g>
+      <g class="lc-st" id="st-ship" data-st="gate"><circle class="lc-st-circle" cx="640" cy="74" r="24"/>
+        <text class="lc-st-ico" x="640" y="81" text-anchor="middle">🚀</text>
+        <text class="lc-st-lbl" x="640" y="118" text-anchor="middle">Ship</text></g>
+
+      <text class="lc-scope-txt" id="scope-txt" x="355" y="170" text-anchor="middle">🛡 no scope wall — click to set</text>
+      <g id="runner" class="hidden" transform="translate(70,74)"><circle class="lc-runner"/></g>
+    </svg>
+
+    <div id="editor"><p class="ed-hint">Click a station above, or type an outcome and press <b>✨ Ask Claude</b>.</p></div>
+
+    <div class="controls">
+      <button class="primary" id="arm">▶ Arm &amp; dry-run</button>
+      <button id="reset">↺ Reset</button>
+      <button class="gate" id="open" style="display:none">🔓 Open the gate</button>
+    </div>
+  </div>
+
+  <div class="card" id="runcard" style="display:none">
+    <div class="gauges">
+      <div class="gauge"><b id="g-lap">Laps 0 / 10</b><div class="bar"><i id="b-lap"></i></div><span>hard ceiling</span></div>
+      <div class="gauge"><b id="g-tok">Budget 0k / 300k</b><div class="bar"><i id="b-tok"></i></div><span>tokens this run</span></div>
+      <div class="gauge"><b>No progress → stop</b><div class="bar"><i style="width:0"></i></div><span>2 identical laps halts it</span></div>
+    </div>
+    <h2 style="font-size:14px;margin:14px 0 4px">Lap history</h2>
+    <div class="laps" id="laps"></div>
+  </div>
+
+  <p class="note">The <b>✨ Ask Claude</b> flow mocks the daemon's real intake agent (<code>intake-model.ts</code>):
+    a read-only repo pass that reads CLAUDE.md + the code, proposes a check/scope/assumptions, and streams each
+    file it reads. Here it's faked from the prompt — but the streaming panel is exactly the surface the real
+    <code>loop.intake</code> call feeds. Click-to-define + live diagram is the authoring model.</p>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const STATION_X = { trigger:70, act:240, check:410, gate:522, ship:640 };
+  const RUNGS = {
+    suggest:{ name:"Suggest", gate:"reports only" },
+    draft:  { name:"Draft",   gate:"stops before PR" },
+    pr:     { name:"PR",      gate:"stops before merge" },
+    ship:   { name:"Ship",    gate:"" },
+  };
+
+  // ── the loop under construction ──────────────────────────────────────
+  const loop = {
+    name:"New loop",
+    trigger:{ kind:"manual", time:"02:00" },
+    act:{ prompt:"", model:"Opus 4.8", effort:"medium" },
+    check:{ kind:"command", value:"", judgeModel:"Opus 4.8", judgeEffort:"high" },
+    scope:[],
+    rung:"pr",
+    maxLaps:10, tokenBudget:300000,
+    assumptions:[],
+  };
+  let sel = null, grounded = false, pending = 0;
+
+  // ── live diagram sync ────────────────────────────────────────────────
+  const trunc = (s,n=22) => !s ? "define me →" : (s.length>n ? s.slice(0,n-1)+"…" : s);
+  function triggerLabel(t){
+    return t.kind==="manual" ? "Manual"
+      : t.kind==="schedule" ? `Nightly ${t.time}`
+      : t.kind==="event" ? "On CI failure"
+      : "After another loop";
+  }
+  function syncDiagram(){
+    $("loop-name").textContent = loop.name;
+    $("sub-trigger").textContent = triggerLabel(loop.trigger);
+    $("sub-act").textContent = trunc(loop.act.prompt);
+    $("sub-check").textContent = trunc(loop.check.kind==="judge" ? "judge: "+loop.check.value : loop.check.value);
+    const gated = loop.rung !== "ship";
+    $("st-gate").style.display = gated ? "" : "none";
+    if (gated) $("sub-gate").textContent = "you · " + RUNGS[loop.rung].gate;
+    $("scope-txt").textContent = loop.scope.length ? "🛡 " + loop.scope.join(", ") : "🛡 no scope wall — click to set";
+    document.querySelectorAll(".lc-st").forEach(g => g.classList.toggle("sel",
+      sel && (g.id === "st-"+sel || (sel==="gate" && g.id==="st-ship"))));
+  }
+
+  // ── station editors ──────────────────────────────────────────────────
+  function seg(options, current, onPick){
+    const wrap = document.createElement("div"); wrap.className = "seg";
+    for (const [val,label] of options){
+      const b = document.createElement("button");
+      b.textContent = label; b.className = val===current ? "on" : "";
+      b.onclick = () => onPick(val);
+      wrap.appendChild(b);
+    }
+    return wrap;
+  }
+  const modelOpts = [["Opus 4.8","Opus 4.8"],["Sonnet 4.6","Sonnet 4.6"],["Haiku 4.5","Haiku 4.5"]];
+  const effortOpts = [["low","low"],["medium","medium"],["high","high"]];
+
+  function editTrigger(e){
+    e.innerHTML = `<p class="ed-title">⚡ Trigger — <span class="ed-hint">when does it fire?</span></p>`;
+    e.appendChild(seg([["manual","On demand"],["schedule","Nightly"],["event","On CI failure"],["chained","After another loop"]],
+      loop.trigger.kind, (k)=>{ loop.trigger.kind=k; render(); }));
+    if (loop.trigger.kind==="schedule"){
+      const l=document.createElement("label"); l.className="field"; l.textContent="Time"; e.appendChild(l);
+      const i=document.createElement("input"); i.type="text"; i.value=loop.trigger.time; i.style.maxWidth="120px";
+      i.oninput=()=>{ loop.trigger.time=i.value; syncDiagram(); }; e.appendChild(i);
+    }
+  }
+  function editAct(e){
+    e.innerHTML = `<p class="ed-title">🔧 Act — <span class="ed-hint">the work Claude does each lap</span></p>`;
+    const l=document.createElement("label"); l.className="field"; l.textContent="Prompt"; e.appendChild(l);
+    const ta=document.createElement("textarea"); ta.rows=3; ta.value=loop.act.prompt;
+    ta.placeholder="Find and fix the flakiness in the upload test…";
+    ta.oninput=()=>{ loop.act.prompt=ta.value; if(!grounded) loop.name=ta.value.slice(0,48)||"New loop"; syncDiagram(); };
+    e.appendChild(ta);
+    const r2=document.createElement("div"); r2.className="row2"; r2.style.marginTop="10px";
+    const mWrap=document.createElement("div");
+    mWrap.innerHTML=`<label class="field">Model</label>`;
+    mWrap.appendChild(seg(modelOpts, loop.act.model, (v)=>{ loop.act.model=v; render(); }));
+    const eWrap=document.createElement("div");
+    eWrap.innerHTML=`<label class="field">Reasoning effort</label>`;
+    eWrap.appendChild(seg(effortOpts, loop.act.effort, (v)=>{ loop.act.effort=v; render(); }));
+    r2.append(mWrap,eWrap); e.appendChild(r2);
+    const hint=document.createElement("p"); hint.className="ed-hint"; hint.style.marginTop="8px";
+    hint.innerHTML="Tip from the harness post: run the <b>act</b> at medium and the <b>check/judge</b> at high.";
+    e.appendChild(hint);
+  }
+  function editCheck(e){
+    e.innerHTML = `<p class="ed-title">✓ Check — <span class="ed-hint">how do we KNOW it's done? (design this first)</span></p>`;
+    e.appendChild(seg([["command","Command"],["judge","Judge"],["metric","Metric"],["http","HTTP"]],
+      loop.check.kind, (k)=>{ loop.check.kind=k; render(); }));
+    const l=document.createElement("label"); l.className="field";
+    l.textContent = loop.check.kind==="command" ? "Shell command (exit 0 = done)"
+      : loop.check.kind==="judge" ? "What should Claude verify?"
+      : loop.check.kind==="metric" ? "Command printing a number" : "URL to probe";
+    e.appendChild(l);
+    const i=document.createElement("input"); i.type="text"; i.value=loop.check.value;
+    i.placeholder = loop.check.kind==="command" ? "bun test test/upload.test.ts"
+      : loop.check.kind==="judge" ? "the upload test passes 50 runs in a row" : "";
+    i.oninput=()=>{ loop.check.value=i.value; syncDiagram(); }; e.appendChild(i);
+    const ai=document.createElement("button"); ai.className="ai"; ai.style.marginTop="10px";
+    ai.textContent="✨ Suggest a check from my repo";
+    ai.onclick=()=>runGrounding(true);
+    e.appendChild(ai);
+    if (loop.check.kind==="judge"){
+      const r2=document.createElement("div"); r2.className="row2"; r2.style.marginTop="10px";
+      const mWrap=document.createElement("div"); mWrap.innerHTML=`<label class="field">Judge model</label>`;
+      mWrap.appendChild(seg(modelOpts, loop.check.judgeModel, (v)=>{ loop.check.judgeModel=v; render(); }));
+      const eWrap=document.createElement("div"); eWrap.innerHTML=`<label class="field">Judge effort</label>`;
+      eWrap.appendChild(seg(effortOpts, loop.check.judgeEffort, (v)=>{ loop.check.judgeEffort=v; render(); }));
+      r2.append(mWrap,eWrap); e.appendChild(r2);
+    }
+  }
+  function editGate(e){
+    e.innerHTML = `<p class="ed-title">🔒 Gate — <span class="ed-hint">how far does it go before stopping for you?</span></p>`;
+    e.appendChild(seg([["suggest","Suggest"],["draft","Draft"],["pr","PR"],["ship","Ship"]],
+      loop.rung, (k)=>{ loop.rung=k; render(); }));
+    const map={ suggest:"Read-only. Each lap ends in a report.", draft:"Writes a branch; you open the PR.",
+      pr:"Opens a verified PR; you merge.", ship:"Merges on green CI. No gate — full autonomy." };
+    const p=document.createElement("p"); p.className="ed-hint"; p.style.marginTop="10px"; p.textContent=map[loop.rung];
+    e.appendChild(p);
+    const r2=document.createElement("div"); r2.className="row2"; r2.style.marginTop="10px";
+    const mx=document.createElement("div"); mx.innerHTML=`<label class="field">Max laps</label>`;
+    const mi=document.createElement("input"); mi.type="text"; mi.value=loop.maxLaps;
+    mi.oninput=()=>{ loop.maxLaps=parseInt(mi.value)||10; }; mx.appendChild(mi);
+    const tb=document.createElement("div"); tb.innerHTML=`<label class="field">Token budget (k)</label>`;
+    const ti=document.createElement("input"); ti.type="text"; ti.value=loop.tokenBudget/1000;
+    ti.oninput=()=>{ loop.tokenBudget=(parseInt(ti.value)||300)*1000; }; tb.appendChild(ti);
+    r2.append(mx,tb); e.appendChild(r2);
+  }
+  function editScope(e){
+    e.innerHTML = `<p class="ed-title">🛡 Scope — <span class="ed-hint">dirs a lap may touch (anything else fails)</span></p>`;
+    const i=document.createElement("input"); i.type="text"; i.value=loop.scope.join(", ");
+    i.placeholder="src/upload/, test/upload.test.ts";
+    i.oninput=()=>{ loop.scope=i.value.split(",").map(s=>s.trim()).filter(Boolean); syncDiagram(); };
+    e.appendChild(i);
+  }
+  function render(){
+    const e=$("editor");
+    if (sel==="trigger") editTrigger(e);
+    else if (sel==="act") editAct(e);
+    else if (sel==="check") editCheck(e);
+    else if (sel==="gate") editGate(e);
+    else if (sel==="scope") editScope(e);
+    syncDiagram();
+  }
+
+  // ── mocked LLM grounding (stands in for loop.intake / intake-model.ts) ─
+  // The adaptive principle: the agent ASSERTS everything the repo makes clear, and only ASKS about the
+  // fields it genuinely can't settle. A clear fix → 0 questions; a vague/feature outcome → 1–2. This is the
+  // fix for "Todoist always asks for more information": don't walk a fixed 5-step script — ask only what's
+  // actually ambiguous.
+  function analyze(prompt){
+    const p=(prompt||"").toLowerCase();
+    const isFeature=!/\b(fix|flak|bug|broke|broken|fail|regress)/.test(p) && /\b(add|build|create|new|implement|export|support)\b/.test(p);
+    const isVague=/\b(improve|faster|slow|better|clean\s?up|optimi|refactor|tidy|polish|nicer|perf|performance)\b/.test(p);
+    const stop=new Set(["fix","the","test","flaky","make","that","our","run","up","to","it","works","with","from","this"]);
+    const word=(p.match(/[a-z]{4,}/g)||[]).find(w=>!stop.has(w));
+    const hasArea=!!word, area=word||"core";
+    const name=(prompt||"New loop").replace(/^fix\s+/i,"Fix ").slice(0,48);
+    const asserted=[], questions=[];
+
+    // CHECK — confident only when it's a fix with a concrete area that maps to a test.
+    if (!isVague && !isFeature && hasArea)
+      asserted.push({ station:"check", k:"Check", v:`bun test test/${area}.test.ts`,
+        apply:()=>{ loop.check={kind:"command",value:`bun test test/${area}.test.ts`,judgeModel:"Opus 4.8",judgeEffort:"high"}; } });
+    else
+      questions.push({ station:"check",
+        claude:`I couldn't pin a single test that proves this${isFeature?" — it's new code with no test yet":isVague?" — \"improve\" has no obvious pass/fail":""}. How should a lap <i>know</i> it's done?`,
+        chips:[
+          ["Judge it works", ()=>{ loop.check={kind:"judge",value:name.replace(/^fix /i,"")+" works end-to-end",judgeModel:"Opus 4.8",judgeEffort:"high"}; }],
+          ["Metric vs threshold", ()=>{ loop.check={kind:"metric",value:"bun run bench | tail -1",judgeModel:"Opus 4.8",judgeEffort:"high"}; }],
+          [`bun test ${area}`, ()=>{ loop.check={kind:"command",value:`bun test ${area}`,judgeModel:"Opus 4.8",judgeEffort:"high"}; }],
+        ]});
+
+    // SCOPE — confident when a concrete area exists; otherwise ask (don't silently fence or un-fence).
+    if (hasArea && !isVague)
+      asserted.push({ station:"scope", k:"Scope", v:`src/${area}/, test/${area}.test.ts`,
+        apply:()=>{ loop.scope=[`src/${area}/`,`test/${area}.test.ts`]; } });
+    else
+      questions.push({ station:"scope",
+        claude:`Which part of the repo may a lap touch? The outcome alone doesn't tell me where this lives.`,
+        chips:[
+          ["Whole repo (no wall)", ()=>{ loop.scope=[]; }],
+          [`Just src/${area}/`, ()=>{ loop.scope=[`src/${area}/`]; }],
+        ]});
+
+    // GATE + budget + assumptions — asserted, never asked (earned-autonomy default is PR).
+    asserted.push({ station:"gate", k:"Gate", v:"PR — you merge (new loops start gated)", apply:()=>{ loop.rung="pr"; } });
+    const budget=isFeature?400:300, laps=isFeature?12:10;
+    asserted.push({ station:"gate", k:"Hard stops", v:`${laps} laps · ${budget}k tokens · 2 no-progress`, apply:()=>{ loop.maxLaps=laps; loop.tokenBudget=budget*1000; } });
+    const assumptions=[ isFeature?"Sensible defaults where the spec is silent":"The failure is deterministic, not environment-specific" ];
+    return { name, asserted, questions, assumptions };
+  }
+
+  async function runGrounding(checkOnly=false){
+    const prompt = $("seed").value.trim() || loop.act.prompt;
+    if (!prompt){ $("seed").focus(); return; }
+    loop.act.prompt = loop.act.prompt || prompt;
+    const a = analyze(prompt);
+
+    const e=$("editor"); sel=null; e.innerHTML="";
+    const panel=document.createElement("div"); panel.className="ground";
+    panel.innerHTML=`<div class="ground-head"><span class="spin"></span> Studying your codebase…</div><div class="ground-body" id="gbody"></div>`;
+    e.appendChild(panel);
+    const body=panel.querySelector("#gbody");
+    const lines=[`Reading CLAUDE.md`,`Inferring project goals from docs/`,
+      `Searching for code touched by "${prompt.slice(0,32)}"`,`Checking for a test that covers it`,
+      `Confirming scope dirs exist`,`Naming genuine ambiguities`];
+    for (const ln of lines){ const d=document.createElement("div"); d.className="gline"; d.textContent="• "+ln; body.appendChild(d); await sleep(360); }
+    panel.querySelector(".ground-head").innerHTML=`✅ Studied your codebase`;
+
+    if (checkOnly){ // the per-station "✨ Suggest a check" button: just settle the check, no interview
+      const c=a.asserted.find(x=>x.station==="check");
+      if (c) c.apply(); else a.questions.find(q=>q.station==="check")?.chips[0][1]();
+      grounded=true; syncDiagram(); return;
+    }
+    // Apply every confident decision immediately — the whole point is to NOT ask about these.
+    loop.name=a.name; loop.assumptions=a.assumptions;
+    a.asserted.forEach(d=>d.apply());
+    grounded=true; syncDiagram();
+    renderIntakeResult(a);
+  }
+
+  function renderIntakeResult(a){
+    const e=$("editor");
+    pending=a.questions.length;
+    const R=a.asserted.length, Q=a.questions.length;
+    const head=document.createElement("div");
+    head.innerHTML=`<p class="ed-title">✨ Built from your repo
+      <span class="badge" style="color:var(--ship);border-color:var(--ship)">resolved ${R}</span>
+      ${Q ? `<span class="badge" style="color:var(--run);border-color:var(--run)">needs you ${Q}</span>`
+          : `<span class="badge" style="color:var(--ship);border-color:var(--ship)">no questions 🎉</span>`}</p>
+      <p class="ed-hint">${Q ? `I asserted what the repo settled. Only ${Q} genuine ambiguit${Q>1?"ies":"y"} left for you:`
+                             : `Nothing was ambiguous — the repo settled every station. Arm it.`}</p>`;
+    e.appendChild(head);
+
+    const sum=document.createElement("div"); sum.className="intake-sum";
+    for (const d of a.asserted){
+      const row=document.createElement("div"); row.className="sum-row";
+      row.innerHTML=`<span class="k">${d.k}</span><span class="v"><code>${d.v}</code></span>`;
+      const ed=document.createElement("a"); ed.textContent="edit"; ed.onclick=()=>{ sel=d.station; render(); };
+      row.appendChild(ed); sum.appendChild(row);
+    }
+    const asg=document.createElement("div"); asg.className="sum-row";
+    asg.innerHTML=`<span class="k">Assumptions</span><span class="v ed-hint">${a.assumptions.join("; ")} <i>(logged, not guessed silently)</i></span>`;
+    sum.appendChild(asg);
+    e.appendChild(sum);
+
+    const qwrap=document.createElement("div"); e.appendChild(qwrap);
+    a.questions.forEach(q=>$("st-"+q.station)?.classList.add("needs"));
+    askNext(a.questions.slice(), qwrap, e);
+  }
+  function askNext(queue, qwrap, e){
+    const q=queue.shift();
+    if (!q){ pending=0;
+      const r=document.createElement("div"); r.className="ready"; r.textContent="✓ Ready — press ▶ Arm & dry-run"; e.appendChild(r);
+      r.scrollIntoView?.({behavior:"smooth",block:"nearest"}); return; }
+    const bub=document.createElement("div"); bub.className="q-bub";
+    bub.innerHTML=`<div>🔸 <b>${q.claude}</b></div>`;
+    const chips=document.createElement("div"); chips.className="q-chips";
+    for (const [label,apply] of q.chips){
+      const b=document.createElement("button"); b.textContent=label;
+      b.onclick=()=>{ apply(); $("st-"+q.station)?.classList.remove("needs"); pending=Math.max(0,pending-1);
+        chips.querySelectorAll("button").forEach(x=>x.disabled=true); b.classList.add("on"); syncDiagram();
+        askNext(queue,qwrap,e); };
+      chips.appendChild(b);
+    }
+    bub.appendChild(chips); qwrap.appendChild(bub);
+    bub.scrollIntoView?.({behavior:"smooth",block:"nearest"});
+  }
+
+  // ── arm & run simulation ─────────────────────────────────────────────
+  let tokens=0, lap=0, running=false;
+  function setChip(cls,t){ const c=$("chip"); c.className="chip chip-"+cls; c.textContent=t; }
+  function moveRunner(st){ const r=$("runner"); r.classList.remove("hidden");
+    r.setAttribute("transform",`translate(${STATION_X[st]},74)`);
+    ["trigger","act","check","gate","ship"].forEach(s=>$("st-"+s)?.classList.toggle("on", s===st && !$("st-"+s).classList.contains("sel"))); }
+  function setGauges(){ $("g-lap").textContent=`Laps ${lap} / ${loop.maxLaps}`; $("b-lap").style.width=(lap/loop.maxLaps*100)+"%";
+    $("g-tok").textContent=`Budget ${Math.round(tokens/1000)}k / ${Math.round(loop.tokenBudget/1000)}k`;
+    const tp=tokens/loop.tokenBudget*100; $("b-tok").style.width=tp+"%"; $("b-tok").classList.toggle("warn",tp>70); }
+  function addLap(n,what,v){ const row=document.createElement("div"); row.className="lap-row";
+    row.innerHTML=`<span class="lap-n">Lap ${n}</span><span class="lap-what">${what}</span><span class="verdict v-${v==="pass"?"pass":"fail"}">${v}</span>`;
+    $("laps").appendChild(row); }
+  async function arm(){
+    if (running) return;
+    if (!loop.act.prompt){ sel="act"; render(); return; }
+    if (!loop.check.value){ sel="check"; render(); return; }
+    if (pending>0){ $("editor").scrollIntoView({behavior:"smooth"}); return; } // answer the ambiguities first
+    running=true; $("arm").disabled=true; $("runcard").style.display="";
+    $("laps").innerHTML=""; tokens=0; lap=0; setGauges();
+    $("circuit").className.baseVal="lc-circuit"; setChip("running","dry-run");
+    moveRunner("trigger"); await sleep(650); moveRunner("act"); await sleep(700);
+    const script=[{w:"first attempt at the fix",v:"fail"},{w:"refined — narrowing the race",v:"fail"},{w:"check passed — 50 runs green",v:"pass"}];
+    for (let i=0;i<script.length;i++){
+      lap=i+1; moveRunner("check"); tokens+=42000+i*6000; setGauges(); await sleep(750);
+      addLap(lap,script[i].w,script[i].v);
+      if (script[i].v==="pass") break;
+      $("return").classList.add("hot"); $("lapcap").textContent=`lap ${lap} of ${loop.maxLaps} · until check passes`;
+      await sleep(250); moveRunner("act"); await sleep(650); $("return").classList.remove("hot");
+    }
+    if (loop.rung==="ship"){ $("circuit").className.baseVal="lc-circuit circuit-shipped"; moveRunner("ship");
+      setChip("shipped","shipped 🎉"); $("lapcap").textContent="merged on green — no gate"; }
+    else { moveRunner("gate"); $("circuit").className.baseVal="lc-circuit circuit-gated";
+      setChip("gated","passed · at your gate"); $("lapcap").textContent="check passed — waiting for you"; $("open").style.display=""; }
+    running=false; $("arm").disabled=false;
+  }
+  async function openGate(){ $("open").style.display="none"; $("circuit").className.baseVal="lc-circuit circuit-shipped";
+    moveRunner("ship"); setChip("shipped","shipped 🎉"); $("lapcap").textContent="merged — 1 clean gated lap earned"; }
+  function reset(){
+    Object.assign(loop,{ name:"New loop", trigger:{kind:"manual",time:"02:00"}, act:{prompt:"",model:"Opus 4.8",effort:"medium"},
+      check:{kind:"command",value:"",judgeModel:"Opus 4.8",judgeEffort:"high"}, scope:[], rung:"pr", maxLaps:10, tokenBudget:300000, assumptions:[] });
+    sel=null; grounded=false; running=false; tokens=0; lap=0; pending=0;
+    $("seed").value=""; $("runcard").style.display="none"; $("open").style.display="none"; $("arm").disabled=false;
+    $("circuit").className.baseVal="lc-circuit"; $("runner").classList.add("hidden"); $("runner").setAttribute("transform","translate(70,74)");
+    ["trigger","act","check","gate","ship"].forEach(s=>$("st-"+s).classList.remove("on","needs"));
+    $("return").classList.remove("hot"); $("lapcap").textContent="Act ⇄ Check until the check passes";
+    setChip("idle","draft");
+    $("editor").innerHTML=`<p class="ed-hint">Click a station above, or type an outcome and press <b>✨ Ask Claude</b>.</p>`;
+    syncDiagram();
+  }
+
+  // ── wiring ───────────────────────────────────────────────────────────
+  document.querySelectorAll(".lc-st").forEach(g => g.addEventListener("click", () => { sel=g.dataset.st; render(); }));
+  $("scope-txt").addEventListener("click", () => { sel="scope"; render(); });
+  $("ground").addEventListener("click", () => runGrounding(false));
+  $("arm").addEventListener("click", arm);
+  $("open").addEventListener("click", openGate);
+  $("reset").addEventListener("click", reset);
+  $("seed").addEventListener("keydown", (e)=>{ if(e.key==="Enter") runGrounding(false); });
+  $("theme").addEventListener("click", () => { const r=document.documentElement; r.dataset.theme = r.dataset.theme==="dark"?"light":"dark"; });
+  document.documentElement.dataset.theme="dark";
+  reset();
+</script>
+</body>
+</html>
