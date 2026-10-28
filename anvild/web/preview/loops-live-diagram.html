@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Loops — live circuit diagram (prototype)</title>
+<style>
+  /* Theme tokens mirror the app (var(--bg) etc.). Toggle swaps the whole palette — proves it's theme-aware. */
+  :root[data-theme="dark"] {
+    --bg: #14161a; --panel: #1b1e24; --border: #2c313b; --fg: #e6e9ef; --muted: #8b93a1;
+    --track: #2c313b; --run: #f2c037; --gate: #b07cc3; --rest: #2196c9; --ship: #3ac07a; --warn: #e0623a;
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f8fa; --panel: #ffffff; --border: #dfe3ea; --fg: #1b1e24; --muted: #6b7382;
+    --track: #dfe3ea; --run: #d79a00; --gate: #8e55a6; --rest: #1478a8; --ship: #1f9d5e; --warn: #c84a22;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 20px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px; margin-bottom: 16px; }
+  .state-chip { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); }
+  .chip-running { color: var(--run); border-color: var(--run); }
+  .chip-gated   { color: var(--gate); border-color: var(--gate); }
+  .chip-shipped { color: var(--ship); border-color: var(--ship); }
+  .chip-idle    { color: var(--muted); }
+  .head-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .head-row h2 { font-size: 16px; margin: 0; flex: 1; }
+
+  /* ── The circuit SVG ─────────────────────────────────────────────── */
+  .lc-circuit { width: 100%; height: auto; }
+  .lc-track   { stroke: var(--track); stroke-width: 3; }
+  .lc-return  { stroke: var(--track); stroke-width: 3; fill: none; stroke-dasharray: 5 5; opacity: .6; transition: stroke .3s, opacity .3s; }
+  .lc-return.hot { stroke: var(--run); opacity: 1; }
+  .lc-st-circle { fill: var(--panel); stroke: var(--border); stroke-width: 2.5; transition: stroke .3s, fill .3s; }
+  .lc-st.on .lc-st-circle { stroke: var(--run); }
+  .lc-st-ico  { font-size: 20px; }
+  .lc-st-lbl  { fill: var(--fg); font-size: 12px; font-weight: 600; }
+  .lc-st-sub  { fill: var(--muted); font-size: 10px; }
+  .lc-gate-d  { fill: var(--panel); stroke: var(--gate); stroke-width: 2.5; }
+  .lc-gate-lbl{ fill: var(--gate); font-size: 11px; font-weight: 600; }
+  .lc-lap     { fill: var(--muted); font-size: 11px; }
+
+  /* The runner dot — mounted ONCE, we only ever update its transform. The CSS transition is what makes
+     it *travel* between stations instead of teleporting. This is the whole trick. */
+  #runner { transition: transform .62s cubic-bezier(.5,.05,.2,1); }
+  #runner.hidden { opacity: 0; }
+  .lc-runner { r: 8; fill: var(--run); filter: drop-shadow(0 0 7px var(--run)); transition: fill .3s; }
+  .circuit-gated  #runner .lc-runner { fill: var(--gate); filter: drop-shadow(0 0 9px var(--gate)); }
+  .circuit-gated  .lc-gate-d { animation: pulse 1.2s ease-in-out infinite; }
+  .circuit-shipped #runner .lc-runner { fill: var(--ship); filter: drop-shadow(0 0 9px var(--ship)); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  /* ── Gauges ──────────────────────────────────────────────────────── */
+  .gauges { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 4px; }
+  .gauge b { display: block; font-size: 13px; margin-bottom: 5px; }
+  .gauge span { color: var(--muted); font-size: 11px; }
+  .bar { height: 7px; background: var(--track); border-radius: 4px; overflow: hidden; margin: 2px 0 4px; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--rest); border-radius: 4px;
+    transition: width .5s ease, background .3s; }
+  .bar i.warn { background: var(--warn); }
+
+  /* ── Lap history ─────────────────────────────────────────────────── */
+  .laps { margin-top: 6px; }
+  .lap-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--border);
+    animation: slidein .35s ease; }
+  @keyframes slidein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .lap-n { color: var(--muted); font-size: 12px; width: 48px; }
+  .lap-what { flex: 1; }
+  .verdict { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
+  .v-pass { color: var(--ship); border: 1px solid var(--ship); }
+  .v-fail { color: var(--warn); border: 1px solid var(--warn); }
+
+  /* ── Controls ────────────────────────────────────────────────────── */
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  button { font: inherit; font-weight: 600; border-radius: 9px; padding: 9px 15px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--fg); }
+  button.primary { background: var(--rest); border-color: var(--rest); color: #fff; }
+  button.gate { background: var(--gate); border-color: var(--gate); color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  .theme-toggle { margin-left: auto; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  code { background: var(--track); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚙️ Loops — live circuit <span class="state-chip chip-idle" id="theme-label">prototype</span></h1>
+  <p class="sub">What a JS-driven diagram looks like: the runner <b>travels</b> the circuit in real time, gauges
+    fill, the gate pulses when it needs you. Press play.</p>
+
+  <div class="card">
+    <div class="head-row">
+      <h2>Fix the flaky upload test</h2>
+      <span class="state-chip chip-idle" id="chip">idle</span>
+      <button class="theme-toggle" id="theme" title="Toggle theme">◐ theme</button>
+    </div>
+
+    <!-- The circuit. Geometry matches circuit.ts (stations 70/240/410/640, gate 522, y=74). -->
+    <svg class="lc-circuit" id="circuit" viewBox="0 0 710 180" xmlns="http://www.w3.org/2000/svg">
+      <line class="lc-track" x1="94"  y1="74" x2="216" y2="74"/>
+      <line class="lc-track" x1="264" y1="74" x2="386" y2="74"/>
+      <line class="lc-track" x1="434" y1="74" x2="506" y2="74"/>
+      <line class="lc-track" x1="538" y1="74" x2="616" y2="74"/>
+      <path class="lc-return" id="return" d="M 410 100 L 410 150 L 240 150 L 240 100"/>
+      <text class="lc-lap" id="lapcap" x="325" y="142" text-anchor="middle">Act ⇄ Check until the check passes</text>
+
+      <g class="lc-st" id="st-trigger"><circle class="lc-st-circle" cx="70" cy="74" r="24"/>
+        <text class="lc-st-ico" x="70" y="81" text-anchor="middle">⚡</text>
+        <text class="lc-st-lbl" x="70" y="118" text-anchor="middle">Trigger</text>
+        <text class="lc-st-sub" x="70" y="132" text-anchor="middle">Manual</text></g>
+      <g class="lc-st" id="st-act"><circle class="lc-st-circle" cx="240" cy="74" r="24"/>
+        <text class="lc-st-ico" x="240" y="81" text-anchor="middle">🔧</text>
+        <text class="lc-st-lbl" x="240" y="118" text-anchor="middle">Act</text>
+        <text class="lc-st-sub" x="240" y="132" text-anchor="middle">find &amp; fix flakiness</text></g>
+      <g class="lc-st" id="st-check"><circle class="lc-st-circle" cx="410" cy="74" r="24"/>
+        <text class="lc-st-ico" x="410" y="81" text-anchor="middle">✓</text>
+        <text class="lc-st-lbl" x="410" y="118" text-anchor="middle">Check</text>
+        <text class="lc-st-sub" x="410" y="132" text-anchor="middle">bun test upload</text></g>
+      <g class="lc-st" id="st-gate"><rect class="lc-gate-d" x="508" y="60" width="28" height="28" rx="6" transform="rotate(45 522 74)"/>
+        <text class="lc-st-ico" x="522" y="80" text-anchor="middle">🔒</text>
+        <text class="lc-gate-lbl" x="522" y="118" text-anchor="middle">you · stops before merge</text></g>
+      <g class="lc-st" id="st-ship"><circle class="lc-st-circle" cx="640" cy="74" r="24"/>
+        <text class="lc-st-ico" x="640" y="81" text-anchor="middle">🚀</text>
+        <text class="lc-st-lbl" x="640" y="118" text-anchor="middle">Ship</text></g>
+
+      <g id="runner" class="hidden" transform="translate(70,74)"><circle class="lc-runner"/></g>
+    </svg>
+
+    <div class="gauges">
+      <div class="gauge"><b id="g-lap">Laps 0 / 10</b><div class="bar"><i id="b-lap"></i></div><span>hard ceiling</span></div>
+      <div class="gauge"><b id="g-tok">Budget 0k / 300k</b><div class="bar"><i id="b-tok"></i></div><span>tokens this run</span></div>
+      <div class="gauge"><b id="g-np">No progress → stop</b><div class="bar"><i id="b-np"></i></div><span>2 identical laps halts it</span></div>
+    </div>
+
+    <div class="controls" style="margin-top:16px">
+      <button class="primary" id="play">▶ Watch a loop run</button>
+      <button id="reset">↺ Reset</button>
+      <button class="gate" id="open" style="display:none">🔓 Open the gate</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:14px;margin:0 0 4px">Lap history</h2>
+    <div class="laps" id="laps"><p style="color:var(--muted)">No laps yet — press play.</p></div>
+  </div>
+
+  <p class="note">This is a throwaway prototype (self-contained, no deps). The trick that makes it live:
+    the runner <code>&lt;g id="runner"&gt;</code> is mounted <b>once</b>; we only update its
+    <code>transform</code> and let a CSS <code>transition</code> tween it between stations. In the shipped app
+    the diagram is re-stringified via <code>innerHTML</code> on every event, so it can only teleport — switching
+    to mount-once/update-in-place is the whole change.</p>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const STATION_X = { trigger: 70, act: 240, check: 410, gate: 522, ship: 640 };
+  const MAX_LAPS = 10, BUDGET = 300_000;
+
+  const circuit = $("circuit"), runner = $("runner");
+  let tokens = 0, lap = 0, running = false;
+
+  function setChip(cls, text) {
+    const c = $("chip"); c.className = "state-chip chip-" + cls; c.textContent = text;
+  }
+  function moveRunner(station) {
+    runner.classList.remove("hidden");
+    runner.setAttribute("transform", `translate(${STATION_X[station]},74)`);
+    ["trigger","act","check","gate","ship"].forEach((s) =>
+      $("st-" + s).classList.toggle("on", s === station));
+  }
+  function setGauges() {
+    $("g-lap").textContent = `Laps ${lap} / ${MAX_LAPS}`;
+    $("b-lap").style.width = (lap / MAX_LAPS * 100) + "%";
+    $("g-tok").textContent = `Budget ${Math.round(tokens/1000)}k / ${Math.round(BUDGET/1000)}k`;
+    const tp = tokens / BUDGET * 100;
+    $("b-tok").style.width = tp + "%";
+    $("b-tok").classList.toggle("warn", tp > 70);
+  }
+  function addLap(n, what, verdict) {
+    if (n === 1) $("laps").innerHTML = "";
+    const row = document.createElement("div");
+    row.className = "lap-row";
+    row.innerHTML = `<span class="lap-n">Lap ${n}</span><span class="lap-what">${what}</span>` +
+      `<span class="verdict v-${verdict === "pass" ? "pass" : "fail"}">${verdict}</span>`;
+    $("laps").appendChild(row);
+  }
+
+  async function run() {
+    if (running) return;
+    reset(); running = true; $("play").disabled = true;
+
+    setChip("running", "running"); circuit.className.baseVal = "lc-circuit";
+    moveRunner("trigger"); await sleep(650);
+    moveRunner("act");     await sleep(700);
+
+    // Laps 1–2 fail, lap 3 passes → parks at the gate.
+    const script = [
+      { what: "patched the race in uploadQueue.flush", verdict: "fail" },
+      { what: "added await on the socket drain",        verdict: "fail" },
+      { what: "fixed teardown order — 50 runs green",   verdict: "pass" },
+    ];
+    for (let i = 0; i < script.length; i++) {
+      lap = i + 1;
+      moveRunner("check");                 // Act → Check
+      tokens += 42_000 + i * 6_000;
+      setGauges();
+      await sleep(750);
+      addLap(lap, script[i].what, script[i].verdict);
+      if (script[i].verdict === "pass") break;
+      // loop back: light the return arc, travel Act←Check
+      $("return").classList.add("hot");
+      $("lapcap").textContent = `lap ${lap} of ${MAX_LAPS} · until check passes`;
+      await sleep(250);
+      moveRunner("act");
+      await sleep(650);
+      $("return").classList.remove("hot");
+    }
+
+    // Parked at your gate.
+    moveRunner("gate");
+    circuit.className.baseVal = "lc-circuit circuit-gated";
+    setChip("gated", "passed · at your gate");
+    $("lapcap").textContent = "check passed — waiting for you";
+    $("open").style.display = "";
+    running = false; $("play").disabled = false;
+  }
+
+  async function openGate() {
+    $("open").style.display = "none";
+    circuit.className.baseVal = "lc-circuit circuit-shipped";
+    moveRunner("ship");
+    setChip("shipped", "shipped 🎉");
+    $("lapcap").textContent = "merged — 1 clean gated lap earned";
+  }
+
+  function reset() {
+    tokens = 0; lap = 0; running = false;
+    circuit.className.baseVal = "lc-circuit";
+    runner.classList.add("hidden");
+    runner.setAttribute("transform", "translate(70,74)");
+    ["trigger","act","check","gate","ship"].forEach((s) => $("st-" + s).classList.remove("on"));
+    $("return").classList.remove("hot");
+    $("lapcap").textContent = "Act ⇄ Check until the check passes";
+    $("open").style.display = "none";
+    $("play").disabled = false;
+    setChip("idle", "idle");
+    setGauges();
+    $("laps").innerHTML = `<p style="color:var(--muted)">No laps yet — press play.</p>`;
+  }
+
+  $("play").addEventListener("click", run);
+  $("reset").addEventListener("click", reset);
+  $("open").addEventListener("click", openGate);
+  $("theme").addEventListener("click", () => {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+  });
+
+  document.documentElement.dataset.theme = "dark";
+  reset();
+</script>
+</body>
+</html>
