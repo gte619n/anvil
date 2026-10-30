@@ -454,6 +454,30 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      // ── Completion verification (completion-verification spec §4.5) ──
+      case "autopilot.verify":
+        // Fleet-wide sweep: progress + plan-grid updates broadcast from inside the supervisor; only the
+        // final (empty) ack returns to the caller. Flag-off / already-running reject via the outer catch.
+        deps.supervisor
+          .verifyCompletion()
+          .then(() => cid && send(ack(cid)))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+      case "autopilot.verify.confirm":
+        ackWhenDone(deps.supervisor.confirmVerification(cmd.workUnitId), send, cid);
+        return;
+      case "autopilot.verify.dismiss":
+        deps.supervisor.dismissVerification(cmd.workUnitId);
+        if (cid) send(ack(cid));
+        return;
+      case "autopilot.verify.ack":
+        ackWhenDone(deps.supervisor.ackMismatch(cmd.workUnitId), send, cid);
+        return;
+      case "autopilot.verify.keep":
+        deps.supervisor.keepAsWork(cmd.workUnitId);
+        if (cid) send(ack(cid));
+        return;
+
       case "loops.get":
         send(deps.supervisor.loopsSnapshotEvent(cid));
         return;
@@ -538,7 +562,7 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       case "autopilot.schedule.set":
         send(
           deps.supervisor.setAutopilotSchedule(
-            { enabled: cmd.enabled, timeOfDay: cmd.timeOfDay, days: cmd.days, autoStart: cmd.autoStart, usePipeline: cmd.usePipeline, maxAutoStart: cmd.maxAutoStart },
+            { enabled: cmd.enabled, timeOfDay: cmd.timeOfDay, days: cmd.days, autoStart: cmd.autoStart, usePipeline: cmd.usePipeline, maxAutoStart: cmd.maxAutoStart, verifyEnabled: cmd.verifyEnabled },
             cid,
           ),
         );

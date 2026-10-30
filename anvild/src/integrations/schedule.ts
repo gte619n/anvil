@@ -21,6 +21,8 @@ export const DEFAULT_SCHEDULE: AutopilotSchedule = {
   usePipeline: false,
   maxAutoStart: 3,
   label: "Autopilot",
+  // Completion verification is opt-in: off until the operator turns it on in Settings (spec §4.6, OD5).
+  verifyEnabled: false,
 };
 
 /** Parse "HH:MM" → minutes since midnight, or undefined if malformed / out of range. */
@@ -129,6 +131,7 @@ export class AutopilotScheduleStore {
     // Empty string clears label sourcing / the catch-all env; a value sets it.
     if (patch.label !== undefined) next.label = patch.label.trim() || undefined;
     if (patch.defaultEnvironmentId !== undefined) next.defaultEnvironmentId = patch.defaultEnvironmentId || undefined;
+    if (patch.verifyEnabled !== undefined) next.verifyEnabled = patch.verifyEnabled;
     this.state = next;
     this.save();
     return this.get();

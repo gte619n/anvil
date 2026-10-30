@@ -186,6 +186,66 @@ export async function createWorktree(
   return { worktree: { repoRoot, branch, base }, cwd };
 }
 
+// ── Completion-verification read worktree (completion-verification spec §4.2) ─────────────────────
+// A shared, branchless, throwaway checkout at `origin/<defaultBase>` the tier-1 verifier reads against —
+// NEVER the live `repoRoot` ([[daemon-runs-from-live-dev-checkout]]), and distinct from a session's
+// `<worktreeRoot>/<sessionId>` worktree so the prune can recognize its own. `createWorktree` can't be
+// reused (it always `-b` branches; A5): verification only reads source and runs nothing, so it needs no
+// branch and no `node_modules` (no linkDeps).
+const READ_WORKTREE_PREFIX = "anvil-verify-";
+
+/**
+ * Fetch, then resolve the base ref a verification read should run against to a concrete SHA. A4: a bare
+ * `rev-parse origin/<base>` reads a stale local mirror, so we fetch first — reusing `syncedBase`, which
+ * fetches the tracking remote and returns `origin/<branch>` (or the base unchanged when it isn't a tracked
+ * local branch: offline / no remote / detached — the `"HEAD"` fallback). The returned `sha` is the
+ * staleness key (OD4: the verdict is stale once this moves); `ref` is what the read worktree detaches at.
+ */
+export async function resolveBaseSha(repoRoot: string, base: string): Promise<{ ref: string; sha: string }> {
+  const ref = await syncedBase(repoRoot, base); // fetches the remote tip (best-effort); returns the ref to read
+  const r = await gitAsync(["rev-parse", ref], repoRoot);
+  // rev-parse of a just-fetched tracking ref should succeed; if it somehow can't, fall back to the ref
+  // string as its own key so the caller still gets a usable (if coarse) staleness signal.
+  return { ref, sha: r.code === 0 && r.stdout.trim() ? r.stdout.trim() : ref };
+}
+
+/**
+ * Create the shared branchless read worktree for a verification sweep: `git worktree add --detach` at
+ * `ref` (a fetched `origin/<base>` from `resolveBaseSha`). `key` namespaces it per repo/sweep so concurrent
+ * repos don't collide. Any stale same-key worktree (a crash orphan) is cleared first so `add` won't refuse.
+ */
+export async function createReadWorktree(repoRoot: string, ref: string, worktreeRoot: string, key: string): Promise<{ cwd: string }> {
+  assertSafeRef(ref, "ref");
+  const cwd = join(worktreeRoot, `${READ_WORKTREE_PREFIX}${key}`);
+  await gitAsync(["worktree", "remove", "--force", cwd], repoRoot);
+  await gitAsync(["worktree", "prune"], repoRoot);
+  if (existsSync(cwd)) rmSync(cwd, { recursive: true, force: true });
+  const r = await gitAsync(["worktree", "add", "--detach", cwd, ref], repoRoot);
+  if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim() || "git worktree add --detach failed");
+  return { cwd };
+}
+
+/** Tear down a read worktree created by `createReadWorktree` (no branch to delete — it's detached). */
+export function removeReadWorktree(repoRoot: string, cwd: string): void {
+  removeWorktree(repoRoot, cwd);
+}
+
+/**
+ * Startup/pre-sweep prune: remove any `anvil-verify-*` read worktree left behind by a crash or an aborted
+ * sweep, so an orphaned detached checkout can't accumulate under `worktreeRoot`. Best-effort — a dir it
+ * can't classify is left alone, and the final `worktree prune` clears the git admin entry either way.
+ */
+export function pruneReadWorktrees(repoRoot: string, worktreeRoot: string): void {
+  try {
+    for (const name of readdirSync(worktreeRoot)) {
+      if (name.startsWith(READ_WORKTREE_PREFIX)) removeWorktree(repoRoot, join(worktreeRoot, name));
+    }
+  } catch {
+    /* worktreeRoot unreadable / gone — nothing to prune */
+  }
+  gitAsync(["worktree", "prune"], repoRoot).catch(() => {});
+}
+
 /**
  * Remove a worktree (arch §5 kill cleanup): `git worktree remove --force` (rmtree + prune
  * fallback), then delete the branch so the session name is reusable.

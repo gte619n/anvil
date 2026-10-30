@@ -67,6 +67,12 @@ const DAY_LABEL = ["S", "M", "T", "W", "T", "F", "S"]; // Sun..Sat, for the sche
 // `running` is the server-authoritative live run state, broadcast on start/finish + sent on connect.
 export const serverSchedule = new Map<string, { schedule: AutopilotSchedule; nextRunAt?: string; running: boolean }>();
 
+/** Whether the "Verify completion" button should show: at least one capable server has the flag on
+ *  (completion-verification spec §4.6 — the button is hidden when verification is disabled everywhere). */
+function verifyButtonVisible(): boolean {
+  return orderedServers().some((s) => serverSupports(s, "autopilot-verify") && serverSchedule.get(s.url)?.schedule.verifyEnabled);
+}
+
 // Client-side backstop against a server that reports `running: true` and never takes it back — an old
 // daemon with a latched flag, or one that died without a clean `running: false`. A healthy current
 // daemon caps its own run (30 min) and broadcasts false well before this fires, so this only bites a
@@ -280,6 +286,7 @@ export function openAutopilot(): void {
       </div>
       <span class="ap-head-actions">
         <button id="autopilot-log-toggle" class="mini" title="Show/hide run log" aria-pressed="true" hidden>${icon("terminal")}<span class="ap-log-toggle-label">Log</span></button>
+        <button id="autopilot-verify" class="mini" title="Check whether any pending work is already implemented"${verifyButtonVisible() ? "" : " hidden"}>${icon("fact_check")}<span class="ap-run-full">Verify completion</span><span class="ap-run-mid">Verify</span></button>
         <button id="autopilot-run" class="primary ap-run-btn" title="Run autopilot">${icon("play_arrow")}<span class="ap-run-full">Run autopilot</span><span class="ap-run-mid">Run</span></button>
         <button id="autopilot-close" class="icon-btn" title="Close">${icon("close")}</button>
       </span>
@@ -290,6 +297,7 @@ export function openAutopilot(): void {
   </div>`;
   $("#autopilot-close").addEventListener("click", () => dismissOverlay("autopilot"));
   $("#autopilot-run").addEventListener("click", () => void runAutopilot());
+  document.getElementById("autopilot-verify")?.addEventListener("click", () => void runVerifyCompletion());
   $("#autopilot-log-toggle").addEventListener("click", () => {
     autopilotLogCollapsed = !autopilotLogCollapsed;
     applyAutopilotLogVisibility();
@@ -352,6 +360,7 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     <span class="plan-title">${esc(p.title)}</span>
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
     ${hold}
+    ${verifyCardChip(p)}
     <span class="plan-meta">
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
@@ -363,6 +372,65 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     </span>
   </button>`;
 }
+// ── Completion-verification overlay (completion-verification spec §4.1) ───────────────────────────
+/** The verify commands a reader button dispatches. Pure map (act → command) so a test can assert the
+ *  button carries the right unit id WITHOUT driving the DOM/sockets (R2 "assert the dispatched payload"). */
+export function verifyCommand(
+  act: string,
+  id: string,
+): { type: "autopilot.verify.confirm" | "autopilot.verify.dismiss" | "autopilot.verify.ack" | "autopilot.verify.keep"; workUnitId: string } | undefined {
+  switch (act) {
+    case "confirm":
+      return { type: "autopilot.verify.confirm", workUnitId: id };
+    case "dismiss":
+      return { type: "autopilot.verify.dismiss", workUnitId: id };
+    case "ack":
+      return { type: "autopilot.verify.ack", workUnitId: id };
+    case "keep":
+      return { type: "autopilot.verify.keep", workUnitId: id };
+    default:
+      return undefined;
+  }
+}
+
+/** The verification overlay for the plan reader: a "Likely complete" badge + evidence + Confirm/Dismiss,
+ *  a mismatch warning + Acknowledge/Keep-as-work, or a partial advisory. Returns "" when there's nothing to
+ *  surface. PURE (AutopilotPlanInfo → HTML) so it's unit-testable without the DOM; buttons carry
+ *  `data-verify-act` + `data-id` for the one delegated click handler in openPlan. */
+export function verifyOverlayHtml(p: AutopilotPlanInfo): string {
+  const v = p.verification;
+  if (!v) return "";
+  const btn = (act: string, label: string, cls: string, ic: string): string =>
+    `<button class="${cls}" data-verify-act="${act}" data-id="${esc(p.id)}">${icon(ic)} ${esc(label)}</button>`;
+  if (v.mismatch) {
+    return `<div class="verify-overlay verify-mismatch">
+      <div class="verify-head">${icon("warning")} <b>Checked off in Todoist, but the code doesn't look implemented.</b> Trust the checkbox, or keep it as work to build.</div>
+      <div class="verify-actions">${btn("ack", "Acknowledge — it's done", "mini", "check")}${btn("keep", "Keep as work", "mini", "build")}</div>
+      ${v.evidence?.html ? `<article class="md verify-evidence">${v.evidence.html}</article>` : ""}
+    </div>`;
+  }
+  if (v.verdict === "done" && !v.dismissedAt) {
+    return `<div class="verify-overlay verify-likely">
+      <div class="verify-head">${icon("check_circle")} <b>Likely complete</b> — the work looks already implemented at the base.</div>
+      <div class="verify-actions">${btn("confirm", "Confirm complete", "primary", "check_circle")}${btn("dismiss", "Dismiss", "mini", "close")}</div>
+      ${v.evidence?.html ? `<article class="md verify-evidence">${v.evidence.html}</article>` : ""}
+    </div>`;
+  }
+  if (v.verdict === "partial" && v.perTask?.length) {
+    const done = v.perTask.filter((t) => t.verdict === "done").length;
+    return `<div class="verify-overlay verify-partial"><div class="verify-head">${icon("info")} ${done}/${v.perTask.length} task(s) appear done (advisory).</div></div>`;
+  }
+  return "";
+}
+
+/** A compact grid-card chip reflecting a verification overlay (so an overlaid card stands out). */
+function verifyCardChip(p: AutopilotPlanInfo): string {
+  const v = p.verification;
+  if (v?.mismatch) return `<span class="plan-hold verify-mismatch-chip" title="Checked off, but code not found">${icon("warning")} Mismatch</span>`;
+  if (v?.verdict === "done" && !v.dismissedAt) return `<span class="ap-chip verify-likely-chip" title="Looks already implemented">${icon("check_circle")} likely complete</span>`;
+  return "";
+}
+
 /** A plan's environment display name (local env → broadcast name → fallback). */
 function planEnvName(p: AutopilotPlanInfo): string {
   return p.environmentName ?? (p.environmentId ? environments.get(p.environmentId)?.name : undefined) ?? "Unlinked";
@@ -568,6 +636,7 @@ function openPlan(id: string): void {
       ${proposed && p.trigger ? `<p class="small muted">${icon("bolt")} Proposed by <b>${esc(p.trigger.source)}</b> — approve to plan &amp; build, or reject.</p>` : ""}
       ${p.hold ? `<div class="reader-hold">${icon("pause_circle")} <b>Held for review:</b> ${esc(p.hold.reason)}</div>` : ""}
       ${p.goalCondition ? `<p class="small muted">${icon("target")} Stop condition once building: ${esc(p.goalCondition)}</p>` : ""}
+      ${verifyOverlayHtml(p)}
       ${p.pipeline ? renderPipelineTrace(p.pipeline) : ""}
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
     </div>
@@ -577,6 +646,11 @@ function openPlan(id: string): void {
   // unwinding the whole Autopilot view to the conversation. Closing it in-app goes through backToGrid.
   openOverlay("plan", () => renderAutopilotGrid());
   $("#plan-back").addEventListener("click", () => backToGrid());
+  // Verification overlay actions (Confirm / Dismiss / Acknowledge / Keep-as-work) — one delegated handler
+  // regardless of which action set rendered above.
+  host.querySelectorAll<HTMLElement>("[data-verify-act]").forEach((b) =>
+    b.addEventListener("click", () => void runVerifyAction(b.dataset.verifyAct!, id)),
+  );
   // These three exist only in some action sets (not on a proposed card), so wire them null-safe.
   document.getElementById("plan-complete")?.addEventListener("click", () => void resolvePlan(id, "completed"));
   document.getElementById("plan-expire")?.addEventListener("click", () => void resolvePlan(id, "expired"));
@@ -663,6 +737,61 @@ async function dismissPlan(id: string): Promise<void> {
     backToGrid(); // the broadcast also refreshes, but don't wait on it
   } catch (err) {
     toast(`Dismiss failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Dispatch a verification-overlay action (Confirm / Dismiss / Acknowledge / Keep-as-work). Capability-
+ *  gated client-side ("autopilot-verify") so an older daemon — which would reject the unknown command —
+ *  never receives it. The server broadcasts the refreshed grid; we jump back to it. */
+async function runVerifyAction(act: string, id: string): Promise<void> {
+  const cmd = verifyCommand(act, id);
+  if (!cmd) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  if (!serverSupports(srv, "autopilot-verify")) {
+    toast("That server doesn't support completion verification");
+    return;
+  }
+  try {
+    const res = await sendAwait(srv, { ...cmd, cid: newCid() }, 60_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    toast(act === "dismiss" ? "Dismissed" : act === "keep" ? "Kept as work" : act === "ack" ? "Completed" : "Completed");
+    backToGrid();
+  } catch (err) {
+    toast(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** The "Verify completion" button: a fleet-wide sweep over every autopilot-verify-capable, flag-on server.
+ *  Progress streams back on the existing run-progress channel (shared with runAutopilot). */
+async function runVerifyCompletion(): Promise<void> {
+  const targets = orderedServers().filter(
+    (s) => s.sock.isOpen() && serverSupports(s, "autopilot-verify") && serverSchedule.get(s.url)?.schedule.verifyEnabled,
+  );
+  if (!targets.length) {
+    toast("Completion verification isn't enabled on any connected server");
+    return;
+  }
+  try {
+    await busy($<HTMLButtonElement>("#autopilot-verify"), "Verifying…", async () => {
+      for (const srv of targets) {
+        try {
+          const res = await sendAwait(srv, { type: "autopilot.verify", cid: newCid() }, 600_000);
+          if (res.type === "command.error") onAutopilotProgress(`⚠ ${srv.name}: ${res.message}`);
+        } catch (err) {
+          onAutopilotProgress(`⚠ ${srv.name}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    });
+    toast("Verification sweep complete");
+  } catch (err) {
+    toast(`Verify failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -994,6 +1123,8 @@ export function openScheduleModal(): void {
       <label class="ap-field-row"><span>Auto-start at most</span><input type="number" id="ap-cap" min="0" max="20" value="${s.maxAutoStart ?? 3}" /><span class="small muted">per run (the rest wait for manual launch; skipped while the budget is in its warn zone)</span></label>
       <label class="ap-field-row"><span>Autopilot label</span><input type="text" id="ap-label" value="${esc(s.label ?? "")}" placeholder="Autopilot" /><span class="small muted">tasks with this Todoist label are pulled in from <b>any</b> project (blank = off)</span></label>
       <label class="ap-field-row"><span>Default environment</span><select id="ap-defenv">${envOptions}</select><span class="small muted">where label-sourced tasks are planned &amp; built — always review-only</span></label>
+      ${toggle("ap-verify", s.verifyEnabled ?? false, "Verify completion (detect already-built work)")}
+      <p class="small muted" style="margin:-2px 0 6px">When on, the run checks whether pending work is already implemented at the base branch and surfaces a "Likely complete" overlay for you to confirm — and skips auto-starting work it can confirm is built. Adds a "Verify completion" button to the Autopilot view.</p>
     </div>
     <div class="btns"><button type="button" id="ap-sched-cancel">Cancel</button><button type="button" id="ap-sched-save" class="primary">Save</button></div></div>`;
   showModal(m);
@@ -1027,6 +1158,7 @@ async function saveSchedule(): Promise<void> {
   const days = on.length === 0 || on.length === 7 ? [] : on.sort((a, b) => a - b);
   const label = $<HTMLInputElement>("#ap-label").value.trim();
   const defaultEnvironmentId = $<HTMLSelectElement>("#ap-defenv").value;
+  const verifyEnabled = isOn("ap-verify");
   // Push the same schedule to EVERY connected autopilot-capable server, not just the hub. Autopilot
   // runs per-daemon ("autopilot runs where the repo lives"), so a member-hosted project (e.g. lapo on
   // the M1) only gets nightly cards once ITS daemon's timer is enabled. The catch-all
@@ -1034,7 +1166,7 @@ async function saveSchedule(): Promise<void> {
   // only — on a member that id won't resolve, so it skips the label pass and just re-plans its own
   // linked projects. (lastRunAt stays server-owned and per-daemon.)
   const targets = orderedServers().filter((s) => s.sock.isOpen() && serverSupports(s, "autopilot"));
-  const patch = { type: "autopilot.schedule.set" as const, enabled, timeOfDay, days, autoStart, usePipeline, maxAutoStart, label, defaultEnvironmentId };
+  const patch = { type: "autopilot.schedule.set" as const, enabled, timeOfDay, days, autoStart, usePipeline, maxAutoStart, label, defaultEnvironmentId, verifyEnabled };
   try {
     const hubIdx = targets.findIndex((s) => s.url === HUB_URL);
     const results = await Promise.allSettled(targets.map((s) => sendAwait(s, { ...patch, cid: newCid() }, 20_000)));

@@ -112,6 +112,11 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   // /api/health before relaying, so a pre-capability member just degrades to "not reachable from the
   // hub's Claude" instead of a 404.
   "fleet-repo",
+  // Completion verification (completion-verification spec): the autopilot.verify* command family + the
+  // "Likely complete" overlay on AutopilotPlanInfo. A client gates every autopilot.verify* send on this,
+  // so an older daemon (which errors on an unknown command) never receives one; the additive
+  // `verification` field it does receive is simply ignored by an old client.
+  "autopilot-verify",
 ];
 
 /** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */
