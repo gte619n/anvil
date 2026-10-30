@@ -22,6 +22,7 @@ import {
   type AutopilotSchedule,
   type AutopilotScheduleEvent,
   type AutopilotStartedEvent,
+  type AutopilotVerifyMetricsEvent,
   type Budget,
   type Environment,
   type Model,
@@ -34,17 +35,19 @@ import type { IntegrationStore } from "../integrations/store";
 import type { IntegrationsFacade } from "./integrations-facade";
 import type { AccountStore } from "../auth/accounts";
 import type { MarkdownRenderer } from "../render/markdown";
-import { WorkUnitStore, type WorkUnit } from "../integrations/workunit";
+import { WorkUnitStore, type WorkUnit, type WorkUnitVerification } from "../integrations/workunit";
 import { AutopilotScheduleStore, scheduledFireDue, nextScheduledFire, runWithinBudget } from "../integrations/schedule";
-import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, toPlanInfo, buildAutopilotBrief, buildAutopilotGoal, buildPlanningBrief } from "../integrations/autopilot-plans";
+import { selectPendingPlans, selectCompletedUnits, RECONCILABLE_STATUSES, VERIFIABLE_STATUSES, selectVerifiableUnits, combineSignals, toPlanInfo, buildAutopilotBrief, buildAutopilotGoal, buildPlanningBrief } from "../integrations/autopilot-plans";
+import type { QueryLike } from "../agent/query";
 import { normalizeTrigger, type TriggerEvent } from "../integrations/event-trigger";
 import type { LoopsInput } from "../integrations/loops";
 import { TodoistClient, type TodoistTask } from "../integrations/todoist";
 import { LapoClient, type LapoEntryEndpoint } from "../integrations/lapo";
 import { buildAutopilotReport, renderJournalOutline, extractOpenQuestions, type ReportUnit } from "../integrations/lapo-report";
 import { readStatus, withStatus, type AnvilStatus } from "../integrations/status";
-import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt } from "../integrations/autopilot";
+import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt, verifyUnit } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
+import { createWorktree, removeWorktree, resolveBaseSha, createReadWorktree, removeReadWorktree, pruneReadWorktrees } from "./worktree";
 import { OpenRouterClient } from "../integrations/openrouter";
 import { OPENROUTER_KEY } from "../auth/openrouter";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
@@ -56,7 +59,6 @@ import type { PhaseDeps } from "../pipeline/phases";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { buildPlanningToolsServer } from "../agent/planning-tools";
 import type { PushPayload } from "../push/webpush";
-import { createWorktree, removeWorktree } from "./worktree";
 import { slugify } from "./slug";
 import { BadCommand } from "./errors";
 import type { Session } from "./session";
@@ -80,6 +82,43 @@ const SCHEDULE_RUN_WINDOW_MS = 10 * 60_000;
  *  completion query at ~3 months; 60 days stays well under that while covering any realistic stretch of
  *  daemon downtime between the completion and the next reconcile tick. */
 const RECONCILE_WINDOW_DAYS = 60;
+/** Completion-verifier bounds (spec OD3): at most this many units verified per sweep, and at most this
+ *  many verifier queries in flight at once (global across accounts). Keeps an unattended sweep from
+ *  fanning out a swarm of model calls or exhausting the subscription window. */
+const MAX_VERIFY_PER_RUN = 25;
+// Gentle concurrency (lowered from 4 after the real-data run): plan-mode verification queries are heavy
+// and a busy subscription throttles several in flight, which fail open to misleading not-dones. 2 keeps
+// the sweep moving without hammering the rate limit; verifyUnit's retry/backoff covers the rest. (OD3.)
+const VERIFY_CONCURRENCY = 2;
+/** Marker embedded in the Todoist evidence comment so a re-sweep recognizes its own and never double-posts
+ *  (spec §4.3 "idempotent evidence comment"). */
+const VERIFY_COMMENT_MARKER = "<!-- anvil:verify -->";
+
+/** The Todoist surface the completion verifier needs. A structural subset of `TodoistClient` so a test
+ *  can inject a fake (spec §8 "fake TodoistClient") and production passes the real client. */
+export type VerifyTodoist = Pick<TodoistClient, "completedTasks" | "getTask" | "setTaskLabels" | "closeTask" | "comments" | "addComment">;
+
+/** Options for the completion-verification sweep. All optional — production passes none (it derives the
+ *  Todoist client from the connected integration and uses the real SDK + clock); tests inject fakes. */
+export interface VerifySweepOpts {
+  queryFn?: QueryLike; // injected fake for the verifier model (deterministic tests)
+  todoist?: VerifyTodoist; // injected fake Todoist (else built from the connected integration)
+  now?: () => number; // injected clock for verdict timestamps
+  signal?: AbortSignal; // run-level abort (watchdog / cancel)
+  onProgress?: (line: string) => void; // stream a progress line
+}
+
+/** The end-of-sweep metrics (spec §4.7), returned and broadcast. */
+export interface VerifyMetrics {
+  verified: number;
+  done: number;
+  partial: number;
+  notDone: number;
+  mismatches: number;
+  aborts: number;
+  errors: number; // units whose verifier errored/was throttled (fail-open) — left unverified to retry
+  estimatedTokens: number;
+}
 
 export interface AutopilotDeps {
   registry: ConnectionRegistry;
@@ -169,7 +208,9 @@ export class AutopilotService {
       // Todoist has no webhooks, so completion is polled: on every tick, drop any pending plan whose
       // source task the user has since checked off in Todoist. Independent of whether a scheduled run
       // is due, so a card clears within a tick of the task being completed even with autopilot idle.
-      void this.reconcileCompletedUnits();
+      // The tick NEVER verifies (OD3 — verification stays off the cheap tick); with verification on it
+      // defers completing a checked-off verifiable unit that lacks a fresh `done` verdict (R3-C2).
+      void this.reconcileCompletedUnits({ verifyDeferral: this.verifyEnabled });
     }, SCHEDULE_TICK_MS);
     this.scheduleTimer.unref?.();
   }
@@ -277,7 +318,7 @@ export class AutopilotService {
   // these methods just supply the Supervisor's stores/renderer.
   /** Pending plans = planned work units not yet started; what the Autopilot card grid shows. */
   private pendingPlans(): WorkUnit[] {
-    return selectPendingPlans(this.workUnits.list());
+    return selectPendingPlans(this.workUnits.list(), this.liveSessionIds());
   }
 
   /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
@@ -494,12 +535,14 @@ export class AutopilotService {
   /** Mark a plan completed or expired: relabel its member tasks (anvil:completed / anvil:expired) and,
    *  when `closeTodoist`, close them in Todoist too. Drops the card (status is no longer "planned").
    *  Best-effort on the Todoist side — the local status change is authoritative. */
-  async resolvePlan(workUnitId: string, status: "completed" | "expired", closeTodoist: boolean): Promise<void> {
+  async resolvePlan(workUnitId: string, status: "completed" | "expired", closeTodoist: boolean, injectedClient?: VerifyTodoist): Promise<void> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     const state = this.deps.integrations.todoist();
-    if (state?.accessToken) {
-      const client = new TodoistClient(state.accessToken);
+    // The verifier's auto-complete passes its (possibly fake) client so the relabel/close bills to the
+    // same sweep; everyone else derives it from the connected integration (local-only when offline).
+    const client = injectedClient ?? (state?.accessToken ? new TodoistClient(state.accessToken) : undefined);
+    if (client) {
       for (const taskId of u.taskIds) {
         try {
           const t = await client.getTask(taskId);
@@ -520,10 +563,10 @@ export class AutopilotService {
    *  top of every autopilot run. Best-effort: a Todoist hiccup just means we retry next tick; a unit with
    *  a live build session is left alone (its session, not the checkbox, owns its lifecycle). Returns the
    *  number of units completed. */
-  async reconcileCompletedUnits(): Promise<number> {
+  async reconcileCompletedUnits(opts: { verifyDeferral?: boolean; todoist?: VerifyTodoist } = {}): Promise<number> {
     if (this.autopilotRunning) return 0; // don't race a run that's mutating the same store
-    const state = this.deps.integrations.todoist();
-    if (!state?.accessToken) return 0;
+    const client = this.verifyTodoist(opts.todoist);
+    if (!client) return 0;
     const isLive = (u: WorkUnit): boolean => !!u.sessionId && this.deps.hasSession(u.sessionId);
     const pending = this.workUnits
       .list()
@@ -532,7 +575,6 @@ export class AutopilotService {
     // One completion query per distinct project the pending units draw from — this is exactly the set of
     // boards we care about, whether project- or label-sourced (each unit stores the project its tasks live in).
     const projectIds = new Set(pending.map((u) => u.todoistProjectId).filter((id): id is string => !!id));
-    const client = new TodoistClient(state.accessToken);
     const completed = new Set<string>();
     try {
       for (const projectId of projectIds) {
@@ -542,9 +584,350 @@ export class AutopilotService {
       return 0; // Todoist unreachable/rate-limited — leave the cards as-is and retry next tick
     }
     const done = selectCompletedUnits(pending, completed, isLive);
-    for (const u of done) this.workUnits.update(u.id, { status: "completed" });
-    if (done.length > 0) this.broadcastAutopilotPlans();
-    return done.length;
+    // Verify-deferral (R3-C2): when verification is on, a CHECKED-OFF unit in a VERIFIABLE status
+    // (planned/blocked) must not be blindly completed on the checkbox alone — the verifier mediates
+    // (done → complete, not-done → mismatch hold). So here we only complete such a unit if it already
+    // carries a fresh, non-mismatch `done` verdict; otherwise it's deferred to the next verifying pass.
+    // Non-verifiable reconcilable statuses (review / needs-clarification) complete on the checkbox as before.
+    const toComplete = opts.verifyDeferral
+      ? done.filter(
+          (u) =>
+            !VERIFIABLE_STATUSES.has(u.status) ||
+            (u.verification?.verdict === "done" && !u.verification.mismatch && !u.verification.dismissedAt),
+        )
+      : done;
+    for (const u of toComplete) this.workUnits.update(u.id, { status: "completed" });
+    if (toComplete.length > 0) this.broadcastAutopilotPlans();
+    return toComplete.length;
+  }
+
+  // ── Completion verification (completion-verification spec) ─────────────────────────
+  /** Whether the completion verifier is enabled (schedule flag, default off — OD5). Gates the nightly
+   *  verify pass and the manual "Verify completion" command; the daemon rejects the command when off. */
+  private get verifyEnabled(): boolean {
+    return !!this.autopilotSchedule.get().verifyEnabled;
+  }
+
+  /**
+   * The manual "Verify completion" command (spec §4.5): a fleet-wide verification sweep over this server's
+   * hub-local envs, progress-streamed to every client and cancelable. It MUST participate in the single-run
+   * state the same way `runAutopilot` does — set the start timestamp + bump the run token + arm the watchdog
+   * (mirror of `:803-817`) and clear them in a token-guarded `finally` (mirror of `:926`) — else the
+   * single-flight guard is inert or a superseded run wipes a newer one's state (R2-C3/R3). Rejects when the
+   * flag is off or a run is already in progress. `opts` lets a test inject the model/clock/Todoist/signal.
+   */
+  async verifyCompletion(opts: VerifySweepOpts = {}): Promise<VerifyMetrics> {
+    if (!this.verifyEnabled) throw new BadCommand("completion verification is disabled — turn it on in Settings");
+    if (this.autopilotRunning) throw new BadCommand("an autopilot run is already in progress");
+    // Bridge any caller-supplied cancel signal into this run's controller, which the watchdog also aborts.
+    const ac = new AbortController();
+    if (opts.signal) {
+      if (opts.signal.aborted) ac.abort();
+      else opts.signal.addEventListener("abort", () => ac.abort(), { once: true });
+    }
+    const token = ++this.autopilotRunToken;
+    this.autopilotRunStartedAt = Date.now();
+    this.autopilotRunLog = [];
+    this.broadcastSchedule(); // running: true to every client
+    const watchdog = setTimeout(() => {
+      if (this.autopilotRunToken !== token) return; // a newer run owns the state
+      ac.abort();
+      this.autopilotRunStartedAt = undefined;
+      this.broadcastSchedule();
+    }, AUTOPILOT_RUN_TIMEOUT_MS);
+    watchdog.unref?.();
+    try {
+      return await this.reconcileAndVerify({
+        ...opts,
+        signal: ac.signal,
+        onProgress: (line) => {
+          this.autopilotRunLog.push(line); // retained so a late-joining client replays via the snapshot
+          this.broadcastRunProgress(line);
+        },
+      });
+    } finally {
+      clearTimeout(watchdog);
+      if (this.autopilotRunToken === token) this.autopilotRunStartedAt = undefined; // only if THIS run still owns it
+      this.broadcastSchedule(); // running: false
+    }
+  }
+
+  /** The set of live (running-session) ids, for the pure selectors/predicates (there's no `isLive` field). */
+  private liveSessionIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const u of this.workUnits.list()) if (u.sessionId && this.deps.hasSession(u.sessionId)) ids.add(u.sessionId);
+    return ids;
+  }
+
+  /** The verifier's Todoist surface: the injected fake (tests) or a real client over the connected token. */
+  private verifyTodoist(injected?: VerifyTodoist): VerifyTodoist | undefined {
+    if (injected) return injected;
+    const state = this.deps.integrations.todoist();
+    return state?.accessToken ? new TodoistClient(state.accessToken) : undefined;
+  }
+
+  /**
+   * The completion-verification sweep (spec §4.2–§4.3): across hub-local envs, judge each STALE, eligible
+   * unit against the code at `origin/<defaultBase>` and apply the signal-combination table. VERIFY-FIRST —
+   * a verdict is computed before any status change, so there's no complete-before-verify race (R2-S4).
+   * Bounded: ≤`MAX_VERIFY_PER_RUN` units, ≤`VERIFY_CONCURRENCY` queries in flight (OD3). Reads run in a
+   * shared per-repo `--detach` read worktree, never the live `repoRoot` ([[daemon-runs-from-live-dev-checkout]]).
+   * Fully guarded: a per-env/per-unit failure is swallowed so one bad repo can't sink the sweep. This is the
+   * CORE; the nightly pre-planning reconcile and the manual button both call it.
+   */
+  async reconcileAndVerify(opts: VerifySweepOpts = {}): Promise<VerifyMetrics> {
+    const metrics: VerifyMetrics = { verified: 0, done: 0, partial: 0, notDone: 0, mismatches: 0, aborts: 0, errors: 0, estimatedTokens: 0 };
+    const todoist = this.verifyTodoist(opts.todoist);
+    if (!todoist) return this.finishVerifySweep(metrics); // no Todoist → nothing to reconcile against
+    const nowMs = opts.now ?? Date.now;
+    const emit = opts.onProgress ?? (() => {});
+    const liveIds = this.liveSessionIds();
+
+    // Resolve a current base SHA per hub-local env that has BOTH a Todoist project AND a repo (spec: an env
+    // without both is suppressed — there's nothing to verify or no code to read). Fetch-first (A4).
+    const refByEnv = new Map<string, string>();
+    const baseShaByEnv = new Map<string, string>();
+    const envs = this.deps.envStore.list().filter((e) => e.repoRoot && e.todoistProjectId);
+    for (const e of envs) {
+      if (opts.signal?.aborted) break;
+      try {
+        pruneReadWorktrees(e.repoRoot, this.deps.worktreeRoot()); // clear any crash-orphaned read worktree first
+        const { ref, sha } = await resolveBaseSha(e.repoRoot, e.defaultBase ?? "HEAD");
+        refByEnv.set(e.id, ref);
+        baseShaByEnv.set(e.id, sha);
+      } catch {
+        /* unresolvable env (no commits / git wedged) — skip; its units are undecidable this sweep */
+      }
+    }
+
+    const candidates = selectVerifiableUnits(this.workUnits.list(), baseShaByEnv, liveIds).slice(0, MAX_VERIFY_PER_RUN);
+    if (candidates.length === 0) return this.finishVerifySweep(metrics);
+
+    // One completion query per distinct project the candidates draw from (the "closed-seen" set).
+    const completed = new Set<string>();
+    try {
+      for (const projectId of new Set(candidates.map((u) => u.todoistProjectId).filter((id): id is string => !!id))) {
+        for (const t of await todoist.completedTasks({ projectId, windowDays: RECONCILE_WINDOW_DAYS })) completed.add(t.id);
+      }
+    } catch {
+      /* Todoist completion query failed — proceed with an empty closed set (no auto-completes this sweep) */
+    }
+
+    // One read worktree per env the candidates touch, created SEQUENTIALLY up front (not lazily inside the
+    // parallel workers — concurrent `worktree add` on the same path would race and drop units). Torn down
+    // at sweep end.
+    const readWtByEnv = new Map<string, string>();
+    for (const envId of new Set(candidates.map((u) => u.environmentId))) {
+      if (opts.signal?.aborted) break;
+      const env = this.deps.envStore.get(envId);
+      const ref = env && refByEnv.get(envId);
+      if (!env || !ref) continue;
+      try {
+        const { cwd } = await createReadWorktree(env.repoRoot, ref, this.deps.worktreeRoot(), envId);
+        readWtByEnv.set(envId, cwd);
+      } catch {
+        /* couldn't create a read worktree for this env — its units are skipped this sweep */
+      }
+    }
+
+    const verifyOne = async (u: WorkUnit): Promise<void> => {
+      if (opts.signal?.aborted) {
+        metrics.aborts++;
+        return;
+      }
+      const env = this.deps.envStore.get(u.environmentId);
+      if (!env) return;
+      const cwd = readWtByEnv.get(env.id);
+      if (!cwd) return;
+      // Fetch the live task objects (the verifier needs their text). A deleted task (404) with none left
+      // means the work is gone from Todoist → clear the overlay and expire the unit (edge-case table).
+      const tasks = [];
+      let anyDeleted = false;
+      for (const id of u.taskIds) {
+        try {
+          tasks.push(await todoist.getTask(id));
+        } catch (e) {
+          if (/→ 404\b/.test(e instanceof Error ? e.message : "")) anyDeleted = true;
+        }
+      }
+      if (tasks.length === 0) {
+        if (anyDeleted) this.workUnits.update(u.id, { verification: undefined, status: "expired" });
+        return;
+      }
+      const result = await verifyUnit({ title: u.title, ...(u.plan ? { plan: u.plan } : {}) }, tasks, {
+        baseWorktree: cwd,
+        accounts: this.deps.accounts,
+        ...(env.accountId ? { accountId: env.accountId } : {}),
+        ...(opts.signal ? { signal: opts.signal } : {}),
+        ...(opts.queryFn ? { queryFn: opts.queryFn } : {}),
+      });
+      // An errored (throttled/aborted) verification never got a real answer. Do NOT persist it as a
+      // verdict — that would stamp an indistinguishable-from-genuine false not-done. Leave the unit
+      // unverified (no verification written) so the next sweep retries it, and count it as an error.
+      if (result.errored) {
+        metrics.errors++;
+        return;
+      }
+      metrics.verified++;
+      metrics.estimatedTokens += Math.ceil((result.raw.length + result.evidence.length) / 4) + 400;
+      metrics[result.verdict === "done" ? "done" : result.verdict === "partial" ? "partial" : "notDone"]++;
+
+      // Sticky closed-seen: once a unit's tasks have been seen fully closed, it stays closed-seen even if
+      // the completion later ages out of the 60-day window (R2-S2).
+      const allClosedNow = u.taskIds.length > 0 && u.taskIds.every((id) => completed.has(id));
+      const closedSeen = allClosedNow || !!u.verification?.todoistClosedSeen;
+      const signals = combineSignals(result.verdict, closedSeen);
+      const verification: WorkUnitVerification = {
+        verdict: result.verdict,
+        evidence: result.evidence,
+        raw: result.raw,
+        perTask: result.perTask,
+        ...(result.confidence !== undefined ? { confidence: result.confidence } : {}),
+        baseRef: refByEnv.get(env.id)!,
+        baseSha: baseShaByEnv.get(env.id)!,
+        at: new Date(nowMs()).toISOString(),
+        ...(closedSeen ? { todoistClosedSeen: true } : {}),
+        ...(signals.mismatch ? { mismatch: true } : {}),
+        // A fresh verdict supersedes any prior dismiss (we only re-verify once the base SHA moved).
+      };
+      if (signals.autoComplete) {
+        this.workUnits.update(u.id, { verification });
+        await this.resolvePlan(u.id, "completed", true, todoist); // relabel + close, billed to this sweep's client
+        await this.postVerificationComment(u.id, result.evidence, todoist); // idempotent evidence comment
+      } else {
+        if (signals.mismatch) metrics.mismatches++;
+        this.workUnits.update(u.id, { verification });
+      }
+    };
+
+    try {
+      await this.boundedForEach(candidates, VERIFY_CONCURRENCY, verifyOne);
+    } finally {
+      for (const [envId, cwd] of readWtByEnv) {
+        const env = this.deps.envStore.get(envId);
+        if (env) {
+          try {
+            removeReadWorktree(env.repoRoot, cwd);
+          } catch {
+            /* best-effort teardown; the next sweep's prune mops up any leftover */
+          }
+        }
+      }
+    }
+    emit(`Verified ${metrics.verified} unit(s): ${metrics.done} done, ${metrics.partial} partial, ${metrics.mismatches} mismatch${metrics.errors ? `, ${metrics.errors} errored (will retry)` : ""}.`);
+    this.broadcastAutopilotPlans();
+    return this.finishVerifySweep(metrics);
+  }
+
+  /** Broadcast the end-of-sweep metrics (cid-less, modeled on autopilot.run.progress — §4.7) and return them. */
+  private finishVerifySweep(metrics: VerifyMetrics): VerifyMetrics {
+    const ev: AutopilotVerifyMetricsEvent = {
+      v: PROTOCOL_VERSION,
+      type: "autopilot.verify.metrics",
+      ts: now(),
+      verified: metrics.verified,
+      done: metrics.done,
+      partial: metrics.partial,
+      notDone: metrics.notDone,
+      mismatches: metrics.mismatches,
+      aborts: metrics.aborts,
+      errors: metrics.errors,
+      ...(metrics.estimatedTokens ? { estimatedTokens: metrics.estimatedTokens } : {}),
+    };
+    this.deps.registry.toAll(ev);
+    return metrics;
+  }
+
+  /** Run `fn` over `items` with at most `limit` in flight (OD3 concurrency cap). A thrown `fn` is swallowed
+   *  so one bad unit can't sink the sweep. */
+  private async boundedForEach<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+    let i = 0;
+    const worker = async (): Promise<void> => {
+      while (i < items.length) {
+        const item = items[i++]!;
+        try {
+          await fn(item);
+        } catch {
+          /* swallow — per-unit failure must not abort the sweep */
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  }
+
+  /** Post the idempotent Todoist evidence comment for an auto-completed unit. Scans for the marker so a
+   *  re-sweep never double-posts (R2-C5); records `commentPosted`. Best-effort — never fails the complete. */
+  private async postVerificationComment(workUnitId: string, evidence: string, client: VerifyTodoist): Promise<void> {
+    const u = this.workUnits.get(workUnitId);
+    const taskId = u?.taskIds[0];
+    if (!u || !taskId || u.verification?.commentPosted) return;
+    try {
+      const existing = await client.comments(taskId);
+      if (!existing.some((c) => c.content?.includes(VERIFY_COMMENT_MARKER))) {
+        await client.addComment(taskId, `${VERIFY_COMMENT_MARKER}\n🤖 **anvil** closed “${u.title}” — the work looks already implemented:\n\n${evidence}`);
+      }
+      if (u.verification) this.workUnits.update(u.id, { verification: { ...u.verification, commentPosted: true } });
+    } catch {
+      /* comment is an audit nicety — never fail the completion over it */
+    }
+  }
+
+  /** Confirm a "Likely complete" overlay: a human agrees the done verdict → complete the unit (close its
+   *  Todoist tasks) + post the evidence comment. Degrades to a local-only completion when Todoist is
+   *  unavailable (never block the human). */
+  async confirmVerification(workUnitId: string): Promise<void> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const evidence = u.verification?.evidence ?? "";
+    await this.resolvePlan(workUnitId, "completed", true);
+    const client = this.verifyTodoist();
+    if (client) await this.postVerificationComment(workUnitId, evidence, client);
+  }
+
+  /** Dismiss a "Likely complete" overlay: suppress it (set `dismissedAt`) until the verdict goes stale
+   *  (the base SHA moves). The unit stays exactly as it was. */
+  dismissVerification(workUnitId: string): void {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (!u.verification) throw new BadCommand("this unit has no verification overlay to dismiss");
+    this.workUnits.update(u.id, { verification: { ...u.verification, dismissedAt: new Date().toISOString() } });
+    this.broadcastAutopilotPlans();
+  }
+
+  /** Acknowledge a mismatch ("trust my checkbox — it really is done"): complete the unit IMMEDIATELY. The
+   *  task is already closed in Todoist, so no close call and NO evidence comment ("couldn't find the code"
+   *  reads as noise on a done task — OD10). Acknowledge *is* completion; no ack flag is persisted. */
+  async ackMismatch(workUnitId: string): Promise<void> {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    await this.resolvePlan(workUnitId, "completed", false);
+  }
+
+  /** Keep-as-work a mismatch ("I checked it off by mistake, I still want it built"): mark `keptAsWork` and
+   *  clear the mismatch overlay. The unit stays in its `planned`/`blocked` status and is buildable again;
+   *  it's thereafter skipped by both the verifier and the completion reconcile, so its still-closed Todoist
+   *  checkbox can't re-trigger a mismatch or an auto-complete (OD10). */
+  keepAsWork(workUnitId: string): void {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const prior = u.verification;
+    this.workUnits.update(u.id, {
+      verification: {
+        ...(prior ?? { verdict: "not-done", evidence: "", raw: "", baseRef: "", baseSha: "", at: new Date().toISOString() }),
+        keptAsWork: new Date().toISOString(),
+        mismatch: false,
+      },
+    });
+    this.broadcastAutopilotPlans();
+  }
+
+  /** Clear the verification overlay when real work starts on a unit, so a stale `done` can't re-flag an
+   *  actively-building unit. Called from the three entry points that START real work: startPlan (Go),
+   *  linkPlan, and runDevPipeline (R3-C4 — identified by "starts real work", not a `status:"building"` grep,
+   *  since runDevPipeline never writes that status). No-op when there's nothing to clear. */
+  private clearVerificationOnBuild(workUnitId: string): void {
+    const u = this.workUnits.get(workUnitId);
+    if (u?.verification) this.workUnits.update(u.id, { verification: undefined });
   }
 
   // ── Autopilot maintenance (Todoist-settings buttons) ──────────────────────────────
@@ -656,6 +1039,7 @@ export class AutopilotService {
     });
     // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
     this.workUnits.update(u.id, { sessionId: id, status: "building", hold: undefined, ...(goalCondition ? { goalCondition } : {}) });
+    this.clearVerificationOnBuild(u.id); // real work is starting → a stale "Likely complete" must not linger
     if (goalCondition) this.deps.armGoal(id, goalCondition);
     void this.tagTasks(u, "building");
     this.broadcastAutopilotPlans();
@@ -675,6 +1059,7 @@ export class AutopilotService {
     if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
     // A human deliberately linking the plan to live work clears any auto-start hold (mirrors startPlan).
     this.workUnits.update(u.id, { sessionId, status: "building", hold: undefined });
+    this.clearVerificationOnBuild(u.id); // starting real work clears a stale completion overlay
     void this.tagTasks(u, "building");
     this.broadcastAutopilotPlans();
     return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId };
@@ -764,7 +1149,8 @@ export class AutopilotService {
     if (!state?.accessToken) throw new BadCommand("Todoist is not connected");
     // Clear any plan whose source task was checked off since the last tick before we plan afresh, so a
     // manual "Run autopilot" reflects completions immediately. Runs before the run marks itself active.
-    await this.reconcileCompletedUnits().catch(() => 0);
+    // With verification on, this defers checked-off verifiable units to the verify pass (pass 1, below).
+    await this.reconcileCompletedUnits({ verifyDeferral: this.verifyEnabled }).catch(() => 0);
     // Run-level abort: the watchdog (below) fires it on timeout so every in-flight Todoist/SDK call
     // unwinds instead of hanging the run open. Threaded into the client and the planning calls.
     const ac = new AbortController();
@@ -819,7 +1205,15 @@ export class AutopilotService {
     const startedUnitIds = new Set<string>(); // units this run auto-started — feeds the lapo report
     let skipped = 0;
     let started = 0;
+    let verifyMismatches = 0; // for the nightly summary line
     try {
+      // Pass 1 (spec §4.5): pre-planning verification reconcile over EXISTING eligible units — verify-first,
+      // so a unit that's already built gets its overlay (and a closed-seen one auto-completes) before we
+      // re-plan and risk rebuilding it. Disjoint from pass 2 below (which verifies the freshly-created units).
+      if (this.verifyEnabled) {
+        const m = await this.reconcileAndVerify({ signal: ac.signal, onProgress: emit }).catch(() => undefined);
+        if (m) verifyMismatches += m.mismatches;
+      }
       for (const env of envs) {
         // Name the Claude account the run bills to, so the report/log says whose subscription paid
         // for an unattended run rather than leaving it to be inferred (§6).
@@ -877,8 +1271,17 @@ export class AutopilotService {
       // `planned` for a human. (The intake/clarification holds were already logged during planning; only
       // surface the adversarial-quality holds here so the run log explains a plan that DID get planned but
       // won't build.)
+      // Pass 2 (spec §4.5): post-planning auto-start pre-pass. Verify the FRESHLY-created units (disjoint
+      // from pass 1's existing units — a double-writer can't occur, R3-#5), annotating each with its verdict
+      // in the store. The sync, SDK-free `autoStartDecision` then reads the plain `verification.verdict` and
+      // holds any `done` unit as "already-implemented" instead of rebuilding it.
+      if (this.verifyEnabled && createdUnits.length) {
+        const m = await this.reconcileAndVerify({ signal: ac.signal, onProgress: emit }).catch(() => undefined);
+        if (m) verifyMismatches += m.mismatches;
+      }
       const autoStartable: WorkUnit[] = [];
-      for (const u of createdUnits) {
+      for (const u0 of createdUnits) {
+        const u = this.workUnits.get(u0.id) ?? u0; // re-read so the verifier's annotation is visible to the gate
         const decision = autoStartDecision(u);
         if (decision.start) autoStartable.push(u);
         else if (u.source !== "label" && u.status === "planned" && decision.reason) {
@@ -918,6 +1321,11 @@ export class AutopilotService {
           }
           if (autoStartable.length > cap) emit(`${autoStartable.length - cap} more plan(s) left for manual review (cap ${cap}).`);
         }
+      }
+      // Nightly summary (spec §4.5): one line on what verification found this run.
+      if (this.verifyEnabled) {
+        const alreadyImplemented = createdUnits.filter((u0) => (this.workUnits.get(u0.id) ?? u0).verification?.verdict === "done").length;
+        emit(`🔎 Verification: ${alreadyImplemented} already implemented, ${verifyMismatches} mismatch(es) held for review.`);
       }
     } finally {
       clearTimeout(watchdog);
@@ -968,6 +1376,7 @@ export class AutopilotService {
     if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
     // Default to broadcasting progress to every client (so the live view updates like an autopilot run).
     const log = opts.onProgress ?? ((m: string) => this.broadcastRunProgress(m));
+    this.clearVerificationOnBuild(u.id); // the pipeline does real work on this unit → clear a stale overlay
     const runId = newId("pipe");
     const branch = `${slugify(u.title)}-pipeline`;
     // One worktree for the whole run: read-only phases inspect it, P3/P4 write, P6 opens the PR from it.

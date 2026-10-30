@@ -26,6 +26,11 @@ describe("serverHelloEvent", () => {
     expect(SERVER_CAPABILITIES).toContain("accounts");
   });
 
+  test("[P0] advertises the autopilot-verify capability (completion-verification send-gate)", () => {
+    expect(SERVER_CAPABILITIES).toContain("autopilot-verify");
+    expect(hello.capabilities).toContain("autopilot-verify");
+  });
+
   test("the hello capabilities mirror SERVER_CAPABILITIES (the single source of truth)", () => {
     expect(hello.capabilities).toEqual([...SERVER_CAPABILITIES]);
   });

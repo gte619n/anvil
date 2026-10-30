@@ -9,6 +9,7 @@ import { readStatus, withStatus, type AnvilStatus } from "./status";
 import { extractPlanMeta, PLAN_META_INSTRUCTION, type PlanClarification } from "./plan-meta";
 import { extractJson } from "./json";
 import { parseIntakeVerdict, type IntakeVerdict } from "./autostart-gate";
+import { parseVerdict, type Verdict } from "./autopilot-plans";
 import { reviewPlan, formatReview, type AdversarialReview } from "./adversarial";
 import type { OpenRouterClient } from "./openrouter";
 import type { WorkUnit, WorkUnitStore } from "./workunit";
@@ -98,7 +99,9 @@ async function runQuery(
       // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
       // effect for the next planning/refine run without restarting the daemon. See AuthStore. When the
       // caller passes a roster, the run bills to the environment's chosen account (multi-account §6).
-      env: buildAgentEnv({ accounts: opts.accounts, accountId: opts.accountId }),
+      // Skipped when a test injects `queryFn` — there's no real subprocess to bill, and buildAgentEnv
+      // throws without an OAuth token, which would wedge an otherwise-deterministic unit test.
+      env: opts.queryFn ? {} : buildAgentEnv({ accounts: opts.accounts, accountId: opts.accountId }),
     },
   });
   let text = "";
@@ -331,6 +334,127 @@ ${taskBlock}`;
     // Never let a classifier hiccup (parse failure, transient SDK error) block planning — fail open.
     return { classification: "well-formed", wellFormed: true, reason: "", questions: [] };
   }
+}
+
+/** The code-judgment half of a completion verdict (completion-verification spec §4.2): the per-task
+ *  verdicts + the derived unit verdict + rendered evidence, carrying the raw model output for forensics.
+ *  The caller (reconcileAndVerify) stamps baseRef/baseSha/at and folds in the Todoist `closedSeen` signal. */
+export interface VerificationResult {
+  verdict: Verdict;
+  perTask: { taskId: string; verdict: "done" | "not-done"; cited: boolean; note?: string }[];
+  confidence?: number;
+  evidence: string; // rendered markdown: a per-task line with its file:line citation
+  raw: string; // raw model output (the JSON verdict), persisted for debugging a wrong call
+  // True when the verifier never got a real answer — the model errored/was throttled/aborted and we fell
+  // open to `not-done`. The caller must NOT persist this as a confirmed verdict (it would be an
+  // indistinguishable-from-genuine false not-done); it leaves the unit unverified to retry next sweep.
+  errored?: boolean;
+}
+
+/** Transient-failure retries for a single verification (spec hardening, from the real-data run): a busy
+ *  subscription throttles concurrent plan-mode queries, which otherwise fail open to a misleading
+ *  not-done. A couple of backed-off retries recover most of those without masking a real outage. */
+const VERIFY_MAX_RETRIES = 2;
+const VERIFY_RETRY_BACKOFF_MS = [1500, 4000];
+
+/** Render the per-task verdict as the evidence markdown shown in the plan reader. Each task gets a line
+ *  with a ✓/✗ and its citation (the whole point is that a `done` is grounded in a file:line). */
+function renderVerificationEvidence(tasks: TodoistTask[], perTask: VerificationResult["perTask"]): string {
+  const byId = new Map(perTask.map((t) => [t.taskId, t]));
+  return tasks
+    .map((t) => {
+      const p = byId.get(t.id);
+      const mark = p?.verdict === "done" ? "✅" : "⬜️";
+      const cite = p?.note ? ` — ${p.note}` : p?.verdict === "done" ? " — (no citation)" : "";
+      return `- ${mark} ${t.content}${cite}`;
+    })
+    .join("\n");
+}
+
+/**
+ * VERIFY (tier-1, completion-verification spec §4.2): read the repo at `baseWorktree` (a detached checkout
+ * of `origin/<defaultBase>`) in PLAN MODE — reads/greps only, no tool execution ([[plan-mode-runs-no-tools]])
+ * — and judge, per task, whether the work is ALREADY implemented, with a `file:line` citation. The unit's
+ * stored plan is included for context. The model delivers its JSON verdict through the `ExitPlanMode` call
+ * (same mechanism as the planner). Parse via the pure `parseVerdict`; FAIL OPEN to `not-done` on any error
+ * (classifyIntake discipline) so a flaky model or malformed output can never falsely mark work done. This
+ * does NOT run the plan's `## Validation` commands (NG7, tier-2 deferred) — a present-but-broken impl can
+ * read as `done`, and the human Confirm is the backstop.
+ */
+export async function verifyUnit(
+  unit: { title: string; rationale?: string; plan?: string },
+  tasks: TodoistTask[],
+  opts: {
+    baseWorktree: string;
+    model?: Model;
+    accounts?: AccountStore;
+    accountId?: string;
+    signal?: AbortSignal;
+    queryFn?: QueryLike;
+  },
+): Promise<VerificationResult> {
+  const taskIds = tasks.map((t) => t.id);
+  const failOpen = (): VerificationResult => ({
+    verdict: "not-done",
+    perTask: taskIds.map((id) => ({ taskId: id, verdict: "not-done" as const, cited: false })),
+    evidence: "",
+    raw: "",
+    errored: true, // never got a real answer — caller must not treat this as a confirmed not-done
+  });
+  const taskBlock = tasks
+    .map((t) => `- id=${t.id}: ${t.content}${t.description?.trim() ? `\n    ${t.description.trim().slice(0, FIELD_CHAR_CAP)}` : ""}`)
+    .join("\n");
+  const prompt = `You are checking whether engineering work is ALREADY implemented in this repository, which is checked out at its base branch. Inspect the code read-only — grep and read files; make no edits. For EACH task below, decide whether it is already done in the current code, and cite the specific \`path:line\` that proves it.
+
+Rules:
+- A task is "done" ONLY if you can point to the concrete code that implements it, with a \`path:line\` citation. If you cannot cite it, it is "not-done".
+- Do not assume; verify against what is actually in the repo. Partial or scaffolding-only implementations are "not-done".
+- Judge against the CURRENT task text and the plan below — not what you think the task "should" be.
+
+${unit.plan ? `Implementation plan for context:\n${unit.plan.slice(0, FIELD_CHAR_CAP * 2)}\n\n` : ""}Tasks:
+${taskBlock}
+
+When you are finished, deliver your answer as a single JSON object. You MUST emit it as a fenced \`\`\`json code block in your final message AND as the plan content of your ExitPlanMode call — do not answer in prose only. The JSON shape is exactly:
+\`\`\`json
+{"tasks": [{"taskId": "<id>", "verdict": "done|not-done", "cite": "path:line", "note": "one phrase"}], "confidence": 0.0}
+\`\`\``;
+
+  // Retry transient failures (throttling under concurrent sweeps) with backoff before failing open — a
+  // fail-open is a misleading not-done, so we try to get a real answer first.
+  for (let attempt = 0; attempt <= VERIFY_MAX_RETRIES; attempt++) {
+    if (opts.signal?.aborted) return failOpen();
+    if (attempt > 0) {
+      // No real backoff when a test injects queryFn (there's no live rate limit to respect, and the
+      // 5s test timeout can't absorb it).
+      const wait = opts.queryFn ? 0 : (VERIFY_RETRY_BACKOFF_MS[attempt - 1] ?? 4000);
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+      if (opts.signal?.aborted) return failOpen();
+    }
+    try {
+      const out = await runQuery(prompt, {
+        model: opts.model ?? "sonnet",
+        cwd: opts.baseWorktree,
+        readonly: true, // plan mode: reads/greps, no writes, no tool execution
+        signal: opts.signal,
+        queryFn: opts.queryFn,
+        accounts: opts.accounts,
+        accountId: opts.accountId,
+      });
+      // The verdict rides the ExitPlanMode plan and/or the final message; parseVerdict tolerates either
+      // (fenced JSON, bare JSON, or — as a last resort — prose, which it reads SAFELY, never inferring done).
+      const parsed = parseVerdict([out.plan, out.text].filter(Boolean).join("\n"), taskIds);
+      return {
+        verdict: parsed.verdict,
+        perTask: parsed.perTask,
+        ...(parsed.confidence !== undefined ? { confidence: parsed.confidence } : {}),
+        evidence: renderVerificationEvidence(tasks, parsed.perTask),
+        raw: parsed.raw,
+      };
+    } catch {
+      // transient — fall through to retry; the last failure drops to failOpen below
+    }
+  }
+  return failOpen(); // exhausted retries — never let a model/SDK hiccup falsely mark work done
 }
 
 /** A held unit's markdown body: the reason + open questions (shown in the plan reader), with any draft plan

@@ -9,6 +9,29 @@ import type { PipelineStatus } from "../pipeline/types";
 import type { TraceRecord } from "../pipeline/trace";
 
 /**
+ * The completion-verifier's overlay on a work unit (completion-verification spec §4.1). This is an
+ * OVERLAY, not a new `AnvilStatus`: the unit keeps its real `status` and this annotates it with a
+ * code-aware "is this already built?" verdict + file:line evidence. Every field is optional on the
+ * unit; when present, the pure predicates in `autopilot-plans.ts` (isLikelyComplete / hasOverlay)
+ * decide what the grid shows. A build start wipes the whole block so a stale `done` can't re-flag.
+ */
+export interface WorkUnitVerification {
+  verdict: "done" | "partial" | "not-done";
+  evidence: string; // rendered markdown: the per-task file:line citations, for the reader
+  raw: string; // raw verdict JSON, persisted so a wrong call is debuggable (spec §4.7)
+  perTask?: { taskId: string; verdict: "done" | "not-done"; cited: boolean; note?: string }[];
+  confidence?: number; // 0..1 — DISPLAY ONLY; never gates control flow (R2-T3)
+  baseRef: string; // "origin/<defaultBase>"
+  baseSha: string; // SHA of baseRef when the verdict was computed; staleness = this moved (OD4)
+  at: string; // ISO 8601
+  todoistClosedSeen?: boolean; // sticky: the tasks were observed closed in the 60-day window (R2-S2)
+  mismatch?: boolean; // closed-seen but code not-done → held for a human (NG3)
+  keptAsWork?: string; // human hit "Keep as work" (mistaken checkoff) → skip verify+complete; stays buildable (OD10)
+  dismissedAt?: string; // human dismissed a done-overlay; suppress until stale
+  commentPosted?: boolean; // idempotency guard for the Todoist evidence comment
+}
+
+/**
  * A bundle of Todoist tasks the nightly planner decided make sense to implement together,
  * scoped to one environment. This is the unit the autopilot plans, builds (in a worktree
  * session), validates, and opens a PR for. Persisted to `<stateDir>/integrations/workunits.json`.
@@ -33,6 +56,7 @@ export interface WorkUnit {
   sessionId?: string; // the worktree session implementing it, once started
   prUrl?: string; // PR opened after validation passes
   validation?: { passed: boolean; log?: string; at?: string }; // last validation result
+  verification?: WorkUnitVerification; // completion-verifier overlay (spec §4.1) — code-aware "already built?" judgment
   blockedReason?: string; // populated when status === "blocked"
   createdAt: string;
   updatedAt: string;

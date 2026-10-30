@@ -53,6 +53,10 @@ export interface AutoStartCandidate {
   status: AnvilStatus;
   source?: "project" | "label";
   adversarial?: { consensusScore?: number };
+  // The completion-verifier's overlay verdict, annotated onto freshly-planned units by the auto-start
+  // pre-pass (completion-verification spec §4.5). The gate reads this PLAIN field — it never calls the
+  // verifier itself, so it stays sync + SDK-free. A `done` verdict means the work already exists.
+  verification?: { verdict?: "done" | "partial" | "not-done" };
 }
 
 /** Decide whether the nightly run may auto-start a unit. `hold` units stay on the grid for a human; `reason`
@@ -64,6 +68,9 @@ export function autoStartDecision(u: AutoStartCandidate): { start: boolean; reas
   // Only a clean `planned` unit is a build candidate. Anything parked (needs-clarification) or already moving
   // (building/review/…) is not auto-started.
   if (u.status !== "planned") return { start: false, reason: `status is ${u.status}` };
+  // Completion gate: the verifier judged this unit's work already implemented at the base — don't rebuild it.
+  // A human reviews the "Likely complete" overlay and Confirms (completes) or Dismisses (lets it build).
+  if (u.verification?.verdict === "done") return { start: false, reason: "already-implemented — the work looks already built; review the Likely-complete overlay" };
   // Plan-quality gate: a panel that scored the plan below the bar is a strong signal not to ship it blind.
   const score = u.adversarial?.consensusScore;
   if (typeof score === "number" && score < AUTOSTART_MIN_CONSENSUS) {

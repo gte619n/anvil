@@ -886,6 +886,22 @@ export class Supervisor {
   reconcileCompletedUnits(): Promise<number> {
     return this.autopilot.reconcileCompletedUnits();
   }
+  // ── Completion verification (completion-verification spec) ──
+  verifyCompletion(): Promise<import("./autopilot-service").VerifyMetrics> {
+    return this.autopilot.verifyCompletion();
+  }
+  confirmVerification(workUnitId: string): Promise<void> {
+    return this.autopilot.confirmVerification(workUnitId);
+  }
+  dismissVerification(workUnitId: string): void {
+    this.autopilot.dismissVerification(workUnitId);
+  }
+  ackMismatch(workUnitId: string): Promise<void> {
+    return this.autopilot.ackMismatch(workUnitId);
+  }
+  keepAsWork(workUnitId: string): void {
+    this.autopilot.keepAsWork(workUnitId);
+  }
   resetAnvilTags(cid?: string): Promise<AutopilotMaintenanceResultEvent> {
     return this.autopilot.resetAnvilTags(cid);
   }

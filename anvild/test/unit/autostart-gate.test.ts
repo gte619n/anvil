@@ -68,3 +68,17 @@ test("extractPlanMeta ignores questions without an explicit needsClarification:t
   const raw = `Body.\n\n\`\`\`json\n{"size": "s", "questions": ["stray"]}\n\`\`\``;
   expect(extractPlanMeta(raw).clarification).toBeUndefined(); // a stray array must not park a shippable plan
 });
+
+// ── [P5] completion-verification "already-implemented" gate (spec §4.5) ──
+test("[P5] autoStartDecision holds a unit the verifier judged already implemented (verdict done)", () => {
+  const d = autoStartDecision({ status: "planned", source: "project", verification: { verdict: "done" } });
+  expect(d.start).toBe(false);
+  expect(d.reason).toContain("already-implemented");
+});
+
+test("[P5] autoStartDecision still starts a unit the verifier found not-done or only partial", () => {
+  expect(autoStartDecision({ status: "planned", source: "project", verification: { verdict: "not-done" } }).start).toBe(true);
+  expect(autoStartDecision({ status: "planned", source: "project", verification: { verdict: "partial" } }).start).toBe(true);
+  // and with no verification at all (verifier off / not yet run)
+  expect(autoStartDecision({ status: "planned", source: "project" }).start).toBe(true);
+});

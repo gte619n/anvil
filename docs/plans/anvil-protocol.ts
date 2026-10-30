@@ -700,6 +700,23 @@ export interface PipelineTraceInfo {
   assignments: { phase: string; author: string; adversary?: string }[]; // who authored/adversaried each phase
   loopbacks: { phase: string; count: number }[]; // per-phase revisit counts
 }
+/** The completion-verifier's overlay on a work unit, shaped for the card grid + reader
+ *  (completion-verification spec §4.1). This is an OVERLAY on the real `status`, never a new status:
+ *  a `done` verdict surfaces a "Likely complete" badge with Confirm/Dismiss; a `mismatch` (the task
+ *  was checked off in Todoist but the code says not-done) surfaces a warning with Acknowledge /
+ *  Keep-as-work. `confidence` is display-only and never gates anything. */
+export interface AutopilotVerificationInfo {
+  verdict: "done" | "partial" | "not-done";
+  evidence: RenderedMarkdown; // per-task file:line citations, rendered for the reader
+  perTask?: { taskId: string; verdict: "done" | "not-done"; cited: boolean; note?: string }[];
+  confidence?: number; // 0..1 — DISPLAY ONLY
+  mismatch?: boolean; // closed-seen but code not-done → show the Acknowledge / Keep-as-work warning
+  dismissedAt?: Iso8601; // a done-overlay the human dismissed
+  keptAsWork?: string; // the human chose "Keep as work" on a mismatch (unit stays buildable)
+  baseRef: string;
+  baseSha: string;
+  at: Iso8601;
+}
 /** A pending (or just-started) autopilot work unit, shaped for the Autopilot card grid + reader. */
 export interface AutopilotPlanInfo {
   id: string; // WorkUnit id
@@ -726,6 +743,10 @@ export interface AutopilotPlanInfo {
   // The stop-condition seeded onto this unit's build session as a `/goal` (loop-engineering: run-until-done).
   // Display-only on the card; the live iteration count rides the session's `goal`.
   goalCondition?: string;
+  // The completion-verifier's overlay (completion-verification spec §4.1): a code-aware "already built?"
+  // judgment surfaced as a "Likely complete" badge (verdict done) or a mismatch warning. Additive, so an
+  // old client simply ignores it. Only present when the verifier has run and the overlay is live.
+  verification?: AutopilotVerificationInfo;
   createdAt: Iso8601;
   updatedAt: Iso8601;
 }
@@ -802,6 +823,19 @@ export interface AutopilotRunSnapshotEvent extends Envelope {
   running: boolean;
   log: string[]; // progress lines so far, oldest first
 }
+/** End-of-sweep observability for the completion verifier (completion-verification spec §4.7). A cid-less
+ *  broadcast (envelope modeled on autopilot.run.progress) so every open screen sees the run's cost/outcome. */
+export interface AutopilotVerifyMetricsEvent extends Envelope {
+  type: "autopilot.verify.metrics";
+  verified: number; // units the verifier actually judged this sweep
+  done: number; // verdict histogram
+  partial: number;
+  notDone: number;
+  mismatches: number; // closed-seen-but-not-done units held for a human
+  aborts: number; // verifier calls cut short by the run abort
+  errors?: number; // units whose verifier errored/was throttled (fail-open, left unverified to retry)
+  estimatedTokens?: number; // rough token spend (answers assumption A3)
+}
 /** Result of an autopilot maintenance command (`autopilot.tags.reset` / `autopilot.clear`). "reset"
  *  strips anvil:* status labels (keeping the user's Autopilot sourcing label) so tasks re-enter the
  *  candidate pool; "clear" additionally wipes the whole pending pipeline. Carries cid. */
@@ -827,6 +861,9 @@ export interface AutopilotSchedule {
   label?: string; // a Todoist label (default "Autopilot"): tasks carrying it are pulled in from ANY
   // project, bundled against `defaultEnvironmentId`, and left for review (never auto-started).
   defaultEnvironmentId?: string; // catch-all environment label-sourced tasks are planned/built against
+  // ── Completion verification (completion-verification spec §4.6) ──
+  verifyEnabled?: boolean; // default OFF: when on, the nightly run adds a verify pass and the manual
+  // "Verify completion" button + autopilot.verify* commands are accepted (the daemon rejects them when off).
 }
 /** The current schedule — answer to `autopilot.schedule.get`/`.set` (cid) and broadcast on change.
  *  Also broadcast (to every client) whenever a run starts or finishes, so any device — including one
@@ -1389,6 +1426,7 @@ export type ServerEvent =
   | AutopilotPipelineResultEvent
   | AutopilotPipelineMetricsEvent
   | AutopilotRunSnapshotEvent
+  | AutopilotVerifyMetricsEvent
   | AutopilotMaintenanceResultEvent
   | AutopilotScheduleEvent
   | LoopsSnapshotEvent
@@ -1822,6 +1860,28 @@ export interface AutopilotApproveCmd extends Envelope, Correlated {
   workUnitId: string;
   start?: boolean; // also start a build session immediately (else it lands on the grid as `planned`)
 }
+// ── Completion verification (completion-verification spec). Gated by the "autopilot-verify" capability:
+// a client sends these only to a daemon that advertises it, and the daemon additionally rejects them when
+// the `verifyEnabled` flag is off. All five settle → autopilot.plans (the overlay rides AutopilotPlanInfo).
+export interface AutopilotVerifyCmd extends Envelope, Correlated {
+  type: "autopilot.verify"; // sweep hub-local envs, verifying eligible units (progress streams; cancelable)
+}
+export interface AutopilotVerifyConfirmCmd extends Envelope, Correlated {
+  type: "autopilot.verify.confirm"; // confirm a "Likely complete" overlay → complete the unit + evidence comment
+  workUnitId: string;
+}
+export interface AutopilotVerifyDismissCmd extends Envelope, Correlated {
+  type: "autopilot.verify.dismiss"; // dismiss a "Likely complete" overlay → suppress it until the verdict goes stale
+  workUnitId: string;
+}
+export interface AutopilotVerifyAckCmd extends Envelope, Correlated {
+  type: "autopilot.verify.ack"; // Acknowledge a mismatch ("trust my checkbox") → complete the unit immediately
+  workUnitId: string;
+}
+export interface AutopilotVerifyKeepCmd extends Envelope, Correlated {
+  type: "autopilot.verify.keep"; // Keep-as-work a mismatch (mistaken checkoff) → unit stays planned/buildable
+  workUnitId: string;
+}
 export interface AutopilotTagsResetCmd extends Envelope, Correlated {
   type: "autopilot.tags.reset"; // strip anvil:* labels (keep the Autopilot sourcing label) so tasks re-plan → autopilot.maintenance.result
 }
@@ -1903,6 +1963,7 @@ export interface AutopilotScheduleSetCmd extends Envelope, Correlated {
   maxAutoStart?: number;
   label?: string; // "" clears it (disables label sourcing)
   defaultEnvironmentId?: string; // "" clears it
+  verifyEnabled?: boolean; // completion verifier on/off (default off) — gates the nightly verify pass + the manual command
 }
 
 // Daemon self-management. `daemon.update` pulls the daemon's own source repo, rebuilds the web
@@ -2041,6 +2102,11 @@ export type ClientCommand =
   | AutopilotRunCmd
   | AutopilotTriggerCmd
   | AutopilotApproveCmd
+  | AutopilotVerifyCmd
+  | AutopilotVerifyConfirmCmd
+  | AutopilotVerifyDismissCmd
+  | AutopilotVerifyAckCmd
+  | AutopilotVerifyKeepCmd
   | AutopilotTagsResetCmd
   | AutopilotClearCmd
   | AutopilotScheduleGetCmd
