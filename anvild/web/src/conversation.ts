@@ -1286,13 +1286,22 @@ function wireLinkMenu(): void {
   });
 }
 
-// ── Message actions: copy a whole message as raw markdown ──────────────────────────
-// Right-click (desktop) or long-press (Android) any user/assistant bubble to copy its source
-// markdown — the raw text the model produced / the user typed, not the rendered HTML. The source is
-// stashed on the bubble as data-md (see commitAssistant / appendUser). Links, images and file chips
-// keep their own copy/download menu (handled above); this only fires on message prose.
+// ── Message actions: copy a message (or a selection within it) ─────────────────────
+// Right-click (desktop) or long-press (Android) any user/assistant bubble to copy it. Three scopes,
+// along two axes — what to copy (your text selection vs. the whole message) and in what form (plain
+// text vs. markdown):
+//   • Copy Selection            — the highlighted text, plain (what the native menu would give you)
+//   • Copy Selection as Markdown — the highlighted range, reconstructed to markdown from its rendered
+//                                   HTML (turndown) — bold/links/code/lists survive as best it can
+//   • Copy Message as Markdown  — the whole bubble's LITERAL source markdown, stashed on the bubble as
+//                                   data-md (see commitAssistant / appendUser). This is lossless; the
+//                                   selection forms are a best-effort round-trip of rendered HTML.
+// The selection items only appear when there's a non-empty selection sitting inside the bubble. Links,
+// images and file chips keep their own copy/download menu (handled above); this only fires on prose.
 const msgMenu = document.createElement("div");
-let msgMenuMd = "";
+let msgMenuMd = ""; // whole-message source (data-md)
+let msgSelText = ""; // plain text of the in-bubble selection, or "" when there is none
+let msgSelHtml = ""; // rendered HTML of that selection (fed to turndown for the markdown form)
 
 /** The bubble under `el` and its stashed markdown, or null when there's nothing to copy. */
 function msgTargetFor(el: EventTarget | null): { host: HTMLElement; md: string } | null {
@@ -1302,13 +1311,56 @@ function msgTargetFor(el: EventTarget | null): { host: HTMLElement; md: string }
   return bubble && md ? { host: bubble, md } : null;
 }
 
+/** The current selection's { text, html } if it sits wholly inside `host`, else null. We require the
+ *  range to be contained by the bubble (not merely intersecting) so a selection spanning several
+ *  messages falls back to the whole-message action rather than copying stray cross-bubble content. */
+function selectionWithin(host: HTMLElement): { text: string; html: string } | null {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0 || !sel.toString().trim()) return null;
+  const range = sel.getRangeAt(0);
+  if (!host.contains(range.commonAncestorContainer)) return null;
+  const holder = document.createElement("div");
+  holder.appendChild(range.cloneContents());
+  return { text: sel.toString(), html: holder.innerHTML };
+}
+
+/** Serialize an HTML fragment to markdown (turndown, loaded lazily on first use — it's a chunk, like
+ *  mermaid). Returns "" on failure so callers can fall back to plain text. */
+let turndownReady: Promise<(html: string) => string> | null = null;
+async function htmlToMarkdown(html: string): Promise<string> {
+  if (!turndownReady) {
+    turndownReady = import("turndown").then((m) => {
+      const td = new m.default({ headingStyle: "atx", codeBlockStyle: "fenced", bulletListMarker: "-" });
+      return (h: string) => td.turndown(h);
+    });
+  }
+  try {
+    return (await turndownReady)(html);
+  } catch {
+    return "";
+  }
+}
+
 function hideMsgMenu(): void {
   msgMenu.hidden = true;
   msgMenuMd = "";
+  msgSelText = "";
+  msgSelHtml = "";
 }
-function openMsgMenu(md: string, x: number, y: number): void {
+function openMsgMenu(host: HTMLElement, md: string, x: number, y: number): void {
   msgMenuMd = md;
-  msgMenu.innerHTML = `<button type="button" class="lm-item" data-act="copy-md">${icon("content_copy")}<span>Copy as Markdown</span></button>`;
+  const sel = selectionWithin(host);
+  msgSelText = sel?.text ?? "";
+  msgSelHtml = sel?.html ?? "";
+  const item = (act: string, label: string): string =>
+    `<button type="button" class="lm-item" data-act="${act}">${icon("content_copy")}<span>${label}</span></button>`;
+  const items = [];
+  if (msgSelText) {
+    items.push(item("copy-sel", "Copy Selection"));
+    items.push(item("copy-sel-md", "Copy Selection as Markdown"));
+  }
+  items.push(item("copy-md", "Copy Message as Markdown"));
+  msgMenu.innerHTML = items.join("");
   msgMenu.hidden = false;
   const w = msgMenu.offsetWidth;
   const h = msgMenu.offsetHeight;
@@ -1318,6 +1370,7 @@ function openMsgMenu(md: string, x: number, y: number): void {
 
 let msgPressTimer = 0;
 let msgPressMd = "";
+let msgPressHost: HTMLElement | null = null;
 let msgPressX = 0;
 let msgPressY = 0;
 
@@ -1329,21 +1382,30 @@ function wireMessageMenu(): void {
   msgMenu.addEventListener("click", (e) => {
     const item = (e.target as HTMLElement).closest<HTMLElement>(".lm-item");
     if (!item) return;
+    // Snapshot before hideMsgMenu() clears these — the mousedown that dismisses may also collapse the
+    // live selection, so we must not read window.getSelection() after this point.
     const md = msgMenuMd;
+    const selText = msgSelText;
+    const selHtml = msgSelHtml;
     hideMsgMenu();
-    if (item.dataset.act === "copy-md") void copyText(md).then((ok) => toast(ok ? "Copied as Markdown" : "Couldn't copy"));
+    if (item.dataset.act === "copy-md") {
+      void copyText(md).then((ok) => toast(ok ? "Copied as Markdown" : "Couldn't copy"));
+    } else if (item.dataset.act === "copy-sel") {
+      void copyText(selText).then((ok) => toast(ok ? "Selection copied" : "Couldn't copy"));
+    } else if (item.dataset.act === "copy-sel-md") {
+      void htmlToMarkdown(selHtml).then((md2) => copyText(md2 || selText).then((ok) => toast(ok ? "Selection copied as Markdown" : "Couldn't copy")));
+    }
   });
 
   // Right-click (desktop) / long-press (Android fires contextmenu too) opens the menu. A link or image
-  // keeps its own handling; on desktop an active text selection defers to the native "Copy" menu.
+  // keeps its own handling. A text selection no longer defers to the native menu — our menu owns the
+  // copy affordances now, offering the selection-scoped items alongside the whole-message one.
   conversation.addEventListener("contextmenu", (e) => {
     if (actionTargetFor(e.target)) return;
-    const sel = window.getSelection();
-    if (!isAndroidApp && sel && !sel.isCollapsed && sel.toString().trim()) return;
     const t = msgTargetFor(e.target);
     if (!t) return;
     e.preventDefault();
-    openMsgMenu(t.md, (e as MouseEvent).clientX, (e as MouseEvent).clientY);
+    openMsgMenu(t.host, t.md, (e as MouseEvent).clientX, (e as MouseEvent).clientY);
   });
 
   // Android: a press timer opens the menu reliably (mirrors the link menu), since a bare contextmenu
@@ -1356,11 +1418,12 @@ function wireMessageMenu(): void {
       const t = msgTargetFor(e.target);
       if (!t) return;
       msgPressMd = t.md;
+      msgPressHost = t.host;
       msgPressX = touch.clientX;
       msgPressY = touch.clientY;
       clearTimeout(msgPressTimer);
       msgPressTimer = window.setTimeout(() => {
-        if (msgPressMd) openMsgMenu(msgPressMd, msgPressX, msgPressY);
+        if (msgPressMd && msgPressHost) openMsgMenu(msgPressHost, msgPressMd, msgPressX, msgPressY);
       }, 500);
     },
     { passive: true },
