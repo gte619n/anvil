@@ -2408,6 +2408,14 @@ initPanel({
   activeServer,
   sessions,
   killSession,
+  // The CAD viewer's Gerber sibling-scan lists a worktree dir via the cid-correlated fs.list
+  // (same raw-activeId sessionId convention panel.ts already uses for fs.list).
+  listDir: async (dir) => {
+    if (!activeId) return [];
+    const res = await sendAwait(activeServer(), { type: "fs.list", sessionId: activeId, path: dir, cid: newCid() });
+    const entries = (res as { entries?: { name: string }[] }).entries ?? [];
+    return entries.map((e) => e.name);
+  },
 });
 
 /** Remove a session from the local view + caches — the client-side half of a deletion. Shared by the

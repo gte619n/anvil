@@ -33,6 +33,9 @@ import { $, esc, icon, linkifyUrls } from "./dom";
 import { closeModal, confirmDialog, showModal, toast } from "./dialogs";
 import { currentTheme } from "./theme";
 import { dismissOverlay, openOverlay, overlayOpen } from "./overlays";
+import { classifyCad } from "./cad-types";
+import { openCadViewer } from "./cad";
+import { makeCadIo } from "./cad-io";
 import { isAndroidApp } from "./platform";
 import { isNarrow } from "./layout";
 import { conversation, copyText, humanSize, references, relTime, runMermaid } from "./conversation";
@@ -57,6 +60,9 @@ export interface PanelDeps {
   /** Kill a session (main's `killSession` — session lifecycle: it reassigns main's `activeId`,
    *  drops caches/drafts, and watches the kill's cid reply for the disowned-ghost eviction). */
   killSession(id: string): void;
+  /** List bare entry names in a worktree directory (main's cid-correlated fs.list via sendAwait).
+   *  The CAD viewer's Gerber sibling-scan needs it; main owns the WS request/response plumbing. */
+  listDir(dir: string): Promise<string[]>;
 }
 // Module-local mirrors of the injected deps, named as in main.ts so the moved code below stays
 // verbatim (main's reassigned `activeId` scalar becomes the call `activeId()`). Assigned once by
@@ -66,8 +72,9 @@ let activeId: PanelDeps["activeId"];
 let activeServer: PanelDeps["activeServer"];
 let sessions: PanelDeps["sessions"];
 let killSession: PanelDeps["killSession"];
+let listDir: PanelDeps["listDir"];
 export function initPanel(deps: PanelDeps): void {
-  ({ activeId, activeServer, sessions, killSession } = deps);
+  ({ activeId, activeServer, sessions, killSession, listDir } = deps);
 
   // ── Moved top-level DOM wiring (runs at main's original side-panel wiring point) ──
   // file links in the conversation (Read/Edit/… tool calls) open the reader
@@ -572,6 +579,12 @@ async function uploadToBrowser(files: File[], dir: string): Promise<void> {
 }
 function openFile(path: string): void {
   if (!activeId()) return;
+  // CAD files (3D models / PCBs) open in the full-screen CAD viewer, not the text/image reader.
+  // Intercept BEFORE the fs.read below so a large STEP never round-trips as text (DL-5, spec §3.3).
+  if (classifyCad(path)) {
+    openCadViewer(path, makeCadIo({ server: activeServer, sessionId: () => activeId()!, listDir }));
+    return;
+  }
   disposeTerminal();
   panel.classList.add("open"); // a file link may open the reader while the panel is closed
   if (panelPinned) localStorage.setItem(PIN_KEY, "reader"); // the pinned tab follows (reader is pinnable too)

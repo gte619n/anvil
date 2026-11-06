@@ -20,6 +20,10 @@ const DELIVERABLE_EXTS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "svg", "mp4", "mov", "webm", "mp3", "wav", "m4a",
   // data exports / binaries
   "ico", "icns", "apk", "ipa", "wasm", "parquet",
+  // CAD — mechanical (mesh + B-rep) and electronic (PCB); the web client offers a "View CAD" button
+  // on these cards (docs/plans/2026-11-06-cad-viewer.md, Phase 7).
+  "stl", "obj", "3mf", "ply", "gltf", "glb", "dae", "step", "stp", "iges", "igs", "fcstd",
+  "kicad_pcb", "kicad_sch", "gbr", "gerber", "drl",
 ]);
 
 const MIME: Record<string, string> = {

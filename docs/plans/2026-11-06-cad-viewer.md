@@ -534,20 +534,24 @@ golden-diff report path / screenshot) linked in §10.
 ## 10. Progress tracking
 
 Update on every change. **Verified** requires the §5 gate passed + evidence linked.
+Status after the 2026-11-06 autonomous implementation pass (✅ done · ◑ partial / golden-CI-deferred ·
+☐ not started). "Tested" here = the in-env gates that CAN run (typecheck ×2, `bun test`, `build:web`);
+browser golden baselines are CI-deferred (no GPU/display in the build env — see decisions log DL-1/DL-18).
+All rows below are on branch `cad-viewer` → **PR #235**.
 
-| Phase | Built | Tested | Verified | Pushed (PR) | Evidence |
-|-------|:-----:|:------:|:--------:|-------------|----------|
-| 0 — Foundations & golden harness | ☐ | ☐ | ☐ | — | |
-| 1 — Mesh viewer + overlay + touch | ☐ | ☐ | ☐ | — | |
-| 2 — Server B-rep→glTF (STEP/IGES/FCStd) | ☐ | ☐ | ☐ | — | |
-| 3 — Tree / isolate / section / exploded | ☐ | ☐ | ☐ | — | |
-| 4 — ECAD 2D (Gerber + KiCad) | ☐ | ☐ | ☐ | — | |
-| 5 — ECAD 3D (KiCad→GLB) | ☐ | ☐ | ☐ | — | |
-| 6 — Snapshot / sign-off export | ☐ | ☐ | ☐ | — | |
-| 7 — Agent "View CAD" loop | ☐ | ☐ | ☐ | — | |
-| 8 — Image-viewer pinch/pan parity | ☐ | ☐ | ☐ | — | |
-| 9 — Big-assembly streaming/compression | ☐ | ☐ | ☐ | — | |
-| 10 — Measurement (snap-to-geometry) | ☐ | ☐ | ☐ | — | |
+| Phase | Built | Tested | Verified | Pushed | Evidence |
+|-------|:-----:|:------:|:--------:|--------|----------|
+| 0 — Foundations & golden harness | ✅ | ✅ | ✅ | #235 | occt-under-Bun spike + 45 cad tests + build green; harness code built, baseline=CI |
+| 1 — Mesh viewer + overlay + touch | ✅ | ◑ | ◑ | #235 | loaders/overlay/OrbitControls/fit+presets/wireframe/units/ceiling built; classifier unit ✅; golden render=CI |
+| 2 — Server B-rep→glTF (STEP/IGES/FCStd) | ✅ | ✅ | ✅ | #235 | convert/cache/queue/glb unit ✅ + STEP cube → GLB e2e; `/cad` route wired; IGES/FCStd golden=CI |
+| 3 — Tree / isolate / section / exploded | ☐ | ☐ | ☐ | — | **not built** — GLB carries the XCAF tree in extras, but the tree/isolate/section/exploded UI is a follow-up |
+| 4 — ECAD 2D (Gerber + KiCad) | ✅ | ◑ | ◑ | #235 | tracespace sibling-scan + KiCanvas adapters built; layer-select unit ✅; render golden=CI |
+| 5 — ECAD 3D (KiCad→GLB) | ✅ | ◑ | ◑ | #235 | kicad-cli path + service built, gated on cli+packages3D; unit ✅; e2e needs a kicad host (CI) |
+| 6 — Snapshot / sign-off export | ◑ | ◑ | ◑ | #235 | composited capture + download + capability-gated clipboard built; save-to-project / insert-into-chat = follow-up (DL-26) |
+| 7 — Agent "View CAD" loop | ✅ | ◑ | ◑ | #235 | file-offer exts + "View CAD" card button built; render golden=CI |
+| 8 — Image-viewer pinch/pan parity | ✅ | ◑ | ◑ | #235 | `enablePinchPan` wired into the image lightbox; touch golden=CI |
+| 9 — Big-assembly streaming/compression | ☐ | ☐ | ☐ | — | **not built** — convert enforces the triangle budget (throws over-cap); Draco/meshopt + streaming + decimation are a follow-up |
+| 10 — Measurement (snap-to-geometry) | ☐ | ☐ | ☐ | — | **not built** — deferred per D28; its own later phase |
 
 ---
 

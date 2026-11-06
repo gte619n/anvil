@@ -13,33 +13,51 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
-    "build:web": "bun run web/build.ts"
+    "build:web": "bun run web/build.ts",
+    "cad:fixtures": "bun run test/fixtures/cad/gen.ts",
+    "cad:fixtures:test": "bun test test/golden/fixtures.test.ts",
+    "cad:golden:install": "bunx --bun playwright install chromium",
+    "cad:golden": "bunx --bun playwright test -c test/golden/playwright.config.ts",
+    "cad:golden:update": "bunx --bun playwright test -c test/golden/playwright.config.ts --update-snapshots"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.0",
     "@types/bun": "latest",
     "@types/jsdom": "^28.0.3",
     "@types/katex": "^0.16.8",
     "@types/markdown-it": "^14.1.2",
+    "@types/pngjs": "^6.0.5",
     "@types/sortablejs": "^1.15.9",
+    "@types/three": "^0.187.0",
     "@types/turndown": "^5.0.6",
+    "pixelmatch": "^8.0.0",
+    "pngjs": "^7.0.0",
     "typescript": "^7"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.183",
+    "@gltf-transform/core": "^4.5.1",
+    "@gltf-transform/functions": "^4.5.1",
     "@types/web-push": "^3.6.4",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "dompurify": "^3.4.11",
+    "fflate": "^0.8.3",
+    "gerber-to-svg": "^4.2.8",
     "jsdom": "^30.0.1",
     "katex": "^0.18.1",
     "markdown-it": "^14.2.0",
     "markdown-it-texmath": "^1.0.0",
     "material-symbols": "^0.45.2",
     "mermaid": "^11.15.0",
+    "occt-import-js": "^0.0.23",
+    "pcb-stackup": "^4.2.8",
     "shiki": "^4.2.0",
     "sortablejs": "^1.15.7",
+    "three": "^0.187.0",
     "tom-select": "^2.6.1",
     "turndown": "^7.2.4",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "whats-that-gerber": "^4.2.7"
   }
 }

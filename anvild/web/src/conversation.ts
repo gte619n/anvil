@@ -26,6 +26,9 @@
 // module and main.ts write them. In-place containers (`references`) stay exported `const`s here.
 import MarkdownIt from "markdown-it";
 import { $, esc, icon, sessIcon } from "./dom";
+import { classifyCad } from "./cad-types";
+import { openCadViewer } from "./cad";
+import { makeCadIo } from "./cad-io";
 import { currentTheme } from "./theme";
 import { ui } from "./state";
 // dialogs.ts is a leaf, so toast + the permission/question card-map reset are direct imports —
@@ -672,6 +675,10 @@ export function openImageLightbox(url: string, name = "image.png"): void {
     closeModal();
   });
   showModal(wrap);
+  // Pinch-zoom + pan on the image (spec D8 / Phase 8), sharing the CAD overlay's gesture code. The
+  // element is removed on close, so the returned cleanup can be dropped.
+  const img = wrap.querySelector(".shot-full");
+  if (img) void import("./cad-gestures").then((m) => m.enablePinchPan(img as HTMLElement));
 }
 
 // ── Links panel (§links) — the reference MODEL; the panel chrome (renderLinks) lives in panel.ts ──
@@ -780,13 +787,24 @@ export function appendFileOffer(file: FileOffer): void {
   b.className = "bubble assistant file-offer";
   const href = serverApiUrl(activeServer().url, file.downloadUrl);
   const taildrop = file.taildropped ? `<span class="fo-taildrop">${icon("send_to_mobile")} Sent to your device</span>` : "";
+  // A CAD deliverable (3D model / PCB) gets a "View CAD" button that opens the full-screen viewer
+  // (spec Phase 7 — notify, open on click; no auto-open). Path comes from the offer's downloadUrl.
+  const cadKind = classifyCad(file.name);
+  const viewCad = cadKind ? `<button type="button" class="fo-dl fo-viewcad" title="View CAD">${icon("view_in_ar")}</button>` : "";
   b.innerHTML =
     `<div class="fo-card">` +
     `<span class="fo-icon">${icon(fileOfferIcon(file.mime))}</span>` +
     `<span class="fo-meta"><span class="fo-name" title="${esc(file.name)}">${esc(file.name)}</span>` +
     `<span class="fo-sub">${esc(humanSize(file.size))}${taildrop}</span></span>` +
+    viewCad +
     `<a class="fo-dl" href="${esc(href)}" download="${esc(file.name)}" title="Download">${icon("download")}</a>` +
     `</div>`;
+  if (cadKind) {
+    const rel = new URL(file.downloadUrl, "http://x").searchParams.get("path");
+    b.querySelector(".fo-viewcad")?.addEventListener("click", () => {
+      if (rel && activeId()) openCadViewer(rel, makeCadIo({ server: activeServer, sessionId: () => activeId()! }));
+    });
+  }
   scrollDown();
   saveConvoCache();
 }

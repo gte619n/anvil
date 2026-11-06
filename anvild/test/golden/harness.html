@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Anvil CAD golden harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #1a1c20;
+      }
+      /* The stage is exactly the render size; the canvas fills it 1:1 (deviceScaleFactor is pinned
+         to 1 in playwright.config.ts) so the screenshot is a stable pixel grid. */
+      #stage {
+        width: 512px;
+        height: 512px;
+      }
+      #stage canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage" data-role="stage"></div>
+    <!-- Served + bundled by server.ts (GET /harness-entry.js → bun build of harness-entry.ts). -->
+    <script type="module" src="/harness-entry.js"></script>
+  </body>
+</html>
