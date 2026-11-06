@@ -108,10 +108,9 @@ async function renderGerberStackup(
   host: HTMLElement,
   io: CadIo,
 ): Promise<void> {
-  // tracespace v4 ships CommonJS (`export =`). Under a bundler the ESM default is the callable, but
-  // some interop paths expose it as the namespace object itself — try `.default` then fall back.
-  const mod = await import("pcb-stackup");
-  const pcbStackup = ((mod as { default?: unknown }).default ?? mod) as typeof import("pcb-stackup");
+  // Vendored tracespace bundle (owner verdict V3) — the abandoned upstream can't disappear from the
+  // shipped web path. Dynamic-imported so it stays a lazy chunk.
+  const { pcbStackup } = await import("./vendor/tracespace");
 
   const sources = await Promise.all(
     layerNames.map(async (filename) => ({
@@ -162,9 +161,8 @@ async function renderSingleGerberLayer(
   host: HTMLElement,
   io: CadIo,
 ): Promise<void> {
-  // Same CJS/ESM interop dance as pcb-stackup above.
-  const mod = await import("gerber-to-svg");
-  const gerberToSvg = ((mod as { default?: unknown }).default ?? mod) as typeof import("gerber-to-svg");
+  // Vendored tracespace bundle (owner verdict V3), same as the stackup path above.
+  const { gerberToSvg } = await import("./vendor/tracespace");
 
   const gerber = await io.fetchText(dir + filename);
   let svg: string;

@@ -57,6 +57,11 @@ export interface CadIo {
   fetchText(path: string): Promise<string>;
   /** List sibling entries in the directory containing `path` (names only, same dir). */
   listSiblings(path: string): Promise<string[]>;
+  /** Save-to-project snapshot target (D16): PUT a PNG into the worktree; returns the written path.
+   *  Optional — contexts without a session (none today) omit it and the viewer hides the action. */
+  saveSnapshot?(name: string, png: Blob): Promise<string>;
+  /** Insert-into-chat snapshot target (D16): drop a PNG into the conversation as an attachment. */
+  insertSnapshot?(name: string, png: Blob): Promise<void>;
 }
 
 /** Device render budget (max triangles / max GLB bytes) the client advertises to the daemon. */

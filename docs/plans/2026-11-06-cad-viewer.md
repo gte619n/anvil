@@ -544,14 +544,14 @@ All rows below are on branch `cad-viewer` → **PR #235**.
 | 0 — Foundations & golden harness | ✅ | ✅ | ✅ | #235 | occt-under-Bun spike + 45 cad tests + build green; harness code built, baseline=CI |
 | 1 — Mesh viewer + overlay + touch | ✅ | ◑ | ◑ | #235 | loaders/overlay/OrbitControls/fit+presets/wireframe/units/ceiling built; classifier unit ✅; golden render=CI |
 | 2 — Server B-rep→glTF (STEP/IGES/FCStd) | ✅ | ✅ | ✅ | #235 | convert/cache/queue/glb unit ✅ + STEP cube → GLB e2e; `/cad` route wired; IGES/FCStd golden=CI |
-| 3 — Tree / isolate / section / exploded | ☐ | ☐ | ☐ | — | **not built** — GLB carries the XCAF tree in extras, but the tree/isolate/section/exploded UI is a follow-up |
-| 4 — ECAD 2D (Gerber + KiCad) | ✅ | ◑ | ◑ | #235 | tracespace sibling-scan + KiCanvas adapters built; layer-select unit ✅; render golden=CI |
+| 3 — Tree / isolate / section / exploded | ✅ | ◑ | ◑ | #235 | `cad-inspect.ts`: XCAF-tree drawer + isolate/visibility/transparency + clipping plane + exploded; render golden=CI |
+| 4 — ECAD 2D (Gerber + KiCad) | ✅ | ◑ | ◑ | #235 | tracespace sibling-scan (vendored) + KiCanvas adapters built; layer-select unit ✅; render golden=CI |
 | 5 — ECAD 3D (KiCad→GLB) | ✅ | ◑ | ◑ | #235 | kicad-cli path + service built, gated on cli+packages3D; unit ✅; e2e needs a kicad host (CI) |
-| 6 — Snapshot / sign-off export | ◑ | ◑ | ◑ | #235 | composited capture + download + capability-gated clipboard built; save-to-project / insert-into-chat = follow-up (DL-26) |
+| 6 — Snapshot / sign-off export | ✅ | ◑ | ◑ | #235 | composited capture + all four targets (download / clipboard / save-to-project / insert-into-chat) built (DL-34) |
 | 7 — Agent "View CAD" loop | ✅ | ◑ | ◑ | #235 | file-offer exts + "View CAD" card button built; render golden=CI |
 | 8 — Image-viewer pinch/pan parity | ✅ | ◑ | ◑ | #235 | `enablePinchPan` wired into the image lightbox; touch golden=CI |
-| 9 — Big-assembly streaming/compression | ☐ | ☐ | ☐ | — | **not built** — convert enforces the triangle budget (throws over-cap); Draco/meshopt + streaming + decimation are a follow-up |
-| 10 — Measurement (snap-to-geometry) | ☐ | ☐ | ☐ | — | **not built** — deferred per D28; its own later phase |
+| 9 — Big-assembly streaming/compression | ✅ | ◑ | ◑ | #235 | decimation (meshopt simplify) + meshopt compression + download-progress built; decimation golden-tested on a dense mesh (DL-33) |
+| 10 — Measurement (snap-to-geometry) | ✅ | ◑ | ◑ | #235 | `cad-measure.ts` snap vertex/edge/face + distance/angle/bbox, "~ (mesh)"; 9 pure-math unit tests ✅; render golden=CI |
 
 ---
 

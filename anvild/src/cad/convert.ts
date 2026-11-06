@@ -4,13 +4,28 @@
 // CadConvertError with a readable reason. See docs/plans/2026-11-06-cad-viewer.md.
 
 import { unzipSync } from "fflate";
-import { meshesToGlb } from "./glb";
+import {
+  buildCadDocument,
+  compressDocument,
+  countTriangles,
+  simplifyDocument,
+  writeGlbBinary,
+} from "./glb";
 import { runOcct } from "./occt-run";
 import type { CadMesh, CadNode, ConvertMeta, ConvertOpts, ConvertResult } from "./types";
 import { CadConvertError } from "./types";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_LOD_MAX_TRIANGLES = 8_000_000;
+const DEFAULT_COMPRESS_THRESHOLD = 50_000;
+// Floor on the decimation ratio: collapsing below ~5% of the original triangle count destroys so
+// much fidelity (merged edges, vanished thin features) that the result is rarely useful. We still
+// honor it so a pathologically tiny budget degrades gracefully instead of throwing — but we refuse
+// (below) if even flooring the ratio can't get under the budget by a safe margin.
+const MIN_SIMPLIFY_RATIO = 0.05;
+// Simplification is approximate; accept a result up to this fraction over the budget rather than
+// refusing a model that landed just above the target triangle count.
+const BUDGET_TOLERANCE = 1.1;
 
 /** Convert B-rep bytes (step/stp/iges/igs/fcstd) to a GLB + metadata. */
 export async function convertCad(
@@ -20,6 +35,7 @@ export async function convertCad(
 ): Promise<ConvertResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const lodMax = opts.lodMaxTriangles ?? DEFAULT_LOD_MAX_TRIANGLES;
+  const compressThreshold = opts.compressThreshold ?? DEFAULT_COMPRESS_THRESHOLD;
   const sourceExt = ext.toLowerCase().replace(/^\./, "");
 
   try {
@@ -45,16 +61,39 @@ export async function convertCad(
       throw new CadConvertError("no geometry produced");
     }
 
-    const triangles = meshes.reduce((n, m) => n + m.indices.length / 3, 0);
-    // Phase-9 follow-up: when we exceed the budget we should decimate server-side (quadric
-    // simplification) and retry; for now we reject so the client can request a coarser LOD.
-    if (triangles > lodMax) {
-      throw new CadConvertError("exceeds device budget");
+    const rawTriangles = meshes.reduce((n, m) => n + m.indices.length / 3, 0);
+    const bbox = computeBbox(meshes);
+
+    // Phase 9 (D22): when the model exceeds the device triangle budget we DECIMATE it to fit rather
+    // than refusing. Build the Document, run meshopt quadric simplification down to the budget, and
+    // only throw if even a floored ratio can't land under the budget by a safe margin.
+    const metaNoGlb: ConvertMeta = { sourceExt, units, triangles: rawTriangles, bbox, tree };
+    const doc = buildCadDocument(meshes, tree, metaNoGlb);
+
+    let triangles = rawTriangles;
+    if (rawTriangles > lodMax) {
+      const ratio = Math.max(MIN_SIMPLIFY_RATIO, lodMax / rawTriangles);
+      await simplifyDocument(doc, ratio);
+      triangles = countTriangles(doc);
+      if (triangles > lodMax * BUDGET_TOLERANCE) {
+        // Even the floored ratio couldn't get us under budget (geometry too fragmented to collapse
+        // further). Refuse so the client can request a coarser LOD instead of shipping an
+        // over-budget model.
+        throw new CadConvertError("exceeds device budget");
+      }
+      // Reflect the decimated count in the metadata the viewer reads.
+      metaNoGlb.triangles = triangles;
+      doc.getRoot().getAsset().extras = {
+        ...(doc.getRoot().getAsset().extras ?? {}),
+        triangles,
+      };
     }
 
-    const bbox = computeBbox(meshes);
-    const metaNoGlb: ConvertMeta = { sourceExt, units, triangles, bbox, tree };
-    const glb = await meshesToGlb(meshes, tree, metaNoGlb);
+    // Phase 9: meshopt-compress large models; small ones skip it (the KHR extension + CPU aren't
+    // worth it). The web GLTFLoader decodes meshopt via MeshoptDecoder (no external decoder files).
+    const compress = triangles >= compressThreshold;
+    if (compress) await compressDocument(doc);
+    const glb = await writeGlbBinary(doc, compress);
 
     return { glb, meta: metaNoGlb };
   } catch (err) {

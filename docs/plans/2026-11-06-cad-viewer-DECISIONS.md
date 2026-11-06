@@ -125,6 +125,87 @@ verification.
 Net: **7 of 11 phases implemented and verified green**; the 4 remaining are the deeper-inspection
 features + full snapshot fan-out, all logged above with their exact state.
 
+## Owner review verdicts (2026-11-06 interview on this log)
+
+The owner reviewed the decisions and gave these verdicts — they supersede the ⚠️ flags above:
+
+- **V1 → DL-26 (Snapshot).** **Complete the fan-out now** — implement save-to-project (PUT to the
+  files route) and insert-into-chat (attachment path) so all four D16 targets work.
+- **V2 → Phases 3/9/10 (Sequencing).** **Build all remaining now** — proceed through Phase 3
+  (inspection UI: tree/isolate/section/exploded), Phase 10 (measurement + snap-to-geometry), and
+  Phase 9 (Draco/meshopt + streaming + server-side decimation) in this branch, then review the
+  complete feature.
+- **V3 → DL-9 (ECAD vendoring).** **Source-vendor tracespace now** — copy tracespace v4 source into
+  the repo (like KiCanvas) so the abandoned upstream can't disappear; keep the adapter.
+- **V4 → DL-13/15/18 (Fixtures/CI).** **STEP-only verification for now** — IGES/FCStd stay unit-tested
+  (not golden) and browser golden baselines remain a CI concern; revisit when a real file needs it.
+- **V5 → resource constants.** **Make them env-configurable** (cache MB, concurrency, device budgets,
+  timeout) with the current values as defaults, so hosts tune without a rebuild.
+- **V6 → DL-16 (`.txt` Gerber).** **Accept the exclusion** — `.txt` stays plain text; no auto-Gerber.
+- **V7 → DL-8 (memory cap).** **Accept** — input byte-cap + conversion timeout are sufficient given
+  the Tailscale trust boundary; no hard rlimit / memory watchdog in v1.
+
+→ Executing V1, V2, V3, V5 now (V4/V6/V7 require no code change beyond what's already shipped).
+
+## Second pass — executing the review verdicts (V1/V2/V3/V5)
+
+- **DL-31 (V2 → Phase 3).** **Inspection UI built** (`cad-inspect.ts` + `cad.ts`): model tree from the
+  GLB `asset.extras.tree` (XCAF names) with scene-graph fallback; show/hide/isolate + per-part
+  transparency; section/clipping plane (X/Y/Z axis + position slider via `localClippingEnabled`);
+  exploded view (radial slider). Disposed on close.
+- **DL-32 (V2 → Phase 10).** **Measurement built** (`cad-measure.ts` pure core + `cad.ts` raycasting):
+  snap-to-vertex → edge-midpoint → face; point-to-point distance + coords/bbox readout + 3-pt angle;
+  labeled "~ (mesh)" (NG5). 9 pure-math unit tests (cube-edge = 1.0 within epsilon, snap radius, etc.).
+- **DL-33 (V2 → Phase 9).** **Decimation + compression built** (daemon). Over-budget models are now
+  **decimated** via gltf-transform `simplify` (meshoptimizer) instead of refused (floor ratio 0.05;
+  only refuses if even floored decimation can't reach budget×1.1). Output **meshopt-compressed**
+  (`quantize()` + `meshopt()`, KHR_mesh_quantization + EXT_meshopt_compression — no external decoder
+  files); web `GLTFLoader.setMeshoptDecoder(...)` decodes. Gated at a 50k-triangle threshold. Web side
+  streams the GLB download with a progress indicator.
+  - ⚠️ The STEP cube fixture is a 12-triangle watertight solid that quadric-simplify can't reduce, so
+    the "tiny budget" test still asserts refusal; actual decimation + size-reduction are tested against
+    a dense generated grid mesh (≈79k tris → ≈179 KB, decodes back via MeshoptDecoder).
+- **DL-34 (V1 → Phase 6).** **Snapshot fan-out completed.** `cad.ts` offers download + capability-gated
+  clipboard + save-to-project + insert-into-chat. Sinks implemented in `cad-io.ts`: **save-to-project**
+  = PUT to the files route under `snapshots/<name>-<n>.png` (unique suffix dodges the no-overwrite 409);
+  **insert-into-chat** = new `composer.attachImageBlob()` → adds the PNG as a pending composer
+  attachment (rides the next message). Absent capabilities/sinks are hidden, never broken.
+- **DL-35 (V3 → ECAD vendoring).** **tracespace rendering engine vendored.** Bundled `pcb-stackup` +
+  `gerber-to-svg` into a committed self-contained `web/src/vendor/tracespace.js` (0.33 MB) with a
+  `.d.ts` preserving types; `cad-ecad.ts` dynamic-imports the vendored bundle. The shipped web path no
+  longer imports npm tracespace. ⚠️ `whats-that-gerber` (tiny, isomorphic, used by the Node fixtures
+  test) stays an npm dep; `pcb-stackup`/`gerber-to-svg` remain listed for types + bundle-rebuild. Full
+  npm removal (hand-authored types) is a possible future hardening — not needed for the resilience goal.
+- **DL-36 (V5 → limits).** **Daemon limits env-configurable** (`ANVIL_CAD_CONCURRENCY` / `_CACHE_MB` /
+  `_TIMEOUT_MS`, defaults 2 / 512 / 60000; defensive parse). Web device budgets (PHONE/DESKTOP_LOD)
+  stay code constants — a browser has no env; they can be made config-served later if needed.
+- **DL-37 (🔬).** **CAD stylesheet added** to `web/styles/app.css` for the viewer chrome / tree drawer /
+  sliders / snap menu / measurement readout / toast (the builder agents couldn't edit the shared CSS).
+- **DL-38 (🔬 PASS — second pass).** typecheck ✅ · typecheck:web ✅ · build:web ✅ (entry 403 KB, +5 KB
+  glue; three + tracespace confirmed still lazy) · CAD tests **62/62** · full `bun test` **1319 pass /
+  0 fail** (1321 tests, 197 files) — no regressions from the Phase 3/9/10 + snapshot + vendoring work.
+
+- **DL-39 (🔬 bug fixed).** **Test hygiene:** `fixtures.test.ts` regenerated fixtures *into the tracked
+  tree* on every `bun test` run, and the 3MF zip is non-deterministic → the committed `cube.3mf` flipped
+  every run. Fixed: the test now drives `gen.ts` into a throwaway tmp dir (parse-tests read there),
+  while existence checks verify the committed corpus. Tests no longer mutate tracked files.
+
+## Status after the second pass — all 11 phases built
+
+**Built + in-env-verified: Phases 0–10 (all).** The first pass delivered 0,1,2,4,5,7,8; the second pass
+added **3** (tree/isolate/section/exploded), **9** (decimation + meshopt compression + streaming),
+**10** (measurement with snap-to-geometry), and completed **6** (four-target snapshot fan-out). All
+four CI gates are green.
+
+**Remaining caveats (unchanged from the owner verdicts — not blockers):**
+- **Golden-image baselines** (V4): still CI-deferred — no GPU/display here. Harness + config are in the
+  repo; run `cad:golden:update` in CI to capture baselines.
+- **IGES/FCStd committed fixtures** (V4): still unit-tested only; STEP is the golden-verified B-rep path.
+- **Phase 9 decimation** is golden-tested against a generated dense mesh, not the 12-triangle cube
+  (which can't be simplified) — see DL-33.
+- **tracespace** `whats-that-gerber` stays npm (DL-35); full npm removal is optional future hardening.
+- **External gate:** counsel sign-off on the LGPL/OCCT acknowledgement (spec Phase 0).
+
 ## Decisions (chronological)
 
 - **DL-5 (⚠️ review — good news).** **No protocol change / no `PROTOCOL_VERSION` bump.** CAD works

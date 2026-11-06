@@ -365,6 +365,12 @@ async function uploadAttachment(file: File): Promise<void> {
     updateSendState();
   }
 }
+
+/** Attach an in-memory image (e.g. a CAD snapshot) to the composer as a pending attachment, so it
+ *  rides the next message — the "insert into chat" snapshot target (CAD viewer D16 / Phase 6). */
+export async function attachImageBlob(name: string, blob: Blob): Promise<void> {
+  await uploadAttachment(new File([blob], name, { type: blob.type || "image/png" }));
+}
 const composerEl = $("#composer");
 
 // ── Select-to-quote (highlight any message text → quote into the composer) ─────────

@@ -36,6 +36,12 @@ export interface ConvertResult {
 export interface ConvertOpts {
   lodMaxTriangles?: number;
   timeoutMs?: number;
+  /**
+   * Meshopt-compress the GLB only when the (post-decimation) triangle count is at or above this
+   * threshold. Compression + quantization add CPU + a KHR extension the client must decode, which
+   * isn't worth it for small models. Default ~50k triangles; set to 0 to always compress.
+   */
+  compressThreshold?: number;
 }
 
 /** Every failure in the pipeline surfaces as this, with a human-readable `reason`. */

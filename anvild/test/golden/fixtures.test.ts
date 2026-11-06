@@ -3,8 +3,9 @@
  * non-empty, and actually parse with the libraries the viewer uses. Run:
  *   cd anvild && bun test test/golden/fixtures.test.ts
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { existsSync, statSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebIO } from "@gltf-transform/core";
@@ -13,6 +14,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = join(HERE, "..", "fixtures", "cad");
 const MESH = join(FIX, "mesh");
 const ECAD = join(FIX, "ecad2d");
+
+// gen.ts output is verified in a THROWAWAY tmp dir — the test must never mutate the tracked,
+// committed fixtures (the 3MF zip in particular is non-deterministic across runs).
+let GEN: string;
 
 const MESH_FILES = [
   "cube.stl",
@@ -27,24 +32,29 @@ const MESH_FILES = [
 const ECAD_FILES = ["board.gtl", "board.gbl", "board.gto", "board.drl"];
 
 beforeAll(async () => {
-  // (Re)generate so the test is self-contained even on a fresh checkout.
+  // Drive gen.ts into a throwaway tmp dir — verifies the generator produces parseable output WITHOUT
+  // touching the committed fixtures. The module writes nothing on import (guarded by import.meta.main).
+  GEN = mkdtempSync(join(tmpdir(), "anvil-cadfix-"));
   const gen = await import("../fixtures/cad/gen");
-  // The module writes nothing on import (guarded by import.meta.main); drive it directly.
   const { glb, asciiStl, binaryStl, objMtl, asciiPly, threeMf, collada, gerbers, drill } = gen;
   const { obj, mtl } = objMtl();
   const outputs: Array<[string, string | Uint8Array]> = [
-    [join(MESH, "cube.stl"), asciiStl()],
-    [join(MESH, "cube-bin.stl"), binaryStl()],
-    [join(MESH, "cube.obj"), obj],
-    [join(MESH, "cube.mtl"), mtl],
-    [join(MESH, "cube.ply"), asciiPly()],
-    [join(MESH, "cube.glb"), await glb()],
-    [join(MESH, "cube.3mf"), threeMf()],
-    [join(MESH, "cube.dae"), collada()],
+    [join(GEN, "cube.stl"), asciiStl()],
+    [join(GEN, "cube-bin.stl"), binaryStl()],
+    [join(GEN, "cube.obj"), obj],
+    [join(GEN, "cube.mtl"), mtl],
+    [join(GEN, "cube.ply"), asciiPly()],
+    [join(GEN, "cube.glb"), await glb()],
+    [join(GEN, "cube.3mf"), threeMf()],
+    [join(GEN, "cube.dae"), collada()],
   ];
-  for (const [name, text] of Object.entries(gerbers())) outputs.push([join(ECAD, name), text]);
-  outputs.push([join(ECAD, "board.drl"), drill()]);
+  for (const [name, text] of Object.entries(gerbers())) outputs.push([join(GEN, name), text]);
+  outputs.push([join(GEN, "board.drl"), drill()]);
   for (const [path, data] of outputs) await Bun.write(path, data);
+});
+
+afterAll(() => {
+  if (GEN) rmSync(GEN, { recursive: true, force: true });
 });
 
 describe("mesh fixtures", () => {
@@ -57,7 +67,7 @@ describe("mesh fixtures", () => {
   }
 
   test("cube.glb re-reads to a mesh with triangles and units extra", async () => {
-    const bytes = new Uint8Array(await Bun.file(join(MESH, "cube.glb")).arrayBuffer());
+    const bytes = new Uint8Array(await Bun.file(join(GEN, "cube.glb")).arrayBuffer());
     const doc = await new WebIO().readBinary(bytes);
     const meshes = doc.getRoot().listMeshes();
     expect(meshes.length).toBe(1);
@@ -70,7 +80,7 @@ describe("mesh fixtures", () => {
   });
 
   test("cube-bin.stl header declares 12 triangles", async () => {
-    const bytes = new Uint8Array(await Bun.file(join(MESH, "cube-bin.stl")).arrayBuffer());
+    const bytes = new Uint8Array(await Bun.file(join(GEN, "cube-bin.stl")).arrayBuffer());
     expect(bytes.byteLength).toBe(84 + 12 * 50);
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const count = dv.getUint32(80, true); // little-endian uint32 after the 80-byte header
