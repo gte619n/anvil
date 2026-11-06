@@ -11,3 +11,8 @@ web/dist.old/
 
 # headless-smoke Chrome profile
 test/tools/.chrome-smoke/
+
+# CAD golden-image artifacts (platform-specific; regenerated in CI)
+test/golden/cad.pw.ts-snapshots/
+test/golden/app-shot.png
+test/golden/test-results/

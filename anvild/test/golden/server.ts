@@ -6,7 +6,8 @@
  *   GET /harness-entry.js  → a Bun bundle of harness-entry.ts (+ three.js), built once at boot
  *   GET /fixtures/...      → the generated mesh/ecad fixtures
  *
- * Fixtures are (re)generated at boot so a fresh CI checkout always has them before the first shot.
+ * Serves the committed fixtures (anvild/test/fixtures/cad) — it does NOT regenerate them, so the
+ * harness never mutates tracked files (the 3MF zip is non-deterministic; see gen.ts / fixtures.test).
  * PORT is read from the env (Playwright sets it via the webServer url/port); defaults to 4321.
  */
 import { dirname, join, normalize } from "node:path";
@@ -15,25 +16,6 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = join(HERE, "..", "fixtures", "cad");
 const PORT = Number(process.env.HARNESS_PORT || process.env.PORT || 4321);
-
-// (Re)generate fixtures before serving (idempotent; see gen.ts).
-const gen = await import("../fixtures/cad/gen");
-{
-  const { glb, asciiStl, binaryStl, objMtl, asciiPly, threeMf, collada } = gen;
-  const { obj, mtl } = objMtl();
-  const mesh = join(FIX, "mesh");
-  const out: Array<[string, string | Uint8Array]> = [
-    [join(mesh, "cube.stl"), asciiStl()],
-    [join(mesh, "cube-bin.stl"), binaryStl()],
-    [join(mesh, "cube.obj"), obj],
-    [join(mesh, "cube.mtl"), mtl],
-    [join(mesh, "cube.ply"), asciiPly()],
-    [join(mesh, "cube.glb"), await glb()],
-    [join(mesh, "cube.3mf"), threeMf()],
-    [join(mesh, "cube.dae"), collada()],
-  ];
-  for (const [p, d] of out) await Bun.write(p, d);
-}
 
 // Bundle the render entry (three.js resolved from node_modules) once at boot.
 const built = await Bun.build({

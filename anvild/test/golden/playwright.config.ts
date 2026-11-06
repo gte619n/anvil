@@ -11,7 +11,11 @@
  * NOTE: baselines must be generated IN CI (`--update-snapshots`) — this environment has no browser
  * installed and no display/GPU, so goldens produced here would not be trustworthy. See README.md.
  */
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig, devices } from "@playwright/test";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const SWIFTSHADER_ARGS = [
   "--use-gl=angle",
@@ -77,7 +81,8 @@ export default defineConfig({
 
   // Playwright boots the Bun static harness server and waits for it before the first test.
   webServer: {
-    command: "bun run test/golden/server.ts",
+    command: "bun run server.ts",
+    cwd: HERE, // run from this config's dir so the relative command resolves regardless of invocation cwd
     env: { HARNESS_PORT: "4321" },
     url: "http://127.0.0.1:4321/",
     reuseExistingServer: !process.env.CI,

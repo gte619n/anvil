@@ -190,6 +190,25 @@ The owner reviewed the decisions and gave these verdicts — they supersede the 
   every run. Fixed: the test now drives `gen.ts` into a throwaway tmp dir (parse-tests read there),
   while existence checks verify the committed corpus. Tests no longer mutate tracked files.
 
+## Actual browser render (owner asked "did you run the tests / show pictures")
+
+- **DL-40 (🔬 — visual verification done, 2 bugs found).** Installed Playwright chromium and **actually
+  rendered** the viewer (SwiftShader software GL). This is the first real render — prior passes were
+  logic/type/build tests only. It immediately surfaced **two bugs unit tests missed**:
+  1. `playwright.config.ts` webServer `command` double-nested the path (cwd defaults to the config dir)
+     → "Module not found test/golden/server.ts". Fixed: `command: "bun run server.ts"` + explicit `cwd`.
+  2. `server.ts` (like the test, DL-39) **regenerated fixtures into the tracked tree at boot**. Fixed:
+     serve the committed fixtures, no regeneration.
+  After the fixes: `cad:golden` renders 6 shots (3 mesh fixtures × desktop/android) — a correct shaded
+  3D cube. A second one-off (`shot-app.ts`) mounts the REAL `cad.ts` chrome (HUD + toolbar + explode
+  slider) against a fixture and screenshots it — renders with **no page errors**.
+- **DL-41 (polish items found by eye — not blockers).** In the standalone harness the toolbar icons show
+  as glyph *names* (material-symbols font not loaded standalone — it IS bundled in the app); fit-to-view
+  frames tight; the section/explode rails look eager. Logged for a polish pass.
+- **DL-42.** **Golden baselines are NOT committed** — they're platform-specific (macOS SwiftShader won't
+  byte-match Linux CI). CI regenerates them with `cad:golden:update` (unchanged from the plan). The
+  harness *fixes* (config + server) ARE committed so CI can actually run it.
+
 ## Status after the second pass — all 11 phases built
 
 **Built + in-env-verified: Phases 0–10 (all).** The first pass delivered 0,1,2,4,5,7,8; the second pass
