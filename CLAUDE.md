@@ -50,6 +50,13 @@ the required fields + types of the critical v4/hello/permission envelopes. Chang
 — a field rename/retype/drop is breaking; bump `PROTOCOL_VERSION` and update all four clients together.
 See [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) §4 for the policy.
 
+**Design docs in `docs/plans/` follow a house shape.** Name new specs `YYYY-MM-DD-<slug>.md` and open
+with a status header (`Status · Owner · Branch · Created · Last revised`), then objective/non-goals, a
+decisions table, and phased sections. Large efforts split into companion files — a `…-design.md`/`…-plan.md`
+pair, or a `…-decisions.md` (sometimes `-DECISIONS.md`) capturing owner-interview answers alongside the
+main spec. Model a new doc on a recent one (e.g. `2026-10-28-autopilot-completion-verification.md`) rather
+than inventing a shape.
+
 ## Build, test, run
 
 All daemon commands run from `anvild/` (Bun ≥ 1.3.14):
