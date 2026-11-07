@@ -29,6 +29,7 @@ import { $, esc, icon, sessIcon } from "./dom";
 import { classifyCad } from "./cad-types";
 import { openCadViewer } from "./cad";
 import { makeCadIo } from "./cad-io";
+import { fileChipIcon, viewablePathRe } from "./file-paths";
 import { currentTheme } from "./theme";
 import { ui } from "./state";
 // dialogs.ts is a leaf, so toast + the permission/question card-map reset are direct imports —
@@ -391,17 +392,18 @@ function toolHtml(b: Extract<ContentBlock, { kind: "tool_use" }>): string {
   return `<div class="tool">${icon("build")} <b>${esc(b.name)}</b> <code>${esc(JSON.stringify(b.input)).slice(0, 160)}</code></div>`;
 }
 
-// Markdown files Claude names in prose (e.g. "see docs/plans/design.md") are usually design docs you
-// want to open — turn those mentions into the same `.file-link` the tool rows use, so one tap opens
-// them in the reader. Limited to .md/.markdown to avoid over-linkifying ordinary words; skips text
-// already inside a link or a fenced code block (but inline `path.md` in backticks is fair game).
-const MD_PATH_RE = /(?:\.{0,2}\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:md|markdown)(?![\w/-])/gi;
-function linkifyFilePaths(root: HTMLElement): void {
+// Files Claude names in prose (e.g. "see docs/plans/design.md" or "open pcb/out/board.glb") are
+// usually things you want to open — turn those mentions into the same `.file-link` the tool rows use,
+// so one tap opens them: CAD models/PCBs in the 3D viewer, images in the reader, markdown in the
+// reader (openFile routes by extension). Limited to viewable extensions to avoid over-linkifying
+// ordinary words; skips text already inside a link or a fenced code block (inline `path` is fair game).
+export function linkifyFilePaths(root: HTMLElement): void {
+  const re = viewablePathRe();
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(n: Node): number {
       const v = n.nodeValue;
-      MD_PATH_RE.lastIndex = 0;
-      if (!v || !MD_PATH_RE.test(v)) return NodeFilter.FILTER_REJECT;
+      re.lastIndex = 0;
+      if (!v || !re.test(v)) return NodeFilter.FILTER_REJECT;
       for (let p = n.parentElement; p && p !== root; p = p.parentElement) {
         if (p.tagName === "A" || p.tagName === "PRE") return NodeFilter.FILTER_REJECT; // already a link / code block
       }
@@ -412,19 +414,20 @@ function linkifyFilePaths(root: HTMLElement): void {
   while (walker.nextNode()) targets.push(walker.currentNode as Text);
   for (const node of targets) {
     const text = node.nodeValue ?? "";
-    MD_PATH_RE.lastIndex = 0;
+    re.lastIndex = 0;
     const frag = document.createDocumentFragment();
     let last = 0;
     let m: RegExpExecArray | null;
-    while ((m = MD_PATH_RE.exec(text)) !== null) {
+    while ((m = re.exec(text)) !== null) {
       const raw = m[0];
       if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
       const a = document.createElement("a");
       a.href = "#";
-      a.className = "file-link md-file-link";
+      a.className = "file-link path-file-link";
       a.dataset.path = raw.replace(/^\.\//, ""); // fs.read is worktree-relative
       a.title = `Open ${raw}`;
-      a.textContent = raw;
+      // A small leading icon (model / image / doc) so the chip reads as an openable file, not prose.
+      a.innerHTML = `<span class="msym file-chip-icon">${fileChipIcon(raw)}</span>${esc(raw)}`;
       frag.appendChild(a);
       last = m.index + raw.length;
     }

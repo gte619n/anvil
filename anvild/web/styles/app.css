@@ -529,8 +529,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .tool .file-link { color: var(--accent); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .tool .file-link:hover { text-decoration: underline; }
 /* clickable .md mentions inside Claude's prose → open in the reader */
-.md .md-file-link { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; cursor: pointer; }
-.md .md-file-link:hover { text-decoration-style: solid; }
+.md .path-file-link { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; cursor: pointer; white-space: nowrap; }
+.md .path-file-link:hover { text-decoration-style: solid; }
+.md .path-file-link .file-chip-icon { font-size: 15px; vertical-align: -3px; margin-right: 1px; text-decoration: none; }
 details.tool-result { font-size: 12px; color: var(--muted); margin: 4px 0; max-width: 100%; }
 details.tool-result > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; padding: 3px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 details.tool-result > summary::-webkit-details-marker { display: none; }
