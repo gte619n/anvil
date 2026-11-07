@@ -227,12 +227,14 @@ Rendered STEP→GLB, Gerber, section, explode in a real browser. **This surfaced
 - **DL-45 (🐞→✅ CSS [hidden] override).** My `.cad-slider{display:flex}` outranked the UA
   `[hidden]{display:none}`, so the section/explode rails + status card showed when they should be hidden
   (the documented [[anvil-hidden-attr-css-override]] gotcha). Fixed: `.cad-shell [hidden]{display:none!important}`.
-- **DL-46 (⚠️ verification gaps — honest).** **Controls** for section (X/Y/Z + slider) and explode
-  (slider) are wired and toggle correctly, but the **visible effect** isn't demonstrable with the
-  single-part STEP cube: explode needs a multi-part assembly, and the section cut lands on the far side
-  at the default camera. Not confirmed visually. The Gerber board renders but the synthetic fixture is
-  visually plain. KiCad (KiCanvas) is **still unrendered** — no committed `.kicad_pcb` fixture.
-  Measurement overlay also not driven in a shot. These remain visual-verification TODOs.
+- **DL-46 (partially closed).** **KiCad now renders (✅).** Added a hand-authored CC0
+  `kicad/board.kicad_pcb` (KiCad 7: 40×30 Edge.Cuts outline, R1/C1 SMD footprints + pads, a track + two
+  vias, "ANVIL CAD" silk). KiCanvas renders it correctly (outline + footprints + track + title block),
+  wrapped in the cad.ts chrome — visually verified via `shot-app.ts` (scene=kicad). Structural test in
+  `fixtures.test.ts`.
+  **Still-open visual gaps (honest):** section/explode *visible effect* needs a multi-part assembly
+  (the single-part cube can't explode and the section cut lands on the far side); the Gerber fixture is
+  visually plain; the measurement overlay hasn't been driven in a shot. Controls are all wired + toggle.
 - **DL-47.** Tally of bugs found ONLY by rendering (all with unit tests green): harness server path,
   harness/test fixture mutation, `process`-not-defined, Node-streams-in-browser (Gerber), CSS
   `[hidden]` override. Five. Visual/functional verification is not optional for this feature.

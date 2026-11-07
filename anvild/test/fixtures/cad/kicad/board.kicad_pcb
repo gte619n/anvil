@@ -1,0 +1,61 @@
+(kicad_pcb (version 20221018) (generator anvil_fixture)
+
+  (general
+    (thickness 1.6)
+  )
+
+  (paper "A4")
+
+  (layers
+    (0 "F.Cu" signal)
+    (31 "B.Cu" signal)
+    (36 "B.SilkS" user "B.Silkscreen")
+    (37 "F.SilkS" user "F.Silkscreen")
+    (38 "B.Mask" user)
+    (39 "F.Mask" user)
+    (44 "Edge.Cuts" user)
+    (49 "F.Fab" user)
+  )
+
+  (setup
+    (pad_to_mask_clearance 0)
+  )
+
+  (net 0 "")
+  (net 1 "GND")
+  (net 2 "VCC")
+
+  (gr_line (start 100 100) (end 140 100) (stroke (width 0.15) (type solid)) (layer "Edge.Cuts") (tstamp 00000000-0000-0000-0000-000000000001))
+  (gr_line (start 140 100) (end 140 130) (stroke (width 0.15) (type solid)) (layer "Edge.Cuts") (tstamp 00000000-0000-0000-0000-000000000002))
+  (gr_line (start 140 130) (end 100 130) (stroke (width 0.15) (type solid)) (layer "Edge.Cuts") (tstamp 00000000-0000-0000-0000-000000000003))
+  (gr_line (start 100 130) (end 100 100) (stroke (width 0.15) (type solid)) (layer "Edge.Cuts") (tstamp 00000000-0000-0000-0000-000000000004))
+
+  (gr_text "ANVIL CAD" (at 120 96) (layer "F.SilkS") (effects (font (size 2 2) (thickness 0.3))) (tstamp 00000000-0000-0000-0000-000000000005))
+
+  (footprint "Resistor_SMD:R_0805" (layer "F.Cu")
+    (at 114 115)
+    (attr smd)
+    (fp_text reference "R1" (at 0 -2) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))) (tstamp 00000000-0000-0000-0000-000000000011))
+    (fp_text value "10k" (at 0 2) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))) (tstamp 00000000-0000-0000-0000-000000000012))
+    (fp_line (start -1.68 -0.95) (end 1.68 -0.95) (stroke (width 0.1) (type solid)) (layer "F.Fab") (tstamp 00000000-0000-0000-0000-000000000013))
+    (fp_line (start 1.68 0.95) (end -1.68 0.95) (stroke (width 0.1) (type solid)) (layer "F.Fab") (tstamp 00000000-0000-0000-0000-000000000014))
+    (pad "1" smd roundrect (at -0.95 0) (size 1.0 1.45) (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.25) (net 1 "GND") (tstamp 00000000-0000-0000-0000-000000000015))
+    (pad "2" smd roundrect (at 0.95 0) (size 1.0 1.45) (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.25) (net 2 "VCC") (tstamp 00000000-0000-0000-0000-000000000016))
+  )
+
+  (footprint "Capacitor_SMD:C_0603" (layer "F.Cu")
+    (at 128 115)
+    (attr smd)
+    (fp_text reference "C1" (at 0 -1.8) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.15))) (tstamp 00000000-0000-0000-0000-000000000021))
+    (fp_text value "100n" (at 0 1.8) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))) (tstamp 00000000-0000-0000-0000-000000000022))
+    (pad "1" smd roundrect (at -0.75 0) (size 0.8 0.95) (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.25) (net 2 "VCC") (tstamp 00000000-0000-0000-0000-000000000023))
+    (pad "2" smd roundrect (at 0.75 0) (size 0.8 0.95) (layers "F.Cu" "F.Paste" "F.Mask") (roundrect_rratio 0.25) (net 1 "GND") (tstamp 00000000-0000-0000-0000-000000000024))
+  )
+
+  (segment (start 114.95 115) (end 127.25 115) (width 0.25) (layer "F.Cu") (net 2) (tstamp 00000000-0000-0000-0000-000000000031))
+  (segment (start 113.05 115) (end 105 115) (width 0.4) (layer "F.Cu") (net 1) (tstamp 00000000-0000-0000-0000-000000000032))
+  (segment (start 128.75 115) (end 135 115) (width 0.4) (layer "F.Cu") (net 1) (tstamp 00000000-0000-0000-0000-000000000033))
+
+  (via (at 135 115) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net 1) (tstamp 00000000-0000-0000-0000-000000000041))
+  (via (at 105 115) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net 1) (tstamp 00000000-0000-0000-0000-000000000042))
+)

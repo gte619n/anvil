@@ -16,7 +16,7 @@ import { renderGerberFromDir } from "../../src/cad/gerber";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const FIX = join(HERE, "..", "fixtures", "cad");
-const SUBDIRS = ["mesh", "ecad2d", "brep"];
+const SUBDIRS = ["mesh", "ecad2d", "brep", "kicad"];
 const STATE = mkdtempSync(join(tmpdir(), "anvil-shot-state-"));
 
 // Locate a fixture by bare name across the fixture subdirs.
@@ -45,7 +45,7 @@ const io = {
   listSiblings: async () => (await (await fetch(base + "/siblings")).json()),
 };
 const scene = new URLSearchParams(location.search).get("scene");
-const target = scene === "step" ? "cube.step" : scene === "gerber" ? "board.gtl" : "cube.glb";
+const target = scene === "step" ? "cube.step" : scene === "gerber" ? "board.gtl" : scene === "kicad" ? "board.kicad_pcb" : "cube.glb";
 try { openCadViewer(target, io); }
 catch (e) { document.body.innerHTML = "<pre style='color:red'>" + (e && e.stack || e) + "</pre>"; }
 `,
@@ -126,6 +126,7 @@ const setRange = async (page: import("playwright-core").Page, role: string, v: n
 
 await shot("step", "shot-step.png");
 await shot("gerber", "shot-gerber.png");
+await shot("kicad", "shot-kicad.png", async (page) => { await page.waitForTimeout(4000); }); // KiCanvas parse + WebGL
 await shot("cube", "shot-section.png", async (page) => {
   await page.click('[data-act="section"]');
   await setRange(page, "section-pos", 0.45);

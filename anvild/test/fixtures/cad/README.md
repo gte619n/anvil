@@ -49,6 +49,12 @@ layer.
 `brep/cube.step` (the STEP B-rep fixture) is maintained by a separate track and is **not** produced
 by `gen.ts`. Do not regenerate or edit it from here.
 
+### `kicad/` — hand-authored CC0
+
+`kicad/board.kicad_pcb` is a minimal hand-authored KiCad 7 board (CC0): a 40×30 mm Edge.Cuts outline,
+two SMD footprints (R1 0805, C1 0603) with pads, a copper track + two vias, and an "ANVIL CAD"
+silkscreen. It exercises the KiCanvas render path (visually verified via `shot-app.ts`). Not generated.
+
 ## Follow-ups (CI, not in this environment)
 
 - **IGES** and **FreeCAD `.FCStd`** fixtures need a real CAD kernel to author a trustworthy file

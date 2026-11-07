@@ -97,6 +97,16 @@ describe("ecad2d fixtures", () => {
     });
   }
 
+  test("kicad board fixture is a well-formed KiCad 7 board", async () => {
+    const txt = await Bun.file(join(FIX, "kicad", "board.kicad_pcb")).text();
+    expect(txt).toStartWith("(kicad_pcb");
+    expect(txt).toContain("(version 20221018)");
+    expect(txt).toContain('(layer "Edge.Cuts")'); // board outline
+    expect(txt).toContain("(footprint"); // at least one component
+    expect(txt).toContain('(pad "1" smd'); // pads
+    expect(txt).toContain("(via "); // routing
+  });
+
   test("whats-that-gerber recognizes the layer set", async () => {
     type WtgFn = (f: readonly string[]) => Record<string, { type: string | null; side: string | null }>;
     const mod = (await import("whats-that-gerber")) as unknown as { default?: WtgFn } & WtgFn;
