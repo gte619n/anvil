@@ -1,0 +1,11 @@
+M48
+; Anvil synthetic drill (CC0)
+METRIC,TZ
+T1C0.800
+%
+T1
+X2.0Y2.0
+X8.0Y8.0
+X5.0Y5.0
+T0
+M30

@@ -1,0 +1,8 @@
+# 10mm cube material (CC0, generated)
+newmtl cube_mat
+Ka 0.200 0.200 0.200
+Kd 0.720 0.750 0.800
+Ks 0.100 0.100 0.100
+Ns 32.0
+d 1.0
+illum 2

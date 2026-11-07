@@ -25,6 +25,7 @@ import { setOpenRouterKey } from "../auth/openrouter";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
+import { serveCad } from "../cad/service";
 import { UpdateStateStore } from "../daemon/update-state";
 import { updateApply, updateCheck, updateStatus, settleAfterBoot, type UpdateApiDeps } from "../daemon/update-api";
 import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
@@ -1299,6 +1300,56 @@ export function createServer(opts: ServerOptions): ServerHandle {
     } catch (e) {
       if (e instanceof FileExists) return new Response("a file with that name already exists", { status: 409 });
       return new Response(e instanceof Error ? e.message : "upload failed", { status: 403 });
+    }
+  });
+
+  // CAD conversion (docs/plans/2026-11-06-cad-viewer.md §3.2): tessellate a B-rep file (STEP/IGES/
+  // FreeCAD) — or export a .kicad_pcb to 3D — to a GLB the browser renders. Queued + cached + killed
+  // on timeout by the cad service; mesh/ECAD-2D formats are rendered client-side and never hit here.
+  // `lod` is the client's device triangle budget (D22). Same fsResolve sandbox as the file route.
+  const CAD_RE = /^\/api\/sessions\/([^/]+)\/cad$/;
+  routeRe("GET", CAD_RE, async (_req, url, m) => {
+    const sessionId = m![1]!;
+    const path = url.searchParams.get("path") ?? "";
+    const lod = Number(url.searchParams.get("lod")) || 1_500_000;
+    let bytes: Uint8Array;
+    try {
+      const abs = supervisor.fsResolve(sessionId, path);
+      const file = Bun.file(abs);
+      if (!(await file.exists())) return new Response("not found", { status: 404 });
+      bytes = new Uint8Array(await file.arrayBuffer());
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
+    const res = await serveCad(opts.stateDir, bytes, path, lod);
+    if (res.glb) {
+      // Copy into a fresh ArrayBuffer-backed view so it satisfies BodyInit under TS's strict
+      // Uint8Array<ArrayBufferLike> generic (the GLB may be backed by a non-ArrayBuffer buffer).
+      return new Response(new Uint8Array(res.glb), { headers: { "Content-Type": "model/gltf-binary", "Cache-Control": "private, max-age=3600" } });
+    }
+    return new Response(res.error ?? "conversion failed", { status: res.status });
+  });
+
+  // Gerber 2D render (CAD viewer): pcb-stackup needs Node streams, so compositing runs on the daemon
+  // (not the browser) and the client just displays the SVG. Scans the opened file's directory for the
+  // layer set. Same fsResolve sandbox. `side` = top|bottom.
+  const CAD_GERBER_RE = /^\/api\/sessions\/([^/]+)\/cad-gerber$/;
+  routeRe("GET", CAD_GERBER_RE, async (_req, url, m) => {
+    const sessionId = m![1]!;
+    const path = url.searchParams.get("path") ?? "";
+    const side = url.searchParams.get("side") === "bottom" ? "bottom" : "top";
+    let abs: string;
+    try {
+      abs = supervisor.fsResolve(sessionId, path);
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
+    try {
+      const { renderGerberFromDir } = await import("../cad/gerber");
+      const stackup = await renderGerberFromDir(abs);
+      return new Response(stackup[side], { headers: { "Content-Type": "image/svg+xml; charset=utf-8" } });
+    } catch (e) {
+      return new Response(e instanceof Error ? e.message : "gerber render failed", { status: 422 });
     }
   });
 
