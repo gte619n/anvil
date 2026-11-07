@@ -45,7 +45,7 @@ const io = {
   listSiblings: async () => (await (await fetch(base + "/siblings")).json()),
 };
 const scene = new URLSearchParams(location.search).get("scene");
-const target = scene === "step" ? "cube.step" : scene === "gerber" ? "board.gtl" : scene === "kicad" ? "board.kicad_pcb" : scene === "assembly" ? "assembly.glb" : "cube.glb";
+const target = scene === "step" ? "cube.step" : scene === "gerber" ? "board.gtl" : scene === "kicad" ? "board.kicad_pcb" : scene === "assembly" ? "assembly.glb" : scene === "draco" ? "assembly-draco.glb" : "cube.glb";
 try { openCadViewer(target, io); }
 catch (e) { document.body.innerHTML = "<pre style='color:red'>" + (e && e.stack || e) + "</pre>"; }
 `,
@@ -88,6 +88,11 @@ const server = Bun.serve({
       } catch (e) {
         return new Response(e instanceof Error ? e.message : "gerber failed", { status: 422 });
       }
+    }
+    if (p.startsWith("/draco/")) {
+      // Serve three's Draco decoder (draco_decoder.wasm / draco_wasm_wrapper.js) like the daemon does.
+      const dp = join(ROOT, "node_modules/three/examples/jsm/libs/draco/gltf", p.slice("/draco/".length));
+      return (await Bun.file(dp).exists()) ? new Response(Bun.file(dp)) : new Response("404", { status: 404 });
     }
     if (p.startsWith("/fixtures/")) {
       const fp = fixturePath(p.slice("/fixtures/".length));
@@ -133,6 +138,7 @@ const setRange = async (page: import("playwright-core").Page, role: string, v: n
 };
 
 await shot("step", "shot-step.png");
+await shot("draco", "shot-draco.png"); // Draco-compressed GLB — the format real exporters emit
 await shot("gerber", "shot-gerber.png");
 await shot("kicad", "shot-kicad.png", async (page) => { await page.waitForTimeout(4000); }); // KiCanvas parse + WebGL
 await shot("kicad", "shot-kicad3d.png", async (page) => {

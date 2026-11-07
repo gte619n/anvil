@@ -1,7 +1,35 @@
-# Draco-compressed GLB support — deferred (blocked by a Bun bundler bug)
+# Draco-compressed GLB support — RESOLVED (re-applied; the "Bun bundler bug" was a misdiagnosis)
 
-- **Status:** Deferred · **Area:** CAD viewer (shipped v5.3.86+) · **Reverted from:** PR #236
+- **Status:** ✅ Implemented on branch `cad-viewer_followup_followup` · **Area:** CAD viewer · **Was:** reverted from PR #236
 - **Priority:** Low — only affects Blender-style *compressed* GLBs; see "Priority" below.
+
+## Resolution (2026-11-07) — the real root cause was NOT a Bun two-build cache bug
+
+The ~23 red boot/mirror/subagent web tests were **not** caused by two in-process `Bun.build`s poisoning
+each other's resolution cache (the theory below). That theory was wrong — and verifiably so: with the
+Draco wiring re-applied, `boot-init.test.ts` fails *in isolation* too (a single build), and bundling
+`main.ts` twice in one process both succeed.
+
+**Actual cause:** three's `DRACOLoader.js` contains
+`new URL("../libs/draco/draco_decoder.wasm", import.meta.url)`. The boot tests bundle `main.ts` as an
+**IIFE** (`test/web/boot-bundle.ts`) and jsdom runs that bundle as a **classic `<script>`**, where any
+surviving `import.meta` is a **parse-time `SyntaxError`** — it aborts the entire bundle *before* the
+harness's boot `try/catch`, so every boot test sees `theme`/`initErr` both null. Production was never
+affected: that build is ESM + splitting (where `import.meta` is legal), and the viewer overrides the
+decoder location with `setDecoderPath("/draco/")` anyway.
+
+**The infra fix:** `test/web/boot-bundle.ts` now passes `define: { "import.meta.url": "\"file:///boot-bundle\"" }`
+to `Bun.build`, stripping every `import.meta` from the IIFE test bundle. This is test-harness-only; no
+product code changed for it. (The stale "subprocess every client-graph build" plan below was unneeded —
+`bundle-hash.test.ts` already subprocesses, and subprocessing never removes the `import.meta` token.)
+
+**Verified:** full `bun test` 1332 pass / 0 fail (199 files); web suite 193/0; CAD fixtures 17/0;
+typecheck clean; `build:web` clean (decoder copied to `dist/draco/`); and a headless-chromium check
+decodes the real `assembly-draco.glb` → 3 meshes / 36 triangles, no page errors.
+
+---
+
+_Original deferral note (root-cause theory below is superseded by the Resolution above):_
 
 ## What it is
 

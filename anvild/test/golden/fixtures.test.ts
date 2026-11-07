@@ -79,6 +79,14 @@ describe("mesh fixtures", () => {
     expect(extras?.units).toBe("mm");
   });
 
+  test("assembly-draco.glb is Draco-compressed (regression: GLTFLoader needs a DRACOLoader)", async () => {
+    // Most real .glb exports are Draco-compressed; the viewer must wire a DRACOLoader or they fail to
+    // open while every other format works. The extension name sits in the glb's plaintext JSON chunk.
+    const bytes = new Uint8Array(await Bun.file(join(MESH, "assembly-draco.glb")).arrayBuffer());
+    const text = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 4096)));
+    expect(text).toContain("KHR_draco_mesh_compression");
+  });
+
   test("cube-bin.stl header declares 12 triangles", async () => {
     const bytes = new Uint8Array(await Bun.file(join(GEN, "cube-bin.stl")).arrayBuffer());
     expect(bytes.byteLength).toBe(84 + 12 * 50);
