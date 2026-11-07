@@ -267,6 +267,27 @@ Rendered STEP→GLB, Gerber, section, explode in a real browser. **This surfaced
   demonstrated. Also noted: mesh-GLB units label reads "m" (the mesh path assumes metres; our fixture
   declares mm in extras) — a minor label gap for mesh fixtures.
 
+## Android (emulated) coverage — and a false alarm corrected
+
+- **DL-52 (🔬 — emulated-Android pictures).** Added a `SHOT_ANDROID=1` profile to `shot-app.ts` (Pixel 7
+  descriptor: mobile viewport + touch + mobile UA). Rendered all 8 CAD scenes under it — STEP, Gerber,
+  KiCad 2D/3D, section, explode, tree, measure — **all render correctly in portrait** (3D geometry,
+  KiCad component bodies, multi-part explode, the `mm` label). Honest caveat baked into the script: it
+  still renders on the **host SwiftShader GPU**, so it validates mobile **layout + touch-wiring**, NOT a
+  real Android System WebView / device GPU.
+- **DL-53 (⚠️→✅ false alarm — trust measurements over emulated screenshots).** I first read the mobile
+  PNGs as having a **doubled toolbar**. Direct DOM inspection disproved it: exactly **one `.cad-tools`,
+  one `.cad-hud`, one modal** — the toolbar is correctly pinned to the viewport bottom (the apparent
+  second row was a mobile-capture/DPR artifact). Lesson re-logged: on emulated mobile, verify element
+  counts/rects, don't trust the raw screenshot. Made a small, honest **robustness tweak** anyway
+  (`.cad-shell` → `height:100%` of the fixed `.cad-modal` + `align-items:stretch`, instead of `100dvh`
+  inside a flex-centred modal) — equivalent on real devices, more predictable across viewports. Desktop
+  re-verified unaffected.
+- **DL-54 (real-device gap, unchanged).** Still NOT verified on a real Android System WebView: on-device
+  WebGL (three.js + meshopt decoder), real multitouch, device memory ceilings, secure-context
+  clipboard/share. And the APK must be rebuilt + reshipped for CAD to reach a phone at all. The golden
+  suite's committed `android` project (Pixel 7) covers the mesh fixtures only, as emulation.
+
 ## Status after the second pass — all 11 phases built
 
 **Built + in-env-verified: Phases 0–10 (all).** The first pass delivered 0,1,2,4,5,7,8; the second pass

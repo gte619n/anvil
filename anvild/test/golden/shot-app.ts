@@ -5,7 +5,7 @@
  * daemon serveCad(). Loads Material Symbols from Google's CDN so toolbar icons render. Not part of CI.
  *   bun run test/golden/shot-app.ts
  */
-import { chromium } from "playwright-core";
+import { chromium, devices } from "playwright-core";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync, writeFileSync, existsSync, readdirSync } from "node:fs";
@@ -102,8 +102,15 @@ const browser = await chromium.launch({
   args: ["--use-gl=angle", "--use-angle=swiftshader-webgl", "--enable-unsafe-swiftshader", "--no-sandbox"],
 });
 
+// SHOT_ANDROID=1 → emulate a Pixel 7 (mobile viewport + touch + mobile UA). Honest caveat: this still
+// renders on the host SwiftShader GPU, so it validates mobile layout / touch-wiring, NOT a real device.
+const ANDROID = process.env.SHOT_ANDROID === "1";
+const profile = ANDROID ? { ...devices["Pixel 7"] } : { viewport: { width: 960, height: 680 }, deviceScaleFactor: 1 };
+const prefix = ANDROID ? "android-" : "";
+
 async function shot(scene: string, file: string, drive?: (page: import("playwright-core").Page) => Promise<void>): Promise<void> {
-  const page = await browser.newPage({ viewport: { width: 960, height: 680 }, deviceScaleFactor: 1 });
+  const context = await browser.newContext(profile);
+  const page = await context.newPage();
   const errs: string[] = [];
   page.on("pageerror", (e) => errs.push(String(e)));
   await page.goto(`http://127.0.0.1:4330/?scene=${scene}`);
@@ -111,9 +118,10 @@ async function shot(scene: string, file: string, drive?: (page: import("playwrig
   await page.waitForSelector("#modal-root canvas, #modal-root svg", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(2500);
   if (drive) await drive(page);
-  await page.screenshot({ path: join(HERE, file) });
+  await page.screenshot({ path: join(HERE, prefix + file) });
   await page.close();
-  console.log(`${file}: ${errs.length ? "ERRORS " + errs.join(" | ") : "ok"}`);
+  await context.close();
+  console.log(`${prefix}${file}: ${errs.length ? "ERRORS " + errs.join(" | ") : "ok"}`);
 }
 
 const setRange = async (page: import("playwright-core").Page, role: string, v: number): Promise<void> => {
