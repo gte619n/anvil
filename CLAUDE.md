@@ -111,6 +111,12 @@ changing v1. See `docs/plans/2026-08-01-stable-update-service.md`.
 - **The Android/Apple apps bundle their own copy of the web UI.** `anvild/web/bundle-native.ts` embeds
   the web client into the native shells, so updating `anvild` never updates a phone's UI — the app
   must be re-shipped. A daemon self-update won't reach installed native clients.
+- **Runtime web assets (decoders / fonts / wasm) ship via `web/build.ts`, not the JS bundler.** The
+  bundler only inlines ES modules; files the client *fetches at runtime* — the Draco decoder, katex
+  fonts, the xterm stylesheet — are `cpSync`'d into `web/dist/` by `build.ts` and referenced by a
+  root-relative URL (`/draco/`, `/katex/…`, `/xterm.css`). Anything under `web/dist/` is automatically
+  carried into the native apps too (`bundle-native.ts` copies `dist/` recursively), so one `cpSync`
+  covers browser + Android + Apple. Skip it and the asset 404s in production.
 - **The daemon runs sessions with `settingSources: []`** (`src/agent/driver.ts`), so this `CLAUDE.md`
   is NOT auto-loaded into daemon-driven Claude Code sessions. Conventions here guide humans/agents
   editing the repo, not the running agent's context.
