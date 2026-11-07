@@ -25,6 +25,7 @@ export function makeCadIo(opts: {
   return {
     fileUrl: (p) => serverApiUrl(base(), filesPath(sid(), p)),
     cadUrl: (p, lod) => serverApiUrl(base(), `/api/sessions/${sid()}/cad?path=${encodeURIComponent(p)}&lod=${lod}`),
+    gerberUrl: (p, side) => serverApiUrl(base(), `/api/sessions/${sid()}/cad-gerber?path=${encodeURIComponent(p)}&side=${side}`),
     fetchBytes: async (p) => new Uint8Array(await (await serverFetch(base(), filesPath(sid(), p))).arrayBuffer()),
     fetchText: async (p) => (await serverFetch(base(), filesPath(sid(), p))).text(),
     listSiblings: async (p) => {

@@ -51,6 +51,8 @@ export interface CadIo {
   fileUrl(path: string): string;
   /** Absolute URL for the server-side CAD conversion of a B-rep/kicad-3d file. */
   cadUrl(path: string, lod: number): string;
+  /** Absolute URL for the server-side Gerber board render (SVG) of the opened file's directory. */
+  gerberUrl(path: string, side: "top" | "bottom"): string;
   /** Fetch raw bytes of a worktree file. */
   fetchBytes(path: string): Promise<Uint8Array>;
   /** Fetch text of a worktree file. */

@@ -209,6 +209,34 @@ The owner reviewed the decisions and gave these verdicts — they supersede the 
   byte-match Linux CI). CI regenerates them with `cad:golden:update` (unchanged from the plan). The
   harness *fixes* (config + server) ARE committed so CI can actually run it.
 
+## Visual verification of the remaining paths (owner: "do the other ones as well")
+
+Rendered STEP→GLB, Gerber, section, explode in a real browser. **This surfaced 3 more real bugs that
+1300+ passing unit tests never caught** — the whole point of visual verification:
+
+- **DL-43 (✅ STEP→GLB works).** The real daemon `serveCad` (occt tessellation → gltf-transform GLB)
+  → viewer renders a correct shaded cube with the detected `(mm)` units badge. Clean.
+- **DL-44 (🐞→✅ BIG ONE — Gerber was fundamentally broken, now fixed).** The client-side Gerber path
+  threw `process is not defined`, then readable-stream errors: **tracespace v4 `pcb-stackup` is built on
+  Node streams and cannot run in a browser bundle.** Unit tests passed because they only exercised the
+  filename classifier, never the actual render. **Fix: render Gerber on the daemon** (pcb-stackup works
+  in Bun — verified) and serve the SVG, exactly like STEP→GLB. New `src/cad/gerber.ts` +
+  `GET /cad-gerber` route + `CadIo.gerberUrl`; `cad-ecad.ts` now fetches the SVG. The browser
+  tracespace vendor bundle (DL-35) is **deleted** — tracespace is now a server-side npm dep (like occt),
+  which also supersedes the V3 browser-vendoring concern. New `cad-gerber.test.ts` (server-side render).
+- **DL-45 (🐞→✅ CSS [hidden] override).** My `.cad-slider{display:flex}` outranked the UA
+  `[hidden]{display:none}`, so the section/explode rails + status card showed when they should be hidden
+  (the documented [[anvil-hidden-attr-css-override]] gotcha). Fixed: `.cad-shell [hidden]{display:none!important}`.
+- **DL-46 (⚠️ verification gaps — honest).** **Controls** for section (X/Y/Z + slider) and explode
+  (slider) are wired and toggle correctly, but the **visible effect** isn't demonstrable with the
+  single-part STEP cube: explode needs a multi-part assembly, and the section cut lands on the far side
+  at the default camera. Not confirmed visually. The Gerber board renders but the synthetic fixture is
+  visually plain. KiCad (KiCanvas) is **still unrendered** — no committed `.kicad_pcb` fixture.
+  Measurement overlay also not driven in a shot. These remain visual-verification TODOs.
+- **DL-47.** Tally of bugs found ONLY by rendering (all with unit tests green): harness server path,
+  harness/test fixture mutation, `process`-not-defined, Node-streams-in-browser (Gerber), CSS
+  `[hidden]` override. Five. Visual/functional verification is not optional for this feature.
+
 ## Status after the second pass — all 11 phases built
 
 **Built + in-env-verified: Phases 0–10 (all).** The first pass delivered 0,1,2,4,5,7,8; the second pass

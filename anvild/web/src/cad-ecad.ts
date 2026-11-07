@@ -1,38 +1,11 @@
 // ── cad-ecad.ts — ECAD (PCB) rendering adapters for the CAD viewer (spec §3.3) ─────────────────────
-// Two client-side 2D pipelines, both lazy so the heavy libs land in their own chunks:
-//   • Gerber  → tracespace v4 (`whats-that-gerber` + `pcb-stackup`/`gerber-to-svg`) → a composited SVG.
-//   • KiCad   → the vendored KiCanvas custom elements (`<kicanvas-embed>`), KiCad 6+ only, alpha.
-// `renderEcad` is kept thin around the pure `selectGerberLayers` helper, which is the only
-// browser-free unit worth testing.
+// Two 2D pipelines:
+//   • Gerber → the daemon composites the board SVG (pcb-stackup is built on Node streams and can't run
+//     in a browser bundle; see src/cad/gerber.ts) and the client just displays it, with pinch/pan.
+//   • KiCad  → the vendored KiCanvas custom elements (`<kicanvas-embed>`), KiCad 6+ only, alpha.
 
 import type { CadIo, CadKind } from "./cad-types";
 import { enablePinchPan } from "./cad-gestures";
-
-// ── Pure, testable: which siblings are real Gerber/drill layers ───────────────────────────────────
-
-/**
- * Run whats-that-gerber over a directory listing and return only the filenames it recognises as a
- * Gerber copper/mask/silk/paste/outline layer or an Excellon drill file. Unrecognised files
- * (readme.txt, images, project files, …) come back with `{type: null}` and are dropped.
- *
- * Synchronous + DOM-free on purpose so `cad-ecad.test.ts` can exercise the layer-selection logic
- * without a browser or the SVG stack.
- */
-export function selectGerberLayers(siblingNames: string[]): string[] {
-  if (siblingNames.length === 0) return [];
-  // whats-that-gerber ships as CJS with `export =`; under esModuleInterop the default import is the
-  // callable. Static import here (not dynamic) keeps the helper synchronous for the unit test; it's a
-  // tiny pure-string module, so bundling it eagerly costs nothing meaningful.
-  // (The heavy SVG renderers below stay dynamic.)
-  const classified = whatsThatGerber(siblingNames);
-  return siblingNames.filter((name) => {
-    // whats-that-gerber tags any `.txt` as an Excellon drill, but `.txt` is too ambiguous to auto-pull
-    // into a board (a readme is also `.txt`). cad-types.ts deliberately keeps `.txt` OUT of the Gerber
-    // set for the same reason — mirror that here so a sibling scan never hijacks plain text files.
-    if (name.toLowerCase().endsWith(".txt")) return false;
-    return classified[name]?.type != null;
-  });
-}
 
 // ── Entry point cad.ts calls ───────────────────────────────────────────────────────────────────────
 
@@ -66,119 +39,45 @@ function disposeHost(host: HTMLElement): void {
   (host as unknown as { __cadCleanup?: () => void }).__cadCleanup = undefined;
 }
 
-// ── Gerber pipeline ─────────────────────────────────────────────────────────────────────────────────
+// ── Gerber pipeline (daemon-rendered SVG) ────────────────────────────────────────────────────────────
 
+/**
+ * Display the composited board. The daemon scans the opened file's directory, runs pcb-stackup, and
+ * returns the top/bottom SVG; the client fetches the requested side and shows it with a top/bottom
+ * toggle. Both sides are cached after first fetch.
+ */
 async function renderGerber(path: string, host: HTMLElement, io: CadIo): Promise<void> {
-  const dir = path.slice(0, path.lastIndexOf("/") + 1);
-  const opened = path.slice(dir.length);
-
-  let siblings: string[];
-  try {
-    siblings = await io.listSiblings(path);
-  } catch {
-    // If the dir can't be listed, degrade to the single opened file.
-    siblings = [opened];
-  }
-  // Always consider the opened file even if listSiblings omits it.
-  if (!siblings.includes(opened)) siblings.push(opened);
-
-  const layerNames = selectGerberLayers(siblings);
-
-  // Nothing recognised at all (not even the opened file) — bail with a note rather than a blank pane.
-  if (layerNames.length === 0) {
-    host.append(noteCard(`Not a recognised Gerber/Excellon file: ${opened}`));
-    return;
-  }
-
-  // Single recognised layer → render just that one via gerber-to-svg with the "open the folder" hint.
-  if (layerNames.length === 1) {
-    await renderSingleGerberLayer(layerNames[0]!, dir, host, io);
-    return;
-  }
-
-  await renderGerberStackup(layerNames, dir, host, io);
-}
-
-/** Full board: feed every recognised layer to pcb-stackup and show the top view with a side toggle.
- *  `dir` is the opened file's directory (with trailing slash, or ""); layer names are bare, so the
- *  fetch re-joins them to resolve worktree-relative paths in subdirectories. */
-async function renderGerberStackup(
-  layerNames: string[],
-  dir: string,
-  host: HTMLElement,
-  io: CadIo,
-): Promise<void> {
-  // Vendored tracespace bundle (owner verdict V3) — the abandoned upstream can't disappear from the
-  // shipped web path. Dynamic-imported so it stays a lazy chunk.
-  const { pcbStackup } = await import("./vendor/tracespace");
-
-  const sources = await Promise.all(
-    layerNames.map(async (filename) => ({
-      filename,
-      gerber: await io.fetchText(dir + filename),
-    })),
-  );
-
-  // Pin the result to the string-SVG form. The overload otherwise leaves `NodeType` as `unknown`
-  // (nothing in the empty options fixes it), so `.top.svg` would be `unknown` under strict mode.
-  let stackup: import("pcb-stackup").Stackup<string>;
-  try {
-    // v4 promise form: pcbStackup(layers, options?) → { top: {svg}, bottom: {svg}, … }.
-    stackup = await pcbStackup<string>(sources);
-  } catch (err) {
-    host.append(errorCard("Could not composite the Gerber board.", String(err)));
-    return;
-  }
-
-  const views: Record<"top" | "bottom", string> = {
-    top: stackup.top.svg,
-    bottom: stackup.bottom.svg,
-  };
-
   const toolbar = document.createElement("div");
   toolbar.className = "cad-ecad-toolbar";
   const topBtn = sideButton("Top");
   const bottomBtn = sideButton("Bottom");
   toolbar.append(topBtn, bottomBtn);
+  host.append(toolbar);
 
   const { setSvg } = makeSvgViewport(host);
-  host.prepend(toolbar);
+  const cache: Partial<Record<"top" | "bottom", string>> = {};
 
-  const show = (side: "top" | "bottom"): void => {
-    setSvg(views[side]);
-    topBtn.setAttribute("aria-pressed", String(side === "top"));
-    bottomBtn.setAttribute("aria-pressed", String(side === "bottom"));
+  const show = async (side: "top" | "bottom"): Promise<void> => {
+    try {
+      if (cache[side] === undefined) {
+        const res = await fetch(io.gerberUrl(path, side));
+        if (!res.ok) {
+          host.append(errorCard("Could not render the Gerber board.", await res.text(), io.fileUrl(path)));
+          return;
+        }
+        cache[side] = await res.text();
+      }
+      setSvg(cache[side]!);
+      topBtn.setAttribute("aria-pressed", String(side === "top"));
+      bottomBtn.setAttribute("aria-pressed", String(side === "bottom"));
+    } catch (err) {
+      host.append(errorCard("Could not render the Gerber board.", String(err), io.fileUrl(path)));
+    }
   };
-  topBtn.addEventListener("click", () => show("top"));
-  bottomBtn.addEventListener("click", () => show("bottom"));
-  show("top");
-}
 
-/** Single opened layer, no siblings — gerber-to-svg + a hint to open the folder for the full board. */
-async function renderSingleGerberLayer(
-  filename: string,
-  dir: string,
-  host: HTMLElement,
-  io: CadIo,
-): Promise<void> {
-  // Vendored tracespace bundle (owner verdict V3), same as the stackup path above.
-  const { gerberToSvg } = await import("./vendor/tracespace");
-
-  const gerber = await io.fetchText(dir + filename);
-  let svg: string;
-  try {
-    // gerber-to-svg v4 promise form returns the SVG string when no callback is supplied.
-    svg = (await gerberToSvg(gerber, {})) as unknown as string;
-  } catch (err) {
-    host.append(errorCard(`Could not render ${filename}.`, String(err)));
-    return;
-  }
-
-  host.append(
-    noteCard("Single layer — open the folder for the full board."),
-  );
-  const { setSvg } = makeSvgViewport(host);
-  setSvg(svg);
+  topBtn.addEventListener("click", () => void show("top"));
+  bottomBtn.addEventListener("click", () => void show("bottom"));
+  await show("top");
 }
 
 // ── KiCad pipeline (vendored KiCanvas) ───────────────────────────────────────────────────────────────
@@ -198,8 +97,6 @@ async function renderKicad(
 
     // Feed approach: `src` (NOT inline). KiCanvas's <kicanvas-source> fetches the URL itself and keeps
     // the real filename, so its file-type detection sees the .kicad_pcb/.kicad_sch extension for free.
-    // io.fileUrl() yields a fleet-routed REST URL KiCanvas can GET. (Inline text is only needed when a
-    // URL fetch is unavailable — not the case here.)
     //
     // Limitation (v1, per spec): hierarchical multi-sheet .kicad_sch designs reference sibling sheets
     // by relative path; those won't resolve through the single `?path=`-style REST URL. The root sheet
@@ -211,7 +108,6 @@ async function renderKicad(
 
     const source = document.createElement("kicanvas-source");
     source.setAttribute("src", io.fileUrl(path));
-    // Hint the file type so detection never has to guess from a partial fetch.
     source.setAttribute("type", kind === "kicad-pcb" ? "board" : "schematic");
     embed.append(source);
 
@@ -269,13 +165,6 @@ function sideButton(label: string): HTMLButtonElement {
   return b;
 }
 
-function noteCard(text: string): HTMLElement {
-  const el = document.createElement("div");
-  el.className = "cad-ecad-note";
-  el.textContent = text;
-  return el;
-}
-
 function errorCard(message: string, detail?: string, rawUrl?: string): HTMLElement {
   const card = document.createElement("div");
   card.className = "cad-ecad-error";
@@ -301,8 +190,3 @@ function errorCard(message: string, detail?: string, rawUrl?: string): HTMLEleme
   }
   return card;
 }
-
-// ── whats-that-gerber import (CJS `export =`) ─────────────────────────────────────────────────────────
-// Imported statically so `selectGerberLayers` stays sync for the unit test. esModuleInterop makes the
-// default import the callable.
-import whatsThatGerber from "whats-that-gerber";

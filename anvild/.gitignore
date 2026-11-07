@@ -17,3 +17,4 @@ test/golden/cad.pw.ts-snapshots/
 test/golden/app-shot.png
 test/golden/test-results/
 test-results/
+test/golden/shot-*.png

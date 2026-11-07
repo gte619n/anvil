@@ -1330,6 +1330,29 @@ export function createServer(opts: ServerOptions): ServerHandle {
     return new Response(res.error ?? "conversion failed", { status: res.status });
   });
 
+  // Gerber 2D render (CAD viewer): pcb-stackup needs Node streams, so compositing runs on the daemon
+  // (not the browser) and the client just displays the SVG. Scans the opened file's directory for the
+  // layer set. Same fsResolve sandbox. `side` = top|bottom.
+  const CAD_GERBER_RE = /^\/api\/sessions\/([^/]+)\/cad-gerber$/;
+  routeRe("GET", CAD_GERBER_RE, async (_req, url, m) => {
+    const sessionId = m![1]!;
+    const path = url.searchParams.get("path") ?? "";
+    const side = url.searchParams.get("side") === "bottom" ? "bottom" : "top";
+    let abs: string;
+    try {
+      abs = supervisor.fsResolve(sessionId, path);
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
+    try {
+      const { renderGerberFromDir } = await import("../cad/gerber");
+      const stackup = await renderGerberFromDir(abs);
+      return new Response(stackup[side], { headers: { "Content-Type": "image/svg+xml; charset=utf-8" } });
+    } catch (e) {
+      return new Response(e instanceof Error ? e.message : "gerber render failed", { status: 422 });
+    }
+  });
+
   // attachments (arch §6.5): POST uploads a pasted/dropped file, GET serves it back. Method "*":
   // the handler narrows POST/GET itself so any other method keeps answering 405 (not 404).
   routeRe("*", /^\/api\/sessions\/([^/]+)\/attachments(?:\/([^/]+))?$/, async (req, _url, m) => {
