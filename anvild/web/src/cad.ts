@@ -629,8 +629,10 @@ async function loadModel(
       await wireGltfDecoders(gltfLoader);
       const gltf = await gltfLoader.parseAsync(buf, path.replace(/[^/]+$/, ""));
       object = gltf.scene as unknown as Object3D;
-      units = "m"; // glTF is defined in metres.
-      const gextras = (gltf.asset?.extras ?? {}) as { tree?: CadNode };
+      // glTF geometry is defined in metres by spec, but an authored asset may declare its real unit
+      // in asset.extras.units (our GLB/assembly fixtures + the server B-rep path both do) — honour it.
+      const gextras = (gltf.asset?.extras ?? {}) as { tree?: CadNode; units?: string };
+      units = typeof gextras.units === "string" ? gextras.units : "m";
       tree = gextras.tree && typeof gextras.tree === "object" ? gextras.tree : null;
       break;
     }
