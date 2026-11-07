@@ -191,6 +191,12 @@ export function openCadViewer(path: string, io: CadIo): void {
   const chrome = buildChrome(path);
   const name = fileNameOf(path);
 
+  // Release any viewer still open before replacing `active`. Opening file-after-file via the chat
+  // chips otherwise orphans the previous WebGLRenderer (its context is never forceContextLoss'd), and
+  // Android WebView's small live-context cap then fails EVERY later open with "Error creating WebGL
+  // context" — the viewer stops working for anything until the page reloads.
+  releaseActiveViewer();
+
   active = {
     units: "—",
     zUp: false,
@@ -1164,9 +1170,26 @@ function teardownActive(): void {
   }
 }
 
-function closeViewer(): void {
+/** Fully release the active viewer (3D renderer/context + ECAD cleanup) WITHOUT touching the modal.
+ *  Shared by closeViewer and openCadViewer so neither path leaks a WebGL context. */
+function releaseActiveViewer(): void {
+  const prev = active;
+  if (!prev) return;
   kicadToggle = null;
-  teardownActive();
+  teardownActive(); // disposes the 3D renderer + forceContextLoss; nulls `active`
+  // Gerber / KiCad 2D stash their own teardown on the stage element (no renderer to drop).
+  const cleanup = (prev.chrome?.stage as unknown as { __cadCleanup?: () => void } | undefined)?.__cadCleanup;
+  if (typeof cleanup === "function") {
+    try {
+      cleanup();
+    } catch {
+      /* a failed ECAD teardown must not block the next open */
+    }
+  }
+}
+
+function closeViewer(): void {
+  releaseActiveViewer();
   closeModal();
 }
 
