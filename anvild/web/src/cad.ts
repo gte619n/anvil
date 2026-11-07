@@ -514,18 +514,6 @@ async function wireGltfDecoders(loader: { setMeshoptDecoder(d: unknown): unknown
   } catch {
     // If the decoder module can't load, uncompressed GLBs still parse — degrade quietly.
   }
-  // Draco is what real glTF exporters (Blender, gltf-transform, …) emit by default, so a user's `.glb`
-  // is as likely compressed as not. Without a DRACOLoader, GLTFLoader throws "No DRACOLoader instance
-  // provided" on those (the one format that'd fail while STL/OBJ/server-STEP open). The decoder ships
-  // with three and is copied to `/draco/` at build time (web/build.ts; also bundled into the apps).
-  try {
-    const { DRACOLoader } = await import("three/examples/jsm/loaders/DRACOLoader.js");
-    const draco = new DRACOLoader();
-    draco.setDecoderPath("/draco/"); // static asset on the UI origin (same place as /katex, /xterm.css)
-    loader.setDRACOLoader?.(draco);
-  } catch {
-    // Draco GLBs won't parse, but uncompressed / meshopt ones still will.
-  }
 }
 
 /** Count triangles across every mesh in an object graph (indexed or not). */

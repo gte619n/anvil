@@ -29,7 +29,6 @@ format (the viewer treats them as such — see `web/src/cad.ts`, spec D20).
 | `cube.ply`     | ASCII PLY                     | unitless     |
 | `cube.glb`     | glTF binary (via `@gltf-transform/core`) | mm (`asset.extras.units`) |
 | `assembly.glb` | 3-part glTF binary (base + 2 blocks, named nodes + `extras.tree`) | mm — exercises tree/isolate/section/explode |
-| `assembly-draco.glb` | `assembly.glb` re-encoded with Draco compression (`gltf-transform draco()`) | mm — the format most real exporters emit; guards the GLTFLoader DRACOLoader wiring |
 | `cube.3mf`     | 3MF (ZIP via `fflate`)        | mm (`model unit="millimeter"`) |
 | `cube.dae`     | COLLADA 1.4.1                 | mm (`<unit>`), Z-up |
 

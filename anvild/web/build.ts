@@ -99,10 +99,6 @@ export async function buildWeb(opts: WebBuildOptions = {}): Promise<{ dist: stri
 
   // xterm.js stylesheet (terminal)
   cpSync(join(root, "../node_modules/@xterm/xterm/css/xterm.css"), join(next, "xterm.css"));
-  // Draco decoder (draco_decoder.wasm + wrapper) for compressed-GLB geometry — the CAD viewer's
-  // DRACOLoader fetches it from /draco/. Served to the browser from dist/ and bundled into the native
-  // apps (bundle-native.ts copies dist/ recursively). Without this, Draco-compressed .glb files fail.
-  cpSync(join(root, "../node_modules/three/examples/jsm/libs/draco/gltf"), join(next, "draco"), { recursive: true });
   // Material Symbols: web loads the font from Google's CDN (index.html); the `material-symbols`
   // dep stays installed so the native client apps can bundle the woff2 offline.
 
