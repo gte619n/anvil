@@ -21,12 +21,11 @@ export async function kicadCliAvailable(): Promise<boolean> {
 }
 
 /**
- * Best-effort check that KiCad's bundled 3D model packages are present — `--subst-models` needs
- * them to place component bodies. We probe the common env vars + default install dirs. This is
- * advisory only: a true/false here never blocks export, it just lets the caller warn the user that
- * boards may render without component models. (Paths differ per OS/version — comment, not gospel.)
+ * Locate KiCad's bundled 3D model packages (the `*.3dshapes` dirs component footprints reference via
+ * `${KICAD*_3DMODEL_DIR}`). Returns the directory or null. We probe the common env vars + default
+ * install dirs; paths differ per OS/version so this is best-effort, not gospel.
  */
-export async function kicadPackages3dAvailable(): Promise<boolean> {
+export async function findKicad3dModelDir(): Promise<string | null> {
   const envDirs = [
     process.env.KICAD9_3DMODEL_DIR,
     process.env.KICAD8_3DMODEL_DIR,
@@ -44,12 +43,21 @@ export async function kicadPackages3dAvailable(): Promise<boolean> {
   for (const dir of [...envDirs, ...commonDirs]) {
     try {
       const s = await (await import("node:fs/promises")).stat(dir);
-      if (s.isDirectory()) return true;
+      if (s.isDirectory()) return dir;
     } catch {
       // not present at this path — keep probing
     }
   }
-  return false;
+  return null;
+}
+
+/**
+ * Advisory check that the 3D model packages are present — `--subst-models` needs them to place
+ * component bodies. A false here never blocks export; it just lets the caller warn that boards may
+ * render as a bare substrate without component models.
+ */
+export async function kicadPackages3dAvailable(): Promise<boolean> {
+  return (await findKicad3dModelDir()) !== null;
 }
 
 /**
@@ -61,12 +69,15 @@ export async function kicadPcbToGlb(pcbPath: string, outPath: string): Promise<v
   if (!(await kicadCliAvailable())) {
     throw new CadConvertError("kicad-cli not found — install KiCad to view PCBs in 3D");
   }
+  // Footprints reference component models via ${KICAD*_3DMODEL_DIR}; define it (to the detected
+  // library) so --subst-models can place component bodies instead of exporting a bare board.
+  const modelDir = await findKicad3dModelDir();
+  const args = ["pcb", "export", "glb", "--subst-models"];
+  if (modelDir) args.push("--define-var", `KICAD9_3DMODEL_DIR=${modelDir}`);
+  args.push("--output", outPath, pcbPath);
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(
-      ["kicad-cli", "pcb", "export", "glb", "--subst-models", "--output", outPath, pcbPath],
-      { stdout: "pipe", stderr: "pipe" },
-    );
+    proc = Bun.spawn(["kicad-cli", ...args], { stdout: "pipe", stderr: "pipe" });
   } catch (err) {
     throw new CadConvertError(
       `failed to launch kicad-cli: ${err instanceof Error ? err.message : String(err)}`,

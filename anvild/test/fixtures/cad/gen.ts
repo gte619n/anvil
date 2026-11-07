@@ -180,6 +180,54 @@ async function glb(): Promise<Uint8Array> {
   return await new WebIO().writeBinary(doc);
 }
 
+// ── Multi-part assembly GLB (base plate + two blocks) ────────────────────────────────────────────
+// A 3-part named assembly so the model tree / isolate / section / explode features have real parts to
+// act on (a single cube can't be exploded). Each part is a transformed copy of the unit cube.
+async function assembly(): Promise<Uint8Array> {
+  const doc = new Document();
+  const buffer = doc.createBuffer();
+  const scene = doc.createScene("assembly");
+  const root = doc.createNode("assembly");
+  scene.addChild(root);
+
+  const part = (name: string, size: [number, number, number], pos: [number, number, number], color: [number, number, number, number]): void => {
+    const positions: number[] = [];
+    const normals: number[] = [];
+    for (const t of TRIS) {
+      for (const i of [t.a, t.b, t.c]) {
+        const v = V[i]!;
+        positions.push((v[0] / S) * size[0] + pos[0], (v[1] / S) * size[1] + pos[1], (v[2] / S) * size[2] + pos[2]);
+        normals.push(t.n[0], t.n[1], t.n[2]);
+      }
+    }
+    const posA = doc.createAccessor().setType("VEC3").setArray(new Float32Array(positions)).setBuffer(buffer);
+    const nrmA = doc.createAccessor().setType("VEC3").setArray(new Float32Array(normals)).setBuffer(buffer);
+    const mat = doc.createMaterial(`${name}_mat`).setBaseColorFactor(color).setRoughnessFactor(0.6).setMetallicFactor(0.1);
+    const prim = doc.createPrimitive().setAttribute("POSITION", posA).setAttribute("NORMAL", nrmA).setMaterial(mat);
+    root.addChild(doc.createNode(name).setMesh(doc.createMesh(name).addPrimitive(prim)));
+  };
+
+  part("base", [40, 2, 24], [0, 0, 0], [0.45, 0.48, 0.52, 1]);
+  part("block_a", [8, 8, 8], [6, 2, 8], [0.82, 0.45, 0.4, 1]);
+  part("block_b", [10, 12, 8], [24, 2, 8], [0.4, 0.55, 0.75, 1]);
+
+  doc.getRoot().setDefaultScene(scene);
+  doc.getRoot().getAsset().extras = {
+    units: "mm",
+    tree: {
+      name: "assembly",
+      meshIndices: [],
+      children: [
+        { name: "base", meshIndices: [0], children: [] },
+        { name: "block_a", meshIndices: [1], children: [] },
+        { name: "block_b", meshIndices: [2], children: [] },
+      ],
+    },
+  };
+  doc.getRoot().getAsset().generator = "anvil cad fixture gen";
+  return await new WebIO().writeBinary(doc);
+}
+
 // ── 3MF (ZIP: [Content_Types].xml + _rels/.rels + 3D/3dmodel.model) ──────────────────────────────
 function threeMf(): Uint8Array {
   const contentTypes =
@@ -336,6 +384,7 @@ async function main(): Promise<void> {
     [join(MESH, "cube.mtl"), mtl],
     [join(MESH, "cube.ply"), asciiPly()],
     [join(MESH, "cube.glb"), await glb()],
+    [join(MESH, "assembly.glb"), await assembly()],
     [join(MESH, "cube.3mf"), threeMf()],
     [join(MESH, "cube.dae"), collada()],
   ];
@@ -356,4 +405,4 @@ if (import.meta.main) {
   await main();
 }
 
-export { asciiStl, binaryStl, objMtl, asciiPly, glb, threeMf, collada, gerbers, drill, S, TRIS, V };
+export { asciiStl, binaryStl, objMtl, asciiPly, glb, assembly, threeMf, collada, gerbers, drill, S, TRIS, V };

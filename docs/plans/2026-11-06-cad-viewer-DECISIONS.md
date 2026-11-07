@@ -239,6 +239,34 @@ Rendered STEP→GLB, Gerber, section, explode in a real browser. **This surfaced
   harness/test fixture mutation, `process`-not-defined, Node-streams-in-browser (Gerber), CSS
   `[hidden]` override. Five. Visual/functional verification is not optional for this feature.
 
+## KiCad 3D assembly + multi-part fixture (owner: "do the KiCad 3D assembly models")
+
+- **DL-48 (🐞→✅ KiCad 3D was half-built; now works).** The daemon could export a PCB→GLB but (a) the
+  **client had no 3D entry point** — `.kicad_pcb` always rendered as 2D KiCanvas (cad.ts:239), and (b)
+  the export produced a **bare board** (no component bodies). Fixes:
+  - **Daemon:** `kicad.ts` now locates the 3D model library (`findKicad3dModelDir`) and passes
+    `--define-var KICAD9_3DMODEL_DIR=<dir>` so `--subst-models` places component bodies. Verified: bare
+    board 12 tris → populated 492 tris (board + resistor + capacitor).
+  - **Fixture:** added `(model …)` refs (portable `${KICAD9_3DMODEL_DIR}` form) to R1/C1.
+  - **Client:** new **2D↔3D toggle** (`data-act="ecad3d"`, shown only for `.kicad_pcb`). 3D routes the
+    board through the existing brep pipeline (`io.cadUrl` → daemon kicad-cli GLB). Extracted
+    `teardownActive()` from `closeViewer` for clean switching.
+  - A toggle crash (`init3d` on a null `active` after teardown) was found + fixed (recreate the skeleton).
+  - **Result: the 3D view renders the green board with both component bodies placed on it** — visually
+    verified (`shot-app.ts` scene=kicad, 3D). Needs kicad-cli + the 3D model lib on the host (gated).
+- **DL-49 (✅ section/explode/tree now demonstrable).** Added a **3-part assembly GLB** fixture
+  (`mesh/assembly.glb`: base plate + two blocks, via `gen.ts assembly()`). With real parts:
+  **explode** separates them radially (clear), **section** clips away the far block + half the plate
+  (clear), and the **model tree** drawer lists assembly→base/block_a/block_b with show/isolate/xray.
+- **DL-50 (🐞→✅ tree drawer didn't open).** The CSS targeted `.cad-tree.cad-tree-open` but
+  `toggleTree` puts `cad-tree-open` on the **shell** (the drawer's parent). Fixed to
+  `.cad-shell.cad-tree-open .cad-tree`. (Bug #8 found only by rendering.)
+- **DL-51 (⚠️ measurement partial).** Measure **mode + live bbox readout** render, but an automated
+  two-click **point-to-point** dimension couldn't be driven cleanly (synthetic canvas picks are
+  finicky). The snap math is unit-tested (9 tests); the point-to-point UI is **not** visually
+  demonstrated. Also noted: mesh-GLB units label reads "m" (the mesh path assumes metres; our fixture
+  declares mm in extras) — a minor label gap for mesh fixtures.
+
 ## Status after the second pass — all 11 phases built
 
 **Built + in-env-verified: Phases 0–10 (all).** The first pass delivered 0,1,2,4,5,7,8; the second pass

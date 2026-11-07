@@ -1364,7 +1364,7 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-dl { color: var(--accent); text-decoration: none; font-weight: 600; }
 /* Model tree drawer */
 .cad-tree { position: absolute; top: 0; right: 0; width: min(280px, 80%); height: 100%; background: var(--bg); border-left: 1px solid var(--border); transform: translateX(100%); transition: transform 0.18s ease; z-index: 5; display: flex; flex-direction: column; }
-.cad-tree.cad-tree-open { transform: none; }
+.cad-shell.cad-tree-open .cad-tree { transform: none; }
 .cad-tree-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 13px; }
 .cad-tree-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 0; }
 .cad-tree-all { display: flex; gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--border); }

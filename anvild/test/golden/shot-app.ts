@@ -45,7 +45,7 @@ const io = {
   listSiblings: async () => (await (await fetch(base + "/siblings")).json()),
 };
 const scene = new URLSearchParams(location.search).get("scene");
-const target = scene === "step" ? "cube.step" : scene === "gerber" ? "board.gtl" : scene === "kicad" ? "board.kicad_pcb" : "cube.glb";
+const target = scene === "step" ? "cube.step" : scene === "gerber" ? "board.gtl" : scene === "kicad" ? "board.kicad_pcb" : scene === "assembly" ? "assembly.glb" : "cube.glb";
 try { openCadViewer(target, io); }
 catch (e) { document.body.innerHTML = "<pre style='color:red'>" + (e && e.stack || e) + "</pre>"; }
 `,
@@ -127,15 +127,37 @@ const setRange = async (page: import("playwright-core").Page, role: string, v: n
 await shot("step", "shot-step.png");
 await shot("gerber", "shot-gerber.png");
 await shot("kicad", "shot-kicad.png", async (page) => { await page.waitForTimeout(4000); }); // KiCanvas parse + WebGL
-await shot("cube", "shot-section.png", async (page) => {
+await shot("kicad", "shot-kicad3d.png", async (page) => {
+  await page.waitForTimeout(4000); // let the 2D board settle first
+  await page.click('[data-act="ecad3d"]'); // switch to the 3D board (daemon kicad-cli → GLB)
+  await page.waitForTimeout(7000); // kicad-cli export + GLB stream + render
+});
+await shot("assembly", "shot-section.png", async (page) => {
   await page.click('[data-act="section"]');
-  await setRange(page, "section-pos", 0.45);
+  await setRange(page, "section-pos", 0.5);
   await page.waitForTimeout(500);
 });
-await shot("cube", "shot-explode.png", async (page) => {
+await shot("assembly", "shot-explode.png", async (page) => {
   await page.click('[data-act="explode"]');
-  await setRange(page, "explode-pos", 0.6);
+  await setRange(page, "explode-pos", 0.65);
   await page.waitForTimeout(500);
+});
+await shot("assembly", "shot-tree.png", async (page) => {
+  await page.click('[data-act="tree"]');
+  await page.waitForTimeout(500);
+});
+await shot("assembly", "shot-measure.png", async (page) => {
+  await page.click('[data-act="measure"]');
+  const canvas = await page.$("#modal-root canvas");
+  const b = await canvas!.boundingBox();
+  if (b) {
+    // Click the base plate's two front corners → snap to nearest vertices → a width dimension.
+    await page.mouse.move(b.x + b.width * 0.30, b.y + b.height * 0.64);
+    await page.mouse.click(b.x + b.width * 0.30, b.y + b.height * 0.64);
+    await page.mouse.move(b.x + b.width * 0.77, b.y + b.height * 0.58);
+    await page.mouse.click(b.x + b.width * 0.77, b.y + b.height * 0.58);
+  }
+  await page.waitForTimeout(700);
 });
 
 await browser.close();

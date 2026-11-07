@@ -131,6 +131,7 @@ function buildChrome(path: string): Chrome {
     `<button type="button" class="cad-btn" data-act="section" title="Section / clipping plane">${icon("content_cut")}</button>` +
     `<button type="button" class="cad-btn" data-act="explode" title="Exploded view">${icon("open_in_full")}</button>` +
     `<button type="button" class="cad-btn" data-act="measure" title="Measure (approximate / mesh)">${icon("straighten")}</button>` +
+    `<button type="button" class="cad-btn" data-act="ecad3d" title="3D board" hidden>${icon("view_in_ar")}</button>` +
     `<button type="button" class="cad-btn" data-act="snapshot" title="Snapshot (PNG)">${icon("photo_camera")}</button>` +
     `<button type="button" class="cad-btn" data-act="close" title="Close">${icon("close")}</button>` +
     `</div>` +
@@ -237,6 +238,12 @@ export function openCadViewer(path: string, io: CadIo): void {
   }
 
   if (kind === "gerber" || kind === "kicad-pcb" || kind === "kicad-sch") {
+    // KiCad boards get a 2D (KiCanvas) ↔ 3D (daemon kicad-cli GLB) toggle; schematics/Gerber stay 2D.
+    if (kind === "kicad-pcb") {
+      kicadToggle = { path, chrome, io, is3d: false };
+      const b3d = chrome.wrap.querySelector<HTMLButtonElement>('[data-act="ecad3d"]');
+      if (b3d) b3d.hidden = false;
+    }
     void delegateEcad(path, kind, chrome, io);
     return;
   }
@@ -298,6 +305,9 @@ async function handleAction(act: string, chrome: Chrome): Promise<void> {
       break;
     case "explode":
       toggleExplode(chrome);
+      break;
+    case "ecad3d":
+      await toggleKicad3d(chrome);
       break;
     case "measure":
       await toggleMeasure(chrome);
@@ -1110,13 +1120,14 @@ function disposeMaterial(mat: Material | Material[]): void {
   for (const m of mats) m.dispose();
 }
 
-function closeViewer(): void {
+/** Dispose the active 3D viewer (renderer/geometry/controls/inspector/measure) without closing the
+ *  modal — shared by closeViewer and the KiCad 2D↔3D toggle. */
+function teardownActive(): void {
   const v = active;
   // Tear down measurement + inspector BEFORE nulling `active` (both read it).
   teardownMeasure();
   v?.inspector?.dispose();
   active = null;
-  closeModal();
   if (!v) return;
 
   if (v.raf) cancelAnimationFrame(v.raf);
@@ -1136,5 +1147,53 @@ function closeViewer(): void {
     // Force the context to drop so the browser reclaims the WebGL resource promptly.
     r.forceContextLoss?.();
     r.domElement.remove();
+  }
+}
+
+function closeViewer(): void {
+  kicadToggle = null;
+  teardownActive();
+  closeModal();
+}
+
+// ── KiCad 2D (KiCanvas) ↔ 3D (daemon kicad-cli GLB) toggle (Phase 5) ────────────────────────────
+let kicadToggle: { path: string; chrome: Chrome; io: CadIo; is3d: boolean } | null = null;
+
+async function toggleKicad3d(chrome: Chrome): Promise<void> {
+  if (!kicadToggle) return;
+  const { path, io } = kicadToggle;
+  const to3d = !kicadToggle.is3d;
+
+  teardownActive(); // drop the 3D viewer if it was up
+  const prevCleanup = (chrome.stage as unknown as { __cadCleanup?: () => void }).__cadCleanup;
+  if (typeof prevCleanup === "function") {
+    try {
+      prevCleanup();
+    } catch {
+      /* a failed ECAD teardown must not block the switch */
+    }
+  }
+  chrome.stage.replaceChildren();
+  kicadToggle.is3d = to3d;
+
+  const btn = chrome.wrap.querySelector<HTMLButtonElement>('[data-act="ecad3d"]');
+  if (btn) {
+    btn.classList.toggle("active", to3d);
+    btn.title = to3d ? "2D view (KiCanvas)" : "3D board";
+  }
+
+  if (to3d) {
+    // The .kicad_pcb's cadUrl routes to the daemon, which runs `kicad-cli pcb export glb` with the
+    // component 3D models and streams the GLB back — rendered by the same brep 3D pipeline.
+    // Recreate the viewer skeleton teardownActive() cleared; init3d populates renderer/scene/model.
+    active = { units: "—", zUp: false, view: "iso", wireframe: false, fileName: fileNameOf(path), path, io, chrome };
+    showStatus(chrome.statusArea, `<div class="cad-card">${icon("hourglass_empty")} Building 3D board…</div>`);
+    try {
+      await init3d(path, "brep", chrome, io);
+    } catch (err) {
+      showError(chrome.statusArea, err instanceof Error ? err.message : String(err), io.fileUrl(path), fileNameOf(path));
+    }
+  } else {
+    await delegateEcad(path, "kicad-pcb", chrome, io);
   }
 }

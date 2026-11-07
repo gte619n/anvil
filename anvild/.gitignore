@@ -18,3 +18,5 @@ test/golden/app-shot.png
 test/golden/test-results/
 test-results/
 test/golden/shot-*.png
+test/fixtures/cad/kicad/*.kicad_prl
+test/fixtures/cad/kicad/*.kicad_pro
