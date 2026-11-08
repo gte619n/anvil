@@ -1356,8 +1356,9 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-hud { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: linear-gradient(var(--bg), transparent); pointer-events: none; z-index: 2; }
 .cad-name { font-weight: 600; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cad-units { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
-.cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: wrap; justify-content: center; max-width: calc(100% - 24px); }
-.cad-btn { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: none; background: transparent; color: var(--text); border-radius: 8px; cursor: pointer; }
+.cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: nowrap; justify-content: center; max-width: calc(100% - 24px); overflow-x: auto; scrollbar-width: none; }
+.cad-tools::-webkit-scrollbar { display: none; }
+.cad-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: none; background: transparent; color: var(--text); border-radius: 8px; cursor: pointer; }
 .cad-btn:hover { background: var(--tool-bg); }
 .cad-btn.active { background: var(--accent); color: #fff; }
 .cad-status { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; z-index: 4; }

@@ -191,6 +191,12 @@ export function openCadViewer(path: string, io: CadIo): void {
   const chrome = buildChrome(path);
   const name = fileNameOf(path);
 
+  // Release any viewer still open before replacing `active`. Opening file-after-file via the chat
+  // chips otherwise orphans the previous WebGLRenderer (its context is never forceContextLoss'd), and
+  // Android WebView's small live-context cap then fails EVERY later open with "Error creating WebGL
+  // context" — the viewer stops working for anything until the page reloads.
+  releaseActiveViewer();
+
   active = {
     units: "—",
     zUp: false,
@@ -513,6 +519,18 @@ async function wireGltfDecoders(loader: { setMeshoptDecoder(d: unknown): unknown
     loader.setMeshoptDecoder(MeshoptDecoder);
   } catch {
     // If the decoder module can't load, uncompressed GLBs still parse — degrade quietly.
+  }
+  // Draco is what real glTF exporters (Blender, gltf-transform, …) emit by default, so a user's `.glb`
+  // is as likely compressed as not. Without a DRACOLoader, GLTFLoader throws "No DRACOLoader instance
+  // provided" on those (the one format that'd fail while STL/OBJ/server-STEP open). The decoder ships
+  // with three and is copied to `/draco/` at build time (web/build.ts; also bundled into the apps).
+  try {
+    const { DRACOLoader } = await import("three/examples/jsm/loaders/DRACOLoader.js");
+    const draco = new DRACOLoader();
+    draco.setDecoderPath("/draco/"); // static asset on the UI origin (same place as /katex, /xterm.css)
+    loader.setDRACOLoader?.(draco);
+  } catch {
+    // Draco GLBs won't parse, but uncompressed / meshopt ones still will.
   }
 }
 
@@ -1152,9 +1170,26 @@ function teardownActive(): void {
   }
 }
 
-function closeViewer(): void {
+/** Fully release the active viewer (3D renderer/context + ECAD cleanup) WITHOUT touching the modal.
+ *  Shared by closeViewer and openCadViewer so neither path leaks a WebGL context. */
+function releaseActiveViewer(): void {
+  const prev = active;
+  if (!prev) return;
   kicadToggle = null;
-  teardownActive();
+  teardownActive(); // disposes the 3D renderer + forceContextLoss; nulls `active`
+  // Gerber / KiCad 2D stash their own teardown on the stage element (no renderer to drop).
+  const cleanup = (prev.chrome?.stage as unknown as { __cadCleanup?: () => void } | undefined)?.__cadCleanup;
+  if (typeof cleanup === "function") {
+    try {
+      cleanup();
+    } catch {
+      /* a failed ECAD teardown must not block the next open */
+    }
+  }
+}
+
+function closeViewer(): void {
+  releaseActiveViewer();
   closeModal();
 }
 
