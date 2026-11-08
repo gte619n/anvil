@@ -32,7 +32,7 @@ import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
 import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } from "./fleet-rollout";
 import { FleetJobs } from "./fleet-jobs";
 import { resolveTargetSha } from "../daemon/selfupdate";
-import { FileExists } from "../fs/session-fs";
+import { FileExists, FileNotFound } from "../fs/session-fs";
 import type { MarkdownRenderer } from "../render/markdown";
 import type { ConnState } from "./connection";
 import { join } from "node:path";
@@ -1268,25 +1268,39 @@ export function createServer(opts: ServerOptions): ServerHandle {
     return new Response("expected a websocket upgrade", { status: 426 });
   });
 
+  // Resolve a worktree path to a single existing file for byte-serving (files/cad download), forgiving
+  // a prose basename the same way the reader (fsRead) does: a chip linkified from prose names the file
+  // by basename, but it may live in a subdir. Returns the abs path, or a Response to short-circuit
+  // (404 not-found / ambiguous, 403 escapes the tree). Keeps download cards working (exact path → hit).
+  const locateForServe = (sessionId: string, path: string): string | Response => {
+    try {
+      const located = supervisor.fsLocate(sessionId, path);
+      if (located.kind === "choices") {
+        return new Response(`"${path}" matches ${located.paths.length} files — open it from the Files panel.`, { status: 404 });
+      }
+      return located.abs;
+    } catch (e) {
+      if (e instanceof FileNotFound) return new Response("not found", { status: 404 });
+      return new Response("forbidden", { status: 403 });
+    }
+  };
+
   // worktree files (arch §8.1): serve a binary/image file from the session worktree.
   // `download=1` forces a save-as via Content-Disposition (used by file-offer download cards, §8).
   const FILES_RE = /^\/api\/sessions\/([^/]+)\/files$/;
   routeRe("GET", FILES_RE, async (_req, url, m) => {
     const sessionId = m![1]!;
     const path = url.searchParams.get("path") ?? "";
-    try {
-      const abs = supervisor.fsResolve(sessionId, path);
-      const file = Bun.file(abs);
-      if (!(await file.exists())) return new Response("not found", { status: 404 });
-      const headers: Record<string, string> = {};
-      if (url.searchParams.get("download")) {
-        const name = (abs.split("/").pop() || "download").replace(/["\\]/g, "_");
-        headers["Content-Disposition"] = `attachment; filename="${name}"`;
-      }
-      return new Response(file, { headers });
-    } catch {
-      return new Response("forbidden", { status: 403 });
+    const hit = locateForServe(sessionId, path);
+    if (hit instanceof Response) return hit;
+    const abs = hit;
+    const file = Bun.file(abs);
+    const headers: Record<string, string> = {};
+    if (url.searchParams.get("download")) {
+      const name = (abs.split("/").pop() || "download").replace(/["\\]/g, "_");
+      headers["Content-Disposition"] = `attachment; filename="${name}"`;
     }
+    return new Response(file, { headers });
   });
   // Upload a dropped file into the worktree at `path` (streamed raw body, not base64). Refuses
   // to overwrite an existing path → 409, so a drag-drop can't silently clobber (arch §8.1).
@@ -1312,15 +1326,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
     const sessionId = m![1]!;
     const path = url.searchParams.get("path") ?? "";
     const lod = Number(url.searchParams.get("lod")) || 1_500_000;
-    let bytes: Uint8Array;
-    try {
-      const abs = supervisor.fsResolve(sessionId, path);
-      const file = Bun.file(abs);
-      if (!(await file.exists())) return new Response("not found", { status: 404 });
-      bytes = new Uint8Array(await file.arrayBuffer());
-    } catch {
-      return new Response("forbidden", { status: 403 });
-    }
+    const hit = locateForServe(sessionId, path);
+    if (hit instanceof Response) return hit;
+    const bytes = new Uint8Array(await Bun.file(hit).arrayBuffer());
     const res = await serveCad(opts.stateDir, bytes, path, lod);
     if (res.glb) {
       // Copy into a fresh ArrayBuffer-backed view so it satisfies BodyInit under TS's strict
@@ -1338,12 +1346,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
     const sessionId = m![1]!;
     const path = url.searchParams.get("path") ?? "";
     const side = url.searchParams.get("side") === "bottom" ? "bottom" : "top";
-    let abs: string;
-    try {
-      abs = supervisor.fsResolve(sessionId, path);
-    } catch {
-      return new Response("forbidden", { status: 403 });
-    }
+    const hit = locateForServe(sessionId, path);
+    if (hit instanceof Response) return hit;
+    const abs = hit;
     try {
       const { renderGerberFromDir } = await import("../cad/gerber");
       const stackup = await renderGerberFromDir(abs);

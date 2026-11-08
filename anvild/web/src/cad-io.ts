@@ -9,6 +9,19 @@ function filesPath(sid: string, path: string): string {
   return `/api/sessions/${sid}/files?path=${encodeURIComponent(path)}`;
 }
 
+/** Reject a non-OK fetch with the server's message instead of handing the error body (e.g. a 404
+ *  "not found") to a binary loader — a truncated/HTML body makes STLLoader throw the opaque "Offset
+ *  is outside the bounds of the DataView" (and "Download original" then 404s too). Surfaces the real
+ *  reason in the viewer's error card. */
+async function okOrThrow(resP: Promise<Response>, path: string): Promise<Response> {
+  const res = await resP;
+  if (!res.ok) {
+    const msg = (await res.text().catch(() => "")).trim();
+    throw new Error(`Couldn't load ${path.split("/").pop() || path} — ${msg || res.statusText || res.status}`);
+  }
+  return res;
+}
+
 // A monotonic-ish suffix so repeated snapshots don't 409 against the no-overwrite PUT route.
 let snapSeq = 0;
 
@@ -26,8 +39,8 @@ export function makeCadIo(opts: {
     fileUrl: (p) => serverApiUrl(base(), filesPath(sid(), p)),
     cadUrl: (p, lod) => serverApiUrl(base(), `/api/sessions/${sid()}/cad?path=${encodeURIComponent(p)}&lod=${lod}`),
     gerberUrl: (p, side) => serverApiUrl(base(), `/api/sessions/${sid()}/cad-gerber?path=${encodeURIComponent(p)}&side=${side}`),
-    fetchBytes: async (p) => new Uint8Array(await (await serverFetch(base(), filesPath(sid(), p))).arrayBuffer()),
-    fetchText: async (p) => (await serverFetch(base(), filesPath(sid(), p))).text(),
+    fetchBytes: async (p) => new Uint8Array(await (await okOrThrow(serverFetch(base(), filesPath(sid(), p)), p)).arrayBuffer()),
+    fetchText: async (p) => (await okOrThrow(serverFetch(base(), filesPath(sid(), p)), p)).text(),
     listSiblings: async (p) => {
       if (!opts.listDir) return [];
       const dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";

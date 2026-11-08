@@ -106,7 +106,7 @@ import { OpenRouterClient } from "../integrations/openrouter";
 import { reviewPlan, formatReview } from "../integrations/adversarial";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { AttachmentStore } from "../attach/store";
-import { FileNotFound, listDir, locateInside, readFile, resolveInside, writeFile } from "../fs/session-fs";
+import { FileNotFound, type Located, listDir, locateInside, readFile, resolveInside, writeFile } from "../fs/session-fs";
 import * as git from "../git/ops";
 import * as selfupdate from "../daemon/selfupdate";
 import { UpdateStateStore } from "../daemon/update-state";
@@ -1321,6 +1321,14 @@ export class Supervisor {
   }
   fsResolve(sessionId: string, path: string): string {
     return resolveInside(this.require(sessionId).data.cwd, path);
+  }
+  /** Forgiving resolve for byte-serving (files/cad download): like the reader (fsRead), a prose
+   *  basename that lives in a subdir still resolves. `fsResolve` is exact-only, so a chip linkified
+   *  from prose (e.g. "mirror_riser_v3_preview.stl") 404'd there even though the file exists deeper
+   *  in the tree. Throws FileNotFound when nothing matches; returns `choices` when a bare basename is
+   *  ambiguous (the caller can't serve bytes for that — it surfaces a "open from Files" hint). */
+  fsLocate(sessionId: string, path: string): Located {
+    return locateInside(this.require(sessionId).data.cwd, path);
   }
   fsWrite(sessionId: string, path: string, data: Uint8Array): { path: string; size: number } {
     return writeFile(this.require(sessionId).data.cwd, path, data);
