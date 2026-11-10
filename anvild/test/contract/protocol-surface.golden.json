@@ -46,6 +46,8 @@
     "autopilot.verify.keep",
     "autopilot.verify.metrics",
     "budget",
+    "claudecli.check",
+    "claudecli.status",
     "command.error",
     "conversation.snapshot",
     "daemon.update",

@@ -111,6 +111,7 @@ import {
   loadTodoistProjects,
   onAuthAccounts,
   onAuthStatus,
+  onClaudeCliStatus,
   onLapoStatus,
   onModelCatalog,
   onPipelineMetrics,
@@ -1618,6 +1619,11 @@ function onEvent(url: string, e: ServerEvent): void {
       // Model labels are hub-authoritative (the hub resolves them from the Models API). Ignore a
       // fleet member's own copy so it can't clobber the hub's labels.
       if (url === HUB_URL) onModelLabels(e);
+      return;
+    case "claudecli.status":
+      // The Claude engine card is hub-scoped (the "Update" button drives the hub's fleet fan-out), so
+      // show the hub's status and ignore members' own copies.
+      if (url === HUB_URL) onClaudeCliStatus(e.info);
       return;
     case "todoist.status":
       // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).

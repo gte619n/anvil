@@ -581,6 +581,24 @@ export interface ModelLabelsEvent extends Envelope {
   checkedAt?: string; // ISO 8601 of the hub's last catalog check (absent/"" if never)
 }
 /**
+ * The Claude Code CLI this daemon spawns sessions with (docs/plans/2026-11-10-managed-claude-cli-updates.md).
+ * The CLI is bundled with the pinned agent-sdk, but can be advanced to the latest published version
+ * WITHOUT an Anvil release by installing a "managed" copy under the state dir. Gated by the
+ * "claude-cli-update" capability.
+ */
+export interface ClaudeCliInfo {
+  active: string; // version actually spawned (managed when installed & valid, else bundled)
+  bundled: string; // CLI version shipped with the pinned agent-sdk — the floor/fallback
+  managed: boolean; // is an independently-installed CLI currently in effect?
+  latest?: string; // newest published version per the npm registry (set by the background check)
+  checkedAt?: string; // ISO 8601 of the last `latest` check
+}
+/** Per-daemon Claude CLI status, broadcast on change + as the reply to `claudecli.check`. */
+export interface ClaudeCliStatusEvent extends Envelope {
+  type: "claudecli.status";
+  info: ClaudeCliInfo;
+}
+/**
  * First frame the server sends on every WS connection (before session.list/budget/
  * environments) — tells the client which server it just connected to (anvil-multi-server.md
  * §3/§6). A client federating many servers keys each socket's sessions/environments by
@@ -1426,6 +1444,7 @@ export type ServerEvent =
   | EnvironmentsEvent
   | PromptsEvent
   | ModelLabelsEvent
+  | ClaudeCliStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
   | LapoStatusEvent
@@ -1995,6 +2014,14 @@ export interface ModelRefreshCmd extends Envelope, Correlated {
   type: "model.refresh";
 }
 
+// Force an immediate check for a newer Claude Code CLI (Settings → Models → "Check for updates" on
+// the Claude engine card). The hub re-reads the npm registry's `latest` dist-tag and replies with a
+// fresh `claudecli.status` on the requester's socket (broadcasting if the newest version changed).
+// This is check-only — applying an update is a separate REST call. Gated by "claude-cli-update".
+export interface ClaudeCliCheckCmd extends Envelope, Correlated {
+  type: "claudecli.check";
+}
+
 // 5d. Terminal (§7)
 
 export interface TerminalOpenCmd extends Envelope, Correlated {
@@ -2150,6 +2177,7 @@ export type ClientCommand =
   | LoopIntakeCmd
   | DaemonUpdateCmd
   | ModelRefreshCmd
+  | ClaudeCliCheckCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd
@@ -2413,6 +2441,65 @@ export namespace rest {
     startedAt?: number;
     finishedAt?: number;
     members: FleetRolloutMember[];
+  }
+
+  /**
+   * Managed Claude CLI updates (docs/plans/2026-11-10-managed-claude-cli-updates.md). Advance the
+   * Claude engine to a newer published version without an Anvil release. Per-daemon install +
+   * status; hub-driven fleet fan-out. Version-independent REST (like daemon.update), identity-gated.
+   */
+  export namespace claudecli {
+    /** GET /api/claude-cli/status → this daemon's engine status. */
+    export interface StatusResponse {
+      ok: boolean;
+      info: ClaudeCliInfo;
+      error?: string;
+    }
+    /** POST /api/claude-cli/install {version?} → install (default: latest) on THIS daemon. */
+    export interface InstallRequest {
+      version?: string; // omit ⇒ newest published
+    }
+    export interface InstallResponse {
+      ok: boolean;
+      info: ClaudeCliInfo; // post-install status (active now reflects the managed version)
+      output: string; // human-readable install log / error text
+      error?: string;
+    }
+
+    // ── Hub fleet fan-out ──────────────────────────────────────────────────────────────────────
+    export type MemberState =
+      | "pending" // queued, not yet contacted
+      | "pending-offline" // unreachable at fan-out time
+      | "installing" // install accepted, in progress on the member
+      | "healthy" // installed the target version
+      | "error"; // install rejected / failed
+    export interface Member {
+      serverId: string;
+      serverName: string;
+      isHub: boolean; // the hub installs itself last
+      state: MemberState;
+      version?: string; // the member's active CLI version once known
+      detail?: string; // human-readable note (error text, "offline", …)
+    }
+    /** POST /api/fleet/claude-cli/update {version?} → resolve one target, fan out to all members. */
+    export interface FleetUpdateRequest {
+      version?: string; // omit ⇒ the hub resolves the newest published version once and pins it
+    }
+    export interface FleetUpdateResponse {
+      ok: boolean;
+      version: string; // the pinned target version the whole fleet converges to
+      members: Member[];
+      error?: string;
+    }
+    /** GET /api/fleet/claude-cli/update/status → rollout snapshot. */
+    export interface FleetUpdateStatusResponse {
+      ok: boolean;
+      active: boolean;
+      version: string; // last/current pinned target ("" if never run)
+      startedAt?: number;
+      finishedAt?: number;
+      members: Member[];
+    }
   }
 
   // ── Joiner-side pairing on :7701 (anvil-headless-join.md §5.3) ───────────────────────────────

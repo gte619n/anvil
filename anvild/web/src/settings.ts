@@ -66,7 +66,7 @@ import {
   type Server,
 } from "./fleet";
 import { MODELS, modelLabel } from "../../protocol";
-import type { AccountInfo, AuthAccountsEvent, AuthStatusEvent, Environment, Model, ModelTierInfo, PipelineAdversaryStat, ServerEvent, Session, TodoistProjectInfo } from "../../protocol";
+import type { AccountInfo, AuthAccountsEvent, AuthStatusEvent, ClaudeCliInfo, Environment, Model, ModelTierInfo, PipelineAdversaryStat, rest, ServerEvent, Session, TodoistProjectInfo } from "../../protocol";
 
 // ── Injected dependencies (initSettings) ─────────────────────────────────────────────────────────
 // What settings code calls back into main.ts for. Each field documents the main.ts state it reaches.
@@ -650,6 +650,25 @@ export function onModelCatalog(catalog: Partial<Record<Model, ModelTierInfo>>, c
   if (document.getElementById("models-panel")) renderModelsPanel();
 }
 
+// The hub's Claude engine (CLI) status — active/bundled/latest version — forwarded from main's
+// `claudecli.status` handler. Powers the "Claude engine" card and its "update available" badge.
+let claudeCli: ClaudeCliInfo | null = null;
+export function onClaudeCliStatus(info: ClaudeCliInfo): void {
+  claudeCli = info;
+  if (document.getElementById("models-panel")) renderModelsPanel();
+}
+
+/** `a` is strictly newer than `b` by dotted-numeric comparison ("2.1.322" > "2.1.290"). */
+function versionNewer(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d > 0;
+  }
+  return false;
+}
+
 /** The live "Models" list: every tier the session picker offers, the exact model it resolves to today,
  *  and a "Check for updates" button that forces a Models-API re-check so a brand-new Anthropic release
  *  shows up without cutting a new build. The button is gated on the hub's "model-catalog" capability. */
@@ -688,6 +707,90 @@ async function refreshModels(btn: HTMLButtonElement): Promise<void> {
       return;
     }
     toast(JSON.stringify(modelCatalog) !== before ? "Models updated to the latest release." : "Models are up to date.");
+  });
+}
+
+/** The "Claude engine" card: which Claude Code CLI the fleet runs sessions on, and a one-click update
+ *  to the latest published version — no Anvil release needed. Gated on "claude-cli-update". The engine
+ *  is bundled with Anvil but can be advanced independently (managed-claude-cli-updates spec). */
+function claudeEngineCard(): string {
+  if (!serverSupports(hub(), "claude-cli-update")) return "";
+  if (!claudeCli) return `<div class="card"><b>Claude engine</b><p class="small muted">Loading…</p></div>`;
+  const { active, bundled, managed, latest, checkedAt } = claudeCli;
+  const updatable = latest ? versionNewer(latest, active) : false;
+  const checked = checkedAt ? `Last checked ${new Date(checkedAt).toLocaleString()}` : "Not checked yet";
+  const badge = updatable
+    ? `<span class="warn small">${icon("arrow_circle_up")} Update available → ${esc(latest!)}</span>`
+    : `<span class="small muted">${icon("check")} Up to date</span>`;
+  const source = managed ? "managed install" : `bundled with Anvil${bundled !== active ? ` (${esc(bundled)})` : ""}`;
+  return `<div class="card"><b>Claude engine <span class="small muted">(Claude Code CLI)</span></b>
+      <p class="small muted">The Claude Code version every session on the fleet runs on. New Anthropic models need a recent CLI; update it here — to the latest published release — without waiting for a new Anvil build. Rolls out to every reachable machine.</p>
+      <table class="pt-table small"><tbody>
+        <tr><td><b>Active</b></td><td><code class="small">${esc(active)}</code> <span class="small muted">(${esc(source)})</span></td></tr>
+        <tr><td><b>Latest</b></td><td>${latest ? `<code class="small">${esc(latest)}</code>` : `<span class="small muted">—</span>`} ${badge}</td></tr>
+      </tbody></table>
+      <div class="card-main" style="margin-top:8px;gap:8px">
+        <button id="cli-update" class="primary${updatable ? "" : " ghost"}">${icon("arrow_circle_up")} Update Claude engine</button>
+        <button id="cli-check" class="mini">${icon("refresh")} Check for updates</button>
+        <span class="small muted" style="margin-left:auto">${esc(checked)}</span>
+      </div>
+      <pre id="cli-update-output" class="small" hidden style="margin-top:8px;white-space:pre-wrap"></pre></div>`;
+}
+
+/** Force a registry re-check for a newer CLI; the hub pushes fresh `claudecli.status` before it acks
+ *  (→ onClaudeCliStatus → re-render), so we just word the toast from the result. */
+async function checkClaudeCli(btn: HTMLButtonElement): Promise<void> {
+  const before = claudeCli?.latest;
+  await busy(btn, "Checking…", async () => {
+    const res = await sendAwait(hub(), { type: "claudecli.check", cid: newCid() }, 30_000);
+    if (res.type === "command.error") return toast(res.message);
+    toast(claudeCli?.latest !== before ? `Newest Claude Code is ${claudeCli?.latest}.` : "Claude engine is up to date.");
+  });
+}
+
+/** Roll the latest Claude CLI to the whole fleet: kick off the hub fan-out, then poll status and
+ *  render per-member progress into the card's <pre> (same live-output shape as the Anvil updater). */
+async function updateClaudeCli(btn: HTMLButtonElement): Promise<void> {
+  const out = document.getElementById("cli-update-output");
+  const render = (members: rest.claudecli.Member[], note: string): void => {
+    if (!out) return;
+    out.hidden = false;
+    const lines = members.map((m) => {
+      const where = m.isHub ? `${m.serverName} (hub)` : m.serverName;
+      const ver = m.version ? ` → ${m.version}` : "";
+      const detail = m.detail ? ` — ${m.detail}` : "";
+      return `${m.state.padEnd(16)} ${where}${ver}${detail}`;
+    });
+    out.textContent = `${note}\n\n${lines.join("\n")}`;
+  };
+  await busy(btn, "Updating…", async () => {
+    let resp: Response;
+    try {
+      resp = await serverFetch(HUB_URL, "/api/fleet/claude-cli/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch (e) {
+      return toast(`Couldn't start the update: ${e instanceof Error ? e.message : e}`);
+    }
+    const start = (await resp.json().catch(() => ({}))) as rest.claudecli.FleetUpdateResponse;
+    if (!start.ok) return toast(start.error ?? "Couldn't start the Claude engine update.");
+    render(start.members, `Installing Claude Code ${start.version} across the fleet…`);
+    // Poll until the rollout settles (the native binary is ~300MB per host, so give it room).
+    const deadline = Date.now() + 10 * 60_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2_000));
+      const st = (await (await serverFetch(HUB_URL, "/api/fleet/claude-cli/update/status")).json().catch(() => null)) as rest.claudecli.FleetUpdateStatusResponse | null;
+      if (!st) continue;
+      render(st.members, st.active ? `Installing Claude Code ${st.version} across the fleet…` : `Claude Code ${st.version} rollout complete.`);
+      if (!st.active) {
+        const failed = st.members.filter((m) => m.state === "error" || m.state === "pending-offline");
+        toast(failed.length ? `Updated with ${failed.length} machine(s) needing attention.` : `Fleet updated to Claude Code ${st.version}.`);
+        return;
+      }
+    }
+    toast("Update is taking longer than expected — check the per-machine status above.");
   });
 }
 /** The adversary calibration card (§6.3): first-pass rejection rate per gate — is the review real? */
@@ -754,11 +857,17 @@ function renderModelsPanel(): void {
           <p class="small muted">Paste a fresh key to replace the current one.</p>
           ${orForm("Replace")}</div>`;
   }
-  host.innerHTML = `${modelsListCard()}${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
+  host.innerHTML = `${modelsListCard()}${claudeEngineCard()}${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
 
   // Wire the "Check for updates" button (present only when the hub advertises "model-catalog").
   const refreshBtn = document.getElementById("model-refresh");
   if (refreshBtn) refreshBtn.addEventListener("click", () => void refreshModels(refreshBtn as HTMLButtonElement));
+
+  // Wire the Claude engine card (present only when the hub advertises "claude-cli-update").
+  const cliCheck = document.getElementById("cli-check");
+  if (cliCheck) cliCheck.addEventListener("click", () => void checkClaudeCli(cliCheck as HTMLButtonElement));
+  const cliUpdate = document.getElementById("cli-update");
+  if (cliUpdate) cliUpdate.addEventListener("click", () => void updateClaudeCli(cliUpdate as HTMLButtonElement));
 
   // Wire Claude controls: the roster's own row/menu/dialog handlers, or the legacy single-token form.
   if (serverSupports(rosterServer(), "accounts") && ui.claudeAccounts) {

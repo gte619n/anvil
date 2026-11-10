@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
+import { claudeCliOptions } from "../agent/cli";
 import type { AccountStore } from "../auth/accounts";
 import { makePipelineGuardHook } from "../agent/pipeline-guard";
 import type { QueryLike } from "../agent/query";
@@ -94,7 +95,8 @@ async function runQuery(
       hooks: {
         PreToolUse: [{ hooks: [makePipelineGuardHook(opts.cwd)], timeout: 3600 }],
       },
-      executable: "bun",
+      // Prefer a managed/latest Claude CLI when one is installed, else the bundled one (cli.ts).
+      ...claudeCliOptions(),
       abortController: ac,
       // Built per-call (not cached at module load) so a token set/reset via the UI (auth.set) takes
       // effect for the next planning/refine run without restarting the daemon. See AuthStore. When the

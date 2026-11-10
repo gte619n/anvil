@@ -166,6 +166,17 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         });
         return;
 
+      case "claudecli.check":
+        // Force an immediate "is a newer Claude CLI published?" check (Settings → Models, Claude
+        // engine card). Reply with fresh status (a changed `latest` also broadcasts fleet-wide from
+        // within refreshClaudeCliLatest); ack on success, command.error on a failed registry check.
+        void deps.supervisor.refreshClaudeCliLatest().then((r) => {
+          send(deps.supervisor.claudeCliStatusEvent());
+          if (!r.ok) send(cmdError(r.error ?? "claude CLI check failed", cid));
+          else if (cid) send(ack(cid));
+        });
+        return;
+
       case "session.account.set":
         ackWhenDone(deps.supervisor.setSessionAccount(cmd.sessionId, cmd.accountId), send, cid);
         return;
