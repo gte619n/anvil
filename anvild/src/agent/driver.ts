@@ -2,7 +2,7 @@ import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthrop
 import { claudeCliOptions } from "./cli";
 import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
-import type { CommandInfo, ContextUsage, Model } from "@protocol";
+import type { CommandInfo, ContextUsage, Model, ModelTierInfo } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, asyncLaunchedToolIds, extractResultUsage, signalsTurnActivity, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
@@ -105,6 +105,9 @@ export class AgentDriver {
      *  by the existing /attachments GET route). Injected by the supervisor, which owns the store. When
      *  absent (e.g. unit tests), tool-result screenshots simply aren't surfaced as thumbnails. */
     private readonly saveToolImage?: (mediaType: string, dataBase64: string) => string,
+    /** The hub's live model catalog, so fable resolves to its newest `claude-fable-*` release instead of
+     *  the static pin (see {@link sdkModelId}). Omitted in tests — fable then falls back to the pin. */
+    private readonly modelCatalog?: () => Partial<Record<Model, ModelTierInfo>>,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -145,7 +148,7 @@ export class AgentDriver {
 
   async setModel(model: Model): Promise<void> {
     try {
-      await this.q?.setModel(sdkModelId(model));
+      await this.q?.setModel(sdkModelId(model, this.modelCatalog?.()));
     } catch {
       /* not started yet — picked up at next start */
     }
@@ -232,7 +235,7 @@ export class AgentDriver {
     this.q = this.queryFn({
       prompt: this.input,
       options: {
-        model: sdkModelId(s.data.model), // alias for opus/sonnet/haiku; full id for fable
+        model: sdkModelId(s.data.model, this.modelCatalog?.()), // alias for opus/sonnet/haiku; newest full id for fable
         cwd: s.data.cwd,
         systemPrompt: this.systemPrompt(),
         resume: s.data.claudeSessionId,

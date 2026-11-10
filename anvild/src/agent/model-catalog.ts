@@ -12,7 +12,7 @@
  * metering — so it does NOT violate the arch §3 "no metered ANTHROPIC_API_KEY" invariant.
  */
 import { MODELS, type Model, type ModelTierInfo } from "@protocol";
-import { sdkModelId } from "./models";
+import { modelFamilyPrefix } from "./models";
 
 /** One entry from `GET /v1/models` — only the fields we resolve labels from. */
 export interface ModelCatalogEntry {
@@ -41,11 +41,12 @@ export async function fetchModelCatalog(token: string, doFetch: typeof fetch = f
 
 /**
  * Map each picker tier to the concrete model it resolves to right now: its id, display label, and
- * release date. For an alias tier (`opus`/`sonnet`/`haiku`) that's the newest catalog entry in that
- * family (`claude-opus-*`, …); for a pinned tier (`fable` → `claude-fable-5`) it's the exact id.
- * Labels drop the leading "Claude " to match the picker's style ("Opus 5", not "Claude Opus 5").
- * Tiers with no match are omitted, so the client keeps its static fallback for them. Pure — no
- * network — so it's unit-testable against a fixed catalog.
+ * release date — the newest catalog entry in that tier's id-family (`claude-opus-*`, `claude-fable-*`,
+ * …; see {@link modelFamilyPrefix}). This picks up a new release automatically for every tier, fable
+ * included (so a fresh `claude-fable-5-2` wins over the older `claude-fable-5`). Labels drop the leading
+ * "Claude " to match the picker's style ("Opus 5", not "Claude Opus 5"). Tiers with no match are
+ * omitted, so the client keeps its static fallback for them. Pure — no network — so it's unit-testable
+ * against a fixed catalog.
  */
 export function resolveModelCatalog(entries: ModelCatalogEntry[]): Partial<Record<Model, ModelTierInfo>> {
   const byNewest = entries
@@ -53,10 +54,7 @@ export function resolveModelCatalog(entries: ModelCatalogEntry[]): Partial<Recor
     .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
   const out: Partial<Record<Model, ModelTierInfo>> = {};
   for (const { id } of MODELS) {
-    const sdk = sdkModelId(id);
-    const match = sdk.startsWith("claude-")
-      ? byNewest.find((e) => e.id === sdk) // pinned concrete id (fable)
-      : byNewest.find((e) => e.id.startsWith(`claude-${sdk}-`)); // alias family (opus/sonnet/haiku)
+    const match = byNewest.find((e) => e.id.startsWith(modelFamilyPrefix(id))); // newest in the tier's family
     const label = match?.display_name.replace(/^Claude\s+/i, "").trim();
     if (match && label) {
       out[id] = { modelId: match.id, label, ...(match.created_at ? { releasedAt: match.created_at } : {}) };

@@ -20,13 +20,13 @@ describe("resolveModelLabels", () => {
     expect(labels.haiku).toBe("Haiku 4.5");
   });
 
-  test("resolves the pinned `fable` tier by its exact sdk id, not by family recency", () => {
-    // Even with a (hypothetical) newer fable in the list, the label must track the pinned claude-fable-5.
+  test("resolves `fable` to the newest `claude-fable-*`, like the alias families", () => {
+    // Fable has no SDK alias, but still auto-upgrades: a newer minor (5.2) must win over the base 5.
     const withNewerFable = [
       ...CATALOG,
-      { id: "claude-fable-6", display_name: "Claude Fable 6", created_at: "2027-01-01T00:00:00Z" },
+      { id: "claude-fable-5-2", display_name: "Claude Fable 5.2", created_at: "2026-11-09T18:30:00Z" },
     ];
-    expect(resolveModelLabels(withNewerFable).fable).toBe("Fable 5");
+    expect(resolveModelLabels(withNewerFable).fable).toBe("Fable 5.2");
   });
 
   test("omits a tier with no catalog match so the client keeps its static fallback", () => {
