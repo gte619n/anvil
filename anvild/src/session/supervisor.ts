@@ -15,6 +15,8 @@ import {
   type EnvironmentValidation,
   type PromptsEvent,
   type ModelLabelsEvent,
+  type ClaudeCliInfo,
+  type ClaudeCliStatusEvent,
   type TodoistStatusEvent,
   type TodoistProjectsResultEvent,
   type LapoStatusEvent,
@@ -65,6 +67,8 @@ import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
 import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
 import { AgentDriver, type TurnUsage } from "../agent/driver";
+import { setManagedCliPath } from "../agent/cli";
+import * as claudeCli from "../daemon/claude-cli";
 import { skillPlugins } from "../agent/skills";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS, type ConciergeFleetOps } from "../agent/default-tools";
@@ -248,6 +252,8 @@ export class Supervisor {
   /** Live model-tier labels (hub-refreshed from the Models API); empty until the first refresh lands. */
   private readonly modelLabels: ModelLabelStore;
   private modelLabelTimer?: ReturnType<typeof setInterval>;
+  /** Background "is a newer Claude CLI published?" check (managed-claude-cli-updates spec). */
+  private claudeCliTimer?: ReturnType<typeof setInterval>;
   private readonly integrations: IntegrationStore;
   /** Todoist + lapo integration domain (P7 extraction). Constructed in the ctor once `integrations` exists. */
   private readonly integrationsFacade: IntegrationsFacade;
@@ -445,6 +451,10 @@ export class Supervisor {
     this.startPrStateSweeper();
     this.startUsagePoll(cfg.usagePollMs ?? 5 * 60_000);
     this.startModelLabelRefresh(cfg.refreshModelLabelsOnBoot ?? false);
+    // Point new sessions at a managed Claude CLI if one was installed on a prior run, then keep an
+    // eye out for newer published versions (auto-check, manual apply — managed-claude-cli-updates D2).
+    setManagedCliPath(claudeCli.managedCliPath(cfg.stateDir) ?? undefined);
+    this.startClaudeCliRefresh(cfg.refreshModelLabelsOnBoot ?? false);
     // Warm the self-URL cache so the lapo callback URL is known by the time the UI opens; rebroadcast
     // the lapo status once discovery completes so an already-connected client sees the callback URL.
     void this.selfBaseUrl().then(() => this.registry.toAll(this.lapoStatusEvent()));
@@ -505,6 +515,56 @@ export class Supervisor {
       return { ok: false, changed: false, error };
     }
   }
+
+  /** This daemon's Claude engine status (active/bundled/latest), broadcast + replied to the UI. */
+  claudeCliInfo(): ClaudeCliInfo {
+    return claudeCli.cliStatus(this.stateDir);
+  }
+  claudeCliStatusEvent(): ClaudeCliStatusEvent {
+    return { v: PROTOCOL_VERSION, type: "claudecli.status", ts: now(), info: this.claudeCliInfo() };
+  }
+  /** Mirror the model-label refresh: an immediate check on boot (so "update available" shows up
+   *  shortly after a restart) + every ~4h. No token needed (public registry). `unref` so it never
+   *  holds the process/test open. */
+  private startClaudeCliRefresh(onBoot: boolean): void {
+    if (onBoot) void this.refreshClaudeCliLatest();
+    this.claudeCliTimer = setInterval(() => void this.refreshClaudeCliLatest(), 4 * 60 * 60_000);
+    this.claudeCliTimer.unref?.();
+  }
+  /** Re-read the npm registry's newest published CLI version, persist it, and broadcast iff it
+   *  changed. Also the handler for the manual `claudecli.check` command. Never throws into the timer. */
+  async refreshClaudeCliLatest(): Promise<{ ok: boolean; changed: boolean; error?: string }> {
+    try {
+      const latest = await claudeCli.resolveLatest();
+      const changed = claudeCli.recordLatest(this.stateDir, latest);
+      if (changed) this.registry.toAll(this.claudeCliStatusEvent());
+      return { ok: true, changed };
+    } catch (e) {
+      const error = (e as Error).message;
+      console.warn(`[claude-cli] latest-version check failed: ${error}`);
+      return { ok: false, changed: false, error };
+    }
+  }
+  /** Install a managed Claude CLI (default: latest) on THIS daemon, hot-swap it for new sessions, and
+   *  broadcast the new status. The single source of truth behind the member REST route + fleet fan-out.
+   *  Serialized: two concurrent installs would `bun add` into the same isolated root and corrupt it, so
+   *  an in-flight install is awaited/shared rather than run twice. */
+  async installClaudeCli(version?: string): Promise<{ info: ClaudeCliInfo; output: string }> {
+    if (this.claudeCliInstall) return this.claudeCliInstall;
+    this.claudeCliInstall = (async () => {
+      try {
+        const res = await claudeCli.install(this.stateDir, version ? { version } : {});
+        setManagedCliPath(res.binPath); // subsequent query() spawns use the new engine, no restart
+        const info = this.claudeCliInfo();
+        this.registry.toAll(this.claudeCliStatusEvent());
+        return { info, output: `Installed Claude Code ${res.version}.` };
+      } finally {
+        this.claudeCliInstall = undefined;
+      }
+    })();
+    return this.claudeCliInstall;
+  }
+  private claudeCliInstall?: Promise<{ info: ClaudeCliInfo; output: string }>;
 
   budget(): Budget {
     return this.labelBudget(this.rateLimits.snapshot());

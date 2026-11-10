@@ -95,6 +95,10 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   // model each tier resolves to + release date) and the `model.refresh` command behind "Check for
   // updates". An older daemon advertises only "model-labels", so the client hides the list/button.
   "model-catalog",
+  // Managed Claude CLI updates (managed-claude-cli-updates spec): the `claudecli.check` command, the
+  // /api/claude-cli/* + /api/fleet/claude-cli/* REST surface, and the "Claude engine" card in
+  // Settings → Models. An older daemon omits this, so the client hides the engine card entirely.
+  "claude-cli-update",
   "accounts",
   // The frozen update API v1 (/api/update/v1/*) + hub-orchestrated fleet rollout. A hub reads this (or
   // the `updateApiVersion` field) to drive a member through the stable path vs the legacy daemon.update

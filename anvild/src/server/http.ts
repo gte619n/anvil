@@ -30,6 +30,8 @@ import { UpdateStateStore } from "../daemon/update-state";
 import { updateApply, updateCheck, updateStatus, settleAfterBoot, type UpdateApiDeps } from "../daemon/update-api";
 import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
 import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } from "./fleet-rollout";
+import { FleetCliRolloutCoordinator, httpMemberCliClient } from "./fleet-cli-rollout";
+import { resolveLatest as resolveLatestCli } from "../daemon/claude-cli";
 import { FleetJobs } from "./fleet-jobs";
 import { resolveTargetSha } from "../daemon/selfupdate";
 import { FileExists, FileNotFound } from "../fs/session-fs";
@@ -260,6 +262,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
     desired: new DesiredTargetStore(opts.stateDir),
   });
 
+  // Hub-orchestrated Claude CLI rollout (managed-claude-cli-updates D3): resolve one target version,
+  // install it on every reachable member in parallel, hub last. No restart/health-gate — a member
+  // hot-swaps the managed CLI in-process and its install response carries the resulting version.
+  const fleetCliRollout = new FleetCliRolloutCoordinator({
+    self: { serverId: identity.serverId, serverName: identity.serverName },
+    members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName, url: m.url })),
+    resolveLatest: () => resolveLatestCli(),
+    installSelf: async (version) => {
+      try {
+        const r = await supervisor.installClaudeCli(version);
+        return { ok: true, version: r.info.active };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    client: httpMemberCliClient(),
+  });
+
   // The bundled native clients serve their UI from a local origin and call the daemon's REST API
   // cross-origin, so /api/* needs permissive CORS. (The daemon is Tailscale-gated; no cookies are
   // used, so `*` is safe.) The PWA is same-origin and unaffected.
@@ -472,6 +492,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
+      ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
@@ -663,6 +684,27 @@ export function createServer(opts: ServerOptions): ServerHandle {
     return Response.json(result, { status: result.ok ? 200 : 500 });
   });
   route("GET", "/api/update/v1/status", () => Response.json(updateStatus(updateDeps)));
+
+  // ── Managed Claude CLI (managed-claude-cli-updates spec) ──────────────────────────────────────
+  // Advance the Claude engine to a newer published version without an Anvil release. Version-
+  // independent REST (like /api/daemon/update), identity-gated with the same posture as update/apply.
+  route("GET", "/api/claude-cli/status", () =>
+    Response.json({ ok: true, info: supervisor.claudeCliInfo() } satisfies rest.claudecli.StatusResponse),
+  );
+  route("POST", "/api/claude-cli/install", async (req, _url, _m, ctx) => {
+    const ct = (req.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const bodyReq = (await jsonBody<rest.claudecli.InstallRequest>(req)) as rest.claudecli.InstallRequest;
+    try {
+      const r = await supervisor.installClaudeCli(bodyReq.version);
+      return Response.json({ ok: true, info: r.info, output: r.output } satisfies rest.claudecli.InstallResponse);
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      return Response.json({ ok: false, info: supervisor.claudeCliInfo(), output: error, error } satisfies rest.claudecli.InstallResponse, { status: 500 });
+    }
+  });
 
   // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
   // /api/health, return the Anvil daemons found (deduped by serverId) as add-suggestions.
@@ -1019,6 +1061,18 @@ export function createServer(opts: ServerOptions): ServerHandle {
     return Response.json(result satisfies rest.FleetUpdateResponse, { status: result.ok ? 200 : 409 });
   });
   route("GET", "/api/fleet/update/status", () => Response.json(fleetRollout.status() satisfies rest.FleetUpdateStatusResponse));
+
+  // Hub-driven Claude CLI fan-out (managed-claude-cli-updates D3). Same identity posture as fleet/update.
+  route("POST", "/api/fleet/claude-cli/update", async (req, _url, _m, ctx) => {
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser") return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const bodyReq = (await jsonBody<rest.claudecli.FleetUpdateRequest>(req)) as rest.claudecli.FleetUpdateRequest;
+    const result = await fleetCliRollout.start({ version: bodyReq.version });
+    return Response.json(result satisfies rest.claudecli.FleetUpdateResponse, { status: result.ok ? 200 : 409 });
+  });
+  route("GET", "/api/fleet/claude-cli/update/status", () =>
+    Response.json(fleetCliRollout.status() satisfies rest.claudecli.FleetUpdateStatusResponse),
+  );
 
   routeRe("DELETE", /^\/api\/fleet\/members\/([^/]+)$/, (_req, _url, m) => {
     fleet.remove(decodeURIComponent(m![1]!));

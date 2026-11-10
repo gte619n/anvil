@@ -29,6 +29,7 @@ const CONNECT_FRAMES = new Set([
   "environments",
   "prompts",
   "model.labels",
+  "claudecli.status", // Claude engine status for Settings → Models (managed-claude-cli-updates spec)
   "auth.accounts",
   "todoist.status",
   "lapo.status",
