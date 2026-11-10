@@ -1649,6 +1649,9 @@ export class Supervisor {
         // Persist a screenshot the agent surfaced in a tool result as a session attachment, reusing the
         // upload store (and its GET route) so the client can fetch + thumbnail it by id (§6.5).
         (mediaType, dataBase64) => this.attachStore.add(id, "screenshot", mediaType, dataBase64).id,
+        // Live catalog so a fable session runs the newest `claude-fable-*` release (the SDK auto-upgrades
+        // the opus/sonnet/haiku aliases itself; fable has no alias, so this is how it keeps current).
+        () => this.modelLabels.catalog(),
       );
       this.drivers.set(id, driver);
     }
