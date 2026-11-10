@@ -46,7 +46,14 @@ export function classifyCad(path: string): CadKind | null {
  * Injected data-access the viewer modules use, so they never reach into WS/fleet internals.
  * Wired by panel.ts/cad.ts at call time (DL-5: all over REST + a thin WS list helper).
  */
+/** Disambiguation result for a (possibly bare-basename) worktree path: one concrete file, or the
+ *  candidate paths when the basename matched 2+ files. */
+export type CadLocateResult = { kind: "file"; path: string } | { kind: "choices"; paths: string[] };
+
 export interface CadIo {
+  /** Resolve a path to one concrete worktree file (or the candidates when a bare basename is
+   *  ambiguous), so every load/convert/download URL the viewer builds is unambiguous. */
+  locate(path: string): Promise<CadLocateResult>;
   /** Absolute URL for a worktree file (daemon-relative → absolute, fleet-routed). */
   fileUrl(path: string): string;
   /** Absolute URL for the server-side CAD conversion of a B-rep/kicad-3d file. */

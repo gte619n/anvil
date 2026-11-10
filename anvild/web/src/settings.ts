@@ -65,7 +65,8 @@ import {
   wireDaemonUpdate,
   type Server,
 } from "./fleet";
-import type { AccountInfo, AuthAccountsEvent, AuthStatusEvent, Environment, PipelineAdversaryStat, ServerEvent, Session, TodoistProjectInfo } from "../../protocol";
+import { MODELS, modelLabel } from "../../protocol";
+import type { AccountInfo, AuthAccountsEvent, AuthStatusEvent, Environment, Model, ModelTierInfo, PipelineAdversaryStat, ServerEvent, Session, TodoistProjectInfo } from "../../protocol";
 
 // ── Injected dependencies (initSettings) ─────────────────────────────────────────────────────────
 // What settings code calls back into main.ts for. Each field documents the main.ts state it reaches.
@@ -638,6 +639,57 @@ export function onPipelineMetrics(stats: PipelineAdversaryStat[]): void {
   pipelineMetrics = stats;
   if (document.getElementById("models-panel")) renderModelsPanel();
 }
+
+// The hub's resolved model catalog (the exact model each picker tier maps to) + its last-check time,
+// forwarded from main's `model.labels` handler. Powers the "Models" list card and its last-checked line.
+let modelCatalog: Partial<Record<Model, ModelTierInfo>> = {};
+let modelCheckedAt = "";
+export function onModelCatalog(catalog: Partial<Record<Model, ModelTierInfo>>, checkedAt: string): void {
+  modelCatalog = catalog ?? {};
+  modelCheckedAt = checkedAt || "";
+  if (document.getElementById("models-panel")) renderModelsPanel();
+}
+
+/** The live "Models" list: every tier the session picker offers, the exact model it resolves to today,
+ *  and a "Check for updates" button that forces a Models-API re-check so a brand-new Anthropic release
+ *  shows up without cutting a new build. The button is gated on the hub's "model-catalog" capability. */
+function modelsListCard(): string {
+  const supported = serverSupports(hub(), "model-catalog");
+  const rows = MODELS.map(({ id }) => {
+    const info = modelCatalog[id];
+    const label = info?.label ?? modelLabel(id);
+    const modelId = info?.modelId;
+    const released = info?.releasedAt ? new Date(info.releasedAt).toLocaleDateString() : "";
+    return `<tr>
+        <td><b>${esc(label)}</b></td>
+        <td>${modelId ? `<code class="small">${esc(modelId)}</code>` : `<span class="small muted">—</span>`}</td>
+        <td class="small muted">${esc(released)}</td>
+      </tr>`;
+  }).join("");
+  const checked = modelCheckedAt ? `Last checked ${new Date(modelCheckedAt).toLocaleString()}` : "Not checked yet";
+  const control = supported
+    ? `<button id="model-refresh" class="mini">${icon("refresh")} Check for updates</button>`
+    : `<span class="small muted">${icon("info")} Update Anvil to check for new models from here.</span>`;
+  return `<div class="card"><b>Models <span class="small muted">(what the picker offers)</span></b>
+      <p class="small muted">The exact models a session can run on. <b>Opus</b>, <b>Sonnet</b> and <b>Haiku</b> are aliases that automatically track Anthropic's latest release; the resolved model and label below refresh from the live Models API — no new build needed.</p>
+      <table class="pt-table small"><thead><tr><th>Tier</th><th>Resolves to</th><th>Released</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="card-main" style="margin-top:8px;gap:8px">${control}<span class="small muted" style="margin-left:auto">${esc(checked)}</span></div></div>`;
+}
+
+/** Force the hub to re-fetch the Models API, then toast whether anything changed. The hub pushes a
+ *  fresh `model.labels` (→ onModelCatalog → re-render) before it acks, so by the time we're here the
+ *  list already reflects the result; we just compare the pre/post catalog to word the toast. */
+async function refreshModels(btn: HTMLButtonElement): Promise<void> {
+  const before = JSON.stringify(modelCatalog);
+  await busy(btn, "Checking…", async () => {
+    const res = await sendAwait(hub(), { type: "model.refresh", cid: newCid() }, 30_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      return;
+    }
+    toast(JSON.stringify(modelCatalog) !== before ? "Models updated to the latest release." : "Models are up to date.");
+  });
+}
 /** The adversary calibration card (§6.3): first-pass rejection rate per gate — is the review real? */
 function pipelineMetricsCard(): string {
   if (!pipelineMetrics || pipelineMetrics.length === 0) {
@@ -702,7 +754,11 @@ function renderModelsPanel(): void {
           <p class="small muted">Paste a fresh key to replace the current one.</p>
           ${orForm("Replace")}</div>`;
   }
-  host.innerHTML = `${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
+  host.innerHTML = `${modelsListCard()}${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
+
+  // Wire the "Check for updates" button (present only when the hub advertises "model-catalog").
+  const refreshBtn = document.getElementById("model-refresh");
+  if (refreshBtn) refreshBtn.addEventListener("click", () => void refreshModels(refreshBtn as HTMLButtonElement));
 
   // Wire Claude controls: the roster's own row/menu/dialog handlers, or the legacy single-token form.
   if (serverSupports(rosterServer(), "accounts") && ui.claudeAccounts) {

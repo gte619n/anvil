@@ -96,6 +96,7 @@
     "loops.snapshot",
     "message.user",
     "model.labels",
+    "model.refresh",
     "permission.request",
     "permission.resolved",
     "permission.respond",

@@ -91,6 +91,10 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   "lapo",
   "pairing",
   "model-labels",
+  // Settings → Models' live list: the richer `model.labels.catalog`/`checkedAt` fields (the exact
+  // model each tier resolves to + release date) and the `model.refresh` command behind "Check for
+  // updates". An older daemon advertises only "model-labels", so the client hides the list/button.
+  "model-catalog",
   "accounts",
   // The frozen update API v1 (/api/update/v1/*) + hub-orchestrated fleet rollout. A hub reads this (or
   // the `updateApiVersion` field) to drive a member through the stable path vs the legacy daemon.update

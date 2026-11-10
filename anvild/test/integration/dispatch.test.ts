@@ -72,6 +72,15 @@ test("unknown command type → command.error, cid echoed", async () => {
   expect(r.message).toContain("unknown command type");
 });
 
+test("model.refresh replies correlated so the UI's await settles (ack or command.error)", async () => {
+  // The handler always replies on the sender's socket after the Models-API check — an `ack` on success
+  // or a `command.error` (no token / API failure) — with the cid echoed. Which branch fires depends on
+  // the ambient subscription token, so we pin only that the reply is correlated and well-formed.
+  const r = await rpc({ ...base, type: "model.refresh", cid: "cm1" });
+  expect(["ack", "command.error"]).toContain(r.type);
+  expect(r.cid).toBe("cm1");
+});
+
 test("ping → pong (heartbeat, §6.4), no cid required", async () => {
   const r = await rpc({ ...base, type: "ping" });
   expect(r.type).toBe("pong");

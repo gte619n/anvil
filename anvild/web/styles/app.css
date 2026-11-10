@@ -1367,6 +1367,10 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-card-body, .cad-error { font-size: 13px; color: var(--muted); text-align: center; }
 .cad-error { color: var(--danger); }
 .cad-dl { color: var(--accent); text-decoration: none; font-weight: 600; }
+/* Ambiguous-basename picker (a prose name matched several files) */
+.cad-choices { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; width: 100%; max-height: 40vh; overflow: auto; }
+.cad-choices a.cad-choice { display: block; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--accent); text-decoration: none; font-size: 13px; word-break: break-all; }
+.cad-choices a.cad-choice:hover { background: var(--tool-bg); }
 /* Model tree drawer */
 .cad-tree { position: absolute; top: 0; right: 0; width: min(280px, 80%); height: 100%; background: var(--bg); border-left: 1px solid var(--border); transform: translateX(100%); transition: transform 0.18s ease; z-index: 5; display: flex; flex-direction: column; }
 .cad-shell.cad-tree-open .cad-tree { transform: none; }

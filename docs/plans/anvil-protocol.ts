@@ -556,15 +556,29 @@ export interface PromptsEvent extends Envelope {
   type: "prompts";
   prompts: Prompt[];
 }
+/** The concrete model a picker tier currently resolves to, as resolved from the live Anthropic Models
+ *  API. Shown in Settings → Models so the user can see the *exact* model each alias (`opus`/`sonnet`/
+ *  `haiku`) or pinned id (`fable`) maps to today — not just its human label. */
+export interface ModelTierInfo {
+  modelId: string; // the resolved concrete id, e.g. "claude-opus-4-8"
+  label: string; // the human label, e.g. "Opus 5"
+  releasedAt?: string; // ISO 8601 release date (the catalog's created_at), when known
+}
 /**
  * Live human labels for the session model tiers, refreshed by the hub from the Anthropic Models API so
  * the picker tracks new releases (e.g. "Opus 4.8" → "Opus 5") without a code change. A partial map:
  * tiers the hub couldn't resolve are absent, and the client falls back to the static `MODELS` label.
  * Hub-authoritative (like `prompts`) — a fleet member's own copy is ignored by the client.
+ *
+ * `catalog` + `checkedAt` are additive (gated by the "model-catalog" capability): the richer per-tier
+ * detail and last-check timestamp that power the Settings → Models list and its "Check for updates"
+ * button. Older daemons omit them and the client keeps using `labels` alone.
  */
 export interface ModelLabelsEvent extends Envelope {
   type: "model.labels";
   labels: Partial<Record<Model, string>>;
+  catalog?: Partial<Record<Model, ModelTierInfo>>;
+  checkedAt?: string; // ISO 8601 of the hub's last catalog check (absent/"" if never)
 }
 /**
  * First frame the server sends on every WS connection (before session.list/budget/
@@ -1973,6 +1987,14 @@ export interface DaemonUpdateCmd extends Envelope, Correlated {
   checkOnly?: boolean; // fetch + report whether an update is available; don't pull/build/restart
 }
 
+// Force an immediate re-fetch of the Anthropic Models API so Settings → Models reflects a brand-new
+// release without waiting for the hub's ~4h refresh timer. The hub re-derives the tier catalog and
+// replies with a fresh `model.labels` on the requester's socket (and broadcasts to the fleet if the
+// resolved catalog changed). Gated by the "model-catalog" capability.
+export interface ModelRefreshCmd extends Envelope, Correlated {
+  type: "model.refresh";
+}
+
 // 5d. Terminal (§7)
 
 export interface TerminalOpenCmd extends Envelope, Correlated {
@@ -2127,6 +2149,7 @@ export type ClientCommand =
   | LoopConvertCmd
   | LoopIntakeCmd
   | DaemonUpdateCmd
+  | ModelRefreshCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd

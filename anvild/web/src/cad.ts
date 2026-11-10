@@ -243,6 +243,28 @@ export function openCadViewer(path: string, io: CadIo): void {
     return;
   }
 
+  // Resolve the path to ONE concrete worktree file before loading, so the loader, the server-side
+  // conversion, and the "Download original" link all target the same file. A bare-basename chip (e.g.
+  // "mirror_riser_v3_preview.stl" living in two dirs) would otherwise 404 on every serve route; now it
+  // shows a picker (like the reader) and re-opens with the chosen path. locate failing → load as-is so
+  // the real reason still surfaces in the error card.
+  showStatus(chrome.statusArea, `<div class="cad-card">${icon("hourglass_empty")} Loading…</div>`);
+  void io
+    .locate(path)
+    .then((res) => {
+      if (res.kind === "choices") showChoices(chrome.statusArea, res.paths, io);
+      else loadResolved(res.path, kind, chrome, io);
+    })
+    .catch(() => loadResolved(path, kind, chrome, io));
+}
+
+/** Dispatch a now-concrete path down the right pipeline (ECAD 2D/3D vs mesh/brep 3D). Updates the live
+ *  viewer's path so snapshot names + "Download original" track the resolved file, not the typed basename. */
+function loadResolved(path: string, kind: CadKind, chrome: Chrome, io: CadIo): void {
+  if (active) {
+    active.path = path;
+    active.fileName = fileNameOf(path);
+  }
   if (kind === "gerber" || kind === "kicad-pcb" || kind === "kicad-sch") {
     // KiCad boards get a 2D (KiCanvas) ↔ 3D (daemon kicad-cli GLB) toggle; schematics/Gerber stay 2D.
     if (kind === "kicad-pcb") {
@@ -253,13 +275,34 @@ export function openCadViewer(path: string, io: CadIo): void {
     void delegateEcad(path, kind, chrome, io);
     return;
   }
-
   // 3D pipeline (mesh | brep).
   showStatus(chrome.statusArea, `<div class="cad-card">${icon("hourglass_empty")} Loading…</div>`);
   void init3d(path, kind, chrome, io).catch((err: unknown) => {
     const reason = err instanceof Error ? err.message : String(err);
-    showError(chrome.statusArea, reason, io.fileUrl(path), name);
+    showError(chrome.statusArea, reason, io.fileUrl(path), fileNameOf(path));
   });
+}
+
+/** A bare basename matched several files — let the user pick which to open (mirrors the reader's
+ *  disambiguation). Picking re-enters openCadViewer with the concrete path, which resolves cleanly. */
+function showChoices(area: HTMLElement, paths: string[], io: CadIo): void {
+  const items = paths.map((p) => `<li><a href="#" class="cad-choice" data-path="${esc(p)}">${esc(p)}</a></li>`).join("");
+  showStatus(
+    area,
+    `<div class="cad-card">` +
+      `<div class="cad-card-title">${icon("help")} Which file?</div>` +
+      `<div class="cad-card-body">That name matches several files — pick one:</div>` +
+      `<ul class="cad-choices">${items}</ul>` +
+      `</div>`,
+  );
+  for (const a of area.querySelectorAll<HTMLElement>(".cad-choice")) {
+    a.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation(); // don't let the wrap's delegated click dismiss the viewer
+      const p = a.dataset.path;
+      if (p) openCadViewer(p, io);
+    };
+  }
 }
 
 async function delegateEcad(path: string, kind: CadKind, chrome: Chrome, io: CadIo): Promise<void> {
