@@ -112,6 +112,7 @@ import {
   onAuthAccounts,
   onAuthStatus,
   onLapoStatus,
+  onModelCatalog,
   onPipelineMetrics,
   onTodoistStatus,
   openSettings,
@@ -202,6 +203,7 @@ import type {
   ConversationEvent,
   Environment,
   FileOffer,
+  ModelLabelsEvent,
   Prompt,
   ServerEvent,
   Session,
@@ -1615,7 +1617,7 @@ function onEvent(url: string, e: ServerEvent): void {
     case "model.labels":
       // Model labels are hub-authoritative (the hub resolves them from the Models API). Ignore a
       // fleet member's own copy so it can't clobber the hub's labels.
-      if (url === HUB_URL) onModelLabels(e.labels);
+      if (url === HUB_URL) onModelLabels(e);
       return;
     case "todoist.status":
       // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
@@ -2198,15 +2200,17 @@ function onPrompts(list: Prompt[]): void {
   if (document.getElementById("prompt-cards")) renderPromptsPanel();
 }
 /** Apply a `model.labels` broadcast from the hub: replace the overrides, cache them, repaint the model
- *  surfaces (header pill + any open picker rebuilds on next open). */
-function onModelLabels(labels: Partial<Record<Model, string>>): void {
-  modelLabelOverrides = labels ?? {};
+ *  surfaces (header pill + any open picker rebuilds on next open), and hand the richer catalog +
+ *  last-check time to Settings → Models. */
+function onModelLabels(e: ModelLabelsEvent): void {
+  modelLabelOverrides = e.labels ?? {};
   try {
     localStorage.setItem(MODEL_LABELS_CACHE_KEY, JSON.stringify(modelLabelOverrides));
   } catch {
     /* quota — the daemon is still the source of truth */
   }
   updateHeaderModel(activeId ? sessions.get(activeId) : undefined);
+  onModelCatalog(e.catalog ?? {}, e.checkedAt ?? "");
 }
 /** True once the hub is connected AND new enough to hold the prompt store. */
 function promptsSupported(): boolean {

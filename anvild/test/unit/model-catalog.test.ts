@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { fetchModelCatalog, resolveModelLabels, type ModelCatalogEntry } from "../../src/agent/model-catalog";
+import { fetchModelCatalog, resolveModelCatalog, resolveModelLabels, type ModelCatalogEntry } from "../../src/agent/model-catalog";
 
 /** A trimmed but representative `GET /v1/models` payload: two Opus generations (4.8 + 5), Sonnet 5,
  *  Haiku, Fable, plus a dated legacy Opus — deliberately unsorted to prove newest-wins by created_at. */
@@ -39,6 +39,27 @@ describe("resolveModelLabels", () => {
   test("ignores malformed entries without throwing", () => {
     const dirty = [...CATALOG, { id: 123 } as unknown as ModelCatalogEntry, null as unknown as ModelCatalogEntry];
     expect(resolveModelLabels(dirty).opus).toBe("Opus 5");
+  });
+});
+
+describe("resolveModelCatalog", () => {
+  test("resolves each tier to its concrete model id + label + release date", () => {
+    const catalog = resolveModelCatalog(CATALOG);
+    expect(catalog.opus).toEqual({ modelId: "claude-opus-5", label: "Opus 5", releasedAt: "2026-07-24T00:00:00Z" });
+    expect(catalog.fable).toEqual({ modelId: "claude-fable-5", label: "Fable 5", releasedAt: "2026-06-07T00:00:00Z" });
+    expect(catalog.haiku?.modelId).toBe("claude-haiku-4-5-20251001");
+  });
+
+  test("omits a tier with no catalog match", () => {
+    const noSonnet = CATALOG.filter((e) => !e.id.startsWith("claude-sonnet-"));
+    expect(resolveModelCatalog(noSonnet).sonnet).toBeUndefined();
+  });
+
+  test("resolveModelLabels stays in lock-step with the catalog's labels", () => {
+    const catalog = resolveModelCatalog(CATALOG);
+    const labels = resolveModelLabels(CATALOG);
+    expect(labels.opus).toBe(catalog.opus?.label);
+    expect(labels.sonnet).toBe(catalog.sonnet?.label);
   });
 });
 

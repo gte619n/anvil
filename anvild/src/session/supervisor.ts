@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync as ensureDir } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
 import {
   PROTOCOL_VERSION,
   type AttachmentRef,
@@ -73,7 +73,7 @@ import { TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
 import { MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
 import { PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
 import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
-import { fetchModelCatalog, resolveModelLabels } from "../agent/model-catalog";
+import { fetchModelCatalog, resolveModelCatalog } from "../agent/model-catalog";
 import { ModelLabelStore } from "../models/store";
 import { CLAUDE_TOKEN_KEY } from "../auth/store";
 import { PermissionBroker } from "../agent/permissions";
@@ -460,9 +460,18 @@ export class Supervisor {
     }, 4 * 60_000);
     this.prSweepTimer.unref?.();
   }
-  /** Current hub-resolved model labels, broadcast to clients (empty until the first refresh). */
+  /** Current hub-resolved model labels + the richer catalog, broadcast to clients (empty until the
+   *  first refresh). `catalog`/`checkedAt` are additive — gated client-side by the "model-catalog"
+   *  capability — so older clients just read `labels`. */
   modelLabelsEvent(): ModelLabelsEvent {
-    return { v: PROTOCOL_VERSION, type: "model.labels", ts: now(), labels: this.modelLabels.get() };
+    return {
+      v: PROTOCOL_VERSION,
+      type: "model.labels",
+      ts: now(),
+      labels: this.modelLabels.get(),
+      catalog: this.modelLabels.catalog(),
+      checkedAt: this.modelLabels.checkedAt(),
+    };
   }
   /** Keep the picker's model labels current by re-deriving them from the Models API every ~4h. Fires an
    *  immediate refresh so a fresh install/label bump shows up shortly after boot rather than 4h later;
@@ -473,19 +482,27 @@ export class Supervisor {
     this.modelLabelTimer = setInterval(() => void this.refreshModelLabels(), 4 * 60 * 60_000);
     this.modelLabelTimer.unref?.();
   }
-  /** Fetch the live catalog with the subscription OAuth token, re-derive the tier labels, and broadcast
-   *  iff they changed. No token (unpaired/logged out) or an API error just leaves the last-known labels
-   *  in place — never throws into the timer. */
-  private async refreshModelLabels(): Promise<void> {
+  /** Fetch the live catalog with the subscription OAuth token, re-derive the tier catalog, stamp the
+   *  check time, and broadcast iff the resolved catalog changed. No token (unpaired/logged out) or an
+   *  API error just leaves the last-known catalog in place (only the timestamp advances) — never throws
+   *  into the timer. Returns a small result so the manual `model.refresh` command can report back. */
+  async refreshModelLabels(): Promise<{ ok: boolean; changed: boolean; error?: string }> {
     const token = (process.env[CLAUDE_TOKEN_KEY] ?? "").trim();
-    if (!token) return; // no subscription login yet — keep the cached/static labels
+    if (!token) {
+      this.modelLabels.set(undefined, now()); // record the attempt so "last checked" updates
+      return { ok: false, changed: false, error: "no-token" };
+    }
     try {
-      const labels = resolveModelLabels(await fetchModelCatalog(token));
-      if (Object.keys(labels).length > 0 && this.modelLabels.set(labels)) {
-        this.registry.toAll(this.modelLabelsEvent());
-      }
+      const catalog = resolveModelCatalog(await fetchModelCatalog(token));
+      const hasAny = Object.keys(catalog).length > 0;
+      const changed = this.modelLabels.set(hasAny ? catalog : undefined, now());
+      if (changed) this.registry.toAll(this.modelLabelsEvent());
+      return { ok: true, changed };
     } catch (e) {
-      console.warn(`[models] label refresh failed: ${(e as Error).message}`);
+      this.modelLabels.set(undefined, now());
+      const error = (e as Error).message;
+      console.warn(`[models] label refresh failed: ${error}`);
+      return { ok: false, changed: false, error };
     }
   }
 
@@ -1329,6 +1346,16 @@ export class Supervisor {
    *  ambiguous (the caller can't serve bytes for that — it surfaces a "open from Files" hint). */
   fsLocate(sessionId: string, path: string): Located {
     return locateInside(this.require(sessionId).data.cwd, path);
+  }
+  /** Like fsLocate, but worktree-RELATIVE for the client: a resolved file comes back as its rel path
+   *  (not an abs disk path), and an ambiguous basename as the rel candidates. The CAD viewer calls this
+   *  BEFORE loading so a bare-basename chip (e.g. "mirror_riser_v3_preview.stl" that lives in two dirs)
+   *  resolves to one concrete path — every downstream load/convert/download URL is then unambiguous,
+   *  instead of the loader and "Download original" both dead-ending on the serve route's 404. */
+  fsLocateRel(sessionId: string, path: string): { kind: "file"; path: string } | { kind: "choices"; paths: string[] } {
+    const cwd = this.require(sessionId).data.cwd;
+    const located = locateInside(cwd, path);
+    return located.kind === "choices" ? located : { kind: "file", path: relative(cwd, located.abs) };
   }
   fsWrite(sessionId: string, path: string, data: Uint8Array): { path: string; size: number } {
     return writeFile(this.require(sessionId).data.cwd, path, data);

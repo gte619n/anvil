@@ -152,6 +152,20 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "model.refresh":
+        // Force an immediate Models-API re-check (Settings → "Check for updates"). Always hand the
+        // requester the latest catalog + checkedAt (a changed catalog is also broadcast fleet-wide from
+        // within refreshModelLabels); ack on success, command.error on a tokenless/failed check.
+        void deps.supervisor.refreshModelLabels().then((r) => {
+          send(deps.supervisor.modelLabelsEvent());
+          if (!r.ok) {
+            send(cmdError(r.error === "no-token" ? "no Claude token set on the hub" : (r.error ?? "model refresh failed"), cid));
+          } else if (cid) {
+            send(ack(cid));
+          }
+        });
+        return;
+
       case "session.account.set":
         ackWhenDone(deps.supervisor.setSessionAccount(cmd.sessionId, cmd.accountId), send, cid);
         return;

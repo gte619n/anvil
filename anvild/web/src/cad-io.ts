@@ -1,7 +1,7 @@
 // Builds the CadIo data-access object the viewer modules consume (cad.ts, cad-ecad.ts), so they
 // never reach into fleet/WS internals. Pure glue over fleet's REST helpers + an injected directory
 // lister. See docs/plans/2026-11-06-cad-viewer.md §3.3 and DL-5 (all over REST, no protocol change).
-import type { CadIo } from "./cad-types";
+import type { CadIo, CadLocateResult } from "./cad-types";
 import { attachImageBlob } from "./composer";
 import { serverApiUrl, serverFetch, wireSessionId, type Server } from "./fleet";
 
@@ -36,6 +36,13 @@ export function makeCadIo(opts: {
   const base = (): string => opts.server().url;
   const sid = (): string => wireSessionId(opts.sessionId());
   return {
+    locate: async (p): Promise<CadLocateResult> => {
+      // A miss/forbidden just falls back to treating the path as concrete — the subsequent load then
+      // surfaces the real reason in the error card rather than swallowing it here.
+      const res = await serverFetch(base(), `/api/sessions/${sid()}/locate?path=${encodeURIComponent(p)}`);
+      if (!res.ok) return { kind: "file", path: p };
+      return (await res.json()) as CadLocateResult;
+    },
     fileUrl: (p) => serverApiUrl(base(), filesPath(sid(), p)),
     cadUrl: (p, lod) => serverApiUrl(base(), `/api/sessions/${sid()}/cad?path=${encodeURIComponent(p)}&lod=${lod}`),
     gerberUrl: (p, side) => serverApiUrl(base(), `/api/sessions/${sid()}/cad-gerber?path=${encodeURIComponent(p)}&side=${side}`),

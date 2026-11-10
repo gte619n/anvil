@@ -59,3 +59,33 @@ test("fsLocate returns choices for an ambiguous basename and throws when nothing
 
   rmSync(dir, { recursive: true, force: true });
 });
+
+// fsLocateRel powers the CAD viewer's pre-load disambiguation (/api/sessions/:id/locate): a resolved
+// file comes back worktree-RELATIVE (not an abs disk path) so the client can re-request it unambiguously,
+// and an ambiguous basename comes back as the candidate rel paths for the viewer's picker.
+test("fsLocateRel returns a worktree-relative path for a resolved file", async () => {
+  const { sup, dir } = newSup();
+  mkdirSync(join(dir, "mirror-mount"), { recursive: true });
+  writeFileSync(join(dir, "mirror-mount", "mirror_riser_v3_preview.stl"), "solid\n");
+  const s = await sup.create(createCmd(dir));
+
+  const located = sup.fsLocateRel(s.data.id, "mirror_riser_v3_preview.stl");
+  expect(located).toEqual({ kind: "file", path: "mirror-mount/mirror_riser_v3_preview.stl" });
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("fsLocateRel surfaces the ambiguous candidates (so the viewer can show a picker)", async () => {
+  const { sup, dir } = newSup();
+  mkdirSync(join(dir, "a"), { recursive: true });
+  mkdirSync(join(dir, "b"), { recursive: true });
+  writeFileSync(join(dir, "a", "part.stl"), "solid\n");
+  writeFileSync(join(dir, "b", "part.stl"), "solid\n");
+  const s = await sup.create(createCmd(dir));
+
+  const located = sup.fsLocateRel(s.data.id, "part.stl");
+  expect(located.kind).toBe("choices");
+  if (located.kind === "choices") expect(located.paths.sort()).toEqual(["a/part.stl", "b/part.stl"]);
+
+  rmSync(dir, { recursive: true, force: true });
+});

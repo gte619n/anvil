@@ -1317,6 +1317,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
     }
   });
 
+  // Resolve a (possibly bare-basename) worktree path to one concrete file, or the candidates when it's
+  // ambiguous. The CAD viewer calls this before loading so a prose-named chip ("model.stl" living in two
+  // dirs) becomes a single concrete path — otherwise the loader AND "Download original" both dead-end on
+  // the serve route's 404. Mirrors the reader's fs.read `choices` disambiguation, but over REST.
+  const LOCATE_RE = /^\/api\/sessions\/([^/]+)\/locate$/;
+  routeRe("GET", LOCATE_RE, (_req, url, m) => {
+    const sessionId = m![1]!;
+    const path = url.searchParams.get("path") ?? "";
+    try {
+      return Response.json(supervisor.fsLocateRel(sessionId, path));
+    } catch (e) {
+      if (e instanceof FileNotFound) return new Response("not found", { status: 404 });
+      return new Response("forbidden", { status: 403 });
+    }
+  });
+
   // CAD conversion (docs/plans/2026-11-06-cad-viewer.md §3.2): tessellate a B-rep file (STEP/IGES/
   // FreeCAD) — or export a .kicad_pcb to 3D — to a GLB the browser renders. Queued + cached + killed
   // on timeout by the cad service; mesh/ECAD-2D formats are rendered client-side and never hit here.

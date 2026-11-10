@@ -37,6 +37,7 @@ writeFileSync(
   `import { openCadViewer } from ${JSON.stringify(join(ROOT, "web/src/cad.ts"))};
 const base = location.origin, nameOf = (p) => p.split("/").pop();
 const io = {
+  locate: async (p) => ({ kind: "file", path: p }),
   fileUrl: (p) => base + "/fixtures/" + nameOf(p),
   cadUrl: (p, lod) => base + "/cad?path=" + encodeURIComponent(nameOf(p)) + "&lod=" + lod,
   gerberUrl: (p, side) => base + "/cad-gerber?path=" + encodeURIComponent(nameOf(p)) + "&side=" + side,
