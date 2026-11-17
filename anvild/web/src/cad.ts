@@ -192,7 +192,7 @@ function showError(area: HTMLElement, reason: string, downloadUrl: string, name:
 function webglUnavailableMessage(reason: string, err: unknown): string {
   const base = err instanceof Error ? err.message : String(err);
   let msg = `3D view unavailable: ${reason || base}`;
-  if (isAndroidApp()) msg += " — WebGL is blocked in this app session. Fully close and relaunch Anvil to restore it.";
+  if (isAndroidApp) msg += " — WebGL is blocked in this app session. Fully close and relaunch Anvil to restore it.";
   return msg;
 }
 
@@ -442,7 +442,7 @@ async function init3d(path: string, kind: CadKind, chrome: Chrome, io: CadIo): P
     if (active !== mine) return;
     showError(
       chrome.statusArea,
-      "The graphics context was lost (GPU reset)." + (isAndroidApp() ? " If reopening fails, fully close and relaunch Anvil." : ""),
+      "The graphics context was lost (GPU reset)." + (isAndroidApp ? " If reopening fails, fully close and relaunch Anvil." : ""),
       io.fileUrl(mine.path),
       mine.fileName,
     );
