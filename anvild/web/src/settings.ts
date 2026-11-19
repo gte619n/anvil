@@ -205,6 +205,7 @@ function selectSettingsTab(tab: SettingsTab): void {
     if (serverSupports(hub(), "auth")) {
       hub().sock.send({ type: "auth.status" }); // claude — refresh once per tab open
       hub().sock.send({ type: "auth.status", provider: "openrouter" });
+      if (serverSupports(hub(), "gemini-sessions")) hub().sock.send({ type: "auth.status", provider: "gemini" });
       hub().sock.send({ type: "autopilot.pipeline.metrics" }); // §6.3 calibration card
     }
     // Refresh the roster from whichever server owns it (§7.2), once per tab open.
@@ -534,16 +535,18 @@ export function closeSettings(): void {
 // are hub-scoped, like Todoist.
 type ProviderAuth = { connected: boolean; persisted: boolean; masked?: string };
 let claudeAuth: ProviderAuth | null = null;
-let openRouterAuth: ProviderAuth | null = null;
+/** Third-party API keys (outside the Claude subscription): OpenRouter + a direct Gemini key. */
+type KeyProvider = "openrouter" | "gemini";
+const keyAuth: Record<KeyProvider, ProviderAuth | null> = { openrouter: null, gemini: null };
 export function onAuthStatus(e: AuthStatusEvent): void {
   const state: ProviderAuth = { connected: e.connected, persisted: e.persisted, ...(e.masked ? { masked: e.masked } : {}) };
-  if (e.provider === "openrouter") openRouterAuth = state;
+  if (e.provider === "openrouter" || e.provider === "gemini") keyAuth[e.provider] = state;
   else claudeAuth = state;
   if (document.getElementById("models-panel")) renderModelsPanel();
   // A Claude-token change is exactly the transition the setup takeover exists for — a pair, a paste, or
   // an auto-degrade. Re-read health so the screen appears/clears live on every open device, rather than
   // only on the next reload (anvil-headless-join.md §5.1).
-  if (e.provider !== "openrouter") void refreshSetupState();
+  if (e.provider === "claude") void refreshSetupState();
 }
 
 // The Claude account roster (Settings → Models; multi-account §9). Absent until the connect burst or
@@ -598,39 +601,94 @@ async function clearClaudeTokenUi(): Promise<void> {
   toast("Claude token cleared");
 }
 
-/** Persist a new/replacement OpenRouter API key on the hub daemon (powers the adversarial panel). */
-async function saveOpenRouterKey(key: string, btn?: HTMLButtonElement): Promise<void> {
+/** Per-provider copy for the third-party key cards. */
+const KEY_PROVIDERS: Record<KeyProvider, { name: string; placeholder: string; about: string; saved: string; clearBody: string }> = {
+  openrouter: {
+    name: "OpenRouter",
+    placeholder: "OpenRouter API key (sk-or-…)",
+    about:
+      "Powers the <b>adversarial review</b> (competing models such as GLM and Gemini read the repo and critique Claude's plan) and <b>Gemini sessions</b> in the model picker. Create a key at <code>openrouter.ai/keys</code>.",
+    saved: "OpenRouter key saved — it applies to the next review or Gemini turn.",
+    clearBody:
+      "The adversarial review falls back to any Gemini-direct models only, and Gemini sessions can't run until a new key is set. The key is removed from the daemon and its env file.",
+  },
+  gemini: {
+    name: "Gemini (direct)",
+    placeholder: "Gemini API key (AIza…)",
+    about:
+      "Optional: lets the adversarial review call <b>Gemini directly on Google's API</b> (billed by Google, no middleman) instead of via OpenRouter. Create a key at <code>aistudio.google.com/apikey</code>. Gemini <i>sessions</i> still run via OpenRouter.",
+    saved: "Gemini key saved — the adversarial review uses it on the next plan.",
+    clearBody: "The adversarial review routes Gemini through OpenRouter again (if an OpenRouter key is set). The key is removed from the daemon and its env file.",
+  },
+};
+
+/** Persist a new/replacement third-party key on the hub daemon. */
+async function saveProviderKey(provider: KeyProvider, key: string, btn?: HTMLButtonElement): Promise<void> {
   const k = key.trim();
   if (!k) {
-    toast("Paste your OpenRouter API key first.");
+    toast(`Paste your ${KEY_PROVIDERS[provider].name} API key first.`);
     return;
   }
   // [WEB2-19] busy() owns the disable → "Saving…" → restore lifecycle around the request.
   await busy(btn, "Saving…", async () => {
     try {
-      const res = await sendAwait(hub(), { type: "auth.set", provider: "openrouter", token: k, cid: newCid() }, 20_000);
+      const res = await sendAwait(hub(), { type: "auth.set", provider, token: k, cid: newCid() }, 20_000);
       if (res.type === "command.error") {
         toast(res.message);
         return;
       }
-      toast("OpenRouter key saved — the adversarial panel applies it on the next autopilot run.");
+      toast(KEY_PROVIDERS[provider].saved);
     } catch (err) {
       toast(`Couldn't save the key: ${err instanceof Error ? err.message : err}`);
     }
   });
 }
 
-async function clearOpenRouterKeyUi(): Promise<void> {
+async function clearProviderKeyUi(provider: KeyProvider): Promise<void> {
   const ok = await confirmDialog({
-    title: "Clear the OpenRouter key?",
-    body: "The adversarial multi-model review will be skipped on future autopilot runs until a new key is set. Planning itself is unaffected. The key is removed from the daemon and its env file.",
+    title: `Clear the ${KEY_PROVIDERS[provider].name} key?`,
+    body: KEY_PROVIDERS[provider].clearBody,
     confirmLabel: "Clear key",
     danger: true,
     icon: "key_off",
   });
   if (!ok) return;
-  hub().sock.send({ type: "auth.clear", provider: "openrouter", cid: newCid() });
-  toast("OpenRouter key cleared");
+  hub().sock.send({ type: "auth.clear", provider, cid: newCid() });
+  toast(`${KEY_PROVIDERS[provider].name} key cleared`);
+}
+
+/** The card for one third-party key: loading / not set / connected + replace. */
+function providerKeySection(provider: KeyProvider, persistWarn: (persisted: boolean) => string): string {
+  const auth = keyAuth[provider];
+  const { name, placeholder, about } = KEY_PROVIDERS[provider];
+  const form = (saveLabel: string): string => `<div class="todoist-connect">
+      <input id="${provider}-key" type="password" autocomplete="off" spellcheck="false" placeholder="${esc(placeholder)}" />
+      <button id="${provider}-save" class="primary">${saveLabel}</button>
+    </div>`;
+  if (!auth) return `<div class="card"><b>${name}</b><p class="small muted">Loading…</p></div>`;
+  if (!auth.connected) {
+    return `<div class="card"><b>${name} — not set <span class="small muted">(optional)</span></b>
+        <p class="small muted">${about} Paste it below, then save. Stored on the hub daemon (mode 0600).</p>
+        ${form("Save")}</div>`;
+  }
+  return `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
+          <span>${name} — connected${auth.masked ? ` · <code>${esc(auth.masked)}</code>` : ""}</span>
+          <button id="${provider}-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(auth.persisted)}</div>
+        <div class="card"><b>Replace ${name} key</b>
+          <p class="small muted">Paste a fresh key to replace the current one.</p>
+          ${form("Replace")}</div>`;
+}
+
+function wireProviderKeySection(provider: KeyProvider): void {
+  const auth = keyAuth[provider];
+  if (!auth) return; // still loading — no controls rendered
+  if (auth.connected) $(`#${provider}-clear`).addEventListener("click", () => void clearProviderKeyUi(provider));
+  const input = $<HTMLInputElement>(`#${provider}-key`);
+  const btn = $<HTMLButtonElement>(`#${provider}-save`);
+  btn.addEventListener("click", () => void saveProviderKey(provider, input.value, btn));
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") void saveProviderKey(provider, input.value, btn);
+  });
 }
 
 // §6.3 adversary calibration metrics, shown under the Models tab. Refreshed on tab open / connect.
@@ -674,7 +732,11 @@ function versionNewer(a: string, b: string): boolean {
  *  shows up without cutting a new build. The button is gated on the hub's "model-catalog" capability. */
 function modelsListCard(): string {
   const supported = serverSupports(hub(), "model-catalog");
-  const rows = MODELS.map(({ id }) => {
+  const rows = MODELS.filter(({ id }) => id !== "gemini" || serverSupports(hub(), "gemini-sessions")).map(({ id }) => {
+    if (id === "gemini") {
+      // Not in Anthropic's catalog: runs on OpenRouter's Gemini slug (ANVIL_GEMINI_MODEL overrides it).
+      return `<tr><td><b>${esc(modelLabel(id))}</b></td><td><span class="small muted">via OpenRouter · needs its key</span></td><td></td></tr>`;
+    }
     const info = modelCatalog[id];
     const label = info?.label ?? modelLabel(id);
     const modelId = info?.modelId;
@@ -837,27 +899,11 @@ function renderModelsPanel(): void {
   //    card an older daemon still understands. ──
   const claudeSection =
     serverSupports(rosterServer(), "accounts") && ui.claudeAccounts ? accountsSection(ui.claudeAccounts, persistWarn) : legacyClaudeSection(tokenForm, persistWarn);
-  // ── OpenRouter (drives the adversarial multi-model planning panel) ──
-  const orForm = (saveLabel: string): string => `<div class="todoist-connect">
-      <input id="or-key" type="password" autocomplete="off" spellcheck="false" placeholder="OpenRouter API key (sk-or-…)" />
-      <button id="or-save" class="primary">${saveLabel}</button>
-    </div>`;
-  let openRouterSection: string;
-  if (!openRouterAuth) {
-    openRouterSection = `<div class="card"><b>OpenRouter</b><p class="small muted">Loading…</p></div>`;
-  } else if (!openRouterAuth.connected) {
-    openRouterSection = `<div class="card"><b>OpenRouter — not set <span class="small muted">(optional)</span></b>
-        <p class="small muted">Powers the <b>adversarial review</b>: after Claude plans, competing models (e.g. GLM) read the repo and critique the plan. Create a key at <code>openrouter.ai/keys</code>, paste it below, then save. Stored on the hub daemon (mode 0600). Leave unset to skip the panel.</p>
-        ${orForm("Save")}</div>`;
-  } else {
-    openRouterSection = `<div class="card"><div class="card-main"><span class="conn-dot connected"></span>
-          <span>OpenRouter — connected${openRouterAuth.masked ? ` · <code>${esc(openRouterAuth.masked)}</code>` : ""}</span>
-          <button id="or-clear" class="mini danger" style="margin-left:auto">${icon("key_off")} Reset / clear</button></div>${persistWarn(openRouterAuth.persisted)}</div>
-        <div class="card"><b>Replace key</b>
-          <p class="small muted">Paste a fresh key to replace the current one.</p>
-          ${orForm("Replace")}</div>`;
-  }
-  host.innerHTML = `${modelsListCard()}${claudeEngineCard()}${claudeSection}${openRouterSection}${pipelineMetricsCard()}`;
+  // ── Third-party keys: OpenRouter (adversarial panel + Gemini sessions) and a direct Gemini key
+  //    (panel only; shown when the hub understands provider:"gemini"). ──
+  const geminiKeyOk = serverSupports(hub(), "gemini-sessions");
+  const keySections = providerKeySection("openrouter", persistWarn) + (geminiKeyOk ? providerKeySection("gemini", persistWarn) : "");
+  host.innerHTML = `${modelsListCard()}${claudeEngineCard()}${claudeSection}${keySections}${pipelineMetricsCard()}`;
 
   // Wire the "Check for updates" button (present only when the hub advertises "model-catalog").
   const refreshBtn = document.getElementById("model-refresh");
@@ -881,16 +927,8 @@ function renderModelsPanel(): void {
       if (ev.key === "Enter") void saveClaudeToken(cInput.value, cBtn);
     });
   }
-  // Wire OpenRouter controls (present unless its status is still loading).
-  if (openRouterAuth) {
-    if (openRouterAuth.connected) $("#or-clear").addEventListener("click", () => void clearOpenRouterKeyUi());
-    const oInput = $<HTMLInputElement>("#or-key");
-    const oBtn = $<HTMLButtonElement>("#or-save");
-    oBtn.addEventListener("click", () => void saveOpenRouterKey(oInput.value, oBtn));
-    oInput.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") void saveOpenRouterKey(oInput.value, oBtn);
-    });
-  }
+  wireProviderKeySection("openrouter");
+  if (geminiKeyOk) wireProviderKeySection("gemini");
 }
 
 /** The pre-roster single-token card (an older daemon that doesn't advertise "accounts"). */

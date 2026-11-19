@@ -100,6 +100,10 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   // Settings → Models. An older daemon omits this, so the client hides the engine card entirely.
   "claude-cli-update",
   "accounts",
+  // Gemini as a session model (Model "gemini", run via OpenRouter's Anthropic Skin) and "gemini" as an
+  // auth provider (a direct Gemini API key for the adversarial panel). An older daemon would silently
+  // ignore session.set_model "gemini", so the client hides that picker entry without this.
+  "gemini-sessions",
   // The frozen update API v1 (/api/update/v1/*) + hub-orchestrated fleet rollout. A hub reads this (or
   // the `updateApiVersion` field) to drive a member through the stable path vs the legacy daemon.update
   // (stable-update-service spec §4.3).

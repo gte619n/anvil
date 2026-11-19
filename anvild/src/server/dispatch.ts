@@ -148,8 +148,8 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       }
 
       case "session.set_model":
-        deps.supervisor.setModel(cmd.sessionId, cmd.model);
-        if (cid) send(ack(cid));
+        // Async: a Claude ↔ Gemini switch tears down the driver; refused mid-turn → command.error.
+        ackWhenDone(deps.supervisor.setModel(cmd.sessionId, cmd.model), send, cid);
         return;
 
       case "model.refresh":

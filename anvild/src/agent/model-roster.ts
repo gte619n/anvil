@@ -12,7 +12,7 @@ import type { ModelProfile } from "./env";
 
 export interface ModelSpec {
   /** Stable id used in the trace record + independence checks. */
-  id: "claude" | "glm";
+  id: "claude" | "glm" | "gemini";
   /** Which env profile drives it (Anthropic subscription vs OpenRouter Anthropic Skin). */
   profile: ModelProfile;
   /** The `model` id passed to the Agent SDK (a Claude alias, or an OpenRouter slug). */
@@ -26,7 +26,7 @@ export const CLAUDE: ModelSpec = { id: "claude", profile: "claude", sdkModel: "o
 
 /** GLM 5.2 — near-peer coder, decorrelated lineage, cheap; carries cheap agentic authorship + test-gen.
  *  The exact OpenRouter slug is overridable via config so the roster can track new GLM releases. */
-export const GLM: ModelSpec = { id: "glm", profile: "glm", sdkModel: "z-ai/glm-5.2", label: "GLM 5.2" };
+export const GLM: ModelSpec = { id: "glm", profile: "openrouter", sdkModel: "z-ai/glm-5.2", label: "GLM 5.2" };
 
 /** Return a roster with GLM's slug overridden (e.g. from config), leaving Claude fixed. */
 export function roster(glmSdkModel?: string): { claude: ModelSpec; glm: ModelSpec } {

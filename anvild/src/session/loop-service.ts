@@ -15,7 +15,8 @@ import { slugify } from "./slug";
 import { createWorktree, removeWorktree } from "./worktree";
 import { runAgentQuery } from "../agent/query";
 import { judgeGoal } from "../agent/goal";
-import { sdkModelId } from "../agent/models";
+import { modelProfile, sdkModelId } from "../agent/models";
+import type { ModelSpec } from "../agent/model-roster";
 import { commit as gitCommit, push as gitPush, createPr as gitCreatePr, mergePr as gitMergePr, prChecksState } from "../git/ops";
 import { LoopStore } from "../loops/store";
 import { LoopEngine, type LapExecution, type LoopEngineDeps } from "../loops/engine";
@@ -192,8 +193,9 @@ export class LoopService {
     throw new BadCommand(`act body "${loop.act.kind}" is not runnable here`);
   }
 
-  private modelSpec(model?: Model): { id: "claude"; profile: "claude"; sdkModel: string; label: string } {
-    return { id: "claude", profile: "claude", sdkModel: sdkModelId(model ?? "opus"), label: model ?? "opus" };
+  private modelSpec(model: Model = "opus"): ModelSpec {
+    const profile = modelProfile(model);
+    return { id: profile === "claude" ? "claude" : "gemini", profile, sdkModel: sdkModelId(model), label: model };
   }
 
   private async ensureWorktree(loop: Loop, run: LoopRun): Promise<RunWorktree> {

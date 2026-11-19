@@ -529,6 +529,7 @@ export async function invitePeer(opts: {
   fleetName?: string;
   todoistToken?: string;
   openRouterKey?: string;
+  geminiKey?: string;
   /** The hub's account roster (multi-account §7.3), so a joiner arrives with every account rather
    *  than waiting for the next rotation. Sent only to a joiner advertising "accounts". */
   accounts?: rest.RosterPush;
@@ -556,6 +557,7 @@ export async function invitePeer(opts: {
       ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
       ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
       ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+      ...(opts.geminiKey ? { geminiKey: opts.geminiKey } : {}),
       ...(roster ? { accounts: roster } : {}),
     },
   });

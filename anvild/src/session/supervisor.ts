@@ -77,6 +77,7 @@ import { TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
 import { MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
 import { PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
 import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
+import { modelProfile, sdkModelId } from "../agent/models";
 import { fetchModelCatalog, resolveModelCatalog } from "../agent/model-catalog";
 import { ModelLabelStore } from "../models/store";
 import { CLAUDE_TOKEN_KEY } from "../auth/store";
@@ -106,7 +107,8 @@ import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/stor
 import { AccountStore, tokenFingerprint } from "../auth/accounts";
 import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
-import { OpenRouterClient } from "../integrations/openrouter";
+import { GEMINI_KEY, clearGeminiKey, geminiAuthStatus, setGeminiKey } from "../auth/gemini";
+import { PanelClient } from "../integrations/openrouter";
 import { reviewPlan, formatReview } from "../integrations/adversarial";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { AttachmentStore } from "../attach/store";
@@ -212,6 +214,11 @@ export class Supervisor {
    *  daemon restart. `s` resolves the spawn's Claude account (multi-account §4.1); omitted for
    *  short-lived utility spawns (icon/branch-kind), which use the roster default. */
   private agentEnv(s?: Session, opts: { requireToken?: boolean } = {}): Record<string, string> {
+    // A Gemini session runs via OpenRouter (no Claude account involved). The terminal (requireToken:false)
+    // stays on the Claude env so a missing OpenRouter key can't take the shell away.
+    if (s && opts.requireToken !== false && modelProfile(s.data.model ?? "opus") === "openrouter") {
+      return buildAgentEnv({ profile: "openrouter", sdkModel: sdkModelId(s.data.model ?? "opus") });
+    }
     return buildAgentEnv({ accounts: this.accounts, ...(s?.data.accountId ? { accountId: s.data.accountId } : {}), ...opts });
   }
   /** Same allow-list, but tolerant of a missing Claude token — for the session TERMINAL, which must keep
@@ -833,11 +840,13 @@ export class Supervisor {
   }
 
   // ── Model-provider auth (Settings → Models) ──────────
-  // Two providers share this surface: "claude" (the subscription OAuth token driving the Agent SDK) and
-  // "openrouter" (the metered key powering the adversarial planning panel). Each has its own env-file-
+  // Three providers share this surface: "claude" (the subscription OAuth token driving the Agent SDK),
+  // "openrouter" (the metered key powering the adversarial panel + GLM/Gemini agents) and "gemini" (a
+  // Google key for calling Gemini directly from the panel). Each has its own env-file-
   // backed store; the OpenRouter key is deliberately outside the §3 metered-key guard (different provider).
   private authStatusEvent(provider: AuthProvider, cid?: string): AuthStatusEvent {
-    const status = provider === "openrouter" ? openRouterAuthStatus() : claudeAuthStatus();
+    const status =
+      provider === "openrouter" ? openRouterAuthStatus() : provider === "gemini" ? geminiAuthStatus() : claudeAuthStatus();
     return { v: PROTOCOL_VERSION, type: "auth.status", ts: now(), ...(cid ? { cid } : {}), ...status };
   }
   /** Current credential state for a provider's Models card (defaults to Claude for back-compat). */
@@ -849,6 +858,7 @@ export class Supervisor {
   setAuthToken(provider: AuthProvider, token: string, cid?: string): AuthStatusEvent {
     try {
       if (provider === "openrouter") setOpenRouterKey(token);
+      else if (provider === "gemini") setGeminiKey(token);
       else setClaudeToken(token);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
@@ -859,6 +869,7 @@ export class Supervisor {
   /** Remove a provider's token from the daemon + env file. */
   clearAuthToken(provider: AuthProvider, cid?: string): AuthStatusEvent {
     if (provider === "openrouter") clearOpenRouterKey();
+    else if (provider === "gemini") clearGeminiKey();
     else clearClaudeToken();
     this.registry.toAll(this.authStatusEvent(provider));
     return this.authStatusEvent(provider, cid);
@@ -1800,12 +1811,21 @@ export class Supervisor {
     void this.apns.notify(payload);
   }
 
-  setModel(id: string, model: Model): void {
+  async setModel(id: string, model: Model): Promise<void> {
     if (!isModel(model)) return; // ignore an unknown model rather than pass junk to the SDK
     const s = this.require(id);
+    const crossProvider = modelProfile(s.data.model ?? "opus") !== modelProfile(model);
+    if (crossProvider) {
+      // Claude ↔ Gemini changes the provider + credential, which a running query() holds for life: drop
+      // the driver so the next turn respawns with the new env and RESUMES the same conversation (verified
+      // both directions). Refused mid-turn, since tearing down a live turn would lose its work.
+      if (!(await this.restartDriverForNewToken(id))) {
+        throw new BadCommand("finish or stop the current turn before switching between Claude and Gemini");
+      }
+    }
     s.data.model = model;
     s.data.lastActivityAt = now();
-    void this.drivers.get(id)?.setModel(model);
+    if (!crossProvider) void this.drivers.get(id)?.setModel(model);
     this.persist();
     this.broadcastUpdated(s.data);
   }
@@ -1854,10 +1874,13 @@ export class Supervisor {
   private planReviewer(s: Session): PlanProposedHook {
     return async (plan: string) => {
       if (!s.data.adversarialReview || !plan.trim()) return; // not opted in / nothing to review
-      const key = (process.env[OPENROUTER_KEY] ?? "").trim();
-      if (!key || process.env.ANVIL_ADVERSARIAL === "0" || !this.adversarial.models.length) return;
+      const client = new PanelClient(
+        { openRouter: process.env[OPENROUTER_KEY], gemini: process.env[GEMINI_KEY] },
+        undefined,
+        this.adversarial.provider,
+      );
+      if (!client.usable || process.env.ANVIL_ADVERSARIAL === "0" || !this.adversarial.models.length) return;
       try {
-        const client = new OpenRouterClient(key, undefined, this.adversarial.provider);
         const review = await reviewPlan(
           { title: s.data.title, rationale: "Interactive session — plan review before execution.", plan },
           { client, models: this.adversarial.models },

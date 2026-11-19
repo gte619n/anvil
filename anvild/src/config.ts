@@ -28,10 +28,11 @@ export interface Config {
   adversarialProvider?: string;
 }
 
-/** OpenRouter slugs used by the adversarial panel when ANVIL_ADVERSARIAL_MODELS isn't set — an
- *  OpenAI Codex-class model and GLM 5.2 (1M context, strong at tool use / long agentic tasks, so it's
- *  well suited to the codebase-reading critic role). */
-const DEFAULT_ADVERSARIAL_MODELS = ["openai/gpt-5-codex", "z-ai/glm-5.2"];
+/** Models the adversarial panel uses when ANVIL_ADVERSARIAL_MODELS isn't set — an OpenAI Codex-class
+ *  model, GLM 5.2 (1M context, strong at tool use / long agentic tasks, so it's well suited to the
+ *  codebase-reading critic role), and Google's flagship reasoning model. `gemini/…` ids are called on
+ *  Google's API directly when GEMINI_API_KEY is set, else via OpenRouter as `google/…` (PanelClient). */
+const DEFAULT_ADVERSARIAL_MODELS = ["openai/gpt-5-codex", "z-ai/glm-5.2", "gemini/gemini-4-argon"];
 
 function expandHome(p: string, home: string): string {
   return p.startsWith("~") ? home + p.slice(1) : p;
@@ -119,8 +120,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     usagePollMs: numEnv(env.ANVIL_BUDGET_POLL_MS, 5 * 60_000, "ANVIL_BUDGET_POLL_MS", { min: 0, integer: true }),
     openRouterApiKey,
     adversarialModels: adversarialModels.length ? adversarialModels : DEFAULT_ADVERSARIAL_MODELS,
-    // On when a key is present, unless explicitly killed via ANVIL_ADVERSARIAL=0.
-    adversarialEnabled: Boolean(openRouterApiKey) && env.ANVIL_ADVERSARIAL !== "0",
+    // On when a panel key (OpenRouter or Gemini) is present, unless explicitly killed via ANVIL_ADVERSARIAL=0.
+    adversarialEnabled: Boolean(openRouterApiKey || env.GEMINI_API_KEY?.trim()) && env.ANVIL_ADVERSARIAL !== "0",
     adversarialProvider: env.ANVIL_ADVERSARIAL_PROVIDER?.trim() || undefined,
   };
 }
