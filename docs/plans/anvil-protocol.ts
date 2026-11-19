@@ -101,7 +101,7 @@ export interface SessionScoped {
 // 1. Domain types (§5)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type Model = "opus" | "sonnet" | "haiku" | "fable";
+export type Model = "opus" | "sonnet" | "haiku" | "fable" | "gemini";
 
 /** The models a session can run on, in picker order. `label` is the human name shown in the UI;
  *  the daemon maps each `id` to the string the Agent SDK expects (see agent/models.ts). */
@@ -110,6 +110,9 @@ export const MODELS: readonly { id: Model; label: string }[] = [
   { id: "sonnet", label: "Sonnet 4.6" },
   { id: "haiku", label: "Haiku 4.5" },
   { id: "fable", label: "Fable 5" },
+  // Not a Claude tier: Google's Gemini, run through the same Agent SDK via OpenRouter (needs an
+  // OpenRouter key; gated client-side by the "gemini-sessions" capability). See agent/models.ts.
+  { id: "gemini", label: "Gemini 4 Neon" },
 ];
 /** Human label for a session's model (falls back to the raw id for forward-compat). */
 export const modelLabel = (m: Model): string => MODELS.find((x) => x.id === m)?.label ?? m;
@@ -669,7 +672,7 @@ export interface LapoAuthorizeEvent extends Envelope {
 /** Model-provider auth. Only "claude" is functional today (the Agent SDK is Claude-only); the field
  *  exists so the Settings → Models UI and the daemon can grow Gemini/ChatGPT entries without a
  *  protocol change. The full secret is never sent to clients — only `masked` + the connected flag. */
-export type AuthProvider = "claude" | "openrouter";
+export type AuthProvider = "claude" | "openrouter" | "gemini";
 /** Connection state for a model provider's credential — answer to `auth.status`/`auth.set`/`auth.clear`
  *  (carries cid) and broadcast (no cid) when it changes. */
 export interface AuthStatusEvent extends Envelope {
@@ -2548,6 +2551,7 @@ export namespace rest {
      *  (HJ-24/HJ-27). Present keys OVERWRITE; absent keys are left alone. */
     todoistToken?: string;
     openRouterKey?: string;
+    geminiKey?: string;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;
@@ -2588,6 +2592,7 @@ export namespace rest {
     hubServerId: string;
     todoistToken?: string;
     openRouterKey?: string;
+    geminiKey?: string;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;

@@ -12,7 +12,7 @@
  * metering — so it does NOT violate the arch §3 "no metered ANTHROPIC_API_KEY" invariant.
  */
 import { MODELS, type Model, type ModelTierInfo } from "@protocol";
-import { modelFamilyPrefix } from "./models";
+import { modelFamilyPrefix, modelProfile } from "./models";
 
 /** One entry from `GET /v1/models` — only the fields we resolve labels from. */
 export interface ModelCatalogEntry {
@@ -54,6 +54,7 @@ export function resolveModelCatalog(entries: ModelCatalogEntry[]): Partial<Recor
     .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
   const out: Partial<Record<Model, ModelTierInfo>> = {};
   for (const { id } of MODELS) {
+    if (modelProfile(id) !== "claude") continue; // Anthropic's catalog only describes Claude tiers
     const match = byNewest.find((e) => e.id.startsWith(modelFamilyPrefix(id))); // newest in the tier's family
     const label = match?.display_name.replace(/^Claude\s+/i, "").trim();
     if (match && label) {

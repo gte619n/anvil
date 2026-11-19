@@ -1587,6 +1587,7 @@ function onEvent(url: string, e: ServerEvent): void {
       if (url === HUB_URL && serverSupports(srv, "auth")) {
         srv!.sock.send({ type: "auth.status" }); // claude (default)
         srv!.sock.send({ type: "auth.status", provider: "openrouter" });
+        if (serverSupports(srv, "gemini-sessions")) srv!.sock.send({ type: "auth.status", provider: "gemini" });
       }
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("env-cards")) renderEnvCards();
@@ -2125,15 +2126,23 @@ function updateGoalChip(s: Session | undefined): void {
 $("#btn-model").addEventListener("click", () => {
   const s = activeId ? sessions.get(activeId) : undefined;
   if (!s) return;
+  // Gemini is offered only when the session's own daemon can run it (an older one would ignore it).
+  const srv = serverOf(activeId) ?? hub();
+  const offered = MODELS.filter((m) => m.id !== "gemini" || m.id === s.model || serverSupports(srv, "gemini-sessions"));
   toggleHeaderMenu(
     $("#btn-model"),
-    MODELS.map((m) => ({
+    offered.map((m) => ({
       icon: m.id === s.model ? "check" : "smart_toy",
       label: modelLabelOf(m.id),
       title: m.id === s.model ? `${modelLabelOf(m.id)} (current)` : `Switch to ${modelLabelOf(m.id)}`,
       run: () => {
         if (m.id === s.model) return;
-        sendTo(activeId, { type: "session.set_model", sessionId: activeId, model: m.id });
+        // Awaited so a refusal (Claude ↔ Gemini mid-turn) is shown instead of silently doing nothing.
+        void sendAwait(srv, { type: "session.set_model", sessionId: activeId, model: m.id, cid: newCid() }, 15_000)
+          .then((res) => {
+            if (res.type === "command.error") toast(res.message);
+          })
+          .catch(() => {});
       },
     })),
   );

@@ -22,6 +22,7 @@ import {
 import { bindDegradeStateDir } from "../auth/degrade";
 import { setClaudeToken } from "../auth/store";
 import { setOpenRouterKey } from "../auth/openrouter";
+import { setGeminiKey } from "../auth/gemini";
 import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
@@ -600,7 +601,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
    *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
+  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; geminiKey?: string; accounts?: rest.RosterPush }): string | null => {
     // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
     // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
     // anything.
@@ -627,6 +628,13 @@ export function createServer(opts: ServerOptions): ServerHandle {
         setOpenRouterKey(body.openRouterKey);
       } catch (e) {
         console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    if (body.geminiKey) {
+      try {
+        setGeminiKey(body.geminiKey);
+      } catch (e) {
+        console.warn(`[fleet] pushed Gemini key rejected: ${e instanceof Error ? e.message : e}`);
       }
     }
     if (body.todoistToken) {
@@ -763,6 +771,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
         ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
         ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+        ...(process.env.GEMINI_API_KEY ? { geminiKey: process.env.GEMINI_API_KEY } : {}),
         // The whole roster rides the first join too, so a new member arrives with every account
         // instead of only the mirrored default (§7.3).
         ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),

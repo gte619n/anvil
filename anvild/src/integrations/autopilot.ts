@@ -12,7 +12,7 @@ import { extractJson } from "./json";
 import { parseIntakeVerdict, type IntakeVerdict } from "./autostart-gate";
 import { parseVerdict, type Verdict } from "./autopilot-plans";
 import { reviewPlan, formatReview, type AdversarialReview } from "./adversarial";
-import type { OpenRouterClient } from "./openrouter";
+import type { ChatClient } from "./openrouter";
 import type { WorkUnit, WorkUnitStore } from "./workunit";
 
 /**
@@ -42,7 +42,7 @@ export interface PlannedUnit extends ProposedUnit {
  *  entirely (the feature is inert without an OpenRouter key), so every path stays backward-compatible. */
 export interface AdversarialOpts {
   enabled: boolean;
-  client: OpenRouterClient;
+  client: ChatClient;
   models: string[];
 }
 
