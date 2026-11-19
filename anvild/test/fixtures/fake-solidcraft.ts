@@ -7,14 +7,19 @@
  * the numbers the way the real kernel would. Reply shapes were copied from the real server
  * (SolidCraft 0.44.1, 2026-11-19).
  *
- *   bun test/fixtures/fake-solidcraft.ts mcp --headless --compact --allow-path DIR [--allow-path DIR2] [--in FILE]
+ *   bun test/fixtures/fake-solidcraft.ts mcp --headless --compact --allow-path DIR [--allow-path DIR2] [--require-allow-path] [--in FILE]
  *   bun test/fixtures/fake-solidcraft.ts --version          → "solidcraft-cli <FAKE_SC_VERSION>"
  *
  * TOOLS: version, list_commands, describe_command, execute, batch, inspect_design, measure,
  * body_topology, set_parameter, check_parameters, screenshot, export, undo, redo, new_design, open,
  * save, skill_reference.
  *
- * COMMANDS (via execute/batch): parameters.add, parameters.change, sketch.create,
+ * `inspect_design` honours `timeline: "summary" | false` and `bodies: "names" | false` (the light
+ * read the daemon's manager takes after every change) and reports `undo` / `redo` stack depths: one
+ * undo step per executed command, so a 16-command batch is 16 steps (the real plate batch is 14).
+ *
+ * COMMANDS (via execute/batch): parameters.add, parameters.change (`{name, expression}` creates an
+ * unknown name as the real tool does; `{changes: {name: expr}}` refuses one), sketch.create,
  * sketch.rectangle.center, sketch.draw.dimensioned (wrapping sketch.rectangle.center), sketch.point,
  * sketch.dimension (horizontal/vertical from the origin to a point), sketch.finish, solid.extrude
  * (new body from a centred rectangle), solid.box (new body), solid.cylinder (new/join/cut, Z axis),
@@ -37,8 +42,18 @@
  *   FAKE_SC_DELAY_MS      delay before every tools/call reply.
  *   FAKE_SC_WARN_ON       a command id whose feature result (and timeline entry) carries a
  *                         "Boolean retry…" warning; the geometry is still built.
+ *   FAKE_SC_HANG_ON       a command id (or tool name): on reaching it the process never replies and
+ *                         stays alive — the "SolidCraft hangs" case the manager's timeout must kill.
  *   FAKE_SC_MISS_CUTS=1   every cut (solid.hole, solid.cylinder cut, and their patterned copies)
  *                         reports success but removes nothing — the "cut that misses" case.
+ *
+ * FAILED FEATURES (A0 evidence): a `solid.*` step that fails while it is being ADDED is an error
+ * reply and adds nothing. One that fails LATER — after a parameter change, or while a script is
+ * replayed with `--in` — stays in the timeline with its `error` set, the reply is a success
+ * (`parameters.change` lists it under `errors`), and `measure` reports the partial geometry.
+ * `--in` therefore starts with failed features, but exits 1 with `error: step N (cmd): …` on a
+ * step it cannot run at all (unknown command, a sketch step with no sketch) or `error: <path>: …`
+ * on a file it cannot read, as the real CLI does.
  *
  * HOW IT DIFFERS FROM THE REAL SERVER
  *  - Geometry is a table of closed forms, not a kernel. Volume, bounding box, face count and the
@@ -76,6 +91,7 @@ const VOLUME_SCALE = Number(process.env.FAKE_SC_VOLUME_SCALE || 1);
 const CRASH_ON = process.env.FAKE_SC_CRASH_ON || "";
 const DELAY_MS = Number(process.env.FAKE_SC_DELAY_MS || 0);
 const WARN_ON = process.env.FAKE_SC_WARN_ON || "";
+const HANG_ON = process.env.FAKE_SC_HANG_ON || "";
 const MISS_CUTS = process.env.FAKE_SC_MISS_CUTS === "1";
 const BOOLEAN_RETRY = "Boolean retry: the boolean needed a second attempt at a looser tolerance; check the result";
 
@@ -87,7 +103,13 @@ interface Cmd {
 }
 
 /** A user-facing failure: becomes an `isError` tool result with this text. */
-class ToolError extends Error {}
+class ToolError extends Error {
+  /** Index of the failing command in the log being built (set by `build`). */
+  step?: number;
+  command?: string;
+}
+/** A step that cannot run at all — never recorded as a failed feature. */
+class UnknownCommand extends ToolError {}
 /** A malformed call: becomes a JSON-RPC error (-32602), as the real server answers. */
 class RpcError extends Error {
   constructor(
@@ -174,6 +196,8 @@ interface Feature {
   name: string;
   type: string;
   warning: string | null;
+  /** Why the feature failed to compute (it stays in the timeline, as in the real tool). */
+  error?: string | null;
   /** Re-apply this feature shifted by (dx, dy) for a pattern copy; returns the bodies it changed. */
   instance?: (dx: number, dy: number, suffix: string) => string[];
 }
@@ -251,13 +275,32 @@ function material(b: Body, x: number, y: number, r: number, z0: number, z1: numb
   return total;
 }
 
-/** Rebuild the whole design from the command log. Throws ToolError on the first command that fails. */
-function build(log: readonly Cmd[]): Model {
+const FEATURE_TYPES: Record<string, [string, string]> = {
+  "solid.extrude": ["ExtrudeFeature", "Extrude"], "solid.box": ["BoxFeature", "Box"], "solid.cylinder": ["CylinderFeature", "Cylinder"],
+  "solid.fillet": ["FilletFeature", "Fillet"], "solid.hole": ["HoleFeature", "Hole"], "solid.pattern.rectangular": ["RectangularPatternFeature", "Pattern"],
+};
+
+/**
+ * Rebuild the whole design from the command log. Commands from `strictFrom` on are being ADDED:
+ * the first that fails throws ToolError. Earlier `solid.*` commands are history being recomputed: one
+ * that fails becomes a timeline feature with `error` set and the build carries on. Any other failure
+ * (unknown command, bad sketch step, bad parameter expression) always throws, tagged with its step.
+ */
+function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
   // Pass 1 — parameters. They are evaluated with their FINAL expressions, because the design is
   // parametric: changing L after the plate was extruded still resizes the plate.
   const params: Param[] = [];
   for (const { command, params: p } of log) {
     if (command !== "parameters.add" && command !== "parameters.change") continue;
+    // The `changes` form (the only one that refuses an unknown name): all or nothing, one rebuild.
+    if (command === "parameters.change" && p.changes && typeof p.changes === "object") {
+      for (const [name, expr] of Object.entries(p.changes as Json)) {
+        const q = params.find((x) => x.name === name);
+        if (!q) throw new ToolError(`unknown parameter \`${name}\``);
+        q.expression = fmtParam(expr);
+      }
+      continue;
+    }
     if (typeof p.name !== "string" || !p.name) throw new ToolError(`invalid parameters for \`${command}\`: \`name\` is required`);
     const expr = p.expression ?? p.value;
     if (expr === undefined) throw new ToolError(`invalid parameters for \`${command}\`: \`expression\` is required`);
@@ -408,7 +451,11 @@ function build(log: readonly Cmd[]): Model {
     return true;
   };
 
-  for (const { command, params: p } of log) {
+  const paramReplies: Json[] = [];
+  for (const [idx, { command, params: p }] of log.entries()) {
+    const tolerant = idx < strictFrom && command.startsWith("solid.");
+    const snap = tolerant ? { bodies: structuredClone(m.bodies), timeline: m.timeline.length, results: m.results.length, bodyCount, nextId, counters: { ...counters } } : undefined;
+    try {
     switch (command) {
       case "parameters.add": {
         const q = params.find((x) => x.name === p.name)!;
@@ -416,8 +463,14 @@ function build(log: readonly Cmd[]): Model {
         break;
       }
       case "parameters.change": {
-        const q = params.find((x) => x.name === p.name)!;
-        m.results.push({ display_value: q.value, errors: [], expression: q.expression, name: q.name, recomputed: m.timeline.length, restored: 0, value: q.value });
+        if (p.changes && typeof p.changes === "object") {
+          const changed = Object.fromEntries(Object.keys(p.changes).map((name) => [name, params.find((x) => x.name === name)!.value]));
+          paramReplies.push({ changed, errors: [], recomputed: 0, restored: 0 });
+        } else {
+          const q = params.find((x) => x.name === p.name)!;
+          paramReplies.push({ display_value: q.value, errors: [], expression: q.expression, name: q.name, recomputed: 0, restored: 0, value: q.value });
+        }
+        m.results.push(paramReplies[paramReplies.length - 1]!);
         break;
       }
       case "sketch.create": {
@@ -661,8 +714,34 @@ function build(log: readonly Cmd[]): Model {
         break;
       }
       default:
-        throw new ToolError(`unknown command \`${command}\``);
+        throw new UnknownCommand(`unknown command \`${command}\``);
     }
+    } catch (e) {
+      if (!(e instanceof ToolError)) throw e;
+      if (!snap || e instanceof UnknownCommand) {
+        e.step ??= idx;
+        e.command ??= command;
+        throw e;
+      }
+      // A feature that no longer computes: undo whatever it half-did and keep it as a failed feature.
+      m.bodies = snap.bodies;
+      m.timeline.length = snap.timeline;
+      m.results.length = snap.results;
+      bodyCount = snap.bodyCount;
+      nextId = snap.nextId;
+      for (const k of Object.keys(counters)) delete counters[k];
+      Object.assign(counters, snap.counters);
+      const [type, base] = FEATURE_TYPES[command] ?? ["Feature", "Feature"];
+      const f: Feature = { id: nextId++, name: typeof p.name === "string" && p.name ? p.name : autoName(base), type, warning: null, error: e.message };
+      m.timeline.push(f);
+      m.results.push({ error: e.message, feature: f.id, name: f.name, warning: null });
+    }
+  }
+  // A parameter change reports every feature it left failing, and still counts as a success.
+  const errors = m.timeline.filter((f) => f.error).map((f) => ({ error: f.error, feature: f.name }));
+  for (const r of paramReplies) {
+    r.errors = errors;
+    r.recomputed = m.timeline.length;
   }
   return m;
 }
@@ -936,7 +1015,7 @@ function execute(command: string, params: Json, verbose: boolean): Json {
   if (!isKnown(command)) throw new ToolError(`unknown command \`${command}\``);
   const ro = READ_ONLY[command];
   if (ro) return ro(model, params);
-  const next = build([...log, { command, params }]);
+  const next = build([...log, { command, params }], log.length);
   log.push({ command, params });
   redo = [];
   model = next;
@@ -1032,7 +1111,16 @@ function save(a: Json): Json {
 function inspectDesign(a: Json): Json {
   return {
     active_sketch: model.activeSketch?.id ?? null,
-    bodies: a.measure === false ? model.bodies.map((b) => ({ feature: b.feature, name: b.name, visible: true })) : model.bodies.map((b) => ({ ...measureBody(b, false), visible: true })),
+    ...(a.bodies === false
+      ? {}
+      : {
+          bodies:
+            a.bodies === "names"
+              ? model.bodies.map((b) => b.name)
+              : a.measure === false
+                ? model.bodies.map((b) => ({ feature: b.feature, name: b.name, visible: true }))
+                : model.bodies.map((b) => ({ ...measureBody(b, false), visible: true })),
+        }),
     dirty: revision > 0,
     hidden_origin: [],
     marker: model.timeline.length,
@@ -1044,7 +1132,15 @@ function inspectDesign(a: Json): Json {
     revision,
     selection: [],
     sketches: a.sketches === false ? [] : model.sketches.map((s) => ({ id: s.id, name: s.name, plane: { origin: [0, 0, s.z], x_dir: [1, 0, 0], y_dir: [0, 1, 0] }, points: s.points.length + 1, profiles: s.rect ? 1 : 0, status: "solved", visible: false, wires_ok: true })),
-    timeline: model.timeline.map((f) => ({ error: null, id: f.id, ms: 0.1, name: f.name, rolled_back: false, suppressed: false, type: f.type, warning: f.warning })),
+    ...(a.timeline === false
+      ? {}
+      : {
+          timeline: model.timeline.map((f) =>
+            a.timeline === "summary"
+              ? { ...(f.error ? { error: f.error } : {}), id: f.id, name: f.name, type: f.type, ...(f.warning ? { warning: f.warning } : {}) }
+              : { error: f.error ?? null, id: f.id, ms: 0.1, name: f.name, rolled_back: false, suppressed: false, type: f.type, warning: f.warning },
+          ),
+        }),
     undo: log.length,
     units: "mm",
   };
@@ -1245,6 +1341,7 @@ async function handle(msg: Json): Promise<void> {
       if (!tool) return fail(-32602, `unknown tool \`${name}\``);
       const args: Json = params?.arguments ?? {};
       if (DELAY_MS > 0) await new Promise((r) => setTimeout(r, DELAY_MS));
+      if (HANG_ON && (HANG_ON === name || (name === "execute" && HANG_ON === args.command))) await new Promise(() => {});
       try {
         for (const key of tool.required ?? []) need(name, args, key);
         crashIf(name);
@@ -1269,13 +1366,18 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] !== "mcp") {
-    process.stderr.write("usage: fake-solidcraft mcp [--headless] [--compact] [--allow-path DIR]... [--in design.sc|script.json]\n");
+    process.stderr.write("usage: fake-solidcraft mcp [--headless] [--compact] [--allow-path DIR]... [--require-allow-path] [--in design.sc|script.json]\n");
     process.exit(2);
   }
   let inFile: string | undefined;
+  let requireAllow = false;
+  const allowArgs: string[] = [];
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i]!;
-    if (a === "--allow-path") allowed.push(real(argv[++i] ?? ""));
+    if (a === "--allow-path") {
+      allowArgs.push(argv[++i] ?? "");
+      allowed.push(real(allowArgs[allowArgs.length - 1]!));
+    } else if (a === "--require-allow-path") requireAllow = true;
     else if (a === "--in") inFile = argv[++i];
     else if (a === "--headless" || a === "--compact") continue;
     else {
@@ -1283,12 +1385,18 @@ async function main(): Promise<void> {
       process.exit(2);
     }
   }
+  if (requireAllow && allowArgs.every((d) => !d || !existsSync(d))) {
+    process.stderr.write(`error: none of the --allow-path folders exist (${allowArgs.join(", ") || "none given"})\n`);
+    process.exit(1);
+  }
   process.stderr.write(`solidcraft mcp: files limited to ${allowed.join(", ") || "(nothing)"} (--allow-path DIR adds one)\n`);
   if (inFile) {
     try {
       openDesign(readablePath(inFile, "--in"));
     } catch (e) {
-      process.stderr.write(`fake-solidcraft: ${e instanceof Error ? e.message : String(e)}\n`);
+      const msg = e instanceof Error ? e.message : String(e);
+      const step = e instanceof ToolError && e.step !== undefined ? `step ${e.step + 1} (${e.command}): ` : "";
+      process.stderr.write(`error: ${step}${msg}\n`);
       process.exit(1);
     }
   }

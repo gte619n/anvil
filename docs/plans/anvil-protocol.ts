@@ -583,6 +583,20 @@ export interface ModelLabelsEvent extends Envelope {
   checkedAt?: string; // ISO 8601 of the hub's last catalog check (absent/"" if never)
 }
 /**
+ * Whether this machine can do CAD work right now (docs/plans/2026-11-19-agent-cad-and-browser.md §4.8).
+ * Separate from the "cad-work" CAPABILITY: a machine can advertise the capability and still be unable
+ * to run SolidCraft (no binary installed, or off the fleet pin). Sent after `server.hello` on a daemon
+ * with "cad-work" enabled and re-broadcast when it changes; the `anvil_cad` tools refuse with `reason`
+ * while `available` is false. Additive: clients without CAD UI ignore it.
+ */
+export interface CadStatusEvent extends Envelope {
+  type: "cad.status";
+  available: boolean;
+  reason?: string; // why not (only when unavailable)
+  version?: string; // the SolidCraft build this machine runs, e.g. "0.44.1"
+  pinned?: string; // the fleet-pinned version, once the hub manages the install
+}
+/**
  * The Claude Code CLI this daemon spawns sessions with (docs/plans/2026-11-10-managed-claude-cli-updates.md).
  * The CLI is bundled with the pinned agent-sdk, but can be advanced to the latest published version
  * WITHOUT an Anvil release by installing a "managed" copy under the state dir. Gated by the
@@ -1446,6 +1460,7 @@ export type ServerEvent =
   | EnvironmentsEvent
   | PromptsEvent
   | ModelLabelsEvent
+  | CadStatusEvent
   | ClaudeCliStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent

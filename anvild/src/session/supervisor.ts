@@ -58,6 +58,11 @@ import {
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { CadStatusEvent } from "@protocol";
+import { featureEnabled } from "../config";
+import type { CadManagerOptions } from "../cadwork/manager";
+import { CadworkService } from "./cadwork-service";
 import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
 import { discoverSelfBaseUrl } from "../server/fleet";
@@ -172,6 +177,11 @@ export interface SupervisorConfig {
   adversarialModels?: string[];
   /** Preferred OpenRouter provider slug for the panel (see `Config.adversarialProvider`). */
   adversarialProvider?: string;
+  /** Capability-gated features switched on by `ANVIL_FEATURES` (see `Config.features`). Omitted →
+   *  none, so a Supervisor built in a unit test never grows CAD tools by accident. */
+  features?: readonly string[];
+  /** Test seam: options for the CAD process manager (fake clock, spawn, FAKE_SC_* env). */
+  cadManager?: CadManagerOptions;
   /** The concierge's reach into the fleet (anvil-fleet-concierge): member roster + REST-backed
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
@@ -263,6 +273,8 @@ export class Supervisor {
   private readonly environments: EnvironmentService;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
+  /** CAD domain — SolidCraft process manager + the `anvil_cad` tool server (agent-cad-and-browser spec). */
+  readonly cadwork: CadworkService;
   /** Team orchestration domain — plan lifecycle, member spawn/queue/drain, relay guard, integration
    *  (P7 extraction; see docs/plans/anvil-team-support.md). */
   private readonly teams: TeamCoordinator;
@@ -322,6 +334,13 @@ export class Supervisor {
       clonesDir: this.clonesDir,
       renderer: this.renderer,
     });
+    this.cadwork = new CadworkService({
+      enabled: featureEnabled({ features: cfg.features }, "cad-work"),
+      getSession: (id) => this.sessions.get(id),
+      registry: this.registry,
+      manager: cfg.cadManager,
+    });
+    if (this.cadwork.enabled) void this.cadwork.refreshStatus(); // learn the SolidCraft version; broadcasts cad.status
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
       getSession: (id) => this.sessions.get(id),
@@ -1693,7 +1712,7 @@ export class Supervisor {
               ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
               : isPlanner
                 ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-                : undefined,
+                : this.ordinaryMcpServers(s),
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
@@ -1716,6 +1735,24 @@ export class Supervisor {
       this.drivers.set(id, driver);
     }
     return driver;
+  }
+
+  /**
+   * The capability-gated MCP servers an ORDINARY session gets (not the concierge, a team lead/member
+   * or a planner — those get their role server above). One map, built by the feature services; an
+   * empty result is `undefined` so the driver is constructed exactly as before. None of these tools
+   * is added to `allowedTools`: every call is decided by the PreToolUse hook.
+   */
+  private ordinaryMcpServers(s: Session): Record<string, McpSdkServerConfigWithInstance> | undefined {
+    const servers: Record<string, McpSdkServerConfigWithInstance> = {
+      ...this.cadwork.serversFor(s.data), // { anvil_cad } when "cad-work" is on and cwd is in a git repo
+    };
+    return Object.keys(servers).length > 0 ? servers : undefined;
+  }
+
+  /** Whether this machine can do CAD right now (`cad.status`, spec §4.8). */
+  cadStatusEvent(): CadStatusEvent {
+    return this.cadwork.statusEvent();
   }
 
   interrupt(id: string): void {
@@ -1956,6 +1993,7 @@ export class Supervisor {
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
     this.terminalMgr.killAll();
+    await this.cadwork.shutdown().catch(() => undefined); // stop every SolidCraft process
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
     // The registry now holds every minted seq — tell the next boot it needn't skip ahead (see restore).

@@ -238,6 +238,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adversarialProvider: opts.adversarialProvider,
       refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
       fleet: conciergeFleet,
+      features: opts.features,
     },
     registry,
   );
@@ -500,6 +501,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
+      if (supervisor.cadwork.enabled) ws.send(JSON.stringify(supervisor.cadStatusEvent())); // can this machine do CAD right now? (spec §4.8)
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));

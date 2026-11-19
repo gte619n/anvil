@@ -46,6 +46,7 @@
     "autopilot.verify.keep",
     "autopilot.verify.metrics",
     "budget",
+    "cad.status",
     "claudecli.check",
     "claudecli.status",
     "command.error",

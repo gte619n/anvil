@@ -110,7 +110,111 @@
     },
     "A1": {
       "title": "process manager, part files, agent tools",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/integration/cad-a1-manager.test.ts",
+          "names": [
+            "Phase A1 acceptance > [A1] acceptance 1: open_part then the 16-command batch writes cad/plate/design.json, which replays in a fresh process to the live volume",
+            "Phase A1 acceptance > [A1] acceptance 2: killing the process between two calls, the second call succeeds and the design is intact",
+            "Phase A1 acceptance > [A1] acceptance 3: with a cap of 1, a second part's first call waits and then succeeds when the first goes idle",
+            "Phase A1 acceptance > [A1] acceptance 4: editing design.json on disk, then calling measure, the result reflects the edited file",
+            "Phase A1 acceptance > [A1] acceptance 5: open_part {part:\"../x\"} is refused; under allowlist measure does not prompt and execute does",
+            "Phase A1 acceptance > [A1] acceptance 6: with cad-work absent from ANVIL_FEATURES, the session has no anvil_cad server",
+            "Phase A1 functional edge cases > [A1] a design.json that fails to replay: the process starts empty, the part fails with the failing step, and the file is kept until a change succeeds",
+            "Phase A1 functional edge cases > [A1] cad.status follows server.hello on a daemon with cad-work, and is absent without it"
+          ]
+        },
+        {
+          "file": "test/unit/cad-manager.test.ts",
+          "names": [
+            "part folders > [A1] a part name is a name, never a path",
+            "part folders > [A1] the key is realpath(worktree)/cad/<part>, whatever path the worktree was reached by",
+            "part folders > [A1] generated folders are excluded through .git/info/exclude, never .gitignore",
+            "cad manager > [A1] a process starts with the amended flags, only the part folder allowed, and --in on replay",
+            "cad manager > [A1] each part gets its own process and the same part shares one",
+            "cad manager > [A1] every caller shares one strict FIFO queue per part",
+            "cad manager > [A1] the script is rewritten after every successful change, and not after a read or a failure",
+            "cad manager > [A1] a process exits after 10 minutes idle and the next request replays the design",
+            "cad manager > [A1] the cap defaults to 4 and reads ANVIL_CAD_MAX_PROCS",
+            "cad manager > [A1] at the cap a new part waits for a slot, visibly, while every process is busy",
+            "cad manager > [A1] an idle process is evicted first, least recently used first, with no waiting",
+            "cad manager > [A1] a crash fails the pending request with the stderr tail; the next request restarts and replays",
+            "cad manager > [A1] a process killed between two calls is restarted and the design is intact",
+            "cad manager > [A1] a daemon restart loses the processes, not the design",
+            "cad manager > [A1] a hung SolidCraft is killed at the request timeout and the next call restarts it",
+            "cad manager > [A1] requests get 120 s, a batch 600 s",
+            "cad manager > [A1] design.json changed on disk is noticed at dequeue: the process restarts from it and the caller is told",
+            "cad manager > [A1] design.json changed during a change is never overwritten: conflict file, part failed, disk wins",
+            "cad manager > [A1] feature errors are read from the timeline straight after start",
+            "cad manager > [A1] a design.json that fails to replay starts empty, fails with the step, and is kept until a change succeeds",
+            "cad manager > [A1] a design from a newer format is refused by Anvil itself, and the local format is learned once per binary",
+            "cad manager > [A1] undo and redo revert one agent request, however many SolidCraft steps it was",
+            "cad manager > [A1] the refresh hook runs after a change, is debounced in a burst, can be forced, and is a no-op when absent",
+            "cad manager > [A1] shutdown stops every process and refuses new work",
+            "cad manager > [A1] with no binary the request fails as unavailable and nothing is spawned"
+          ]
+        },
+        {
+          "file": "test/unit/cad-poststep.test.ts",
+          "names": [
+            "cad poststep > [A1] scriptSha hashes the canonical commands only: about and key order do not matter",
+            "cad poststep > [A1] design.json has sorted keys and a stable about block named after the part",
+            "cad poststep > [A1] the script is exported with no path and written by the daemon",
+            "cad poststep > [A1] a crash during the script write leaves the old script intact (temp file + rename)",
+            "cad poststep > [A1] a design.json that changed on disk is never overwritten: the result goes to .cache/design.conflict.json",
+            "cad poststep > [A1] an identical script is not rewritten",
+            "cad poststep > [A1] a failed export throws and leaves design.json untouched"
+          ]
+        },
+        {
+          "file": "test/unit/cad-mcp-client.test.ts",
+          "names": [
+            "cad mcp client > [A1] the handshake completes and reports the server's version",
+            "cad mcp client > [A1] the child environment is exactly PATH, HOME, TMPDIR and SOLIDCRAFT_GPU=cpu, plus explicit extras",
+            "cad mcp client > [A1] callTool keeps text parts, image parts and isError",
+            "cad mcp client > [A1] the JSON is the last text part that parses, wherever it sits",
+            "cad mcp client > [A1] a JSON-RPC error is a typed McpRpcError and the process stays usable",
+            "cad mcp client > [A1] a request that outlives its timeout kills the process and rejects McpTimeoutError",
+            "cad mcp client > [A1] a crash rejects the pending call with McpExitError carrying the stderr tail",
+            "cad mcp client > [A1] a process that dies before the handshake rejects with its stderr",
+            "cad mcp client > [A1] close ends the process cleanly with exit code 0",
+            "cad mcp client > [A1] a reply line of 800 KB split across many chunks arrives whole (no line-length cap)"
+          ]
+        },
+        {
+          "file": "test/unit/cad-tools.test.ts",
+          "names": [
+            "anvil_cad names and permission classes > [A1] the server is named anvil_cad and exposes exactly the A1 tools",
+            "anvil_cad names and permission classes > [A1] isReadOnly knows the read-only anvil_cad tools and none of the mutating ones",
+            "anvil_cad names and permission classes > [A1] mutating tools follow the autonomy policy like Edit; read-only ones like Read",
+            "anvil_cad names and permission classes > [A1] the hook always decides an anvil_cad tool, so canUseTool is never needed and stays fail-closed",
+            "anvil_cad tools > [A1] open_part takes a name, never a path",
+            "anvil_cad tools > [A1] execute and batch refuse the commands that would touch files behind the daemon's back",
+            "anvil_cad tools > [A1] the pass-through tools map to the right SolidCraft tool and request kind",
+            "anvil_cad tools > [A1] list_commands refuses an unfiltered listing",
+            "anvil_cad tools > [A1] set_parameter changes an existing parameter and refuses an unknown name instead of creating it",
+            "anvil_cad tools > [A1] undo and redo revert a whole batch through the tools",
+            "anvil_cad tools > [A1] a screenshot comes back as MCP image content",
+            "anvil_cad tools > [A1] compare_picture only reads a picture inside the part folder",
+            "anvil_cad tools > [A1] export_part writes into .cache/exports and offers one file card per file",
+            "cadwork service > [A1] with no binary CAD is unavailable with a reason, and every tool refuses with it",
+            "cadwork service > [A1] cad.status reports the version once the binary answers, and is broadcast only on change",
+            "cadwork service > [A1] only an ordinary session in a git repo, with the capability on, gets the anvil_cad server"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/cad-a1.test.ts",
+          "names": [
+            "real SolidCraft through the manager > [A1] real: the 16-command plate builds, design.json is written, and it replays in a fresh process to the same volume",
+            "real SolidCraft through the manager > [A1] real: killing the process between two calls, the next call recovers the design",
+            "real SolidCraft through the manager > [A1] real: editing design.json on disk then measuring reflects the edited file",
+            "real SolidCraft through the manager > [A1] real: set_parameter refuses an unknown name, undo reverts a whole batch, and a broken feature marks the part failed",
+            "real SolidCraft through the manager > [A1] real: file commands never reach SolidCraft, exports land in .cache/exports, a screenshot is an image, a newer format is refused"
+          ]
+        }
+      ]
     },
     "A2": {
       "title": "expectations, gate, rules",

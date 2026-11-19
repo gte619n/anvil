@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { CAD_READ_ONLY_TOOL_IDS } from "./cad-tool-ids";
 
 /**
  * The autonomy backstop (arch §6.6). Under `mostly-autonomous`, this is the ONLY thing
@@ -25,7 +26,12 @@ const BASH_PATTERNS: [RegExp, string][] = [
 
 const SECRET_PATH = /(^|\/)\.env(\.[a-z]+)?$|\/\.ssh\/|id_(rsa|ed25519)|(^|\/)credentials\b|\.pem$|\.p8$|\bsecrets?\b/i;
 
-const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead", "TodoWrite"]);
+const READ_ONLY_TOOLS = new Set([
+  "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead", "TodoWrite",
+  // The read-only SolidCraft pass-throughs (agent-cad-and-browser spec §4.4, D10). The mutating
+  // `mcp__anvil_cad__*` tools are deliberately absent: they follow the autonomy policy like `Edit`.
+  ...CAD_READ_ONLY_TOOL_IDS,
+]);
 
 export function isReadOnly(toolName: string): boolean {
   return READ_ONLY_TOOLS.has(toolName);
