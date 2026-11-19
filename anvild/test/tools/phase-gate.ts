@@ -150,6 +150,10 @@ function main(): number {
 
   const steps: Step[] = [];
   const t0 = performance.now();
+  // Read BEFORE anything runs: this is the commit the steps below test. (A commit landing while the
+  // suite runs must not be the sha the summary vouches for — see the end-of-run check.)
+  const sha = git("rev-parse", "HEAD");
+  const branch = git("rev-parse", "--abbrev-ref", "HEAD");
 
   // 1. Dirty tree.
   const dirty = classifyDirty(run(["git", "status", "--porcelain"]).out);
@@ -227,12 +231,19 @@ function main(): number {
     }
   }
 
+  // HEAD must not have moved under the run, or the results describe a mix of two commits.
+  const shaNow = git("rev-parse", "HEAD");
+  if (shaNow !== sha) {
+    console.log(`\n[stable HEAD] FAILED: HEAD moved during the run (${sha.slice(0, 7)} → ${shaNow.slice(0, 7)}) — run the gate again`);
+    steps.push({ name: "stable HEAD", status: "fail", detail: `HEAD moved to ${shaNow.slice(0, 7)} during the run` });
+  }
+
   // 7. Summary.
   const ok = steps.every((s) => s.status !== "fail");
   const width = Math.max(...steps.map((s) => s.name.length));
   console.log(`\n================ PHASE GATE ${id}: ${phase.title} ================`);
-  console.log(`git sha:     ${git("rev-parse", "HEAD")}`);
-  console.log(`branch:      ${git("rev-parse", "--abbrev-ref", "HEAD")}`);
+  console.log(`git sha:     ${sha}`);
+  console.log(`branch:      ${branch}`);
   console.log(`dirty:       ${isDirty ? "yes" : "no"}${dirty.ignored.length ? ` (${dirty.ignored.length} non-blocking path(s) outside anvild/, listed above)` : ""}`);
   console.log(`bun:         ${Bun.version}`);
   console.log(`solidcraft:  ${solidcraftVersion()}`);
