@@ -111,6 +111,8 @@ import {
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
 // The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
 // Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
+import { initParts, onPartSources } from "./parts";
+import { browserCardImageUrl, initMcp, onBrowserLoggedIn, onBrowserSites, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
 import { initLoops, onLoopRun, onLoopRuns, onLoopsHome, onLoopsList, onLoopUpdated, openLoops, openLoopsDeepLink } from "./loops";
 import {
   closeSettings,
@@ -190,6 +192,8 @@ import {
   initDialogs,
   resolvePermissionUI,
   resolveQuestionUI,
+  resolveHumanUI,
+  showHumanRequest,
   selectedIcon,
   showModal,
   showNewSession,
@@ -349,6 +353,8 @@ initLoops({
 // declarations; `activeId` is a reassigned scalar declared further down, so it's injected as a lazy
 // read. The dialog helpers + environment modals it used to receive here are imported from
 // dialogs.ts directly now.
+initMcp({ sessions, activeId: () => activeId, sendAwait });
+initParts({ sendAwait });
 initSettings({
   sessions,
   environments,
@@ -1535,6 +1541,7 @@ function onEvent(url: string, e: ServerEvent): void {
         renderTermStrip(); // roster changes (open/exit/kill on any device) refresh the chip strip
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
         updateHeaderAccount(e.session); // reflect an account switch + the idle/mid-turn tooltip
+        updateHeaderTools(e.session); // the Tools chip follows the session's integration list
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
         updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
         updateGoalChip(e.session); // the goal's iteration count climbs on every unmet stop attempt
@@ -1597,6 +1604,7 @@ function onEvent(url: string, e: ServerEvent): void {
         srv!.sock.send({ type: "auth.status", provider: "openrouter" });
       }
       renderSessions(); // group headers now know this server's name
+      if (document.getElementById("mcp-panel")) renderMcpPanel(); // the capability decides whether the card shows
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
       // A member just (re)joined the fleet — if the hub holds a Todoist token, have the hub replicate
@@ -1630,6 +1638,21 @@ function onEvent(url: string, e: ServerEvent): void {
       return;
     case "cad.expectations.resolved":
       cadCards.onResolved(serverByUrl(url)?.url ?? url, e);
+      return;
+    case "mcp.integrations":
+      // Per machine, never merged: each server's list is kept under its own url.
+      onMcpIntegrations(url, e.integrations);
+      return;
+    case "browser.sites":
+      // Each daemon sends its own copy of the fleet's list; Settings shows the hub's (mcp.ts).
+      onBrowserSites(url, e.sites, e.pending ?? 0);
+      return;
+    case "parts.sources":
+      onPartSources(url, e.sources); // Settings → Models → Part sources (Phase C5)
+      return;
+    case "browser.loggedin":
+      // Logged-in sites and their unlock switches (Phase C3); same hub-synced shape as the sites list.
+      onBrowserLoggedIn(url, e.sites, e.pending ?? 0, e.error);
       return;
     case "prompts":
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
@@ -1946,7 +1969,21 @@ function handleSessionEvent(e: ServerEvent): void {
       if (panelView === "git" && e.sessionId === activeId) requestGitStatus(); // refresh the SCM buttons
       return;
     case "permission.request":
-      showPermission(e.requestId, e.tool, e.input, e.suggestions);
+      showPermission(
+        e.requestId,
+        e.tool,
+        e.input,
+        e.suggestions,
+        permissionToolName(e.tool, e.sessionId),
+        // An agent-browser hard stop says why it asks and shows the page (Phase C3).
+        e.reason || e.image ? { reason: e.reason, imageUrl: browserCardImageUrl(e.sessionId, e.image) } : undefined,
+      );
+      return;
+    case "human.request":
+      showHumanRequest(e.requestId, e.reason, browserCardImageUrl(e.sessionId, e.image));
+      return;
+    case "human.resolved":
+      resolveHumanUI(e.requestId);
       return;
     case "permission.resolved":
       // Retire EXACTLY this card (answered here, on another device, or superseded). Per-request so a
@@ -2109,6 +2146,7 @@ function setHeaderTitle(s: Session | undefined): void {
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   updateHeaderBranch(s);
   updateHeaderAccount(s);
+  updateHeaderTools(s);
   updateHeaderModel(s);
   updateContextMeter(s);
   updateGoalChip(s);
@@ -2280,6 +2318,9 @@ $("#header-account").addEventListener("click", () => {
     })),
   );
 });
+
+// The Tools chip lists this machine's MCP integrations with a switch each (mcp.ts).
+$("#header-tools").addEventListener("click", () => openToolsMenu($("#header-tools")));
 
 function onEnvironments(url: string, list: Environment[]): void {
   // Replace only THIS server's environments (others stay), and tag each with its server.

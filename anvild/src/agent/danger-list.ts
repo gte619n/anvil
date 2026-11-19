@@ -31,6 +31,8 @@ const READ_ONLY_TOOLS = new Set([
   // The read-only SolidCraft pass-throughs (agent-cad-and-browser spec §4.4, D10). The mutating
   // `mcp__anvil_cad__*` tools are deliberately absent: they follow the autonomy policy like `Edit`.
   ...CAD_READ_ONLY_TOOL_IDS,
+  // `mcp__anvil_parts__parts_search`: a vendor catalog lookup that writes nothing (Phase C5).
+  "mcp__anvil_parts__parts_search",
 ]);
 
 export function isReadOnly(toolName: string): boolean {

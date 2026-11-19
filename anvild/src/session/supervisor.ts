@@ -55,6 +55,9 @@ import {
   type SessionGoal,
   type ResumeWatermarksEvent,
   type TelemetrySnapshotEvent,
+  type McpIntegrationsEvent,
+  type BrowserSitesEvent,
+  type BrowserLoggedInEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
@@ -88,6 +91,12 @@ import { ModelLabelStore } from "../models/store";
 import { CLAUDE_TOKEN_KEY } from "../auth/store";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
+import { HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, buildHumanToolsServer } from "../agent/human-tools";
+import { TEST_MCP_SERVER_NAME, buildTestDaemonToolsServer } from "../agent/testdaemon-tools";
+import { PARTS_MCP_SERVER_NAME, PARTS_TOOL_IDS, buildPartsToolsServer } from "../agent/parts-tools";
+import { PartsService, type PartsServiceDeps } from "../integrations/parts/service";
+import { envFile as launcherEnvFile } from "../auth/env-file";
+import { isOrdinarySession } from "../agent/mcp-external";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { RateLimitTracker } from "../budget/tracker";
@@ -97,6 +106,9 @@ import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
+import { McpIntegrationService, type McpIntegrationServiceDeps } from "./mcp-integration-service";
+import type { McpProber } from "../mcp/health";
+import type { McpIntegrationFields, McpIntegrationInput } from "../mcp/store";
 import { GitProjectionService } from "./git-projection-service";
 import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled, PrActivityWatcher } from "./claude-md-reflection";
 import { AutopilotService } from "./autopilot-service";
@@ -178,8 +190,9 @@ export interface SupervisorConfig {
   adversarialModels?: string[];
   /** Preferred OpenRouter provider slug for the panel (see `Config.adversarialProvider`). */
   adversarialProvider?: string;
-  /** Capability-gated features switched on by `ANVIL_FEATURES` (see `Config.features`). Omitted →
-   *  none, so a Supervisor built in a unit test never grows CAD tools by accident. */
+  /** Capability-gated features switched on by `ANVIL_FEATURES` (see `Config.features`): "cad-work",
+   *  "mcp-integrations", "browser", "part-sources" are read here. Omitted → none, so a Supervisor
+   *  built in a unit test never grows CAD or integration tools by accident. */
   features?: readonly string[];
   /** Test seam: options for the CAD process manager (fake clock, spawn, FAKE_SC_* env). */
   cadManager?: CadManagerOptions;
@@ -190,6 +203,10 @@ export interface SupervisorConfig {
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
   fleet?: ConciergeFleetOps;
+  /** Test seams for the MCP integration registry (fake prober / fake clock / no timer). */
+  mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number; browser?: McpIntegrationServiceDeps["browser"] };
+  /** Test seams for the part sources (Phase C5; "part-sources" feature): fake fetch, base URLs, … */
+  parts?: Omit<Partial<PartsServiceDeps>, "envFile" | "onKeysChanged">;
 }
 
 /**
@@ -275,6 +292,14 @@ export class Supervisor {
   private readonly accountRoster: AccountRosterService;
   /** Environment (project) CRUD + clone + README domain (P7 extraction). */
   private readonly environments: EnvironmentService;
+  /** MCP integration registry: store, health, exclusive lock, commands and the permission gate's
+   *  lookups (mcp-integrations spec). Inert unless the "mcp-integrations" feature is on. */
+  readonly mcp: McpIntegrationService;
+  /** `request_human` hand-offs (agent browser Phase C3). The autopilot track assigns
+   *  `human.onUnattendedHumanRequest` to mark a builder's work unit blocked. */
+  readonly human: HumanRequestService;
+  /** Part sources and their keys (Phase C5). Absent unless the "part-sources" feature is on. */
+  readonly parts?: PartsService;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
   /** CAD domain — SolidCraft process manager + the `anvil_cad` tool server (agent-cad-and-browser spec). */
@@ -348,6 +373,48 @@ export class Supervisor {
       writableStateRoots: [this.store.worktreeRoot(), this.clonesDir], // the only folders under the state dir a session may edit
     });
     if (this.cadwork.enabled) void this.cadwork.refreshStatus(); // learn the SolidCraft version; broadcasts cad.status
+    this.mcp = new McpIntegrationService({
+      stateDir: cfg.stateDir,
+      enabled: featureEnabled(cfg, "mcp-integrations"),
+      browserEnabled: featureEnabled(cfg, "browser"),
+      browser: cfg.mcp?.browser,
+      broadcast: (event) => this.registry.toAll(event),
+      clientCount: () => this.registry.all().length,
+      sessions: () => this.sessions.values(),
+      getSession: (id) => this.sessions.get(id),
+      persist: () => this.persist(),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+      dropIdleDriver: (id) => this.dropIdleDriver(id),
+      denyParked: (id, key) => {
+        const s = this.sessions.get(id);
+        for (const p of [...(s?.pendingPermissions.values() ?? [])]) {
+          if (p.tool.startsWith(`mcp__${key}__`)) this.resolvePermission(p.requestId, "deny");
+        }
+      },
+      notice: (id, markdown) => {
+        this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
+      },
+      saveImage: (sessionId, mediaType, dataBase64) => this.attachStore.add(sessionId, "screenshot", mediaType, dataBase64).id,
+      onConsumeExit: (id) => this.cancelHumanRequests(id), // a dead turn cannot receive "I've cleared it"
+      prober: cfg.mcp?.prober,
+      clock: cfg.mcp?.clock,
+      intervalMs: cfg.mcp?.intervalMs,
+    });
+    // Part sources (Phase C5): only with the "part-sources" feature. Keys live in the launcher env file
+    // (a test's own when it passes one); a change is broadcast and, on a hub, pushed to the members.
+    this.parts = featureEnabled(cfg, "part-sources")
+      ? new PartsService({
+          ...cfg.parts,
+          envFile: cfg.envFile ?? launcherEnvFile(),
+          onKeysChanged: (event, origin) => {
+            this.registry.toAll(event);
+            this.rebuildIdleDriversForParts();
+            if (origin === "local") this.onRosterChanged?.("part-source keys changed");
+          },
+        })
+      : undefined;
+    this.partsToolsOn = this.parts?.anyConfigured() ?? false;
+    this.human = new HumanRequestService({ screenshot: (sessionId) => this.mcp.browser?.screenshot(sessionId) });
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
       getSession: (id) => this.sessions.get(id),
@@ -425,6 +492,12 @@ export class Supervisor {
         this.broadcastUpdated(built.data);
       },
     });
+    // A builder that hits a bot check or a CAPTCHA cannot wait for a person: its work unit is marked
+    // blocked with the reason (agent browser §4.12 "Hand-off"; C3 review, item 3).
+    this.human.onUnattendedHumanRequest = (sessionId, reason) => {
+      const unit = this.sessions.get(sessionId)?.data.workUnitId;
+      if (unit) this.autopilot.blockUnit(unit, `needs a human: ${reason}`);
+    };
     this.loops = new LoopService({
       registry: this.registry,
       stateDir: cfg.stateDir,
@@ -472,6 +545,7 @@ export class Supervisor {
       softStopFraction: cfg.softStopFraction ?? 0.95,
     });
     this.restore();
+    this.mcp.start(); // after restore: prunes stale integration ids off sessions, then the first probe
     this.autopilot.startScheduler();
     this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
@@ -816,6 +890,140 @@ export class Supervisor {
     return true;
   }
 
+  /** A part source was switched on or off: idle ordinary sessions rebuild their tools on the next
+   *  turn (a busy one keeps what it has until it is idle and its driver is rebuilt). */
+  private partsToolsOn = false;
+  private rebuildIdleDriversForParts(): void {
+    const on = this.parts?.anyConfigured() ?? false;
+    if (on === this.partsToolsOn) return;
+    this.partsToolsOn = on;
+    for (const s of this.sessions.values()) if (isOrdinarySession(s.data)) this.dropIdleDriver(s.id);
+  }
+
+  // ── Part sources (Phase C5) — delegated to PartsService ─────────────────────────────────────
+  private requireParts(): PartsService {
+    if (!this.parts) throw new BadCommand("part sources are not enabled on this server");
+    return this.parts;
+  }
+  partsEvent(cid?: string): import("@protocol").PartSourcesEvent {
+    return { ...this.requireParts().event(), ...(cid ? { cid } : {}) };
+  }
+  partsSetKeys(source: unknown, values: unknown): void {
+    const p = this.requireParts();
+    try {
+      p.setKeys(source, values);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  partsClearKeys(source: unknown): void {
+    const p = this.requireParts();
+    try {
+      p.clearKeys(source);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  partsTest(source: unknown, cid?: string): Promise<import("@protocol").PartsTestResultEvent> {
+    return this.requireParts().test(source, cid);
+  }
+
+  /** Synchronous sibling of {@link restartDriverForNewToken} for the MCP registry: drop an IDLE
+   *  session's driver so its next turn rebuilds the MCP server map (`claudeSessionId` is kept, so the
+   *  conversation resumes). Returns false when the session is mid-turn and was left alone. */
+  private dropIdleDriver(id: string): boolean {
+    const status = this.sessions.get(id)?.data.status;
+    if (status && status !== "idle") return false;
+    const driver = this.drivers.get(id);
+    if (!driver) return true;
+    this.drivers.delete(id);
+    void driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+    return true;
+  }
+
+  // ── MCP integrations — delegated to McpIntegrationService ─────────────────────────────────────
+  mcpIntegrationsEvent(): McpIntegrationsEvent {
+    return this.mcp.integrationsEvent();
+  }
+  mcpIntegrationAdd(integration: McpIntegrationInput): void {
+    this.mcp.add(integration);
+  }
+  mcpIntegrationUpdate(id: string, fields: McpIntegrationFields): void {
+    this.mcp.update(id, fields);
+  }
+  mcpIntegrationRemove(id: string): void {
+    this.mcp.remove(id);
+  }
+  mcpIntegrationCheck(): Promise<void> {
+    return this.mcp.check();
+  }
+  setSessionMcpIntegrations(sessionId: string, ids: string[]): void {
+    this.mcp.setSessionIntegrations(sessionId, ids);
+  }
+
+  // ── Agent browser allowed sites (Phase C2) — delegated to the browser's AllowedSitesService ───
+  private requireBrowser(): NonNullable<McpIntegrationService["browser"]> {
+    if (!this.mcp.browser) throw new BadCommand("the agent browser is not enabled on this server");
+    return this.mcp.browser;
+  }
+  browserSitesEvent(): BrowserSitesEvent {
+    return this.requireBrowser().sites.event();
+  }
+  browserSiteAdd(site: string): void {
+    try {
+      this.requireBrowser().sites.add(site);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  /** Install the agent browser's pinned server runtime on this machine. */
+  async browserRuntimeInstall(): Promise<void> {
+    try {
+      await this.requireBrowser().installRuntime();
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    await this.mcp.probe("change");
+  }
+  browserSiteRemove(site: string): void {
+    try {
+      this.requireBrowser().sites.remove(site);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // ── Agent browser logged-in sites, unlock switches and "Open agent browser" (Phase C3) ───────
+  private browserCommand<T>(run: (browser: NonNullable<McpIntegrationService["browser"]>) => T): T {
+    const browser = this.requireBrowser();
+    try {
+      return run(browser);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  browserLoggedInEvent(): BrowserLoggedInEvent {
+    return this.requireBrowser().loggedIn.event();
+  }
+  browserLoggedInAdd(site: string): void {
+    this.browserCommand((b) => b.loggedIn.add(site, "owner"));
+  }
+  browserLoggedInRemove(site: string): void {
+    this.browserCommand((b) => b.loggedIn.remove(site));
+  }
+  browserLoggedInReset(): void {
+    this.browserCommand((b) => b.loggedIn.reset());
+  }
+  browserLoggedInSetUnlocked(site: string, unlocked: unknown): void {
+    if (typeof unlocked !== "boolean") throw new BadCommand("unlocked must be true or false");
+    this.browserCommand((b) => b.loggedIn.setUnlocked(site, unlocked));
+  }
+  /** Open the owner's Chrome window on this machine's agent profile (refused with no desktop session
+   *  or while a session is using the browser). */
+  browserOpenAgentBrowser(): void {
+    this.browserCommand((b) => b.openAgentBrowser());
+  }
+
   /**
    * A new Claude credential just landed (a pair, a rotation, a paste, or a roster mutation). Sessions
    * build their agent env per spawn, so nothing needs a restart to pick it up — but a session whose
@@ -1092,6 +1300,8 @@ export class Supervisor {
     // attach would otherwise never see them and the session would look stuck. Re-surface all of them
     // (a session can hold several at once, like permissions). (arch §6.6).
     for (const pendingQuestion of s.questionRequestEvents()) events.push(pendingQuestion);
+    for (const pendingHuman of s.humanRequestEvents()) events.push(pendingHuman); // parked request_human cards
+
     // Re-surface the live sub-agent set so a client attaching MID fan-out sees the running sub-agents at
     // once (§sub-agents, D9/ID13) — the subagent.activity channel is ephemeral (no seq), so without this
     // a reconnect would show a frozen pane until the next heartbeat. Empty when no sub-agents ran this turn.
@@ -1685,6 +1895,20 @@ export class Supervisor {
     // the client can retire its optimistic bubble instead of double-rendering (spec A5/A6).
     if (cid) s.recordPromptCid(cid);
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments, ...(cid ? { cid } : {}) });
+    // A session with MCP integrations on gets a fresh health probe first, so the server map the driver
+    // is (re)built with is never older than this turn. A flip drops the idle driver inside the probe.
+    if (this.mcp.needsProbeBeforeTurn(s.data)) {
+      void this.mcp.probe("turn").then(() => {
+        if (this.sessions.get(id) !== s || s.isDisposed) return; // deleted while the probe ran
+        try {
+          this.ensureDriver(id).prompt(text, inline);
+        } catch (e) {
+          // No dispatcher frame is left to carry this (the command was already acked): say it in the session.
+          s.emitError(e instanceof Error ? e.message : String(e), false);
+        }
+      });
+      return;
+    }
     this.ensureDriver(id).prompt(text, inline);
   }
 
@@ -1704,6 +1928,23 @@ export class Supervisor {
       const isLead = s.data.teamRole === "lead";
       const isMember = s.data.teamRole === "member" && !!s.data.parentId;
       const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
+      // An ordinary session with the agent browser switched on also gets `request_human` (Phase C3).
+      const hasBrowser = !!this.mcp.browser && isOrdinarySession(s.data) && this.mcp.store.list().some((i) => i.kind === "browser" && i.enabled && s.data.mcpIntegrations?.includes(i.id));
+      // …and any ordinary session gets the part-source tools while one source is configured (Phase C5).
+      const hasParts = !!this.parts && isOrdinarySession(s.data) && this.parts.anyConfigured();
+      // The session's in-process servers: its role server, or for an ordinary session the capability-
+      // gated ones (anvil_cad, anvil_human/anvil_test, anvil_parts). `mcp.serversFor` passes them
+      // through unchanged (any `type: "sdk"` entry counts as in-process for the permission gate) and
+      // adds the session's ready MCP integrations (ordinary sessions only).
+      const inProcessServers: Record<string, McpSdkServerConfigWithInstance> | undefined = isDefault
+        ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
+        : isLead
+          ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
+          : isMember
+            ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
+            : isPlanner
+              ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
+              : this.ordinaryMcpServers(s, hasBrowser, hasParts);
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -1711,16 +1952,8 @@ export class Supervisor {
         this.questionBroker,
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
-        isDefault
-          ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
-          : isLead
-            ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
-            : isMember
-              ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
-              : isPlanner
-                ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-                : this.ordinaryMcpServers(s),
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
+        this.mcp.serversFor(s, inProcessServers),
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser || hasParts ? [...(hasBrowser ? HUMAN_TOOL_IDS : []), ...(hasParts ? PARTS_TOOL_IDS : [])] : undefined,
         this.planReviewer(s),
         this.sessionQueryFn, // queryFn — the SDK default unless a test injected one
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
@@ -1738,6 +1971,7 @@ export class Supervisor {
         // Live catalog so a fable session runs the newest `claude-fable-*` release (the SDK auto-upgrades
         // the opus/sonnet/haiku aliases itself; fable has no alias, so this is how it keeps current).
         () => this.modelLabels.catalog(),
+        this.mcp.gate,
       );
       this.drivers.set(id, driver);
     }
@@ -1750,9 +1984,14 @@ export class Supervisor {
    * empty result is `undefined` so the driver is constructed exactly as before. None of these tools
    * is added to `allowedTools`: every call is decided by the PreToolUse hook.
    */
-  private ordinaryMcpServers(s: Session): Record<string, McpSdkServerConfigWithInstance> | undefined {
+  private ordinaryMcpServers(s: Session, hasBrowser: boolean, hasParts: boolean): Record<string, McpSdkServerConfigWithInstance> | undefined {
     const servers: Record<string, McpSdkServerConfigWithInstance> = {
       ...this.cadwork.serversFor(s.data), // { anvil_cad } when "cad-work" is on and cwd is in a git repo
+      // `request_human` and the throwaway test daemon's tools (Phases C3, C4). The test tools' ids are
+      // deliberately NOT in `allowedTools`: every call goes through the permission hook.
+      ...(hasBrowser ? { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s), [TEST_MCP_SERVER_NAME]: buildTestDaemonToolsServer(this.mcp.browser!.testDaemons, s) } : {}),
+      // parts_search is read-only (allowed in `allowedTools`); parts_fetch goes through the hook.
+      ...(hasParts ? { [PARTS_MCP_SERVER_NAME]: buildPartsToolsServer(this.parts!, s) } : {}),
     };
     return Object.keys(servers).length > 0 ? servers : undefined;
   }
@@ -1880,6 +2119,23 @@ export class Supervisor {
       // sibling is still parked would orphan that prompt (its push vanishes). (arch §6.6)
       if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion()) this.clearNotifications(sessionId);
     }
+  }
+
+  /** "I've cleared it": answer a parked `request_human` hand-off — may come from any device. */
+  resolveHumanRequest(requestId: string): void {
+    const sessionId = this.human.sessionFor(requestId);
+    if (!this.human.respond(requestId)) throw new BadCommand(`no pending request for a person: ${requestId}`);
+    const s = sessionId ? this.sessions.get(sessionId) : undefined;
+    s?.humanResolved(requestId);
+    if (s) {
+      s.setStatus(s.settleStatus("running_tool"));
+      if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion() && !s.hasPendingHuman()) this.clearNotifications(sessionId);
+    }
+  }
+  /** Cancel a session's parked hand-offs (reset, new topic, deletion) and retire their cards. */
+  private cancelHumanRequests(sessionId: string): void {
+    this.human.cancelSession(sessionId);
+    this.sessions.get(sessionId)?.resolveAllHumans();
   }
 
   /** Answer (or cancel) a parked AskUserQuestion (arch §6.6) — may come from any device. */
@@ -2047,6 +2303,9 @@ export class Supervisor {
     this.goalPushSuppressed.delete(id);
     this.reflectedSessions.delete(id);
     this.prWatchers.delete(id);
+    this.mcp.onSessionGone(id); // free any exclusive MCP integration lock the session held
+    this.parts?.forgetSession(id); // the URLs its parts_search returned
+    this.human.cancelSession(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
@@ -2096,6 +2355,7 @@ export class Supervisor {
    */
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
+    this.mcp.stop();
     this.terminalMgr.killAll();
     await this.cadwork.shutdown().catch(() => undefined); // stop every SolidCraft process
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
@@ -2122,6 +2382,9 @@ export class Supervisor {
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
     this.cadwork.cancelSession(id); // …and any expectations card a CAD tool is waiting on
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
+    this.cancelHumanRequests(id);
+    this.mcp.onSessionReset(id); // forget "always allow <integration>" + free its exclusive locks
+    this.parts?.forgetSession(id);
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
 
@@ -2276,6 +2539,7 @@ export class Supervisor {
     this.broker.resolveSession(id, "deny"); // unblock any parked permission
     this.cadwork.cancelSession(id); // …and any expectations card a CAD tool is waiting on
     this.questionBroker.resolveSession(id); // cancel any parked AskUserQuestion
+    this.cancelHumanRequests(id);
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
     s.data.claudeSessionId = undefined; // the key line: forget the prior topic (no resume next turn)
@@ -2369,6 +2633,8 @@ export class Supervisor {
       const opts = (q0?.options ?? []).slice(0, 3).map((o) => o.label).filter(Boolean).join(" · ");
       const more = event.questions.length > 1 ? ` (+${event.questions.length - 1} more)` : "";
       payload = { title, body: `${first}${more}${opts ? `\n${opts}` : ""}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
+    } else if (event.type === "human.request") {
+      payload = { title, body: `Needs you at the browser — ${event.reason}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
       // A goal in flight ends a turn on every iteration. Suppressing the "your turn" push here is
       // what makes a 10-iteration goal send ONE notification instead of ten (design D3). The

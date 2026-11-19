@@ -314,6 +314,12 @@ export interface Session {
   /** Live terminal roster for this session's chip strip (multi-terminal, design 2026-08-08).
    *  Runtime-only — cleared on daemon restart (the PTYs die with the process). Additive. */
   terminals?: TerminalInfo[];
+  /** MCP integrations switched on for this session (ids from `mcp.integrations`). Ordinary sessions
+   *  only; absent = none. Behind the "mcp-integrations" capability. Additive. */
+  mcpIntegrations?: string[];
+  /** Integration ids the owner answered "Always allow <label> this session" for. Cleared for an
+   *  integration when it is switched off for the session, updated or removed, and wholly on reset. */
+  mcpAllowed?: string[];
 }
 
 /** One live PTY of a session (multi-terminal). */
@@ -539,6 +545,132 @@ export interface BudgetEvent extends Envelope {
 export interface EnvironmentsEvent extends Envelope {
   type: "environments";
   environments: Environment[];
+}
+
+// ── MCP integrations (agent-cad-and-browser spec, Track C) ────────────────────────────────────────
+// Third-party MCP servers installed on ONE machine that an ordinary session can switch on. Per
+// machine, not hub-synced. Everything here is behind the "mcp-integrations" capability: a daemon that
+// does not advertise it never sends `mcp.integrations` and rejects the commands.
+export type McpIntegrationKind = "browser" | "custom";
+/** How the daemon reaches the server. http is loopback only (scheme http:, no userinfo, host
+ *  127.0.0.1 / localhost / [::1]); stdio is an operator-typed command, run with a scrubbed
+ *  environment. `{cwd}` in `args` becomes the session's worktree; it is the only substitution. */
+export type McpTransport =
+  | { type: "http"; url: string }
+  | { type: "stdio"; command: string; args: string[] };
+export interface McpIntegration {
+  id: string; // "mcpi_…"
+  key: string; // server key → tool prefix mcp__<key>__ ; /^[a-z][a-z0-9]{1,23}$/ (no underscores)
+  kind: McpIntegrationKind;
+  label: string;
+  transport: McpTransport;
+  exclusive: boolean; // one session at a time on this machine
+  enabled: boolean; // operator kill switch for the machine
+}
+export type McpHealth =
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string } // port closed, command not found, failed at session start
+  | { state: "disabled" };
+export interface McpIntegrationStatus extends McpIntegration {
+  health: McpHealth;
+  heldBy?: SessionId; // the session holding the exclusive lock
+  checkedAt: number; // ms since epoch of the last health probe (0 = never probed)
+  /** Present on a `browser` integration only ("browser" capability): how the agent browser would
+   *  start on this machine, and whether its network block can run. Additive. */
+  browser?: BrowserIntegrationInfo;
+}
+export interface McpIntegrationsEvent extends Envelope {
+  type: "mcp.integrations";
+  integrations: McpIntegrationStatus[];
+}
+
+// ── Agent browser (agent-cad-and-browser spec, Phase C2). Behind the "browser" capability. ────────
+export interface BrowserIntegrationInfo {
+  /** `headed`: the installed Chrome with the dedicated profile, on the logged-in desktop.
+   *  `headless`: no desktop session (or a headed launch failed) — a throwaway profile. */
+  mode: "headed" | "headless";
+  /** Why that mode, in words fit to show. */
+  modeReason: string;
+  /** The loopback proxy that is the browser's only route out. `stopped` = the browser cannot start. */
+  proxy: { state: "ready" | "stopped"; reason?: string; sessions: number };
+  /** The pinned server runtime the daemon installs into its own state folder (never run from a
+   *  session's worktree). `missing`: the browser cannot start until `browser.runtime.install` succeeds. */
+  runtime?: { state: "installed" | "installing" | "missing"; package: string; reason?: string };
+  /** Phase C3. Whether someone is logged in at this machine's screen — "Open agent browser" is only
+   *  offered where this is true. */
+  desktop?: boolean;
+  /** Phase C3. Present while the owner has the agent browser open ("Open agent browser"): it is "in
+   *  use by owner" and no session can use it until that Chrome is closed. */
+  ownerBrowser?: { since: number };
+}
+/** One logged-in site (Phase C3, spec §4.14 items 28 and 44). While `unlocked` is false every click,
+ *  key press and form action on the site asks first; once true nothing on it asks. */
+export interface BrowserLoggedInSite {
+  site: string; // registrable domain, as BrowserSite.site
+  /** `owner`: listed by hand. `login-session`: the agent profile gained cookies for it while the
+   *  owner had "Open agent browser" open. */
+  source: "owner" | "login-session";
+  unlocked: boolean;
+  addedAt: number; // ms since epoch
+}
+/** The logged-in sites list with each site's unlock switch. Hub-authoritative and hub-synced exactly
+ *  like `browser.sites`. */
+export interface BrowserLoggedInEvent extends Envelope {
+  type: "browser.loggedin";
+  sites: BrowserLoggedInSite[];
+  pending?: number;
+  /** The list on this machine was damaged (C3 review): until the owner starts a new one
+   *  (`browser.loggedin.reset`), every site the agent profile has cookies for counts as a locked
+   *  logged-in site. Shown in Settings as an error. */
+  error?: string;
+}
+/** Part sources (agent-cad-and-browser Phase C5; "part-sources" capability): the vendor APIs the
+ *  `parts_search` / `parts_fetch` tools use. */
+export type PartSourceId = "digikey" | "mouser" | "traceparts";
+/** One key field of a part source. The value itself never leaves the daemon: only whether it is set
+ *  and a masked preview, exactly like the OpenRouter key's `auth.status`. */
+export interface PartSourceField {
+  name: string; // e.g. "DIGIKEY_CLIENT_ID" — the env-file line it is stored under
+  label: string; // "Client ID"
+  set: boolean;
+  masked?: string;
+}
+export interface PartSourceStatus {
+  id: PartSourceId;
+  label: string;
+  /** Every field this source needs is set (TraceParts: tenant uid, API key AND request email). */
+  configured: boolean;
+  fields: PartSourceField[];
+  /** What the owner must do for an unconfigured source, or a limit worth knowing. */
+  note?: string;
+}
+/** The part sources on the daemon that sends it, with which are configured. Sent on connect and
+ *  after every key change. Keys are entered on the hub and pushed to members with the fleet's
+ *  credentials (the OpenRouter key's path). */
+export interface PartSourcesEvent extends Envelope {
+  type: "parts.sources";
+  sources: PartSourceStatus[];
+}
+/** Reply to `parts.test`: the outcome of one cheap authenticated call to the source. */
+export interface PartsTestResultEvent extends Envelope, Correlated {
+  type: "parts.test.result";
+  source: PartSourceId;
+  ok: boolean;
+  message: string;
+}
+/** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
+ *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
+export interface BrowserSite {
+  site: string;
+  addedAt: number; // ms since epoch
+}
+/** The allowed-sites list. Hub-authoritative and hub-synced: the hub stores it and pushes it to every
+ *  member; each daemon keeps a local copy and broadcasts this to its own clients. `pending` counts
+ *  changes made on a member that the hub has not confirmed yet. */
+export interface BrowserSitesEvent extends Envelope {
+  type: "browser.sites";
+  sites: BrowserSite[];
+  pending?: number;
 }
 /**
  * A saved prompt snippet the user fires into the composer with one click (a sidebar button). Stored
@@ -1589,6 +1721,12 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   tool: string;
   input: unknown;
   suggestions: PermissionSuggestion[];
+  /** Why the daemon is asking, in words fit to show above the buttons (agent browser hard stops,
+   *  Phase C3). Absent on every other prompt; an older client ignores it. */
+  reason?: string;
+  /** A picture of what the answer applies to — the page screenshot on an agent-browser hard-stop
+   *  card (Phase C3). An attachment of this session, fetched like a tool-result image. */
+  image?: ToolResultImage;
   /** [BE2-8] Set when this event is RE-SURFACED on resume (not a fresh prompt). Its `seq` is the
    *  session's current lastSeq — equal to a delta-resuming client's watermark — so a client that drops
    *  events with `seq <= watermark` would otherwise silently discard a pending permission prompt (the
@@ -1615,6 +1753,24 @@ export interface QuestionRequestEvent extends Envelope, SessionScoped {
  *  requestId (sub-agents can fan out several at once, like permissions). (§6.6) */
 export interface QuestionResolvedEvent extends Envelope, SessionScoped {
   type: "question.resolved";
+  requestId: RequestId;
+}
+/** The agent asked for a person (`request_human`, agent browser Phase C3; "browser" capability): a
+ *  bot check, a CAPTCHA or a login only the owner can clear. The turn is parked until any device
+ *  answers with `human.request.respond`. */
+export interface HumanRequestEvent extends Envelope, SessionScoped {
+  type: "human.request";
+  requestId: RequestId;
+  /** The agent's own words for what it needs. Untrusted text: shown, never acted on. */
+  reason: string;
+  /** The latest page screenshot the agent took, when there is one. */
+  image?: ToolResultImage;
+  /** Set when re-surfaced on resume — see PermissionRequestEvent.replay. Apply regardless of seq. */
+  replay?: boolean;
+}
+/** A parked `human.request` was answered or superseded — clients retire exactly that card. */
+export interface HumanResolvedEvent extends Envelope, SessionScoped {
+  type: "human.resolved";
   requestId: RequestId;
 }
 export interface StatusEvent extends Envelope, SessionScoped {
@@ -1764,6 +1920,11 @@ export type ServerEvent =
   | TeamPlanResolvedEvent
   | BudgetEvent
   | EnvironmentsEvent
+  | McpIntegrationsEvent
+  | BrowserSitesEvent
+  | BrowserLoggedInEvent
+  | PartSourcesEvent
+  | PartsTestResultEvent
   | PromptsEvent
   | ModelLabelsEvent
   | CadStatusEvent
@@ -1818,6 +1979,8 @@ export type ServerEvent =
   | PermissionResolvedEvent
   | QuestionRequestEvent
   | QuestionResolvedEvent
+  | HumanRequestEvent
+  | HumanResolvedEvent
   | StatusEvent
   | SubAgentActivityEvent
   | SubAgentSettledEvent
@@ -2117,6 +2280,107 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";
   id: string;
+}
+/** Register an MCP integration on this machine ("mcp-integrations" capability). Client command
+ *  only: nothing inside a session can add or change one. */
+export interface McpIntegrationAddCmd extends Envelope, Correlated {
+  type: "mcp.integration.add";
+  integration: Omit<McpIntegration, "id">;
+}
+export interface McpIntegrationUpdateCmd extends Envelope, Correlated {
+  type: "mcp.integration.update";
+  id: string;
+  fields: Partial<Omit<McpIntegration, "id" | "key" | "kind">>;
+}
+export interface McpIntegrationRemoveCmd extends Envelope, Correlated {
+  type: "mcp.integration.remove";
+  id: string;
+}
+/** Re-probe every integration's health now; the reply is a fresh `mcp.integrations`. */
+export interface McpIntegrationCheckCmd extends Envelope, Correlated {
+  type: "mcp.integration.check";
+}
+/** Replace the list of integrations switched on for a session (ordinary sessions only). */
+export interface SessionSetMcpIntegrationsCmd extends Envelope, Correlated {
+  type: "session.set_mcp_integrations";
+  sessionId: SessionId;
+  ids: string[];
+}
+/** Agent browser allowed sites ("browser" capability). Hub-authoritative: clients send these to the
+ *  hub; a member that receives one applies it locally and forwards it to the hub. Client commands
+ *  only — nothing inside a session can add a site (a session asks through its permission card). */
+export interface BrowserSitesListCmd extends Envelope, Correlated {
+  type: "browser.sites.list"; // reply: a fresh `browser.sites`
+}
+export interface BrowserSiteAddCmd extends Envelope, Correlated {
+  type: "browser.site.add";
+  site: string; // a hostname or URL; stored as its registrable domain
+}
+export interface BrowserSiteRemoveCmd extends Envelope, Correlated {
+  type: "browser.site.remove";
+  site: string;
+}
+/** Install the agent browser's pinned server runtime on the machine that receives this (needs the
+ *  npm registry once). Acked when it is installed; a `command.error` says why it could not be. */
+export interface BrowserRuntimeInstallCmd extends Envelope, Correlated {
+  type: "browser.runtime.install";
+}
+/** Agent browser logged-in sites and their unlock switches (Phase C3; "browser" capability).
+ *  Hub-authoritative like the allowed sites. Client commands only. */
+export interface BrowserLoggedInListCmd extends Envelope, Correlated {
+  type: "browser.loggedin.list"; // reply: a fresh `browser.loggedin`
+}
+export interface BrowserLoggedInAddCmd extends Envelope, Correlated {
+  type: "browser.loggedin.add";
+  site: string; // a hostname or URL; stored as its registrable domain, locked
+}
+export interface BrowserLoggedInRemoveCmd extends Envelope, Correlated {
+  type: "browser.loggedin.remove";
+  site: string;
+}
+/** Start a new, empty logged-in list after a damaged one (clears `BrowserLoggedInEvent.error`). */
+export interface BrowserLoggedInResetCmd extends Envelope, Correlated {
+  type: "browser.loggedin.reset";
+}
+export interface BrowserLoggedInSetUnlockedCmd extends Envelope, Correlated {
+  type: "browser.loggedin.set_unlocked";
+  site: string;
+  /** true: nothing on the site asks any more, in any session on any machine. false: lock it again. */
+  unlocked: boolean;
+}
+/** Open the agent browser's own Chrome window on the machine that receives this, so the owner can
+ *  log in to sites at the desk. Refused where nobody is logged in at the screen, and while a session
+ *  is using the browser. Sites that gain cookies while it is open become logged-in sites. */
+export interface BrowserOpenAgentBrowserCmd extends Envelope, Correlated {
+  type: "browser.open_agent_browser";
+}
+/** "I've cleared it": answer a parked `human.request` — may come from any device. */
+export interface HumanRequestRespondCmd extends Envelope, Correlated {
+  type: "human.request.respond";
+  requestId: RequestId;
+}
+
+/** Part sources (Phase C5; "part-sources" capability). Client commands only; refused with a
+ *  `command.error` on a daemon without the feature. */
+export interface PartsSourcesGetCmd extends Envelope, Correlated {
+  type: "parts.sources.get"; // reply: a fresh `parts.sources`
+}
+/** Set some or all of a source's key fields (field name → value; empty values are ignored). Stored
+ *  in the daemon's env file (mode 0600) and pushed to fleet members; acked, then `parts.sources`. */
+export interface PartsKeysSetCmd extends Envelope, Correlated {
+  type: "parts.keys.set";
+  source: PartSourceId;
+  values: Record<string, string>;
+}
+/** Remove every key field of a source on this daemon. */
+export interface PartsKeysClearCmd extends Envelope, Correlated {
+  type: "parts.keys.clear";
+  source: PartSourceId;
+}
+/** Make one cheap authenticated call to the source; reply: `parts.test.result`. */
+export interface PartsTestCmd extends Envelope, Correlated {
+  type: "parts.test";
+  source: PartSourceId;
 }
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
@@ -2526,6 +2790,26 @@ export type ClientCommand =
   | EnvCloneCmd
   | EnvUpdateCmd
   | EnvRemoveCmd
+  | McpIntegrationAddCmd
+  | McpIntegrationUpdateCmd
+  | McpIntegrationRemoveCmd
+  | McpIntegrationCheckCmd
+  | SessionSetMcpIntegrationsCmd
+  | BrowserSitesListCmd
+  | BrowserSiteAddCmd
+  | BrowserSiteRemoveCmd
+  | BrowserRuntimeInstallCmd
+  | BrowserLoggedInListCmd
+  | BrowserLoggedInAddCmd
+  | BrowserLoggedInRemoveCmd
+  | BrowserLoggedInSetUnlockedCmd
+  | BrowserLoggedInResetCmd
+  | BrowserOpenAgentBrowserCmd
+  | HumanRequestRespondCmd
+  | PartsSourcesGetCmd
+  | PartsKeysSetCmd
+  | PartsKeysClearCmd
+  | PartsTestCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd
@@ -3081,6 +3365,9 @@ export namespace rest {
      *  (HJ-24/HJ-27). Present keys OVERWRITE; absent keys are left alone. */
     todoistToken?: string;
     openRouterKey?: string;
+    /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
+     *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
+    partKeys?: Record<string, string>;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;
@@ -3121,6 +3408,9 @@ export namespace rest {
     hubServerId: string;
     todoistToken?: string;
     openRouterKey?: string;
+    /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
+     *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
+    partKeys?: Record<string, string>;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;

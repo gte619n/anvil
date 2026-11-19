@@ -319,6 +319,38 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .header-branch:hover { border-color: var(--accent); color: var(--text); }
 .header-branch .msym { font-size: 15px; color: var(--accent); }
 .header-branch .hb-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+/* MCP integrations: the session Tools chip (lit when one is on) + the Settings → Integrations rows. */
+.header-tools.on { border-color: var(--accent); color: var(--text); }
+.header-tools .hb-name { font-family: inherit; }
+.mcp-row-actions { margin-left: auto; display: inline-flex; gap: 6px; flex-shrink: 0; }
+.mcp-row .mcp-health, .mcp-row .mcp-held, .mcp-row .mcp-transport { margin-top: 6px; overflow-wrap: anywhere; }
+.mcp-row .mcp-held { display: flex; align-items: center; gap: 4px; }
+.mcp-row .mcp-held .msym { font-size: 15px; }
+.mcp-row .mcp-toggle[aria-checked="true"] .msym { color: var(--accent); }
+.mcp-server-head { margin: 10px 0 8px; }
+.mcp-row .mcp-browser-mode, .mcp-row .mcp-browser-proxy { margin-top: 6px; display: flex; align-items: center; gap: 4px; overflow-wrap: anywhere; }
+.mcp-row .mcp-browser-mode .msym, .mcp-row .mcp-browser-proxy .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-row .mcp-browser-proxy.bad { color: var(--danger); }
+.mcp-row .mcp-browser-runtime { margin-top: 6px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; overflow-wrap: anywhere; }
+.mcp-row .mcp-browser-runtime .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-row .mcp-browser-runtime.bad { color: var(--danger); }
+.mcp-runner-warning { display: flex; align-items: center; gap: 4px; color: var(--warn); margin-top: 6px; }
+.mcp-runner-warning .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-runner-warning[hidden] { display: none; }
+.browser-site-row .card-main { display: flex; align-items: center; gap: 6px; }
+.browser-site-add-row { margin-top: 8px; gap: 6px; }
+.browser-site-add-row input { flex: 1; min-width: 0; }
+.browser-sites-pending { display: flex; align-items: center; gap: 4px; }
+.browser-loggedin-row .card-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.browser-loggedin-row .browser-loggedin-unlock[aria-checked="true"] { color: var(--danger); border-color: var(--danger); }
+.mcp-row .mcp-browser-open-row { margin-top: 8px; }
+.bubble.permission .perm-reason { margin-top: 8px; font-weight: 600; overflow-wrap: anywhere; }
+.bubble .perm-shot { display: block; max-width: 100%; max-height: 320px; margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; cursor: zoom-in; }
+.bubble.human-request .human-reason { margin: 6px 0; overflow-wrap: anywhere; }
+.bubble.human-request .perm-btns { display: flex; margin-top: 8px; }
+.mcp-warning { display: flex; align-items: center; gap: 6px; }
+.modal-box label[hidden] { display: none; } /* [hidden] loses to `.modal-box label { display: block }` — the Add-integration dialog swaps its Command/URL rows */
+.mcp-warning .msym { font-size: 16px; color: var(--danger); }
 @media (max-width: 700px) { .header-branch { max-width: 16ch; } }
 #header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; color: var(--text); font: inherit; }

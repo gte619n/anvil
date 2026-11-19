@@ -33,9 +33,9 @@ export interface Config {
 }
 
 /** The capability-gated features `ANVIL_FEATURES` may switch on (agent-cad-and-browser spec §4.8):
- *  `cad-work` (Track A), `solidcraft-pin` (Track B), `mcp-integrations` and `browser` (Track C).
+ *  `cad-work` (Track A), `solidcraft-pin` (Track B), `mcp-integrations`, `browser` and `part-sources` (Track C).
  *  All are OFF by default; the list order is the order they are advertised in. */
-export const FEATURE_CAPABILITIES = ["cad-work", "solidcraft-pin", "mcp-integrations", "browser"] as const;
+export const FEATURE_CAPABILITIES = ["cad-work", "solidcraft-pin", "mcp-integrations", "browser", "part-sources"] as const;
 export type FeatureName = (typeof FEATURE_CAPABILITIES)[number];
 
 /** Parse `ANVIL_FEATURES`: comma-separated, trimmed, de-duplicated, returned in `FEATURE_CAPABILITIES`

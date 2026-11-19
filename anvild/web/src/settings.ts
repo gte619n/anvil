@@ -24,6 +24,7 @@
 // pickers; `todoistConnected`/`todoistProjectsLoaded` for the environment modal and the member
 // token-propagation check) live on `ui` in state.ts; in-place containers (`todoistProjects`,
 // `readmeLoaded`) stay `const` here.
+import { partsSectionShellHtml, refreshParts } from "./parts";
 import { apiFetch } from "./api";
 import { $, busy, byEnvName, envIcon, esc, icon } from "./dom";
 // dialogs.ts is a leaf, so the modal/toast helpers and the environment modals are direct imports —
@@ -40,6 +41,7 @@ import { newCid } from "./outbox";
 import { runMermaid } from "./conversation";
 import { openScheduleModal, scheduleSettingsCardHtml } from "./autopilot";
 import { CAD_PIN_CAPABILITY, cadTabHtml, mountCadCard, type CadCardHandle } from "./settings-cad";
+import { mcpSectionShellHtml, renderMcpPanel } from "./mcp";
 import {
   HUB_URL,
   confirmRemoveServer,
@@ -152,11 +154,13 @@ export function openSettings(): void {
         <div class="section-head" style="margin-top:1.75rem"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
         <p class="small muted">Link a Todoist project to an environment, then the nightly autopilot plans &amp; builds its tasks. Set the token with <code>bun run scripts/todoist.ts set</code>.</p>
         <div id="todoist-panel"><p class="small muted">Loading…</p></div>
+        ${mcpSectionShellHtml()}
       </section>
       <section class="settings-panel" data-tab="models">
         <div class="section-head"><h3>Models</h3></div>
         <p class="small muted">The model providers Anvil drives. Set or reset the Claude subscription token and OpenRouter key here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
+        ${partsSectionShellHtml()}
       </section>
       <section class="settings-panel" data-tab="cad">
         <div class="section-head"><h3>CAD</h3></div>
@@ -207,12 +211,14 @@ function selectSettingsTab(tab: SettingsTab): void {
     hub().sock.send({ type: "lapo.status", cid: newCid() }); // pull fresh connected/configured state
     renderLapoPanel();
     renderTodoistPanel();
+    renderMcpPanel(); // agent tools (MCP integrations) — hidden unless a server advertises the capability
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
   }
   if (tab === "prompts") renderPromptsPanel();
   if (tab === "cad") renderCadPanel();
   if (tab === "models") {
     renderModelsPanel();
+    refreshParts(); // Part sources (Phase C5) — hidden unless the hub advertises "part-sources"
     if (serverSupports(hub(), "auth")) {
       hub().sock.send({ type: "auth.status" }); // claude — refresh once per tab open
       hub().sock.send({ type: "auth.status", provider: "openrouter" });

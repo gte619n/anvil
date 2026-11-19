@@ -103,6 +103,9 @@ const GOLDEN: Record<string, Shape> = {
       tool: { optional: false, type: "string" },
       input: { optional: false, type: "unknown" },
       suggestions: { optional: false, type: "PermissionSuggestion[]" },
+      // Additive and optional (agent browser hard stops, Phase C3): an older client ignores both.
+      reason: { optional: true, type: "string" },
+      image: { optional: true, type: "ToolResultImage" },
       replay: { optional: true, type: "boolean" },
     },
   },

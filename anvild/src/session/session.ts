@@ -2,6 +2,7 @@ import {
   PROTOCOL_VERSION,
   type PermissionSuggestion,
   type Question,
+  type ToolResultImage,
   type ServerEvent,
   type Session as SessionData,
   type SessionStatus,
@@ -30,6 +31,15 @@ export interface PendingPermission {
   tool: string;
   input: unknown;
   suggestions: PermissionSuggestion[];
+  /** Why the daemon asks, and a picture of what the answer applies to (agent browser hard stops). */
+  reason?: string;
+  image?: ToolResultImage;
+}
+/** A `request_human` hand-off parked until the owner says it is cleared (agent browser Phase C3). */
+export interface PendingHuman {
+  requestId: string;
+  reason: string;
+  image?: ToolResultImage;
 }
 /** An AskUserQuestion prompt currently parked in the canUseTool handler (arch §6.6). */
 export interface PendingQuestion {
@@ -48,6 +58,8 @@ export class Session {
   /** AskUserQuestion prompts parked in canUseTool, keyed by requestId. Like permissions, sub-agents
    *  can fan out several at once, so a (re)attaching client re-surfaces all of them (arch §6.6). */
   readonly pendingQuestions = new Map<string, PendingQuestion>();
+  /** `request_human` hand-offs parked until the owner answers, keyed by requestId (Phase C3). */
+  readonly pendingHumans = new Map<string, PendingHuman>();
   /** The most recent assistant prose (plain text, trimmed) — used to give the "your turn"
    *  notification real context ("…here's the summary") instead of a generic "Finished". Transient. */
   lastAssistantText: string | undefined;
@@ -246,7 +258,7 @@ export class Session {
     // running_tool/thinking, but the session must keep advertising that it needs the user (fleet
     // badge + the parked sibling cards) until every prompt is resolved. The awaiting statuses
     // themselves, plus terminal/error/idle, always pass through. (arch §6.6)
-    const parked = this.pendingPermissions.size > 0 || this.pendingQuestions.size > 0;
+    const parked = this.pendingPermissions.size > 0 || this.pendingQuestions.size > 0 || this.pendingHumans.size > 0;
     if (
       parked &&
       status !== "awaiting_permission" &&
@@ -265,7 +277,7 @@ export class Session {
    *  waiting (a sibling from sub-agent fan-out), else fall back to the caller's working status. */
   settleStatus(fallback: SessionStatus): SessionStatus {
     if (this.pendingPermissions.size > 0) return "awaiting_permission";
-    if (this.pendingQuestions.size > 0) return "awaiting_question";
+    if (this.pendingQuestions.size > 0 || this.pendingHumans.size > 0) return "awaiting_question";
     return fallback;
   }
 
@@ -282,10 +294,11 @@ export class Session {
 
   /** Block on a permission decision (arch §6.6): flips to awaiting_permission + emits the request.
    *  Several may be parked at once (sub-agent fan-out) — each is tracked + re-surfaced by requestId. */
-  requestPermission(requestId: string, tool: string, input: unknown, suggestions: PermissionSuggestion[]): void {
-    this.pendingPermissions.set(requestId, { requestId, tool, input, suggestions });
+  requestPermission(requestId: string, tool: string, input: unknown, suggestions: PermissionSuggestion[], card?: { reason?: string; image?: ToolResultImage }): void {
+    const extra = { ...(card?.reason ? { reason: card.reason } : {}), ...(card?.image ? { image: card.image } : {}) };
+    this.pendingPermissions.set(requestId, { requestId, tool, input, suggestions, ...extra });
     this.setStatus("awaiting_permission");
-    this.emit({ type: "permission.request", requestId, tool, input, suggestions });
+    this.emit({ type: "permission.request", requestId, tool, input, suggestions, ...extra });
   }
 
   /** A parked permission was answered or superseded: stop re-surfacing it on reattach. With no
@@ -327,6 +340,8 @@ export class Session {
           tool: p.tool,
           input: p.input,
           suggestions: p.suggestions,
+          ...(p.reason ? { reason: p.reason } : {}),
+          ...(p.image ? { image: p.image } : {}),
         }) as ServerEvent,
     );
   }
@@ -376,6 +391,46 @@ export class Session {
           replay: true, // [BE2-8] re-surfaced on resume — apply regardless of seq (see permissionRequestEvents)
           requestId: q.requestId,
           questions: q.questions,
+        }) as ServerEvent,
+    );
+  }
+
+  // ── request_human hand-offs (agent browser Phase C3) ────────────────────────────────────────
+  // Parked like a question (the session shows `awaiting_question`: it needs the owner), keyed by
+  // requestId, re-surfaced on reattach, retired per request.
+
+  hasPendingHuman(): boolean {
+    return this.pendingHumans.size > 0;
+  }
+
+  requestHuman(requestId: string, reason: string, image?: ToolResultImage): void {
+    this.pendingHumans.set(requestId, { requestId, reason, ...(image ? { image } : {}) });
+    this.setStatus("awaiting_question");
+    this.emit({ type: "human.request", requestId, reason, ...(image ? { image } : {}) });
+  }
+
+  humanResolved(requestId: string): void {
+    this.pendingHumans.delete(requestId);
+    this.emit({ type: "human.resolved", requestId });
+  }
+
+  resolveAllHumans(): void {
+    for (const requestId of [...this.pendingHumans.keys()]) this.humanResolved(requestId);
+  }
+
+  humanRequestEvents(): ServerEvent[] {
+    return [...this.pendingHumans.values()].map(
+      (h) =>
+        ({
+          v: PROTOCOL_VERSION,
+          type: "human.request",
+          ts: now(),
+          sessionId: this.data.id,
+          seq: this.lastSeq,
+          replay: true,
+          requestId: h.requestId,
+          reason: h.reason,
+          ...(h.image ? { image: h.image } : {}),
         }) as ServerEvent,
     );
   }

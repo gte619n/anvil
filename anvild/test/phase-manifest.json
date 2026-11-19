@@ -871,23 +871,750 @@
     },
     "C1": {
       "title": "registry core",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/mcp-store.test.ts",
+          "names": [
+            "McpIntegrationStore > [C1] add assigns an mcpi_ id, persists, and a new store over the same dir reloads it",
+            "McpIntegrationStore > [C1] a corrupt mcp-integrations.json is quarantined to .corrupt-<ts> and the store starts empty",
+            "McpIntegrationStore > [C1] a file of the wrong shape is quarantined too",
+            "McpIntegrationStore > [C1] a malformed or duplicate row is dropped and the rest of the file loads",
+            "McpIntegrationStore > [C1] add rejects a key that collides with a built-in server name",
+            "McpIntegrationStore > [C1] add rejects a key that another integration already uses",
+            "McpIntegrationStore > [C1] the key grammar is /^[a-z][a-z0-9]{1,23}$/ — no underscores, no capitals, 2 to 24 characters",
+            "McpIntegrationStore > [C1] an http integration must be loopback: scheme http, no credentials, host 127.0.0.1 / localhost / [::1]",
+            "McpIntegrationStore > [C1] update re-validates the transport, and can never change key or kind",
+            "McpIntegrationStore > [C1] a stdio integration needs a command and string args",
+            "McpIntegrationStore > [C1] a stdio command is a bare name (found on the daemon's PATH) or an absolute path; a relative path, which would run a file from the session's repo, is refused on add and on update",
+            "McpIntegrationStore > [C1] remove reports whether anything was removed, and a re-add under the same key gets a NEW id",
+            "presets > [C1] custom is the only kind this phase can add; browser is refused until its preset registers",
+            "presets > [C1] {cwd} is replaced with the worktree and is the only substitution"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-lock.test.ts",
+          "names": [
+            "[C1] the first session to acquire holds it; a second is refused and told who holds it",
+            "[C1] release frees it for the next session; a non-holder cannot release it",
+            "[C1] releaseSession frees everything a session holds and nothing else",
+            "[C1] 10 minutes of silence releases the lock",
+            "[C1] activity at minute 9 keeps the lock past minute 10",
+            "[C1] refresh by a non-holder neither takes nor extends the lock",
+            "[C1] sweep reports the locks that went idle"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-health.test.ts",
+          "names": [
+            "probes > [C1] tcpProbe: a listening loopback port is open, a closed one is not",
+            "probes > [C1] an http integration whose port is closed is unavailable, and ready once something listens",
+            "probes > [C1] an http integration with a non-loopback URL is unavailable without any connection attempt",
+            "probes > [C1] a stdio integration is ready when its command resolves on PATH — the probe never launches it",
+            "McpHealthTracker > [C1] an integration never probed is unavailable (fail closed)",
+            "McpHealthTracker > [C1] a probe that throws is unavailable with the error text",
+            "McpHealthTracker > [C1] a disabled integration is `disabled` and is not probed",
+            "McpHealthTracker > [C1] probeAll returns only the ids whose health changed",
+            "McpHealthTracker > [C1] a server that failed at session init stays unavailable through turn, timer and connect probes, until Check",
+            "McpHealthTracker > [C1] an integration that no longer exists is forgotten on the next probe"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-external.test.ts",
+          "names": [
+            "buildMcpServers > [C1] an ordinary session with stdio integration `echo` gets servers.echo wrapped in /usr/bin/env -i with {cwd} replaced and no secret-looking key",
+            "buildMcpServers > [C1] the same call for a concierge session returns only `anvil`",
+            "buildMcpServers > [C1] lead, member, planner and builder sessions get their role server only",
+            "buildMcpServers > [C1] an http integration becomes { type: http, url, alwaysLoad: true }",
+            "buildMcpServers > [C1] a hand-edited non-loopback URL is rejected at build time and reported in skipped",
+            "buildMcpServers > [C1] a hand-edited relative command is rejected at build time and reported in skipped — nothing from the session's folder is started",
+            "buildMcpServers > [C1] an unavailable integration is left out and returned in skipped with its reason",
+            "buildMcpServers > [C1] a disabled integration is left out and returned in skipped",
+            "buildMcpServers > [C1] the same id twice is added once; an unknown id is ignored; an integration not in the session's list is not attached",
+            "buildMcpServers > [C1] the in-process server map is passed through unchanged — including `anvil_cad` on an ordinary session",
+            "buildMcpServers > [C1] an integration whose key is reserved or already taken by an in-process server is never attached",
+            "buildMcpServers > [C1] gamed spec: the result is server configs only — no allowedTools, no mcp__echo__ id anywhere",
+            "buildMcpServers > [C1] a kind's preset can resolve the launch line per session, or skip with a reason; the result is still wrapped and checked",
+            "[C1] wrapStdio puts -i first and passes exactly PATH, HOME and TMPDIR"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-permissions.test.ts",
+          "names": [
+            "integration tools > [C1] under mostly-autonomous an integration call parks a permission request with Allow once / Always allow <label> this session / Deny",
+            "integration tools > [C1] answering always lets every tool of that integration through with no prompt, and is recorded in session.mcpAllowed",
+            "integration tools > [C1] switching the integration off for the session denies immediately with no prompt; switching it back on prompts again",
+            "integration tools > [C1] an unknown mcp__<key>__ tool is denied with no prompt",
+            "integration tools > [C1] bypass allows an integration call with no prompt",
+            "integration tools > [C1] every non-bypass policy prompts — there is no follow-the-autonomy-policy mode",
+            "integration tools > [C1] the branch runs before the remembered-allow lookup: a per-tool always-allow does not skip it",
+            "integration tools > [C1] an integration switched off in Settings is denied, even with an always-allow and under bypass",
+            "integration tools > [C1] the lookup is live: switching off while a prompt is parked denies the call even if it is then approved",
+            "integration tools > [C1] an integration is denied in a session that is not an ordinary one",
+            "integration tools > [C1] another session's integration list does not leak: a session without it on is denied",
+            "integration tools > [C1] with no registry behind the hook every integration call is denied",
+            "integration tools > [C1] with the feature off the gate denies, whatever the store holds",
+            "the session's own in-process servers > [C1] a key in the session's in-process server map keeps the existing behaviour — the four role servers and anvil_cad alike",
+            "the session's own in-process servers > [C1] a hook built without an MCP context keeps the pre-registry behaviour for every tool",
+            "the session's own in-process servers > [C1] parseMcpTool splits integration names only; isInProcessTool matches whole keys",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate sees the short tool name, the input and the integration, and only for its own kind",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate's deny wins under bypass and over a session-wide allow",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate's `always` prompt parks a card under bypass with its own choices; onAnswer records the kind's approval",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate's ordinary prompt is skipped under bypass, and onAnswer can still refuse",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate with no opinion falls through to the generic flow, and one that throws fails closed",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] the generic checks run before the kind gate: unknown, switched-off and locked calls never reach it",
+            "protected rules and integrations > [C1] a protected deny beats the integration branch; a protected always-prompt prompts under bypass with Allow once / Deny only",
+            "canUseTool backstop > [C1] canUseTool denies mcp__echo__ping: an integration call the hook did not decide fails closed"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-service.test.ts",
+          "names": [
+            "feature flag > [C1] with the feature off every command is refused, nothing is broadcast, and no integration is attached",
+            "commands > [C1] add broadcasts the list, then the first probe broadcasts its health once; an unchanged probe broadcasts nothing",
+            "commands > [C1] add surfaces a store refusal as a BadCommand with the reason",
+            "commands > [C1] session.set_mcp_integrations dedupes, drops unknown ids, persists, and emits one session.updated per write",
+            "commands > [C1] integrations cannot be switched on for the concierge, a team session or an autopilot session",
+            "commands > [C1] on load, ids that no longer name an integration are dropped from every session, and duplicates collapse",
+            "commands > [C1] removing an integration that sessions reference: off every list, idle drivers dropped, lock released",
+            "commands > [C1] removed and re-added under the same key gets a new id, so a stale always-allow does not apply",
+            "commands > [C1] updating an integration clears its always-allow in every session and rebuilds idle drivers",
+            "commands > [C1] a session reset clears its always-allow list and frees its exclusive locks",
+            "commands > [C1] deleting a session frees its exclusive locks",
+            "driver rebuilds > [C1] switching one on for an idle session drops its driver so the next turn rebuilds",
+            "driver rebuilds > [C1] switched on mid-turn: persisted now, driver left alone, rebuilt when the turn ends",
+            "driver rebuilds > [C1] a turn that dies (consume loop exit) also applies the deferred rebuild",
+            "driver rebuilds > [C1] serversFor attaches ready integrations and puts one notice line in the session per skipped one",
+            "failed at session init (§4.14 item 31) > [C1] a server the SDK reports failed in the init message is marked unavailable, noticed once in the session, and held until Check",
+            "health loop > [C1] the timer probes only while a client is connected",
+            "health loop > [C1] concurrent probe requests share one probe",
+            "health loop > [C1] a session with integrations on needs a probe before its turn; one without, or a non-ordinary one, does not",
+            "health loop > [C1] the tick releases a lock whose holder has been silent for 10 minutes and broadcasts the change"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-driver.test.ts",
+          "names": [
+            "[C1] every session's query gets strictMcpConfig: true and the three resource tools disallowed — with no servers at all, too",
+            "[C1] a role session keeps its in-process server and its role tool ids under strictMcpConfig",
+            "[C1] an integration server is passed to the SDK but never contributes an allowedTools entry",
+            "[C1] the driver reports init-time server status, integration tool results, the turn end and the loop exit to the registry",
+            "[C1] a turn that throws still reports the loop exit, so no lock outlives a dead turn"
+          ]
+        },
+        {
+          "file": "test/integration/mcp-c1-registry.test.ts",
+          "names": [
+            "Phase 1 acceptance: daemon core > [C1] buildMcpServers for an ordinary session with stdio integration `echo`: /usr/bin/env, -i first, {cwd} replaced, no TOKEN|KEY|ANTHROPIC anywhere",
+            "Phase 1 acceptance: daemon core > [C1] the same call for a concierge session returns only `anvil`",
+            "Phase 1 acceptance: daemon core > [C1] an AgentDriver built with a capturing queryFn passes strictMcpConfig: true, the three resource tools in disallowedTools, and no mcp__echo__ id in allowedTools",
+            "Phase 1 acceptance: daemon core > [C1] the hook under mostly-autonomous: mcp__echo__ping parks a request; always lets mcp__echo__pong through; switching echo off denies with no prompt; switching it back on prompts again",
+            "Phase 1 acceptance: daemon core > [C1] the hook denies mcp__other__x",
+            "Phase 1 acceptance: daemon core > [C1] canUseTool denies mcp__echo__ping",
+            "Phase 2 acceptance: health and lock > [C1] an http integration whose port is closed reports unavailable and buildMcpServers returns it in skipped; when the probe flips to open exactly one mcp.integrations event is broadcast and the idle driver of a referencing session is dropped",
+            "Phase 2 acceptance: health and lock > [C1] a health flip while a referencing session is mid-turn leaves its driver alone and rebuilds it when the turn ends",
+            "Phase 2 acceptance: health and lock > [C1] switching `enabled` off in Settings drops the idle drivers of referencing sessions and reports the integration disabled",
+            "Phase 2 acceptance: health and lock > [C1] lock: A's approved call acquires; B's call is denied naming A; A's consume loop exits; B's next call succeeds",
+            "Phase 2 acceptance: health and lock > [C1] lock: with A parked on a prompt and never approved, B succeeds — and A's late approval is then denied",
+            "Phase 2 acceptance: health and lock > [C1] lock: under bypass, B is still denied while A holds",
+            "Phase 2 acceptance: health and lock > [C1] lock: 10 minutes of fake-clock silence from A releases the lock; a tool.result at minute 9 does not",
+            "Phase 2 acceptance: health and lock > [C1] lock: a non-exclusive integration is never locked, and switching an exclusive one off for the holder releases it",
+            "turn start > [C1] a turn on a session with integrations probes first, so a flip rebuilds the driver before the prompt reaches it",
+            "dispatch > [C1] server.hello advertises mcp-integrations and mcp.integrations arrives on connect; neither on a daemon with the feature off",
+            "dispatch > [C1] add / check / update / remove over the socket: acked, validated, and broadcast to every client",
+            "dispatch > [C1] session.set_mcp_integrations from two clients: last write wins, one session.updated per write"
+          ]
+        },
+        {
+          "file": "test/web/mcp.test.ts",
+          "names": [
+            "Settings → Integrations card > [C1] hidden unless a server advertises the mcp-integrations capability",
+            "Settings → Integrations card > [C1] the card says third-party servers run as the daemon's user",
+            "Settings → Integrations card > [C1] one row per integration: label, health dot and reason, in-use-by, an enabled switch, and remove",
+            "Settings → Integrations card > [C1] the enabled switch sends mcp.integration.update, Check sends mcp.integration.check, and a refusal is shown",
+            "Settings → Integrations card > [C1] remove asks first, names the sessions that use it, and sends mcp.integration.remove only on confirm",
+            "Settings → Integrations card > [C1] Add offers Custom, and the Custom form sends mcp.integration.add with the typed command split into command + args",
+            "Settings → Integrations card > [C1] a package runner as a custom command shows a one-line warning on the form as it is typed and on the integration's row; other commands show none",
+            "Settings → Integrations card > [C1] the Custom form's URL type takes a loopback http URL only",
+            "session Tools control > [C1] the header chip is hidden without the capability, without integrations, and for a session that is not ordinary",
+            "session Tools control > [C1] the header chip shows which integrations are on for the session",
+            "session Tools control > [C1] the Tools menu lists this machine's integrations with a switch each and sends session.set_mcp_integrations",
+            "session Tools control > [C1] an unavailable integration is shown disabled with its reason and cannot be switched on — but one already on can be switched off",
+            "session Tools control > [C1] toggling mid-turn says it applies after this turn",
+            "permission cards > [C1] a permission card for an integration tool shows the integration label, not the raw mcp__ name",
+            "permission cards > [C1] other tools keep their own name on the card: built-ins, the daemon's own servers, and unknown keys"
+          ]
+        },
+        {
+          "file": "test/integration/mcp-c1-review.test.ts",
+          "names": [
+            "C1 review findings > [C1] review 1: updating an integration denies its parked card, so a late 'always' is neither an allow nor remembered",
+            "C1 review findings > [C1] review 1: the approval is for the definition that was shown — an edit behind an open card denies the call even when the card is answered 'always'",
+            "C1 review findings > [C1] review 1: removing an integration denies its parked card",
+            "C1 review findings > [C1] review 2: a failed-at-start hold survives another integration's edit and another session's Tools toggle; its own edit or Check clears it",
+            "C1 review findings > [C1] review 2: through the service — toggling Tools on another session and adding another integration leave a failed server unavailable",
+            "C1 review findings > [C1] review 3: a command env would misread (NAME=value, or an option) is refused by the store, and wrapStdio never emits it",
+            "C1 review findings > [C1] review 3: a hand-edited store with such a command is skipped by name at build time, never launched",
+            "C1 review findings > [C1] review 4: the permission gate itself denies the three MCP resource tools, under every policy including bypass",
+            "C1 review findings > [C1] review 5: a key that names an Object.prototype member is refused by the store and never reads as 'already used'",
+            "C1 review findings > [C1] review 6: an http URL is stored and forwarded in its normalized form"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/mcp-c1.test.ts",
+          "names": [
+            "[C1] the env -i command line buildMcpServers produces starts the echo server, which answers MCP and sees only PATH, HOME and TMPDIR"
+          ]
+        }
+      ]
     },
     "C2": {
       "title": "browser preset, network block, per-site approval",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/browser-preset.test.ts",
+          "names": [
+            "buildBrowserLaunch > [C2] the pinned version is 0.0.86, a named constant, and the launch is node by absolute path running the daemon's own runtime script by absolute path — never npx",
+            "buildBrowserLaunch > [C2] a launch that is not an absolute node and the absolute runtime script fails the check: npx, a bare node, a relative script, a script outside the runtime",
+            "buildBrowserLaunch > [C2] headed: the complete argument list, with the dedicated profile under the state dir",
+            "buildBrowserLaunch > [C2] no desktop session: the built config is headless with a temporary profile (--isolated --headless, no --user-data-dir)",
+            "buildBrowserLaunch > [C2] the generated config carries the three Chrome arguments and nothing else — no ignoreDefaultArgs",
+            "buildBrowserLaunch > [C2] the preset's arguments are a subset of the allow list: every flag in both modes is on it, with nothing else",
+            "buildBrowserLaunch > [C2] never --proxy-bypass, --caps, --blocked-origins or --allowed-origins, in either mode",
+            "buildBrowserLaunch > [C2] there is no launch line without a proxy port",
+            "the argument allow list (gamed spec) > [C2] any flag not on the allow list fails the check",
+            "the argument allow list (gamed spec) > [C2] a config that adds anything — ignoreDefaultArgs, another Chrome argument, another key — fails the check",
+            "the argument allow list (gamed spec) > [C2] the proxy must be the daemon's loopback one, the browser Chrome, and the two modes cannot be mixed",
+            "desktop detection > [C2] headed needs the daemon's own user on the console: scutil's ConsoleUser names them with kCGSSessionOnConsoleKey TRUE",
+            "desktop detection > [C2] nobody logged in, the login window, another user, or a session off the console → no desktop → headless fallback",
+            "desktop detection > [C2] a headed launch that failed falls back to headless even with a desktop session",
+            "git exclude > [C2] .anvil-browser/ is added once to the checkout's .git/info/exclude; a linked worktree uses the common git dir; a plain folder is left alone"
+          ]
+        },
+        {
+          "file": "test/unit/browser-runtime.test.ts",
+          "names": [
+            "the pinned manifest > [C2] the repo ships a manifest pinning @playwright/mcp@0.0.86 with an integrity hash for every package, and the runtime folder is named after the lock's hash",
+            "install > [C2] the install command is npm ci --ignore-scripts with env -i (PATH, a temporary HOME, TMPDIR) and empty user and global npm config, run inside a daemon-owned staging folder",
+            "install > [C2] a successful install leaves the runtime in runtime-<hash> with the marker and the lock copy, and passes the launch check; a second install is a no-op",
+            "install > [C2] a failed install (offline, an integrity mismatch) throws with npm's words and leaves no runtime behind (fail closed)",
+            "the check before every launch > [C2] the runtime may be launched only with a marker for the pinned lock, an unchanged lock copy, the server script in place and the pinned version installed"
+          ]
+        },
+        {
+          "file": "test/unit/browser-proxy.test.ts",
+          "names": [
+            "the block list > [C2] blockedAddressReason: loopback, RFC 1918, link-local, tailnet/CGNAT, unique-local (incl. Tailscale's IPv6 range), unspecified — and the public internet is not blocked",
+            "the block list > [C2] through the proxy: 127.0.0.1, a 10.x address, a tailnet address and a public name that resolves to 127.0.0.1 are all refused with 403; a public address is allowed",
+            "the block list > [C2] localhost, [::1], link-local, RFC 1918 and unique-local targets are refused, for plain HTTP and for CONNECT (which is how WebSockets arrive)",
+            "the block list > [C2] every resolved address is checked: a name with one public and one private address is refused",
+            "the block list > [C2] every fleet member's hostname and address is refused whatever it resolves to, and so are the daemon's own addresses",
+            "the block list > [C2] an unresolvable name, a non-http scheme and a malformed request are refused without dialling anything",
+            "DNS rebinding > [C2] a name that answers public first and private next: the address that was checked is the one connected, with one lookup per connection",
+            "DNS rebinding > [C2] vetTarget returns only addresses it checked, and never the name",
+            "plain HTTP and CONNECT forwarding > [C2] an allowed plain request is forwarded in origin form with the proxy headers removed; an allowed CONNECT is a transparent tunnel",
+            "plain HTTP and CONNECT forwarding > [C2] a target that does not answer is a 502, not a hang and not a fallback to another address",
+            "per-session listeners and the loopback exemption > [C2] one listener per session on its own random loopback port; ensure() is stable until the listener dies",
+            "per-session listeners and the loopback exemption > [C2] allowLoopbackPort opens one loopback port for one session only; revoke closes it again",
+            "per-session listeners and the loopback exemption > [C2] the daemon's own port can never be opened, and revoke destroys the tunnels that are open to the port",
+            "per-session listeners and the loopback exemption > [C2] proxy dies: the browser has no route out (its port refuses connections), the state reports stopped, and Check recovers",
+            "per-session listeners and the loopback exemption > [C2] a stopped manager refuses to create a listener, and one that cannot bind reports why"
+          ]
+        },
+        {
+          "file": "test/unit/browser-tools.test.ts",
+          "names": [
+            "classification > [C2] the table is exactly the C0 one: 25 tools in six classes",
+            "classification > [C2] browser_tabs splits by action: list reads; new, select and close navigate; anything else is denied",
+            "classification > [C2] browser_drop splits by payload: data is input, paths is an upload (paths wins when both are given), neither is denied",
+            "classification > [C2] any tool not in the table is denied — a newer server's tools, opt-in capability tools, prototype names",
+            "filename arguments > [C2] a filename that is absolute or contains .. is refused, at any depth; a plain relative name is fine",
+            "upload paths > [C2] upload paths must resolve inside the session worktree — relative, absolute, .. and symlinks all checked on the real path",
+            "upload paths > [C2] uploadPaths reads a non-empty list of strings and nothing else"
+          ]
+        },
+        {
+          "file": "test/unit/browser-sites.test.ts",
+          "names": [
+            "registrable domain > [C2] a site is the registrable domain by the public suffix list; an IP or single-label host is itself",
+            "registrable domain > [C2] normalizeSite takes a hostname or a URL and refuses anything that is not a web site",
+            "allowed schemes > [C2] only http: and https: targets (and about:blank) pass; file:, chrome:, data:, view-source:, javascript: and other about: pages are refused",
+            "page URL parser > [C2] reads the Page URL line under ### Page; no block means unchanged",
+            "page URL parser > [C2] more than one ### Page block is reported as such and gives no URL (page-controlled text sits in the same result)",
+            "page URL parser > [C2] toolResultText joins the text blocks of an SDK tool result and ignores images",
+            "readPage: the current tab's address (review of Phase C2) > [C2] reads the ### Page block of navigate, snapshot (inline yaml), wait_for (### Result first) and click (### Open tabs first) results",
+            "readPage: the current tab's address (review of Phase C2) > [C2] reads the current tab from browser_tabs' ### Result list (select, list, close, new), which has no ### Page block",
+            "readPage: the current tab's address (review of Phase C2) > [C2] never reads an address from a tool whose result is page text, nor from an error result",
+            "readPage: the current tab's address (review of Phase C2) > [C2] a forged block in a dialog message, console events or snapshot text makes the result ambiguous — with or without a real block",
+            "readPage: the current tab's address (review of Phase C2) > [C2] a page title cannot forge an address: it is one line, and a tab line with more than one ]( is not split",
+            "readPage: the current tab's address (review of Phase C2) > [C2] checkNavigationInput passes only a URL in its normal form, so what is checked is what is forwarded",
+            "readPage: the current tab's address (review of Phase C2) > [C2] resultFileLinks lists the snapshot and screenshot files a result says it wrote",
+            "AllowedSitesStore > [C2] add and remove persist to browser-sites.json and a new store over the same dir reloads them",
+            "AllowedSitesStore > [C2] a corrupt file allows nothing (fail closed) and is kept aside; a hand-edited row that is not a site is dropped",
+            "AllowedSitesStore > [C2] a member's own changes are queued, survive the hub's list replacing the local one, and leave the queue when confirmed",
+            "AllowedSitesStore > [C2] a queued add cannot resurrect a site the hub removed later; a removal is remembered for 30 days; the later of an add and a remove always wins"
+          ]
+        },
+        {
+          "file": "test/unit/browser-gate.test.ts",
+          "names": [
+            "fail closed > [C2] with no proxy running for the session every browser call is denied, navigation and reads alike",
+            "classification at the gate > [C2] a tool outside the table, browser_run_code_unsafe and browser_evaluate are denied on an allowed site",
+            "classification at the gate > [C2] a filename argument that is absolute or contains .. is denied on any tool; a relative one passes",
+            "classification at the gate > [C2] the C4 hook can exempt browser_evaluate (the session's own test daemon); run_code_unsafe stays denied whatever the hook says",
+            "navigation > [C2] navigation to file:, chrome:, data:, view-source:, javascript: and about: pages is denied; about:blank is allowed",
+            "navigation > [C2] an allowed site passes without a prompt; a new one prompts Allow once / Always allow <site> / Deny; browser_tabs new with a url is gated the same way",
+            "navigation > [C2] Allow once covers the session only; Always allow goes to the fleet list",
+            "navigation > [C2] under bypass a new site is allowed without a prompt and counts as allowed for the session; scheme and classification denials still apply",
+            "navigation > [C2] an unattended builder session is denied a new site, with or without bypass, and never prompted",
+            "navigation > [C2] headless fallback: a navigation to a listed logged-in site is denied, even if the site is allowed; headed mode is not affected",
+            "uploads > [C2] an upload always prompts — Allow once / Deny, no always-allow, even under bypass — and is denied when unattended",
+            "uploads > [C2] an upload whose path leaves the worktree is denied before any prompt",
+            "reads and inputs on an allowed site > [C2] read-only and input tools on an allowed site run without a prompt",
+            "reads and inputs on an allowed site > [C2] the C3 hook sees every call that would be allowed and can replace the allow with its own verdict (a hard stop)",
+            "HOLD and about:blank > [C2] a result reporting a page on unapproved c.test holds the next call — any class — behind a prompt for c.test, under bypass too",
+            "HOLD and about:blank > [C2] approving the hold records the site, clears the hold and lets the held call run",
+            "HOLD and about:blank > [C2] Deny on a held call denies it — a browser_navigate too — and nothing is rewritten: only browser_navigate written exactly about:blank, or browser_close, then runs",
+            "HOLD and about:blank > [C2] Deny sticks: the refused site is remembered for the session, going back is refused, and so is selecting a tab known to be on it",
+            "HOLD and about:blank > [C2] Deny on a site prompt (nothing loaded) remembers the site too",
+            "HOLD and about:blank > [C2] a result that shows a page on a site that is not allowed asks the caller to delete the files it wrote (purge); one on an allowed site does not",
+            "HOLD and about:blank > [C2] closing the browser also ends a hold or a refused page",
+            "HOLD and about:blank > [C2] a result with more than one ### Page block holds the next call behind an Allow once / Deny prompt",
+            "HOLD and about:blank > [C2] a page that ends up on a scheme that is not allowed goes straight to closing, with no prompt to approve it",
+            "HOLD and about:blank > [C2] an unattended session with a hold must leave for about:blank, without a prompt",
+            "HOLD and about:blank > [C2] the held call still has to pass on its own after the hold is approved: a refused one stays refused, one needing its own approval is asked again",
+            "HOLD and about:blank > [C2] a hold ends by itself when the owner allows the site in Settings, or the page moves back to an allowed site",
+            "HOLD and about:blank > [C2] headless fallback: a page that lands on a logged-in site is closed, not offered for approval",
+            "HOLD and about:blank > [C2] a read result with no page block changes nothing; a new server process (pageGone) drops the page state but keeps the session's approvals",
+            "the current tab (review of Phase C2) > [C2] after browser_tabs select the current tab's address is read from the tab list: a tab on an unapproved site holds the next call, whatever it is",
+            "the current tab (review of Phase C2) > [C2] a popup that becomes the current tab is seen in ### Open tabs: on an unapproved site it holds the next call",
+            "the current tab (review of Phase C2) > [C2] selecting a tab the server listed on a site that is not allowed asks for that site BEFORE the tab is shown; an unlisted tab is checked on its result",
+            "the current tab (review of Phase C2) > [C2] a navigation-class result that does not say where the current tab is makes the page unknown: only browser_snapshot, browser_tabs list, browser_close and about:blank run until a result establishes it",
+            "the current tab (review of Phase C2) > [C2] after an input-class call whose result has no page block, reads may run but no further input, navigation or upload until a result says where the page is",
+            "the current tab (review of Phase C2) > [C2] a forged ### Page block never moves the page: console, network, find and dialog results are not read at all, and a block in dialog, event or snapshot text makes the result ambiguous",
+            "the current tab (review of Phase C2) > [C2] a navigation url is forwarded exactly as checked: anything not in its normal form is denied, never repaired",
+            "the current tab (review of Phase C2) > [C2] Chrome's own error page belongs to no site: it neither holds the next call nor ends a refusal"
+          ]
+        },
+        {
+          "file": "test/unit/browser-service.test.ts",
+          "names": [
+            "feature flag > [C2] with `browser` absent from ANVIL_FEATURES the preset is not registered, no proxy listens, nothing is written and the commands are refused",
+            "feature flag > [C2] `browser` without `mcp-integrations` is inert too; with both, the preset, gate and result hook are registered and removed again on shutdown",
+            "the preset > [C2] the browser integration is key `browser`, stdio, exclusive — whatever the client sends — and update cannot change its transport or exclusivity",
+            "the preset > [C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener",
+            "the preset > [C2] a hand-edited store cannot add a flag: the stored transport is ignored when the launch line is built",
+            "the preset > [C2] no desktop session: the session's launch line is headless with a temporary profile, and the row says why",
+            "the preset > [C2] the worktree's .git/info/exclude gains .anvil-browser/ when the session folder is a checkout",
+            "the preset > [C2] the row in mcp.integrations carries the mode with its reason and the proxy state",
+            "health and fail closed > [C2] the browser is unavailable when node is not on the PATH it would be started with, or Chrome is not installed",
+            "health and fail closed > [C2] proxy not running: the preset is skipped with a reason (no launch line, no config file), health reports unavailable, and every browser call is denied",
+            "health and fail closed > [C2] proxy dies under a running session: its port refuses connections (no route out), browser calls are denied, health flips to unavailable, and Check recovers with a new listener",
+            "health and fail closed > [C2] a browser call from a session whose browser Anvil never started is denied",
+            "health and fail closed > [C2] a headed launch that fails switches the machine to headless for the next launch, until Check",
+            "health and fail closed > [C2] only a launch error counts as a failed headed launch: the words in a URL, in page text or in a successful result do not switch the machine to headless",
+            "the pinned server runtime > [C2] runtime not installed: health is unavailable with the reason, no launch line is built, the daemon tries one install by itself, and a failure is reported until Install succeeds",
+            "the pinned server runtime > [C2] the runtime is verified before EVERY launch: a missing script, a changed lock copy or a marker for another lock stops the launch",
+            "the pinned server runtime > [C2] a planted server in the worktree is never the launch target: node_modules/@playwright/mcp and node_modules/.bin in the session folder change nothing in the launch line",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] a request the network block refused is told to the model with its next browser call, in plain words",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] a result showing a page on a site that is not allowed has its snapshot and screenshot files deleted from .anvil-browser/ at once; files of allowed pages and files elsewhere are left alone",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] session Bash that calls the daemon's browser or fleet routes, or talks to the daemon's own port, is denied (a tripwire: the agent runs as the daemon's user)",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] the test-daemon exemption needs a registration: a bare port, the daemon's own port and another session's port are refused; revoke forgets it",
+            "session lifecycle > [C2] a session's listener and approvals go when it is reset, deleted, or the browser is switched off for it",
+            "session lifecycle > [C2] the same listener serves a session across driver rebuilds, and a rebuild forgets the old page",
+            "session lifecycle > [C2] when a session uses the headed browser, the idle drivers of other sessions that started one are dropped (one Chrome per profile)",
+            "session lifecycle > [C2] the browser is exclusive: while one session holds it, another session's call is denied naming the holder",
+            "protected files > [C2] session Bash that launches Chrome on the agent profile is denied, as is any Bash or file tool that touches the profile, the allowed-sites list or the launch files"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c2-sites.test.ts",
+          "names": [
+            "Phase C2 acceptance: sites > [C2] navigation to file:///etc/hosts, chrome://settings and a data: URL is denied, with no prompt, under every policy",
+            "Phase C2 acceptance: sites > [C2] first navigation to a.test prompts; Allow once lets a second a.test navigation through and still prompts for b.test; a new session prompts for a.test again",
+            "Phase C2 acceptance: sites > [C2] Always allow: a second navigation, a new session and a restarted daemon do not prompt; removing the site in Settings makes the next navigation prompt again",
+            "Phase C2 acceptance: sites > [C2] a tool result reporting a page on unapproved c.test holds the next browser call behind a prompt; Deny leaves only a navigation to about:blank",
+            "Phase C2 acceptance: sites > [C2] popup and tab select: after the model selects a tab on unapproved c.test, no key press, screenshot or network read runs there without the owner's approval",
+            "Phase C2 acceptance: sites > [C2] a console message that forges a ### Page block does not move the page or raise a prompt naming a site of the page's choosing",
+            "Phase C2 acceptance: sites > [C2] a page that navigates by itself to an unapproved site is held on the next call of any class; Allow once continues, and the hold is asked even under bypass",
+            "Phase C2 acceptance: sites > [C2] under bypass: site prompts are skipped, while scheme denial, classification denial and uploads' always-prompt still apply",
+            "Phase C2 acceptance: sites > [C2] no desktop session: the built config is headless with a temporary profile, and a navigation to a listed logged-in site is denied",
+            "Phase C2 acceptance: sites > [C2] the preset's arguments are a subset of the allow list, in the launch line a session actually gets, in both modes",
+            "Phase C2 acceptance: the network block > [C2] through the session's proxy, requests to 127.0.0.1, a 10.x address, a tailnet address and a public name that resolves to 127.0.0.1 are all refused; a public address is allowed",
+            "Phase C2 acceptance: the network block > [C2] every fleet member's name and address, and the daemon's own, are refused through the session's proxy",
+            "Phase C2 acceptance: the network block > [C2] allowLoopbackPort opens one loopback port for one session (Phase C4's test daemon) and revoke closes it",
+            "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] Always allow on the hub: after sync a session on a second daemon does not prompt; removing the site in Settings on the hub makes that daemon prompt again",
+            "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] a member forwards its own Always allow to the hub, which stores it and pushes it to every other member",
+            "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] a member that cannot reach the hub keeps its approval for offline use and queues it; the hub collects it on its next push",
+            "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] a member's queued add cannot resurrect a site the hub removed afterwards: the later change wins, and the member's copy follows the hub",
+            "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] the hub's list is the authority: a member's stale copy is replaced on the next push, and an unreachable member heals later",
+            "Phase C2: real daemons over HTTP and WebSocket > [C2] server.hello advertises browser and browser.sites arrives on connect; add / remove / list are acked, validated and broadcast to every client; none of it on a daemon with the feature off",
+            "Phase C2: real daemons over HTTP and WebSocket > [C2] two real daemons: a site allowed on the hub reaches the member's clients, and one allowed on the member reaches the hub's — over the real sync routes, which refuse an unknown hub or member"
+          ]
+        },
+        {
+          "file": "test/web/browser.test.ts",
+          "names": [
+            "Add menu > [C2] web: Add offers Browser on a machine with the browser capability, and choosing it sends mcp.integration.add for the browser kind",
+            "Add menu > [C2] web: Browser is not offered without the capability, nor when the machine already has a browser integration",
+            "the browser's row > [C2] web: the row shows headed mode and why, and that the network block is ready",
+            "the browser's row > [C2] web: the row shows headless mode with its reason, and a stopped network block as a fault",
+            "the browser's row > [C2] web: the row says the browser runtime is installed in the daemon's own folder; when it is missing it says why and offers Install browser runtime, which sends browser.runtime.install to that machine",
+            "the browser's row > [C2] web: a custom integration's row has no browser lines",
+            "allowed sites > [C2] web: the list is hidden without the browser capability and shown with it",
+            "allowed sites > [C2] web: each site has a remove button that sends browser.site.remove to the hub; a browser.sites event repaints the list",
+            "allowed sites > [C2] web: typing a site and pressing Allow site sends browser.site.add; a refusal is shown and nothing is invented locally",
+            "allowed sites > [C2] web: changes a member has not yet delivered to the hub are counted"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/browser-c2.test.ts",
+          "names": [
+            "real Chrome through the real proxy > [C2] real: Chrome and node are present, the daemon installed the pinned runtime itself, and the preset's fallback command (node + the runtime's script, no npx) starts Playwright MCP 0.0.86 with exactly the 25 classified tools",
+            "real Chrome through the real proxy > [C2] real (a): navigating to a loopback fixture server shows HTTP status: 403 and the fixture records zero requests",
+            "real Chrome through the real proxy > [C2] real (b): the localhost and [::1] forms of the same server are refused too, with zero requests",
+            "real Chrome through the real proxy > [C2] real (b2): a tailnet address and this machine's own network address are refused the same way — the target is never contacted and the result shows 403",
+            "real Chrome through the real proxy > [C2] real (d): after allowLoopbackPort the same navigation succeeds, for that port only",
+            "real Chrome through the real proxy > [C2] real (c): a WebSocket from an allowed page to a loopback server fails and never arrives",
+            "real Chrome through the real proxy > [C2] real (e): Chrome's real command line has the proxy, the loopback un-bypass, no QUIC and the WebRTC policy, and the server's has nothing off the allow list",
+            "real Chrome through the real proxy > [C2] real (f): the page-URL parser reads the URL from real navigate, snapshot and click results",
+            "real Chrome through the real proxy > [C2] real: a page that lands on an unapproved site is held and its snapshot file is deleted; Deny sticks — only about:blank runs, going back is refused, and the real browser ends on about:blank",
+            "real Chrome through the real proxy > [C2] real: popup and tab select — a key press never reaches the unapproved site: selecting the listed tab asks first, and when the gate only learns the address from the select's own result the next call is held",
+            "real Chrome through the real proxy > [C2] real: a console message that forges a ### Page block appears verbatim in browser_console_messages and does not move the gate's page or raise a hold",
+            "real Chrome through the real proxy > [C2] real: an https target the network block refuses shows as a tunnel error, not as HTTP status: 403, and the model is told it was Anvil's policy with its next call",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 1: a planted node_modules/@playwright/mcp (version 0.0.86, with cli.js) and node_modules/.bin/playwright-mcp in the worktree are not run: the real server starts with its 25 tools",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 2: a worktree .npmrc with script-shell= is not read: the real server starts and the planted shell never runs",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 3: a worktree .npmrc with node-options=--require <file> is not read: the real server starts and the planted module never loads",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 4: a worktree .npmrc with registry= and cache= is not read: the real server starts, the planted registry gets no request and the planted cache is never created"
+          ]
+        }
+      ]
     },
     "C3": {
       "title": "logged-in sites, hard stops, downloads, hand-off",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/browser-loggedin.test.ts",
+          "names": [
+            "LoggedInSitesStore > [C3] a logged-in site has site, source, unlocked and addedAt; add, unlock, lock and remove persist and reload; a new site starts LOCKED",
+            "LoggedInSitesStore > [C3] a corrupt file unlocks nothing and is kept aside; a hand-edited row unlocks only with the literal true, and a row that is not a site is dropped",
+            "LoggedInSitesStore > [C3] a member's own changes are queued in order, survive the hub's list replacing the local one, and leave the queue when confirmed",
+            "LoggedInSitesStore > [C3] on the authority the later change wins: a queued unlock cannot undo a lock set afterwards, a queued add cannot bring back a site removed afterwards, and a tie leaves the site locked",
+            "LoggedInSitesService > [C3] list, add, remove and set-unlocked: a site is its registrable domain, each change is broadcast as browser.loggedin, and only a listed site can be unlocked",
+            "the cookie snapshot > [C3] reads the profile's cookie hosts from a real SQLite cookie database, by registrable domain, without changing the file",
+            "the cookie snapshot > [C3] a profile with no cookie database has no cookies; a file that is not a database is 'unknown' (tolerated, never thrown)",
+            "the cookie snapshot > [C3] a site gained cookies when it has a cookie that was not there before — a new site, a new cookie, or one set again; untouched sites did not",
+            "Open agent browser > [C3] the command line is the installed Chrome on the agent profile with --password-store=basic and --use-mock-keychain — no proxy, no debugging port, no automation switch",
+            "Open agent browser > [C3] the command-line check refuses anything else: an extra flag, a URL, another profile, a missing or changed password-store",
+            "Open agent browser > [C3] a run snapshots cookies before launch and after exit and reports the sites that gained cookies; the launcher gets exactly the built command and a clean environment"
+          ]
+        },
+        {
+          "file": "test/unit/browser-hardstops.test.ts",
+          "names": [
+            "on a LOCKED logged-in site > [C3] the allow list is closed: of every tool in the table only read-class tools run without a prompt; every other call prompts — under bypass",
+            "on a LOCKED logged-in site > [C3] scrolling: browser_press_key with exactly PageDown, PageUp, Home or End runs without a prompt; every other key — and every near-miss spelling — prompts",
+            "on a LOCKED logged-in site > [C3] navigation: an https URL on the same site runs without a prompt; http on the same site, another site, a new tab elsewhere and going back all prompt",
+            "on a LOCKED logged-in site > [C3] the prompt is a hard stop: always (so bypass and any remembered allow cannot skip it), three options with no always-allow, the page screenshot attached, and a time limit",
+            "on a LOCKED logged-in site > [C3] gamed spec: the decision ignores what the model says it is doing — a click described as harmless, or as a scroll, prompts exactly like any other; a read described as a purchase does not",
+            "on a LOCKED logged-in site > [C3] the card must show the page as it is now: with no current screenshot the call is denied with an instruction to take one (a screenshot is a read, so it never asks)",
+            "on a LOCKED logged-in site > [C3] an unattended (builder) session is denied without a card",
+            "on a LOCKED logged-in site > [C3] when the page's address is unknown it is treated as a logged-in site, never as 'not logged in': only reads run",
+            "unlock (item 44) and sites that are not logged-in > [C3] choosing Unlock <site> sets the site's unlock switch and lets the call through; Allow once does not unlock",
+            "unlock (item 44) and sites that are not logged-in > [C3] on an UNLOCKED logged-in site nothing asks — every tool in the table, including on a checkout or payment page — and locking it again makes the next click prompt",
+            "unlock (item 44) and sites that are not logged-in > [C3] on an allowed site that is not logged-in a click, a key press and a form fill do not prompt; a site that only has cookies from agent sessions is not logged-in",
+            "unlock (item 44) and sites that are not logged-in > [C3] headless fallback: a logged-in site is refused entirely — unlocked or not — at navigation and when a page lands on it"
+          ]
+        },
+        {
+          "file": "test/unit/browser-downloads.test.ts",
+          "names": [
+            "constants > [C3] the quarantine is .anvil-downloads/, the limit is 200 MB, and the allowed extensions are exactly the listed fourteen",
+            "reading results > [C3] parses the Downloaded file line from a real result, ignores the earlier Downloading line, and handles several in one result",
+            "reading results > [C3] Playwright's own page-*.yml, page-*.png and console-*.log files are recognised and are not downloads; look-alikes are",
+            "reading results > [C3] file names the model asked for through a filename argument are remembered as not-downloads",
+            "quarantineFile > [C3] a 1 KB part.step is moved into .anvil-downloads/ with its bytes intact and no execute bit, and is gone from .anvil-browser/",
+            "quarantineFile > [C3] every allowed extension is kept, in any letter case; a second file of the same name gets a unique name instead of replacing the first",
+            "quarantineFile > [C3] a .dmg is deleted and reported — as are .exe, .sh, .app, .html, .js, a double extension ending in a refused one, and a file with no extension",
+            "quarantineFile > [C3] a file over the size limit is deleted and reported; one exactly at the limit is kept (a sparse file stands in for 200 MB + 1)",
+            "quarantineFile > [C3] a symbolic link is never followed: the link is deleted and reported, and what it points at is untouched",
+            "quarantineFile > [C3] the name is sanitized: path separators, control characters, leading dots and odd characters cannot shape where the file lands",
+            "quarantineFile > [C3] gamed result text: a Downloaded line naming a file outside this session's .anvil-browser/ moves nothing — not /etc/hosts, not a worktree file, not a file in a subfolder or through a link",
+            "quarantineFile > [C3] a .anvil-downloads that is a link to somewhere else is not written through: the download is deleted and reported",
+            "quarantineFile > [C3] .anvil-downloads/ is added to the checkout's git exclude through the helper the caller passes",
+            "the end-of-turn sweep > [C3] files left in .anvil-browser/ that are not Playwright's own and were not asked for by filename are treated as downloads; Playwright's page and console files and the model's own files stay put",
+            "the end-of-turn sweep > [C3] the sweep only takes files that appeared since the last sweep",
+            "reports > [C3] each outcome becomes one notice line for the transcript and one line of context for the model",
+            "quarantinePath (for import_reference) > [C3] returns the absolute path of a quarantined file by its bare name, and throws for anything that is not a plain file directly in the quarantine",
+            "never executed > [C3] Bash that executes a file in .anvil-downloads/ is denied: as the command word, through a shell or interpreter, with open, with chmod +x, after cd into the folder, or piped into a shell",
+            "never executed > [C3] reading, listing and deliberately copying a quarantined file is not denied, and the rule has no opinion on other tools or other folders",
+            "never executed > [C3] a file in the quarantine gets no file-offer card, whatever its type; the same file copied out does"
+          ]
+        },
+        {
+          "file": "test/unit/browser-human.test.ts",
+          "names": [
+            "request_human > [C3] the server is anvil_human with one tool, request_human {reason}; anvil_human is a reserved MCP key",
+            "request_human > [C3] request_human parks a card with the reason and the latest page screenshot, and returns only when the owner answers I've cleared it — from any device",
+            "request_human > [C3] with no screenshot the card has none; an empty reason is refused at once; two requests are two cards answered separately",
+            "request_human > [C3] in an unattended (builder) session request_human returns an error immediately, parks nothing, and calls onUnattendedHumanRequest(sessionId, reason) so the work unit can be blocked",
+            "request_human > [C3] resetting the session, or its turn dying, cancels a parked request: the card is retired and the tool returns an error",
+            "which sessions get it > [C3] an ordinary session with the browser switched on gets the anvil_human server, its tool id and the browser paragraph in its system prompt; one without the browser gets none of them",
+            "which sessions get it > [C3] the tool is the session's own in-process tool at the permission gate (not an integration call), and it exists only with the browser feature"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c3-loggedin.test.ts",
+          "names": [
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] on a LOCKED logged-in site under bypass: a snapshot, a PageDown key press and a same-site https navigation do not prompt; a click, an Enter key press and a form fill each prompt with a screenshot attached and no always-allow option",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] on an allowed site that is not logged-in, a click, an Enter key press and a form fill do not prompt — in a bypass session and in an ordinary one",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] the card shows the page as it is now: after any action the screenshot is stale, so the next action is denied until the model takes a new one; a screenshot of another page does not count",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] gamed spec: a misleading element text changes nothing — the decision uses only the tool's class and the page site the daemon tracked",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] a hard stop is denied without a card in an unattended (builder) session",
+            "Phase C3: a hard-stop prompt that times out > [C3] a hard-stop prompt nobody answers times out and is denied: the card is retired on every device and a late answer is refused",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] a site becomes logged-in when the profile gains a cookie for it during an Open agent browser session — with no list edit — and does NOT when cookies appear outside such a session",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] while Open agent browser is running the browser is in use by owner: its row says so, every session's browser call is denied, and a second open is refused; closing the window frees it",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] Open agent browser is refused where nobody is logged in at the screen, while a session holds the browser, and without Chrome — and nothing is launched",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] the logged-in list and the agent profile's cookies are off limits to the session's own tools",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] choosing Unlock <site> allows the call; a later click on that site in a NEW session and on a SECOND daemon after hub sync does not prompt, including on a /checkout page; switching the unlock off in Settings makes the next click prompt again",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] Unlock chosen on a member reaches the hub and every other member; removing the site on the hub removes it everywhere",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] an unlock queued on a member that was cut off cannot undo a lock the owner set on the hub afterwards",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] in headless fallback mode an unlocked logged-in site is still refused, at navigation and when a page lands on it",
+            "Phase C3 acceptance: uploads and script evaluation, on every site > [C3] an upload of a path outside the worktree is denied; inside it, it prompts — on a site that is not logged-in, on a locked one and on an unlocked one, under bypass",
+            "Phase C3 acceptance: uploads and script evaluation, on every site > [C3] a script-evaluation call on a public site is denied — logged-in or not, unlocked or not, under bypass — and browser_run_code_unsafe always is",
+            "Phase C3 acceptance: downloads > [C3] a 1 KB part.step download lands in .anvil-downloads/ with no file card; a .dmg is deleted and reported; a file over the limit is deleted and reported",
+            "Phase C3 acceptance: downloads > [C3] an injected size limit works the same way: a file one byte over it is deleted and reported, one at it is kept",
+            "Phase C3 acceptance: downloads > [C3] the Downloaded line arriving one result late still gets handled; Playwright's own page and console files, and a file the model asked for by filename, are not moved",
+            "Phase C3 acceptance: downloads > [C3] a download no result ever names is caught by the sweep when the turn ends; a Downloaded line that names a file outside .anvil-browser/ moves nothing",
+            "Phase C3 acceptance: downloads > [C3] files in the quarantine are never executed: session Bash that runs one is denied under every policy, while copying one out is not",
+            "Phase C3 acceptance: hand-off > [C3] request_human parks until I've cleared it; in an unattended session it returns an error at once and reports the session through onUnattendedHumanRequest",
+            "Phase C3: real daemons over HTTP and WebSocket > [C3] browser.loggedin arrives on connect; list / add / remove / set_unlocked are acked, validated and broadcast to every client; human.request.respond is dispatched; every command, open_agent_browser included, is refused on a daemon with the feature off",
+            "Phase C3: real daemons over HTTP and WebSocket > [C3] two real daemons: a site listed and unlocked on the hub reaches the member's clients, and an unlock on the member reaches the hub's — over the real sync routes, which refuse an unknown hub or member, a foreign origin and a non-JSON body"
+          ]
+        },
+        {
+          "file": "test/web/browser-c3.test.ts",
+          "names": [
+            "logged-in sites in Settings → Integrations > [C3] web: the list is hidden without the browser capability; with it each logged-in site shows its source, a Locked / Unlocked switch and a remove button",
+            "logged-in sites in Settings → Integrations > [C3] web: switching a site to Unlocked asks first, saying nothing on it will ask — checkout and payment pages included — and sends browser.loggedin.set_unlocked only on confirm; switching back to Locked sends at once",
+            "logged-in sites in Settings → Integrations > [C3] web: remove sends browser.loggedin.remove; typing a site and pressing Add logged-in site sends browser.loggedin.add; a refusal is shown",
+            "logged-in sites in Settings → Integrations > [C3] web: a site name is shown as text, never as markup",
+            "Open agent browser > [C3] web: the button is shown only on a machine that reports a desktop session, and pressing it sends browser.open_agent_browser to that machine",
+            "Open agent browser > [C3] web: while the owner has it open the row says In use by owner and the button is gone",
+            "the hard-stop card > [C3] web: the card shows the reason, the page screenshot and exactly three options — Allow once, Unlock <site>, Deny — with no always-allow",
+            "the hard-stop card > [C3] web: each option sends its decision for that request: Unlock <site> sends allow_always, and the card then shows what was chosen",
+            "the hard-stop card > [C3] web: an ordinary permission card is unchanged — no reason line, no image — and a reason is shown as text, never as markup",
+            "the hand-off card > [C3] web: a human.request shows the agent's reason and the latest page screenshot with one button, I've cleared it, which sends human.request.respond for that request and retires the card",
+            "the hand-off card > [C3] web: with no screenshot the card has no image; a card answered on another device is retired by human.resolved",
+            "logged-in sites in Settings → Integrations > [C3] web review 5: a damaged list is shown as an error with 'Start a new list', which sends browser.loggedin.reset"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c3-review.test.ts",
+          "names": [
+            "item 1: a page that moves by itself > [C3] review 1: after the result, traffic to a locked logged-in site makes the page unknown — a key press or a click is refused with 'take a snapshot first', under bypass; the snapshot then applies the hard stop on that site",
+            "item 1: a page that moves by itself > [C3] review 1: traffic to a site not allowed in this session also makes the page unknown; traffic only to the page's own site does not, nor does traffic that came before the result",
+            "item 1: a page that moves by itself > [C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page clears it",
+            "item 1: a page that moves by itself > [C3] review 6: browser_close is allowed in every state — unknown, held, closing, and on a locked logged-in site",
+            "item 2: the card's picture > [C3] review 2: a PNG planted in .anvil-browser and named in browser_find's text never becomes the card image; neither does a file a take_screenshot result links that was there before the call",
+            "item 2: the card's picture > [C3] review 2: the screenshot goes stale after an input call and when the browser contacts another site after it was taken",
+            "item 3: hand-off in an autopilot unit > [C3] review 3: request_human in a builder session with a work unit marks that unit blocked with 'needs a human: <reason>'",
+            "item 4: the output folder > [C3] review 4: a symlinked .anvil-browser is never swept (nothing outside the worktree is moved, deleted or chmod-ed), the owner is told, and the browser is not started for that worktree",
+            "item 4: the output folder > [C3] review 4: a hard-linked file in the output folder is reported and left alone — not chmod-ed, moved or deleted",
+            "item 5: a damaged logged-in list > [C3] review 5: a corrupt browser-loggedin.json fails closed — every site the profile has cookies for is a locked logged-in site, the event carries an error, the hub pushes nothing and refuses members' ops, and 'Start a new list' ends it",
+            "item 5: a damaged logged-in list > [C3] review 5: the gate applies it — with a damaged list a click on a profile site is a hard stop",
+            "item 6: small gaps > [C3] review 6: an updatedInput sent with the answer to a browser prompt is ignored — the call that runs is the one the card showed",
+            "item 6: small gaps > [C3] review 6: the runtime's node is what `node -p process.execPath` prints from a neutral daemon folder, so a .tool-versions planted in the worktree cannot change it",
+            "item 6: small gaps > [C3] review 6: the file-offer quarantine check compares real paths — a link inside the worktree that points into .anvil-downloads gets no download card",
+            "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/browser-c3.test.ts",
+          "names": [
+            "real Chrome: downloads and hard stops > [C3] real: Chrome, node and the pinned runtime are present, and the headless launch line through the real proxy starts the server with its 25 tools",
+            "real Chrome: downloads and hard stops > [C3] real: a real download of a small part.step lands in the quarantine via the real result text, with no file card",
+            "real Chrome: downloads and hard stops > [C3] real: a .dmg download is deleted and reported",
+            "real Chrome: downloads and hard stops > [C3] real: with the fixture's site logged-in and locked, a real browser_click is gated while browser_snapshot is not, and the card carries a non-empty PNG from a real screenshot result; after Unlock the same click goes through to the real server"
+          ]
+        },
+        {
+          "file": "test/real/browser-c3-review.test.ts",
+          "names": [
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1: setup — the real server starts headless through the real proxy; A (127.0.0.1) is allowed, B (localhost) is a locked logged-in site",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (timer): after A's own timer sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (meta): after A's own meta sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (replace): after A's own replace sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 4: a frame from the locked site B on allowed page A — a click on A is a hard stop naming B (screenshot first, then a card), and B records zero presses"
+          ]
+        }
+      ]
     },
     "C4": {
       "title": "throwaway test daemon",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/testdaemon-tools.test.ts",
+          "names": [
+            "the anvil_test server > [C4] the server is anvil_test with start_test_daemon {} and stop_test_daemon {}; the name is reserved, so no integration can take it",
+            "the anvil_test server > [C4] start_test_daemon returns {url} as JSON on its first line, says when an existing one is returned, and reports a refusal as an error result",
+            "the anvil_test server > [C4] stop_test_daemon stops this session's daemon and says whether there was one",
+            "the system prompt > [C4] a session with anvil_human and anvil_test gets the browser paragraph plus one sentence about the test daemon; without the servers it gets nothing"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-env.test.ts",
+          "names": [
+            "the environment > [C4] the test daemon's environment is exactly the ten listed variables, with ANVIL_HOST=127.0.0.1, the state and clones folders inside the new home, and nothing else",
+            "the environment > [C4] the web build's environment is PATH, TMPDIR, HOME and ANVIL_BUILD_OUT inside the temporary home — the worktree is not the output",
+            "which worktrees > [C4] a worktree that is not an Anvil checkout (no anvild/src/main.ts) is refused with a clear message; one without node_modules is told to install first",
+            "which worktrees > [C4] the port picker returns a free loopback port at or above 1024"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-selfurl.test.ts",
+          "names": [
+            "discoverSelfBaseUrl with unparsable tailscale output > [C4] non-JSON output from tailscale resolves — to the tailnet address when there is one, else undefined — and never rejects",
+            "discoverSelfBaseUrl with unparsable tailscale output > [C4] the parser itself still throws on non-JSON (its other callers report that as a warning), and valid output still yields the MagicDNS name"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-service.test.ts",
+          "names": [
+            "starting > [C4] start builds the worktree's bundle into the new home, then starts `bun run src/main.ts` from the worktree's anvild with exactly the listed environment, waits for /api/health, and only then registers and opens the port — register before allow",
+            "starting > [C4] one test daemon per session: a second call returns the existing one, concurrent calls share one start, and another session gets its own on another port",
+            "starting > [C4] refused before anything is built: a worktree that is not Anvil, and a session whose browser proxy is not running",
+            "a start that fails leaves nothing behind > [C4] a failed build starts no daemon, registers no port and deletes the temporary home; the error carries the build's output",
+            "a start that fails leaves nothing behind > [C4] a port that cannot be registered (this daemon's own, another session's) is never started on",
+            "a start that fails leaves nothing behind > [C4] a daemon that exits while starting, or never answers /api/health, is killed, its port revoked without ever being opened, and its home deleted",
+            "a start that fails leaves nothing behind > [C4] a daemon whose port cannot be opened in the session's proxy is killed and deleted, and the call fails",
+            "a start that fails leaves nothing behind > [C4] a stop that arrives while the bundle is still building cancels the start: no daemon is started and the home is deleted",
+            "ending > [C4] stop revokes the port, kills the process group and deletes the temporary home at once, clears the timer, and reports the origin that is gone; a second stop is a no-op",
+            "ending > [C4] the 15-minute timer stops the daemon by itself and says so in the session; stopping first disarms it",
+            "ending > [C4] stopAll (daemon shutdown) ends every session's test daemon; a daemon that exits by itself is cleaned up the same way",
+            "the crash ledger > [C4] a started daemon with a real pid is listed in <stateDir>/testdaemons.json and removed from it when stopped",
+            "the crash ledger > [C4] reapOrphans deletes a home a crashed run left behind, asks what the pid is before signalling it, and ignores rows that do not name a folder this code made"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-gate.test.ts",
+          "names": [
+            "the session's own test daemon is an allowed page > [C4] navigating to the session's test-daemon origin needs no site prompt — under prompt-all, in an unattended session and in headless mode — and a result on it holds nothing",
+            "the session's own test daemon is an allowed page > [C4] only that exact origin: another loopback port, localhost, https on the same port, and another session's test daemon all get the ordinary site prompt",
+            "the session's own test daemon is an allowed page > [C4] the test daemon is never a logged-in site: with 127.0.0.1 on the logged-in list and locked, a click on the test daemon does not prompt and headless mode does not refuse it; a real logged-in site still stops",
+            "browser_evaluate > [C4] browser_evaluate is allowed when the tracked page is exactly the session's test-daemon origin, and denied everywhere else: an allowed site, another loopback port, about:blank, before any page, and for a session with no test daemon",
+            "browser_evaluate > [C4] the address must be KNOWN: after an evaluate (whose result never sets the address) the next evaluate is refused until a snapshot says the page is still on the test daemon",
+            "browser_evaluate > [C4] when the test daemon stops, the page that was showing it must be left (CLOSING, no owner prompt), browser_evaluate is denied at once, and its old address is an ordinary unapproved site again"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c4-testdaemon.test.ts",
+          "names": [
+            "Acceptance: what is started > [C4] Acceptance: the started process's environment is exactly the listed variables plus PATH and TMPDIR, with ANVIL_HOST=127.0.0.1 and HOME a new temporary folder, and nothing of the daemon's own environment is inherited",
+            "Acceptance: what is started > [C4] Acceptance: it is told to listen on loopback only — ANVIL_HOST and its base URL are 127.0.0.1, and the port is one this daemon registered for the session before anything listened on it",
+            "Acceptance: what is started > [C4] a session whose repo is not Anvil is refused with a clear message, and nothing is built, started or opened",
+            "Acceptance: what is started > [C4] one test daemon per session: a second start_test_daemon returns the same URL and starts nothing",
+            "Acceptance: who can reach it > [C4] Acceptance: its port is reachable through the proxy from that session only — a second session's browser is refused on that port, before and after the second session starts a test daemon of its own",
+            "Acceptance: who can reach it > [C4] Acceptance: the live daemon's port stays refused for both sessions — a loopback server that is not the test daemon is never reachable, and this daemon's own port cannot be registered at all",
+            "Acceptance: how it ends > [C4] Acceptance: the process and its temporary home are gone after the turn ends, the port is closed in the proxy again, and a connection that was open to it is dropped",
+            "Acceptance: how it ends > [C4] Acceptance (§7): a test daemon that outlives everything else is killed by the 15-minute timer — process gone, home deleted, port closed, and the session is told",
+            "Acceptance: how it ends > [C4] it is also stopped by stop_test_daemon, when the session is reset, when it is deleted, when the browser is switched off for it, and when the daemon shuts down",
+            "the gate > [C4] browser_evaluate is allowed on the session's test-daemon origin and denied elsewhere — through the real permission hook, under bypass too — and denied again the moment the daemon stops",
+            "the gate > [C4] the test-daemon origin is the session's own: navigating to it asks nobody under prompt-all, a page on it is not held, and it is never treated as a logged-in site even when 127.0.0.1 is on the owner's list",
+            "permission and availability > [C4] start_test_daemon follows the session's autonomy policy as a mutating tool: prompt-all and allowlist park a card (Deny refuses it), mostly-autonomous and bypass run it; it is not in allowedTools, so the canUseTool backstop denies it",
+            "permission and availability > [C4] only an ordinary session with the browser switched on gets the anvil_test server: a plain session, the concierge and a team lead do not, and with the browser feature off nothing of it exists"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/browser-c4.test.ts",
+          "names": [
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: start_test_daemon builds the bundle into the temp home and boots this checkout's daemon; the live process's environment (ps eww) is exactly the listed variables, HOME a new temp folder, and the repo is not written",
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: it listens on loopback only — lsof shows one listener, on 127.0.0.1 — and a connection to a non-loopback local address on that port is refused",
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: the real headless browser, launched with C2's line through session A's proxy, loads the test daemon's root page; session B's proxy gets 403 on the same port and a loopback fixture standing in for the live daemon is refused for both",
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: the child writes only under its own temp home — every file it holds open for writing is inside that home — and its process and temp home are gone after the turn ends"
+          ]
+        }
+      ]
     },
     "C5": {
       "title": "part sources",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/parts-connectors.test.ts",
+          "names": [
+            "DigiKey > [C5] DigiKey: client-credentials token, then keyword search with X-DIGIKEY-Client-Id + Bearer; results are normalized, with model links from product media and attribution",
+            "DigiKey > [C5] DigiKey token caching and refresh: one token for many searches until shortly before expiry, a new one after; a 401 on a search gets one fresh token and one retry",
+            "DigiKey > [C5] DigiKey errors are normalized and carry no key: a server error, an unreachable host, a timeout, and missing keys",
+            "DigiKey > [C5] DigiKey Test makes one token request and says what it proved",
+            "Mouser > [C5] Mouser: POST /api/v1/search/keyword?apiKey= with SearchByKeywordRequest; results are normalized with attribution and stock from Availability",
+            "Mouser > [C5] Mouser: an invalid key (reported in the body with HTTP 200) is an auth error; a vendor 429 is 'rate limited, retry after'; the key in the query string never appears in an error",
+            "TraceParts > [C5] TraceParts is inactive until the tenant UID, the API key AND the request email are all set",
+            "TraceParts > [C5] TraceParts: RequestToken {tenantUid, apiKey} → JWT; part-number availability per catalog; STEP formats become a cadRequest model link; normalized with attribution",
+            "TraceParts > [C5] TraceParts token caching and refresh: reused until a minute before its expiryDate, then renewed; a 401 renews once",
+            "TraceParts > [C5] TraceParts model fetch: cadRequest is sent under the configured request email, cadFileUrl is polled through 204s, and the file URL is returned"
+          ]
+        },
+        {
+          "file": "test/unit/parts-ratelimit.test.ts",
+          "names": [
+            "rate limiter > [C5] rate limiter: a per-minute and a per-day window are both enforced, refill over time, and a refused call says how long to wait",
+            "rate limiter > [C5] rate limited calls never reach the vendor and come back as 'rate limited, retry after'",
+            "rate limiter > [C5] keys are scrubbed from text, raw and URL-encoded"
+          ]
+        },
+        {
+          "file": "test/unit/parts-keys.test.ts",
+          "names": [
+            "PartKeyStore > [C5] keys: DigiKey client id + secret, Mouser key, TraceParts tenant uid + key + email are NAME=value lines in the env file (0600), read at use time, never put in process.env",
+            "PartKeyStore > [C5] keys are masked to the last four characters in the status clients see; TraceParts is configured only with all three fields",
+            "PartKeyStore > [C5] the hub's push payload carries every set key; a member adopts known names only (present keys overwrite, unknown names and bad values are ignored)"
+          ]
+        },
+        {
+          "file": "test/unit/parts-download.test.ts",
+          "names": [
+            "downloadPart > [C5] a STEP file over https is written whole, from the address that was checked (the name's resolved address, never a second lookup)",
+            "downloadPart > [C5] a redirect to a loopback address is refused, and so is one to a name that resolves to a private address, and one to http — nothing is written",
+            "downloadPart > [C5] an http URL, a loopback URL and a private name are refused before any connection",
+            "downloadPart > [C5] an oversize response is aborted and deleted — by its Content-Length before writing, and while streaming when it has none",
+            "downloadPart > [C5] the type is decided from the server's suggested name before a byte is written: destFor refusing stops the download"
+          ]
+        },
+        {
+          "file": "test/web/parts-c5.test.ts",
+          "names": [
+            "Settings → Models → Part sources > [C5] web: the Part sources section is hidden without the hub's part-sources capability; with it each source shows Configured / Not configured, its note, and only masked values",
+            "Settings → Models → Part sources > [C5] web: Save sends parts.keys.set with only the fields typed in; Test sends parts.test and shows the result; Clear asks first, then sends parts.keys.clear"
+          ]
+        },
+        {
+          "file": "test/integration/parts-c5.test.ts",
+          "names": [
+            "Acceptance: parts_search > [C5] Acceptance: a search returns normalized results from each configured source — DigiKey, Mouser and TraceParts — each with its attribution",
+            "Acceptance: parts_search > [C5] Acceptance: a source with no key is skipped with a note, not an error — and TraceParts with only some of its fields counts as no key",
+            "Acceptance: parts_search > [C5] one source failing does not fail the call: its error is a note, the others' results stand; asking for unknown sources is an error",
+            "Acceptance: parts_fetch > [C5] Acceptance: parts_fetch of a STEP link lands in the quarantine (.anvil-downloads/, 0600, git-excluded) under the download limits",
+            "Acceptance: parts_fetch > [C5] Acceptance: a non-allowed type is refused — nothing is saved",
+            "Acceptance: parts_fetch > [C5] parts_fetch refuses a URL that no parts_search in this session returned (another session's, a made-up one, http) — it is not a general fetcher",
+            "Acceptance: parts_fetch > [C5] a model link that redirects to a loopback address is refused and nothing is saved",
+            "Acceptance: parts_fetch > [C5] an oversize streamed response (no Content-Length) is aborted and the partial file deleted",
+            "tools, permissions and keys > [C5] the anvil_parts server is given to ordinary sessions only while a source is configured; parts_search is read-only and auto-allowed, parts_fetch follows the autonomy policy like a write; the system prompt says to try parts_search before the browser and to show attribution",
+            "tools, permissions and keys > [C5] keys never appear in logs, tool results, client events (masked) or error messages — through set, search, fetch, Test and failures",
+            "tools, permissions and keys > [C5] Settings: Test makes one cheap authenticated call per source and reports it; an unconfigured source says what is missing; with the feature off every command is refused",
+            "key propagation hub → member (two real daemons) > [C5] keys set in Settings on the hub reach a member with the fleet's credential push (the OpenRouter key's path): stored in the member's env file, masked in its parts.sources, used by its tools; a push from an unknown hub is refused",
+            "key propagation hub → member (two real daemons) > [C5] a key change on the hub triggers the fleet push (onRosterChanged), and a member's adoption is broadcast without pushing on",
+            "Acceptance: parts_fetch > [C5] parts_fetch never writes through a symlinked .anvil-browser"
+          ]
+        }
+      ],
+      "real": []
     }
   }
 }

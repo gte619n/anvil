@@ -23,6 +23,8 @@ import { bindDegradeStateDir } from "../auth/degrade";
 import { setClaudeToken } from "../auth/store";
 import { setOpenRouterKey } from "../auth/openrouter";
 import { FleetStore } from "../fleet/store";
+import type { SitesOpBody, SitesOpReply, SitesSyncBody, SitesSyncReply } from "../browser/sites-sync";
+import type { LoggedInOpBody, LoggedInOpReply, LoggedInSyncBody, LoggedInSyncReply } from "../browser/loggedin";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import { serveCad } from "../cad/service";
@@ -179,6 +181,9 @@ export interface ServerOptions {
   /** [BE2-15] Test-only override of the caller-identity resolver (the real one shells out to the
    *  tailscale CLI, which makes identity-gated routes untestable hermetically). */
   resolveIdentity?: () => Promise<{ trust: PeerTrust; reject?: string }>;
+  /** Test-only override of this daemon's base URL as other machines reach it — what a hub tells its
+   *  members so they can forward allowed-site approvals (the real one shells out to `tailscale`). */
+  selfBaseUrl?: () => Promise<string | undefined>;
 }
 
 /** The fleet fan-out network surface the rotate/invite paths reach the tailnet through ([BE2-15]). */
@@ -254,6 +259,16 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     registry,
   );
+
+  // Agent browser (Phase C2; only with the "browser" feature on): hand its allowed-sites sync the
+  // fleet — who the members are, which hub paired this machine, and where this daemon answers.
+  supervisor.mcp.browser?.setFleet({
+    selfServerId: identity.serverId,
+    members: () => fleet.list().map((m) => ({ url: m.url, host: m.host, serverId: m.serverId })),
+    pairedHubId: () => pairedHub.get()?.hubServerId ?? null,
+    selfUrl: opts.selfBaseUrl ?? (() => supervisor.selfBaseUrl()),
+    selfPort: opts.port,
+  });
 
   // Frozen update API v1 (stable-update-service spec §4.3). The state store persists the pre-pull SHA +
   // phase across the very restart it coordinates; `settleAfterBoot` is the in-daemon half of the
@@ -373,6 +388,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
       hubServerId: identity.serverId,
       ...(payload ? { accounts: payload } : {}),
+      // Part-source keys (Phase C5) ride the same push; a key change on the hub triggers it.
+      ...(supervisor.parts?.fleetPayload() ? { partKeys: supervisor.parts.fleetPayload()! } : {}),
       port: opts.port,
     });
     for (const r of results) {
@@ -510,6 +527,21 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.teamInfoEvent())); // derived team tree alongside the session list
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
+      // MCP integrations (only on a daemon with the feature on — an older client ignores the event).
+      // The last known health goes out now; the probe this connect triggers broadcasts any change.
+      if (supervisor.mcp.enabled) {
+        ws.send(JSON.stringify(supervisor.mcpIntegrationsEvent()));
+        supervisor.mcp.onClientConnected();
+      }
+      // Agent browser allowed sites ("browser" feature only). A client connecting to the hub is also
+      // a cue to push the list to members and collect what they queued while unreachable.
+      if (supervisor.mcp.browser) {
+        ws.send(JSON.stringify(supervisor.browserSitesEvent()));
+        void supervisor.mcp.browser.sites.syncNow();
+        ws.send(JSON.stringify(supervisor.browserLoggedInEvent())); // Phase C3: logged-in sites + unlock switches
+        void supervisor.mcp.browser.loggedIn.syncNow();
+      }
+      if (supervisor.parts) ws.send(JSON.stringify(supervisor.partsEvent())); // Phase C5: part sources (masked)
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
@@ -641,7 +673,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
    *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
+  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; partKeys?: Record<string, string>; accounts?: rest.RosterPush }): string | null => {
     // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
     // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
     // anything.
@@ -668,6 +700,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
         setOpenRouterKey(body.openRouterKey);
       } catch (e) {
         console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    // Part-source keys (Phase C5): present keys overwrite, like the OpenRouter key. Ignored without the feature.
+    if (body.partKeys) {
+      try {
+        supervisor.parts?.adoptFleetKeys(body.partKeys);
+      } catch (e) {
+        console.warn(`[fleet] pushed part-source keys rejected: ${e instanceof Error ? e.message : "error"}`);
       }
     }
     if (body.todoistToken) {
@@ -821,6 +861,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
         ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
         ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+        ...(supervisor.parts?.fleetPayload() ? { partKeys: supervisor.parts.fleetPayload()! } : {}),
         // The whole roster rides the first join too, so a new member arrives with every account
         // instead of only the mirrored default (§7.3).
         ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),
@@ -1085,6 +1126,55 @@ export function createServer(opts: ServerOptions): ServerHandle {
     (cadSyncBoot as { unref?: () => void }).unref?.();
     (cadSyncRetry as { unref?: () => void }).unref?.();
   }
+
+  // Agent browser allowed-sites sync (agent-cad-and-browser §4.14 item 43; src/browser/sites-sync.ts).
+  // Both routes answer 404 unless the "browser" feature is on.
+  //  - /sync: the hub pushes the authoritative list to this member. Same gate as the fleet-repo
+  //    routes: not a proven different tailnet user, and the caller names the hub that paired us.
+  //  - /op: a member forwards approvals made on it to this hub. The caller must name a member in
+  //    this hub's fleet.
+  route("POST", "/api/browser/sites/sync", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesSyncReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<SitesSyncBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    return Response.json(browser.sites.receiveSync({ hubServerId: body.hubServerId!, hubUrl: body.hubUrl, sites: body.sites ?? [], confirmed: body.confirmed }) satisfies SitesSyncReply);
+  });
+  route("POST", "/api/browser/sites/op", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesOpReply, { status: 404 });
+    // A JSON content type is required, like the other fleet routes: a cross-origin "simple request"
+    // (text/plain, no preflight) must not be able to change the list.
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<SitesOpBody>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies SitesOpReply, { status: 403 });
+    if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies SitesOpReply, { status: 403 });
+    return Response.json(browser.sites.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies SitesOpReply);
+  });
+  // The logged-in sites list and its unlock switches (Phase C3, §4.14 items 28 and 44;
+  // src/browser/loggedin.ts). The same two routes with the same two gates as the allowed sites.
+  route("POST", "/api/browser/loggedin/sync", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies LoggedInSyncReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<LoggedInSyncBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    return Response.json(browser.loggedIn.receiveSync({ hubServerId: body.hubServerId!, hubUrl: body.hubUrl, sites: body.sites ?? [], confirmed: body.confirmed }) satisfies LoggedInSyncReply);
+  });
+  route("POST", "/api/browser/loggedin/op", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies LoggedInOpReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<LoggedInOpBody>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies LoggedInOpReply, { status: 403 });
+    if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies LoggedInOpReply, { status: 403 });
+    return Response.json(browser.loggedIn.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies LoggedInOpReply);
+  });
 
   // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
   // here so this daemon can run autopilot for its own linked environments. Validated against the

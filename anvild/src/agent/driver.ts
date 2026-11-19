@@ -1,4 +1,4 @@
-import { query, type McpSdkServerConfigWithInstance, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type McpServerConfig, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliOptions } from "./cli";
 import { buildCommandInfo, type LocalPlugin } from "./skills";
 import { sdkModelId } from "./models";
@@ -10,6 +10,11 @@ import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
 import { makeCanUseTool, type QuestionBroker } from "./questions";
+import { browserSessionPrompt } from "./human-tools";
+import { TEST_DAEMON_SESSION_PROMPT, TEST_MCP_SERVER_NAME } from "./testdaemon-tools";
+import { PARTS_MCP_SERVER_NAME, PARTS_SESSION_PROMPT } from "./parts-tools";
+import { inProcessKeys } from "./mcp-external";
+import { MCP_RESOURCE_TOOLS, isInProcessTool, parseMcpTool, type McpSessionGate } from "./mcp-gate";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
@@ -25,6 +30,8 @@ export interface TurnUsage {
 }
 /** Called once per completed turn so the supervisor can refresh the shared rate-limit gauge. */
 export type ResultRecorder = (usage: TurnUsage) => void;
+
+export { MCP_RESOURCE_TOOLS };
 
 /** The SDK `query` entrypoint — injectable so tests can drive `consume()` without a subprocess. */
 export type QueryFn = typeof query;
@@ -72,6 +79,11 @@ export class AgentDriver {
    *  card once the write's tool.result confirms success (UI refinement §8). */
   private readonly pendingOffers = new Map<string, string>();
 
+  /** In-flight MCP integration calls (toolUseId → server key, tool and input), so their tool.result
+   *  can refresh the integration's exclusive lock (mcp-integrations spec §4.5) and be handed, paired
+   *  with its call, to the integration kind's result hook (agent-cad-and-browser Phase C2). */
+  private readonly mcpCalls = new Map<string, { key: string; tool: string; input: Record<string, unknown> }>();
+
   constructor(
     private readonly session: Session,
     private readonly renderer: MarkdownRenderer,
@@ -79,8 +91,9 @@ export class AgentDriver {
     private readonly questionBroker: QuestionBroker,
     private readonly env: Record<string, string>,
     private readonly onResult: ResultRecorder,
-    /** In-process MCP servers exposed to this session — set ONLY for the default concierge chat (§0.6). */
-    private readonly mcpServers?: Record<string, McpSdkServerConfigWithInstance>,
+    /** Every MCP server this session gets: the daemon's own in-process servers (`type: "sdk"`) plus
+     *  any integrations `buildMcpServers` attached. With `strictMcpConfig` below, nothing else exists. */
+    private readonly mcpServers?: Record<string, McpServerConfig>,
     /** Extra `allowedTools` (the concierge's `mcp__anvil__*` ids) auto-allowed by the SDK layer. */
     private readonly extraAllowedTools?: string[],
     /** Runs the adversarial plan review when the model calls ExitPlanMode (advisory). Set by the
@@ -109,6 +122,9 @@ export class AgentDriver {
     /** The hub's live model catalog, so fable resolves to its newest `claude-fable-*` release instead of
      *  the static pin (see {@link sdkModelId}). Omitted in tests — fable then falls back to the pin. */
     private readonly modelCatalog?: () => Partial<Record<Model, ModelTierInfo>>,
+    /** The MCP integration registry's hooks for this daemon (permission lookups, the exclusive lock,
+     *  init-time failure reports). Absent (unit tests): every integration tool call is denied. */
+    private readonly mcpGate?: McpSessionGate,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -224,6 +240,10 @@ export class AgentDriver {
         `repository checkout or any absolute path outside this worktree — even if you discover its location via ` +
         "`git worktree list`, git metadata, or documentation. All work for this task must stay in this worktree so it can be reviewed as a branch.";
     }
+    // A session with the agent browser has the `anvil_human` server (agent-cad-and-browser Phase C3)
+    // the test daemon's `anvil_test` (Phase C4) and the part sources' `anvil_parts` (Phase C5); each
+    // brings its own words.
+    append += browserSessionPrompt(Object.keys(this.mcpServers ?? {}), { [TEST_MCP_SERVER_NAME]: TEST_DAEMON_SESSION_PROMPT, [PARTS_MCP_SERVER_NAME]: PARTS_SESSION_PROMPT });
     return { type: "preset", preset: "claude_code", append };
   }
 
@@ -257,7 +277,12 @@ export class AgentDriver {
         // phone). This is the authoritative gate (M7); canUseTool alone only sees ops the
         // CLI already flags.
         hooks: {
-          PreToolUse: [{ hooks: [makePreToolUseHook(s, this.broker, this.onPlanProposed)], timeout: 3600 }],
+          PreToolUse: [
+            {
+              hooks: [makePreToolUseHook(s, this.broker, this.onPlanProposed, { inProcessKeys: inProcessKeys(this.mcpServers), gate: this.mcpGate })],
+              timeout: 3600,
+            },
+          ],
           // The goal hook (design 2026-07-25). Registered unconditionally — the SDK offers no way to
           // add a hook to a live query — and returns `{continue:true}` immediately when the session
           // has no goal. 60s covers the judge's own 20s abort with headroom.
@@ -287,10 +312,43 @@ export class AgentDriver {
         ...claudeCliOptions(), // executable:"bun" in dev; pathToClaudeCodeExecutable when packaged (§3.1)
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
         ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),
+        // Only the servers in `mcpServers` exist — for subagents too; agent frontmatter and ambient
+        // config cannot add one (mcp-integrations spec §4.3). In-process servers passed here are
+        // still honoured under it (C0 A1).
+        strictMcpConfig: true,
+        disallowedTools: [...MCP_RESOURCE_TOOLS],
+        // The daemon's own role tools ONLY. An integration tool id is never auto-allowed: every
+        // `mcp__<key>__` call must go through the permission gate.
         ...(this.extraAllowedTools ? { allowedTools: this.extraAllowedTools } : {}),
       },
     });
     void this.consume();
+  }
+
+  /**
+   * Follow MCP integration calls through the raw SDK stream — sub-agents' too, which `mapMessage`
+   * hides from the transcript — so each call's tool result refreshes the integration's exclusive lock
+   * and a long call never counts as idle (mcp-integrations spec §4.5).
+   */
+  private trackMcpCalls(m: unknown): void {
+    if (!this.mcpGate) return;
+    const msg = m as { type?: string; message?: { content?: unknown } };
+    const content = Array.isArray(msg.message?.content) ? (msg.message!.content as any[]) : [];
+    if (msg.type === "assistant") {
+      for (const b of content) {
+        if (b?.type !== "tool_use" || typeof b.name !== "string" || typeof b.id !== "string") continue;
+        if (isInProcessTool(b.name, inProcessKeys(this.mcpServers))) continue;
+        const parsed = parseMcpTool(b.name);
+        if (parsed) this.mcpCalls.set(b.id, { key: parsed.key, tool: parsed.tool, input: b.input && typeof b.input === "object" ? (b.input as Record<string, unknown>) : {} });
+      }
+    } else if (msg.type === "user") {
+      for (const b of content) {
+        const call = b?.type === "tool_result" && typeof b.tool_use_id === "string" ? this.mcpCalls.get(b.tool_use_id) : undefined;
+        if (!call) continue;
+        this.mcpCalls.delete(b.tool_use_id);
+        this.mcpGate.onToolResult(this.session, call.key, { tool: call.tool, input: call.input, content: b.content, isError: b.is_error === true });
+      }
+    }
   }
 
   /** Realize a deliverable write into a download card (and Taildrop it if configured). */
@@ -319,6 +377,18 @@ export class AgentDriver {
           const slash = (m as any).slash_commands;
           if (Array.isArray(slash)) this.onCommands(buildCommandInfo(slash, this.session.data.cwd));
         }
+        // The same init message says which MCP servers connected. One that `failed` (crashed or hung
+        // on launch) is reported to the registry, which marks it unavailable and tells the owner
+        // (agent-cad-and-browser §4.14 item 31).
+        if (this.mcpGate && m.type === "system" && (m as any).subtype === "init") {
+          const reported = (m as any).mcp_servers;
+          if (Array.isArray(reported)) {
+            this.mcpGate.onInit(
+              this.session,
+              reported.filter((r: any) => r && typeof r.name === "string").map((r: any) => ({ name: r.name as string, status: String(r.status) })),
+            );
+          }
+        }
 
         // The SDK compacted the context — either a manual `/compact` or an automatic compaction at the
         // window limit. Drop a persisted divider so the boundary is visible on every device (and the
@@ -346,6 +416,7 @@ export class AgentDriver {
         if (this.session.data.status === "idle" && signalsTurnActivity(m)) this.session.setStatus("thinking");
 
         for (const id of askUserQuestionToolIds(m)) this.askQuestionIds.add(id);
+        this.trackMcpCalls(m);
         // Tool results are the evidence the goal judge needs (design D2) — a claim of success that
         // the tool result contradicts must be visible to it.
         if (m.type === "user") {
@@ -434,6 +505,7 @@ export class AgentDriver {
           }
           this.onResult({ model: this.session.data.model, costUsd, rateLimits, subscriptionType, contextUsage });
           this.session.setStatus("idle");
+          this.mcpGate?.onTurnEnd(this.session); // releases this session's exclusive locks (§4.5)
         }
       }
     } catch (e) {
@@ -467,6 +539,8 @@ export class AgentDriver {
       this.questionBroker.resolveSession(this.session.id);
       this.pendingOffers.clear();
       this.askQuestionIds.clear();
+      this.mcpCalls.clear();
+      this.mcpGate?.onConsumeExit(this.session); // a dead or stopped turn must not keep a lock
       // Any sub-agent still "running" at teardown (turn error, or a stop that drained here) never got its
       // Task tool.result — mark it canceled so the indicator shows a terminal ⊘, not an eternal spinner (D7).
       this.session.cancelRunningSubAgents();

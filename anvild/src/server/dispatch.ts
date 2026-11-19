@@ -358,6 +358,127 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      // MCP integrations (mcp-integrations spec). Client commands only — nothing inside a session can
+      // reach these. Each is refused with a command.error when the feature is off on this daemon.
+      case "mcp.integration.add":
+        deps.supervisor.mcpIntegrationAdd(cmd.integration);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.update":
+        deps.supervisor.mcpIntegrationUpdate(cmd.id, cmd.fields);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.remove":
+        deps.supervisor.mcpIntegrationRemove(cmd.id);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.check":
+        // Re-probe now; the requester always gets the fresh list (others only on a change).
+        deps.supervisor
+          .mcpIntegrationCheck()
+          .then(() => {
+            send(deps.supervisor.mcpIntegrationsEvent());
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "session.set_mcp_integrations":
+        deps.supervisor.setSessionMcpIntegrations(cmd.sessionId, cmd.ids);
+        if (cid) send(ack(cid));
+        return;
+
+      // Agent browser allowed sites (Phase C2). Refused with a command.error unless the "browser"
+      // feature is on. Every client of this daemon gets the `browser.sites` broadcast on a change.
+      case "browser.sites.list":
+        send(deps.supervisor.browserSitesEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.site.add":
+        deps.supervisor.browserSiteAdd(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.site.remove":
+        deps.supervisor.browserSiteRemove(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.runtime.install":
+        deps.supervisor
+          .browserRuntimeInstall()
+          .then(() => {
+            send(deps.supervisor.mcpIntegrationsEvent());
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      // Agent browser logged-in sites, their unlock switches, "Open agent browser" and the
+      // request_human answer (Phase C3). Same gate: refused unless the "browser" feature is on.
+      case "browser.loggedin.list":
+        send(deps.supervisor.browserLoggedInEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.add":
+        deps.supervisor.browserLoggedInAdd(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.remove":
+        deps.supervisor.browserLoggedInRemove(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.set_unlocked":
+        deps.supervisor.browserLoggedInSetUnlocked(cmd.site, cmd.unlocked);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.reset":
+        deps.supervisor.browserLoggedInReset();
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.open_agent_browser":
+        deps.supervisor.browserOpenAgentBrowser();
+        if (cid) send(ack(cid));
+        return;
+
+      // Part sources (Phase C5). Refused with a command.error unless the "part-sources" feature is on.
+      // A key change is broadcast to every client as `parts.sources` (masked values only).
+      case "parts.sources.get":
+        send(deps.supervisor.partsEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.keys.set":
+        deps.supervisor.partsSetKeys(cmd.source, cmd.values);
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.keys.clear":
+        deps.supervisor.partsClearKeys(cmd.source);
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.test":
+        deps.supervisor
+          .partsTest(cmd.source, cid)
+          .then((r) => send(r))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "human.request.respond":
+        deps.supervisor.resolveHumanRequest(cmd.requestId);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.list":
         send(deps.supervisor.promptsEvent());
         if (cid) send(ack(cid));

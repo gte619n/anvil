@@ -27,6 +27,7 @@
         "shiki": "^4.2.0",
         "sortablejs": "^1.15.7",
         "three": "^0.187.0",
+        "tldts": "^7.4.3",
         "tom-select": "^2.6.1",
         "turndown": "^7.2.4",
         "web-push": "^3.6.7",
