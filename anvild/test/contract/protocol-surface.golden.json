@@ -49,6 +49,7 @@
     "browser.loggedin.add",
     "browser.loggedin.list",
     "browser.loggedin.remove",
+    "browser.loggedin.reset",
     "browser.loggedin.set_unlocked",
     "browser.open_agent_browser",
     "browser.runtime.install",

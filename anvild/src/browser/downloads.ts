@@ -110,6 +110,8 @@ export interface DownloadOutcome {
   file?: string;
   /** Deleted: why. */
   deleted?: string;
+  /** Neither kept nor deleted (a hard link): why. */
+  skipped?: string;
   size?: number;
 }
 
@@ -153,6 +155,27 @@ function uniqueDest(dir: string, name: string): string {
 }
 
 /**
+ * Why `<worktree>/.anvil-browser/` cannot be used, or undefined when it is fine (C3 review, item 4):
+ * it must be a real folder (not a symbolic link) whose real path is the worktree's real path plus
+ * `.anvil-browser`. A folder that does not exist yet is fine. Never throws.
+ */
+export function outputDirProblem(worktree: string): string | undefined {
+  const outDir = join(worktree, OUTPUT_DIRNAME);
+  let st;
+  try {
+    st = lstatSync(outDir);
+  } catch {
+    return undefined; // not there yet
+  }
+  if (st.isSymbolicLink()) return `${OUTPUT_DIRNAME} in this worktree is a symbolic link; remove it (Anvil will create a real folder)`;
+  if (!st.isDirectory()) return `${OUTPUT_DIRNAME} in this worktree is not a folder; remove it`;
+  const real = realOrUndefined(outDir);
+  const wt = realOrUndefined(worktree);
+  if (!real || !wt || real !== join(wt, OUTPUT_DIRNAME)) return `${OUTPUT_DIRNAME} in this worktree does not resolve to a folder inside it`;
+  return undefined;
+}
+
+/**
  * Take one file out of `<worktree>/.anvil-browser/`: keep it in the quarantine if it passes the
  * limits, delete it otherwise. Returns undefined — and touches nothing — when `sourcePath` is not a
  * file directly inside that folder (already handled, not there yet, or a made-up path).
@@ -166,6 +189,8 @@ export function quarantineFile(worktree: string, sourcePath: string, opts: Quara
   const parentReal = realOrUndefined(dirname(src));
   if (!outReal || !parentReal || parentReal !== outReal) return undefined;
   if (dirname(src) !== resolve(outDir) && dirname(src) !== outReal) return undefined;
+  // …and the output folder itself is a real folder of this worktree, never a link out of it.
+  if (outputDirProblem(worktree)) return undefined;
 
   let st;
   try {
@@ -179,6 +204,8 @@ export function quarantineFile(worktree: string, sourcePath: string, opts: Quara
     return { name, deleted: "it is a symbolic link" };
   }
   if (!st.isFile()) return undefined;
+  // A hard link shares its inode with a file somewhere else: never chmod, move or delete it.
+  if (st.nlink > 1) return { name, size: st.size, skipped: "it has another name elsewhere on disk (a hard link); it was left where it is and not quarantined" };
 
   const clean = sanitizeDownloadName(name);
   const ext = extOf(clean);
@@ -221,6 +248,8 @@ export function quarantineFile(worktree: string, sourcePath: string, opts: Quara
  */
 export function sweepOutputDir(worktree: string, opts: QuarantineOptions & { requested?: ReadonlySet<string>; since?: number } = {}): DownloadOutcome[] {
   const outDir = join(worktree, OUTPUT_DIRNAME);
+  const bad = outputDirProblem(worktree);
+  if (bad) throw new Error(`the download sweep was refused: ${bad}`);
   let entries: string[];
   try {
     entries = readdirSync(outDir);
@@ -265,13 +294,16 @@ export function requestedOutputFiles(worktree: string, input: unknown, depth = 0
 /** One transcript line per outcome (Markdown). */
 export function downloadNotice(o: DownloadOutcome): string {
   const name = o.name.replace(/[`*_[\]<>]/g, "");
+  if (o.skipped) return `⚠️ _Download \`${name}\` was not touched: ${o.skipped}._`;
   return o.kept ? `⬇️ _Download \`${name}\` was put in quarantine at \`${o.kept}\`. It is never run and gets no download card; copy it out deliberately to use it._` : `🗑️ _Download \`${name}\` was deleted: ${o.deleted}._`;
 }
 
 /** What the model is told with its next browser call. */
 export function downloadContext(outcomes: readonly DownloadOutcome[]): string {
   const lines = outcomes.map((o) =>
-    o.kept
+    o.skipped
+      ? `- ${JSON.stringify(o.name)} was NOT quarantined and was left in place: ${o.skipped}. Do not use it.`
+      : o.kept
       ? `- ${JSON.stringify(o.name)} was moved to ${o.kept} (it is no longer in ${OUTPUT_DIRNAME}/). Files there are never executed; copy one out deliberately if the task needs it.`
       : `- ${JSON.stringify(o.name)} was DELETED: ${o.deleted}. Do not try to fetch it again another way.`,
   );

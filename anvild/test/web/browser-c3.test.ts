@@ -211,6 +211,18 @@ describe("logged-in sites in Settings → Integrations", () => {
     expect([...list().querySelectorAll<HTMLElement>(".browser-loggedin-row")].map((r) => r.dataset.site)).toEqual(["bank.test", "shop.test"]);
   });
 
+  test("[C3] web review 5: a damaged list is shown as an error with 'Start a new list', which sends browser.loggedin.reset", async () => {
+    setup([browserRow()]);
+    mcp.onBrowserLoggedIn(fleet.HUB_URL, [], 0, "The logged-in sites list on this machine was damaged (bad JSON).");
+    const err = list().querySelector<HTMLElement>(".browser-loggedin-error")!;
+    expect(err.textContent).toContain("was damaged (bad JSON)");
+    err.querySelector<HTMLButtonElement>("#browser-loggedin-reset")!.click();
+    await settle();
+    expect(sent).toEqual([expect.objectContaining({ type: "browser.loggedin.reset" })]);
+    mcp.onBrowserLoggedIn(fleet.HUB_URL, []);
+    expect(list().querySelector(".browser-loggedin-error")).toBeNull();
+  });
+
   test("[C3] web: a site name is shown as text, never as markup", () => {
     setup([browserRow()]);
     mcp.onBrowserLoggedIn(fleet.HUB_URL, [{ site: '<img src=x onerror="alert(1)">', source: "owner", unlocked: false, addedAt: 1 }]);

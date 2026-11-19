@@ -449,6 +449,12 @@ export class Supervisor {
         this.broadcastUpdated(built.data);
       },
     });
+    // A builder that hits a bot check or a CAPTCHA cannot wait for a person: its work unit is marked
+    // blocked with the reason (agent browser §4.12 "Hand-off"; C3 review, item 3).
+    this.human.onUnattendedHumanRequest = (sessionId, reason) => {
+      const unit = this.sessions.get(sessionId)?.data.workUnitId;
+      if (unit) this.autopilot.blockUnit(unit, `needs a human: ${reason}`);
+    };
     this.loops = new LoopService({
       registry: this.registry,
       stateDir: cfg.stateDir,
@@ -923,6 +929,9 @@ export class Supervisor {
   }
   browserLoggedInRemove(site: string): void {
     this.browserCommand((b) => b.loggedIn.remove(site));
+  }
+  browserLoggedInReset(): void {
+    this.browserCommand((b) => b.loggedIn.reset());
   }
   browserLoggedInSetUnlocked(site: string, unlocked: unknown): void {
     if (typeof unlocked !== "boolean") throw new BadCommand("unlocked must be true or false");

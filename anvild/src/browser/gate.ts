@@ -39,6 +39,25 @@
  *   Residual, inherent to learning the address from results: when a page navigates by itself, the
  *   ONE call that reveals it (a read, or the input call that caused it) runs on the new site.
  *
+ * What the browser contacted (C3 review, item 1). A page can move by itself — a timer setting
+ * `location`, a meta refresh, `location.replace` — after the result that established it, and the
+ * next input would then land on the new page unprompted. So the session's proxy records the site of
+ * every connection its browser makes, in order (`hooks.trafficSince`), and before any input, upload,
+ * script or navigation call the gate looks at what was contacted since the last result that said
+ * where the page is. Any site that is (a) a locked logged-in site other than the page's own, or (b)
+ * not allowed for this session (and not the page's own) makes the page UNKNOWN("traffic"): the call
+ * is refused with "take a snapshot first", and the snapshot's result then applies the normal hold and
+ * hard-stop rules. Accepted cost: a page that keeps loading things from other sites (ads, analytics,
+ * a logged-in site's widget) forces a snapshot before most inputs. Residual: a connection Chrome
+ * already holds open (HTTP/2 reuse of a socket opened before the last result) is not seen again.
+ *
+ * Embedded logged-in sites (C3 review, item 4): while any locked logged-in site has been contacted
+ * since the navigation that led to the current page (a frame or widget from it on this page), input,
+ * upload, script and housekeeping calls on that page are hard-stopped as if they were on that site,
+ * naming it (`BrowserActionInfo.embeddedSites`). Reads and navigations are not.
+ *
+ * `browser_close` is always allowed: it is the way out, in every state (C3 review, item 6).
+ *
  * Deny. The daemon has no connection of its own to the browser, so it cannot navigate by itself, and
  * nothing here depends on the CLI applying a rewritten input. When the owner answers Deny on a hold
  * the held call is denied and the session is CLOSING until a result reports `about:blank` (or the
@@ -67,7 +86,13 @@ export interface BrowserSessionState {
   currentUrl?: string;
   /** The current tab's address is NOT known: the last result that could have changed it did not say.
    *  `navigation`: a call that changes the page. `input`: an input-class call. */
-  unknown?: "navigation" | "input";
+  unknown?: "navigation" | "input" | "traffic";
+  /** The proxy's traffic sequence when the last result established the page. */
+  resultSeq?: number;
+  /** The traffic sequence when the navigation that led to the current page began. */
+  pageSeq?: number;
+  /** The traffic sequence when the last navigation-class call was allowed. */
+  navCallSeq?: number;
   /** The tabs as last listed by the server (only entries whose URL could be read with certainty). */
   tabs?: TabEntry[];
   /** The owner refused a page that this browser's history still holds: no going back. */
@@ -88,6 +113,9 @@ export interface BrowserActionInfo {
   currentUnknown?: boolean;
   /** For a navigation with a target: where it goes. */
   target?: { site: string; url: string };
+  /** Locked logged-in sites the browser contacted since the navigation to the current page (a frame
+   *  or widget from them on it). Input-like calls are hard-stopped as if on them. */
+  embeddedSites?: string[];
   mode: BrowserMode;
 }
 
@@ -103,6 +131,8 @@ export interface BrowserGateHooks {
   /** PHASE C3 — whether a logged-in site is unlocked (item 44). Not read by Phase C2; it is here so
    *  the unlock list has one place to live next to `loggedInSites`. */
   isUnlocked?: (site: string) => boolean;
+  /** PHASE C3 — logged in and not unlocked (a damaged list counts every profile site; see loggedin.ts). */
+  isLocked?: (site: string) => boolean;
   /**
    * PHASE C3 — per-action rules for logged-in sites (hard stops). Called for every call Phase C2 is
    * about to ALLOW (reads, inputs, housekeeping, and navigations whose site is allowed). Return a
@@ -117,6 +147,10 @@ export interface BrowserGateHooks {
    *  daemon. A page on it is the session's own: allowed without a site prompt, in every mode, and
    *  never treated as a logged-in site. Compared by ORIGIN, so no other loopback port is covered. */
   ownOrigin?: (sessionId: string) => string | undefined;
+  /** C3 REVIEW — the session's proxy traffic: the current sequence number, and the sites (registrable
+   *  domains) its browser contacted after sequence `seq`. Absent → no traffic rule. */
+  trafficSeq?: (sessionId: string) => number;
+  trafficSince?: (sessionId: string, seq: number) => string[];
 }
 
 /** What the hard-stop policy is shown in place of the site of the session's own test daemon: not a
@@ -172,6 +206,9 @@ export class BrowserGate {
 
   private resetPage(st: BrowserSessionState): void {
     st.currentUrl = undefined;
+    st.resultSeq = undefined;
+    st.pageSeq = undefined;
+    st.navCallSeq = undefined;
     st.hold = undefined;
     st.closing = undefined;
     st.unknown = undefined;
@@ -222,9 +259,19 @@ export class BrowserGate {
     if (!rt) return { kind: "deny", reason: "the browser was not started by Anvil for this session (switch it off and on again in the Tools menu)" };
     if (!rt.proxyRunning) return { kind: "deny", reason: "the browser's network block is not running, so the browser is not allowed to act (press Check in Settings → Integrations)" };
 
+    // The way out is always open (C3 review, item 6).
+    if (ctx.tool === "browser_close") return { kind: "allow", reason: "browser_close is always allowed" };
+
     const st = this.state(ctx.session.id);
     // CLOSING comes first: only the way out is open.
     if (st.closing) return this.closingVerdict(ctx, st);
+
+    // The page may have moved by itself since the last result (C3 review, item 1).
+    const moved = this.movedByItself(ctx, st);
+    if (moved) {
+      st.unknown = "traffic";
+      return { kind: "deny", reason: `the page may have changed by itself: since the last result the browser contacted ${moved}. Call browser_snapshot first; no action runs until a snapshot says where the page is.` };
+    }
 
     // What the call would get on its own merits. A call that is refused anyway never costs a prompt.
     const plan = this.plan(ctx, st, rt.mode);
@@ -248,16 +295,57 @@ export class BrowserGate {
     }
 
     if (plan.recordOnce) st.once.add(plan.recordOnce);
+    this.noteNavigationCall(ctx, st, plan.verdict);
     return plan.verdict;
   };
 
+  private trafficSince(sessionId: string, seq: number | undefined): string[] {
+    return this.deps.hooks.trafficSince?.(sessionId, seq ?? 0) ?? [];
+  }
+
+  private isLocked(site: string): boolean {
+    if (this.deps.hooks.isLocked) return this.deps.hooks.isLocked(site);
+    return this.loggedIn(site) && this.deps.hooks.isUnlocked?.(site) !== true;
+  }
+
+  private currentSite(st: BrowserSessionState): string | undefined {
+    const current = st.currentUrl ? checkUrl(st.currentUrl) : undefined;
+    return current?.ok && "site" in current ? current.site : undefined;
+  }
+
+  /**
+   * Before an input, upload, script or navigation call: the sites contacted since the last result
+   * that make the page's address untrustworthy (see the file comment), as text, or undefined.
+   */
+  private movedByItself(ctx: McpKindGateContext, st: BrowserSessionState): string | undefined {
+    if (!this.deps.hooks.trafficSince || st.currentUrl === undefined || st.resultSeq === undefined) return undefined;
+    if (ctx.tool === "browser_navigate" && ctx.input.url === BLANK_URL) return undefined; // the way out
+    const cls = classifyBrowserTool(ctx.tool, ctx.input);
+    if (!("cls" in cls) || cls.cls === "read") return undefined;
+    if (this.isOwn(ctx.session.id, st.currentUrl)) return undefined;
+    const here = this.currentSite(st);
+    const bad = this.trafficSince(ctx.session.id, st.resultSeq).filter((s) => s !== here && (this.isLocked(s) || !this.siteAllowed(st, s)));
+    if (!bad.length) return undefined;
+    return bad
+      .slice(0, 4)
+      .map((s) => (this.isLocked(s) ? `${s} (a locked logged-in site)` : `${s} (not allowed in this session)`))
+      .join(", ");
+  }
+
+  /** An allowed navigation-class call: the traffic from here on belongs to the page it leads to. */
+  private noteNavigationCall(ctx: McpKindGateContext, st: BrowserSessionState, verdict: McpKindVerdict): void {
+    if (verdict?.kind !== "allow" || !this.deps.hooks.trafficSeq) return;
+    const cls = classifyBrowserTool(ctx.tool, ctx.input);
+    if ("cls" in cls && cls.cls === "navigation") st.navCallSeq = this.deps.hooks.trafficSeq(ctx.session.id);
+  }
+
   /** Whether this call is one that may run while the page's address is unknown: the calls whose
    *  result establishes it, the way out, and — after an input-class call only — any read. */
-  private establishesPage(ctx: McpKindGateContext, unknown: "navigation" | "input"): boolean {
+  private establishesPage(ctx: McpKindGateContext, unknown: "navigation" | "input" | "traffic"): boolean {
     if (ctx.tool === "browser_snapshot" || ctx.tool === "browser_close") return true;
     if (ctx.tool === "browser_tabs" && ctx.input.action === "list") return true;
     if (ctx.tool === "browser_navigate" && ctx.input.url === BLANK_URL) return true;
-    if (unknown === "input") {
+    if (unknown === "input" || unknown === "traffic") {
       const cls = classifyBrowserTool(ctx.tool, ctx.input);
       return "cls" in cls && cls.cls === "read";
     }
@@ -278,7 +366,10 @@ export class BrowserGate {
     // that is not a hostname in place of its site.
     const onOwn = this.isOwn(ctx.session.id, st.currentUrl);
     const shownSite = onOwn ? OWN_TEST_DAEMON_SITE : currentSite;
-    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(shownSite ? { currentSite: shownSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}) };
+    // Locked logged-in sites this page has loaded something from (a frame, a widget): input-like calls
+    // are hard-stopped as if on them. Not for the session's own test daemon.
+    const embedded = onOwn || cls.cls === "read" || cls.cls === "navigation" ? [] : this.trafficSince(ctx.session.id, st.pageSeq).filter((s) => s !== currentSite && this.isLocked(s));
+    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(shownSite ? { currentSite: shownSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}), ...(embedded.length ? { embeddedSites: embedded } : {}) };
     const session = ctx.session;
 
     if (cls.cls === "script") {
@@ -442,6 +533,13 @@ export class BrowserGate {
     }
 
     st.unknown = undefined;
+    // The traffic so far is accounted for by this result; traffic before the navigation that led here
+    // belongs to an earlier page.
+    const seq = this.deps.hooks.trafficSeq?.(sessionId);
+    if (seq !== undefined) {
+      if (st.currentUrl !== reading.url || st.pageSeq === undefined) st.pageSeq = changesPage ? (st.navCallSeq ?? st.resultSeq ?? 0) : (st.resultSeq ?? 0);
+      st.resultSeq = seq;
+    }
     st.currentUrl = reading.url;
     const where: UrlVerdict = reading.url === CHROME_ERROR_URL ? { ok: true, blank: true } : checkUrl(reading.url);
     if (where.ok && "blank" in where) {

@@ -54,8 +54,14 @@ describe("LoggedInSitesStore", () => {
 
   test("[C3] a corrupt file unlocks nothing and is kept aside; a hand-edited row unlocks only with the literal true, and a row that is not a site is dropped", () => {
     writeFileSync(join(dir, BROWSER_LOGGEDIN_FILE), "{ not json");
-    expect(new LoggedInSitesStore(dir, () => 5).list()).toEqual([]);
+    const damaged = new LoggedInSitesStore(dir, () => 5);
+    expect(damaged.list()).toEqual([]); // nothing is UNLOCKED by a damaged file…
     expect(readdirSync(dir).some((f) => f.startsWith(`${BROWSER_LOGGEDIN_FILE}.corrupt-`))).toBe(true);
+    // …and the store says it is damaged, so the service fails closed (C3 review, item 5; see
+    // browser-c3-review.test.ts) instead of treating "no rows" as "no logged-in sites". A restart keeps that.
+    expect(damaged.corrupt()).toMatchObject({ at: 5, reason: expect.stringMatching(/JSON/) });
+    expect(new LoggedInSitesStore(dir).corrupt()).toBeDefined();
+    rmSync(join(dir, BROWSER_LOGGEDIN_FILE));
 
     writeFileSync(
       join(dir, BROWSER_LOGGEDIN_FILE),

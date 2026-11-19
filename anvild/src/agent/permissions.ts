@@ -338,7 +338,9 @@ async function decideMcp(
     }
     const after = verdict.onAnswer?.(ans.decision);
     if (after && "deny" in after) return { behavior: "deny", reason: after.deny };
-    return finish(ans.updatedInput ?? input, verdict.reason);
+    // The call that was asked about is the call that runs: a client-supplied `updatedInput` is
+    // ignored on a kind-gate prompt (C3 review, item 6) — the card showed THIS input.
+    return finish(input, verdict.reason);
   }
 
   if (bypass) return finish(input, "bypass: permissions skipped");

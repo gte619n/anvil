@@ -81,6 +81,7 @@ export function runsWithoutPrompt(info: BrowserActionInfo, site: string): boolea
 /** What the card says the call does — built from the tool name and tracked facts only. */
 function describe(info: BrowserActionInfo, site: string): string {
   const tool = info.ctx.tool.replace(/^browser_/, "").replace(/_/g, " ");
+  if (site !== info.currentSite && site !== info.target?.site) return `${tool} on ${info.currentSite ?? "a page"} that has loaded ${site}, a logged-in site (a frame or widget from it may be on the page)`;
   if (info.target && info.target.site !== site) return `leave ${site} for ${info.target.site} (${tool})`;
   if (info.target) return `open ${info.target.url.slice(0, 160)} on ${site} without https (${tool})`;
   return `${tool} on ${site}, a logged-in site`;
@@ -89,7 +90,9 @@ function describe(info: BrowserActionInfo, site: string): string {
 export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo) => McpKindVerdict {
   return (info) => {
     // The sites this call touches: where the page is, and where a navigation would take it.
-    const touched = [info.currentSite, info.target?.site].filter((s, i, all): s is string => !!s && all.indexOf(s) === i);
+    // …and the locked logged-in sites this page has loaded something from (C3 review, item 4): a frame
+    // from one of them is acted on as if the page were on it.
+    const touched = [info.currentSite, info.target?.site, ...(info.embeddedSites ?? [])].filter((s, i, all): s is string => !!s && all.indexOf(s) === i);
     const site = touched.find((s) => deps.isLocked(s) && !runsWithoutPrompt(info, s));
     // The daemon does not know which page the current tab shows: assume the worst — a locked
     // logged-in site — never "not logged in". Only a read runs; anything else is refused until a

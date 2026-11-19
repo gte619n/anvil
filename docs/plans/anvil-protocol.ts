@@ -619,6 +619,10 @@ export interface BrowserLoggedInEvent extends Envelope {
   type: "browser.loggedin";
   sites: BrowserLoggedInSite[];
   pending?: number;
+  /** The list on this machine was damaged (C3 review): until the owner starts a new one
+   *  (`browser.loggedin.reset`), every site the agent profile has cookies for counts as a locked
+   *  logged-in site. Shown in Settings as an error. */
+  error?: string;
 }
 /** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
  *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
@@ -1907,6 +1911,10 @@ export interface BrowserLoggedInRemoveCmd extends Envelope, Correlated {
   type: "browser.loggedin.remove";
   site: string;
 }
+/** Start a new, empty logged-in list after a damaged one (clears `BrowserLoggedInEvent.error`). */
+export interface BrowserLoggedInResetCmd extends Envelope, Correlated {
+  type: "browser.loggedin.reset";
+}
 export interface BrowserLoggedInSetUnlockedCmd extends Envelope, Correlated {
   type: "browser.loggedin.set_unlocked";
   site: string;
@@ -2331,6 +2339,7 @@ export type ClientCommand =
   | BrowserLoggedInAddCmd
   | BrowserLoggedInRemoveCmd
   | BrowserLoggedInSetUnlockedCmd
+  | BrowserLoggedInResetCmd
   | BrowserOpenAgentBrowserCmd
   | HumanRequestRespondCmd
   | PromptListCmd

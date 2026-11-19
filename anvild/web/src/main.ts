@@ -1626,7 +1626,7 @@ function onEvent(url: string, e: ServerEvent): void {
       return;
     case "browser.loggedin":
       // Logged-in sites and their unlock switches (Phase C3); same hub-synced shape as the sites list.
-      onBrowserLoggedIn(url, e.sites, e.pending ?? 0);
+      onBrowserLoggedIn(url, e.sites, e.pending ?? 0, e.error);
       return;
     case "prompts":
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's

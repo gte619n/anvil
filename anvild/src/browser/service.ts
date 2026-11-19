@@ -7,7 +7,7 @@
  * are on. Without it nothing here exists: the preset is not registered (so `mcp.integration.add`
  * refuses the kind), no proxy listens and nothing is written.
  */
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { BrowserIntegrationInfo, McpHealth, McpIntegration, McpTransport, ServerEvent, ToolResultImage } from "@protocol";
@@ -16,7 +16,7 @@ import { registerMcpKindGate, registerMcpKindResultHook, type McpKindGateContext
 import { registerProtectedRule, type ProtectedRule } from "../agent/protected";
 import { resolveOnPath } from "../mcp/health";
 import { registerMcpPreset, type McpPreset, type McpPresetContext } from "../mcp/presets";
-import { DOWNLOADS_DIRNAME, downloadContext, downloadNotice, downloadsProtectedRule, parseDownloadLines, quarantineFile, requestedOutputFiles, sweepOutputDir, type DownloadOutcome } from "./downloads";
+import { DOWNLOADS_DIRNAME, downloadContext, downloadNotice, downloadsProtectedRule, outputDirProblem, parseDownloadLines, quarantineFile, requestedOutputFiles, sweepOutputDir, type DownloadOutcome } from "./downloads";
 import { BrowserGate, type BrowserGateHooks } from "./gate";
 import { makeHardStopPolicy } from "./hardstops";
 import { BROWSER_LOGGEDIN_FILE, LoggedInSitesService, runOwnerBrowser, type AgentBrowserLauncher, type AgentBrowserProcess } from "./loggedin";
@@ -37,7 +37,7 @@ import {
 } from "./preset";
 import { browserRuntimeCli, browserRuntimeProblem, installBrowserRuntime } from "./runtime";
 import { BrowserProxyManager, ownHosts, type BrowserProxyOptions, type ProxyFactory, type ProxyResolver } from "./proxy";
-import { BROWSER_SITES_FILE, resultFileLinks, toolResultText } from "./sites";
+import { BROWSER_SITES_FILE, registrableDomain, resultFileLinks, toolResultText } from "./sites";
 import { TestDaemonService, type TestDaemonSeams } from "./testdaemon";
 import { classifyBrowserTool } from "./tools";
 import { AllowedSitesService, type BrowserFleetLink } from "./sites-sync";
@@ -171,6 +171,8 @@ export function daemonApiCommandProblem(command: string, selfPort?: number): str
 
 /** A page screenshot a session's browser returned, kept for the hard-stop and hand-off cards. */
 interface Shot {
+  /** The proxy's traffic sequence when it was noted: traffic to another site since makes it stale. */
+  seq: number;
   mediaType: string;
   dataBase64: string;
   /** The page address when it was taken. */
@@ -183,11 +185,13 @@ interface Shot {
 const MAX_SHOT_BASE64 = 12 * 1024 * 1024;
 
 /**
- * The image in a browser tool result: an image content block (the SDK's `source` shape or MCP's
- * `data`/`mimeType` shape), or — when the server only linked a file — the PNG/JPEG it wrote directly
- * inside this session's output folder.
+ * The image in a `browser_take_screenshot` result (C3 review, item 2: never another tool's): an image
+ * content block (the SDK's `source` shape or MCP's `data`/`mimeType` shape), or — when the server only
+ * linked a file — the PNG/JPEG its own result links, and only when that file is a regular file (not a
+ * link, one name only) directly inside this session's real output folder and was written after the
+ * call began (`since`). A path merely mentioned in some text is never read.
  */
-export function resultImage(content: unknown, outputDir?: string): { mediaType: string; dataBase64: string } | undefined {
+export function resultImage(content: unknown, outputDir?: string, since?: number): { mediaType: string; dataBase64: string } | undefined {
   if (Array.isArray(content)) {
     for (const b of [...content].reverse() as Record<string, unknown>[]) {
       if (!b || typeof b !== "object" || b.type !== "image") continue;
@@ -197,19 +201,45 @@ export function resultImage(content: unknown, outputDir?: string): { mediaType: 
       if (data && data.length <= MAX_SHOT_BASE64 && /^image\/(png|jpeg|webp)$/.test(mediaType)) return { mediaType, dataBase64: data };
     }
   }
-  if (!outputDir) return undefined;
-  for (const m of toolResultText(content).matchAll(/(\/[^\s()"']+\.(png|jpe?g))/g)) {
+  if (!outputDir || since === undefined) return undefined;
+  for (const file of resultFileLinks(toolResultText(content))) {
     try {
-      const file = m[1]!;
+      const ext = /\.(png|jpe?g)$/i.exec(file)?.[1]?.toLowerCase();
+      if (!ext) continue;
       if (realpathSync(dirname(file)) !== realpathSync(outputDir)) continue;
-      const st = statSync(file);
-      if (!st.isFile() || st.size > (MAX_SHOT_BASE64 * 3) / 4) continue;
-      return { mediaType: m[2] === "png" ? "image/png" : "image/jpeg", dataBase64: readFileSync(file).toString("base64") };
+      const st = lstatSync(file);
+      if (!st.isFile() || st.isSymbolicLink() || st.nlink > 1 || st.size > (MAX_SHOT_BASE64 * 3) / 4) continue;
+      if (st.mtimeMs < since - 5) continue; // there before the call: not this screenshot
+      return { mediaType: ext === "png" ? "image/png" : "image/jpeg", dataBase64: readFileSync(file).toString("base64") };
     } catch {
       /* not there, or not readable */
     }
   }
   return undefined;
+}
+
+const realNodeCache = new Map<string, string>();
+/**
+ * The real `node` binary behind `candidate` (C3 review, item 6): what `node -p process.execPath`
+ * prints when run from a neutral folder the daemon owns. A version-manager shim on the PATH (asdf,
+ * mise, nodenv…) picks a version from files like `.tool-versions` in the folder it runs in — and the
+ * browser's server runs in the session's worktree — so the launch line names the binary the shim
+ * resolved HERE, by absolute path, and no worktree file can change which program starts.
+ */
+export function resolveRealNode(candidate: string | undefined, neutralDir: string, env: { PATH: string; HOME: string; TMPDIR: string }): string | undefined {
+  if (!candidate || !isAbsolute(candidate)) return undefined;
+  const hit = realNodeCache.get(`${candidate}\0${neutralDir}`);
+  if (hit && existsSync(hit)) return hit;
+  try {
+    mkdirSync(neutralDir, { recursive: true });
+    const r = Bun.spawnSync([candidate, "-p", "process.execPath"], { cwd: neutralDir, env: { PATH: env.PATH, HOME: env.HOME, TMPDIR: env.TMPDIR }, stdout: "pipe", stderr: "ignore", timeout: 10_000 });
+    const out = r.stdout.toString().trim().split("\n").pop()?.trim();
+    if (r.exitCode !== 0 || !out || !isAbsolute(out) || !existsSync(out)) return undefined;
+    realNodeCache.set(`${candidate}\0${neutralDir}`, out);
+    return out;
+  } catch {
+    return undefined;
+  }
 }
 
 // ── One registration per process, routed to the owning service ──────────────────────────────────
@@ -291,6 +321,13 @@ export class BrowserService {
   private selfPort: number | undefined;
   /** Requests the network block refused since each session's last browser call (told to the model). */
   private readonly refusals = new Map<string, string[]>();
+  /** Every site each session's browser contacted, in order (C3 review, item 1). */
+  private readonly traffic = new Map<string, { seq: number; site: string }[]>();
+  /** Per session: entries up to this sequence were dropped (the log is bounded). */
+  private readonly trafficDropped = new Map<string, number>();
+  private trafficCounter = 0;
+  /** When each session's last `browser_take_screenshot` call was allowed (its file must be newer). */
+  private readonly shotCallAt = new Map<string, number>();
 
   constructor(private readonly deps: BrowserServiceDeps) {
     this.sites = new AllowedSitesService({ stateDir: deps.stateDir, broadcast: deps.broadcast, clock: deps.clock, fetchImpl: deps.fetchImpl, intervalMs: deps.sitesIntervalMs });
@@ -305,6 +342,7 @@ export class BrowserService {
       deps.proxyFactory,
     );
     this.proxies.onSessionDecision = (sessionId, d) => {
+      this.recordTraffic(sessionId, d.host, d.port);
       if (d.allowed) return;
       const line = `${d.host}:${d.port} (${d.reason ?? "refused"})`;
       const list = this.refusals.get(sessionId) ?? [];
@@ -323,6 +361,7 @@ export class BrowserService {
     this.loggedIn = new LoggedInSitesService({ stateDir: deps.stateDir, broadcast: deps.broadcast, clock: deps.clock, fetchImpl: deps.fetchImpl, intervalMs: deps.sitesIntervalMs });
     this.hooks.loggedInSites = () => this.loggedIn.sites();
     this.hooks.isUnlocked = (site) => this.loggedIn.isUnlocked(site);
+    this.hooks.isLocked = (site) => this.loggedIn.isLocked(site);
     this.hooks.actionPolicy = makeHardStopPolicy({
       isLocked: (site) => this.loggedIn.isLocked(site),
       unlock: (site) => void this.loggedIn.setUnlocked(site, true),
@@ -344,6 +383,8 @@ export class BrowserService {
       ...deps.testDaemon,
     });
     this.hooks.ownOrigin = (sessionId) => this.testDaemons.origin(sessionId);
+    this.hooks.trafficSeq = () => this.trafficCounter;
+    this.hooks.trafficSince = (sessionId, seq) => this.trafficSince(sessionId, seq);
     this.hooks.allowEvaluate = (info) => {
       const sessionId = info.ctx.session.id;
       const own = this.testDaemons.origin(sessionId);
@@ -480,6 +521,29 @@ export class BrowserService {
   /** Settles when the current (or last) "Open agent browser" session has been closed and recorded. */
   ownerBrowserDone: Promise<string[]> = Promise.resolve([]);
 
+  // ── what the browser contacted (C3 review, item 1) ──────────────────────────────────────────
+
+  private recordTraffic(sessionId: string, host: string, port: number): void {
+    const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+    // The session's own test daemon is the session's own page.
+    if (port === this.testDaemons.port(sessionId) && (h === "127.0.0.1" || h === "localhost" || h === "::1")) return;
+    const site = registrableDomain(h);
+    if (!site) return;
+    let list = this.traffic.get(sessionId);
+    if (!list) this.traffic.set(sessionId, (list = []));
+    list.push({ seq: ++this.trafficCounter, site });
+    if (list.length > 2000) this.trafficDropped.set(sessionId, list.splice(0, list.length - 1500).at(-1)!.seq);
+  }
+
+  /** The sites the session's browser contacted after `seq` (each once). When the bounded log no
+   *  longer reaches back that far, an unknown site is reported, so the caller fails closed. */
+  trafficSince(sessionId: string, seq: number): string[] {
+    const out = new Set<string>();
+    if ((this.trafficDropped.get(sessionId) ?? 0) > seq) out.add("(more traffic than Anvil keeps)");
+    for (const e of this.traffic.get(sessionId) ?? []) if (e.seq > seq) out.add(e.site);
+    return [...out];
+  }
+
   // ── the page screenshot (Phase C3) ──────────────────────────────────────────────────────────
 
   /**
@@ -492,6 +556,20 @@ export class BrowserService {
     if (!shot || !this.deps.saveImage) return undefined;
     const st = this.gate.state(sessionId);
     if (currentOnly && (shot.stale || st.unknown !== undefined || shot.url !== st.currentUrl)) return undefined;
+    // The page may have changed itself since (C3 review, item 2): traffic to another site makes the
+    // picture stale. Residual: a page can change its pixels without any network traffic.
+    if (currentOnly) {
+      let here: string | undefined;
+      try {
+        here = shot.url ? registrableDomain(new URL(shot.url).hostname) : undefined;
+      } catch {
+        here = undefined;
+      }
+      if (this.trafficSince(sessionId, shot.seq).some((s) => s !== here)) {
+        shot.stale = true;
+        return undefined;
+      }
+    }
     try {
       shot.attachmentId ??= this.deps.saveImage(sessionId, shot.mediaType, shot.dataBase64);
     } catch (e) {
@@ -504,8 +582,10 @@ export class BrowserService {
   private noteShot(sessionId: string, rt: Runtime | undefined, result: Parameters<BrowserGate["onResult"]>[1]): void {
     const cls = classifyBrowserTool(result.tool, result.input);
     const read = "cls" in cls && cls.cls === "read";
-    const image = read && !result.isError ? resultImage(result.content, rt ? join(rt.worktree, BROWSER_OUTPUT_DIRNAME) : undefined) : undefined;
-    if (image) this.shots.set(sessionId, { ...image, url: this.gate.state(sessionId).currentUrl, stale: false });
+    // Only browser_take_screenshot's own result is a picture of the page (C3 review, item 2).
+    const outDir = rt && !outputDirProblem(rt.worktree) ? join(rt.worktree, BROWSER_OUTPUT_DIRNAME) : undefined;
+    const image = result.tool === "browser_take_screenshot" && !result.isError ? resultImage(result.content, outDir, this.shotCallAt.get(sessionId)) : undefined;
+    if (image) this.shots.set(sessionId, { ...image, url: this.gate.state(sessionId).currentUrl, stale: false, seq: this.trafficCounter });
     else if (!read) {
       // A click, a key, a navigation, a resize…: whatever was photographed may look different now.
       const shot = this.shots.get(sessionId);
@@ -551,7 +631,9 @@ export class BrowserService {
     try {
       this.reportDownloads(sessionId, sweepOutputDir(rt.worktree, { ...this.quarantineOptions(), requested: this.requested.get(sessionId), ...(since !== undefined ? { since: since - 2000 } : {}) }));
     } catch (e) {
-      console.error(`[browser] download sweep failed: ${e instanceof Error ? e.message : String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[browser] download sweep failed: ${msg}`);
+      this.deps.notice(sessionId, `⚠️ _${msg.replace(/[`*_[\]<>]/g, "")}._`);
     }
   }
 
@@ -574,7 +656,8 @@ export class BrowserService {
   // ── the pinned server runtime (runtime.ts) ──────────────────────────────────────────────────
 
   private nodePath(): string | undefined {
-    return (this.deps.nodePath ?? (() => resolveOnPath("node", this.deps.childEnv.PATH)))();
+    if (this.deps.nodePath) return this.deps.nodePath();
+    return resolveRealNode(resolveOnPath("node", this.deps.childEnv.PATH), join(this.deps.stateDir, BROWSER_STATE_DIRNAME), this.deps.childEnv);
   }
 
   runtimeInfo(): NonNullable<BrowserIntegrationInfo["runtime"]> {
@@ -651,6 +734,9 @@ export class BrowserService {
     const sessionId = ctx.session.id;
     const worktree = ctx.cwd;
     if (!worktree || !isAbsolute(worktree)) return { skip: "the session has no worktree" };
+    // The output folder must be a real folder of this worktree, never a link out of it (C3 review, item 4).
+    const outBad = outputDirProblem(worktree);
+    if (outBad) return { skip: `the browser was not started: ${outBad}` };
     const proxy = this.proxies.ensure(sessionId);
     if ("error" in proxy) return { skip: proxy.error };
 
@@ -691,6 +777,7 @@ export class BrowserService {
     if (this.ownerBrowser) return { kind: "deny", reason: "the agent browser is in use by the owner (Open agent browser); it is free again when that Chrome window is closed" };
     const verdict = this.gate.gate(ctx);
     if (verdict?.kind !== "deny") this.retireOtherHeadedBrowsers(ctx.session.id);
+    if (verdict?.kind === "allow" && ctx.tool === "browser_take_screenshot") this.shotCallAt.set(ctx.session.id, Date.now());
     return this.withDownloadReport(ctx.session.id, this.withRefusals(ctx.session.id, verdict));
   };
 
@@ -777,6 +864,9 @@ export class BrowserService {
     this.gate.forget(sessionId);
     this.refusals.delete(sessionId);
     this.shots.delete(sessionId);
+    this.shotCallAt.delete(sessionId);
+    this.traffic.delete(sessionId);
+    this.trafficDropped.delete(sessionId);
     this.requested.delete(sessionId);
     this.reports.delete(sessionId);
     this.sweptAt.delete(sessionId);

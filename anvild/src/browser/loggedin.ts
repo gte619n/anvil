@@ -20,9 +20,9 @@
  *    (pure), and the run that snapshots cookies before and after it.
  */
 import { Database } from "bun:sqlite";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { PROTOCOL_VERSION, type BrowserLoggedInEvent, type BrowserLoggedInSite, type ServerEvent } from "@protocol";
 import { memberBases } from "../server/fleet";
 import { now } from "../util/envelope";
@@ -60,6 +60,9 @@ interface Persisted {
   pending: LoggedInOp[];
   removed?: { site: string; at: number }[];
   hub?: { serverId: string; url?: string };
+  /** The list on disk was damaged (C3 review, item 5): until the owner starts a new list (or the hub
+   *  sends a good one) every site the headed profile has cookies for counts as logged in and locked. */
+  corrupt?: { at: number; reason: string; keptAs?: string };
 }
 
 const isSource = (v: unknown): v is LoggedInSource => v === "owner" || v === "login-session";
@@ -124,6 +127,17 @@ export class LoggedInSitesStore {
   hub(): { serverId: string; url?: string } | undefined {
     return this.state.hub ? { ...this.state.hub } : undefined;
   }
+  /** Set while the list is known to be damaged (fail closed; see `Persisted.corrupt`). */
+  corrupt(): { at: number; reason: string; keptAs?: string } | undefined {
+    return this.state.corrupt ? { ...this.state.corrupt } : undefined;
+  }
+  /** The owner starts a new, empty list: the damaged one is no longer in force. */
+  clearCorrupt(): boolean {
+    if (!this.state.corrupt) return false;
+    this.state.corrupt = undefined;
+    this.save();
+    return true;
+  }
 
   /** Apply one change to the authority's list, in time order. Returns whether the list changed. */
   apply(op: LoggedInOp): boolean {
@@ -157,6 +171,7 @@ export class LoggedInSitesStore {
     const next = cleanRows(sites, this.clock);
     for (const p of this.state.pending) this.applyTo(next, p, false);
     this.state.sites = next;
+    this.state.corrupt = undefined; // the hub's list is the authority, and it is whole
     this.state.hub = { serverId: hub.serverId, ...(hub.url ? { url: hub.url } : this.state.hub?.url ? { url: this.state.hub.url } : {}) };
     this.save();
     return JSON.stringify(this.list()) !== before;
@@ -213,17 +228,29 @@ export class LoggedInSitesStore {
         const site = normalizeSite(t?.site);
         if (site && typeof t.at === "number") (this.state.removed ??= []).push({ site, at: t.at });
       }
+      const c = (raw as { corrupt?: { at?: unknown; reason?: unknown; keptAs?: unknown } }).corrupt;
+      if (c && typeof c === "object") this.state.corrupt = { at: Number(c.at) || this.clock(), reason: String(c.reason ?? "damaged"), ...(typeof c.keptAs === "string" ? { keptAs: c.keptAs } : {}) };
     } catch (e) {
-      // A corrupt list cannot be trusted to say what is unlocked. Keep the evidence and start empty:
-      // nothing is unlocked. (Sites are then no longer treated as logged in until listed again.)
+      // A corrupt list cannot be trusted to say what is logged in, nor what is unlocked. Keep the
+      // evidence, and FAIL CLOSED (C3 review, item 5): until the owner starts a new list in Settings,
+      // every site the headed profile holds cookies for is treated as logged in and locked. The state
+      // is written down, so a restart does not forget it.
       const dest = `${this.file}.corrupt-${this.clock()}`;
+      let keptAs: string | undefined;
       try {
         renameSync(this.file, dest);
+        keptAs = dest;
       } catch {
-        /* could not move it; the next save overwrites it */
+        /* could not move it; the save below overwrites it */
       }
-      this.state = { sites: [], pending: [] };
-      console.error(`[browser] ${this.file} is corrupt (${e instanceof Error ? e.message : String(e)}); starting with no logged-in sites`);
+      const reason = e instanceof Error ? e.message : String(e);
+      this.state = { sites: [], pending: [], corrupt: { at: this.clock(), reason, ...(keptAs ? { keptAs } : {}) } };
+      try {
+        this.save();
+      } catch {
+        /* the in-memory state still fails closed */
+      }
+      console.error(`[browser] ${this.file} is corrupt (${reason}); every site with cookies in the agent profile is treated as a locked logged-in site until the list is started again in Settings`);
     }
   }
 
@@ -317,25 +344,65 @@ export class LoggedInSitesService {
 
   // ── read side ───────────────────────────────────────────────────────────────────────────────
 
+  private cookieCache: { at: number; sites: Set<string> | undefined } | undefined;
+  /** While the list is damaged: the sites the headed profile has cookies for (undefined: unreadable,
+   *  so every site counts). Read at most every 30 s. */
+  private profileSites(): Set<string> | undefined {
+    const t = (this.deps.clock ?? Date.now)();
+    if (!this.cookieCache || t - this.cookieCache.at > 30_000 || t < this.cookieCache.at) {
+      let snap: CookieSnapshot | undefined;
+      try {
+        snap = readCookieSnapshot(browserProfileDir(this.deps.stateDir));
+      } catch {
+        snap = undefined;
+      }
+      this.cookieCache = { at: t, sites: snap ? new Set(snap.keys()) : undefined };
+    }
+    return this.cookieCache.sites;
+  }
+  /** Whether a damaged list makes `site` count as logged in and locked (fail closed). */
+  private corruptCovers(site: string): boolean {
+    if (!this.store.corrupt()) return false;
+    const sites = this.profileSites();
+    return !sites || sites.has(site);
+  }
+
   /** Every logged-in site, locked or not. */
   sites(): string[] {
     return this.store.list().map((s) => s.site);
   }
   isLoggedIn(site: string): boolean {
-    return this.store.get(site) !== undefined;
+    return this.store.get(site) !== undefined || this.corruptCovers(site);
   }
   isUnlocked(site: string): boolean {
-    return this.store.get(site)?.unlocked === true;
+    return !this.store.corrupt() && this.store.get(site)?.unlocked === true;
   }
   /** Logged in and not unlocked: the state in which actions ask. */
   isLocked(site: string): boolean {
+    if (this.corruptCovers(site)) return true;
     const s = this.store.get(site);
     return !!s && !s.unlocked;
   }
 
   event(): BrowserLoggedInEvent {
     const pending = this.store.pending().length;
-    return { v: PROTOCOL_VERSION, type: "browser.loggedin", ts: now(), sites: this.store.list(), ...(pending ? { pending } : {}) };
+    const corrupt = this.store.corrupt();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "browser.loggedin",
+      ts: now(),
+      sites: this.store.list(),
+      ...(pending ? { pending } : {}),
+      ...(corrupt ? { error: `The logged-in sites list on this machine was damaged (${corrupt.reason})${corrupt.keptAs ? `; it was kept as ${corrupt.keptAs}` : ""}. Until a new list is started, every site the agent profile has cookies for is treated as a locked logged-in site.` } : {}),
+    };
+  }
+
+  /** The owner starts a new, empty list after a damaged one (Settings). */
+  reset(): void {
+    if (this.store.clearCorrupt()) {
+      this.deps.broadcast(this.event());
+      void this.syncNow();
+    }
   }
 
   // ── changes made on this machine ────────────────────────────────────────────────────────────
@@ -380,7 +447,8 @@ export class LoggedInSitesService {
     const run = async (): Promise<void> => {
       try {
         if (this.role() === "member") await this.forwardQueue();
-        else await this.pushToMembers(0);
+        // A damaged list is never pushed: members would take the empty list as the truth.
+        else if (!this.store.corrupt()) await this.pushToMembers(0);
       } catch (e) {
         console.warn(`[browser] logged-in sites sync failed: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -447,6 +515,8 @@ export class LoggedInSitesService {
 
   /** Hub side of `POST /api/browser/loggedin/op` (the caller has been checked to be a member). */
   receiveOps(body: LoggedInOpBody): LoggedInOpReply {
+    // A damaged list cannot answer with "the truth": the member keeps its queue and its copy.
+    if (this.store.corrupt()) return { ok: false, error: "the hub's logged-in sites list is damaged; start a new one in Settings on the hub" };
     let changed = false;
     for (const op of cleanLoggedInOps(body.ops)) changed = this.store.apply(op) || changed;
     if (changed) {
@@ -586,6 +656,28 @@ export const defaultAgentBrowserLauncher: AgentBrowserLauncher = (command, args,
   return { exited: proc.exited, kill: () => proc.kill() };
 };
 
+/**
+ * Why the DEFAULT launcher must not start a Chrome window here, or undefined (test safety, C3 review
+ * item 7): under a test runner (`NODE_ENV=test`, which `bun test` sets; `BUN_TEST`; `ANVIL_TEST=1`),
+ * or when the daemon's state folder is inside the OS temp folder (a test daemon, a throwaway
+ * daemon). A test that means to exercise "Open agent browser" passes its own launcher.
+ */
+export function defaultLauncherRefusal(stateDir: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.NODE_ENV === "test" || env.BUN_TEST || env.ANVIL_TEST === "1") return "this daemon is running under a test runner";
+  const within = (dir: string, root: string): boolean => dir === root || dir.startsWith(`${root}/`);
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  const roots = [...new Set([tmpdir(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"].map(real))];
+  const dir = real(stateDir);
+  if (roots.some((r) => within(dir, r))) return "this daemon's state folder is in the temporary folder (a test or throwaway daemon)";
+  return undefined;
+}
+
 export interface OwnerBrowserRunDeps {
   stateDir: string;
   chromePath: string;
@@ -604,6 +696,10 @@ export function runOwnerBrowser(deps: OwnerBrowserRunDeps): AgentBrowserProcess 
   const cmd = buildAgentBrowserCommand({ chromePath: deps.chromePath, stateDir: deps.stateDir });
   const problems = agentBrowserArgProblems(cmd.args, deps.stateDir);
   if (problems.length) throw new Error(`the agent browser's command line failed its own check (${problems[0]})`);
+  if (!deps.launcher) {
+    const refusal = defaultLauncherRefusal(deps.stateDir);
+    if (refusal) throw new Error(`Open agent browser would start a visible Chrome window, and ${refusal}; it is refused here`);
+  }
   mkdirSync(cmd.profileDir, { recursive: true, mode: 0o700 });
   const before = readCookieSnapshot(cmd.profileDir);
   const proc = (deps.launcher ?? defaultAgentBrowserLauncher)(cmd.command, cmd.args, deps.env);

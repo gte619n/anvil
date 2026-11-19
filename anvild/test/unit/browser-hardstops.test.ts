@@ -74,7 +74,8 @@ const EVERY_CALL: [string, Record<string, unknown>][] = [
   ["browser_resize", { width: 800, height: 600 }],
   ["browser_emulate_media", { colorScheme: "dark" }],
 ];
-const FREE = new Set(["browser_snapshot", "browser_take_screenshot", "browser_wait_for", "browser_console_messages", "browser_network_requests", "browser_network_request", "browser_find", "browser_tabs:list"]);
+// browser_close is the way out and is always allowed (C3 review, item 6).
+const FREE = new Set(["browser_snapshot", "browser_take_screenshot", "browser_wait_for", "browser_console_messages", "browser_network_requests", "browser_network_request", "browser_find", "browser_tabs:list", "browser_close"]);
 const key = ([tool, input]: [string, Record<string, unknown>]): string => (tool === "browser_tabs" ? `${tool}:${String(input.action)}` : tool);
 
 describe("on a LOCKED logged-in site", () => {
@@ -187,11 +188,12 @@ describe("on a LOCKED logged-in site", () => {
     // A key press whose result has no page block: the page may be anywhere now.
     gate.onResult("s1", { tool: "browser_press_key", input: { key: "Enter" }, content: "### Ran Playwright code\n```js\nawait page.keyboard.press('Enter');\n```", isError: false }, mode);
     expect(gate.state("s1").unknown).toBe("input");
-    for (const [tool, input] of [["browser_click", { target: "e1" }], ["browser_press_key", { key: "PageDown" }], ["browser_navigate", { url: "https://plain.test/x" }], ["browser_close", {}]] as const) {
+    for (const [tool, input] of [["browser_click", { target: "e1" }], ["browser_press_key", { key: "PageDown" }], ["browser_navigate", { url: "https://plain.test/x" }]] as const) {
       const v = call(tool, input);
       expect([tool, v.kind]).toEqual([tool, "deny"]);
       expect((v as { reason: string }).reason).toMatch(/browser_snapshot/);
     }
+    expect(call("browser_close").kind).toBe("allow"); // the way out, always (C3 review, item 6)
     expect(call("browser_snapshot").kind).toBe("allow");
     expect(call("browser_take_screenshot").kind).toBe("allow");
   });

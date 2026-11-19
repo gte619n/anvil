@@ -339,6 +339,17 @@ export class AutopilotService {
       plans: this.pendingPlans().map((u) => this.autopilotPlanInfo(u)),
     };
   }
+  /**
+   * Mark a work unit blocked, with the reason the card shows (the agent browser's `request_human`
+   * in an unattended builder session: "needs a human: <reason>"). Returns false for an unknown unit.
+   */
+  blockUnit(workUnitId: string, blockedReason: string): boolean {
+    if (!this.workUnits.get(workUnitId)) return false;
+    this.workUnits.update(workUnitId, { status: "blocked", blockedReason });
+    this.broadcastAutopilotPlans();
+    return true;
+  }
+
   private broadcastAutopilotPlans(): void {
     this.deps.registry.toAll(this.autopilotPlansEvent());
     this.deps.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid

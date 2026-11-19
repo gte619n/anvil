@@ -689,7 +689,28 @@
             "the hard-stop card > [C3] web: each option sends its decision for that request: Unlock <site> sends allow_always, and the card then shows what was chosen",
             "the hard-stop card > [C3] web: an ordinary permission card is unchanged — no reason line, no image — and a reason is shown as text, never as markup",
             "the hand-off card > [C3] web: a human.request shows the agent's reason and the latest page screenshot with one button, I've cleared it, which sends human.request.respond for that request and retires the card",
-            "the hand-off card > [C3] web: with no screenshot the card has no image; a card answered on another device is retired by human.resolved"
+            "the hand-off card > [C3] web: with no screenshot the card has no image; a card answered on another device is retired by human.resolved",
+            "logged-in sites in Settings → Integrations > [C3] web review 5: a damaged list is shown as an error with 'Start a new list', which sends browser.loggedin.reset"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c3-review.test.ts",
+          "names": [
+            "item 1: a page that moves by itself > [C3] review 1: after the result, traffic to a locked logged-in site makes the page unknown — a key press or a click is refused with 'take a snapshot first', under bypass; the snapshot then applies the hard stop on that site",
+            "item 1: a page that moves by itself > [C3] review 1: traffic to a site not allowed in this session also makes the page unknown; traffic only to the page's own site does not, nor does traffic that came before the result",
+            "item 1: a page that moves by itself > [C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page clears it",
+            "item 1: a page that moves by itself > [C3] review 6: browser_close is allowed in every state — unknown, held, closing, and on a locked logged-in site",
+            "item 2: the card's picture > [C3] review 2: a PNG planted in .anvil-browser and named in browser_find's text never becomes the card image; neither does a file a take_screenshot result links that was there before the call",
+            "item 2: the card's picture > [C3] review 2: the screenshot goes stale after an input call and when the browser contacts another site after it was taken",
+            "item 3: hand-off in an autopilot unit > [C3] review 3: request_human in a builder session with a work unit marks that unit blocked with 'needs a human: <reason>'",
+            "item 4: the output folder > [C3] review 4: a symlinked .anvil-browser is never swept (nothing outside the worktree is moved, deleted or chmod-ed), the owner is told, and the browser is not started for that worktree",
+            "item 4: the output folder > [C3] review 4: a hard-linked file in the output folder is reported and left alone — not chmod-ed, moved or deleted",
+            "item 5: a damaged logged-in list > [C3] review 5: a corrupt browser-loggedin.json fails closed — every site the profile has cookies for is a locked logged-in site, the event carries an error, the hub pushes nothing and refuses members' ops, and 'Start a new list' ends it",
+            "item 5: a damaged logged-in list > [C3] review 5: the gate applies it — with a damaged list a click on a profile site is a hard stop",
+            "item 6: small gaps > [C3] review 6: an updatedInput sent with the answer to a browser prompt is ignored — the call that runs is the one the card showed",
+            "item 6: small gaps > [C3] review 6: the runtime's node is what `node -p process.execPath` prints from a neutral daemon folder, so a .tool-versions planted in the worktree cannot change it",
+            "item 6: small gaps > [C3] review 6: the file-offer quarantine check compares real paths — a link inside the worktree that points into .anvil-downloads gets no download card",
+            "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused"
           ]
         }
       ],
@@ -701,6 +722,16 @@
             "real Chrome: downloads and hard stops > [C3] real: a real download of a small part.step lands in the quarantine via the real result text, with no file card",
             "real Chrome: downloads and hard stops > [C3] real: a .dmg download is deleted and reported",
             "real Chrome: downloads and hard stops > [C3] real: with the fixture's site logged-in and locked, a real browser_click is gated while browser_snapshot is not, and the card carries a non-empty PNG from a real screenshot result; after Unlock the same click goes through to the real server"
+          ]
+        },
+        {
+          "file": "test/real/browser-c3-review.test.ts",
+          "names": [
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1: setup — the real server starts headless through the real proxy; A (127.0.0.1) is allowed, B (localhost) is a locked logged-in site",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (timer): after A's own timer sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (meta): after A's own meta sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (replace): after A's own replace sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 4: a frame from the locked site B on allowed page A — a click on A is a hard stop naming B (screenshot first, then a card), and B records zero presses"
           ]
         }
       ]

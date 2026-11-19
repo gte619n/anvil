@@ -382,6 +382,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "browser.loggedin.reset":
+        deps.supervisor.browserLoggedInReset();
+        if (cid) send(ack(cid));
+        return;
+
       case "browser.open_agent_browser":
         deps.supervisor.browserOpenAgentBrowser();
         if (cid) send(ack(cid));

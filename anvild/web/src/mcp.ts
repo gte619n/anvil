@@ -56,7 +56,7 @@ export const serverMcp = new Map<string, McpIntegrationStatus[]>();
  *  hub's copy is the authority; a member's is what the hub last pushed plus its own unconfirmed changes. */
 export const serverSites = new Map<string, { sites: BrowserSite[]; pending: number }>();
 /** Each server's copy of the fleet's logged-in sites and their unlock switches (`browser.loggedin`). */
-export const serverLoggedIn = new Map<string, { sites: BrowserLoggedInSite[]; pending: number }>();
+export const serverLoggedIn = new Map<string, { sites: BrowserLoggedInSite[]; pending: number; error?: string }>();
 
 /** Where a card's screenshot is fetched from: the session's attachment route on the server that owns
  *  the session (the hard-stop and hand-off cards, Phase C3). */
@@ -262,8 +262,8 @@ export function onBrowserSites(url: string, sites: BrowserSite[], pending = 0): 
 }
 
 /** `browser.loggedin` from one server: keep that server's copy, repaint the list if it is showing. */
-export function onBrowserLoggedIn(url: string, sites: BrowserLoggedInSite[], pending = 0): void {
-  serverLoggedIn.set(url, { sites, pending });
+export function onBrowserLoggedIn(url: string, sites: BrowserLoggedInSite[], pending = 0, error?: string): void {
+  serverLoggedIn.set(url, { sites, pending, ...(error ? { error } : {}) });
   if (document.getElementById("browser-loggedin-panel")) renderBrowserLoggedIn();
 }
 
@@ -366,7 +366,12 @@ export function renderBrowserSites(): void {
 
 // ── Settings → Integrations: logged-in sites and their unlock switches (Phase C3) ────────────────
 
-export function browserLoggedInHtml(sites: readonly BrowserLoggedInSite[], pending: number): string {
+export function browserLoggedInHtml(sites: readonly BrowserLoggedInSite[], pending: number, error?: string): string {
+  // A damaged list fails closed on the daemon; the owner is shown why and starts a new one.
+  const damaged = error
+    ? `<div class="card browser-loggedin-error"><div class="card-main">${icon("error")} <span class="warn small">${esc(error)}</span>
+        <span class="mcp-row-actions"><button type="button" class="mini" id="browser-loggedin-reset">${icon("restart_alt")} Start a new list</button></span></div></div>`
+    : "";
   const rows = sites.length
     ? sites
         .map(
@@ -377,7 +382,7 @@ export function browserLoggedInHtml(sites: readonly BrowserLoggedInSite[], pendi
         )
         .join("")
     : `<div class="card"><span class="small muted">No logged-in sites yet. Log in with “Open agent browser” on a machine with a screen, or add one here.</span></div>`;
-  return `${rows}
+  return `${damaged}${rows}
     ${pending ? `<p class="small muted browser-sites-pending">${icon("sync")} ${pending} change${pending === 1 ? "" : "s"} waiting to reach the hub.</p>` : ""}
     <div class="card-main browser-site-add-row"><input id="browser-loggedin-input" type="text" autocapitalize="off" spellcheck="false" placeholder="example.com" />
       <button type="button" class="mini" id="browser-loggedin-add">${icon("add")} Add logged-in site</button></div>`;
@@ -392,7 +397,10 @@ export function renderBrowserLoggedIn(): void {
     return;
   }
   const state = serverLoggedIn.get(srv.url) ?? { sites: [], pending: 0 };
-  host.innerHTML = browserLoggedInHtml(state.sites, state.pending);
+  host.innerHTML = browserLoggedInHtml(state.sites, state.pending, state.error);
+  host.querySelector<HTMLButtonElement>("#browser-loggedin-reset")?.addEventListener("click", async () => {
+    if (await sendMcp(srv, { type: "browser.loggedin.reset" })) toast("A new logged-in sites list was started. Add your logged-in sites again.");
+  });
   host.querySelectorAll<HTMLElement>(".browser-loggedin-row").forEach((row) => {
     const site = row.dataset.site!;
     const entry = state.sites.find((s) => s.site === site);

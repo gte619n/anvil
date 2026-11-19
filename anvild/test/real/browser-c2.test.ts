@@ -79,7 +79,11 @@ beforeAll(async () => {
   await settle();
 }, 600_000);
 
-const NODE = resolveOnPath("node") ?? "node-not-found";
+// The launch line names the REAL node binary (`node -p process.execPath`), not a PATH shim (C3 review, item 6).
+const NODE = (() => {
+  const onPath = resolveOnPath("node");
+  return onPath ? Bun.spawnSync([onPath, "-p", "process.execPath"]).stdout.toString().trim() || "node-not-found" : "node-not-found";
+})();
 const launchInput = () => ({ mode: "headless" as const, proxyPort, worktree, stateDir: rig.dir, sessionId: session.id, nodePath: NODE, cliPath: browserRuntimeCli(rig.dir) });
 /** A refusal as the page shows it: `HTTP status: 403` for http (tests a–b2), a tunnel error for https. */
 const BLOCKED = /HTTP status: 403|ERR_TUNNEL_CONNECTION_FAILED/;
