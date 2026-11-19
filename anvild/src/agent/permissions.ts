@@ -128,6 +128,7 @@ export function makePreToolUseHook(
         permissionDecision: out.behavior,
         permissionDecisionReason: out.reason,
         ...(out.updatedInput ? { updatedInput: out.updatedInput } : {}),
+        ...(out.additionalContext ? { additionalContext: out.additionalContext } : {}),
       },
     };
   };
@@ -137,6 +138,8 @@ interface Decision {
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
   reason?: string;
+  /** Text for the model, delivered with this call's result (an integration kind's `context`). */
+  additionalContext?: string;
 }
 
 async function decide(
@@ -300,7 +303,10 @@ async function decideMcp(
     }
   }
   if (verdict?.kind === "deny") return { behavior: "deny", reason: verdict.reason };
-  if (verdict?.kind === "allow") return finish(verdict.updatedInput ?? input, verdict.reason ?? `${integration.label}: allowed`);
+  if (verdict?.kind === "allow") {
+    const done = finish(verdict.updatedInput ?? input, verdict.reason ?? `${integration.label}: allowed`);
+    return done.behavior === "allow" && verdict.context ? { ...done, additionalContext: verdict.context } : done;
+  }
 
   const bypass = session.data.autonomy === "bypass";
   if (verdict?.kind === "prompt") {

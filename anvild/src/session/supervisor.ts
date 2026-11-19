@@ -879,6 +879,15 @@ export class Supervisor {
       throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
     }
   }
+  /** Install the agent browser's pinned server runtime on this machine. */
+  async browserRuntimeInstall(): Promise<void> {
+    try {
+      await this.requireBrowser().installRuntime();
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    await this.mcp.probe("change");
+  }
   browserSiteRemove(site: string): void {
     try {
       this.requireBrowser().sites.remove(site);

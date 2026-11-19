@@ -102,6 +102,16 @@ describe("buildMcpServers", () => {
     }
   });
 
+  test("[C1] a hand-edited relative command is rejected at build time and reported in skipped — nothing from the session's folder is started", () => {
+    for (const command of ["./evil-mcp", "node_modules/.bin/echo-mcp", "../evil"]) {
+      const bad = echo({ transport: { type: "stdio", command, args: [] } });
+      const { servers, skipped } = buildMcpServers(session({ mcpIntegrations: [bad.id] }), undefined, [bad], ENV);
+      expect(servers).toEqual({});
+      expect(skipped).toHaveLength(1);
+      expect(skipped[0]!.reason).toMatch(/bare name .* or an absolute path/);
+    }
+  });
+
   test("[C1] an unavailable integration is left out and returned in skipped with its reason", () => {
     const down = echo({ health: { state: "unavailable", reason: "nothing is listening on port 27182" } });
     expect(buildMcpServers(session(), undefined, [down], ENV)).toEqual({ servers: {}, skipped: [{ id: "mcpi_echo", label: "Echo", reason: "nothing is listening on port 27182" }] });

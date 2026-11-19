@@ -45,6 +45,7 @@
     "autopilot.verify.dismiss",
     "autopilot.verify.keep",
     "autopilot.verify.metrics",
+    "browser.runtime.install",
     "browser.site.add",
     "browser.site.remove",
     "browser.sites",

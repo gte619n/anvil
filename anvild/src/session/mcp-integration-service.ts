@@ -37,7 +37,7 @@ export interface McpIntegrationServiceDeps {
    *  (its proxy, its allowed-sites list, its gate); otherwise nothing of it is created or written. */
   browserEnabled?: boolean;
   /** Test seams for the browser (fake desktop probe, resolver, …). */
-  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs">>;
+  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs" | "nodePath" | "npmPath" | "runtimeInstaller">>;
   /** Send an event to every connected client. */
   broadcast: (event: ServerEvent) => void;
   /** How many clients are connected — the health loop only runs while there is one. */
@@ -97,6 +97,7 @@ export class McpIntegrationService {
         hasIntegration: (id) => this.store.get(id) !== undefined,
         notice: deps.notice,
         clock,
+        reprobe: () => void this.probe("change"),
         ...deps.browser,
       });
       this.browser.start();

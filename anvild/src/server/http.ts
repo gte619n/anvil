@@ -254,6 +254,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     members: () => fleet.list().map((m) => ({ url: m.url, host: m.host, serverId: m.serverId })),
     pairedHubId: () => pairedHub.get()?.hubServerId ?? null,
     selfUrl: opts.selfBaseUrl ?? (() => supervisor.selfBaseUrl()),
+    selfPort: opts.port,
   });
 
   // Frozen update API v1 (stable-update-service spec §4.3). The state store persists the pre-pull SHA +
@@ -1024,6 +1025,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
   route("POST", "/api/browser/sites/sync", async (req, _url, _m, ctx) => {
     const browser = supervisor.mcp.browser;
     if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesSyncReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
     const body = await jsonBody<SitesSyncBody>(req);
     const gate = await fleetRepoGate(ctx, body.hubServerId);
     if (gate) return gate;
@@ -1032,6 +1034,9 @@ export function createServer(opts: ServerOptions): ServerHandle {
   route("POST", "/api/browser/sites/op", async (req, _url, _m, ctx) => {
     const browser = supervisor.mcp.browser;
     if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesOpReply, { status: 404 });
+    // A JSON content type is required, like the other fleet routes: a cross-origin "simple request"
+    // (text/plain, no preflight) must not be able to change the list.
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
     const body = await jsonBody<SitesOpBody>(req);
     const who = await ctx.callerIdentity();
     if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies SitesOpReply, { status: 403 });

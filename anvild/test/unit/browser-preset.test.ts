@@ -18,24 +18,50 @@ import {
   presetArgProblems,
   type BrowserLaunch,
 } from "../../src/browser/preset";
+import { browserRuntimeManifest } from "../../src/browser/runtime";
 import { ensureGitExcluded } from "../../src/browser/service";
 
-const IN = { proxyPort: 51234, worktree: "/work/tree", stateDir: "/state", sessionId: "sess_1" };
+const CLI = "/state/browser/runtime-0123456789abcdef/node_modules/@playwright/mcp/cli.js";
+const IN = { proxyPort: 51234, worktree: "/work/tree", stateDir: "/state", sessionId: "sess_1", nodePath: "/opt/homebrew/bin/node", cliPath: CLI };
 const headed = () => buildBrowserLaunch({ ...IN, mode: "headed" });
 const headless = () => buildBrowserLaunch({ ...IN, mode: "headless" });
 
 describe("buildBrowserLaunch", () => {
-  test("[C2] the pinned version is 0.0.86, a named constant, run with npx -y", () => {
+  test("[C2] the pinned version is 0.0.86, a named constant, and the launch is node by absolute path running the daemon's own runtime script by absolute path — never npx", () => {
     expect(PLAYWRIGHT_MCP_VERSION).toBe("0.0.86");
     expect(PLAYWRIGHT_MCP_PACKAGE).toBe("@playwright/mcp@0.0.86");
-    expect(headed().command).toBe("npx");
-    expect(headed().args.slice(0, 2)).toEqual(["-y", "@playwright/mcp@0.0.86"]);
+    for (const l of [headed(), headless()]) {
+      expect(l.command).toBe("/opt/homebrew/bin/node");
+      expect(l.args[0]).toBe(CLI);
+      expect([l.command, ...l.args].some((a) => /^(npx|npm|bunx|pnpm|yarn)$/.test(a) || a === "-y")).toBe(false);
+    }
+    // The pinned manifest in the repo names that version, and every package in its lock has a hash.
+    const m = browserRuntimeManifest();
+    expect(JSON.parse(m.packageJson).dependencies).toEqual({ "@playwright/mcp": "0.0.86" });
+    const pkgs = Object.entries(JSON.parse(m.packageLock).packages as Record<string, { integrity?: string; version?: string }>).filter(([k]) => k);
+    expect(pkgs.length).toBeGreaterThanOrEqual(3);
+    for (const [, v] of pkgs) expect(v.integrity).toMatch(/^sha512-/);
+    expect(pkgs.find(([k]) => k === "node_modules/@playwright/mcp")![1].version).toBe("0.0.86");
+    expect(m.lockSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("[C2] a launch that is not an absolute node and the absolute runtime script fails the check: npx, a bare node, a relative script, a script outside the runtime", () => {
+    const ok = headless();
+    expect(presetArgProblems(ok, CLI)).toEqual([]);
+    const flags = ok.args.slice(1);
+    expect(presetArgProblems({ ...ok, command: "npx", args: ["-y", "@playwright/mcp@0.0.86", ...flags] })).not.toEqual([]);
+    expect(presetArgProblems({ ...ok, command: "node" }).join()).toMatch(/absolute path to node/);
+    expect(presetArgProblems({ ...ok, command: "/work/tree/node_modules/.bin/playwright-mcp" }).join()).toMatch(/absolute path to node/);
+    expect(presetArgProblems({ ...ok, args: ["node_modules/@playwright/mcp/cli.js", ...flags] }).join()).toMatch(/server script/);
+    expect(presetArgProblems({ ...ok, args: ["/state/browser/x/../../../work/tree/node_modules/@playwright/mcp/cli.js", ...flags] }).join()).toMatch(/server script/);
+    expect(presetArgProblems({ ...ok, args: ["/work/tree/node_modules/@playwright/mcp/cli.js", ...flags] }, CLI).join()).toMatch(/not the daemon's own runtime/);
+    expect(() => buildBrowserLaunch({ ...IN, mode: "headless", nodePath: "node" })).toThrow(/absolute/);
+    expect(() => buildBrowserLaunch({ ...IN, mode: "headless", cliPath: "cli.js" })).toThrow(/absolute/);
   });
 
   test("[C2] headed: the complete argument list, with the dedicated profile under the state dir", () => {
     expect(headed().args).toEqual([
-      "-y",
-      "@playwright/mcp@0.0.86",
+      CLI,
       "--browser",
       "chrome",
       "--proxy-server",
@@ -56,8 +82,7 @@ describe("buildBrowserLaunch", () => {
   test("[C2] no desktop session: the built config is headless with a temporary profile (--isolated --headless, no --user-data-dir)", () => {
     const l = headless();
     expect(l.args).toEqual([
-      "-y",
-      "@playwright/mcp@0.0.86",
+      CLI,
       "--browser",
       "chrome",
       "--proxy-server",
@@ -90,7 +115,7 @@ describe("buildBrowserLaunch", () => {
 
   test("[C2] the preset's arguments are a subset of the allow list: every flag in both modes is on it, with nothing else", () => {
     for (const l of [headed(), headless()]) {
-      const flags = l.args.slice(2).filter((a) => a.startsWith("--"));
+      const flags = l.args.slice(1).filter((a) => a.startsWith("--"));
       for (const f of flags) expect(Object.keys(PRESET_FLAG_ALLOW_LIST)).toContain(f);
       expect(presetArgProblems(l)).toEqual([]);
     }
@@ -155,8 +180,8 @@ describe("the argument allow list (gamed spec)", () => {
     expect(presetArgProblems({ ...base, args: base.args.filter((a) => a !== "--headless") }).join()).toMatch(/--isolated and --headless/);
     expect(presetArgProblems(withArgs(["--user-data-dir", "/state/browser-profile"])).join()).toMatch(/cannot be combined/);
     expect(presetArgProblems(withArgs(["--headless"])).join()).toMatch(/twice/);
-    expect(presetArgProblems({ ...base, command: "node" }).join()).toMatch(/command is node/);
-    expect(presetArgProblems({ ...base, args: ["-y", "@playwright/mcp@latest", ...base.args.slice(2)] }).join()).toMatch(/must start with -y @playwright\/mcp@0\.0\.86/);
+    expect(presetArgProblems({ ...base, command: "/usr/bin/python3" }).join()).toMatch(/absolute path to node/);
+    expect(presetArgProblems({ ...base, args: ["-y", "@playwright/mcp@latest", ...base.args.slice(1)] }).join()).toMatch(/server script/);
   });
 });
 

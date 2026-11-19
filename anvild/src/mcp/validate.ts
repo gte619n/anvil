@@ -17,6 +17,19 @@ export const MCP_INTEGRATION_KINDS: readonly McpIntegrationKind[] = ["browser", 
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
+/** Why a stdio command may not be a relative path, or undefined. */
+export function relativeCommandProblem(command: string): string | undefined {
+  if (command.startsWith("/")) return undefined;
+  if (command.includes("/") || command.includes("\\") || command === "." || command === "..") {
+    return "command must be a bare name (found on the daemon's PATH) or an absolute path; a relative path would run a file from the session's repo";
+  }
+  return undefined;
+}
+
+/** Package runners read configuration (`.npmrc`, `node_modules`) from the working directory — the
+ *  session's repo. Allowed for a custom integration, with a warning. */
+export const PACKAGE_RUNNERS: readonly string[] = ["npx", "npm", "bunx", "pnpm", "yarn"];
+
 /** Why `key` cannot be an integration key, or undefined when it can. */
 export function keyProblem(key: unknown): string | undefined {
   if (typeof key !== "string" || !MCP_KEY_RE.test(key)) {
@@ -69,6 +82,11 @@ export function transportProblem(t: unknown): string | undefined {
     if (/[\0\n\r]/.test(tr.command)) return "command must be a single line";
     const wrapErr = envWrapProblem(tr.command.trim());
     if (wrapErr) return wrapErr;
+    // A bare name is found on the daemon's PATH and an absolute path is what it says. A relative
+    // path (`./server`, `node_modules/.bin/x`) would be resolved against the session's worktree,
+    // which the agent can write.
+    const rel = relativeCommandProblem(tr.command.trim());
+    if (rel) return rel;
     if (!Array.isArray(tr.args) || tr.args.some((a) => typeof a !== "string" || a.includes("\0"))) return "args must be a list of strings";
     return undefined;
   }

@@ -166,6 +166,7 @@
             "McpIntegrationStore > [C1] an http integration must be loopback: scheme http, no credentials, host 127.0.0.1 / localhost / [::1]",
             "McpIntegrationStore > [C1] update re-validates the transport, and can never change key or kind",
             "McpIntegrationStore > [C1] a stdio integration needs a command and string args",
+            "McpIntegrationStore > [C1] a stdio command is a bare name (found on the daemon's PATH) or an absolute path; a relative path, which would run a file from the session's repo, is refused on add and on update",
             "McpIntegrationStore > [C1] remove reports whether anything was removed, and a re-add under the same key gets a NEW id",
             "presets > [C1] custom is the only kind this phase can add; browser is refused until its preset registers",
             "presets > [C1] {cwd} is replaced with the worktree and is the only substitution"
@@ -206,6 +207,7 @@
             "buildMcpServers > [C1] lead, member, planner and builder sessions get their role server only",
             "buildMcpServers > [C1] an http integration becomes { type: http, url, alwaysLoad: true }",
             "buildMcpServers > [C1] a hand-edited non-loopback URL is rejected at build time and reported in skipped",
+            "buildMcpServers > [C1] a hand-edited relative command is rejected at build time and reported in skipped — nothing from the session's folder is started",
             "buildMcpServers > [C1] an unavailable integration is left out and returned in skipped with its reason",
             "buildMcpServers > [C1] a disabled integration is left out and returned in skipped",
             "buildMcpServers > [C1] the same id twice is added once; an unknown id is ignored; an integration not in the session's list is not attached",
@@ -312,6 +314,7 @@
             "Settings → Integrations card > [C1] the enabled switch sends mcp.integration.update, Check sends mcp.integration.check, and a refusal is shown",
             "Settings → Integrations card > [C1] remove asks first, names the sessions that use it, and sends mcp.integration.remove only on confirm",
             "Settings → Integrations card > [C1] Add offers Custom, and the Custom form sends mcp.integration.add with the typed command split into command + args",
+            "Settings → Integrations card > [C1] a package runner as a custom command shows a one-line warning on the form as it is typed and on the integration's row; other commands show none",
             "Settings → Integrations card > [C1] the Custom form's URL type takes a loopback http URL only",
             "session Tools control > [C1] the header chip is hidden without the capability, without integrations, and for a session that is not ordinary",
             "session Tools control > [C1] the header chip shows which integrations are on for the session",
@@ -353,7 +356,8 @@
         {
           "file": "test/unit/browser-preset.test.ts",
           "names": [
-            "buildBrowserLaunch > [C2] the pinned version is 0.0.86, a named constant, run with npx -y",
+            "buildBrowserLaunch > [C2] the pinned version is 0.0.86, a named constant, and the launch is node by absolute path running the daemon's own runtime script by absolute path — never npx",
+            "buildBrowserLaunch > [C2] a launch that is not an absolute node and the absolute runtime script fails the check: npx, a bare node, a relative script, a script outside the runtime",
             "buildBrowserLaunch > [C2] headed: the complete argument list, with the dedicated profile under the state dir",
             "buildBrowserLaunch > [C2] no desktop session: the built config is headless with a temporary profile (--isolated --headless, no --user-data-dir)",
             "buildBrowserLaunch > [C2] the generated config carries the three Chrome arguments and nothing else — no ignoreDefaultArgs",
@@ -367,6 +371,16 @@
             "desktop detection > [C2] nobody logged in, the login window, another user, or a session off the console → no desktop → headless fallback",
             "desktop detection > [C2] a headed launch that failed falls back to headless even with a desktop session",
             "git exclude > [C2] .anvil-browser/ is added once to the checkout's .git/info/exclude; a linked worktree uses the common git dir; a plain folder is left alone"
+          ]
+        },
+        {
+          "file": "test/unit/browser-runtime.test.ts",
+          "names": [
+            "the pinned manifest > [C2] the repo ships a manifest pinning @playwright/mcp@0.0.86 with an integrity hash for every package, and the runtime folder is named after the lock's hash",
+            "install > [C2] the install command is npm ci --ignore-scripts with env -i (PATH, a temporary HOME, TMPDIR) and empty user and global npm config, run inside a daemon-owned staging folder",
+            "install > [C2] a successful install leaves the runtime in runtime-<hash> with the marker and the lock copy, and passes the launch check; a second install is a no-op",
+            "install > [C2] a failed install (offline, an integrity mismatch) throws with npm's words and leaves no runtime behind (fail closed)",
+            "the check before every launch > [C2] the runtime may be launched only with a marker for the pinned lock, an unchanged lock copy, the server script in place and the pinned version installed"
           ]
         },
         {
@@ -384,6 +398,7 @@
             "plain HTTP and CONNECT forwarding > [C2] a target that does not answer is a 502, not a hang and not a fallback to another address",
             "per-session listeners and the loopback exemption > [C2] one listener per session on its own random loopback port; ensure() is stable until the listener dies",
             "per-session listeners and the loopback exemption > [C2] allowLoopbackPort opens one loopback port for one session only; revoke closes it again",
+            "per-session listeners and the loopback exemption > [C2] the daemon's own port can never be opened, and revoke destroys the tunnels that are open to the port",
             "per-session listeners and the loopback exemption > [C2] proxy dies: the browser has no route out (its port refuses connections), the state reports stopped, and Check recovers",
             "per-session listeners and the loopback exemption > [C2] a stopped manager refuses to create a listener, and one that cannot bind reports why"
           ]
@@ -409,9 +424,17 @@
             "page URL parser > [C2] reads the Page URL line under ### Page; no block means unchanged",
             "page URL parser > [C2] more than one ### Page block is reported as such and gives no URL (page-controlled text sits in the same result)",
             "page URL parser > [C2] toolResultText joins the text blocks of an SDK tool result and ignores images",
+            "readPage: the current tab's address (review of Phase C2) > [C2] reads the ### Page block of navigate, snapshot (inline yaml), wait_for (### Result first) and click (### Open tabs first) results",
+            "readPage: the current tab's address (review of Phase C2) > [C2] reads the current tab from browser_tabs' ### Result list (select, list, close, new), which has no ### Page block",
+            "readPage: the current tab's address (review of Phase C2) > [C2] never reads an address from a tool whose result is page text, nor from an error result",
+            "readPage: the current tab's address (review of Phase C2) > [C2] a forged block in a dialog message, console events or snapshot text makes the result ambiguous — with or without a real block",
+            "readPage: the current tab's address (review of Phase C2) > [C2] a page title cannot forge an address: it is one line, and a tab line with more than one ]( is not split",
+            "readPage: the current tab's address (review of Phase C2) > [C2] checkNavigationInput passes only a URL in its normal form, so what is checked is what is forwarded",
+            "readPage: the current tab's address (review of Phase C2) > [C2] resultFileLinks lists the snapshot and screenshot files a result says it wrote",
             "AllowedSitesStore > [C2] add and remove persist to browser-sites.json and a new store over the same dir reloads them",
             "AllowedSitesStore > [C2] a corrupt file allows nothing (fail closed) and is kept aside; a hand-edited row that is not a site is dropped",
-            "AllowedSitesStore > [C2] a member's own changes are queued, survive the hub's list replacing the local one, and leave the queue when confirmed"
+            "AllowedSitesStore > [C2] a member's own changes are queued, survive the hub's list replacing the local one, and leave the queue when confirmed",
+            "AllowedSitesStore > [C2] a queued add cannot resurrect a site the hub removed later; a removal is remembered for 30 days; the later of an add and a remove always wins"
           ]
         },
         {
@@ -433,16 +456,26 @@
             "reads and inputs on an allowed site > [C2] the C3 hook sees every call that would be allowed and can replace the allow with its own verdict (a hard stop)",
             "HOLD and about:blank > [C2] a result reporting a page on unapproved c.test holds the next call — any class — behind a prompt for c.test, under bypass too",
             "HOLD and about:blank > [C2] approving the hold records the site, clears the hold and lets the held call run",
-            "HOLD and about:blank > [C2] Deny on a held browser_navigate turns that very call into a navigation to about:blank",
-            "HOLD and about:blank > [C2] Deny on any other held call denies it and leaves only the way out: browser_navigate (rewritten to about:blank) or browser_close",
+            "HOLD and about:blank > [C2] Deny on a held call denies it — a browser_navigate too — and nothing is rewritten: only browser_navigate written exactly about:blank, or browser_close, then runs",
+            "HOLD and about:blank > [C2] Deny sticks: the refused site is remembered for the session, going back is refused, and so is selecting a tab known to be on it",
+            "HOLD and about:blank > [C2] Deny on a site prompt (nothing loaded) remembers the site too",
+            "HOLD and about:blank > [C2] a result that shows a page on a site that is not allowed asks the caller to delete the files it wrote (purge); one on an allowed site does not",
             "HOLD and about:blank > [C2] closing the browser also ends a hold or a refused page",
             "HOLD and about:blank > [C2] a result with more than one ### Page block holds the next call behind an Allow once / Deny prompt",
             "HOLD and about:blank > [C2] a page that ends up on a scheme that is not allowed goes straight to closing, with no prompt to approve it",
-            "HOLD and about:blank > [C2] an unattended session with a hold is sent to about:blank without a prompt",
+            "HOLD and about:blank > [C2] an unattended session with a hold must leave for about:blank, without a prompt",
             "HOLD and about:blank > [C2] the held call still has to pass on its own after the hold is approved: a refused one stays refused, one needing its own approval is asked again",
             "HOLD and about:blank > [C2] a hold ends by itself when the owner allows the site in Settings, or the page moves back to an allowed site",
             "HOLD and about:blank > [C2] headless fallback: a page that lands on a logged-in site is closed, not offered for approval",
-            "HOLD and about:blank > [C2] a result with no page block changes nothing; a new server process (pageGone) drops the page state but keeps the session's approvals"
+            "HOLD and about:blank > [C2] a read result with no page block changes nothing; a new server process (pageGone) drops the page state but keeps the session's approvals",
+            "the current tab (review of Phase C2) > [C2] after browser_tabs select the current tab's address is read from the tab list: a tab on an unapproved site holds the next call, whatever it is",
+            "the current tab (review of Phase C2) > [C2] a popup that becomes the current tab is seen in ### Open tabs: on an unapproved site it holds the next call",
+            "the current tab (review of Phase C2) > [C2] selecting a tab the server listed on a site that is not allowed asks for that site BEFORE the tab is shown; an unlisted tab is checked on its result",
+            "the current tab (review of Phase C2) > [C2] a navigation-class result that does not say where the current tab is makes the page unknown: only browser_snapshot, browser_tabs list, browser_close and about:blank run until a result establishes it",
+            "the current tab (review of Phase C2) > [C2] after an input-class call whose result has no page block, reads may run but no further input, navigation or upload until a result says where the page is",
+            "the current tab (review of Phase C2) > [C2] a forged ### Page block never moves the page: console, network, find and dialog results are not read at all, and a block in dialog, event or snapshot text makes the result ambiguous",
+            "the current tab (review of Phase C2) > [C2] a navigation url is forwarded exactly as checked: anything not in its normal form is denied, never repaired",
+            "the current tab (review of Phase C2) > [C2] Chrome's own error page belongs to no site: it neither holds the next call nor ends a refusal"
           ]
         },
         {
@@ -451,16 +484,24 @@
             "feature flag > [C2] with `browser` absent from ANVIL_FEATURES the preset is not registered, no proxy listens, nothing is written and the commands are refused",
             "feature flag > [C2] `browser` without `mcp-integrations` is inert too; with both, the preset, gate and result hook are registered and removed again on shutdown",
             "the preset > [C2] the browser integration is key `browser`, stdio, exclusive — whatever the client sends — and update cannot change its transport or exclusivity",
-            "the preset > [C2] a session's launch line is the preset's, wrapped in env -i with a PATH for npx and node; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener",
+            "the preset > [C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener",
             "the preset > [C2] a hand-edited store cannot add a flag: the stored transport is ignored when the launch line is built",
             "the preset > [C2] no desktop session: the session's launch line is headless with a temporary profile, and the row says why",
             "the preset > [C2] the worktree's .git/info/exclude gains .anvil-browser/ when the session folder is a checkout",
             "the preset > [C2] the row in mcp.integrations carries the mode with its reason and the proxy state",
-            "health and fail closed > [C2] the browser is unavailable when npx or node is not on the PATH it would be started with, or Chrome is not installed",
+            "health and fail closed > [C2] the browser is unavailable when node is not on the PATH it would be started with, or Chrome is not installed",
             "health and fail closed > [C2] proxy not running: the preset is skipped with a reason (no launch line, no config file), health reports unavailable, and every browser call is denied",
             "health and fail closed > [C2] proxy dies under a running session: its port refuses connections (no route out), browser calls are denied, health flips to unavailable, and Check recovers with a new listener",
             "health and fail closed > [C2] a browser call from a session whose browser Anvil never started is denied",
             "health and fail closed > [C2] a headed launch that fails switches the machine to headless for the next launch, until Check",
+            "health and fail closed > [C2] only a launch error counts as a failed headed launch: the words in a URL, in page text or in a successful result do not switch the machine to headless",
+            "the pinned server runtime > [C2] runtime not installed: health is unavailable with the reason, no launch line is built, the daemon tries one install by itself, and a failure is reported until Install succeeds",
+            "the pinned server runtime > [C2] the runtime is verified before EVERY launch: a missing script, a changed lock copy or a marker for another lock stops the launch",
+            "the pinned server runtime > [C2] a planted server in the worktree is never the launch target: node_modules/@playwright/mcp and node_modules/.bin in the session folder change nothing in the launch line",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] a request the network block refused is told to the model with its next browser call, in plain words",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] a result showing a page on a site that is not allowed has its snapshot and screenshot files deleted from .anvil-browser/ at once; files of allowed pages and files elsewhere are left alone",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] session Bash that calls the daemon's browser or fleet routes, or talks to the daemon's own port, is denied (a tripwire: the agent runs as the daemon's user)",
+            "what the model is told, and what it may not keep (review of Phase C2) > [C2] the test-daemon exemption needs a registration: a bare port, the daemon's own port and another session's port are refused; revoke forgets it",
             "session lifecycle > [C2] a session's listener and approvals go when it is reset, deleted, or the browser is switched off for it",
             "session lifecycle > [C2] the same listener serves a session across driver rebuilds, and a rebuild forgets the old page",
             "session lifecycle > [C2] when a session uses the headed browser, the idle drivers of other sessions that started one are dropped (one Chrome per profile)",
@@ -474,7 +515,9 @@
             "Phase C2 acceptance: sites > [C2] navigation to file:///etc/hosts, chrome://settings and a data: URL is denied, with no prompt, under every policy",
             "Phase C2 acceptance: sites > [C2] first navigation to a.test prompts; Allow once lets a second a.test navigation through and still prompts for b.test; a new session prompts for a.test again",
             "Phase C2 acceptance: sites > [C2] Always allow: a second navigation, a new session and a restarted daemon do not prompt; removing the site in Settings makes the next navigation prompt again",
-            "Phase C2 acceptance: sites > [C2] a tool result reporting a page on unapproved c.test holds the next browser call behind a prompt; Deny issues a navigation to about:blank",
+            "Phase C2 acceptance: sites > [C2] a tool result reporting a page on unapproved c.test holds the next browser call behind a prompt; Deny leaves only a navigation to about:blank",
+            "Phase C2 acceptance: sites > [C2] popup and tab select: after the model selects a tab on unapproved c.test, no key press, screenshot or network read runs there without the owner's approval",
+            "Phase C2 acceptance: sites > [C2] a console message that forges a ### Page block does not move the page or raise a prompt naming a site of the page's choosing",
             "Phase C2 acceptance: sites > [C2] a page that navigates by itself to an unapproved site is held on the next call of any class; Allow once continues, and the hold is asked even under bypass",
             "Phase C2 acceptance: sites > [C2] under bypass: site prompts are skipped, while scheme denial, classification denial and uploads' always-prompt still apply",
             "Phase C2 acceptance: sites > [C2] no desktop session: the built config is headless with a temporary profile, and a navigation to a listed logged-in site is denied",
@@ -485,6 +528,7 @@
             "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] Always allow on the hub: after sync a session on a second daemon does not prompt; removing the site in Settings on the hub makes that daemon prompt again",
             "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] a member forwards its own Always allow to the hub, which stores it and pushes it to every other member",
             "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] a member that cannot reach the hub keeps its approval for offline use and queues it; the hub collects it on its next push",
+            "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] a member's queued add cannot resurrect a site the hub removed afterwards: the later change wins, and the member's copy follows the hub",
             "Phase C2 acceptance: approvals persist fleet-wide (fleet simulator) > [C2] the hub's list is the authority: a member's stale copy is replaced on the next push, and an unreachable member heals later",
             "Phase C2: real daemons over HTTP and WebSocket > [C2] server.hello advertises browser and browser.sites arrives on connect; add / remove / list are acked, validated and broadcast to every client; none of it on a daemon with the feature off",
             "Phase C2: real daemons over HTTP and WebSocket > [C2] two real daemons: a site allowed on the hub reaches the member's clients, and one allowed on the member reaches the hub's — over the real sync routes, which refuse an unknown hub or member"
@@ -497,6 +541,7 @@
             "Add menu > [C2] web: Browser is not offered without the capability, nor when the machine already has a browser integration",
             "the browser's row > [C2] web: the row shows headed mode and why, and that the network block is ready",
             "the browser's row > [C2] web: the row shows headless mode with its reason, and a stopped network block as a fault",
+            "the browser's row > [C2] web: the row says the browser runtime is installed in the daemon's own folder; when it is missing it says why and offers Install browser runtime, which sends browser.runtime.install to that machine",
             "the browser's row > [C2] web: a custom integration's row has no browser lines",
             "allowed sites > [C2] web: the list is hidden without the browser capability and shown with it",
             "allowed sites > [C2] web: each site has a remove button that sends browser.site.remove to the hub; a browser.sites event repaints the list",
@@ -509,7 +554,7 @@
         {
           "file": "test/real/browser-c2.test.ts",
           "names": [
-            "real Chrome through the real proxy > [C2] real: Chrome and npx are present, and the preset's fallback command starts Playwright MCP 0.0.86 with exactly the 25 classified tools",
+            "real Chrome through the real proxy > [C2] real: Chrome and node are present, the daemon installed the pinned runtime itself, and the preset's fallback command (node + the runtime's script, no npx) starts Playwright MCP 0.0.86 with exactly the 25 classified tools",
             "real Chrome through the real proxy > [C2] real (a): navigating to a loopback fixture server shows HTTP status: 403 and the fixture records zero requests",
             "real Chrome through the real proxy > [C2] real (b): the localhost and [::1] forms of the same server are refused too, with zero requests",
             "real Chrome through the real proxy > [C2] real (b2): a tailnet address and this machine's own network address are refused the same way — the target is never contacted and the result shows 403",
@@ -517,7 +562,14 @@
             "real Chrome through the real proxy > [C2] real (c): a WebSocket from an allowed page to a loopback server fails and never arrives",
             "real Chrome through the real proxy > [C2] real (e): Chrome's real command line has the proxy, the loopback un-bypass, no QUIC and the WebRTC policy, and the server's has nothing off the allow list",
             "real Chrome through the real proxy > [C2] real (f): the page-URL parser reads the URL from real navigate, snapshot and click results",
-            "real Chrome through the real proxy > [C2] real: a page that lands on an unapproved site is held; Deny leaves the real browser on about:blank"
+            "real Chrome through the real proxy > [C2] real: a page that lands on an unapproved site is held and its snapshot file is deleted; Deny sticks — only about:blank runs, going back is refused, and the real browser ends on about:blank",
+            "real Chrome through the real proxy > [C2] real: popup and tab select — a key press never reaches the unapproved site: selecting the listed tab asks first, and when the gate only learns the address from the select's own result the next call is held",
+            "real Chrome through the real proxy > [C2] real: a console message that forges a ### Page block appears verbatim in browser_console_messages and does not move the gate's page or raise a hold",
+            "real Chrome through the real proxy > [C2] real: an https target the network block refuses shows as a tunnel error, not as HTTP status: 403, and the model is told it was Anvil's policy with its next call",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 1: a planted node_modules/@playwright/mcp (version 0.0.86, with cli.js) and node_modules/.bin/playwright-mcp in the worktree are not run: the real server starts with its 25 tools",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 2: a worktree .npmrc with script-shell= is not read: the real server starts and the planted shell never runs",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 3: a worktree .npmrc with node-options=--require <file> is not read: the real server starts and the planted module never loads",
+            "real: files in the session worktree cannot replace the pinned server > [C2] real hijack 4: a worktree .npmrc with registry= and cache= is not read: the real server starts, the planted registry gets no request and the planted cache is never created"
           ]
         }
       ]

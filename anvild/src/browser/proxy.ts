@@ -199,6 +199,8 @@ export interface BrowserProxyOptions {
   selfHosts?: () => readonly string[];
   /** Called once per request with what was decided (tests, and a debug log). */
   onDecision?: (d: ProxyDecision) => void;
+  /** The daemon's own listening port. It can never be opened as a loopback exemption. */
+  selfPort?: () => number | undefined;
   /** Test seam: open the TCP connection to a checked address (default `net.connect`). Lets a test
    *  see exactly which address is dialled and stand a local server in for a public one. */
   dial?: (address: string, port: number) => Socket;
@@ -226,6 +228,8 @@ export class BrowserProxy {
   private readonly server: Server;
   private readonly sockets = new Set<Socket>();
   private readonly ports = new Set<number>();
+  /** Open connections to loopback addresses, by port — destroyed when the port's exemption goes. */
+  private readonly loopbackTunnels = new Map<number, Set<Socket>>();
   private boundPort = 0;
   /** Why the listener is no longer running, when it stopped by itself. */
   failure: string | undefined;
@@ -258,11 +262,18 @@ export class BrowserProxy {
     return this.server.listening && !this.failure;
   }
 
-  allowLoopbackPort(port: number): void {
-    if (Number.isInteger(port) && port > 0 && port < 65536) this.ports.add(port);
+  /** Open one loopback port. Never the daemon's own port, and never this listener's. */
+  allowLoopbackPort(port: number): boolean {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+    if (port === this.opts.selfPort?.() || port === this.boundPort) return false;
+    this.ports.add(port);
+    return true;
   }
+  /** Close it again, and drop every connection that is open to it. */
   revokeLoopbackPort(port: number): void {
     this.ports.delete(port);
+    for (const s of this.loopbackTunnels.get(port) ?? []) s.destroy();
+    this.loopbackTunnels.delete(port);
   }
   allowedLoopbackPorts(): number[] {
     return [...this.ports];
@@ -359,6 +370,16 @@ export class BrowserProxy {
     this.opts.onDecision?.({ kind, host, port, allowed: true, address: upstream.address });
     const up = upstream.socket;
     if (client.destroyed) return void up.destroy();
+    if (isLoopbackAddress(upstream.address)) {
+      // Only reachable through an exemption: remember the pair so revoking the port cuts it.
+      let set = this.loopbackTunnels.get(port);
+      if (!set) this.loopbackTunnels.set(port, (set = new Set()));
+      const tunnels = set;
+      for (const s of [up, client]) {
+        tunnels.add(s);
+        s.once("close", () => tunnels.delete(s));
+      }
+    }
     up.on("close", () => {
       this.sockets.delete(up);
       client.end();
@@ -411,6 +432,10 @@ export type ProxyFactory = (opts: BrowserProxyOptions) => BrowserProxy;
 
 export class BrowserProxyManager {
   private readonly bySession = new Map<string, BrowserProxy>();
+  /** Loopback ports the test-daemon launcher registered, per session (Phase C4). Only these can be opened. */
+  private readonly registered = new Map<string, Set<number>>();
+  /** Told about every decision, with the session whose browser asked. */
+  onSessionDecision: ((sessionId: string, d: ProxyDecision) => void) | undefined;
   private stopped: string | undefined;
   private lastFailure: string | undefined;
 
@@ -431,7 +456,13 @@ export class BrowserProxyManager {
     existing?.close();
     this.bySession.delete(sessionId);
     try {
-      const proxy = this.factory(this.opts);
+      const proxy = this.factory({
+        ...this.opts,
+        onDecision: (d) => {
+          this.opts.onDecision?.(d);
+          this.onSessionDecision?.(sessionId, d);
+        },
+      });
       const port = proxy.listen();
       for (const p of carried) proxy.allowLoopbackPort(p);
       this.bySession.set(sessionId, proxy);
@@ -459,19 +490,44 @@ export class BrowserProxyManager {
   allowLoopbackPort(sessionId: string, port: number): boolean {
     const p = this.bySession.get(sessionId);
     if (!p?.listening) return false;
-    p.allowLoopbackPort(port);
-    return true;
+    // Only a port the test-daemon launcher registered for THIS session — never a bare number.
+    if (!this.registered.get(sessionId)?.has(port)) return false;
+    return p.allowLoopbackPort(port);
   }
-  /** Close that port again. With no `port`, every exemption the session has. */
+
+  /**
+   * Phase C4's launcher registers the port of the throwaway daemon it just started for `sessionId`.
+   * Only a registered port can be opened with `allowLoopbackPort`. Refused: the daemon's own
+   * listening port, a privileged or invalid port, a browser proxy's own port, and a port another
+   * session registered.
+   */
+  registerTestDaemon(sessionId: string, port: number): { ok: true } | { ok: false; reason: string } {
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) return { ok: false, reason: "not a port a test daemon can listen on" };
+    if (port === this.opts.selfPort?.()) return { ok: false, reason: "that is this daemon's own port" };
+    for (const p of this.bySession.values()) if (p.port === port) return { ok: false, reason: "that is a browser proxy's port" };
+    for (const [other, ports] of this.registered) if (other !== sessionId && ports.has(port)) return { ok: false, reason: "that port belongs to another session's test daemon" };
+    let set = this.registered.get(sessionId);
+    if (!set) this.registered.set(sessionId, (set = new Set()));
+    set.add(port);
+    return { ok: true };
+  }
+
+  /** Close that port again — its open connections are dropped — and forget its registration. With
+   *  no `port`, every exemption and registration the session has. */
   revoke(sessionId: string, port?: number): void {
     const p = this.bySession.get(sessionId);
-    if (!p) return;
-    for (const open of port === undefined ? p.allowedLoopbackPorts() : [port]) p.revokeLoopbackPort(open);
+    const reg = this.registered.get(sessionId);
+    for (const open of port === undefined ? [...new Set([...(p?.allowedLoopbackPorts() ?? []), ...(reg ?? [])])] : [port]) {
+      p?.revokeLoopbackPort(open);
+      reg?.delete(open);
+    }
+    if (reg && !reg.size) this.registered.delete(sessionId);
   }
 
   closeSession(sessionId: string): void {
     this.bySession.get(sessionId)?.close();
     this.bySession.delete(sessionId);
+    this.registered.delete(sessionId);
   }
 
   /** Stop everything. Until `restart()`, `ensure` refuses, so no browser can be started. */
@@ -504,7 +560,7 @@ export class BrowserProxyManager {
     for (const [id, p] of [...this.bySession]) if (!p.listening) this.closeSession(id);
     if (this.stopped) return;
     try {
-      const probe = this.factory(this.opts);
+      const probe = this.factory({ ...this.opts, onDecision: undefined });
       probe.listen();
       probe.close();
       this.lastFailure = undefined;

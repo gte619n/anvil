@@ -7,15 +7,16 @@
  */
 import { describe, test, expect, afterEach } from "bun:test";
 import { connect } from "node:net";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mcpPreset } from "../../src/mcp/presets";
 import { mcpKindGate, mcpKindResultHook } from "../../src/agent/mcp-gate";
 import { BROWSER_CHROME_ARGS, presetArgProblems } from "../../src/browser/preset";
 import { BROWSER_SITES_FILE } from "../../src/browser/sites";
-import { browserIntegrationDefaults } from "../../src/browser/service";
+import { RUNTIME_MARKER, browserRuntimeCli, browserRuntimeDir } from "../../src/browser/runtime";
+import { browserIntegrationDefaults, daemonApiCommandProblem } from "../../src/browser/service";
 import { serverCapabilities } from "../../src/server/identity";
-import { addBrowser, browserHook, browserOf, browserRig, browserSession, feedResult, pageResult, startBrowser } from "../helpers/browser";
+import { TEST_NODE, addBrowser, browserHook, browserOf, browserRig, browserSession, feedResult, pageResult, seedBrowserRuntime, startBrowser } from "../helpers/browser";
 import { callHook, driversOf, fakeDriver, settle, type McpRig } from "../helpers/mcp";
 
 let rig: McpRig;
@@ -69,26 +70,32 @@ describe("the preset", () => {
   test("[C2] the browser integration is key `browser`, stdio, exclusive — whatever the client sends — and update cannot change its transport or exclusivity", async () => {
     rig = browserRig();
     const added = rig.sup.mcp.add({ key: "evil", kind: "browser", label: "My browser", transport: { type: "stdio", command: "/bin/sh", args: ["-c", "evil"] }, exclusive: false, enabled: true });
-    expect(added).toMatchObject({ key: "browser", kind: "browser", label: "My browser", exclusive: true, transport: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@0.0.86"] } });
+    expect(added).toMatchObject({ key: "browser", kind: "browser", label: "My browser", exclusive: true, transport: { type: "stdio", command: "node", args: ["@playwright/mcp@0.0.86 (pinned runtime in the daemon's state folder)"] } });
     expect(() => rig.sup.mcp.add(browserIntegrationDefaults())).toThrow(/already used/); // one per machine
 
     rig.sup.mcp.update(added.id, { transport: { type: "stdio", command: "/bin/sh", args: [] }, exclusive: false, label: "Agent browser" });
-    expect(rig.sup.mcp.store.get(added.id)).toMatchObject({ label: "Agent browser", exclusive: true, transport: { command: "npx" } });
+    expect(rig.sup.mcp.store.get(added.id)).toMatchObject({ label: "Agent browser", exclusive: true, transport: { command: "node" } });
   });
 
-  test("[C2] a session's launch line is the preset's, wrapped in env -i with a PATH for npx and node; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener", async () => {
+  test("[C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener", async () => {
     rig = browserRig();
     const integration = await addBrowser(rig);
     const s = await browserSession(rig, integration);
     const cfg = startBrowser(rig, s)!;
     expect(cfg.command).toBe("/usr/bin/env");
     expect(cfg.args[0]).toBe("-i");
-    const at = cfg.args.indexOf("npx");
+    const at = cfg.args.indexOf(TEST_NODE);
     expect(cfg.args.slice(1, at).map((a) => a.split("=")[0])).toEqual(["PATH", "HOME", "TMPDIR"]);
     expect(cfg.args[1]).toBe(`PATH=${process.env.PATH}`);
+    // No package runner anywhere in the line, and nothing in it is relative to the worktree.
+    expect(cfg.args.some((a) => /^(npx|npm|bunx|pnpm|yarn|-y)$/.test(a))).toBe(false);
 
     const args = cfg.args.slice(at + 1);
-    expect(presetArgProblems({ command: "npx", args, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } } })).toEqual([]);
+    const cli = browserRuntimeCli(rig.dir);
+    expect(args[0]).toBe(cli);
+    expect(cli.startsWith(join(rig.dir, "browser", "runtime-"))).toBe(true);
+    expect(cli.startsWith(s.data.cwd + "/.")).toBe(false);
+    expect(presetArgProblems({ command: TEST_NODE, args, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } } }, cli)).toEqual([]);
     const port = browserOf(rig).proxies.get(s.id)!.port;
     expect(args[args.indexOf("--proxy-server") + 1]).toBe(`http://127.0.0.1:${port}`);
     expect(args[args.indexOf("--output-dir") + 1]).toBe(join(s.data.cwd, ".anvil-browser"));
@@ -108,7 +115,8 @@ describe("the preset", () => {
     rig.sup.mcp.store.update(integration.id, { transport: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@latest", "--proxy-bypass", "<loopback>", "--caps", "vision"] } });
     const cfg = startBrowser(rig, s)!;
     const joined = cfg.args.join(" ");
-    expect(joined).toContain("@playwright/mcp@0.0.86");
+    expect(joined).toContain(browserRuntimeCli(rig.dir));
+    expect(joined).not.toContain(" npx ");
     expect(joined).not.toContain("--proxy-bypass ");
     expect(joined).not.toContain("--caps");
     expect(joined).not.toContain("@latest");
@@ -122,7 +130,7 @@ describe("the preset", () => {
     expect(args.slice(-2)).toEqual(["--isolated", "--headless"]);
     expect(args).not.toContain("--user-data-dir");
     expect(existsSync(join(rig.dir, "browser-profile"))).toBe(false);
-    expect(row().browser).toEqual({ mode: "headless", modeReason: "Headless with a throwaway profile: nobody is logged in at this machine's screen.", proxy: { state: "ready", sessions: 1 } });
+    expect(row().browser).toEqual({ mode: "headless", modeReason: "Headless with a throwaway profile: nobody is logged in at this machine's screen.", proxy: { state: "ready", sessions: 1 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" } });
   });
 
   test("[C2] the worktree's .git/info/exclude gains .anvil-browser/ when the session folder is a checkout", async () => {
@@ -139,15 +147,15 @@ describe("the preset", () => {
     rig = browserRig();
     await addBrowser(rig);
     expect(row().health).toEqual({ state: "ready" });
-    expect(row().browser).toEqual({ mode: "headed", modeReason: "Headed, with the agent profile: evan is logged in at the screen.", proxy: { state: "ready", sessions: 0 } });
+    expect(row().browser).toEqual({ mode: "headed", modeReason: "Headed, with the agent profile: evan is logged in at the screen.", proxy: { state: "ready", sessions: 0 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" } });
     expect(rig.sup.mcpIntegrationsEvent().integrations[0]!.browser?.mode).toBe("headed");
   });
 });
 
 describe("health and fail closed", () => {
-  test("[C2] the browser is unavailable when npx or node is not on the PATH it would be started with, or Chrome is not installed", async () => {
+  test("[C2] the browser is unavailable when node is not on the PATH it would be started with, or Chrome is not installed", async () => {
     for (const [seams, reason] of [
-      [{ commandExists: (c: string) => c !== "npx" }, /npx was not found/],
+      [{ nodePath: () => undefined }, /node was not found/],
       [{ commandExists: (c: string) => c !== "node" }, /node was not found/],
       [{ chromeInstalled: () => false }, /Google Chrome is not installed/],
     ] as const) {
@@ -220,6 +228,204 @@ describe("health and fail closed", () => {
     expect(startBrowser(rig, s)!.args.slice(-2)).toEqual(["--isolated", "--headless"]);
     await rig.sup.mcpIntegrationCheck();
     expect(row().browser!.mode).toBe("headed");
+  });
+
+  test("[C2] only a launch error counts as a failed headed launch: the words in a URL, in page text or in a successful result do not switch the machine to headless", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    const s = await browserSession(rig, integration);
+    for (const [text, isError] of [
+      ["### Error\nError: browserBackend.callTool: net::ERR_NAME_NOT_RESOLVED at https://a.test/Failed to launch/browserType.launch", true],
+      ["### Error\nTimeoutError: locator.click: Timeout 5000ms exceeded.\nCall log:\n  - locator resolved to <a>browserType.launchPersistentContext: Failed to launch</a>", true],
+      [`${pageResult("https://a.test/", "Failed to launch browserType.launch")}`, false],
+      ["### Result\n[LOG] browserType.launchPersistentContext: Failed to launch", false],
+      ["### Error\nError: browserType.launchPersistentContext: Failed to launch\nuser data directory is already in use", true],
+    ] as const) {
+      feedResult(rig, s, "browser_navigate", text, { url: "https://a.test/" }, isError);
+      expect([text.slice(0, 40), row().browser!.mode]).toEqual([text.slice(0, 40), "headed"]);
+    }
+  });
+});
+
+describe("the pinned server runtime", () => {
+  test("[C2] runtime not installed: health is unavailable with the reason, no launch line is built, the daemon tries one install by itself, and a failure is reported until Install succeeds", async () => {
+    let attempts = 0;
+    let online = false;
+    rig = browserRig({
+      runtime: false,
+      browser: {
+        runtimeInstaller: async (stateDir) => {
+          attempts++;
+          if (!online) throw new Error("npm ci failed (exit 1): getaddrinfo ENOTFOUND registry.npmjs.org");
+          seedBrowserRuntime(stateDir);
+        },
+      },
+    });
+    const integration = await addBrowser(rig); // add → probe → health finds it missing → one automatic attempt
+    await settle(10);
+    await rig.sup.mcp.probe("timer");
+    expect(attempts).toBe(1);
+    expect(row().health.state).toBe("unavailable");
+    expect((row().health as { reason: string }).reason).toMatch(/browser runtime is not installed.*could not be installed.*ENOTFOUND.*Install browser runtime/);
+    expect(row().browser!.runtime).toMatchObject({ state: "missing", package: "@playwright/mcp@0.0.86", reason: expect.stringMatching(/ENOTFOUND/) });
+
+    // Fail closed: no launch line, no proxy-less start, every call denied.
+    const s = await rig.session();
+    rig.sup.setSessionMcpIntegrations(s.id, [integration.id]);
+    await settle(10);
+    expect(startBrowser(rig, s)).toBeUndefined();
+    expect((await browserHook(rig, s, "browser_snapshot")).decision).toBe("deny");
+    // It does not hammer the registry: further probes do not retry by themselves.
+    await rig.sup.mcp.probe("timer");
+    await rig.sup.mcp.probe("timer");
+    expect(attempts).toBe(1);
+
+    // "Install browser runtime" while still offline: refused with the reason.
+    await expect(rig.sup.browserRuntimeInstall()).rejects.toThrow(/ENOTFOUND/);
+    expect(attempts).toBe(2);
+    // Online: it installs, health turns ready, and the launch line appears.
+    online = true;
+    await rig.sup.browserRuntimeInstall();
+    expect(attempts).toBe(3);
+    expect(row().health).toEqual({ state: "ready" });
+    expect(row().browser!.runtime).toEqual({ state: "installed", package: "@playwright/mcp@0.0.86" });
+    expect(startBrowser(rig, s)!.args).toContain(browserRuntimeCli(rig.dir));
+    await rig.sup.browserRuntimeInstall(); // already installed: nothing to do
+    expect(attempts).toBe(3);
+  });
+
+  test("[C2] the runtime is verified before EVERY launch: a missing script, a changed lock copy or a marker for another lock stops the launch", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    const s = await browserSession(rig, integration);
+    expect(startBrowser(rig, s)).toBeDefined();
+    const dir = browserRuntimeDir(rig.dir);
+
+    rmSync(browserRuntimeCli(rig.dir));
+    expect(startBrowser(rig, s)).toBeUndefined();
+    seedBrowserRuntime(rig.dir);
+    expect(startBrowser(rig, s)).toBeDefined();
+
+    writeFileSync(join(dir, "package-lock.json"), readFileSync(join(dir, "package-lock.json"), "utf8").replace("0.0.86", "0.0.87"));
+    expect(startBrowser(rig, s)).toBeUndefined();
+    seedBrowserRuntime(rig.dir);
+
+    writeFileSync(join(dir, RUNTIME_MARKER), JSON.stringify({ lockSha256: "0".repeat(64) }));
+    expect(startBrowser(rig, s)).toBeUndefined();
+    seedBrowserRuntime(rig.dir);
+
+    writeFileSync(join(dir, "node_modules", "@playwright", "mcp", "package.json"), JSON.stringify({ version: "9.9.9" }));
+    expect(startBrowser(rig, s)).toBeUndefined();
+  });
+
+  test("[C2] a planted server in the worktree is never the launch target: node_modules/@playwright/mcp and node_modules/.bin in the session folder change nothing in the launch line", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    const wt = join(rig.dir, "wt");
+    mkdirSync(join(wt, "node_modules", "@playwright", "mcp"), { recursive: true });
+    mkdirSync(join(wt, "node_modules", ".bin"), { recursive: true });
+    writeFileSync(join(wt, "node_modules", "@playwright", "mcp", "package.json"), JSON.stringify({ name: "@playwright/mcp", version: "0.0.86", bin: { "playwright-mcp": "cli.js" } }));
+    writeFileSync(join(wt, "node_modules", "@playwright", "mcp", "cli.js"), "require('fs').writeFileSync('PWNED','1')");
+    writeFileSync(join(wt, "node_modules", ".bin", "playwright-mcp"), "#!/bin/sh\ntouch PWNED\n", { mode: 0o755 });
+    writeFileSync(join(wt, ".npmrc"), "script-shell=/tmp/evil.sh\nnode-options=--require /tmp/evil.js\nregistry=http://127.0.0.1:1/\ncache=/tmp/evil-cache\n");
+    const s = await browserSession(rig, integration, { cwd: wt });
+    const line = startBrowser(rig, s)!;
+    const at = line.args.indexOf(TEST_NODE);
+    expect(line.args[at + 1]).toBe(browserRuntimeCli(rig.dir));
+    expect(line.args.filter((a) => a.startsWith(wt)).map((a) => a.slice(wt.length))).toEqual(["/.anvil-browser"]); // only the output folder
+    expect(line.args.slice(1, at).map((a) => a.split("=")[0])).toEqual(["PATH", "HOME", "TMPDIR"]); // env -i: no npm_config_*, no NODE_OPTIONS
+  });
+});
+
+describe("what the model is told, and what it may not keep (review of Phase C2)", () => {
+  test("[C2] a request the network block refused is told to the model with its next browser call, in plain words", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    rig.sup.browserSiteAdd("a.test");
+    const s = await browserSession(rig, integration);
+    const b = browserOf(rig);
+    b.proxies.onSessionDecision!(s.id, { kind: "connect", host: "127.0.0.1", port: 7701, allowed: false, reason: "127.0.0.1 is a loopback address" });
+    b.proxies.onSessionDecision!(s.id, { kind: "connect", host: "127.0.0.1", port: 7701, allowed: false, reason: "127.0.0.1 is a loopback address" });
+    b.proxies.onSessionDecision!(s.id, { kind: "http", host: "public.example", port: 80, allowed: true });
+    const out = await browserHook(rig, s, "browser_snapshot");
+    expect(out.decision).toBe("allow");
+    expect(out.additionalContext).toMatch(/Blocked by Anvil's network policy/);
+    expect(out.additionalContext).toContain("127.0.0.1:7701 (127.0.0.1 is a loopback address)");
+    expect(out.additionalContext!.split("127.0.0.1:7701").length - 1).toBe(1); // said once
+    expect(out.additionalContext).not.toContain("public.example");
+    expect((await browserHook(rig, s, "browser_snapshot")).additionalContext).toBeUndefined(); // and only once
+    // On a denied call it rides in the reason the model reads.
+    b.proxies.onSessionDecision!(s.id, { kind: "http", host: "10.0.0.5", port: 80, allowed: false, reason: "a private address (10.0.0.0/8)" });
+    const denied = await browserHook(rig, s, "browser_run_code_unsafe", { code: "x" });
+    expect(denied.reason).toMatch(/never allowed[\s\S]*Blocked by Anvil's network policy[\s\S]*10\.0\.0\.5:80/);
+  });
+
+  test("[C2] a result showing a page on a site that is not allowed has its snapshot and screenshot files deleted from .anvil-browser/ at once; files of allowed pages and files elsewhere are left alone", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    rig.sup.browserSiteAdd("a.test");
+    const s = await browserSession(rig, integration);
+    const out = join(s.data.cwd, ".anvil-browser");
+    const outside = join(s.data.cwd, "keep.yml");
+    const file = (name: string): string => (writeFileSync(join(out, name), "secret page text"), join(out, name));
+    writeFileSync(outside, "mine");
+
+    const ok = file("page-2026-11-19T10-00-00-000Z.yml");
+    feedResult(rig, s, "browser_navigate", `### Page\n- Page URL: https://a.test/\n### Snapshot\n- [Snapshot](${ok})`);
+    expect(existsSync(ok)).toBe(true);
+
+    const leaked = file("page-2026-11-19T10-00-01-000Z.yml");
+    feedResult(rig, s, "browser_navigate_back", `### Ran Playwright code\n\`\`\`js\nawait page.goBack();\n\`\`\`\n### Page\n- Page URL: https://c.test/secret\n### Snapshot\n- [Snapshot](${leaked})\n- [x](${outside})\n- [y](/etc/hosts.yml)`);
+    expect(browserOf(rig).gate.state(s.id).hold).toMatchObject({ kind: "site", site: "c.test" });
+    expect(existsSync(leaked)).toBe(false);
+    expect(existsSync(ok)).toBe(true);
+    expect(existsSync(outside)).toBe(true); // named in the result, but not in the output folder
+  });
+
+  test("[C2] session Bash that calls the daemon's browser or fleet routes, or talks to the daemon's own port, is denied (a tripwire: the agent runs as the daemon's user)", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    const s = await browserSession(rig, integration, { autonomy: "bypass" });
+    browserOf(rig).setFleet({ selfServerId: "srv_x", members: () => [], pairedHubId: () => null, selfUrl: async () => undefined, selfPort: 7701 });
+    const tool = (command: string) => callHook(s, rig.broker, "Bash", { inProcessKeys: [], gate: rig.sup.mcp.gate }, { command });
+    for (const command of [
+      `curl -s -X POST http://127.0.0.1:7701/api/browser/sites/op -H 'content-type: application/json' -d '{"from":"x","ops":[{"op":"add","site":"evil.test"}]}'`,
+      `wget -qO- https://m4.tail1234.ts.net/api/fleet/members`,
+      `curl http://localhost:7701/api/health`,
+      `nc 127.0.0.1 7701`,
+      `node -e 'fetch("http://127.0.0.1:7701/api/sessions")'`,
+      `bun -e 'new WebSocket("ws://127.0.0.1:7701/ws")'`,
+      `python3 -c 'import urllib.request; urllib.request.urlopen("http://host/api/browser/sites/sync")'`,
+    ]) {
+      const out = await tool(command);
+      expect([command, out.decision]).toEqual([command, "deny"]);
+    }
+    for (const command of ["curl -s https://example.com/api/v1/items", "git log -7701", "curl http://127.0.0.1:5173/", "echo 7701", "ls api/browser/"]) {
+      expect([command, (await tool(command)).decision]).toEqual([command, "allow"]);
+    }
+    expect(daemonApiCommandProblem("curl http://127.0.0.1:7701/", undefined)).toBeUndefined(); // port unknown: only the routes are matched
+    expect(daemonApiCommandProblem("curl http://127.0.0.1:7701/api/fleet/x", undefined)).toBeDefined();
+  });
+
+  test("[C2] the test-daemon exemption needs a registration: a bare port, the daemon's own port and another session's port are refused; revoke forgets it", async () => {
+    rig = browserRig();
+    const integration = await addBrowser(rig);
+    const a = await browserSession(rig, integration);
+    const b = await browserSession(rig, integration);
+    const svc = browserOf(rig);
+    svc.setFleet({ selfServerId: "srv_x", members: () => [], pairedHubId: () => null, selfUrl: async () => undefined, selfPort: 7701 });
+    expect(svc.allowLoopbackPort(a.id, 45001)).toBe(false); // never registered
+    expect(svc.registerTestDaemon(a.id, 7701)).toEqual({ ok: false, reason: expect.stringMatching(/own port/) });
+    expect(svc.registerTestDaemon(a.id, 80)).toMatchObject({ ok: false });
+    expect(svc.registerTestDaemon(a.id, svc.proxies.get(b.id)!.port)).toMatchObject({ ok: false });
+    expect(svc.registerTestDaemon(a.id, 45001)).toEqual({ ok: true });
+    expect(svc.registerTestDaemon(b.id, 45001)).toEqual({ ok: false, reason: expect.stringMatching(/another session/) });
+    expect(svc.allowLoopbackPort(b.id, 45001)).toBe(false);
+    expect(svc.allowLoopbackPort(a.id, 45001)).toBe(true);
+    expect(svc.allowLoopbackPort(a.id, 7701)).toBe(false);
+    svc.revokeLoopbackPort(a.id, 45001);
+    expect(svc.proxies.get(a.id)!.allowedLoopbackPorts()).toEqual([]);
+    expect(svc.allowLoopbackPort(a.id, 45001)).toBe(false); // the registration went with it
   });
 });
 

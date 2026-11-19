@@ -593,6 +593,9 @@ export interface BrowserIntegrationInfo {
   modeReason: string;
   /** The loopback proxy that is the browser's only route out. `stopped` = the browser cannot start. */
   proxy: { state: "ready" | "stopped"; reason?: string; sessions: number };
+  /** The pinned server runtime the daemon installs into its own state folder (never run from a
+   *  session's worktree). `missing`: the browser cannot start until `browser.runtime.install` succeeds. */
+  runtime?: { state: "installed" | "installing" | "missing"; package: string; reason?: string };
 }
 /** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
  *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
@@ -1836,6 +1839,11 @@ export interface BrowserSiteRemoveCmd extends Envelope, Correlated {
   type: "browser.site.remove";
   site: string;
 }
+/** Install the agent browser's pinned server runtime on the machine that receives this (needs the
+ *  npm registry once). Acked when it is installed; a `command.error` says why it could not be. */
+export interface BrowserRuntimeInstallCmd extends Envelope, Correlated {
+  type: "browser.runtime.install";
+}
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
 export interface PromptListCmd extends Envelope, Correlated {
@@ -2238,6 +2246,7 @@ export type ClientCommand =
   | BrowserSitesListCmd
   | BrowserSiteAddCmd
   | BrowserSiteRemoveCmd
+  | BrowserRuntimeInstallCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd

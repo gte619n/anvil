@@ -2,7 +2,9 @@
  * The `browser` MCP preset's launch line (agent-cad-and-browser §4.12, §4.14 items 20, 21, 34, 37).
  *
  * Everything here is pure or takes its probes as arguments: `buildBrowserLaunch` turns a mode, a proxy
- * port and three folders into the exact `npx` command and the JSON config Playwright MCP reads, and
+ * port and three folders into the exact command and the JSON config Playwright MCP reads — `node`
+ * by absolute path, running the server script of the daemon-owned pinned runtime (`runtime.ts`) by
+ * absolute path; never `npx`, which would read `node_modules` and `.npmrc` from the worktree — and
  * `presetArgProblems` checks any argument list against the closed allow list. The service that owns
  * the proxy and writes the files is `browser/service.ts`.
  *
@@ -13,12 +15,15 @@
  */
 import { spawnSync } from "node:child_process";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
 /** The pinned Playwright MCP release (item 20). The tool table in `tools.ts` is for this version. */
 export const PLAYWRIGHT_MCP_VERSION = "0.0.86";
 export const PLAYWRIGHT_MCP_PACKAGE = `@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}`;
-export const BROWSER_COMMAND = "npx";
+/** What the launch runs: `node` (resolved to an absolute path once, from the daemon's PATH). */
+export const BROWSER_COMMAND = "node";
+/** The server script inside the daemon-owned runtime folder. */
+export const BROWSER_CLI_SUFFIX = "/node_modules/@playwright/mcp/cli.js";
 export const BROWSER_KEY = "browser";
 
 /** Playwright's output folder inside the session worktree (snapshots, screenshots, downloads). */
@@ -48,6 +53,10 @@ export interface BrowserLaunchInput {
   /** The daemon's state dir (absolute). */
   stateDir: string;
   sessionId: string;
+  /** Absolute path of `node`. */
+  nodePath: string;
+  /** Absolute path of the pinned runtime's `cli.js` (`runtime.ts`). */
+  cliPath: string;
 }
 
 export interface BrowserLaunch {
@@ -77,9 +86,9 @@ export function buildBrowserLaunch(input: BrowserLaunchInput): BrowserLaunch {
   const outputDir = browserOutputDir(input.worktree);
   const configPath = browserConfigPath(input.stateDir, input.sessionId);
   const profileDir = input.mode === "headed" ? browserProfileDir(input.stateDir) : undefined;
+  if (!isAbsolute(input.nodePath) || !isAbsolute(input.cliPath)) throw new Error("the browser is started by absolute paths only");
   const args = [
-    "-y",
-    PLAYWRIGHT_MCP_PACKAGE,
+    input.cliPath,
     "--browser",
     "chrome",
     "--proxy-server",
@@ -93,7 +102,7 @@ export function buildBrowserLaunch(input: BrowserLaunchInput): BrowserLaunch {
     configPath,
     ...(profileDir ? ["--user-data-dir", profileDir] : ["--isolated", "--headless"]),
   ];
-  return { command: BROWSER_COMMAND, args, configPath, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } }, outputDir, ...(profileDir ? { profileDir } : {}) };
+  return { command: input.nodePath, args, configPath, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } }, outputDir, ...(profileDir ? { profileDir } : {}) };
 }
 
 // ── The argument allow list ─────────────────────────────────────────────────────────────────────
@@ -115,13 +124,17 @@ export const PRESET_FLAG_ALLOW_LIST: Readonly<Record<string, "value" | "none">> 
  * Why `launch` is not a launch the preset may make; empty when it is. Checked by the unit test and
  * again by the service before every launch (a launch with a problem is skipped, not started).
  */
-export function presetArgProblems(launch: Pick<BrowserLaunch, "command" | "args" | "configJson">): string[] {
+export function presetArgProblems(launch: Pick<BrowserLaunch, "command" | "args" | "configJson">, expectedCli?: string): string[] {
   const problems: string[] = [];
   const { args } = launch;
-  if (launch.command !== BROWSER_COMMAND) problems.push(`command is ${launch.command}, not ${BROWSER_COMMAND}`);
-  if (args[0] !== "-y" || args[1] !== PLAYWRIGHT_MCP_PACKAGE) problems.push(`must start with -y ${PLAYWRIGHT_MCP_PACKAGE}`);
+  // `node` by absolute path, then the runtime's server script by absolute path. A bare name or a
+  // relative path would be resolved against the session's worktree or its PATH.
+  if (!isAbsolute(launch.command) || basename(launch.command) !== BROWSER_COMMAND) problems.push(`command must be an absolute path to ${BROWSER_COMMAND}, not ${launch.command}`);
+  const cli = args[0] ?? "";
+  if (!isAbsolute(cli) || !cli.endsWith(BROWSER_CLI_SUFFIX) || cli.split("/").includes("..")) problems.push(`the first argument must be the absolute path of the pinned runtime's server script (…${BROWSER_CLI_SUFFIX})`);
+  else if (expectedCli !== undefined && cli !== expectedCli) problems.push("the server script is not the daemon's own runtime");
   const seen = new Map<string, string | true>();
-  for (let i = 2; i < args.length; i++) {
+  for (let i = 1; i < args.length; i++) {
     const flag = args[i]!;
     const kind = Object.hasOwn(PRESET_FLAG_ALLOW_LIST, flag) ? PRESET_FLAG_ALLOW_LIST[flag] : undefined;
     if (!kind) {

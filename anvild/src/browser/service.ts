@@ -7,7 +7,7 @@
  * are on. Without it nothing here exists: the preset is not registered (so `mcp.integration.add`
  * refuses the kind), no proxy listens and nothing is written.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { BrowserIntegrationInfo, McpHealth, McpIntegration, McpTransport, ServerEvent } from "@protocol";
@@ -32,8 +32,9 @@ import {
   type DesktopProbe,
   type DesktopProbeResult,
 } from "./preset";
+import { browserRuntimeCli, browserRuntimeProblem, installBrowserRuntime } from "./runtime";
 import { BrowserProxyManager, ownHosts, type BrowserProxyOptions, type ProxyFactory, type ProxyResolver } from "./proxy";
-import { BROWSER_SITES_FILE, toolResultText } from "./sites";
+import { BROWSER_SITES_FILE, resultFileLinks, toolResultText } from "./sites";
 import { AllowedSitesService, type BrowserFleetLink } from "./sites-sync";
 
 export interface BrowserServiceDeps {
@@ -62,11 +63,20 @@ export interface BrowserServiceDeps {
   clock?: () => number;
   /** Allowed-sites sync timer; 0 = none. */
   sitesIntervalMs?: number;
+  /** Absolute path of `node` / `npm` (default: resolved on the child PATH). */
+  nodePath?: () => string | undefined;
+  npmPath?: () => string | undefined;
+  /** Installs the pinned server runtime into the state dir (default: `installBrowserRuntime`). */
+  runtimeInstaller?: (stateDir: string) => Promise<void>;
+  /** Health may have changed without a command (the runtime finished installing): probe again. */
+  reprobe?: () => void;
 }
 
 /** The entry "Add → Browser" creates. Every field but `label` and `enabled` is fixed by the preset. */
 export function browserIntegrationDefaults(): Omit<McpIntegration, "id"> {
-  return { key: BROWSER_KEY, kind: "browser", label: "Browser", transport: { type: "stdio", command: BROWSER_COMMAND, args: ["-y", PLAYWRIGHT_MCP_PACKAGE] }, exclusive: true, enabled: true };
+  // The stored transport is for show: every launch is built by `buildBrowserLaunch` from the
+  // daemon-owned runtime (an absolute `node`, an absolute script).
+  return { key: BROWSER_KEY, kind: "browser", label: "Browser", transport: { type: "stdio", command: BROWSER_COMMAND, args: [`${PLAYWRIGHT_MCP_PACKAGE} (pinned runtime in the daemon's state folder)`] }, exclusive: true, enabled: true };
 }
 
 const CHROME_PATHS = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", join(homedir(), "Applications/Google Chrome.app/Contents/MacOS/Google Chrome")];
@@ -115,6 +125,19 @@ const DESKTOP_PROBE_TTL_MS = 10_000;
 interface Runtime {
   mode: BrowserMode;
   integrationId: string;
+  worktree: string;
+}
+
+/**
+ * Whether a Bash command talks to a daemon's own API from inside a session: a tripwire for the
+ * routes that change what the browser may do (and the fleet routes), and for this daemon's port.
+ * The agent runs as the daemon's user, so this is not a boundary (§6) — it stops the obvious route.
+ */
+export function daemonApiCommandProblem(command: string, selfPort?: number): string | undefined {
+  if (!/\b(curl|wget|nc|ncat|netcat|socat|http|https|xh|websocat)\b|fetch\s*\(|WebSocket\s*\(|urlopen|requests\.|http\.client|Invoke-WebRequest/.test(command)) return undefined;
+  if (/\/api\/browser\/|\/api\/fleet\//.test(command)) return "a session may not call the daemon's browser or fleet routes";
+  if (selfPort && new RegExp(`(^|[^0-9])${selfPort}([^0-9]|$)`).test(command) && /127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0|100\.\d+\.\d+\.\d+|\.ts\.net|\b[a-z0-9-]+\.lan\b/i.test(command)) return "a session may not talk to the daemon's own port";
+  return undefined;
 }
 
 // ── One registration per process, routed to the owning service ──────────────────────────────────
@@ -178,6 +201,12 @@ export class BrowserService {
   private headedFailed = false;
   private started = false;
   private probed: { at: number; result: DesktopProbeResult } | undefined;
+  private runtimeInstall: Promise<void> | undefined;
+  private runtimeTried = false;
+  private runtimeError: string | undefined;
+  private selfPort: number | undefined;
+  /** Requests the network block refused since each session's last browser call (told to the model). */
+  private readonly refusals = new Map<string, string[]>();
 
   constructor(private readonly deps: BrowserServiceDeps) {
     this.sites = new AllowedSitesService({ stateDir: deps.stateDir, broadcast: deps.broadcast, clock: deps.clock, fetchImpl: deps.fetchImpl, intervalMs: deps.sitesIntervalMs });
@@ -187,9 +216,16 @@ export class BrowserService {
         fleetHosts: () => this.sites.fleetHosts(),
         selfHosts: deps.selfHosts ?? ownHosts,
         onDecision: deps.onProxyDecision,
+        selfPort: () => this.selfPort,
       },
       deps.proxyFactory,
     );
+    this.proxies.onSessionDecision = (sessionId, d) => {
+      if (d.allowed) return;
+      const line = `${d.host}:${d.port} (${d.reason ?? "refused"})`;
+      const list = this.refusals.get(sessionId) ?? [];
+      if (!list.includes(line) && list.length < 6) this.refusals.set(sessionId, [...list, line]);
+    };
     this.gate = new BrowserGate({
       isSiteAllowed: (site) => this.sites.isAllowed(site),
       allowSiteAlways: (site) => void this.sites.add(site),
@@ -222,6 +258,7 @@ export class BrowserService {
   }
 
   setFleet(link: BrowserFleetLink): void {
+    this.selfPort = link.selfPort;
     this.sites.setFleet(link);
   }
 
@@ -229,6 +266,7 @@ export class BrowserService {
 
   /** The operator pressed Check: try headed again, and re-prove the network block can run. */
   onCheck(): void {
+    this.runtimeTried = false; // Check also retries a runtime install that failed (offline earlier)
     this.headedFailed = false;
     this.probed = undefined;
     this.proxies.recheck();
@@ -246,15 +284,72 @@ export class BrowserService {
 
   info(): BrowserIntegrationInfo {
     const m = this.mode();
-    return { mode: m.mode, modeReason: m.reason, proxy: this.proxies.state() };
+    return { mode: m.mode, modeReason: m.reason, proxy: this.proxies.state(), runtime: this.runtimeInfo() };
   }
 
-  /** Beyond "npx is on PATH": node, an installed Chrome, and a network block that can run. */
+  // ── the pinned server runtime (runtime.ts) ──────────────────────────────────────────────────
+
+  private nodePath(): string | undefined {
+    return (this.deps.nodePath ?? (() => resolveOnPath("node", this.deps.childEnv.PATH)))();
+  }
+
+  runtimeInfo(): NonNullable<BrowserIntegrationInfo["runtime"]> {
+    const problem = browserRuntimeProblem(this.deps.stateDir);
+    if (!problem) return { state: "installed", package: PLAYWRIGHT_MCP_PACKAGE };
+    if (this.runtimeInstall) return { state: "installing", package: PLAYWRIGHT_MCP_PACKAGE, reason: "installing the browser runtime" };
+    return { state: "missing", package: PLAYWRIGHT_MCP_PACKAGE, reason: this.runtimeError ? `${problem}; the last install failed: ${this.runtimeError}` : problem };
+  }
+
+  /**
+   * Install the pinned server runtime into the daemon's state folder (once; a call while one is in
+   * flight shares it). Rejects with the reason when it cannot be installed (no network, a hash that
+   * does not match the lock); the browser then stays unavailable.
+   */
+  installRuntime(): Promise<void> {
+    if (!browserRuntimeProblem(this.deps.stateDir)) return Promise.resolve();
+    if (this.runtimeInstall) return this.runtimeInstall;
+    this.runtimeTried = true;
+    const install =
+      this.deps.runtimeInstaller ??
+      ((stateDir: string) => {
+        const npmPath = (this.deps.npmPath ?? (() => resolveOnPath("npm", this.deps.childEnv.PATH)))();
+        if (!npmPath) throw new Error(`npm was not found on the PATH the browser is started with (${this.deps.childEnv.PATH})`);
+        return installBrowserRuntime(stateDir, { npmPath, pathEnv: this.deps.childEnv.PATH, tmpdir: this.deps.childEnv.TMPDIR });
+      });
+    const run = (async () => {
+      try {
+        await install(this.deps.stateDir);
+        const problem = browserRuntimeProblem(this.deps.stateDir);
+        if (problem) throw new Error(problem);
+        this.runtimeError = undefined;
+      } catch (e) {
+        this.runtimeError = e instanceof Error ? e.message : String(e);
+        throw e;
+      } finally {
+        this.runtimeInstall = undefined;
+        this.deps.reprobe?.();
+      }
+    })();
+    this.runtimeInstall = run;
+    return run;
+  }
+
+  /** node, the pinned runtime, an installed Chrome, and a network block that can run. */
   health(): McpHealth {
     const path = this.deps.childEnv.PATH;
     const exists = this.deps.commandExists ?? ((c: string, p: string) => !!resolveOnPath(c, p));
-    for (const cmd of [BROWSER_COMMAND, "node"]) {
-      if (!exists(cmd, path)) return { state: "unavailable", reason: `${cmd} was not found on the PATH the browser is started with (${path})` };
+    if (!exists("node", path) || !this.nodePath()) return { state: "unavailable", reason: `node was not found on the PATH the browser is started with (${path})` };
+    const runtime = browserRuntimeProblem(this.deps.stateDir);
+    if (runtime) {
+      // The first time it is found missing the daemon installs it by itself; after a failure it waits
+      // for Check or "Install browser runtime".
+      if (!this.runtimeTried && !this.runtimeInstall) void this.installRuntime().catch(() => undefined);
+      return {
+        state: "unavailable",
+        reason: this.runtimeInstall
+          ? "the browser runtime is being installed into the daemon's state folder (one time)"
+          : `${runtime}${this.runtimeError ? ` and could not be installed (${this.runtimeError})` : ""}. Press “Install browser runtime” in Settings → Integrations when this machine is online.`,
+      };
     }
     if (!(this.deps.chromeInstalled ?? defaultChromeInstalled)()) return { state: "unavailable", reason: "Google Chrome is not installed on this machine" };
     const proxy = this.proxies.state();
@@ -275,9 +370,16 @@ export class BrowserService {
     const proxy = this.proxies.ensure(sessionId);
     if ("error" in proxy) return { skip: proxy.error };
 
+    // Checked before EVERY launch: the marker, the lock copy and the script of the daemon's runtime.
+    const runtime = browserRuntimeProblem(this.deps.stateDir);
+    if (runtime) return { skip: `${runtime} (press “Install browser runtime” in Settings → Integrations)` };
+    const nodePath = this.nodePath();
+    if (!nodePath || !isAbsolute(nodePath)) return { skip: "node was not found on the PATH the browser is started with" };
+    const cliPath = browserRuntimeCli(this.deps.stateDir);
+
     const { mode } = this.mode();
-    const launch = buildBrowserLaunch({ mode, proxyPort: proxy.port, worktree, stateDir: this.deps.stateDir, sessionId });
-    const problems = presetArgProblems(launch);
+    const launch = buildBrowserLaunch({ mode, proxyPort: proxy.port, worktree, stateDir: this.deps.stateDir, sessionId, nodePath, cliPath });
+    const problems = presetArgProblems(launch, cliPath);
     if (problems.length) return { skip: `the browser's launch line failed its own check (${problems[0]})` };
     try {
       mkdirSync(dirname(launch.configPath), { recursive: true });
@@ -291,7 +393,7 @@ export class BrowserService {
 
     // A new server process means a new, empty browser: the old page (and any hold on it) is gone.
     this.gate.pageGone(sessionId);
-    this.runtimes.set(sessionId, { mode, integrationId: integration.id });
+    this.runtimes.set(sessionId, { mode, integrationId: integration.id, worktree });
     return { type: "stdio", command: launch.command, args: launch.args };
   }
 
@@ -300,8 +402,21 @@ export class BrowserService {
   readonly kindGate = (ctx: McpKindGateContext): McpKindVerdict => {
     const verdict = this.gate.gate(ctx);
     if (verdict?.kind !== "deny") this.retireOtherHeadedBrowsers(ctx.session.id);
-    return verdict;
+    return this.withRefusals(ctx.session.id, verdict);
   };
+
+  /**
+   * Tell the model, with the verdict it is about to get, which requests the network block refused
+   * since its last browser call. In the page a refusal looks like `HTTP status: 403` (http) or
+   * `net::ERR_TUNNEL_CONNECTION_FAILED` (https); this says plainly that it was Anvil's policy.
+   */
+  private withRefusals(sessionId: string, verdict: McpKindVerdict): McpKindVerdict {
+    const list = this.refusals.get(sessionId);
+    if (!list?.length || !verdict || verdict.kind === "prompt") return verdict;
+    this.refusals.delete(sessionId);
+    const text = `Blocked by Anvil's network policy since your last browser call (the agent browser cannot reach private, local or fleet addresses; do not retry them): ${list.join("; ")}`;
+    return verdict.kind === "allow" ? { ...verdict, context: text } : { ...verdict, reason: `${verdict.reason}\n\n${text}` };
+  }
 
   /**
    * The headed profile can be open in one Chrome only, and a session's browser outlives its turn. So
@@ -323,14 +438,36 @@ export class BrowserService {
 
   onToolResult(sessionId: string, result: Parameters<BrowserGate["onResult"]>[1]): void {
     const rt = this.runtimes.get(sessionId);
-    this.gate.onResult(sessionId, result, rt?.mode ?? "headed");
-    // Item 34: a headed launch that fails falls back to headless from the next turn on.
+    const { purge } = this.gate.onResult(sessionId, result, rt?.mode ?? "headed");
+    // The result showed a page the session may not see (a site that is not allowed): the snapshot
+    // and screenshot files it wrote into the output folder are deleted before any tool can read them.
+    if (purge && rt) this.purgeResultFiles(rt.worktree, toolResultText(result.content));
+    // Item 34: a headed launch that fails falls back to headless from the next turn on. Only an ERROR
+    // result whose `### Error` section starts with the launch call counts — text further in (a URL,
+    // a page's own words) does not.
     if (rt?.mode === "headed" && result.isError && !this.headedFailed) {
       const text = toolResultText(result.content);
-      if (/browserType\.launch|Failed to launch|launchPersistentContext/i.test(text) && !/already in use/i.test(text)) {
+      if (/^\s*### Error[ \t]*\r?\n\s*(?:Error: )?browserType\.launch(?:PersistentContext)?\b/.test(text) && !/already in use/i.test(text.split(/\r?\n/).slice(0, 3).join("\n"))) {
         this.headedFailed = true;
         this.deps.notice(sessionId, "⚠️ _The headed browser could not start on this machine. From the next turn the agent browser runs headless with a throwaway profile; press Check in Settings → Integrations to try headed again._");
         this.deps.requestRebuild(sessionId);
+      }
+    }
+  }
+
+  /** Delete the files a result says it wrote, when they sit directly in this session's output folder. */
+  private purgeResultFiles(worktree: string, text: string): void {
+    let out: string;
+    try {
+      out = realpathSync(join(worktree, BROWSER_OUTPUT_DIRNAME));
+    } catch {
+      return;
+    }
+    for (const file of resultFileLinks(text)) {
+      try {
+        if (realpathSync(dirname(file)) === out) rmSync(file, { force: true });
+      } catch {
+        /* not there */
       }
     }
   }
@@ -342,16 +479,26 @@ export class BrowserService {
     this.runtimes.delete(sessionId);
     this.proxies.closeSession(sessionId);
     this.gate.forget(sessionId);
+    this.refusals.delete(sessionId);
   }
 
   // ── Phase C4 ────────────────────────────────────────────────────────────────────────────────
 
-  /** Let this session's browser reach one loopback port (its throwaway test daemon). False when the
-   *  session has no running proxy. */
+  /**
+   * The test-daemon launcher registers the port of the throwaway daemon it started for this session.
+   * Only a registered port can be opened. Refused: this daemon's own port, a privileged port, a
+   * browser proxy's port, a port registered for another session.
+   */
+  registerTestDaemon(sessionId: string, port: number): { ok: true } | { ok: false; reason: string } {
+    return this.proxies.registerTestDaemon(sessionId, port);
+  }
+  /** Let this session's browser reach its registered test daemon's port. False when the session has
+   *  no running proxy or the port was not registered for it. */
   allowLoopbackPort(sessionId: string, port: number): boolean {
     return this.proxies.allowLoopbackPort(sessionId, port);
   }
-  /** Close it again; with no port, every exemption the session has. */
+  /** Close it again (open connections to it are dropped) and forget the registration; with no port,
+   *  everything the session has. */
   revokeLoopbackPort(sessionId: string, port?: number): void {
     this.proxies.revoke(sessionId, port);
   }
@@ -367,6 +514,8 @@ export class BrowserService {
     const reason = "the agent browser's profile, allowed-sites list and launch files are off limits to the session";
     if (ctx.tool === "Bash") {
       const cmd = typeof ctx.input.command === "string" ? ctx.input.command : "";
+      const api = daemonApiCommandProblem(cmd, this.selfPort);
+      if (api) return { kind: "deny", reason: api };
       if (guarded.some((p) => cmd.includes(p)) || /\bbrowser-profile\b|\bbrowser-sites\.json\b/.test(cmd)) return { kind: "deny", reason };
       return undefined;
     }

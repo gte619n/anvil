@@ -256,6 +256,10 @@ describe("per-session listeners and the loopback exemption", () => {
     manager.ensure("sess_b");
     expect(await viaSession("sess_a", target.url("/page2"))).toBe(403);
 
+    expect(manager.allowLoopbackPort("sess_a", target.port)).toBe(false); // a bare port: not registered by the launcher
+    expect(await viaSession("sess_a", target.url("/page2"))).toBe(403);
+    expect(manager.registerTestDaemon("sess_a", target.port)).toEqual({ ok: true });
+    expect(manager.allowLoopbackPort("sess_b", target.port)).toBe(false); // registered for another session
     expect(manager.allowLoopbackPort("sess_a", target.port)).toBe(true);
     expect(await viaSession("sess_a", target.url("/page2"))).toBe(200);
     expect(await viaSession("sess_a", target.url("/page2", "localhost").replace("localhost", "127.0.0.1"))).toBe(200);
@@ -268,10 +272,44 @@ describe("per-session listeners and the loopback exemption", () => {
     expect(await viaSession("sess_a", target.url("/page2"))).toBe(403);
     expect(manager.allowLoopbackPort("sess_none", target.port)).toBe(false); // no listener → nothing opened
 
-    manager.allowLoopbackPort("sess_a", target.port);
+    expect(manager.allowLoopbackPort("sess_a", target.port)).toBe(false); // revoke forgot the registration too
+    manager.registerTestDaemon("sess_a", target.port);
+    expect(manager.allowLoopbackPort("sess_a", target.port)).toBe(true);
     manager.revoke("sess_a"); // every exemption
     expect(await viaSession("sess_a", target.url("/page2"))).toBe(403);
     expect(target.requests).toHaveLength(2);
+  });
+
+  test("[C2] the daemon's own port can never be opened, and revoke destroys the tunnels that are open to the port", async () => {
+    const own = new BrowserProxyManager(options({ selfPort: () => target.port }));
+    try {
+      own.ensure("sess_a");
+      expect(own.registerTestDaemon("sess_a", target.port)).toEqual({ ok: false, reason: expect.stringMatching(/own port/) });
+      expect(own.allowLoopbackPort("sess_a", target.port)).toBe(false);
+      expect(own.get("sess_a")!.allowLoopbackPort(target.port)).toBe(false); // even asked directly
+      expect(own.get("sess_a")!.allowLoopbackPort(own.get("sess_a")!.port)).toBe(false); // nor its own listener
+    } finally {
+      own.stop();
+    }
+
+    // An open WebSocket-style tunnel to the exempt port is cut the moment the exemption goes.
+    manager.ensure("sess_a");
+    manager.registerTestDaemon("sess_a", target.port);
+    manager.allowLoopbackPort("sess_a", target.port);
+    const port = manager.get("sess_a")!.port;
+    let closed = false;
+    const sock = connect({ host: "127.0.0.1", port }, () => sock.write(`CONNECT 127.0.0.1:${target.port} HTTP/1.1\r\nHost: 127.0.0.1:${target.port}\r\n\r\n`));
+    const established = await new Promise<string>((resolve) => sock.once("data", (d) => resolve(d.toString("latin1"))));
+    expect(established).toContain("200 Connection Established");
+    sock.on("close", () => (closed = true));
+    sock.on("error", () => (closed = true));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(closed).toBe(false); // the tunnel is idle and open
+    manager.revoke("sess_a", target.port);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(closed).toBe(true);
+    sock.destroy();
+    expect(await viaSession("sess_a", target.url("/page2"))).toBe(403);
   });
 
   test("[C2] proxy dies: the browser has no route out (its port refuses connections), the state reports stopped, and Check recovers", async () => {

@@ -1,35 +1,50 @@
 /**
  * The browser's approval model (agent-cad-and-browser §4.12 "Per-site approval", §4.14 items 23–26
- * and 43): the kind gate `decide()` consults before every `mcp__browser__*` call, and what the daemon
- * learns from every result.
+ * and 43, as hardened by the Phase C2 review): the kind gate `decide()` consults before every
+ * `mcp__browser__*` call, and what the daemon learns from every result.
  *
  * Before a call, in this order:
  *   1. No network block running for this session → deny (fail closed).
- *   2. Tool not in the closed table, `browser_run_code_unsafe`, `browser_evaluate`, or a `filename`
+ *   2. CLOSING (a refused page is still open) → only `browser_navigate` with the url written exactly
+ *      `about:blank`, or `browser_close`, is allowed.
+ *   3. Tool not in the closed table, `browser_run_code_unsafe`, `browser_evaluate`, or a `filename`
  *      argument that is absolute or has `..` → deny.
- *   3. A navigation target that is not `http:`/`https:` (or `about:blank`) → deny.
- *   4. The session is CLOSING a refused page (see below) → only the way out is allowed. (Checked
- *      first: in that state a `browser_navigate` is rewritten, so its own target does not matter.)
- *   5. The session is on HOLD (the last result put the page somewhere not allowed) → prompt for that
- *      site, whatever the call is, under every policy.
- *   6. A navigation to a site not yet allowed → prompt "Allow once / Always allow <site> / Deny".
+ *   4. A navigation target that is not a plain `http:`/`https:` URL in its normal form (or exactly
+ *      `about:blank`) → deny. The string that is checked is the string that is forwarded.
+ *   5. `browser_navigate_back` after the owner refused a page in this browser → deny (the history
+ *      holds that page). `browser_tabs select` of a tab known to be on a refused site → deny; of a tab
+ *      known to be on a site not yet allowed → the site prompt, before the tab is shown.
+ *   6. UNKNOWN (the last result did not say where the current tab is — see below) → only the calls
+ *      that establish it are allowed.
+ *   7. HOLD (the current tab is on a site that is not allowed, or the last result could not be
+ *      trusted) → prompt, whatever the call is, under every policy.
+ *   8. A navigation to a site not yet allowed → prompt "Allow once / Always allow <site> / Deny".
  *      Under `bypass` the prompt is skipped and the site counts as allowed for the session.
- *   7. An upload → always prompt, paths inside the worktree only.
- *   8. Everything else on an allowed site → allow (Phase C3 adds logged-in-site rules here).
+ *   9. An upload → always prompt, paths inside the worktree only.
+ *  10. Everything else on an allowed site → allow (Phase C3 adds logged-in-site rules here).
  *
- * After a result: the `- Page URL:` line under `### Page` is the page's address (absent = unchanged).
- * More than one `### Page` block, or a page on a site that is not allowed, puts the session on HOLD.
+ * After a result (`readPage` in sites.ts): the CURRENT TAB's address comes from the server's own
+ * `### Page` block or tab list — never from a tool whose result is page text, never from an error,
+ * and never from a block in a place a page could have written. Then:
+ *   - ambiguous → HOLD (ambiguous);
+ *   - known → on a site that is not allowed: HOLD (that site), and the caller deletes the snapshot
+ *     and screenshot files the result wrote; on a scheme that is not allowed, or a logged-in site in
+ *     headless mode: CLOSING;
+ *   - not known → after a call that changes which page is shown (`browser_navigate`,
+ *     `browser_navigate_back`, `browser_tabs` new / select / close): UNKNOWN("navigation") — only
+ *     `browser_snapshot` and `browser_tabs list` (and the way out) may run next, and their result
+ *     sets the address. After an input-class call (click, key, type, fill, select, drag, dialog,
+ *     drop, upload): UNKNOWN("input") — the page may have moved by itself, so read-class calls may
+ *     run but no further input until a result says where the tab is.
+ *   Residual, inherent to learning the address from results: when a page navigates by itself, the
+ *   ONE call that reveals it (a read, or the input call that caused it) runs on the new site.
  *
- * HOLD and `about:blank`. The daemon has no connection of its own to the Playwright server (it is a
- * child of the Claude CLI), so it cannot navigate by itself. When the owner answers Deny on a hold:
- *   - if the held call is `browser_navigate`, the gate ALLOWS it with its input replaced by
- *     `{ url: "about:blank" }` — the navigation to `about:blank` happens right then;
- *   - otherwise the held call is denied and the session is CLOSING: every browser call is denied
- *     except `browser_navigate` (whose input is replaced the same way, whatever URL the model sent)
- *     and `browser_close`. The page can be neither read nor acted on until a result reports
- *     `about:blank` (or the browser closed), which ends CLOSING.
- * An unattended session, a page on a scheme that is not allowed, and a logged-in site reached in
- * headless mode go straight to CLOSING with no prompt.
+ * Deny. The daemon has no connection of its own to the browser, so it cannot navigate by itself, and
+ * nothing here depends on the CLI applying a rewritten input. When the owner answers Deny on a hold
+ * the held call is denied and the session is CLOSING until a result reports `about:blank` (or the
+ * browser is closed). The refused site is remembered for the session: going back in history is
+ * refused, and so is selecting a tab known to be on it. An unattended session, a page on a scheme
+ * that is not allowed, and a logged-in site reached in headless mode go straight to CLOSING.
  *
  * Approvals: "Always allow" is written to the fleet's allowed-sites list (hub-synced, persistent);
  * "Allow once" is remembered for this session only, in memory, and dies with it.
@@ -38,16 +53,25 @@ import type { PermissionSuggestion } from "@protocol";
 import type { McpKindGateContext, McpKindVerdict, McpToolResult } from "../agent/mcp-gate";
 import { isUnattended } from "../agent/protected";
 import type { BrowserMode } from "./preset";
-import { checkUrl, parsePageReport, toolResultText } from "./sites";
+import { CHROME_ERROR_URL, checkNavigationInput, checkUrl, readPage, toolResultText, type TabEntry, type UrlVerdict } from "./sites";
 import { classifyBrowserTool, filenameProblem, uploadPathProblem, uploadPaths, type BrowserToolClass } from "./tools";
 
-export const BLANK_INPUT = { url: "about:blank" } as const;
+export const BLANK_URL = "about:blank";
 
 export interface BrowserSessionState {
   /** Sites answered "Allow once" (or allowed by `bypass`) in this session. */
   once: Set<string>;
-  /** The last page URL a result reported. */
+  /** Sites the owner refused in this session. */
+  denied: Set<string>;
+  /** The current tab's address, as last established by a result. */
   currentUrl?: string;
+  /** The current tab's address is NOT known: the last result that could have changed it did not say.
+   *  `navigation`: a call that changes the page. `input`: an input-class call. */
+  unknown?: "navigation" | "input";
+  /** The tabs as last listed by the server (only entries whose URL could be read with certainty). */
+  tabs?: TabEntry[];
+  /** The owner refused a page that this browser's history still holds: no going back. */
+  backBlocked?: boolean;
   hold?: { kind: "site"; site: string; url: string } | { kind: "ambiguous" };
   /** CLOSING: the page must go to `about:blank` before anything else. */
   closing?: { reason: string };
@@ -59,6 +83,9 @@ export interface BrowserActionInfo {
   cls: BrowserToolClass;
   /** The site of the page the session is on (undefined before the first page, or on `about:blank`). */
   currentSite?: string;
+  /** True when the current tab's address is not known (see `BrowserSessionState.unknown`). Phase C3
+   *  must then assume the worst (a locked logged-in site), never "not logged in". */
+  currentUnknown?: boolean;
   /** For a navigation with a target: where it goes. */
   target?: { site: string; url: string };
   mode: BrowserMode;
@@ -119,7 +146,7 @@ export class BrowserGate {
 
   state(sessionId: string): BrowserSessionState {
     let st = this.states.get(sessionId);
-    if (!st) this.states.set(sessionId, (st = { once: new Set() }));
+    if (!st) this.states.set(sessionId, (st = { once: new Set(), denied: new Set() }));
     return st;
   }
 
@@ -132,9 +159,16 @@ export class BrowserGate {
   pageGone(sessionId: string): void {
     const st = this.states.get(sessionId);
     if (!st) return;
+    this.resetPage(st);
+  }
+
+  private resetPage(st: BrowserSessionState): void {
     st.currentUrl = undefined;
     st.hold = undefined;
     st.closing = undefined;
+    st.unknown = undefined;
+    st.tabs = undefined;
+    st.backBlocked = undefined;
   }
 
   private siteAllowed(st: BrowserSessionState, site: string): boolean {
@@ -154,12 +188,23 @@ export class BrowserGate {
     if (!rt.proxyRunning) return { kind: "deny", reason: "the browser's network block is not running, so the browser is not allowed to act (press Check in Settings → Integrations)" };
 
     const st = this.state(ctx.session.id);
-    // CLOSING comes first: the only calls it lets through have their input replaced or take none.
+    // CLOSING comes first: only the way out is open.
     if (st.closing) return this.closingVerdict(ctx, st);
 
     // What the call would get on its own merits. A call that is refused anyway never costs a prompt.
     const plan = this.plan(ctx, st, rt.mode);
     if (plan.verdict.kind === "deny") return plan.verdict;
+
+    // UNKNOWN: nothing acts on a page whose address the daemon does not know.
+    if (st.unknown && !this.establishesPage(ctx, st.unknown)) {
+      return {
+        kind: "deny",
+        reason:
+          st.unknown === "navigation"
+            ? "Anvil does not know which page the browser is showing after the last call. Call browser_snapshot (or browser_tabs with action \"list\") first; nothing else runs until then."
+            : "the last action may have moved the page, and its result did not say where the page is. Call browser_snapshot first; no further action runs until then.",
+      };
+    }
 
     if (st.hold) {
       // The owner may have allowed the site in Settings since the hold began.
@@ -171,7 +216,20 @@ export class BrowserGate {
     return plan.verdict;
   };
 
-  /** Steps 2, 3 and 6–8: the verdict for this call with no hold in the way. No side effects. */
+  /** Whether this call is one that may run while the page's address is unknown: the calls whose
+   *  result establishes it, the way out, and — after an input-class call only — any read. */
+  private establishesPage(ctx: McpKindGateContext, unknown: "navigation" | "input"): boolean {
+    if (ctx.tool === "browser_snapshot" || ctx.tool === "browser_close") return true;
+    if (ctx.tool === "browser_tabs" && ctx.input.action === "list") return true;
+    if (ctx.tool === "browser_navigate" && ctx.input.url === BLANK_URL) return true;
+    if (unknown === "input") {
+      const cls = classifyBrowserTool(ctx.tool, ctx.input);
+      return "cls" in cls && cls.cls === "read";
+    }
+    return false;
+  }
+
+  /** Steps 3–5 and 8–10: the verdict for this call with no hold in the way. No side effects. */
   private plan(ctx: McpKindGateContext, st: BrowserSessionState, mode: BrowserMode): Plan {
     const cls = classifyBrowserTool(ctx.tool, ctx.input);
     if ("deny" in cls) return deny(cls.deny);
@@ -181,7 +239,7 @@ export class BrowserGate {
 
     const current = st.currentUrl ? checkUrl(st.currentUrl) : undefined;
     const currentSite = current?.ok && "site" in current ? current.site : undefined;
-    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(currentSite ? { currentSite } : {}) };
+    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(currentSite ? { currentSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}) };
     const session = ctx.session;
 
     if (cls.cls === "script") {
@@ -208,13 +266,23 @@ export class BrowserGate {
       };
     }
 
-    // A navigation that names where it goes: browser_navigate {url}, browser_tabs {action:"new", url}.
+    // Going back after the owner refused a page: the history holds that page.
+    if (ctx.tool === "browser_navigate_back" && st.backBlocked) {
+      return deny("going back is not allowed after the owner refused a page in this browser (the history holds it); open the page you want with browser_navigate");
+    }
+
+    // A navigation that names where it goes: browser_navigate {url}, browser_tabs {action:"new", url}
+    // — and browser_tabs {action:"select"} of a tab whose address the server listed.
     const hasTarget = ctx.tool === "browser_navigate" || (ctx.tool === "browser_tabs" && ctx.input.action === "new" && ctx.input.url !== undefined);
-    if (hasTarget) {
-      const target = checkUrl(ctx.input.url);
-      if (!target.ok) return deny(target.reason);
+    const selected = ctx.tool === "browser_tabs" && ctx.input.action === "select" ? st.tabs?.find((t) => t.index === ctx.input.index)?.url : undefined;
+    if (hasTarget || selected !== undefined) {
+      // A URL the model wrote is forwarded as written, so it is held to its normal form; a tab's
+      // address came from the server and is only read.
+      const target: UrlVerdict = hasTarget ? checkNavigationInput(ctx.input.url) : selected === CHROME_ERROR_URL ? { ok: true, blank: true } : checkUrl(selected);
+      if (!target.ok) return deny(hasTarget ? target.reason : `that tab is on an address that is not allowed (${target.reason})`);
       if ("blank" in target) return { verdict: { kind: "allow", reason: "about:blank" } };
       const { site, url } = target;
+      if (!hasTarget && st.denied.has(site) && !this.siteAllowed(st, site)) return deny(`that tab is on ${site}, which the owner refused in this session`);
       if (mode === "headless" && this.loggedIn(site)) {
         return deny(`${site} is a logged-in site, and this machine's agent browser is running headless with a throwaway profile; it can only be opened in the headed browser, at the desk`);
       }
@@ -229,6 +297,7 @@ export class BrowserGate {
             suggestions: SITE_SUGGESTIONS(site),
             denyWhenUnattended: true,
             onAnswer: (decision) => this.recordApproval(st, site, decision, session.id),
+            onDeny: () => void st.denied.add(site),
           },
         };
       }
@@ -247,15 +316,18 @@ export class BrowserGate {
   }
 
   private recordApproval(st: BrowserSessionState, site: string, decision: string, sessionId: string): void {
+    st.denied.delete(site); // the owner changed their mind
     if (decision === "allow_always") this.deps.allowSiteAlways(site, sessionId);
     else st.once.add(site);
   }
 
   private closingVerdict(ctx: McpKindGateContext, st: BrowserSessionState): McpKindVerdict {
     const why = st.closing!.reason;
-    if (ctx.tool === "browser_navigate") return { kind: "allow", reason: `${why}: the page is sent to about:blank`, updatedInput: { ...BLANK_INPUT } };
+    // The call itself must already be the way out. Nothing is rewritten: the gate does not rely on
+    // the CLI applying a replacement input.
+    if (ctx.tool === "browser_navigate" && ctx.input.url === BLANK_URL) return { kind: "allow", reason: `${why}: the page is sent to about:blank` };
     if (ctx.tool === "browser_close") return { kind: "allow", reason: `${why}: the browser is closed` };
-    return { kind: "deny", reason: `${why}. The page must be left before anything else: call browser_navigate (it will open about:blank, whatever url you pass) or browser_close.` };
+    return { kind: "deny", reason: `${why}. The page must be left before anything else: call browser_navigate with the url written exactly "about:blank", or browser_close. Nothing else runs until then.` };
   }
 
   private startClosing(st: BrowserSessionState, reason: string): void {
@@ -289,9 +361,11 @@ export class BrowserGate {
         return undefined;
       },
       onDeny: () => {
+        if (hold.kind === "site") st.denied.add(hold.site);
+        st.backBlocked = true; // the refused page is in this browser's history
         this.startClosing(st, refused);
-        const v = this.closingVerdict(ctx, st);
-        if (v?.kind === "allow" && v.updatedInput) return { allow: { updatedInput: v.updatedInput, reason: v.reason } };
+        // The held call is refused even when it is itself the way out: it was asked about the page.
+        const v = this.closingVerdict({ ...ctx, tool: "", input: {} }, st);
         return { deny: v?.kind === "deny" ? v.reason : refused };
       },
     };
@@ -299,35 +373,54 @@ export class BrowserGate {
 
   // ── after a result ──────────────────────────────────────────────────────────────────────────
 
-  /** The kind result hook: read where the page is now and decide whether the next call is held. */
-  onResult(sessionId: string, result: McpToolResult, mode: BrowserMode = "headed"): void {
+  /**
+   * The kind result hook: read where the current tab is now and decide whether the next call is
+   * held. Returns `purge: true` when the result showed a page the session may not see yet (a site
+   * that is not allowed, or a refused address): the caller deletes the files that result wrote.
+   */
+  onResult(sessionId: string, result: McpToolResult, mode: BrowserMode = "headed"): { purge: boolean } {
     const st = this.state(sessionId);
     if (result.tool === "browser_close" && !result.isError) {
-      st.currentUrl = undefined;
-      st.hold = undefined;
-      st.closing = undefined;
-      return;
+      this.resetPage(st);
+      return { purge: false };
     }
-    const report = parsePageReport(toolResultText(result.content));
-    if (report.blocks > 1) {
+    const reading = readPage(result.tool, toolResultText(result.content), result.isError);
+    const cls = classifyBrowserTool(result.tool, result.input);
+    const changesPage = result.tool === "browser_navigate" || result.tool === "browser_navigate_back" || (result.tool === "browser_tabs" && result.input.action !== "list");
+    if (reading.kind === "ambiguous") {
       if (!st.closing) st.hold = { kind: "ambiguous" };
-      return;
+      return { purge: false };
     }
-    if (!report.url) return; // no page block: the address is unchanged
-    st.currentUrl = report.url;
-    const where = checkUrl(report.url);
+    if (reading.tabs) st.tabs = reading.tabs;
+    else if (changesPage) st.tabs = undefined; // the list we had may no longer be true
+    if (reading.kind === "none") {
+      if (changesPage) st.unknown = "navigation";
+      else if ("cls" in cls && (cls.cls === "input" || cls.cls === "upload" || cls.cls === "script")) st.unknown ??= "input";
+      return { purge: false };
+    }
+
+    st.unknown = undefined;
+    st.currentUrl = reading.url;
+    const where: UrlVerdict = reading.url === CHROME_ERROR_URL ? { ok: true, blank: true } : checkUrl(reading.url);
     if (where.ok && "blank" in where) {
       st.hold = undefined;
-      st.closing = undefined;
-      return;
+      if (reading.url !== CHROME_ERROR_URL) st.closing = undefined; // only about:blank ends CLOSING
+      return { purge: false };
     }
-    if (st.closing) return; // still has to leave
-    if (!where.ok) return this.startClosing(st, `the page moved to an address that is not allowed (${where.reason})`);
-    if (mode === "headless" && this.loggedIn(where.site)) return this.startClosing(st, `the page moved to ${where.site}, a logged-in site that the headless browser may not open`);
+    if (st.closing) return { purge: true }; // still has to leave
+    if (!where.ok) {
+      this.startClosing(st, `the page moved to an address that is not allowed (${where.reason})`);
+      return { purge: true };
+    }
+    if (mode === "headless" && this.loggedIn(where.site)) {
+      this.startClosing(st, `the page moved to ${where.site}, a logged-in site that the headless browser may not open`);
+      return { purge: true };
+    }
     if (this.siteAllowed(st, where.site)) {
       if (st.hold?.kind === "site") st.hold = undefined;
-      return;
+      return { purge: false };
     }
     st.hold = { kind: "site", site: where.site, url: where.url };
+    return { purge: true };
   }
 }

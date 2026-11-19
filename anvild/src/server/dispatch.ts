@@ -350,6 +350,16 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "browser.runtime.install":
+        deps.supervisor
+          .browserRuntimeInstall()
+          .then(() => {
+            send(deps.supervisor.mcpIntegrationsEvent());
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "prompt.list":
         send(deps.supervisor.promptsEvent());
         if (cid) send(ack(cid));

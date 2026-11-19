@@ -28,7 +28,7 @@ export const BROWSER_INTEGRATION: Omit<McpIntegration, "id"> = {
   key: "browser",
   kind: "browser",
   label: "Browser",
-  transport: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@0.0.86"] },
+  transport: { type: "stdio", command: "node", args: ["@playwright/mcp@0.0.86 (pinned runtime in the daemon's state folder)"] },
   exclusive: true,
   enabled: true,
 };
@@ -90,6 +90,25 @@ export function browserInfoView(b: BrowserIntegrationInfo): { mode: string; prox
   };
 }
 
+/** Package runners read their configuration (`.npmrc`, `node_modules`) from the working directory —
+ *  the session's repo, which the agent can write. Mirrors the daemon's list (src/mcp/validate.ts). */
+export const PACKAGE_RUNNERS: readonly string[] = ["npx", "npm", "bunx", "pnpm", "yarn"];
+export const PACKAGE_RUNNER_WARNING = "Package runners read config from the session's repo; prefer an absolute path to an installed server.";
+/** The warning for a command line (or a stored command) that starts a package runner, else "". */
+export function packageRunnerWarning(command: string): string {
+  const first = command.trim().split(/\s+/)[0] ?? "";
+  const name = first.split("/").pop() ?? "";
+  return PACKAGE_RUNNERS.includes(name) ? PACKAGE_RUNNER_WARNING : "";
+}
+
+/** The browser row's runtime line: installed, installing, or missing with an Install button. */
+export function runtimeLineHtml(r: NonNullable<BrowserIntegrationInfo["runtime"]>): string {
+  if (r.state === "installed") return `<div class="small muted mcp-browser-runtime" data-runtime="installed">${icon("inventory_2")} Browser runtime installed: ${esc(r.package)}, in the daemon's own folder</div>`;
+  if (r.state === "installing") return `<div class="small muted mcp-browser-runtime" data-runtime="installing">${icon("downloading")} Installing the browser runtime (${esc(r.package)})…</div>`;
+  return `<div class="small mcp-browser-runtime bad" data-runtime="missing">${icon("error")} Browser runtime not installed: ${esc(r.reason ?? "unknown")}
+      <button type="button" class="mini mcp-runtime-install" title="Download ${esc(r.package)} into the daemon's own folder (needs the npm registry once)">${icon("download")} Install browser runtime</button></div>`;
+}
+
 /** What the transport looks like on a row: the command line, or the URL. */
 export function transportText(i: McpIntegration): string {
   return i.transport.type === "http" ? i.transport.url : [i.transport.command, ...i.transport.args].join(" ");
@@ -116,7 +135,9 @@ export function mcpRowHtml(i: McpIntegrationStatus, heldByTitle?: string): strin
     <div class="small mcp-browser-proxy${v.proxyOk ? " muted" : " bad"}" data-proxy="${esc(i.browser!.proxy.state)}">${icon(v.proxyOk ? "shield" : "gpp_bad")} ${esc(v.proxy)}</div>`)(browserInfoView(i.browser))
         : ""
     }
+    ${i.browser?.runtime ? runtimeLineHtml(i.browser.runtime) : ""}
     <div class="small muted mcp-transport"><code>${esc(transportText(i))}</code></div>
+    ${i.kind === "custom" && i.transport.type === "stdio" && packageRunnerWarning(i.transport.command) ? `<div class="small mcp-runner-warning">${icon("warning")} ${esc(PACKAGE_RUNNER_WARNING)}</div>` : ""}
   </div>`;
 }
 
@@ -343,6 +364,14 @@ export function renderMcpPanel(): void {
     sec.querySelector<HTMLButtonElement>(".mcp-add")?.addEventListener("click", (ev) => {
       toggleHeaderMenu(ev.currentTarget as HTMLElement, addMenuItems(srv));
     });
+    sec.querySelectorAll<HTMLButtonElement>(".mcp-runtime-install").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        toast(`Installing the browser runtime on ${srv.name}…`);
+        if (await sendMcp(srv, { type: "browser.runtime.install" }, 600_000)) toast(`The browser runtime is installed on ${srv.name}.`);
+        else b.disabled = false;
+      }),
+    );
     sec.querySelectorAll<HTMLElement>(".mcp-row").forEach((row) => {
       const i = (serverMcp.get(srv.url) ?? []).find((x) => x.id === row.dataset.mcpId);
       if (!i) return;
@@ -379,9 +408,9 @@ export function addMenuItems(srv: Server): HeaderMenuItem[] {
 }
 
 /** Send one `mcp.*` command and surface a refusal as a toast. Resolves true on success. */
-async function sendMcp(srv: Server, cmd: Record<string, unknown> & { type: string }): Promise<boolean> {
+async function sendMcp(srv: Server, cmd: Record<string, unknown> & { type: string }, timeoutMs = 20_000): Promise<boolean> {
   try {
-    const res = await sendAwait(srv, { ...cmd, cid: newCid() }, 20_000);
+    const res = await sendAwait(srv, { ...cmd, cid: newCid() }, timeoutMs);
     if (res.type === "command.error") {
       toast(res.message);
       return false;
@@ -404,7 +433,8 @@ export function showAddCustom(srv: Server): void {
     <label>Type<select id="mcp-dlg-type"><option value="stdio">Command (stdio)</option><option value="http">Local URL (http)</option></select></label>
     <label id="mcp-dlg-cmd-row">Command<input id="mcp-dlg-cmd" type="text" autocapitalize="off" spellcheck="false" placeholder="my-mcp-server --root {cwd}" /></label>
     <label id="mcp-dlg-url-row" hidden>URL<input id="mcp-dlg-url" type="text" autocapitalize="off" spellcheck="false" placeholder="http://127.0.0.1:8123/mcp" /></label>
-    <p class="small muted" id="mcp-dlg-hint"><code>{cwd}</code> becomes the session's worktree. The server starts with only PATH, HOME and TMPDIR.</p>
+    <p class="small muted" id="mcp-dlg-hint"><code>{cwd}</code> becomes the session's worktree. The server starts with only PATH, HOME and TMPDIR. Use a bare command name or an absolute path.</p>
+    <p class="small mcp-runner-warning" id="mcp-dlg-runner-warning" hidden>${icon("warning")} ${esc(PACKAGE_RUNNER_WARNING)}</p>
     <label class="cd-option"><input type="checkbox" id="mcp-dlg-exclusive"> One session at a time</label>
     <div id="mcp-dlg-status" class="small muted" role="status"></div>
     <div class="btns"><button type="button" id="mcp-dlg-cancel">Cancel</button><button type="button" id="mcp-dlg-ok" class="primary">Add</button></div>
@@ -421,6 +451,12 @@ export function showAddCustom(srv: Server): void {
     $("#mcp-dlg-url-row").hidden = !http;
     $("#mcp-dlg-hint").hidden = http;
   });
+  const cmdInput = $<HTMLInputElement>("#mcp-dlg-cmd");
+  const showRunnerWarning = (): void => {
+    $("#mcp-dlg-runner-warning").hidden = type.value === "http" || !packageRunnerWarning(cmdInput.value);
+  };
+  cmdInput.addEventListener("input", showRunnerWarning);
+  type.addEventListener("change", showRunnerWarning);
   $<HTMLButtonElement>("#mcp-dlg-cancel").onclick = closeModal;
   $<HTMLInputElement>("#mcp-dlg-label").focus();
   $<HTMLButtonElement>("#mcp-dlg-ok").addEventListener("click", async () => {

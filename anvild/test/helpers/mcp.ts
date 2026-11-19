@@ -127,6 +127,8 @@ export function callHook(session: Session, broker: PermissionBroker, tool: strin
 export interface FullHookOutcome extends HookOutcome {
   /** The input the tool will actually run with (the gate may have replaced it). */
   updatedInput?: Record<string, unknown>;
+  /** Text the hook hands the model with this call's result. */
+  additionalContext?: string;
 }
 
 /** As `callHook`, and also returns the input the hook hands back to the SDK. */
@@ -136,6 +138,7 @@ export function callHookFull(session: Session, broker: PermissionBroker, tool: s
     decision: out.hookSpecificOutput.permissionDecision,
     reason: out.hookSpecificOutput.permissionDecisionReason,
     updatedInput: out.hookSpecificOutput.updatedInput,
+    additionalContext: out.hookSpecificOutput.additionalContext,
   }));
 }
 

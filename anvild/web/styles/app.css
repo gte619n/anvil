@@ -331,6 +331,12 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .mcp-row .mcp-browser-mode, .mcp-row .mcp-browser-proxy { margin-top: 6px; display: flex; align-items: center; gap: 4px; overflow-wrap: anywhere; }
 .mcp-row .mcp-browser-mode .msym, .mcp-row .mcp-browser-proxy .msym { font-size: 15px; flex-shrink: 0; }
 .mcp-row .mcp-browser-proxy.bad { color: var(--danger); }
+.mcp-row .mcp-browser-runtime { margin-top: 6px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; overflow-wrap: anywhere; }
+.mcp-row .mcp-browser-runtime .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-row .mcp-browser-runtime.bad { color: var(--danger); }
+.mcp-runner-warning { display: flex; align-items: center; gap: 4px; color: var(--warn); margin-top: 6px; }
+.mcp-runner-warning .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-runner-warning[hidden] { display: none; }
 .browser-site-row .card-main { display: flex; align-items: center; gap: 6px; }
 .browser-site-add-row { margin-top: 8px; gap: 6px; }
 .browser-site-add-row input { flex: 1; min-width: 0; }

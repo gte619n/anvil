@@ -72,6 +72,28 @@ export function checkUrl(raw: unknown): UrlVerdict {
   return { ok: true, site: registrableDomain(u.hostname), url: u.href };
 }
 
+/** Chrome's own "this page could not be loaded" page: browser-made, belongs to no site. */
+export const CHROME_ERROR_URL = "chrome-error://chromewebdata/";
+
+/**
+ * As `checkUrl`, for a URL the MODEL wrote and the gate will forward to the server unchanged. The
+ * string that is checked must be the string that is sent, so anything a second parser could read
+ * differently is refused rather than repaired: surrounding or embedded whitespace, control
+ * characters, backslashes, and any spelling whose normalized form (`new URL(raw).href`) is not the
+ * raw string itself (a bare origin may omit its final `/`). `about:blank` must be written exactly.
+ */
+export function checkNavigationInput(raw: unknown): UrlVerdict {
+  if (typeof raw !== "string" || !raw) return { ok: false, reason: "a navigation needs a url" };
+  if (raw === "about:blank") return { ok: true, blank: true };
+  if (raw.trim().toLowerCase() === "about:blank") return { ok: false, reason: 'write the url exactly as "about:blank"' };
+  // eslint-disable-next-line no-control-regex
+  if (/[\s\\\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/.test(raw)) return { ok: false, reason: "the url contains whitespace, a backslash or a control character; write it as one plain URL" };
+  const v = checkUrl(raw);
+  if (!v.ok || "blank" in v) return v;
+  if (v.url !== raw && v.url !== `${raw}/`) return { ok: false, reason: `the url is not in its normal form; write it exactly as ${v.url}` };
+  return v;
+}
+
 // ── Reading the page URL out of a tool result ───────────────────────────────────────────────────
 
 /** The C0 marker: the `- Page URL:` line directly under a `### Page` heading. */
@@ -93,6 +115,112 @@ export function parsePageReport(text: string): PageReport {
   return url ? { blocks, url } : { blocks };
 }
 
+// ── Reading the CURRENT TAB's address (review of Phase C2) ───────────────────────────────────────
+// Real Playwright MCP 0.0.86 results are a run of `### <Section>` blocks in this order:
+//   [Result] [Ran Playwright code] [Open tabs] [Page] [Modal state] [Snapshot] [Events]   — or just [Error].
+// `### Page` (with `- Page URL:` as its first line) describes the current tab. `### Open tabs` (when
+// there is more than one tab) and the `### Result` of `browser_tabs` list every tab as
+// `- <n>: [(current) ][<title>](<url>)`.
+//
+// What a page controls: its title (one line: inside `- Page Title:` and inside a tab line's
+// brackets), its URL, and free multi-line text in `### Modal state` (a dialog's message),
+// `### Snapshot` (inline for `browser_snapshot`), `### Events` (console lines), `### Error` (element
+// HTML in a call log) and the `### Result` of the tools in PAGE_TEXT_TOOLS. So:
+//   - a result of a PAGE_TEXT_TOOLS tool, or an error result, says nothing about the address;
+//   - `### Page` counts only when it is the ONLY such heading in the whole result and it comes before
+//     any `### Modal state` / `### Snapshot` / `### Events`, after nothing but the server's own
+//     sections — otherwise the result is AMBIGUOUS;
+//   - a tab line counts only when it has exactly one `](` (a title or URL containing `](` could move
+//     the split); the `### Page` block, whose URL is a whole line, is the authority when both exist,
+//     and the two must agree.
+
+/** Tools whose result carries page-controlled text. A page address is never read from them. */
+export const PAGE_TEXT_TOOLS: ReadonlySet<string> = new Set(["browser_console_messages", "browser_network_requests", "browser_network_request", "browser_find", "browser_evaluate", "browser_run_code_unsafe", "browser_handle_dialog"]);
+
+export interface TabEntry {
+  index: number;
+  current: boolean;
+  /** Absent when the line cannot be split into title and URL with certainty. */
+  url?: string;
+}
+
+export type PageReading =
+  /** The current tab is at `url`. */
+  | { kind: "url"; url: string; tabs?: TabEntry[] }
+  /** The result does not say where the current tab is. */
+  | { kind: "none"; tabs?: TabEntry[] }
+  /** The result cannot be trusted to say it (page text in the place of the server's). */
+  | { kind: "ambiguous"; why: string };
+
+const HEADING_RE = /^### (.+?)[ \t]*$/;
+const SERVER_SECTIONS_BEFORE_PAGE = new Set(["Result", "Ran Playwright code", "Open tabs"]);
+const PAGE_TEXT_SECTIONS = new Set(["Modal state", "Snapshot", "Events", "Error"]);
+const TAB_LINE_RE = /^- (\d+): (\(current\) )?\[(.*)\)$/;
+
+function parseTabLines(lines: string[]): TabEntry[] | undefined {
+  const out: TabEntry[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const m = TAB_LINE_RE.exec(line);
+    if (!m) return undefined; // not a tab list (e.g. `browser_close`'s "No open tabs…")
+    const rest = m[3]!;
+    const splits = rest.split("](").length - 1;
+    out.push({ index: Number(m[1]), current: !!m[2], ...(splits === 1 ? { url: rest.slice(rest.indexOf("](") + 2) } : {}) });
+  }
+  return out.length ? out : undefined;
+}
+
+/** Where the current tab is, according to one tool result. See the block comment above. */
+export function readPage(tool: string, text: string, isError = false): PageReading {
+  if (isError || PAGE_TEXT_TOOLS.has(tool)) return { kind: "none" };
+  const lines = text.split(/\r?\n/);
+  const sections: { name: string; at: number }[] = [];
+  for (const [i, line] of lines.entries()) {
+    const m = HEADING_RE.exec(line);
+    if (m) sections.push({ name: m[1]!, at: i });
+  }
+  const body = (k: number): string[] => lines.slice(sections[k]!.at + 1, sections[k + 1]?.at ?? lines.length);
+  const pages = sections.flatMap((s, k) => (s.name === "Page" ? [k] : []));
+  if (pages.length > 1) return { kind: "ambiguous", why: "the result has more than one ### Page block" };
+
+  let pageUrl: string | undefined;
+  if (pages.length === 1) {
+    const k = pages[0]!;
+    const before = sections.slice(0, k);
+    if (before.some((s) => !SERVER_SECTIONS_BEFORE_PAGE.has(s.name))) return { kind: "ambiguous", why: "the ### Page block is not where the server puts it" };
+    const first = body(k)[0] ?? "";
+    if (!first.startsWith("- Page URL: ")) return { kind: "ambiguous", why: "the ### Page block has no address line" };
+    pageUrl = first.slice("- Page URL: ".length).trim();
+    if (!pageUrl) return { kind: "ambiguous", why: "the ### Page block has no address" };
+  }
+
+  // Tab lists: `### Open tabs`, and `### Result` of `browser_tabs`. Only ahead of any page-text section.
+  const firstPageText = sections.findIndex((s) => PAGE_TEXT_SECTIONS.has(s.name));
+  let tabs: TabEntry[] | undefined;
+  for (const [k, s] of sections.entries()) {
+    if (firstPageText >= 0 && k > firstPageText) break;
+    if (s.name !== "Open tabs" && !(s.name === "Result" && tool === "browser_tabs")) continue;
+    const parsed = parseTabLines(body(k));
+    if (!parsed) continue;
+    if (parsed.filter((t) => t.current).length !== 1) return { kind: "ambiguous", why: "the tab list does not name exactly one current tab" };
+    if (tabs && JSON.stringify(tabs) !== JSON.stringify(parsed)) return { kind: "ambiguous", why: "the result lists the tabs twice, differently" };
+    tabs = parsed;
+  }
+  const current = tabs?.find((t) => t.current);
+  const withTabs = tabs ? { tabs } : {};
+  if (pageUrl !== undefined) {
+    if (current?.url !== undefined && current.url !== pageUrl) return { kind: "ambiguous", why: "the ### Page block and the tab list disagree about the current tab" };
+    return { kind: "url", url: pageUrl, ...withTabs };
+  }
+  if (current?.url !== undefined) return { kind: "url", url: current.url, ...withTabs };
+  return { kind: "none", ...withTabs };
+}
+
+/** The files a result says the server wrote (`[Snapshot](/abs/page-….yml)`, a screenshot's path). */
+export function resultFileLinks(text: string): string[] {
+  return [...text.matchAll(/\]\((\/[^)\n]+\.(?:yml|yaml|md|png|jpe?g|log))\)/g)].map((m) => m[1]!);
+}
+
 /** The text of a tool result as the SDK delivers it (a string, or content blocks). */
 export function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -105,7 +233,12 @@ export function toolResultText(content: unknown): string {
 
 // ── The allowed-sites list on disk ──────────────────────────────────────────────────────────────
 
-export type SiteOp = { op: "add" | "remove"; site: string };
+/** One change to the list. `at` is when it was made (ms): the later of an add and a remove of the
+ *  same site wins, so a change queued on a member cannot undo a newer one made on the hub. */
+export type SiteOp = { op: "add" | "remove"; site: string; at?: number };
+
+/** How long the hub remembers that a site was removed (so a stale queued add cannot bring it back). */
+export const SITE_TOMBSTONE_MS = 30 * 24 * 60 * 60_000;
 
 export const BROWSER_SITES_FILE = "browser-sites.json";
 const MAX_SITES = 2000;
@@ -113,6 +246,8 @@ const MAX_SITES = 2000;
 interface Persisted {
   sites: BrowserSite[];
   pending: SiteOp[];
+  /** Removals, newest per site, kept for SITE_TOMBSTONE_MS. */
+  removed?: { site: string; at: number }[];
   hub?: { serverId: string; url?: string };
 }
 
@@ -153,15 +288,16 @@ export class AllowedSitesStore {
   /** Apply one change to the local list. Returns whether the list changed. */
   apply(op: SiteOp): boolean {
     const changed = this.applyTo(this.state.sites, op);
-    if (changed) this.save();
+    this.save(); // a removal is remembered even when the site was not listed
     return changed;
   }
 
-  /** Member: apply locally AND remember it for the hub. */
+  /** Member: apply locally AND remember it for the hub, stamped with when it was made. */
   applyAndQueue(op: SiteOp): boolean {
-    const changed = this.applyTo(this.state.sites, op);
+    const stamped: SiteOp = { ...op, at: op.at ?? this.clock() };
+    const changed = this.applyTo(this.state.sites, stamped, false);
     // The latest word on a site replaces any earlier queued one.
-    this.state.pending = [...this.state.pending.filter((p) => p.site !== op.site), { ...op }];
+    this.state.pending = [...this.state.pending.filter((p) => p.site !== op.site), stamped];
     this.save();
     return changed;
   }
@@ -181,19 +317,34 @@ export class AllowedSitesStore {
   replaceFromHub(sites: readonly BrowserSite[], hub: { serverId: string; url?: string }): boolean {
     const before = JSON.stringify(this.list());
     const next = sites.filter((s) => s && typeof s.site === "string" && s.site).map((s) => ({ site: s.site, addedAt: Number(s.addedAt) || this.clock() })).slice(0, MAX_SITES);
-    for (const p of this.state.pending) this.applyTo(next, p);
+    for (const p of this.state.pending) this.applyTo(next, p, false);
     this.state.sites = next;
     this.state.hub = { serverId: hub.serverId, ...(hub.url ? { url: hub.url } : this.state.hub?.url ? { url: this.state.hub.url } : {}) };
     this.save();
     return JSON.stringify(this.list()) !== before;
   }
 
-  private applyTo(sites: BrowserSite[], op: SiteOp): boolean {
+  /**
+   * Apply one change. With `ordered` (the authority's own list) the change's time is compared with
+   * what the list already knows: an add older than the site's removal, or a removal older than the
+   * site's add, is a stale message and changes nothing.
+   */
+  private applyTo(sites: BrowserSite[], op: SiteOp, ordered = true): boolean {
+    const at = typeof op.at === "number" && Number.isFinite(op.at) ? op.at : this.clock();
     const i = sites.findIndex((s) => s.site === op.site);
+    const tombs = (this.state.removed ??= []);
+    const tomb = tombs.find((t) => t.site === op.site);
     if (op.op === "add") {
+      if (ordered && tomb && tomb.at > at) return false; // removed after this add was made
       if (i >= 0 || sites.length >= MAX_SITES) return false;
-      sites.push({ site: op.site, addedAt: this.clock() });
+      sites.push({ site: op.site, addedAt: at });
+      if (ordered && tomb) tombs.splice(tombs.indexOf(tomb), 1);
       return true;
+    }
+    if (ordered) {
+      if (i >= 0 && sites[i]!.addedAt > at) return false; // added again after this removal was made
+      if (tomb) tomb.at = Math.max(tomb.at, at);
+      else tombs.push({ site: op.site, at });
     }
     if (i < 0) return false;
     sites.splice(i, 1);
@@ -215,7 +366,11 @@ export class AllowedSitesStore {
       }
       for (const p of Array.isArray(raw.pending) ? raw.pending : []) {
         const site = normalizeSite(p?.site);
-        if (site && (p.op === "add" || p.op === "remove")) this.state.pending.push({ op: p.op, site });
+        if (site && (p.op === "add" || p.op === "remove")) this.state.pending.push({ op: p.op, site, ...(typeof p.at === "number" ? { at: p.at } : {}) });
+      }
+      for (const t of Array.isArray(raw.removed) ? raw.removed : []) {
+        const site = normalizeSite(t?.site);
+        if (site && typeof t.at === "number") (this.state.removed ??= []).push({ site, at: t.at });
       }
       if (raw.hub && typeof raw.hub.serverId === "string") this.state.hub = { serverId: raw.hub.serverId, ...(typeof raw.hub.url === "string" ? { url: raw.hub.url } : {}) };
     } catch (e) {
@@ -232,6 +387,8 @@ export class AllowedSitesStore {
   }
 
   private save(): void {
+    const cutoff = this.clock() - SITE_TOMBSTONE_MS;
+    if (this.state.removed) this.state.removed = this.state.removed.filter((t) => t.at >= cutoff);
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.state, null, 2));
     renameSync(tmp, this.file);

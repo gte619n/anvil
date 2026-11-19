@@ -245,6 +245,43 @@ describe("Settings → Integrations card", () => {
     expect(document.querySelector("#modal-root .modal")).toBeNull();
   });
 
+  test("[C1] a package runner as a custom command shows a one-line warning on the form as it is typed and on the integration's row; other commands show none", () => {
+    expect(mcp.PACKAGE_RUNNERS).toEqual(["npx", "npm", "bunx", "pnpm", "yarn"]);
+    for (const cmd of ["npx -y some-mcp", "npm exec some-mcp", "bunx some-mcp", "pnpm dlx some-mcp", "yarn dlx some-mcp", "/opt/homebrew/bin/npx -y x", "  npx x"]) {
+      expect([cmd, mcp.packageRunnerWarning(cmd)]).toEqual([cmd, "Package runners read config from the session's repo; prefer an absolute path to an installed server."]);
+    }
+    for (const cmd of ["node /opt/x/server.js", "/usr/local/bin/my-mcp", "echo-mcp --npx", "npxx", ""]) expect([cmd, mcp.packageRunnerWarning(cmd)]).toEqual([cmd, ""]);
+
+    // The form: hidden until a runner is typed, hidden again for another command or the URL type.
+    setup([]);
+    panel().querySelector<HTMLButtonElement>(".mcp-add")!.click();
+    menuItems()[0]!.click();
+    const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+    const warn = $("mcp-dlg-runner-warning");
+    const type = (v: string): void => {
+      $<HTMLInputElement>("mcp-dlg-cmd").value = v;
+      $<HTMLInputElement>("mcp-dlg-cmd").dispatchEvent(new window.Event("input"));
+    };
+    expect(warn.hidden).toBe(true);
+    type("npx -y @acme/mcp");
+    expect(warn.hidden).toBe(false);
+    expect(warn.textContent).toContain("Package runners read config from the session's repo; prefer an absolute path to an installed server.");
+    type("/opt/acme/bin/mcp");
+    expect(warn.hidden).toBe(true);
+    type("bunx acme");
+    expect(warn.hidden).toBe(false);
+    $<HTMLSelectElement>("mcp-dlg-type").value = "http";
+    $<HTMLSelectElement>("mcp-dlg-type").dispatchEvent(new window.Event("change"));
+    expect(warn.hidden).toBe(true);
+    dialogs.closeModal();
+
+    // The row.
+    setup([integ({ id: "a", key: "runner", label: "Runner", transport: { type: "stdio", command: "npx", args: ["-y", "x"] } }), integ({ id: "b", key: "plain", label: "Plain", transport: { type: "stdio", command: "/opt/x/mcp", args: [] } })]);
+    const rows = [...panel().querySelectorAll<HTMLElement>(".mcp-row")];
+    expect(rows[0]!.querySelector(".mcp-runner-warning")!.textContent).toContain("Package runners read config from the session's repo");
+    expect(rows[1]!.querySelector(".mcp-runner-warning")).toBeNull();
+  });
+
   test("[C1] the Custom form's URL type takes a loopback http URL only", () => {
     const base = { label: "Web", key: "web", transport: "http" as const, commandLine: "", exclusive: false };
     expect(mcp.parseCustomForm({ ...base, url: "http://127.0.0.1:27182/mcp" })).toEqual({

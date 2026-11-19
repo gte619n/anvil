@@ -61,6 +61,8 @@ export interface BrowserFleetLink {
   pairedHubId: () => string | null;
   /** This daemon's base URL as other machines reach it. */
   selfUrl: () => Promise<string | undefined>;
+  /** The port this daemon listens on (the browser can never be given a way to it). */
+  selfPort?: number;
 }
 
 export const SITES_SYNC_INTERVAL_MS = 5 * 60_000;
@@ -72,7 +74,8 @@ function cleanOps(raw: unknown): SiteOp[] {
   for (const o of raw.slice(0, 500)) {
     const site = normalizeSite((o as SiteOp | undefined)?.site);
     const op = (o as SiteOp | undefined)?.op;
-    if (site && (op === "add" || op === "remove")) out.push({ op, site });
+    const at = (o as SiteOp | undefined)?.at;
+    if (site && (op === "add" || op === "remove")) out.push({ op, site, ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}) });
   }
   return out;
 }

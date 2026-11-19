@@ -7,7 +7,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { McpIntegrationStore, MCP_STORE_FILE } from "../../src/mcp/store";
 import { CUSTOM_PRESET, mcpPreset, mcpPresetKinds, registerMcpPreset, substituteCwd } from "../../src/mcp/presets";
-import { MCP_KEY_RE, RESERVED_MCP_KEYS, keyProblem, loopbackUrlProblem } from "../../src/mcp/validate";
+import { MCP_KEY_RE, PACKAGE_RUNNERS, RESERVED_MCP_KEYS, keyProblem, loopbackUrlProblem, relativeCommandProblem } from "../../src/mcp/validate";
 import { tmpDir } from "../helpers";
 import { echoInput } from "../helpers/mcp";
 
@@ -125,6 +125,20 @@ describe("McpIntegrationStore", () => {
     expect(() => store.add(echoInput({ transport: { type: "stdio", command: "  ", args: [] } }))).toThrow(/command is required/);
     expect(() => store.add(echoInput({ transport: { type: "stdio", command: "x", args: [1 as unknown as string] } }))).toThrow(/args/);
     expect(() => store.add(echoInput({ transport: { type: "sse", url: "http://127.0.0.1/" } as never }))).toThrow(/transport type/);
+  });
+
+  test("[C1] a stdio command is a bare name (found on the daemon's PATH) or an absolute path; a relative path, which would run a file from the session's repo, is refused on add and on update", () => {
+    const store = new McpIntegrationStore(stateDir());
+    for (const command of ["./server", "node_modules/.bin/some-mcp", "bin/mcp", "../mcp", "sub\\\\mcp.exe", ".", ".."]) {
+      expect(() => store.add(echoInput({ transport: { type: "stdio", command, args: [] } }))).toThrow(/bare name .* or an absolute path/);
+    }
+    const ok = store.add(echoInput({ transport: { type: "stdio", command: "some-mcp", args: ["./relative-arg-is-fine"] } }));
+    expect(() => store.update(ok.id, { transport: { type: "stdio", command: "./node_modules/.bin/some-mcp", args: [] } })).toThrow(/absolute path/);
+    store.update(ok.id, { transport: { type: "stdio", command: "/opt/acme/bin/some-mcp", args: [] } });
+    expect(store.get(ok.id)!.transport).toEqual({ type: "stdio", command: "/opt/acme/bin/some-mcp", args: [] });
+    // Package runners are allowed (with a warning in the UI); the list is shared with the web.
+    expect(PACKAGE_RUNNERS).toEqual(["npx", "npm", "bunx", "pnpm", "yarn"]);
+    expect(relativeCommandProblem("npx")).toBeUndefined();
   });
 
   test("[C1] remove reports whether anything was removed, and a re-add under the same key gets a NEW id", () => {

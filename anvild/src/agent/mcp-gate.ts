@@ -107,8 +107,12 @@ export type McpKindVerdict =
   | { kind: "deny"; reason: string }
   /** Run with no prompt (the kind already holds an approval that covers this call). The exclusive
    *  lock is still taken. `updatedInput` REPLACES the tool's input (Phase C2: the browser turns a
-   *  navigation into one to `about:blank` after the owner refused a site). */
-  | { kind: "allow"; reason?: string; updatedInput?: Record<string, unknown> }
+   *  navigation into one to `about:blank` after the owner refused a site). Never rely on it for
+   *  safety: a kind must be correct even if the replacement is not applied.
+   *  `context` is text for the MODEL, delivered next to this call's result (the PreToolUse hook's
+   *  `additionalContext`): what the kind learned since the last call (the browser: requests its
+   *  network block refused, and — Phase C3 — what happened to a download). */
+  | { kind: "allow"; reason?: string; updatedInput?: Record<string, unknown>; context?: string }
   | {
       /** Park a card with the kind's own choices. */
       kind: "prompt";

@@ -132,7 +132,7 @@ const browserRow = (over: Partial<McpIntegrationStatus> = {}): McpIntegrationSta
     key: "browser",
     kind: "browser",
     label: "Browser",
-    transport: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@0.0.86"] },
+    transport: { type: "stdio", command: "node", args: ["@playwright/mcp@0.0.86 (pinned runtime in the daemon's state folder)"] },
     exclusive: true,
     browser: { mode: "headed", modeReason: "Headed, with the agent profile: evan is logged in at the screen.", proxy: { state: "ready", sessions: 1 } },
     ...over,
@@ -154,7 +154,8 @@ describe("Add menu", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0].type).toBe("mcp.integration.add");
     expect(sent[0].integration).toMatchObject({ key: "browser", kind: "browser", exclusive: true, enabled: true });
-    expect(sent[0].integration.transport).toEqual({ type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@0.0.86"] });
+    expect(sent[0].integration.transport).toEqual({ type: "stdio", command: "node", args: ["@playwright/mcp@0.0.86 (pinned runtime in the daemon's state folder)"] });
+    expect(JSON.stringify(sent[0].integration)).not.toContain("npx");
   });
 
   test("[C2] web: Browser is not offered without the capability, nor when the machine already has a browser integration", () => {
@@ -205,11 +206,53 @@ describe("the browser's row", () => {
     expect(row.querySelector(".mcp-health")!.textContent).toContain("Unavailable: the browser's network block is stopped");
   });
 
+  test("[C2] web: the row says the browser runtime is installed in the daemon's own folder; when it is missing it says why and offers Install browser runtime, which sends browser.runtime.install to that machine", async () => {
+    setup([browserRow({ browser: { mode: "headed", modeReason: "Headed.", proxy: { state: "ready", sessions: 0 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" } } })], undefined, BOTH);
+    mcp.renderMcpPanel();
+    let line = panel().querySelector<HTMLElement>(".mcp-browser-runtime")!;
+    expect(line.dataset.runtime).toBe("installed");
+    expect(line.textContent).toContain("Browser runtime installed: @playwright/mcp@0.0.86, in the daemon's own folder");
+    expect(panel().querySelector(".mcp-runtime-install")).toBeNull();
+
+    setup([browserRow({ health: { state: "unavailable", reason: "the browser runtime is not installed" }, browser: { mode: "headed", modeReason: "Headed.", proxy: { state: "ready", sessions: 0 }, runtime: { state: "installing", package: "@playwright/mcp@0.0.86" } } })], undefined, BOTH);
+    mcp.renderMcpPanel();
+    expect(panel().querySelector<HTMLElement>(".mcp-browser-runtime")!.dataset.runtime).toBe("installing");
+    expect(panel().querySelector(".mcp-runtime-install")).toBeNull();
+
+    setup(
+      [browserRow({ health: { state: "unavailable", reason: "the browser runtime is not installed" }, browser: { mode: "headed", modeReason: "Headed.", proxy: { state: "ready", sessions: 0 }, runtime: { state: "missing", package: "@playwright/mcp@0.0.86", reason: "the browser runtime is not installed; the last install failed: <b>ENOTFOUND</b> registry.npmjs.org" } } })],
+      undefined,
+      BOTH,
+    );
+    mcp.renderMcpPanel();
+    line = panel().querySelector<HTMLElement>(".mcp-browser-runtime")!;
+    expect(line.dataset.runtime).toBe("missing");
+    expect(line.classList.contains("bad")).toBe(true);
+    expect(line.textContent).toContain("Browser runtime not installed: the browser runtime is not installed; the last install failed: <b>ENOTFOUND</b> registry.npmjs.org");
+    expect(line.querySelector("b")).toBeNull(); // the reason is text, never markup
+    const install = line.querySelector<HTMLButtonElement>(".mcp-runtime-install")!;
+    expect(install.textContent).toContain("Install browser runtime");
+    install.click();
+    await settle();
+    expect(sent.at(-1)).toMatchObject({ type: "browser.runtime.install" });
+    expect(install.disabled).toBe(true); // acked → stays disabled until the row repaints
+
+    // A refusal (still offline) is shown and the button comes back.
+    mcp.renderMcpPanel();
+    nextReply = { type: "command.error", message: "npm ci failed (exit 1): ENOTFOUND registry.npmjs.org" };
+    const again = panel().querySelector<HTMLButtonElement>(".mcp-runtime-install")!;
+    again.click();
+    await settle();
+    expect(document.getElementById("toast")!.textContent).toContain("ENOTFOUND");
+    expect(again.disabled).toBe(false);
+  });
+
   test("[C2] web: a custom integration's row has no browser lines", () => {
     setup([integ()], undefined, BOTH);
     mcp.renderMcpPanel();
     expect(panel().querySelector(".mcp-browser-mode")).toBeNull();
     expect(panel().querySelector(".mcp-browser-proxy")).toBeNull();
+    expect(panel().querySelector(".mcp-browser-runtime")).toBeNull();
   });
 });
 
