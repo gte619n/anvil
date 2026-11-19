@@ -45,7 +45,9 @@ export const CAD_OWNER_CARD_TOOL_IDS: readonly string[] = CAD_OWNER_CARD_TOOLS.m
 export const CAD_SYSTEM_PROMPT =
   "\n\nCAD PARTS (anvil_cad tools): Work on ONE part at a time (open_part). Before the first modeling call on a part, " +
   "record what it must be with record_expectations (bounding box, volume, body count, holes); modeling is refused until " +
-  "you do, and after that only the owner can change the expectations (propose_expectations shows them a card). Name " +
+  "you do, and after that only the owner can change the expectations (propose_expectations shows them a card). Give " +
+  "record_expectations the value of every parameter its formulas use: the expected numbers are fixed from those values " +
+  "at that moment, the daemon creates those parameters for you, and changing one later fails the gate. Name " +
   "every driving dimension as a parameter and build from the parameters. Fetch skill_reference before the first build. " +
   "Call check_part to see the geometry gate; never say a part is done while the gate fails or is unverified. If SolidCraft " +
   "cannot make a feature the part needs, call report_gap instead of approximating it. Never edit cad/*/part.json or " +
