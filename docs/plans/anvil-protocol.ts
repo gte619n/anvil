@@ -272,7 +272,9 @@ export interface Session {
   team?: TeamPolicy; // set only on a lead: this team's integration/concurrency policy
   // ── Autopilot planning session (see docs/plans/anvil-improvement-program.md) ──
   workUnitId?: string; // set on a "Plan with Claude" session: the autopilot work unit it plans/builds
-  workUnitRole?: "planner"; // marks a session created to plan (then build) an autopilot work unit
+  // "planner": created to plan (then build) an autopilot work unit, with the owner in the chat.
+  // "builder": an unattended autopilot build session — nobody is there to answer a permission card.
+  workUnitRole?: "planner" | "builder";
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted
   finished?: boolean; // user-parked in the sidebar's "Finished" group (done, e.g. pending deploy)
   order?: number; // explicit sidebar sort position (lower = higher); unset sorts newest-on-top

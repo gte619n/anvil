@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
     "build:web": "bun run web/build.ts",
+    "phase-gate": "bun test/tools/phase-gate.ts",
     "cad:fixtures": "bun run test/fixtures/cad/gen.ts",
     "cad:fixtures:test": "bun test test/golden/fixtures.test.ts",
     "cad:golden:install": "bunx --bun playwright install chromium",

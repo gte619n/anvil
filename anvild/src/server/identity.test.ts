@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { PROTOCOL_VERSION } from "@protocol";
-import { SERVER_CAPABILITIES, serverHelloEvent } from "./identity";
+import { SERVER_CAPABILITIES, serverCapabilities, serverHelloEvent } from "./identity";
+import { FEATURE_CAPABILITIES } from "../config";
 
 // server.hello advertises this build's capabilities so a newer client can skip commands an older
 // member can't handle (instead of getting `unknown command type` back — the bug that surfaced as a
@@ -38,6 +39,58 @@ describe("serverHelloEvent", () => {
   test("emits a fresh capabilities array, not a shared reference to the constant", () => {
     // Defensive: clients/tests must not be able to mutate the module-level constant through a frame.
     expect(hello.capabilities).not.toBe(SERVER_CAPABILITIES);
+  });
+});
+
+// agent-cad-and-browser spec §4.8: the capability list is the pinned BASE list plus each opt-in
+// feature ANVIL_FEATURES enabled. The base list is pinned verbatim so adding/removing a capability is
+// always a deliberate, reviewed edit here — and so a feature flag can never leak in by default.
+describe("serverCapabilities", () => {
+  test("[F0] the base capability list is pinned", () => {
+    expect([...SERVER_CAPABILITIES]).toEqual([
+      "autopilot",
+      "autopilot-maintenance",
+      "auth",
+      "prompts",
+      "lapo",
+      "pairing",
+      "model-labels",
+      "model-catalog",
+      "claude-cli-update",
+      "accounts",
+      "stable-update",
+      "loops",
+      "history",
+      "shadow",
+      "fleet-repo",
+      "autopilot-verify",
+    ]);
+  });
+
+  test("[F0] with no features it is exactly the base list, as a fresh array", () => {
+    expect(serverCapabilities()).toEqual([...SERVER_CAPABILITIES]);
+    expect(serverCapabilities([])).toEqual([...SERVER_CAPABILITIES]);
+    expect(serverCapabilities()).not.toBe(SERVER_CAPABILITIES);
+    for (const f of FEATURE_CAPABILITIES) expect(serverCapabilities()).not.toContain(f);
+  });
+
+  test("[F0] each enabled feature is appended after the base list, in canonical order", () => {
+    for (const f of FEATURE_CAPABILITIES) {
+      expect(serverCapabilities([f])).toEqual([...SERVER_CAPABILITIES, f]);
+    }
+    expect(serverCapabilities(["browser", "cad-work"])).toEqual([...SERVER_CAPABILITIES, "cad-work", "browser"]);
+    expect(serverCapabilities([...FEATURE_CAPABILITIES])).toEqual([...SERVER_CAPABILITIES, ...FEATURE_CAPABILITIES]);
+  });
+
+  test("[F0] an unknown feature name is never advertised", () => {
+    expect(serverCapabilities(["teleport", "cad-work"])).toEqual([...SERVER_CAPABILITIES, "cad-work"]);
+  });
+
+  test("[F0] server.hello advertises the enabled features through serverCapabilities", () => {
+    const id = { serverId: "srv_test", serverName: "test-host" };
+    const hello = serverHelloEvent(id, { pairedHubId: null, memberCount: 0 }, ["cad-work", "browser"]);
+    expect(hello.capabilities).toEqual(serverCapabilities(["cad-work", "browser"]));
+    expect(serverHelloEvent(id).capabilities).toEqual([...SERVER_CAPABILITIES]);
   });
 });
 

@@ -98,8 +98,27 @@ function normalizeQuestions(raw: unknown): Question[] {
  * question in the broker, surface it to clients, and turn the answer into the PermissionResult whose
  * `updatedInput` the CLI re-runs the tool with.
  */
-export function makeCanUseTool(session: Session, broker: QuestionBroker): CanUseTool {
+export function makeCanUseTool(
+  session: Session,
+  broker: QuestionBroker,
+  /** The session's role tool ids (the daemon's own in-process servers: `mcp__anvil__*`,
+   *  `mcp__anvil_team__*`, …) — the same list the driver passes as `allowedTools`. These are trusted
+   *  and stay allowed here; every OTHER `mcp__` tool that reaches this callback is denied. */
+  allowedMcpTools: readonly string[] = [],
+): CanUseTool {
   return async (toolName, input): Promise<PermissionResult> => {
+    // Fail-closed backstop for MCP tools (agent-cad-and-browser spec §4.4). The PreToolUse hook is
+    // the authoritative gate and normally decides every tool before this callback runs — so an
+    // `mcp__` tool arriving HERE means the hook did not decide it (a hook timeout/crash, or an SDK
+    // path that skipped it). External-server tools can reach the network and the owner's accounts, so
+    // an undecided one is refused rather than waved through by the allow-by-default below. The
+    // daemon's own in-process role tools are exempt: they are SDK-auto-allowed (`allowedTools`).
+    if (toolName.startsWith("mcp__") && !allowedMcpTools.includes(toolName)) {
+      return {
+        behavior: "deny",
+        message: `${toolName} was not approved by the permission gate (MCP tools are denied unless the gate allows them)`,
+      };
+    }
     // Only AskUserQuestion ever reaches canUseTool: the hook resolves all other tools to allow/deny,
     // which short-circuits before this callback. Anything else here was already vetted by the hook,
     // so allow it through unchanged rather than second-guessing it.

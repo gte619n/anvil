@@ -2,6 +2,7 @@ import type { HookCallback, PreToolUseHookInput } from "@anthropic-ai/claude-age
 import type { PermissionDecision, PermissionSuggestion } from "@protocol";
 import { newId } from "../util/ids";
 import { isDangerous, isReadOnly } from "./danger-list";
+import { isUnattended, protectedVerdict } from "./protected";
 import type { Session } from "../session/session";
 
 interface ResolvedDecision {
@@ -51,6 +52,13 @@ export class PermissionBroker {
 const SUGGESTIONS = (tool: string): PermissionSuggestion[] => [
   { decision: "allow", label: "Allow once" },
   { decision: "allow_always", label: `Always allow ${tool} this session` },
+  { decision: "deny", label: "Deny" },
+];
+
+/** The card for a protected always-prompt action (spec §4.4): Allow once / Deny ONLY — never an
+ *  "always allow", because the whole point is that it is asked every single time. */
+const PROTECTED_SUGGESTIONS = (label?: string): PermissionSuggestion[] => [
+  { decision: "allow", label: label ?? "Allow once" },
   { decision: "deny", label: "Deny" },
 ];
 
@@ -127,6 +135,33 @@ async function decide(
   // NOTE: AskUserQuestion is handled before this point in makePreToolUseHook — it must fall through
   // with no decision so its "ask" verdict reaches canUseTool (where the question card is surfaced).
   // Do not re-add it here: a decision returned from the hook short-circuits before canUseTool (arch §6.6).
+
+  // The protected check (agent-cad-and-browser spec §4.4) runs FIRST — before the remembered-allow
+  // lookup and before the `bypass` short-circuit below — so neither an earlier "always allow" nor an
+  // autonomy policy can wave a protected action through. With no rule registered (or none with an
+  // opinion) `guard` is undefined and everything below behaves exactly as it always has.
+  const guard = protectedVerdict({ session, tool, input, cwd: session.data.cwd });
+  if (guard?.kind === "deny") {
+    return { behavior: "deny", reason: guard.reason };
+  }
+  if (guard?.kind === "always-prompt") {
+    // Nobody is there to answer in an unattended (autopilot builder) session: deny without a card
+    // rather than park the run forever.
+    if (guard.denyWhenUnattended && isUnattended(session)) {
+      return { behavior: "deny", reason: `${guard.reason} (denied: this session is unattended)` };
+    }
+    const requestId = newId("perm");
+    const answer = broker.request(requestId, session.id);
+    session.requestPermission(requestId, tool, input, PROTECTED_SUGGESTIONS(guard.label));
+    const ans = await answer;
+    if (ans.decision === "deny") {
+      return { behavior: "deny", reason: `denied by user (${guard.reason})` };
+    }
+    // "allow_always" is not offered; if a client sends it anyway it is an allow-ONCE. Deliberately
+    // no session.rememberAllow(): a protected action is never remembered.
+    return { behavior: "allow", updatedInput: ans.updatedInput ?? input, reason: `protected: ${guard.reason}` };
+  }
+
   if (session.isAlwaysAllowed(tool)) {
     return { behavior: "allow", updatedInput: input, reason: "remembered allow" };
   }

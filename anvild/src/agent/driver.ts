@@ -281,7 +281,7 @@ export class AgentDriver {
         // canUseTool parks the question, surfaces the card, and returns the answer via updatedInput.
         // (The PreToolUse hook is still the authoritative gate for every other tool — a hook
         // allow/deny short-circuits before canUseTool, so canUseTool only ever sees AskUserQuestion.)
-        canUseTool: makeCanUseTool(s, this.questionBroker),
+        canUseTool: makeCanUseTool(s, this.questionBroker, this.extraAllowedTools),
         ...claudeCliOptions(), // executable:"bun" in dev; pathToClaudeCodeExecutable when packaged (§3.1)
         env: this.env, // §3 allow-list; no ANTHROPIC_API_KEY
         ...(this.mcpServers ? { mcpServers: this.mcpServers } : {}),

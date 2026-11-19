@@ -1,0 +1,174 @@
+{
+  "phases": {
+    "F0": {
+      "title": "Foundation: capability flags, protected permission check, phase gate, fake SolidCraft",
+      "tests": [
+        {
+          "file": "src/server/identity.test.ts",
+          "names": [
+            "serverCapabilities > [F0] the base capability list is pinned",
+            "serverCapabilities > [F0] with no features it is exactly the base list, as a fresh array",
+            "serverCapabilities > [F0] each enabled feature is appended after the base list, in canonical order",
+            "serverCapabilities > [F0] an unknown feature name is never advertised",
+            "serverCapabilities > [F0] server.hello advertises the enabled features through serverCapabilities"
+          ]
+        },
+        {
+          "file": "test/unit/features.test.ts",
+          "names": [
+            "[F0] features default to none",
+            "[F0] ANVIL_FEATURES is comma-separated, trimmed, de-duplicated and canonically ordered",
+            "[F0] an unknown feature is ignored with a warning, not a startup error",
+            "[F0] featureEnabled reads the flag off a config-like object",
+            "[F0] /api/health and server.hello advertise the base list plus the enabled features"
+          ]
+        },
+        {
+          "file": "test/unit/protected.test.ts",
+          "names": [
+            "protected rule registry > [F0] no rule registered → no verdict",
+            "protected rule registry > [F0] the first non-undefined verdict wins, and a rule sees tool, input and cwd",
+            "protected rule registry > [F0] deny outranks always-prompt regardless of registration order",
+            "protected rule registry > [F0] a throwing rule fails closed (deny)",
+            "protected rule registry > [F0] registering is idempotent and the returned thunk unregisters",
+            "protected rule registry > [F0] isUnattended is true only for an autopilot builder session",
+            "protected check in the permission gate > [F0] deny beats bypass, with the rule's reason and no prompt",
+            "protected check in the permission gate > [F0] deny beats a remembered allow for the same tool",
+            "protected check in the permission gate > [F0] always-prompt prompts under bypass",
+            "protected check in the permission gate > [F0] always-prompt prompts even after a prior rememberAllow for the same tool",
+            "protected check in the permission gate > [F0] an always-prompt card offers Allow once / Deny only — no allow_always suggestion",
+            "protected check in the permission gate > [F0] an allow_always answer is an allow-once and is never remembered",
+            "protected check in the permission gate > [F0] unattended + denyWhenUnattended denies with no request emitted",
+            "protected check in the permission gate > [F0] an attended session with denyWhenUnattended still gets the card",
+            "protected check in the permission gate > [F0] an unattended session without denyWhenUnattended is still prompted",
+            "protected check in the permission gate > [F0] a tool no rule covers is unchanged: bypass allows, remembered allow allows",
+            "protected check in the permission gate > [F0] with no rule, the normal prompt keeps its three suggestions and allow_always is remembered",
+            "canUseTool MCP backstop > [F0] an mcp__ tool reaching canUseTool is denied (fail closed)",
+            "canUseTool MCP backstop > [F0] the session's own role tools (allowedTools) still pass canUseTool",
+            "canUseTool MCP backstop > [F0] non-MCP tools are unaffected by the backstop"
+          ]
+        },
+        {
+          "file": "test/unit/phase-gate.test.ts",
+          "names": [
+            "parseJUnit > [F0] reads every testcase with its file, full describe path, status and assertion count",
+            "parseJUnit > [F0] counts cases by status",
+            "parseJUnit > [F0] a report with no <testsuites> root is an error, never 'no tests ran'",
+            "parseJUnit > [F0] the full name is describe titles outermost-first, then the title, joined by ' > '",
+            "checkNamedTests > [F0] all named tests present, passed, with assertions → pass",
+            "checkNamedTests > [F0] a skipped named test → fail",
+            "checkNamedTests > [F0] a zero-assertion named test → fail",
+            "checkNamedTests > [F0] a missing named test → fail",
+            "checkNamedTests > [F0] a failed named test → fail",
+            "checkNamedTests > [F0] names match exactly and per file — no bare title, prefix or other-file match",
+            "checkNamedTests > [F0] an unnamed failing test in the phase's files still fails the check",
+            "checkNamedTests > [F0] unnamed skips are tolerated normally but fail a real-tool run (failOnAnySkip)",
+            "manifest > [F0] a well-formed manifest validates",
+            "manifest > [F0] shape errors are all reported",
+            "manifest > [F0] a non-spike phase with zero named tests fails; a spike phase does not",
+            "manifest > [F0] a listed test, real or Playwright file that does not exist fails",
+            "manifest > [F0] the checked-in manifest is valid, lists every phase, and its F0 files exist",
+            "gate arguments and dirty-tree rule > [F0] parses the phase and flags",
+            "gate arguments and dirty-tree rule > [F0] tracked changes and untracked files under anvild/ are dirty; other untracked files are not"
+          ]
+        },
+        {
+          "file": "test/unit/fake-solidcraft.test.ts",
+          "names": [
+            "MCP protocol > [F0] initialize, tools/list and ping answer like an MCP server",
+            "MCP protocol > [F0] version reports FAKE_SC_VERSION, and --version prints it like the CLI",
+            "MCP protocol > [F0] an unknown command is an error result, as the real tool answers",
+            "MCP protocol > [F0] list_commands filters, and finds the STEP import command",
+            "reference plate > [F0] the plate measures 23335.2 mm³ with 22 faces at L=80",
+            "reference plate > [F0] set_parameter L=120 rebuilds the plate to 35335.2 mm³",
+            "reference plate > [F0] check_parameters tries a value without keeping it",
+            "reference plate > [F0] hole table data is present in body_topology",
+            "reference plate > [F0] removing the hole pattern changes volume and face count, and undo/redo restore them",
+            "script round trip > [F0] an exported script replayed in a fresh process reproduces the same measure",
+            "script round trip > [F0] save then open restores the design, parameters included",
+            "script round trip > [F0] opening a script from a newer format fails",
+            "files > [F0] export writes placeholders with the right magic bytes",
+            "files > [F0] export outside the allowed folders is refused",
+            "files > [F0] screenshot returns a valid PNG image block",
+            "other solids > [F0] box, boss, blind hole, through hole and cylinder cut match the real kernel's numbers",
+            "other solids > [F0] an imported reference body is fixed, and interference is found by bounding-box overlap",
+            "other solids > [F0] a failing batch rolls back and names the failing step",
+            "failure hooks > [F0] FAKE_SC_CRASH_ON exits abruptly with code 139 and a stderr line, sending no reply",
+            "failure hooks > [F0] FAKE_SC_VOLUME_SCALE scales every reported volume",
+            "failure hooks > [F0] FAKE_SC_MISS_CUTS reports success for a cut that removes nothing",
+            "failure hooks > [F0] without the hook, a cut placed off the part also misses silently",
+            "failure hooks > [F0] FAKE_SC_WARN_ON puts a Boolean retry warning on that command's feature",
+            "failure hooks > [F0] FAKE_SC_DELAY_MS delays every tool reply, in order"
+          ]
+        }
+      ]
+    },
+    "A0": {
+      "title": "spike (no product code)",
+      "tests": [],
+      "spike": true
+    },
+    "A1": {
+      "title": "process manager, part files, agent tools",
+      "tests": []
+    },
+    "A2": {
+      "title": "expectations, gate, rules",
+      "tests": []
+    },
+    "A3": {
+      "title": "live preview and parameters panel",
+      "tests": []
+    },
+    "A4": {
+      "title": "inputs, gaps, release",
+      "tests": []
+    },
+    "A5": {
+      "title": "merge guard",
+      "tests": []
+    },
+    "B0": {
+      "title": "spike",
+      "tests": [],
+      "spike": true
+    },
+    "B1": {
+      "title": "managed install and pin",
+      "tests": []
+    },
+    "B2": {
+      "title": "replay gate and auto-advance",
+      "tests": []
+    },
+    "B3": {
+      "title": "autopilot CAD",
+      "tests": []
+    },
+    "C0": {
+      "title": "spike",
+      "tests": [],
+      "spike": true
+    },
+    "C1": {
+      "title": "registry core",
+      "tests": []
+    },
+    "C2": {
+      "title": "browser preset, network block, per-site approval",
+      "tests": []
+    },
+    "C3": {
+      "title": "logged-in sites, hard stops, downloads, hand-off",
+      "tests": []
+    },
+    "C4": {
+      "title": "throwaway test daemon",
+      "tests": []
+    },
+    "C5": {
+      "title": "part sources",
+      "tests": []
+    }
+  }
+}

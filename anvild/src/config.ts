@@ -26,6 +26,37 @@ export interface Config {
    *  explicit cache_control, so a stable, cheap-cache-read provider is the real cost lever. Falls back
    *  to normal routing for any model that provider can't serve (allow_fallbacks). Undefined → default routing. */
   adversarialProvider?: string;
+  /** Opt-in feature flags from `ANVIL_FEATURES` (comma-separated), each one of `FEATURE_CAPABILITIES`.
+   *  An enabled feature is advertised as a capability (`serverCapabilities`) and unlocks its code
+   *  paths (`featureEnabled`). Read once at startup, so a flag changes only with a daemon restart. */
+  features: string[];
+}
+
+/** The capability-gated features `ANVIL_FEATURES` may switch on (agent-cad-and-browser spec §4.8):
+ *  `cad-work` (Track A), `solidcraft-pin` (Track B), `mcp-integrations` and `browser` (Track C).
+ *  All are OFF by default; the list order is the order they are advertised in. */
+export const FEATURE_CAPABILITIES = ["cad-work", "solidcraft-pin", "mcp-integrations", "browser"] as const;
+export type FeatureName = (typeof FEATURE_CAPABILITIES)[number];
+
+/** Parse `ANVIL_FEATURES`: comma-separated, trimmed, de-duplicated, returned in `FEATURE_CAPABILITIES`
+ *  order. An unknown name is ignored with a warning rather than failing startup — a member that is a
+ *  release behind the hub must still boot when the fleet env names a feature it doesn't know yet. */
+export function parseFeatures(raw: string | undefined, warn: (msg: string) => void = (m) => console.warn(m)): string[] {
+  const asked = (raw ?? "")
+    .split(",")
+    .map((f) => f.trim())
+    .filter(Boolean);
+  const known = new Set<string>(FEATURE_CAPABILITIES);
+  for (const f of asked) {
+    if (!known.has(f)) warn(`[anvild] ANVIL_FEATURES: ignoring unknown feature ${JSON.stringify(f)} (known: ${FEATURE_CAPABILITIES.join(", ")})`);
+  }
+  return FEATURE_CAPABILITIES.filter((f) => asked.includes(f));
+}
+
+/** Whether a capability-gated feature is switched on for this daemon. Takes anything carrying a
+ *  `features` list (the full `Config`, or `ServerOptions`), so callers needn't thread the whole config. */
+export function featureEnabled(config: { features?: readonly string[] }, name: FeatureName): boolean {
+  return config.features?.includes(name) ?? false;
 }
 
 /** OpenRouter slugs used by the adversarial panel when ANVIL_ADVERSARIAL_MODELS isn't set — an
@@ -122,5 +153,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // On when a key is present, unless explicitly killed via ANVIL_ADVERSARIAL=0.
     adversarialEnabled: Boolean(openRouterApiKey) && env.ANVIL_ADVERSARIAL !== "0",
     adversarialProvider: env.ANVIL_ADVERSARIAL_PROVIDER?.trim() || undefined,
+    features: parseFeatures(env.ANVIL_FEATURES),
   };
 }

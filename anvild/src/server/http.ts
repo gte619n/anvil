@@ -6,7 +6,7 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
-import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
+import { loadServerIdentity, serverHelloEvent, serverCapabilities } from "./identity";
 import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateAdbIdentity, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
 import type { ConciergeFleetOps } from "../agent/default-tools";
 import {
@@ -157,6 +157,9 @@ export interface ServerOptions {
   /** Set by the real daemon (main.ts) to refresh model labels from the Models API shortly after boot;
    *  omitted by tests so they never make a live API call. */
   refreshModelLabelsOnBoot?: boolean;
+  /** Enabled opt-in features (`Config.features`, from `ANVIL_FEATURES`). Each is advertised as a
+   *  capability via `serverCapabilities`; omitted (tests) ⇒ the base capability list only. */
+  features?: string[];
   /** [BE2-15] Test-only injection of the fleet fan-out network calls (rotate/invite jobs), so the job
    *  guard tests can simulate a slow/unreachable member deterministically. Production omits it and
    *  gets the real implementations from ./fleet. */
@@ -480,7 +483,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
       registry.add(ws);
       ws.send(
         JSON.stringify(
-          serverHelloEvent(identity, { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length }),
+          serverHelloEvent(
+            identity,
+            { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length },
+            opts.features,
+          ),
         ),
       ); // who am I — first frame (fleet §3/§6)
       // Resume watermarks BEFORE session.list (v4, §6.4): the client's session.list handler drives the
@@ -655,7 +662,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // capability list a client normally reads off `server.hello` is mirrored here (HJ-32/§3.5).
       // Deliberately NOT included: this window's arm-state, which would broadcast an open
       // credential window to the whole tailnet (HJ-9).
-      capabilities: [...SERVER_CAPABILITIES],
+      capabilities: serverCapabilities(opts.features),
       // Frozen update API version + boot smoke result. A hub reads updateApiVersion off health
       // (discovery is REST) to route this member through the stable path; the watchdog polls
       // health and treats webBundleOk:false as NOT-healthy (spec §4.3/D14).

@@ -64,6 +64,7 @@ const server = ((): ReturnType<typeof createServer> => {
       usagePollMs: config.usagePollMs,
       adversarialModels: config.adversarialModels,
       adversarialProvider: config.adversarialProvider,
+      features: config.features, // ANVIL_FEATURES → advertised capabilities (spec §4.8)
       renderer,
       accounts,
       refreshModelLabelsOnBoot: true, // real daemon: pull live model labels shortly after boot
