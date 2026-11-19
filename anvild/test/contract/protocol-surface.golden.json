@@ -138,6 +138,8 @@
     "session.unarchive",
     "session.updated",
     "shadow.subscribe",
+    "solidcraft.status",
+    "solidcraft.status.get",
     "status",
     "subagent.activity",
     "subagent.settled",

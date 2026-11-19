@@ -601,6 +601,56 @@ export interface ClaudeCliStatusEvent extends Envelope {
   info: ClaudeCliInfo;
 }
 /**
+ * SolidCraft fleet pin (docs/plans/2026-11-19-agent-cad-and-browser.md §4.10). The hub records ONE
+ * build — a version plus the sha256 of its release zip — and every machine installs exactly that
+ * build, so no design is written by a build the rest of the fleet cannot read. Gated by the
+ * "solidcraft-pin" capability.
+ */
+export type SolidcraftSource = "env" | "managed" | "app";
+/** One exact SolidCraft build. */
+export interface SolidcraftPinRef {
+  version: string; // "0.44.1"
+  sha256: string; // sha256 of the release zip, lowercase hex
+  pinnedAt?: Iso8601; // when it became the pin
+}
+/** The fleet pin, as stored on the hub and applied verbatim by each member. */
+export interface SolidcraftPin {
+  version: string;
+  sha256: string;
+  pinnedAt: Iso8601;
+  previous?: SolidcraftPinRef; // the pin this one replaced — what "Pin back" returns to
+}
+export type SolidcraftMachineState =
+  | "unpinned" // no pin recorded; whatever build is installed is used
+  | "installing" // applying the pin
+  | "ready" // running exactly the pinned version
+  | "error"; // a pin is recorded and this machine is not on it
+/** One machine's SolidCraft build and where it stands against the pin. */
+export interface SolidcraftMachineStatus {
+  state: SolidcraftMachineState;
+  version?: string; // the build this machine would run now (absent: none found, or unreadable)
+  source?: SolidcraftSource; // env override, managed install, or the app bundle a person installed
+  pinned?: string; // the pinned version this machine last applied
+  available: boolean; // may CAD run here right now (spec §4.8)
+  reason?: string; // why not, when `available` is false
+  error?: string; // the last install failure, human-readable
+  failure?: string; // …and its typed reason ("sha-mismatch", "wrong-team", "not-notarized", …)
+}
+/** A design already rewritten by the newer build — listed as the "Pin back" warning. */
+export interface SolidcraftRewrittenDesign {
+  part: string;
+  version: string; // the SolidCraft version that last wrote it (`measured.solidcraft`)
+  environment?: string;
+  path?: string;
+  serverName?: string;
+}
+/** This daemon's pin status: sent on connect, on change, and as the reply to `solidcraft.status.get`. */
+export interface SolidcraftStatusEvent extends Envelope {
+  type: "solidcraft.status";
+  pin?: SolidcraftPin;
+  local: SolidcraftMachineStatus;
+}
+/**
  * First frame the server sends on every WS connection (before session.list/budget/
  * environments) — tells the client which server it just connected to (anvil-multi-server.md
  * §3/§6). A client federating many servers keys each socket's sessions/environments by
@@ -1447,6 +1497,7 @@ export type ServerEvent =
   | PromptsEvent
   | ModelLabelsEvent
   | ClaudeCliStatusEvent
+  | SolidcraftStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
   | LapoStatusEvent
@@ -2024,6 +2075,13 @@ export interface ClaudeCliCheckCmd extends Envelope, Correlated {
   type: "claudecli.check";
 }
 
+// Ask this daemon for its SolidCraft pin status (Settings → CAD). Replies with a fresh
+// `solidcraft.status` on the requester's socket, then an ack. Read-only: setting the pin and pinning
+// back are REST calls on the hub. Gated by "solidcraft-pin".
+export interface SolidcraftStatusGetCmd extends Envelope, Correlated {
+  type: "solidcraft.status.get";
+}
+
 // 5d. Terminal (§7)
 
 export interface TerminalOpenCmd extends Envelope, Correlated {
@@ -2180,6 +2238,7 @@ export type ClientCommand =
   | DaemonUpdateCmd
   | ModelRefreshCmd
   | ClaudeCliCheckCmd
+  | SolidcraftStatusGetCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd
@@ -2498,6 +2557,89 @@ export namespace rest {
       ok: boolean;
       active: boolean;
       version: string; // last/current pinned target ("" if never run)
+      startedAt?: number;
+      finishedAt?: number;
+      members: Member[];
+    }
+  }
+
+  /**
+   * SolidCraft fleet pin (docs/plans/2026-11-19-agent-cad-and-browser.md §4.10). Per-daemon status
+   * and apply; hub-driven set / pin back with per-machine status. Same posture as `claudecli`:
+   * identity-gated, JSON content type on POSTs. Every route answers 404 unless the daemon runs with
+   * the "solidcraft-pin" feature.
+   */
+  export namespace solidcraft {
+    /** GET /api/solidcraft/status → this daemon's pin and build. */
+    export interface StatusResponse {
+      ok: boolean;
+      pin?: SolidcraftPin;
+      local: SolidcraftMachineStatus;
+      error?: string;
+    }
+    /** POST /api/solidcraft/pin/apply → install exactly this pin on THIS daemon (sent by the hub). */
+    export interface ApplyRequest {
+      pin: SolidcraftPin;
+      keep?: string[]; // extra versions to keep on disk (the candidate under evaluation)
+    }
+    export interface ApplyResponse {
+      ok: boolean; // true only when this machine ended up `ready` on the pin
+      pin?: SolidcraftPin;
+      local: SolidcraftMachineStatus;
+      error?: string;
+    }
+
+    // ── Hub ──────────────────────────────────────────────────────────────────────────────────
+    export type MemberState =
+      | "pending" // queued, not yet contacted
+      | "pending-offline" // unreachable — re-applied when it is back
+      | "unsupported" // reachable, but does not advertise "solidcraft-pin"
+      | "installing"
+      | "ready" // on the pinned version
+      | "unpinned" // no pin recorded there
+      | "error"; // not on the pin
+    export interface Member {
+      serverId: string;
+      serverName: string;
+      isHub: boolean;
+      state: MemberState;
+      version?: string;
+      source?: SolidcraftSource;
+      pinned?: string;
+      available?: boolean;
+      detail?: string; // error text, "offline", …
+    }
+    /** POST /api/fleet/solidcraft/pin → set the pin and fan it out. */
+    export interface SetPinRequest {
+      version: string;
+      sha256?: string; // omit ⇒ the hub reads it from the GitHub release (asset digest = SHA256SUMS line)
+    }
+    export interface SetPinResponse {
+      ok: boolean;
+      pin?: SolidcraftPin; // the pin now in force (unchanged when `ok` is false)
+      members: Member[];
+      error?: string;
+      failure?: string; // typed install failure on the hub, when that is why the pin was refused
+    }
+    /** GET /api/fleet/solidcraft/pin/back → what "Pin back" would do, and its warning list. */
+    export interface PinBackPreviewResponse {
+      ok: boolean;
+      current?: SolidcraftPinRef;
+      previous?: SolidcraftPinRef;
+      rewritten: SolidcraftRewrittenDesign[]; // designs the newer build already rewrote; may not open
+      listError?: string; // the list could not be built; treat it as incomplete
+      error?: string;
+    }
+    /** POST /api/fleet/solidcraft/pin/back {} → pin back to `previous` and fan out. */
+    export interface PinBackResponse extends SetPinResponse {
+      rewritten: SolidcraftRewrittenDesign[];
+      listError?: string;
+    }
+    /** GET /api/fleet/solidcraft/status[?refresh=1] → the pin and every machine's standing. */
+    export interface FleetStatusResponse {
+      ok: boolean;
+      active: boolean; // a fan-out is in progress
+      pin?: SolidcraftPin;
       startedAt?: number;
       finishedAt?: number;
       members: Member[];

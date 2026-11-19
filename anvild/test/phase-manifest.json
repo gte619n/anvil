@@ -135,7 +135,127 @@
     },
     "B1": {
       "title": "managed install and pin",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/solidcraft-install.test.ts",
+          "names": [
+            "verification > [B1] a zip whose sha256 differs is deleted and reported",
+            "verification > [B1] a zip signed by the wrong Team ID is deleted and reported",
+            "verification > [B1] the Team ID is the constant G5QA5U5X2S, enforced by a codesign requirement string",
+            "verification > [B1] an invalid signature is deleted and reported",
+            "verification > [B1] a build that is not notarized is retried a bounded number of times, then deleted and reported",
+            "verification > [B1] a notarization check that passes on a retry installs",
+            "verification > [B1] Gatekeeper assessments disabled is 'cannot verify', a failure, with no retry",
+            "verification > [B1] a binary that reports another version is deleted and reported",
+            "verification > [B1] --version must match exactly: extra output is a mismatch",
+            "verification > [B1] the six steps run in order, with spctl -t install and never -t execute",
+            "verification > [B1] a failed download is reported and leaves nothing behind",
+            "verification > [B1] a malformed version or sha256 is refused before anything is downloaded",
+            "zip handling > [B1] a zip entry with '..' is refused and nothing is written outside the staging folder",
+            "zip handling > [B1] a zip entry with an absolute path is refused",
+            "zip handling > [B1] a zip entry that is a symlink is refused",
+            "zip handling > [B1] a zip with no solidcraft-cli is refused as a missing binary",
+            "zip handling > [B1] solidcraft-cli as a folder is not a binary",
+            "zip handling > [B1] solvecraft-cli is never extracted, so it can never be run",
+            "zip handling > [B1] the single top-level folder is stripped; two top folders or a loose file are refused",
+            "zip handling > [B1] the reader refuses backslashes, duplicates, file-as-folder and a wrong checksum",
+            "zip handling > [B1] extraction keeps the executable bit and file contents",
+            "install > [B1] a good zip becomes the binary resolveSolidcraftCli() returns",
+            "install > [B1] an already verified install is reused without downloading again",
+            "install > [B1] a folder verified against a different zip is not trusted: it is replaced, or removed on failure",
+            "install > [B1] a version folder without the verification marker is not an install",
+            "install > [B1] concurrent installs of one version download once and leave one folder",
+            "install > [B1] an install that loses the race to another process accepts the winner's verified folder",
+            "install > [B1] prune keeps only the pinned, previous and candidate versions"
+          ]
+        },
+        {
+          "file": "test/unit/solidcraft-pin.test.ts",
+          "names": [
+            "pinAvailability > [B1] no pin recorded → available with no reason, so CAD works before a pin exists",
+            "pinAvailability > [B1] on the pinned version → available",
+            "pinAvailability > [B1] a machine on a different version is unavailable, with a reason naming both versions",
+            "pinAvailability > [B1] a failed install (no local build on the pin) is unavailable, and the failure is in the reason",
+            "pin store > [B1] the pin survives a reload, with pinnedAt and previous",
+            "pin store > [B1] setting the build that is already pinned keeps previous and pinnedAt",
+            "pin store > [B1] a corrupt pin file is reported, left in place, and is not treated as 'no pin'",
+            "pin store > [B1] a pin file of the wrong shape is corrupt too",
+            "pin store > [B1] a machine with a corrupt pin file reports CAD unavailable until the pin is set again",
+            "member apply > [B1] applying the hub's pin installs that exact version and reports ready",
+            "member apply > [B1] a member whose install fails stays on its old version and reports CAD unavailable with the reason",
+            "member apply > [B1] after an apply only the pinned, previous and candidate versions stay on disk",
+            "member apply > [B1] an env override on the pinned version is ready; on another version it is not",
+            "hub pin > [B1] the hub verifies a build before recording it: a failing install leaves the pin unchanged",
+            "hub pin > [B1] pin back returns to previous; the build left behind becomes the new previous",
+            "hub pin > [B1] pin back with no previous is refused",
+            "hub pin > [B1] pin back after scripts were rewritten: warned, affected parts listed, no automatic rewrite",
+            "boot > [B1] at start, a recorded pin whose folder is a verified install becomes the daemon's SolidCraft",
+            "boot > [B1] at start, no pin means nothing is primed",
+            "boot > [B1] at start, a pin whose folder is missing or unverified is not used, and the install is retried",
+            "design format guard > [B1] a script written by a newer format is refused with \"this machine's SolidCraft is older than the design\"",
+            "design format guard > [B1] the local build's format number is read once per version",
+            "release lookup > [B1] the hub resolves one { version, sha256 } when the asset digest and SHA256SUMS.txt agree",
+            "release lookup > [B1] a digest that disagrees with SHA256SUMS.txt, a missing line, a draft or a missing release records nothing"
+          ]
+        },
+        {
+          "file": "test/unit/fleet-solidcraft.test.ts",
+          "names": [
+            "FleetSolidcraftCoordinator > [B1] the hub resolves ONE { version, sha256 } and every member is sent that exact pair",
+            "FleetSolidcraftCoordinator > [B1] an explicit sha256 is used as given, without a lookup",
+            "FleetSolidcraftCoordinator > [B1] the hub proves the build first: if its own install fails, no pin is recorded and no member is contacted",
+            "FleetSolidcraftCoordinator > [B1] the hub installs before the members are sent the pin",
+            "FleetSolidcraftCoordinator > [B1] a member that fails to install is reported as an error with its reason and old version",
+            "FleetSolidcraftCoordinator > [B1] an unreachable member is pending-offline and is brought to the pin by reconcile when it is back",
+            "FleetSolidcraftCoordinator > [B1] a member without the capability is reported unsupported and never sent a pin",
+            "FleetSolidcraftCoordinator > [B1] a second pin change while one is in progress is refused",
+            "FleetSolidcraftCoordinator > [B1] bad input and a failed lookup change nothing",
+            "FleetSolidcraftCoordinator > [B1] pin back fans the previous build out and returns the designs the newer build rewrote",
+            "FleetSolidcraftCoordinator > [B1] refresh re-reads every machine without changing anything"
+          ]
+        },
+        {
+          "file": "test/web/settings-cad.test.ts",
+          "names": [
+            "Settings → CAD card > [B1] shows each machine's SolidCraft version, source and ready/error state",
+            "Settings → CAD card > [B1] shows the pin, its sha256 and the previous version; with no pin it says so and Pin back is disabled",
+            "Settings → CAD card > [B1] 'Set pin to version…' sends the typed version to the hub and repaints with the new pin",
+            "Settings → CAD card > [B1] an optional sha256 is passed through, and a non-version is refused before any request",
+            "Settings → CAD card > [B1] a refused pin shows the hub's reason and leaves the pin as it was",
+            "Settings → CAD card > [B1] 'Pin back' first shows the warning list of rewritten designs, and only pins back on confirm",
+            "Settings → CAD card > [B1] cancelling the pin-back warning changes nothing; an empty or incomplete list is stated",
+            "Settings → CAD card > [B1] the replay-gate and live-process rows are labelled placeholders until a later phase supplies them",
+            "Settings → CAD card > [B1] while a fan-out is active the controls are disabled and the card says so",
+            "Settings → CAD card > [B1] the CAD tab exists only when the hub advertises solidcraft-pin"
+          ]
+        },
+        {
+          "file": "test/integration/solidcraft-b1-pin.test.ts",
+          "names": [
+            "Phase B1 acceptance > [B1] in the fleet simulator, setting the pin on the hub brings two members to ready",
+            "Phase B1 acceptance > [B1] a member on a different version reports CAD unavailable with the reason",
+            "Phase B1 acceptance > [B1] a zip whose sha differs is deleted and reported, and the pin does not move",
+            "Phase B1 acceptance > [B1] a zip with the wrong Team ID is deleted and reported, and the pin does not move",
+            "Phase B1 acceptance > [B1] a build that is not notarized, or cannot be checked, is refused the same way",
+            "Phase B1 acceptance > [B1] pin back returns the fleet to the previous build and lists the designs the newer build rewrote",
+            "Phase B1 surface > [B1] the routes follow the managed-CLI posture: JSON content type, and a proven other tailnet user is rejected",
+            "Phase B1 surface > [B1] without the solidcraft-pin feature the capability is not advertised and every route is a 404",
+            "Phase B1 surface > [B1] a hub reports a member without the feature as unsupported and does not send it the pin",
+            "Phase B1 surface > [B1] solidcraft.status is sent on connect, on a pin change, and in reply to solidcraft.status.get",
+            "Phase B1 surface > [B1] a good zip becomes the manager's binary, and still is after the daemon restarts"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/solidcraft-b1.test.ts",
+          "names": [
+            "[B1 real] a real release zip installs into a temp state dir and passes all six verification steps",
+            "[B1 real] the installed build becomes the daemon's SolidCraft through the pin, and survives a restart",
+            "[B1 real] real refusals: a wrong sha256, a tampered binary, another team's binary, and the un-notarized 0.30.1 build"
+          ]
+        }
+      ]
     },
     "B2": {
       "title": "replay gate and auto-advance",

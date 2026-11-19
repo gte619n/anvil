@@ -14,6 +14,8 @@ export interface DispatchDeps {
   /** Hub-only: replicate the stored Todoist token to fleet members (defined in http.ts, where the
    *  FleetStore lives). Omitted/no-op on leaf members. */
   propagateTodoist?: (targets?: string[]) => void;
+  /** This daemon's `solidcraft.status` event. Present only with the "solidcraft-pin" feature. */
+  solidcraftStatus?: () => Promise<ServerEvent>;
 }
 
 type Send = (event: ServerEvent) => void;
@@ -175,6 +177,21 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           if (!r.ok) send(cmdError(r.error ?? "claude CLI check failed", cid));
           else if (cid) send(ack(cid));
         });
+        return;
+
+      case "solidcraft.status.get":
+        // Settings → CAD: hand the requester this daemon's pin and build. Read-only.
+        if (!deps.solidcraftStatus) {
+          send(cmdError("the SolidCraft pin is not switched on for this server", cid));
+          return;
+        }
+        void deps.solidcraftStatus().then(
+          (e) => {
+            send(e);
+            if (cid) send(ack(cid));
+          },
+          (e) => send(cmdError(errMsg(e), cid)),
+        );
         return;
 
       case "session.account.set":

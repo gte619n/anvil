@@ -112,6 +112,7 @@ import {
   onAuthAccounts,
   onAuthStatus,
   onClaudeCliStatus,
+  onSolidcraftStatus,
   onLapoStatus,
   onModelCatalog,
   onPipelineMetrics,
@@ -1624,6 +1625,11 @@ function onEvent(url: string, e: ServerEvent): void {
       // The Claude engine card is hub-scoped (the "Update" button drives the hub's fleet fan-out), so
       // show the hub's status and ignore members' own copies.
       if (url === HUB_URL) onClaudeCliStatus(e.info);
+      return;
+    case "solidcraft.status":
+      // The Settings → CAD card reads the hub's fleet view over REST; the hub's event is the cue to
+      // re-read it. Members' own copies are ignored (the card is hub-scoped).
+      if (url === HUB_URL) onSolidcraftStatus();
       return;
     case "todoist.status":
       // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
