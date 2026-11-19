@@ -1,5 +1,5 @@
 import type { ServerWebSocket } from "bun";
-import type { rest, PermissionDecision } from "@protocol";
+import type { rest, PermissionDecision, FleetSkillMemberSync } from "@protocol";
 import { UPDATE_API_VERSION, PROTOCOL_VERSION } from "@protocol";
 import { AccountStore, resolveAuthStatus } from "../auth/accounts";
 import { newId } from "../util/ids";
@@ -7,7 +7,7 @@ import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
 import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
-import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateAdbIdentity, propagateTodoist, resolveMember, rotateToken, tailnetPeers } from "./fleet";
+import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateAdbIdentity, propagateTodoist, resolveMember, rotateToken, tailnetPeers, checkMemberSkills, pushMemberSkills } from "./fleet";
 import type { ConciergeFleetOps } from "../agent/default-tools";
 import {
   DEFAULT_ARM_TTL_MS,
@@ -161,6 +161,9 @@ export interface ServerOptions {
    *  guard tests can simulate a slow/unreachable member deterministically. Production omits it and
    *  gets the real implementations from ./fleet. */
   fleetNet?: Partial<FleetNetOps>;
+  /** How often the hub re-checks members' fleet skill libraries (ms). 0 disables the boot + periodic
+   *  sweeps (tests); changes and "Sync now" still push. Default 10 min. */
+  skillSweepMs?: number;
   /** [BE2-15] Test-only override of the caller-identity resolver (the real one shells out to the
    *  tailscale CLI, which makes identity-gated routes untestable hermetically). */
   resolveIdentity?: () => Promise<{ trust: PeerTrust; reject?: string }>;
@@ -235,9 +238,75 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adversarialProvider: opts.adversarialProvider,
       refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
       fleet: conciergeFleet,
+      // Lazy, like onRosterChanged: `syncSkills` is hoisted below and closes over `fleet`/`identity`.
+      onSkillsChanged: () => void syncSkills(),
+      skillMembers: () => [...skillSync.values()],
     },
     registry,
   );
+
+  // ── Fleet skill library replication (docs/plans/2026-11-19-fleet-skills.md) ──────────────────────
+  // The hub owns the library and pushes it to every member daemon. Each sweep first asks the member for
+  // its library hash (cheap GET) and only POSTs the bundle to a member that drifted, so the periodic
+  // sweep costs one tiny request per member when nothing changed. Fires after every hub-side change,
+  // shortly after boot, every `skillSweepMs`, and on "Sync now". No-op on a leaf (no members).
+  const skillSync = new Map<string, FleetSkillMemberSync>(); // serverId → last observed state
+  let skillSweep: Promise<void> | undefined;
+  let skillSweepAgain = false;
+  function syncSkills(): Promise<void> {
+    if (skillSweep) {
+      skillSweepAgain = true; // a change landed mid-sweep — run once more when this one finishes
+      return skillSweep;
+    }
+    skillSweep = (async () => {
+      do {
+        skillSweepAgain = false;
+        await skillSweepOnce();
+      } while (skillSweepAgain);
+    })().finally(() => {
+      skillSweep = undefined;
+    });
+    return skillSweep;
+  }
+  async function skillSweepOnce(): Promise<void> {
+    const store = supervisor.skillStore;
+    const members = fleet.list();
+    if (store.role() !== "hub") return;
+    for (const sid of [...skillSync.keys()]) if (!members.some((m) => m.serverId === sid)) skillSync.delete(sid);
+    if (members.length === 0) return;
+    const want = store.hash();
+    let bundle: rest.skills.Bundle | undefined;
+    const before = JSON.stringify([...skillSync.values()].map((x) => [x.serverId, x.inSync, x.error ?? ""]));
+    await Promise.all(
+      members.map(async (m) => {
+        let r = await checkMemberSkills(m);
+        if (r.ok && r.hash !== want) {
+          bundle ??= store.bundle(identity.serverId);
+          r = await pushMemberSkills(m, bundle);
+          if (r.ok) console.log(`[skills] replicated ${store.list().length} skill(s) → ${m.serverName || m.url}`);
+          else console.warn(`[skills] push to ${m.serverName || m.url} failed: ${r.error ?? "unknown"}`);
+        }
+        skillSync.set(m.serverId, {
+          serverId: m.serverId,
+          serverName: m.serverName || m.host,
+          inSync: r.ok && r.hash === want,
+          ...(r.ok ? {} : { error: r.error ?? "unknown" }),
+          checkedAt: Date.now(),
+        });
+      }),
+    );
+    const after = JSON.stringify([...skillSync.values()].map((x) => [x.serverId, x.inSync, x.error ?? ""]));
+    if (after !== before) supervisor.broadcastSkills();
+  }
+  const skillSweepMs = opts.skillSweepMs ?? 10 * 60_000;
+  const skillTimers: ReturnType<typeof setTimeout>[] = [];
+  if (skillSweepMs > 0) {
+    const boot = setTimeout(() => void syncSkills(), 20_000);
+    const every = setInterval(() => void syncSkills(), skillSweepMs);
+    boot.unref?.();
+    every.unref?.();
+    skillTimers.push(boot, every);
+  }
 
   // Frozen update API v1 (stable-update-service spec §4.3). The state store persists the pre-pull SHA +
   // phase across the very restart it coordinates; `settleAfterBoot` is the in-daemon half of the
@@ -491,6 +560,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
       ws.send(JSON.stringify(supervisor.promptsEvent()));
+      ws.send(JSON.stringify(supervisor.skillsEvent())); // fleet skill library (Settings → Skills)
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
@@ -511,7 +581,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     message(ws: ServerWebSocket<ConnState>, message: string | Buffer) {
       const raw = typeof message === "string" ? message : message.toString("utf8");
-      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist });
+      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist, syncSkills });
     },
   };
 
@@ -980,6 +1050,37 @@ export function createServer(opts: ServerOptions): ServerHandle {
     } catch (e) {
       return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies rest.FleetHandoffResponse, { status: 400 });
     }
+  });
+
+  // Hub→member fleet skill replication landing point (docs/plans/2026-11-19-fleet-skills.md). GET reports
+  // this daemon's library hash (the hub's cheap drift check); POST adopts the hub's whole library. Tailnet-
+  // gated like the rest of the API, plus two anti-confusion checks: a daemon that is itself a hub (has
+  // members) never adopts someone else's library, and a member that knows its hub only accepts that hub.
+  route("GET", "/api/skills/replica", () => {
+    const store = supervisor.skillStore;
+    return Response.json({ ok: true, hash: store.hash(), role: store.role(), serverId: identity.serverId, serverName: identity.serverName } satisfies rest.skills.ReplicaState);
+  });
+  // A fleet skill's SKILL.md, for the Settings → Skills viewer/editor.
+  route("GET", "/api/skills/file", (_req, url) => {
+    const name = url.searchParams.get("name") ?? "";
+    const skill = supervisor.skillStore.get(name);
+    if (!skill) return new Response("not found", { status: 404 });
+    return new Response(Bun.file(join(supervisor.skillStore.skillsDir, skill.name, "SKILL.md")), { headers: { "content-type": "text/markdown; charset=utf-8" } });
+  });
+  route("POST", "/api/skills/replica", async (req) => {
+    const body = (await jsonBody<rest.skills.Bundle>(req)) as rest.skills.Bundle;
+    const reject = (error: string, status: number): Response => Response.json({ ok: false, error } satisfies rest.skills.ReplicaState, { status });
+    if (!body.hubServerId || !Array.isArray(body.skills)) return reject("bad request", 400);
+    if (fleet.list().length > 0) return reject("this server is a hub — it owns its own skill library", 409);
+    const paired = pairedHub.get();
+    if (paired && paired.hubServerId !== body.hubServerId) return reject("push is not from this server's hub", 403);
+    try {
+      supervisor.adoptSkillReplica(body);
+    } catch (e) {
+      return reject(e instanceof Error ? e.message : String(e), 400);
+    }
+    const store = supervisor.skillStore;
+    return Response.json({ ok: true, hash: store.hash(), role: store.role(), serverId: identity.serverId, serverName: identity.serverName } satisfies rest.skills.ReplicaState);
   });
 
   // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
@@ -1525,8 +1626,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   return {
     port: server.port ?? opts.port,
-    stop: () => server.stop(true),
+    stop: () => {
+      skillTimers.forEach(clearTimeout);
+      server.stop(true);
+    },
     shutdown: async () => {
+      skillTimers.forEach(clearTimeout);
       await supervisor.shutdown();
       server.stop(true);
     },

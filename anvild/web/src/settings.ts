@@ -39,6 +39,7 @@ import { stripeColor } from "./sessionColor";
 import { newCid } from "./outbox";
 import { runMermaid } from "./conversation";
 import { openScheduleModal, scheduleSettingsCardHtml } from "./autopilot";
+import { renderSkillsPanel, showSkillEditor, showSkillImport } from "./skills";
 import {
   HUB_URL,
   confirmRemoveServer,
@@ -114,7 +115,7 @@ export function initSettings(deps: SettingsDeps): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "integrations" | "models" | "appearance" | "prompts";
+type SettingsTab = "servers" | "environments" | "integrations" | "models" | "appearance" | "prompts" | "skills";
 let settingsTab: SettingsTab = "environments";
 export function openSettings(): void {
   const root = $("#settings-root");
@@ -129,6 +130,7 @@ export function openSettings(): void {
       <button class="stab" role="tab" data-tab="integrations">${icon("extension")} Integrations</button>
       <button class="stab" role="tab" data-tab="models">${icon("smart_toy")} Models</button>
       <button class="stab" role="tab" data-tab="prompts">${icon("bookmark")} Prompts</button>
+      <button class="stab" role="tab" data-tab="skills">${icon("auto_awesome")} Skills</button>
       <button class="stab" role="tab" data-tab="appearance">${icon("palette")} Appearance</button>
     </div>
     <div class="settings-body">
@@ -158,6 +160,11 @@ export function openSettings(): void {
         <p class="small muted">Reusable prompt snippets. Each shows up as a button in the sidebar — click it to drop the prompt into the chat box.</p>
         <div id="prompt-cards"></div>
       </section>
+      <section class="settings-panel" data-tab="skills">
+        <div class="section-head"><h3>Skills</h3><span style="display:flex;gap:6px"><button id="set-import-skill" class="mini">${icon("download")} Import</button><button id="set-add-skill" class="primary">${icon("add")} New skill</button></span></div>
+        <p class="small muted">One library of Claude Code skills for every server in your fleet. Add a skill once here and every session on every machine can use it as <code>/fleet:&lt;name&gt;</code> — nothing is copied into your repos.</p>
+        <div id="skill-cards"></div>
+      </section>
       <section class="settings-panel" data-tab="appearance">
         <div class="section-head"><h3>Appearance</h3></div>
         <p class="small muted">Choose how Anvil looks. <b>System</b> follows your device's light or dark setting.</p>
@@ -172,6 +179,8 @@ export function openSettings(): void {
   $("#settings-close").addEventListener("click", () => dismissOverlay("settings"));
   $("#set-add-env").addEventListener("click", () => showAddEnvironment());
   $("#set-add-prompt").addEventListener("click", () => showEditPrompt());
+  $("#set-add-skill").addEventListener("click", () => void showSkillEditor());
+  $("#set-import-skill").addEventListener("click", () => showSkillImport());
   $("#todoist-refresh").addEventListener("click", () => loadTodoistProjects(true));
   root.querySelectorAll<HTMLElement>(".theme-opt").forEach((b) =>
     b.addEventListener("click", () => setThemePref(b.dataset.themePref as ThemePref)),
@@ -200,6 +209,10 @@ function selectSettingsTab(tab: SettingsTab): void {
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
   }
   if (tab === "prompts") renderPromptsPanel();
+  if (tab === "skills") {
+    if (serverSupports(hub(), "fleet-skills")) hub().sock.send({ type: "skill.list", cid: newCid() }); // fresh sync state
+    renderSkillsPanel();
+  }
   if (tab === "models") {
     renderModelsPanel();
     if (serverSupports(hub(), "auth")) {

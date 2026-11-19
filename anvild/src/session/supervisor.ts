@@ -14,6 +14,9 @@ import {
   type EnvironmentsEvent,
   type EnvironmentValidation,
   type PromptsEvent,
+  type SkillsEvent,
+  type FleetSkill,
+  type FleetSkillMemberSync,
   type ModelLabelsEvent,
   type ClaudeCliInfo,
   type ClaudeCliStatusEvent,
@@ -69,7 +72,8 @@ import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWork
 import { AgentDriver, type TurnUsage } from "../agent/driver";
 import { setManagedCliPath } from "../agent/cli";
 import * as claudeCli from "../daemon/claude-cli";
-import { skillPlugins } from "../agent/skills";
+import { refreshHeadlessSkills, setFleetSkillsDir, skillPlugins } from "../agent/skills";
+import { FleetSkillStore } from "../skills/fleet-store";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS, type ConciergeFleetOps } from "../agent/default-tools";
 import { repoOp, type RepoRequest, type RepoResult } from "../fleet/repo-access";
@@ -176,6 +180,11 @@ export interface SupervisorConfig {
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
   fleet?: ConciergeFleetOps;
+  /** Fleet skill library hooks (docs/plans/2026-11-19-fleet-skills.md), defined in http.ts where the
+   *  FleetStore lives: replicate after a hub-side change, and report each member's last-seen sync state
+   *  for the `skills` event. Omitted in unit tests / on a leaf. */
+  onSkillsChanged?: () => void;
+  skillMembers?: () => FleetSkillMemberSync[];
 }
 
 /**
@@ -248,6 +257,8 @@ export class Supervisor {
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
+  /** The fleet skill library (hub-authored, replicated to members). */
+  readonly skillStore: FleetSkillStore;
   private readonly updateState: UpdateStateStore;
   /** Live model-tier labels (hub-refreshed from the Models API); empty until the first refresh lands. */
   private readonly modelLabels: ModelLabelStore;
@@ -287,6 +298,7 @@ export class Supervisor {
   readonly accounts: AccountStore;
   private readonly pairedHub?: PairedHubStore;
   private readonly onRosterChanged?: (reason: string) => void;
+  private readonly skillHooks: Pick<SupervisorConfig, "onSkillsChanged" | "skillMembers">;
   private readonly envFile?: string;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
@@ -307,6 +319,7 @@ export class Supervisor {
     this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
     this.pairedHub = cfg.pairedHub;
     this.onRosterChanged = cfg.onRosterChanged;
+    this.skillHooks = { onSkillsChanged: cfg.onSkillsChanged, skillMembers: cfg.skillMembers };
     this.envFile = cfg.envFile;
     this.fleetOps = cfg.fleet;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
@@ -343,6 +356,9 @@ export class Supervisor {
       handoffCreate: (a) => this.handoffCreate(a),
     });
     this.promptStore = new PromptStore(cfg.stateDir);
+    this.skillStore = new FleetSkillStore(cfg.stateDir);
+    setFleetSkillsDir(this.skillStore.skillsDir);
+    this.refreshHeadless();
     this.updateState = new UpdateStateStore(cfg.stateDir);
     this.modelLabels = new ModelLabelStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -719,6 +735,87 @@ export class Supervisor {
   removePrompt(id: string): void {
     this.promptStore.remove(id);
     this.registry.toAll(this.promptsEvent());
+  }
+
+  // ── Fleet skill library (docs/plans/2026-11-19-fleet-skills.md) ──────────────────────────────
+  skillsEvent(): SkillsEvent {
+    const members = this.skillHooks.skillMembers?.();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "skills",
+      ts: now(),
+      role: this.skillStore.role(),
+      hash: this.skillStore.hash(),
+      skills: this.skillStore.list(),
+      ...(members && this.skillStore.role() === "hub" ? { members } : {}),
+    };
+  }
+  /** Re-broadcast the library (e.g. after a member's sync state changed). */
+  broadcastSkills(): void {
+    this.registry.toAll(this.skillsEvent());
+  }
+  saveSkill(name: string, body: string, headless?: boolean): FleetSkill {
+    return this.skillMutation(() => this.skillStore.saveInline(name.trim(), body, headless));
+  }
+  async importSkills(source: string, opts: { ref?: string; subdir?: string; headless?: boolean }): Promise<FleetSkill[]> {
+    return this.skillMutation(() => this.skillStore.import(source, opts));
+  }
+  async updateSkills(name?: string): Promise<{ changed: string[]; errors: string[] }> {
+    return this.skillMutation(() => this.skillStore.update(name));
+  }
+  removeSkill(name: string): void {
+    this.skillMutation(() => this.skillStore.remove(name));
+  }
+  setSkillHeadless(name: string, headless: boolean): void {
+    this.skillMutation(() => this.skillStore.setHeadless(name, headless));
+  }
+  /** A hub pushed its library to this member: adopt it, then refresh like any local change (minus the
+   *  re-replication — a replica has no members of its own to push to). */
+  adoptSkillReplica(bundle: Parameters<FleetSkillStore["adoptReplica"]>[0]): void {
+    const before = this.skillStore.hash();
+    this.skillStore.adoptReplica(bundle);
+    if (this.skillStore.hash() !== before) this.afterSkillsChanged(false);
+  }
+
+  /** Run a hub-side library write; a store error becomes a BadCommand (shown to the user), success
+   *  refreshes the headless plugin, broadcasts, replicates, and recycles idle drivers. */
+  private skillMutation<T>(fn: () => T): T;
+  private skillMutation<T>(fn: () => Promise<T>): Promise<T>;
+  private skillMutation<T>(fn: () => T | Promise<T>): T | Promise<T> {
+    const fail = (e: unknown): never => {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    };
+    let out: T | Promise<T>;
+    try {
+      out = fn();
+    } catch (e) {
+      return fail(e);
+    }
+    if (out instanceof Promise) {
+      return out.then(
+        (v) => {
+          this.afterSkillsChanged(true);
+          return v;
+        },
+        fail,
+      );
+    }
+    this.afterSkillsChanged(true);
+    return out;
+  }
+
+  private afterSkillsChanged(replicate: boolean): void {
+    this.refreshHeadless();
+    this.broadcastSkills();
+    if (replicate) this.skillHooks.onSkillsChanged?.();
+    // A live SDK query discovered its skills at init, so an IDLE session would otherwise keep the old
+    // set until a restart. Drop idle drivers — the next prompt resumes the same conversation with the
+    // new library (same mechanism as a credential change); sessions mid-turn pick it up next time.
+    for (const [id] of [...this.drivers]) void this.restartDriverForNewToken(id);
+  }
+
+  private refreshHeadless(): void {
+    refreshHeadlessSkills({ stateDir: this.stateDir, fleetSkillsDir: this.skillStore.skillsDir, names: this.skillStore.headlessNames() });
   }
 
   // ── Integrations (Todoist + lapo) — delegated to IntegrationsFacade (P7 extraction) ──────────────
@@ -1697,7 +1794,7 @@ export class Supervisor {
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
-        skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
+        skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir, fleetSkillsDir: this.skillStore.skillsDir }),
         (commands) => this.onSessionCommands(id, commands),
         (err) => this.onTurnError(err),
         (met, goal) => this.onGoalResolved(id, met, goal),

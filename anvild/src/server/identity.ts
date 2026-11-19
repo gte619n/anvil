@@ -88,6 +88,10 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   "autopilot-maintenance",
   "auth",
   "prompts",
+  // The fleet skill library (docs/plans/2026-11-19-fleet-skills.md): the `skills` event, skill.* commands,
+  // and the /api/skills/replica hub→member push. Absent ⇒ the client hides Settings → Skills and the hub
+  // reports the member as "predates fleet skills".
+  "fleet-skills",
   "lapo",
   "pairing",
   "model-labels",
