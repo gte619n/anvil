@@ -2628,12 +2628,14 @@ export namespace rest {
       previous?: SolidcraftPinRef;
       rewritten: SolidcraftRewrittenDesign[]; // designs the newer build already rewrote; may not open
       listError?: string; // the list could not be built; treat it as incomplete
+      listUnavailable?: boolean; // no design store is connected: the list is unknown, NOT empty
       error?: string;
     }
     /** POST /api/fleet/solidcraft/pin/back {} → pin back to `previous` and fan out. */
     export interface PinBackResponse extends SetPinResponse {
       rewritten: SolidcraftRewrittenDesign[];
       listError?: string;
+      listUnavailable?: boolean;
     }
     /** GET /api/fleet/solidcraft/status[?refresh=1] → the pin and every machine's standing. */
     export interface FleetStatusResponse {

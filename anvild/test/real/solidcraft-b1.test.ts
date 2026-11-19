@@ -172,21 +172,21 @@ test.skipIf(!REAL)(
     if (!ls.ok) expect(ls.detail).toContain(SOLIDCRAFT_TEAM_ID);
 
     // 4. SolidCraft 0.30.1 is signed by the right team but was never notarized: refused at step 5.
-    if (existsSync(localZip(UNNOTARIZED.version))) {
-      const oldDir = tmp("anvil-sc-real-old-");
-      const run = recordingRun();
-      const old = await installSolidcraft(oldDir, UNNOTARIZED, { ...quick, download: fileDownloader(localZip), run, log: () => {} });
-      expect(old).toMatchObject({ ok: false, reason: "not-notarized" });
-      if (!old.ok) expect(old.detail).toContain("Unnotarized Developer ID");
-      // It got as far as step 5 (signature and team passed) and was never executed.
-      expect(run.log.filter((l) => l.cmd[0] === "/usr/bin/codesign").map((l) => l.code)).toEqual([0, 0]);
-      expect(run.log.filter((l) => l.cmd[0] === "/usr/sbin/spctl" && l.cmd.includes("install")).length).toBe(2);
-      expect(run.log.some((l) => l.cmd.includes("--version"))).toBe(false);
-      expect(existsSync(solidcraftVersionDir(oldDir, UNNOTARIZED.version))).toBe(false);
-      expect(leftovers(oldDir)).toEqual([]);
-    } else {
-      console.log(`[B1 real] NOTE: ${localZip(UNNOTARIZED.version)} is absent, so the un-notarized 0.30.1 refusal was not exercised in this run.`);
+    // The zip is REQUIRED: a real-tool run that cannot exercise this refusal must fail, not pass quietly.
+    if (!existsSync(localZip(UNNOTARIZED.version))) {
+      throw new Error(`[B1 real] required file missing: ${localZip(UNNOTARIZED.version)} (the SolidCraft 0.30.1 release zip, sha256 ${UNNOTARIZED.sha256}). Download it from the v0.30.1 release into ${SPIKE_DL} and run again.`);
     }
+    const oldDir = tmp("anvil-sc-real-old-");
+    const run = recordingRun();
+    const old = await installSolidcraft(oldDir, UNNOTARIZED, { ...quick, download: fileDownloader(localZip), run, log: () => {} });
+    expect(old).toMatchObject({ ok: false, reason: "not-notarized" });
+    if (!old.ok) expect(old.detail).toContain("Unnotarized Developer ID");
+    // It got as far as step 5 (signature and team passed) and was never executed.
+    expect(run.log.filter((l) => l.cmd[0] === "/usr/bin/codesign").map((l) => l.code)).toEqual([0, 0]);
+    expect(run.log.filter((l) => l.cmd[0] === "/usr/sbin/spctl" && l.cmd.includes("install")).length).toBe(2);
+    expect(run.log.some((l) => l.cmd.includes("--version"))).toBe(false);
+    expect(existsSync(solidcraftVersionDir(oldDir, UNNOTARIZED.version))).toBe(false);
+    expect(leftovers(oldDir)).toEqual([]);
 
     // None of the refusals disturbed the good install.
     expect(installedSolidcraft(goodDir, GOOD.version, GOOD.sha256)).toBeDefined();

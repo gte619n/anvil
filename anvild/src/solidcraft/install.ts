@@ -238,7 +238,8 @@ const inflight = new Map<string, Promise<InstallResult>>();
 
 /**
  * Install exactly `ref` (version + zip sha256) under `stateDir`, or return the already-verified
- * install. Never throws; a refusal is `{ ok: false, reason, detail }` with nothing left on disk.
+ * install. Never throws; a refusal is `{ ok: false, reason, detail }` and leaves the disk as it was:
+ * nothing new is kept, and a build already installed for this version is not touched.
  */
 export function installSolidcraft(stateDir: string, ref: SolidcraftRef, deps: Partial<InstallDeps> = {}): Promise<InstallResult> {
   if (!isSolidcraftVersion(ref.version) || !isSha256(ref.sha256)) {
@@ -259,8 +260,9 @@ async function doInstall(stateDir: string, ref: SolidcraftRef, deps: InstallDeps
   const finalBin = solidcraftCliPath(stateDir, version);
   const have = installedSolidcraft(stateDir, version, sha256);
   if (have) return { ok: true, version, sha256, path: have.path, alreadyInstalled: true };
-  // A folder that is there but was not verified against THIS zip is not trusted: remove it.
-  rmSync(finalDir, { recursive: true, force: true });
+  // A folder that is there but was not verified against THIS zip is not trusted for this ref, but
+  // it is NOT removed here: it may be the working pinned build, and this attempt may yet be refused.
+  // It is replaced only by the swap below, after every check has passed.
 
   const fail = (reason: InstallFailure, detail: string): InstallResult => {
     deps.log(`[solidcraft] install ${version} refused (${reason}): ${detail}`);
@@ -300,11 +302,26 @@ async function doInstall(stateDir: string, ref: SolidcraftRef, deps: InstallDeps
     if (!verdict.ok) return fail(verdict.reason, verdict.detail);
 
     writeFileSync(join(staged, MARKER), JSON.stringify({ version, sha256, verifiedAt: new Date().toISOString() }, null, 2));
+    // Swap. A folder left by an earlier install of another zip of this version (or an unverified
+    // leftover) steps aside into the temp folder, which is deleted below.
+    const displaced = join(tmp, "displaced");
+    let moved = false;
+    if (existsSync(finalDir) && !installedSolidcraft(stateDir, version, sha256)) {
+      try {
+        renameSync(finalDir, displaced);
+        moved = true;
+      } catch (e) {
+        return fail("install-failed", `could not replace the existing build: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     try {
       renameSync(staged, finalDir);
     } catch (e) {
       // Another process finished the same install first. Its folder is fine if it carries our marker.
-      if (!installedSolidcraft(stateDir, version, sha256)) return fail("install-failed", `could not move the build into place: ${e instanceof Error ? e.message : String(e)}`);
+      if (!installedSolidcraft(stateDir, version, sha256)) {
+        if (moved && !existsSync(finalDir)) renameSync(displaced, finalDir); // put the old build back
+        return fail("install-failed", `could not move the build into place: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
     deps.log(`[solidcraft] installed ${version} at ${finalBin}`);
     return { ok: true, version, sha256, path: finalBin, alreadyInstalled: false };

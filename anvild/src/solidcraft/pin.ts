@@ -168,7 +168,8 @@ export function pinAvailability(localVersion: string | undefined, pin: Pick<Soli
 /**
  * Lists the designs whose `measured.solidcraft` is `newerVersion`: those were rewritten by the build
  * being left, and may not open under the one being returned to. The design store belongs to Track A,
- * so the list is supplied from outside; the default knows of none.
+ * so the list is supplied from outside. With NO provider the list is unknown (`listUnavailable`),
+ * which is not the same as a provider that answered "none".
  */
 export type RewrittenDesignsProvider = (newerVersion: string) => Promise<SolidcraftRewrittenDesign[]> | SolidcraftRewrittenDesign[];
 
@@ -180,13 +181,16 @@ export interface PinBackWarning {
   rewritten: SolidcraftRewrittenDesign[];
   /** Set when the provider failed: the list is then incomplete, and the caller must say so. */
   listError?: string;
+  /** No provider is wired (Track A's design store is not connected): the list is unknown, not empty. */
+  listUnavailable?: boolean;
 }
 
 /** What "Pin back" would do and which designs it puts at risk. Nothing is changed. */
-export async function pinBackWarning(pin: SolidcraftPin | undefined, provider: RewrittenDesignsProvider = noRewrittenDesigns): Promise<PinBackWarning> {
+export async function pinBackWarning(pin: SolidcraftPin | undefined, provider?: RewrittenDesignsProvider): Promise<PinBackWarning> {
   if (!pin) return { rewritten: [] };
   const current: SolidcraftPinRef = { version: pin.version, sha256: pin.sha256, pinnedAt: pin.pinnedAt };
   if (!pin.previous) return { current, rewritten: [] };
+  if (!provider) return { current, previous: pin.previous, rewritten: [], listUnavailable: true };
   try {
     const all = await provider(pin.version);
     return { current, previous: pin.previous, rewritten: all.filter((d) => d.version === pin.version) };
@@ -347,6 +351,12 @@ export class SolidcraftPinService {
     const env = this.deps.env ?? process.env;
     const override = env.ANVIL_SOLIDCRAFT_CLI?.trim();
     if (override) return { path: override, source: "env" };
+    if (this.managed && !existsSync(this.managed.path)) {
+      // The folder was removed under us. Stop claiming it, so status says what is true.
+      this.log(`[solidcraft] the managed build ${this.managed.version} is no longer on disk at ${this.managed.path}`);
+      this.managed = undefined;
+      if (this.deps.primeResolver ?? true) setManagedSolidcraftCli(undefined);
+    }
     if (this.managed) return { path: this.managed.path, source: "managed", version: this.managed.version };
     if ((this.deps.exists ?? existsSync)(APP_BUNDLE_SOLIDCRAFT_CLI)) return { path: APP_BUNDLE_SOLIDCRAFT_CLI, source: "app" };
     return undefined;

@@ -264,6 +264,12 @@ describe("Phase B1 surface", () => {
       expect(res.status).toBe(403);
       expect(((await res.json()) as { ok: boolean }).ok).toBe(false);
     }
+    // The member-side apply route too. A caller that PRESENTS a tailnet identity which resolves to
+    // another user is rejected; only a purely local caller with no identity is let through there.
+    const asOther = await post(other, "/api/solidcraft/pin/apply", { pin: { version: "0.44.1", sha256: NEW.sha256, pinnedAt: "2026-11-19T10:00:00.000Z" } }, { "Content-Type": "application/json", "Tailscale-User-Login": "mallory@example" });
+    expect(asOther.status).toBe(403);
+    expect(((await asOther.json()) as { ok: boolean }).ok).toBe(false);
+    expect(other.download.calls).toEqual([]);
     expect((await localStatus(other)).local.state).toBe("unpinned"); // nothing happened
     expect(versionFolders(other)).toEqual([]);
     // A malformed pin is a 400, not an install.

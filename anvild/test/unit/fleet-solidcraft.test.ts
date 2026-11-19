@@ -225,6 +225,31 @@ describe("FleetSolidcraftCoordinator", () => {
     expect(coord.status().members.every((m) => m.version === "0.43.0" && m.state === "ready")).toBe(true);
   });
 
+  test("[B1] with no rewritten-designs provider the pin-back list is reported unavailable; a provider that returns none is reported as none", async () => {
+    const log: string[] = [];
+    const make = (rewrittenDesigns?: () => { part: string; version: string }[]) => {
+      const local = fakeLocal(log);
+      const coord = new FleetSolidcraftCoordinator({ self, members: () => [], local, client: fakeClient({}, log), resolveRef: async (v) => ({ version: v, sha256: v === "0.43.0" ? SHA_A : SHA_B }), ...(rewrittenDesigns ? { rewrittenDesigns } : {}) });
+      return coord;
+    };
+    const without = make();
+    await without.setPin({ version: "0.43.0" });
+    await without.settled();
+    await without.setPin({ version: "0.44.1" });
+    await without.settled();
+    expect(await without.pinBackPreview()).toMatchObject({ ok: true, rewritten: [], listUnavailable: true });
+    expect(await without.pinBack()).toMatchObject({ ok: true, rewritten: [], listUnavailable: true });
+
+    const withEmpty = make(() => []);
+    await withEmpty.setPin({ version: "0.43.0" });
+    await withEmpty.settled();
+    await withEmpty.setPin({ version: "0.44.1" });
+    await withEmpty.settled();
+    const preview = await withEmpty.pinBackPreview();
+    expect(preview).toMatchObject({ ok: true, rewritten: [] });
+    expect(preview.listUnavailable).toBeUndefined();
+  });
+
   test("[B1] refresh re-reads every machine without changing anything", async () => {
     const { coord, client } = coordinator();
     await coord.refresh();

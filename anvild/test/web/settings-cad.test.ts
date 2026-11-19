@@ -199,6 +199,21 @@ describe("Settings → CAD card", () => {
     expect(cadCardHtml({ status: status(), pinBack: { ok: false, rewritten: [], error: "there is no previous pin to go back to" } })).toContain("no previous pin");
   });
 
+  test("[B1] with no design store connected the pin-back warning says the list is not available, never that it is empty", () => {
+    const base: rest.solidcraft.PinBackPreviewResponse = { ok: true, current: { version: "0.44.1", sha256: SHA_NEW }, previous: { version: "0.43.0", sha256: SHA_OLD }, rewritten: [] };
+    // No provider: unknown.
+    host.innerHTML = cadCardHtml({ status: status(), pinBack: { ...base, listUnavailable: true } });
+    expect(text("#cad-pinback-unavailable")).toContain("not available yet");
+    expect(text("#cad-pinback-unavailable")).toContain("0.44.1");
+    expect(text("#cad-pinback-warning")).not.toContain("No designs are recorded");
+    expect(host.querySelector("#cad-pinback-none")).toBeNull();
+    expect(host.querySelector("#cad-pinback-confirm")).not.toBeNull(); // the owner can still pin back
+    // A provider that answered "none": that, and only that, is stated as none.
+    host.innerHTML = cadCardHtml({ status: status(), pinBack: base });
+    expect(text("#cad-pinback-none")).toContain("No designs are recorded as rewritten by SolidCraft 0.44.1");
+    expect(host.querySelector("#cad-pinback-unavailable")).toBeNull();
+  });
+
   test("[B1] the replay-gate and live-process rows are labelled placeholders until a later phase supplies them", async () => {
     const card = mountCadCard(host, fakeApi());
     await card.ready;

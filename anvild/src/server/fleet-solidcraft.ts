@@ -18,7 +18,7 @@ import { PROTOCOL_VERSION } from "@protocol";
 import { featureEnabled } from "../config";
 import type { InstallDeps, SolidcraftRef } from "../solidcraft/install";
 import { isSha256, isSolidcraftVersion } from "../solidcraft/install";
-import { SolidcraftPinService, noRewrittenDesigns, parsePin, pinBackWarning, type RewrittenDesignsProvider, type SetPinResult } from "../solidcraft/pin";
+import { SolidcraftPinService, parsePin, pinBackWarning, type RewrittenDesignsProvider, type SetPinResult } from "../solidcraft/pin";
 import { resolveReleaseRef } from "../solidcraft/release";
 
 export const SOLIDCRAFT_PIN_CAPABILITY = "solidcraft-pin";
@@ -55,7 +55,8 @@ export interface FleetSolidcraftDeps {
   client: MemberSolidcraftClient;
   /** Look up the sha256 for a version when the request carries none (GitHub release metadata). */
   resolveRef: (version: string) => Promise<SolidcraftRef>;
-  /** Designs the newer build already rewrote — the "Pin back" warning list. Default: none known. */
+  /** Designs the newer build already rewrote — the "Pin back" warning list. Absent ⇒ the list is
+   *  reported as not available (never as empty). */
   rewrittenDesigns?: RewrittenDesignsProvider;
   /** Extra versions members keep on disk (the candidate under evaluation, Phase B2). */
   keepVersions?: () => string[];
@@ -111,15 +112,15 @@ export class FleetSolidcraftCoordinator {
 
   /** What "Pin back" would do, with the designs it puts at risk. Changes nothing. */
   async pinBackPreview(): Promise<rest.solidcraft.PinBackPreviewResponse> {
-    const w = await pinBackWarning(this.deps.local.pin(), this.deps.rewrittenDesigns ?? noRewrittenDesigns);
+    const w = await pinBackWarning(this.deps.local.pin(), this.deps.rewrittenDesigns);
     if (!w.previous) return { ok: false, ...(w.current ? { current: w.current } : {}), rewritten: [], error: "there is no previous pin to go back to" };
-    return { ok: true, current: w.current, previous: w.previous, rewritten: w.rewritten, ...(w.listError ? { listError: w.listError } : {}) };
+    return { ok: true, current: w.current, previous: w.previous, rewritten: w.rewritten, ...(w.listError ? { listError: w.listError } : {}), ...(w.listUnavailable ? { listUnavailable: true } : {}) };
   }
 
   /** Pin back to `previous`, returning the warning list gathered BEFORE the change. Nothing is rewritten. */
   async pinBack(): Promise<rest.solidcraft.PinBackResponse> {
-    const w = await pinBackWarning(this.deps.local.pin(), this.deps.rewrittenDesigns ?? noRewrittenDesigns);
-    const warn = { rewritten: w.rewritten, ...(w.listError ? { listError: w.listError } : {}) };
+    const w = await pinBackWarning(this.deps.local.pin(), this.deps.rewrittenDesigns);
+    const warn = { rewritten: w.rewritten, ...(w.listError ? { listError: w.listError } : {}), ...(w.listUnavailable ? { listUnavailable: true } : {}) };
     if (!w.previous) return { ...this.refuse("there is no previous pin to go back to"), ...warn };
     if (this.active) return { ...this.refuse("a SolidCraft pin change is already in progress"), ...warn };
     this.active = true;
@@ -332,6 +333,12 @@ export interface MountSolidcraftOptions {
   hooks?: SolidcraftTestHooks;
   self: { serverId: string; serverName: string };
   members: () => SolidcraftTarget[];
+  /**
+   * PRODUCTION option, supplied by Track A's design store: the designs whose `measured.solidcraft`
+   * is the given (newer) version — the "Pin back" warning list. Until it is passed, the card says
+   * the list is not available yet; a provider that returns [] means "none are rewritten".
+   */
+  rewrittenDesigns?: RewrittenDesignsProvider;
   /** Send an event to every connected client. */
   broadcast: (event: SolidcraftStatusEvent) => void;
   route: (method: string, path: string, handler: Handler) => void;
@@ -376,7 +383,7 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     local: service,
     client: httpMemberSolidcraftClient(),
     resolveRef: hooks.resolveRef ?? ((v) => resolveReleaseRef(v)),
-    rewrittenDesigns: hooks.rewrittenDesigns,
+    rewrittenDesigns: hooks.rewrittenDesigns ?? o.rewrittenDesigns,
     log: (m) => console.log(m),
   });
   service.boot();

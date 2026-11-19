@@ -157,12 +157,14 @@
             "zip handling > [B1] a zip with no solidcraft-cli is refused as a missing binary",
             "zip handling > [B1] solidcraft-cli as a folder is not a binary",
             "zip handling > [B1] solvecraft-cli is never extracted, so it can never be run",
+            "zip handling > [B1] solvecraft-cli is skipped whatever its letter case",
             "zip handling > [B1] the single top-level folder is stripped; two top folders or a loose file are refused",
             "zip handling > [B1] the reader refuses backslashes, duplicates, file-as-folder and a wrong checksum",
             "zip handling > [B1] extraction keeps the executable bit and file contents",
             "install > [B1] a good zip becomes the binary resolveSolidcraftCli() returns",
             "install > [B1] an already verified install is reused without downloading again",
-            "install > [B1] a folder verified against a different zip is not trusted: it is replaced, or removed on failure",
+            "install > [B1] a refused re-install of an installed version leaves the working folder intact",
+            "install > [B1] a successful re-install of an installed version from a different zip replaces the folder",
             "install > [B1] a version folder without the verification marker is not an install",
             "install > [B1] concurrent installs of one version download once and leave one folder",
             "install > [B1] an install that loses the race to another process accepts the winner's verified folder",
@@ -186,6 +188,8 @@
             "member apply > [B1] after an apply only the pinned, previous and candidate versions stay on disk",
             "member apply > [B1] an env override on the pinned version is ready; on another version it is not",
             "hub pin > [B1] the hub verifies a build before recording it: a failing install leaves the pin unchanged",
+            "hub pin > [B1] a refused re-pin of the pinned version with a wrong sha256 leaves the install intact and the machine ready",
+            "hub pin > [B1] status never says ready for a managed build that is no longer on disk",
             "hub pin > [B1] pin back returns to previous; the build left behind becomes the new previous",
             "hub pin > [B1] pin back with no previous is refused",
             "hub pin > [B1] pin back after scripts were rewritten: warned, affected parts listed, no automatic rewrite",
@@ -211,7 +215,8 @@
             "FleetSolidcraftCoordinator > [B1] a second pin change while one is in progress is refused",
             "FleetSolidcraftCoordinator > [B1] bad input and a failed lookup change nothing",
             "FleetSolidcraftCoordinator > [B1] pin back fans the previous build out and returns the designs the newer build rewrote",
-            "FleetSolidcraftCoordinator > [B1] refresh re-reads every machine without changing anything"
+            "FleetSolidcraftCoordinator > [B1] refresh re-reads every machine without changing anything",
+            "FleetSolidcraftCoordinator > [B1] with no rewritten-designs provider the pin-back list is reported unavailable; a provider that returns none is reported as none"
           ]
         },
         {
@@ -226,7 +231,8 @@
             "Settings → CAD card > [B1] cancelling the pin-back warning changes nothing; an empty or incomplete list is stated",
             "Settings → CAD card > [B1] the replay-gate and live-process rows are labelled placeholders until a later phase supplies them",
             "Settings → CAD card > [B1] while a fan-out is active the controls are disabled and the card says so",
-            "Settings → CAD card > [B1] the CAD tab exists only when the hub advertises solidcraft-pin"
+            "Settings → CAD card > [B1] the CAD tab exists only when the hub advertises solidcraft-pin",
+            "Settings → CAD card > [B1] with no design store connected the pin-back warning says the list is not available, never that it is empty"
           ]
         },
         {

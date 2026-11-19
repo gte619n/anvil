@@ -195,14 +195,16 @@ export interface ExtractOptions {
 export async function extractZip(file: string, destDir: string, opts: ExtractOptions = {}): Promise<string[]> {
   const entries = readZipEntries(file);
   const top = singleTopFolder(entries);
-  const skip = new Set(opts.skip ?? []);
+  // Compared lowercased: the default macOS file system is case-insensitive, so `SolveCraft-CLI`
+  // would land on the same name as `solvecraft-cli`.
+  const skip = new Set((opts.skip ?? []).map((n) => n.toLowerCase()));
   const written: string[] = [];
   const fd = openSync(file, "r");
   try {
     for (const e of entries) {
       const rel = e.name.slice(top.length + 1).replace(/\/+$/, "");
       if (!rel) continue; // the top folder itself
-      if (skip.has(rel)) continue;
+      if (skip.has(rel.toLowerCase())) continue;
       const out = join(destDir, rel);
       if (e.isDirectory) {
         mkdirSync(out, { recursive: true });

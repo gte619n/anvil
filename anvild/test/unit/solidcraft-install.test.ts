@@ -252,6 +252,16 @@ describe("zip handling", () => {
     expect(s.run.calls.flat().some((a) => a.includes("solvecraft"))).toBe(false);
   });
 
+  test("[B1] solvecraft-cli is skipped whatever its letter case", async () => {
+    const extra = [{ name: `${top}/SolveCraft-CLI`, data: "#!/bin/sh\nexit 0\n", mode: 0o100755 }, { name: `${top}/SOLVECRAFT-CLI.txt`, data: "kept: a different name" }];
+    const s = setup({ extra });
+    const r = await installSolidcraft(s.dir, { version: V, sha256: s.sha256 }, s.deps);
+    expect(r.ok).toBe(true);
+    const files = readdirSync(solidcraftVersionDir(s.dir, V)).sort();
+    expect(files).toEqual([".anvil-verified.json", "LICENSE-MIT", "SOLVECRAFT-CLI.txt", "solidcraft-cli"]);
+    expect(files.some((f) => f.toLowerCase() === "solvecraft-cli")).toBe(false);
+  });
+
   test("[B1] the single top-level folder is stripped; two top folders or a loose file are refused", async () => {
     const two = await installZip(makeZip([{ name: `${top}/` }, good, { name: "other/solidcraft-cli", data: "x" }]));
     expect(refused(two.r).reason).toBe("bad-zip");
@@ -333,15 +343,45 @@ describe("install", () => {
     expect(s.download.calls).toEqual([V]);
   });
 
-  test("[B1] a folder verified against a different zip is not trusted: it is replaced, or removed on failure", async () => {
+  test("[B1] a refused re-install of an installed version leaves the working folder intact", async () => {
     const s = setup();
-    await installSolidcraft(s.dir, { version: V, sha256: s.sha256 }, s.deps);
-    // The pin now records another sha256 for the same version, and the download does not match it.
+    const first = await installSolidcraft(s.dir, { version: V, sha256: s.sha256 }, s.deps);
+    expect(first.ok).toBe(true);
+    const before = readFileSync(solidcraftCliPath(s.dir, V), "utf8");
+    // The pin is asked to record another sha256 for the same version, and the download does not match it.
     const other = "f".repeat(64);
-    expect(installedSolidcraft(s.dir, V, other)).toBeUndefined();
+    expect(installedSolidcraft(s.dir, V, other)).toBeUndefined(); // not trusted FOR that ref…
     const r = refused(await installSolidcraft(s.dir, { version: V, sha256: other }, s.deps));
     expect(r.reason).toBe("sha-mismatch");
-    expect(existsSync(solidcraftVersionDir(s.dir, V))).toBe(false); // the untrusted folder is gone
+    // …but the build that was verified and working is still there, untouched, and still runs.
+    expect(installedSolidcraft(s.dir, V, s.sha256)).toEqual({ path: solidcraftCliPath(s.dir, V), version: V, sha256: s.sha256 });
+    expect(readFileSync(solidcraftCliPath(s.dir, V), "utf8")).toBe(before);
+    expect(Bun.spawnSync([solidcraftCliPath(s.dir, V), "--version"]).stdout.toString().trim()).toBe(`solidcraft-cli ${V}`);
+    expect(leftovers(s.dir)).toEqual([V]); // no temp folder, no zip
+    // The same holds for a refusal late in the sequence (step 4, after extraction).
+    const wrongTeam = refused(await installSolidcraft(s.dir, { version: V, sha256: other }, { ...s.deps, download: memoryDownloader({ [V]: fakeReleaseZip(V, { withSolvecraft: true }).zip }), run: fakeVerifier({ teamOk: false }) }));
+    expect(wrongTeam.reason).toBe("sha-mismatch");
+    expect(installedSolidcraft(s.dir, V, s.sha256)).toBeDefined();
+  });
+
+  test("[B1] a successful re-install of an installed version from a different zip replaces the folder", async () => {
+    const s = setup();
+    await installSolidcraft(s.dir, { version: V, sha256: s.sha256 }, s.deps);
+    const next = fakeReleaseZip(V, { extra: [{ name: `solidcraft-cli-${V}-macos-universal/NOTICE`, data: "rebuilt" }] });
+    expect(next.sha256).not.toBe(s.sha256);
+    const r = await installSolidcraft(s.dir, { version: V, sha256: next.sha256 }, { ...s.deps, download: memoryDownloader({ [V]: next.zip }) });
+    expect(r).toMatchObject({ ok: true, alreadyInstalled: false, sha256: next.sha256 });
+    expect(installedSolidcraft(s.dir, V, next.sha256)).toBeDefined();
+    expect(installedSolidcraft(s.dir, V, s.sha256)).toBeUndefined(); // the old zip's folder is gone
+    expect(existsSync(join(solidcraftVersionDir(s.dir, V), "NOTICE"))).toBe(true);
+    expect(leftovers(s.dir)).toEqual([V]);
+    // A refusal at step 4 with an older folder present keeps the older folder too.
+    const t = setup();
+    await installSolidcraft(t.dir, { version: V, sha256: t.sha256 }, t.deps);
+    const bad = refused(await installSolidcraft(t.dir, { version: V, sha256: next.sha256 }, { ...t.deps, download: memoryDownloader({ [V]: next.zip }), run: fakeVerifier({ teamOk: false }) }));
+    expect(bad.reason).toBe("wrong-team");
+    expect(installedSolidcraft(t.dir, V, t.sha256)).toBeDefined();
+    expect(leftovers(t.dir)).toEqual([V]);
   });
 
   test("[B1] a version folder without the verification marker is not an install", async () => {

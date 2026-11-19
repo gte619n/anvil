@@ -213,6 +213,35 @@ describe("hub pin", () => {
     expect(currentManagedSolidcraft()?.version).toBe("0.43.0");
   });
 
+  test("[B1] a refused re-pin of the pinned version with a wrong sha256 leaves the install intact and the machine ready", async () => {
+    const dir = stateDir();
+    const { svc } = service(dir);
+    expect((await svc.setPin(refB)).ok).toBe(true);
+    const bad = await svc.setPin({ version: "0.44.1", sha256: "0".repeat(64) });
+    expect(bad).toMatchObject({ ok: false, failure: "sha-mismatch" });
+    // The pin, the folder and the running build are all exactly as before.
+    expect(svc.pin()).toMatchObject({ version: "0.44.1", sha256: B.sha256 });
+    expect(installedVersions(dir)).toEqual(["0.44.1"]);
+    expect(Bun.spawnSync([solidcraftCliPath(dir, "0.44.1"), "--version"]).stdout.toString().trim()).toBe("solidcraft-cli 0.44.1");
+    expect(await svc.status()).toEqual({ state: "ready", version: "0.44.1", source: "managed", pinned: "0.44.1", available: true });
+    expect(resolveSolidcraftCli({}, () => false)).toEqual({ path: solidcraftCliPath(dir, "0.44.1"), source: "managed", version: "0.44.1" });
+  });
+
+  test("[B1] status never says ready for a managed build that is no longer on disk", async () => {
+    const dir = stateDir();
+    const { svc } = service(dir);
+    await svc.setPin(refB);
+    expect((await svc.status()).state).toBe("ready");
+    rmSync(join(dir, "solidcraft"), { recursive: true, force: true }); // the folder vanishes under the daemon
+    const st = await svc.status();
+    expect(st.state).toBe("error");
+    expect(st.available).toBe(false);
+    expect(st.version).toBeUndefined();
+    expect(st.reason).toContain("not installed");
+    expect((await svc.availability()).available).toBe(false);
+    expect(resolveSolidcraftCli({}, () => false)).toBeUndefined(); // the daemon stops pointing at it
+  });
+
   test("[B1] pin back returns to previous; the build left behind becomes the new previous", async () => {
     const dir = stateDir();
     const { svc, install } = service(dir);
@@ -262,7 +291,10 @@ describe("hub pin", () => {
     expect(designs.length).toBe(3);
 
     // With no provider (the design store is another track's), the list is empty, not an error.
-    expect((await pinBackWarning(svc.pin())).rewritten).toEqual([]);
+    expect((await pinBackWarning(svc.pin(), () => [])).rewritten).toEqual([]);
+    // With NO provider the list is unknown, which is reported as such and never as "none".
+    expect(await pinBackWarning(svc.pin())).toMatchObject({ rewritten: [], listUnavailable: true });
+    expect((await pinBackWarning(svc.pin(), () => [])).listUnavailable).toBeUndefined();
     // A provider that fails must not be read as "nothing is at risk".
     const failed = await pinBackWarning(svc.pin(), () => {
       throw new Error("design store offline");

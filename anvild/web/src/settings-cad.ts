@@ -64,7 +64,9 @@ function memberRow(m: rest.solidcraft.Member): string {
 
 function pinBackWarningHtml(p: rest.solidcraft.PinBackPreviewResponse): string {
   if (!p.ok || !p.previous) return `<div id="cad-pinback-warning" class="card"><p class="small warn">${esc(p.error ?? "There is no previous pin to go back to.")}</p></div>`;
-  const list = p.rewritten.length
+  const list = p.listUnavailable
+    ? `<p id="cad-pinback-unavailable" class="small warn">${icon("warning")} The list of designs already rewritten by SolidCraft ${esc(p.current?.version ?? "the newer build")} is not available yet, so it is not known which designs may fail to open after pinning back. Nothing is rewritten automatically.</p>`
+    : p.rewritten.length
     ? `<p class="small warn">${icon("warning")} These designs were already rewritten by SolidCraft ${esc(p.current?.version ?? "the newer build")} and may not open after pinning back. Nothing is rewritten automatically.</p>
         <ul id="cad-pinback-list" class="small">${p.rewritten
           .map((d) => `<li>${esc(d.part)}${d.environment ? ` <span class="muted">· ${esc(d.environment)}</span>` : ""}${d.serverName ? ` <span class="muted">· ${esc(d.serverName)}</span>` : ""}</li>`)
