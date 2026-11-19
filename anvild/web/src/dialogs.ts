@@ -760,7 +760,7 @@ function showOneOff(): void {
 // requestId so a replayed/re-surfaced request (cold attach) doesn't stack duplicate cards.
 const permCards = new Map<string, HTMLElement>();
 
-export function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[]): void {
+export function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[], displayName?: string): void {
   if (permCards.has(requestId)) return; // already shown (re-attach replay)
   dropSessionHero(); // a request landed in a blank session — retire the title card
   hideThinking(); // the turn is parked on this decision, not working
@@ -770,7 +770,9 @@ export function showPermission(requestId: string, tool: string, inputObj: unknow
   card.dataset.req = requestId;
   const json = esc(JSON.stringify(inputObj, null, 2)).slice(0, 800);
   card.innerHTML =
-    `<div class="perm-head">${icon("encrypted")}<span>Permission needed · <b>${esc(tool)}</b></span></div>` +
+    // `displayName` is the integration's label for an MCP integration tool ("Echo · ping") — shown
+    // in place of the raw `mcp__echo__ping`, which stays in the tooltip.
+    `<div class="perm-head">${icon("encrypted")}<span>Permission needed · <b title="${esc(tool)}">${esc(displayName ?? tool)}</b></span></div>` +
     `<pre class="perm-input">${json}</pre>` +
     `<div class="perm-btns"></div>`;
   const btns = card.querySelector(".perm-btns")!;

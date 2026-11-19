@@ -319,6 +319,18 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .header-branch:hover { border-color: var(--accent); color: var(--text); }
 .header-branch .msym { font-size: 15px; color: var(--accent); }
 .header-branch .hb-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+/* MCP integrations: the session Tools chip (lit when one is on) + the Settings → Integrations rows. */
+.header-tools.on { border-color: var(--accent); color: var(--text); }
+.header-tools .hb-name { font-family: inherit; }
+.mcp-row-actions { margin-left: auto; display: inline-flex; gap: 6px; flex-shrink: 0; }
+.mcp-row .mcp-health, .mcp-row .mcp-held, .mcp-row .mcp-transport { margin-top: 6px; overflow-wrap: anywhere; }
+.mcp-row .mcp-held { display: flex; align-items: center; gap: 4px; }
+.mcp-row .mcp-held .msym { font-size: 15px; }
+.mcp-row .mcp-toggle[aria-checked="true"] .msym { color: var(--accent); }
+.mcp-server-head { margin: 10px 0 8px; }
+.mcp-warning { display: flex; align-items: center; gap: 6px; }
+.modal-box label[hidden] { display: none; } /* [hidden] loses to `.modal-box label { display: block }` — the Add-integration dialog swaps its Command/URL rows */
+.mcp-warning .msym { font-size: 16px; color: var(--danger); }
 @media (max-width: 700px) { .header-branch { max-width: 16ch; } }
 #header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; color: var(--text); font: inherit; }

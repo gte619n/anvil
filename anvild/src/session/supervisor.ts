@@ -55,6 +55,7 @@ import {
   type SessionGoal,
   type ResumeWatermarksEvent,
   type TelemetrySnapshotEvent,
+  type McpIntegrationsEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
@@ -91,6 +92,11 @@ import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
+import { McpIntegrationService } from "./mcp-integration-service";
+import type { McpProber } from "../mcp/health";
+import type { McpIntegrationFields, McpIntegrationInput } from "../mcp/store";
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import { featureEnabled } from "../config";
 import { GitProjectionService } from "./git-projection-service";
 import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled, PrActivityWatcher } from "./claude-md-reflection";
 import { AutopilotService } from "./autopilot-service";
@@ -176,6 +182,11 @@ export interface SupervisorConfig {
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
   fleet?: ConciergeFleetOps;
+  /** Enabled opt-in features (`Config.features`, from `ANVIL_FEATURES`). Only "mcp-integrations" is
+   *  read here: it switches the MCP integration registry on. */
+  features?: readonly string[];
+  /** Test seams for the MCP integration registry (fake prober / fake clock / no timer). */
+  mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number };
 }
 
 /**
@@ -261,6 +272,9 @@ export class Supervisor {
   private readonly accountRoster: AccountRosterService;
   /** Environment (project) CRUD + clone + README domain (P7 extraction). */
   private readonly environments: EnvironmentService;
+  /** MCP integration registry: store, health, exclusive lock, commands and the permission gate's
+   *  lookups (mcp-integrations spec). Inert unless the "mcp-integrations" feature is on. */
+  readonly mcp: McpIntegrationService;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
   /** Team orchestration domain — plan lifecycle, member spawn/queue/drain, relay guard, integration
@@ -321,6 +335,23 @@ export class Supervisor {
       registry: this.registry,
       clonesDir: this.clonesDir,
       renderer: this.renderer,
+    });
+    this.mcp = new McpIntegrationService({
+      stateDir: cfg.stateDir,
+      enabled: featureEnabled(cfg, "mcp-integrations"),
+      broadcast: (event) => this.registry.toAll(event),
+      clientCount: () => this.registry.all().length,
+      sessions: () => this.sessions.values(),
+      getSession: (id) => this.sessions.get(id),
+      persist: () => this.persist(),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+      dropIdleDriver: (id) => this.dropIdleDriver(id),
+      notice: (id, markdown) => {
+        this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
+      },
+      prober: cfg.mcp?.prober,
+      clock: cfg.mcp?.clock,
+      intervalMs: cfg.mcp?.intervalMs,
     });
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
@@ -446,6 +477,7 @@ export class Supervisor {
       softStopFraction: cfg.softStopFraction ?? 0.95,
     });
     this.restore();
+    this.mcp.start(); // after restore: prunes stale integration ids off sessions, then the first probe
     this.autopilot.startScheduler();
     this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
@@ -788,6 +820,39 @@ export class Supervisor {
     this.drivers.delete(id);
     await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
     return true;
+  }
+
+  /** Synchronous sibling of {@link restartDriverForNewToken} for the MCP registry: drop an IDLE
+   *  session's driver so its next turn rebuilds the MCP server map (`claudeSessionId` is kept, so the
+   *  conversation resumes). Returns false when the session is mid-turn and was left alone. */
+  private dropIdleDriver(id: string): boolean {
+    const status = this.sessions.get(id)?.data.status;
+    if (status && status !== "idle") return false;
+    const driver = this.drivers.get(id);
+    if (!driver) return true;
+    this.drivers.delete(id);
+    void driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+    return true;
+  }
+
+  // ── MCP integrations — delegated to McpIntegrationService ─────────────────────────────────────
+  mcpIntegrationsEvent(): McpIntegrationsEvent {
+    return this.mcp.integrationsEvent();
+  }
+  mcpIntegrationAdd(integration: McpIntegrationInput): void {
+    this.mcp.add(integration);
+  }
+  mcpIntegrationUpdate(id: string, fields: McpIntegrationFields): void {
+    this.mcp.update(id, fields);
+  }
+  mcpIntegrationRemove(id: string): void {
+    this.mcp.remove(id);
+  }
+  mcpIntegrationCheck(): Promise<void> {
+    return this.mcp.check();
+  }
+  setSessionMcpIntegrations(sessionId: string, ids: string[]): void {
+    this.mcp.setSessionIntegrations(sessionId, ids);
   }
 
   /**
@@ -1659,6 +1724,20 @@ export class Supervisor {
     // the client can retire its optimistic bubble instead of double-rendering (spec A5/A6).
     if (cid) s.recordPromptCid(cid);
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments, ...(cid ? { cid } : {}) });
+    // A session with MCP integrations on gets a fresh health probe first, so the server map the driver
+    // is (re)built with is never older than this turn. A flip drops the idle driver inside the probe.
+    if (this.mcp.needsProbeBeforeTurn(s.data)) {
+      void this.mcp.probe("turn").then(() => {
+        if (this.sessions.get(id) !== s || s.isDisposed) return; // deleted while the probe ran
+        try {
+          this.ensureDriver(id).prompt(text, inline);
+        } catch (e) {
+          // No dispatcher frame is left to carry this (the command was already acked): say it in the session.
+          s.emitError(e instanceof Error ? e.message : String(e), false);
+        }
+      });
+      return;
+    }
     this.ensureDriver(id).prompt(text, inline);
   }
 
@@ -1678,6 +1757,17 @@ export class Supervisor {
       const isLead = s.data.teamRole === "lead";
       const isMember = s.data.teamRole === "member" && !!s.data.parentId;
       const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
+      // The session's in-process servers (its role server, if any). `mcp.serversFor` passes them
+      // through unchanged and adds the session's ready MCP integrations (ordinary sessions only).
+      const inProcessServers: Record<string, McpSdkServerConfigWithInstance> | undefined = isDefault
+        ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
+        : isLead
+          ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
+          : isMember
+            ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
+            : isPlanner
+              ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
+              : undefined;
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -1685,15 +1775,7 @@ export class Supervisor {
         this.questionBroker,
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
-        isDefault
-          ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
-          : isLead
-            ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
-            : isMember
-              ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
-              : isPlanner
-                ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-                : undefined,
+        this.mcp.serversFor(s, inProcessServers),
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
@@ -1712,6 +1794,7 @@ export class Supervisor {
         // Live catalog so a fable session runs the newest `claude-fable-*` release (the SDK auto-upgrades
         // the opus/sonnet/haiku aliases itself; fable has no alias, so this is how it keeps current).
         () => this.modelLabels.catalog(),
+        this.mcp.gate,
       );
       this.drivers.set(id, driver);
     }
@@ -1906,6 +1989,7 @@ export class Supervisor {
     this.goalPushSuppressed.delete(id);
     this.reflectedSessions.delete(id);
     this.prWatchers.delete(id);
+    this.mcp.onSessionGone(id); // free any exclusive MCP integration lock the session held
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
@@ -1955,6 +2039,7 @@ export class Supervisor {
    */
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
+    this.mcp.stop();
     this.terminalMgr.killAll();
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
@@ -1979,6 +2064,7 @@ export class Supervisor {
     this.terminalMgr.kill(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
+    this.mcp.onSessionReset(id); // forget "always allow <integration>" + free its exclusive locks
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
 

@@ -152,7 +152,185 @@
     },
     "C1": {
       "title": "registry core",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/mcp-store.test.ts",
+          "names": [
+            "McpIntegrationStore > [C1] add assigns an mcpi_ id, persists, and a new store over the same dir reloads it",
+            "McpIntegrationStore > [C1] a corrupt mcp-integrations.json is quarantined to .corrupt-<ts> and the store starts empty",
+            "McpIntegrationStore > [C1] a file of the wrong shape is quarantined too",
+            "McpIntegrationStore > [C1] a malformed or duplicate row is dropped and the rest of the file loads",
+            "McpIntegrationStore > [C1] add rejects a key that collides with a built-in server name",
+            "McpIntegrationStore > [C1] add rejects a key that another integration already uses",
+            "McpIntegrationStore > [C1] the key grammar is /^[a-z][a-z0-9]{1,23}$/ — no underscores, no capitals, 2 to 24 characters",
+            "McpIntegrationStore > [C1] an http integration must be loopback: scheme http, no credentials, host 127.0.0.1 / localhost / [::1]",
+            "McpIntegrationStore > [C1] update re-validates the transport, and can never change key or kind",
+            "McpIntegrationStore > [C1] a stdio integration needs a command and string args",
+            "McpIntegrationStore > [C1] remove reports whether anything was removed, and a re-add under the same key gets a NEW id",
+            "presets > [C1] custom is the only kind this phase can add; browser is refused until its preset registers",
+            "presets > [C1] {cwd} is replaced with the worktree and is the only substitution"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-lock.test.ts",
+          "names": [
+            "[C1] the first session to acquire holds it; a second is refused and told who holds it",
+            "[C1] release frees it for the next session; a non-holder cannot release it",
+            "[C1] releaseSession frees everything a session holds and nothing else",
+            "[C1] 10 minutes of silence releases the lock",
+            "[C1] activity at minute 9 keeps the lock past minute 10",
+            "[C1] refresh by a non-holder neither takes nor extends the lock",
+            "[C1] sweep reports the locks that went idle"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-health.test.ts",
+          "names": [
+            "probes > [C1] tcpProbe: a listening loopback port is open, a closed one is not",
+            "probes > [C1] an http integration whose port is closed is unavailable, and ready once something listens",
+            "probes > [C1] an http integration with a non-loopback URL is unavailable without any connection attempt",
+            "probes > [C1] a stdio integration is ready when its command resolves on PATH — the probe never launches it",
+            "McpHealthTracker > [C1] an integration never probed is unavailable (fail closed)",
+            "McpHealthTracker > [C1] a probe that throws is unavailable with the error text",
+            "McpHealthTracker > [C1] a disabled integration is `disabled` and is not probed",
+            "McpHealthTracker > [C1] probeAll returns only the ids whose health changed",
+            "McpHealthTracker > [C1] a server that failed at session init stays unavailable through turn, timer and connect probes, until Check",
+            "McpHealthTracker > [C1] an integration that no longer exists is forgotten on the next probe"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-external.test.ts",
+          "names": [
+            "buildMcpServers > [C1] an ordinary session with stdio integration `echo` gets servers.echo wrapped in /usr/bin/env -i with {cwd} replaced and no secret-looking key",
+            "buildMcpServers > [C1] the same call for a concierge session returns only `anvil`",
+            "buildMcpServers > [C1] lead, member, planner and builder sessions get their role server only",
+            "buildMcpServers > [C1] an http integration becomes { type: http, url, alwaysLoad: true }",
+            "buildMcpServers > [C1] a hand-edited non-loopback URL is rejected at build time and reported in skipped",
+            "buildMcpServers > [C1] an unavailable integration is left out and returned in skipped with its reason",
+            "buildMcpServers > [C1] a disabled integration is left out and returned in skipped",
+            "buildMcpServers > [C1] the same id twice is added once; an unknown id is ignored; an integration not in the session's list is not attached",
+            "buildMcpServers > [C1] the in-process server map is passed through unchanged — including `anvil_cad` on an ordinary session",
+            "buildMcpServers > [C1] an integration whose key is reserved or already taken by an in-process server is never attached",
+            "buildMcpServers > [C1] gamed spec: the result is server configs only — no allowedTools, no mcp__echo__ id anywhere",
+            "buildMcpServers > [C1] a kind's preset can resolve the launch line per session, or skip with a reason; the result is still wrapped and checked",
+            "[C1] wrapStdio puts -i first and passes exactly PATH, HOME and TMPDIR"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-permissions.test.ts",
+          "names": [
+            "integration tools > [C1] under mostly-autonomous an integration call parks a permission request with Allow once / Always allow <label> this session / Deny",
+            "integration tools > [C1] answering always lets every tool of that integration through with no prompt, and is recorded in session.mcpAllowed",
+            "integration tools > [C1] switching the integration off for the session denies immediately with no prompt; switching it back on prompts again",
+            "integration tools > [C1] an unknown mcp__<key>__ tool is denied with no prompt",
+            "integration tools > [C1] bypass allows an integration call with no prompt",
+            "integration tools > [C1] every non-bypass policy prompts — there is no follow-the-autonomy-policy mode",
+            "integration tools > [C1] the branch runs before the remembered-allow lookup: a per-tool always-allow does not skip it",
+            "integration tools > [C1] an integration switched off in Settings is denied, even with an always-allow and under bypass",
+            "integration tools > [C1] the lookup is live: switching off while a prompt is parked denies the call even if it is then approved",
+            "integration tools > [C1] an integration is denied in a session that is not an ordinary one",
+            "integration tools > [C1] another session's integration list does not leak: a session without it on is denied",
+            "integration tools > [C1] with no registry behind the hook every integration call is denied",
+            "integration tools > [C1] with the feature off the gate denies, whatever the store holds",
+            "the session's own in-process servers > [C1] a key in the session's in-process server map keeps the existing behaviour — the four role servers and anvil_cad alike",
+            "the session's own in-process servers > [C1] a hook built without an MCP context keeps the pre-registry behaviour for every tool",
+            "the session's own in-process servers > [C1] parseMcpTool splits integration names only; isInProcessTool matches whole keys",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate sees the short tool name, the input and the integration, and only for its own kind",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate's deny wins under bypass and over a session-wide allow",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate's `always` prompt parks a card under bypass with its own choices; onAnswer records the kind's approval",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate's ordinary prompt is skipped under bypass, and onAnswer can still refuse",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] a kind gate with no opinion falls through to the generic flow, and one that throws fails closed",
+            "per-kind gate (the hook Phase C2 plugs into) > [C1] the generic checks run before the kind gate: unknown, switched-off and locked calls never reach it",
+            "protected rules and integrations > [C1] a protected deny beats the integration branch; a protected always-prompt prompts under bypass with Allow once / Deny only",
+            "canUseTool backstop > [C1] canUseTool denies mcp__echo__ping: an integration call the hook did not decide fails closed"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-service.test.ts",
+          "names": [
+            "feature flag > [C1] with the feature off every command is refused, nothing is broadcast, and no integration is attached",
+            "commands > [C1] add broadcasts the list, then the first probe broadcasts its health once; an unchanged probe broadcasts nothing",
+            "commands > [C1] add surfaces a store refusal as a BadCommand with the reason",
+            "commands > [C1] session.set_mcp_integrations dedupes, drops unknown ids, persists, and emits one session.updated per write",
+            "commands > [C1] integrations cannot be switched on for the concierge, a team session or an autopilot session",
+            "commands > [C1] on load, ids that no longer name an integration are dropped from every session, and duplicates collapse",
+            "commands > [C1] removing an integration that sessions reference: off every list, idle drivers dropped, lock released",
+            "commands > [C1] removed and re-added under the same key gets a new id, so a stale always-allow does not apply",
+            "commands > [C1] updating an integration clears its always-allow in every session and rebuilds idle drivers",
+            "commands > [C1] a session reset clears its always-allow list and frees its exclusive locks",
+            "commands > [C1] deleting a session frees its exclusive locks",
+            "driver rebuilds > [C1] switching one on for an idle session drops its driver so the next turn rebuilds",
+            "driver rebuilds > [C1] switched on mid-turn: persisted now, driver left alone, rebuilt when the turn ends",
+            "driver rebuilds > [C1] a turn that dies (consume loop exit) also applies the deferred rebuild",
+            "driver rebuilds > [C1] serversFor attaches ready integrations and puts one notice line in the session per skipped one",
+            "failed at session init (§4.14 item 31) > [C1] a server the SDK reports failed in the init message is marked unavailable, noticed once in the session, and held until Check",
+            "health loop > [C1] the timer probes only while a client is connected",
+            "health loop > [C1] concurrent probe requests share one probe",
+            "health loop > [C1] a session with integrations on needs a probe before its turn; one without, or a non-ordinary one, does not",
+            "health loop > [C1] the tick releases a lock whose holder has been silent for 10 minutes and broadcasts the change"
+          ]
+        },
+        {
+          "file": "test/unit/mcp-driver.test.ts",
+          "names": [
+            "[C1] every session's query gets strictMcpConfig: true and the three resource tools disallowed — with no servers at all, too",
+            "[C1] a role session keeps its in-process server and its role tool ids under strictMcpConfig",
+            "[C1] an integration server is passed to the SDK but never contributes an allowedTools entry",
+            "[C1] the driver reports init-time server status, integration tool results, the turn end and the loop exit to the registry",
+            "[C1] a turn that throws still reports the loop exit, so no lock outlives a dead turn"
+          ]
+        },
+        {
+          "file": "test/integration/mcp-c1-registry.test.ts",
+          "names": [
+            "Phase 1 acceptance: daemon core > [C1] buildMcpServers for an ordinary session with stdio integration `echo`: /usr/bin/env, -i first, {cwd} replaced, no TOKEN|KEY|ANTHROPIC anywhere",
+            "Phase 1 acceptance: daemon core > [C1] the same call for a concierge session returns only `anvil`",
+            "Phase 1 acceptance: daemon core > [C1] an AgentDriver built with a capturing queryFn passes strictMcpConfig: true, the three resource tools in disallowedTools, and no mcp__echo__ id in allowedTools",
+            "Phase 1 acceptance: daemon core > [C1] the hook under mostly-autonomous: mcp__echo__ping parks a request; always lets mcp__echo__pong through; switching echo off denies with no prompt; switching it back on prompts again",
+            "Phase 1 acceptance: daemon core > [C1] the hook denies mcp__other__x",
+            "Phase 1 acceptance: daemon core > [C1] canUseTool denies mcp__echo__ping",
+            "Phase 2 acceptance: health and lock > [C1] an http integration whose port is closed reports unavailable and buildMcpServers returns it in skipped; when the probe flips to open exactly one mcp.integrations event is broadcast and the idle driver of a referencing session is dropped",
+            "Phase 2 acceptance: health and lock > [C1] a health flip while a referencing session is mid-turn leaves its driver alone and rebuilds it when the turn ends",
+            "Phase 2 acceptance: health and lock > [C1] switching `enabled` off in Settings drops the idle drivers of referencing sessions and reports the integration disabled",
+            "Phase 2 acceptance: health and lock > [C1] lock: A's approved call acquires; B's call is denied naming A; A's consume loop exits; B's next call succeeds",
+            "Phase 2 acceptance: health and lock > [C1] lock: with A parked on a prompt and never approved, B succeeds — and A's late approval is then denied",
+            "Phase 2 acceptance: health and lock > [C1] lock: under bypass, B is still denied while A holds",
+            "Phase 2 acceptance: health and lock > [C1] lock: 10 minutes of fake-clock silence from A releases the lock; a tool.result at minute 9 does not",
+            "Phase 2 acceptance: health and lock > [C1] lock: a non-exclusive integration is never locked, and switching an exclusive one off for the holder releases it",
+            "turn start > [C1] a turn on a session with integrations probes first, so a flip rebuilds the driver before the prompt reaches it",
+            "dispatch > [C1] server.hello advertises mcp-integrations and mcp.integrations arrives on connect; neither on a daemon with the feature off",
+            "dispatch > [C1] add / check / update / remove over the socket: acked, validated, and broadcast to every client",
+            "dispatch > [C1] session.set_mcp_integrations from two clients: last write wins, one session.updated per write"
+          ]
+        },
+        {
+          "file": "test/web/mcp.test.ts",
+          "names": [
+            "Settings → Integrations card > [C1] hidden unless a server advertises the mcp-integrations capability",
+            "Settings → Integrations card > [C1] the card says third-party servers run as the daemon's user",
+            "Settings → Integrations card > [C1] one row per integration: label, health dot and reason, in-use-by, an enabled switch, and remove",
+            "Settings → Integrations card > [C1] the enabled switch sends mcp.integration.update, Check sends mcp.integration.check, and a refusal is shown",
+            "Settings → Integrations card > [C1] remove asks first, names the sessions that use it, and sends mcp.integration.remove only on confirm",
+            "Settings → Integrations card > [C1] Add offers Custom, and the Custom form sends mcp.integration.add with the typed command split into command + args",
+            "Settings → Integrations card > [C1] the Custom form's URL type takes a loopback http URL only",
+            "session Tools control > [C1] the header chip is hidden without the capability, without integrations, and for a session that is not ordinary",
+            "session Tools control > [C1] the header chip shows which integrations are on for the session",
+            "session Tools control > [C1] the Tools menu lists this machine's integrations with a switch each and sends session.set_mcp_integrations",
+            "session Tools control > [C1] an unavailable integration is shown disabled with its reason and cannot be switched on — but one already on can be switched off",
+            "session Tools control > [C1] toggling mid-turn says it applies after this turn",
+            "permission cards > [C1] a permission card for an integration tool shows the integration label, not the raw mcp__ name",
+            "permission cards > [C1] other tools keep their own name on the card: built-ins, the daemon's own servers, and unknown keys"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/mcp-c1.test.ts",
+          "names": [
+            "[C1] the env -i command line buildMcpServers produces starts the echo server, which answers MCP and sees only PATH, HOME and TMPDIR"
+          ]
+        }
+      ]
     },
     "C2": {
       "title": "browser preset, network block, per-site approval",

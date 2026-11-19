@@ -238,6 +238,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adversarialProvider: opts.adversarialProvider,
       refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
       fleet: conciergeFleet,
+      features: opts.features,
     },
     registry,
   );
@@ -497,6 +498,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.teamInfoEvent())); // derived team tree alongside the session list
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
+      // MCP integrations (only on a daemon with the feature on — an older client ignores the event).
+      // The last known health goes out now; the probe this connect triggers broadcasts any change.
+      if (supervisor.mcp.enabled) {
+        ws.send(JSON.stringify(supervisor.mcpIntegrationsEvent()));
+        supervisor.mcp.onClientConnected();
+      }
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models

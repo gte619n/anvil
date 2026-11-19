@@ -314,6 +314,12 @@ export interface Session {
   /** Live terminal roster for this session's chip strip (multi-terminal, design 2026-08-08).
    *  Runtime-only — cleared on daemon restart (the PTYs die with the process). Additive. */
   terminals?: TerminalInfo[];
+  /** MCP integrations switched on for this session (ids from `mcp.integrations`). Ordinary sessions
+   *  only; absent = none. Behind the "mcp-integrations" capability. Additive. */
+  mcpIntegrations?: string[];
+  /** Integration ids the owner answered "Always allow <label> this session" for. Cleared for an
+   *  integration when it is switched off for the session, updated or removed, and wholly on reset. */
+  mcpAllowed?: string[];
 }
 
 /** One live PTY of a session (multi-terminal). */
@@ -539,6 +545,40 @@ export interface BudgetEvent extends Envelope {
 export interface EnvironmentsEvent extends Envelope {
   type: "environments";
   environments: Environment[];
+}
+
+// ── MCP integrations (agent-cad-and-browser spec, Track C) ────────────────────────────────────────
+// Third-party MCP servers installed on ONE machine that an ordinary session can switch on. Per
+// machine, not hub-synced. Everything here is behind the "mcp-integrations" capability: a daemon that
+// does not advertise it never sends `mcp.integrations` and rejects the commands.
+export type McpIntegrationKind = "browser" | "custom";
+/** How the daemon reaches the server. http is loopback only (scheme http:, no userinfo, host
+ *  127.0.0.1 / localhost / [::1]); stdio is an operator-typed command, run with a scrubbed
+ *  environment. `{cwd}` in `args` becomes the session's worktree; it is the only substitution. */
+export type McpTransport =
+  | { type: "http"; url: string }
+  | { type: "stdio"; command: string; args: string[] };
+export interface McpIntegration {
+  id: string; // "mcpi_…"
+  key: string; // server key → tool prefix mcp__<key>__ ; /^[a-z][a-z0-9]{1,23}$/ (no underscores)
+  kind: McpIntegrationKind;
+  label: string;
+  transport: McpTransport;
+  exclusive: boolean; // one session at a time on this machine
+  enabled: boolean; // operator kill switch for the machine
+}
+export type McpHealth =
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string } // port closed, command not found, failed at session start
+  | { state: "disabled" };
+export interface McpIntegrationStatus extends McpIntegration {
+  health: McpHealth;
+  heldBy?: SessionId; // the session holding the exclusive lock
+  checkedAt: number; // ms since epoch of the last health probe (0 = never probed)
+}
+export interface McpIntegrationsEvent extends Envelope {
+  type: "mcp.integrations";
+  integrations: McpIntegrationStatus[];
 }
 /**
  * A saved prompt snippet the user fires into the composer with one click (a sidebar button). Stored
@@ -1444,6 +1484,7 @@ export type ServerEvent =
   | TeamPlanResolvedEvent
   | BudgetEvent
   | EnvironmentsEvent
+  | McpIntegrationsEvent
   | PromptsEvent
   | ModelLabelsEvent
   | ClaudeCliStatusEvent
@@ -1726,6 +1767,31 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";
   id: string;
+}
+/** Register an MCP integration on this machine ("mcp-integrations" capability). Client command
+ *  only: nothing inside a session can add or change one. */
+export interface McpIntegrationAddCmd extends Envelope, Correlated {
+  type: "mcp.integration.add";
+  integration: Omit<McpIntegration, "id">;
+}
+export interface McpIntegrationUpdateCmd extends Envelope, Correlated {
+  type: "mcp.integration.update";
+  id: string;
+  fields: Partial<Omit<McpIntegration, "id" | "key" | "kind">>;
+}
+export interface McpIntegrationRemoveCmd extends Envelope, Correlated {
+  type: "mcp.integration.remove";
+  id: string;
+}
+/** Re-probe every integration's health now; the reply is a fresh `mcp.integrations`. */
+export interface McpIntegrationCheckCmd extends Envelope, Correlated {
+  type: "mcp.integration.check";
+}
+/** Replace the list of integrations switched on for a session (ordinary sessions only). */
+export interface SessionSetMcpIntegrationsCmd extends Envelope, Correlated {
+  type: "session.set_mcp_integrations";
+  sessionId: SessionId;
+  ids: string[];
 }
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
@@ -2121,6 +2187,11 @@ export type ClientCommand =
   | EnvCloneCmd
   | EnvUpdateCmd
   | EnvRemoveCmd
+  | McpIntegrationAddCmd
+  | McpIntegrationUpdateCmd
+  | McpIntegrationRemoveCmd
+  | McpIntegrationCheckCmd
+  | SessionSetMcpIntegrationsCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd

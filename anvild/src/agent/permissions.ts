@@ -2,7 +2,8 @@ import type { HookCallback, PreToolUseHookInput } from "@anthropic-ai/claude-age
 import type { PermissionDecision, PermissionSuggestion } from "@protocol";
 import { newId } from "../util/ids";
 import { isDangerous, isReadOnly } from "./danger-list";
-import { isUnattended, protectedVerdict } from "./protected";
+import { isUnattended, protectedVerdict, type ProtectedVerdict } from "./protected";
+import { isInProcessTool, mcpKindGate, parseMcpTool, type McpHookContext, type McpKindVerdict, type McpSessionGate } from "./mcp-gate";
 import type { Session } from "../session/session";
 
 interface ResolvedDecision {
@@ -55,6 +56,14 @@ const SUGGESTIONS = (tool: string): PermissionSuggestion[] => [
   { decision: "deny", label: "Deny" },
 ];
 
+/** The card for an MCP integration (mcp-integrations spec §4.4): the "always" choice covers the whole
+ *  integration for this session — rules match on the server key only, never on a tool name. */
+const MCP_SUGGESTIONS = (label: string): PermissionSuggestion[] => [
+  { decision: "allow", label: "Allow once" },
+  { decision: "allow_always", label: `Always allow ${label} this session` },
+  { decision: "deny", label: "Deny" },
+];
+
 /** The card for a protected always-prompt action (spec §4.4): Allow once / Deny ONLY — never an
  *  "always allow", because the whole point is that it is asked every single time. */
 const PROTECTED_SUGGESTIONS = (label?: string): PermissionSuggestion[] => [
@@ -82,6 +91,10 @@ export function makePreToolUseHook(
   session: Session,
   broker: PermissionBroker,
   onPlanProposed?: PlanProposedHook,
+  /** The session's MCP context (its in-process server keys + the integration registry). The driver
+   *  always passes one, which switches on the MCP branch in `decide()`; omitted (older unit tests),
+   *  every tool takes the pre-registry path. */
+  mcp?: McpHookContext,
 ): HookCallback {
   return async (input) => {
     const i = input as PreToolUseHookInput;
@@ -108,7 +121,7 @@ export function makePreToolUseHook(
     // canUseTool. (arch §6.6 — see src/agent/questions.ts)
     if (tool === "AskUserQuestion") return { continue: true };
 
-    const out = await decide(session, broker, tool, toolInput);
+    const out = await decide(session, broker, tool, toolInput, mcp);
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -131,6 +144,7 @@ async function decide(
   broker: PermissionBroker,
   tool: string,
   input: Record<string, unknown>,
+  mcp?: McpHookContext,
 ): Promise<Decision> {
   // NOTE: AskUserQuestion is handled before this point in makePreToolUseHook — it must fall through
   // with no decision so its "ask" verdict reaches canUseTool (where the question card is surfaced).
@@ -143,6 +157,14 @@ async function decide(
   const guard = protectedVerdict({ session, tool, input, cwd: session.data.cwd });
   if (guard?.kind === "deny") {
     return { behavior: "deny", reason: guard.reason };
+  }
+
+  // MCP branch (mcp-integrations spec §4.4). Runs before the remembered-allow lookup and the `bypass`
+  // short-circuit below. A tool of one of the session's own in-process servers (`anvil`,
+  // `anvil_team`, `anvil_cad`, … — whatever is in the driver's server map) keeps the existing
+  // behaviour; every other `mcp__` tool is an integration call and is decided entirely here.
+  if (mcp && tool.startsWith("mcp__") && !isInProcessTool(tool, mcp.inProcessKeys)) {
+    return decideMcp(session, broker, tool, input, mcp.gate, guard);
   }
   if (guard?.kind === "always-prompt") {
     // Nobody is there to answer in an unattended (autopilot builder) session: deny without a card
@@ -195,4 +217,99 @@ async function decide(
   }
   if (ans.decision === "allow_always") session.rememberAllow(tool);
   return { behavior: "allow", updatedInput: ans.updatedInput ?? input };
+}
+
+/**
+ * Decide one call to an MCP integration tool (mcp-integrations spec §4.4/§4.5):
+ *
+ *  1. unknown `mcp__<key>__`, an integration not switched on for this session, or one not enabled → deny
+ *     (looked up LIVE on every call, never from a snapshot taken when the driver started);
+ *  2. exclusive and held by another session → deny, naming the holder;
+ *  3. the integration kind's own gate, if one is registered (Phase C2's browser) → deny / allow / its
+ *     own prompt;
+ *  4. otherwise: `bypass` allows; an "Always allow <label> this session" allows; else prompt;
+ *  5. on allow, re-check 1 (the prompt may have been open for minutes) and take or refresh the
+ *     exclusive lock in one synchronous check-and-set. A session parked on a prompt does not hold the
+ *     lock, so if another session took it meanwhile the approved call is denied.
+ *
+ * A protected always-prompt verdict (`guard`) still forces its Allow once / Deny card, under every
+ * policy, in place of step 4.
+ */
+async function decideMcp(
+  session: Session,
+  broker: PermissionBroker,
+  tool: string,
+  input: Record<string, unknown>,
+  gate: McpSessionGate | undefined,
+  guard: ProtectedVerdict,
+): Promise<Decision> {
+  const parsed = parseMcpTool(tool);
+  if (!parsed || !gate) return { behavior: "deny", reason: `${tool}: unknown MCP server (not an integration switched on for this session)` };
+
+  const found = gate.lookup(session, parsed.key);
+  if ("deny" in found) return { behavior: "deny", reason: found.deny };
+  const integration = found.integration;
+
+  const busy = gate.heldByOther(session, integration);
+  if (busy) return { behavior: "deny", reason: `${integration.label} is in use by ${busy.title}` };
+
+  // After approval (or with no prompt needed): the live re-check + the lock.
+  const finish = (updatedInput: Record<string, unknown>, reason: string): Decision => {
+    const again = gate.lookup(session, parsed.key);
+    if ("deny" in again) return { behavior: "deny", reason: again.deny };
+    const lock = gate.acquire(session, again.integration);
+    if (!lock.ok) return { behavior: "deny", reason: `${again.integration.label} is in use by ${lock.title}` };
+    return { behavior: "allow", updatedInput, reason };
+  };
+  const ask = async (suggestions: PermissionSuggestion[]) => {
+    const requestId = newId("perm");
+    const answer = broker.request(requestId, session.id);
+    session.requestPermission(requestId, tool, input, suggestions);
+    return answer;
+  };
+
+  if (guard?.kind === "always-prompt") {
+    if (guard.denyWhenUnattended && isUnattended(session)) {
+      return { behavior: "deny", reason: `${guard.reason} (denied: this session is unattended)` };
+    }
+    const ans = await ask(PROTECTED_SUGGESTIONS(guard.label));
+    if (ans.decision === "deny") return { behavior: "deny", reason: `denied by user (${guard.reason})` };
+    return finish(ans.updatedInput ?? input, `protected: ${guard.reason}`);
+  }
+
+  let verdict: McpKindVerdict;
+  const kindGate = mcpKindGate(integration.kind);
+  if (kindGate) {
+    try {
+      verdict = await kindGate({ session, integration, tool: parsed.tool, fullTool: tool, input, cwd: session.data.cwd });
+    } catch (e) {
+      // A safety gate that throws fails closed.
+      return { behavior: "deny", reason: `${integration.label} check failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+  if (verdict?.kind === "deny") return { behavior: "deny", reason: verdict.reason };
+  if (verdict?.kind === "allow") return finish(input, verdict.reason ?? `${integration.label}: allowed`);
+
+  const bypass = session.data.autonomy === "bypass";
+  if (verdict?.kind === "prompt") {
+    if (bypass && !verdict.always) return finish(input, "bypass: permissions skipped");
+    if (verdict.denyWhenUnattended && isUnattended(session)) {
+      return { behavior: "deny", reason: `${verdict.reason} (denied: this session is unattended)` };
+    }
+    const ans = await ask(verdict.suggestions);
+    if (ans.decision === "deny") return { behavior: "deny", reason: `denied by user (${verdict.reason})` };
+    const after = verdict.onAnswer?.(ans.decision);
+    if (after && "deny" in after) return { behavior: "deny", reason: after.deny };
+    return finish(ans.updatedInput ?? input, verdict.reason);
+  }
+
+  if (bypass) return finish(input, "bypass: permissions skipped");
+  if (gate.isAllowed(session, integration)) return finish(input, `${integration.label}: allowed for this session`);
+
+  const ans = await ask(MCP_SUGGESTIONS(integration.label));
+  if (ans.decision === "deny") return { behavior: "deny", reason: "denied by user" };
+  const done = finish(ans.updatedInput ?? input, `${integration.label}: allowed by user`);
+  // Remember only an approval that actually went through (not one refused by the lock or a switch-off).
+  if (done.behavior === "allow" && ans.decision === "allow_always") gate.rememberAllowed(session, integration);
+  return done;
 }

@@ -300,6 +300,39 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      // MCP integrations (mcp-integrations spec). Client commands only — nothing inside a session can
+      // reach these. Each is refused with a command.error when the feature is off on this daemon.
+      case "mcp.integration.add":
+        deps.supervisor.mcpIntegrationAdd(cmd.integration);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.update":
+        deps.supervisor.mcpIntegrationUpdate(cmd.id, cmd.fields);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.remove":
+        deps.supervisor.mcpIntegrationRemove(cmd.id);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.check":
+        // Re-probe now; the requester always gets the fresh list (others only on a change).
+        deps.supervisor
+          .mcpIntegrationCheck()
+          .then(() => {
+            send(deps.supervisor.mcpIntegrationsEvent());
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "session.set_mcp_integrations":
+        deps.supervisor.setSessionMcpIntegrations(cmd.sessionId, cmd.ids);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.list":
         send(deps.supervisor.promptsEvent());
         if (cid) send(ack(cid));
