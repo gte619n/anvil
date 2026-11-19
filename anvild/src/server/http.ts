@@ -727,6 +727,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
     hooks: opts.solidcraft,
     self: { serverId: identity.serverId, serverName: identity.serverName },
     members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName, url: m.url })),
+    // Replay gate (Phase B2): what this machine hosts, its open worktrees (advisory), and who checks.
+    environments: () => supervisor.environmentsEvent().environments.map((e) => ({ name: e.name, repoRoot: e.repoRoot, defaultBase: e.defaultBase })),
+    worktrees: () => supervisor.list().filter((s) => s.worktree && !s.archived).map((s) => ({ path: s.cwd, label: s.title || s.worktree!.branch })),
+    notify: (title, body, tag) => supervisor.pushSystemAlert(title, body, tag),
+    isHub: () => !pairedHub.get(),
     broadcast: (event) => registry.toAll(event),
     route,
   });

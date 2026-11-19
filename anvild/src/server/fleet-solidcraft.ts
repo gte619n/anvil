@@ -16,10 +16,12 @@
 import type { rest, SolidcraftMachineStatus, SolidcraftPin, SolidcraftStatusEvent } from "@protocol";
 import { PROTOCOL_VERSION } from "@protocol";
 import { featureEnabled } from "../config";
-import type { InstallDeps, SolidcraftRef } from "../solidcraft/install";
-import { isSha256, isSolidcraftVersion } from "../solidcraft/install";
+import { CHECK_EVERY_MS, CandidateGate, fetchReleases, type LocalReplay, type MemberReplayClient } from "../solidcraft/candidate";
+import type { InstallDeps, Run, SolidcraftRef } from "../solidcraft/install";
+import { installedSolidcraft, isSha256, isSolidcraftVersion, pruneSolidcraft } from "../solidcraft/install";
 import { SolidcraftPinService, parsePin, pinBackWarning, type RewrittenDesignsProvider, type SetPinResult } from "../solidcraft/pin";
-import { resolveReleaseRef } from "../solidcraft/release";
+import { resolveReleaseRef, type GithubRelease } from "../solidcraft/release";
+import { replayMachine, type ReplayBuild, type ReplayEnvironment, type WorktreeProvider } from "../solidcraft/replay";
 
 export const SOLIDCRAFT_PIN_CAPABILITY = "solidcraft-pin";
 
@@ -266,7 +268,7 @@ export class FleetSolidcraftCoordinator {
 }
 
 /** The real HTTP transport to a member. Short probe timeout; the apply downloads and verifies ~160 MB. */
-export function httpMemberSolidcraftClient(fetchImpl: typeof fetch = fetch): MemberSolidcraftClient {
+export function httpMemberSolidcraftClient(fetchImpl: typeof fetch = fetch): MemberSolidcraftClient & MemberReplayClient {
   const trim = (base: string) => base.replace(/\/+$/, "");
   const timeout = (ms: number) => AbortSignal.timeout(ms);
   return {
@@ -290,6 +292,21 @@ export function httpMemberSolidcraftClient(fetchImpl: typeof fetch = fetch): Mem
         });
         const j = (await r.json().catch(() => ({}))) as Partial<rest.solidcraft.ApplyResponse>;
         return { ok: !!j.ok, local: j.local, error: j.error ?? (r.ok ? undefined : `member answered ${r.status}`) };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    async replay(base, req) {
+      // Long: the member may download and verify the candidate, then replays every design twice.
+      try {
+        const r = await fetchImpl(`${trim(base)}/api/solidcraft/replay`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(req satisfies rest.solidcraft.ReplayRequest),
+          signal: timeout(60 * 60_000),
+        });
+        const j = (await r.json().catch(() => ({}))) as Partial<rest.solidcraft.ReplayResponse>;
+        return { ok: !!j.ok && !!j.report, ...(j.report ? { report: j.report } : {}), ...(j.error || !r.ok ? { error: j.error ?? `member answered ${r.status}` } : {}) };
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
@@ -318,6 +335,20 @@ export interface SolidcraftTestHooks {
   primeResolver?: boolean;
   /** How often the hub re-applies the pin to stragglers. 0 disables the timer. */
   reconcileMs?: number;
+  // ── Replay gate (Phase B2) ──
+  /** The clock the candidate gate reads (release age, the 24-hour limit). */
+  now?: () => number;
+  /** The release list, instead of GitHub. Throwing simulates GitHub being unreachable. */
+  listReleases?: () => Promise<GithubRelease[]>;
+  /** The zip sha256 for a listed release, instead of digest + SHA256SUMS.txt over the network. */
+  releaseSha?: (release: GithubRelease, version: string) => Promise<string>;
+  /** Receives the gate's push notification instead of the device registries. */
+  notify?: (title: string, body: string, tag: string) => void;
+  /** How often the hub checks for a candidate. 0 disables the timer. */
+  checkEveryMs?: number;
+  environments?: () => ReplayEnvironment[];
+  worktrees?: WorktreeProvider;
+  replay?: { timeoutMs?: number; concurrency?: number; run?: Run };
 }
 
 type Trust = { trust: string; reject?: string };
@@ -339,6 +370,14 @@ export interface MountSolidcraftOptions {
    * the list is not available yet; a provider that returns [] means "none are rewritten".
    */
   rewrittenDesigns?: RewrittenDesignsProvider;
+  /** The environments this daemon hosts: their default branches are what the replay gate replays. */
+  environments?: () => ReplayEnvironment[];
+  /** Open session worktrees, replayed as advisory (listed, never holding the pin). */
+  worktrees?: WorktreeProvider;
+  /** One operational push notification to every registered device: (title, body, tag). */
+  notify?: (title: string, body: string, tag: string) => void;
+  /** Is this daemon the fleet's hub? Only the hub checks for candidates on a timer. Default: yes. */
+  isHub?: () => boolean;
   /** Send an event to every connected client. */
   broadcast: (event: SolidcraftStatusEvent) => void;
   route: (method: string, path: string, handler: Handler) => void;
@@ -347,6 +386,8 @@ export interface MountSolidcraftOptions {
 export interface MountedSolidcraft {
   service: SolidcraftPinService;
   coordinator: FleetSolidcraftCoordinator;
+  /** The hub's candidate check and replay gate (Phase B2). */
+  gate: CandidateGate;
   /** This daemon's `solidcraft.status` event, built fresh. */
   statusEvent: () => Promise<SolidcraftStatusEvent>;
   stop: () => void;
@@ -376,7 +417,12 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     exists: hooks.exists,
     primeResolver: hooks.primeResolver,
     onChange: () => void statusEvent().then(o.broadcast, () => {}),
+    candidateVersion: () => keptCandidate(),
   });
+  // The candidate this machine keeps on disk beside the pin: the one the hub's gate is evaluating
+  // (or holding), or the one a hub last asked THIS machine to replay.
+  let replayedCandidate: string | undefined;
+  const keptCandidate = (): string | undefined => gate.candidateVersion() ?? replayedCandidate;
   const coordinator = new FleetSolidcraftCoordinator({
     self: o.self,
     members: o.members,
@@ -384,9 +430,71 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     client: httpMemberSolidcraftClient(),
     resolveRef: hooks.resolveRef ?? ((v) => resolveReleaseRef(v)),
     rewrittenDesigns: hooks.rewrittenDesigns ?? o.rewrittenDesigns,
+    keepVersions: () => [keptCandidate()].filter((v): v is string => !!v),
+    log: (m) => console.log(m),
+  });
+
+  /**
+   * This machine's part of the replay gate, used for the hub itself and by the member route:
+   * install the candidate BESIDE the pinned build (the pin and the running build are not touched),
+   * then replay every hosted design under both and report.
+   */
+  const localReplay: LocalReplay = async (candidate, pinRef) => {
+    replayedCandidate = candidate.version;
+    const own = service.pin();
+    pruneSolidcraft(o.stateDir, [own?.version, own?.previous?.version, pinRef?.version, candidate.version]);
+    const inst = await service.installBeside(candidate);
+    if (!inst.ok) return { ok: false, error: `SolidCraft ${candidate.version} could not be installed here: ${inst.detail}` };
+    // The baseline is the pinned build; with none installed, whatever this machine would run now.
+    const want = pinRef ?? own;
+    const pinned = want ? installedSolidcraft(o.stateDir, want.version, want.sha256) : undefined;
+    let baseline: ReplayBuild | undefined = pinned ? { path: pinned.path, version: pinned.version } : undefined;
+    if (!baseline) {
+      const l = await service.local();
+      if (l.path && l.version) baseline = { path: l.path, version: l.version };
+    }
+    const selfCompare = baseline?.version === candidate.version;
+    if (selfCompare) baseline = undefined; // comparing a build with itself proves nothing
+    const report = await replayMachine({
+      candidate: { path: inst.path, version: inst.version },
+      baseline,
+      environments: (hooks.environments ?? o.environments ?? (() => []))(),
+      worktrees: hooks.worktrees ?? o.worktrees,
+      run: hooks.replay?.run,
+      timeoutMs: hooks.replay?.timeoutMs,
+      concurrency: hooks.replay?.concurrency,
+      env: hooks.env,
+    });
+    if (selfCompare) report.notes.push(`this machine already runs SolidCraft ${candidate.version}, so there was no other build to compare against`);
+    return { ok: true, report };
+  };
+
+  const client = httpMemberSolidcraftClient();
+  const gate: CandidateGate = new CandidateGate({
+    stateDir: o.stateDir,
+    self: o.self,
+    members: o.members,
+    client,
+    listReleases: hooks.listReleases ?? (() => fetchReleases()),
+    releaseSha: hooks.releaseSha,
+    pin: () => service.pin(),
+    localVersion: async () => (await service.local()).version,
+    replayLocal: localReplay,
+    advance: (ref) => coordinator.setPin({ version: ref.version, sha256: ref.sha256 }),
+    prune: () => {
+      const pin = service.pin();
+      if (pin) pruneSolidcraft(o.stateDir, [pin.version, pin.previous?.version]);
+    },
+    notify: hooks.notify ?? o.notify,
+    // Only the hub looks for candidates by itself; a member is told what to replay.
+    timerEnabled: () => o.isHub?.() ?? true,
+    now: hooks.now,
+    // The card re-reads the gate when it sees a status event.
+    onChange: () => void statusEvent().then(o.broadcast, () => {}),
     log: (m) => console.log(m),
   });
   service.boot();
+  gate.start(hooks.checkEveryMs ?? CHECK_EVERY_MS); // 0 disables the timers
 
   // A member that was offline when the pin moved is brought to it here.
   const every = hooks.reconcileMs ?? 10 * 60_000;
@@ -395,7 +503,7 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
 
   const json = (body: unknown, status = 200): Response => Response.json(body, { status });
   /** The mutating-route gate: JSON content type, and not a proven other tailnet user. */
-  const gate = async (req: Request, ctx: RouteCtx, allowLocal: boolean): Promise<Response | undefined> => {
+  const gate_ = async (req: Request, ctx: RouteCtx, allowLocal: boolean): Promise<Response | undefined> => {
     const ct = (req.headers.get("content-type") || "").toLowerCase();
     if (!ct.includes("application/json")) return new Response("application/json required", { status: 415 });
     const who = await ctx.callerIdentity();
@@ -410,7 +518,7 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     return json({ ok: true, ...(pin ? { pin } : {}), local: await service.status() } satisfies rest.solidcraft.StatusResponse);
   });
   o.route("POST", "/api/solidcraft/pin/apply", async (req, _url, _m, ctx) => {
-    const denied = await gate(req, ctx, true);
+    const denied = await gate_(req, ctx, true);
     if (denied) return denied;
     const b = await body<rest.solidcraft.ApplyRequest>(req);
     const pin = parsePin(b.pin);
@@ -421,13 +529,42 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     return json({ ok, pin: service.pin(), local, ...(ok ? {} : { error: local.error ?? local.reason ?? "not on the pinned version" }) } satisfies rest.solidcraft.ApplyResponse, ok ? 200 : 500);
   });
 
+  o.route("POST", "/api/solidcraft/replay", async (req, _url, _m, ctx) => {
+    const denied = await gate_(req, ctx, true);
+    if (denied) return denied;
+    const b = await body<rest.solidcraft.ReplayRequest>(req);
+    const ref = (r: unknown): SolidcraftRef | undefined => {
+      const x = r as { version?: unknown; sha256?: unknown } | undefined;
+      return x && isSolidcraftVersion(x.version) && isSha256(x.sha256) ? { version: x.version, sha256: x.sha256 } : undefined;
+    };
+    const candidate = ref(b.candidate);
+    if (!candidate) return json({ ok: false, error: "a candidate { version, sha256 } is required" } satisfies rest.solidcraft.ReplayResponse, 400);
+    if (b.pin !== undefined && !ref(b.pin)) return json({ ok: false, error: "pin must be { version, sha256 }" } satisfies rest.solidcraft.ReplayResponse, 400);
+    const r = await localReplay(candidate, ref(b.pin)).catch((e): { ok: false; error: string } => ({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+    return json((r.ok ? { ok: true, report: r.report } : { ok: false, error: r.error }) satisfies rest.solidcraft.ReplayResponse, r.ok ? 200 : 500);
+  });
+
   // ── Hub ──
+  o.route("GET", "/api/fleet/solidcraft/candidate", () => json(gate.status() satisfies rest.solidcraft.CandidateStatusResponse));
+  o.route("POST", "/api/fleet/solidcraft/candidate/check", async (req, _url, _m, ctx) => {
+    const denied = await gate_(req, ctx, false);
+    if (denied) return denied;
+    const check = await gate.check();
+    return json({ ...gate.status(), check } satisfies rest.solidcraft.CandidateCheckResponse);
+  });
+  o.route("POST", "/api/fleet/solidcraft/candidate/advance", async (req, _url, _m, ctx) => {
+    const denied = await gate_(req, ctx, false);
+    if (denied) return denied;
+    const b = await body<rest.solidcraft.AdvanceAnywayRequest>(req);
+    const r = await gate.advanceAnyway(String(b.version ?? ""));
+    return json(r satisfies rest.solidcraft.AdvanceAnywayResponse, r.ok ? 200 : 409);
+  });
   o.route("GET", "/api/fleet/solidcraft/status", async (_req, url) => {
     if (url.searchParams.get("refresh")) await coordinator.refresh();
     return json(coordinator.status() satisfies rest.solidcraft.FleetStatusResponse);
   });
   o.route("POST", "/api/fleet/solidcraft/pin", async (req, _url, _m, ctx) => {
-    const denied = await gate(req, ctx, false);
+    const denied = await gate_(req, ctx, false);
     if (denied) return denied;
     const b = await body<rest.solidcraft.SetPinRequest>(req);
     const r = await coordinator.setPin({ version: String(b.version ?? ""), ...(typeof b.sha256 === "string" ? { sha256: b.sha256 } : {}) });
@@ -435,11 +572,20 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
   });
   o.route("GET", "/api/fleet/solidcraft/pin/back", async () => json((await coordinator.pinBackPreview()) satisfies rest.solidcraft.PinBackPreviewResponse));
   o.route("POST", "/api/fleet/solidcraft/pin/back", async (req, _url, _m, ctx) => {
-    const denied = await gate(req, ctx, false);
+    const denied = await gate_(req, ctx, false);
     if (denied) return denied;
     const r = await coordinator.pinBack();
     return json(r satisfies rest.solidcraft.PinBackResponse, r.ok ? 200 : 409);
   });
 
-  return { service, coordinator, statusEvent, stop: () => timer && clearInterval(timer) };
+  return {
+    service,
+    coordinator,
+    gate,
+    statusEvent,
+    stop: () => {
+      if (timer) clearInterval(timer);
+      gate.stop();
+    },
+  };
 }

@@ -678,6 +678,9 @@ function renderCadPanel(): void {
     setPin: (version, sha256) => hubJson<rest.solidcraft.SetPinResponse>("/api/fleet/solidcraft/pin", postJson({ version, ...(sha256 ? { sha256 } : {}) })),
     pinBackPreview: () => hubJson<rest.solidcraft.PinBackPreviewResponse>("/api/fleet/solidcraft/pin/back"),
     pinBack: () => hubJson<rest.solidcraft.PinBackResponse>("/api/fleet/solidcraft/pin/back", postJson({})),
+    gate: () => hubJson<rest.solidcraft.CandidateStatusResponse>("/api/fleet/solidcraft/candidate"),
+    checkNow: () => hubJson<rest.solidcraft.CandidateCheckResponse>("/api/fleet/solidcraft/candidate/check", postJson({})),
+    advanceAnyway: (version) => hubJson<rest.solidcraft.AdvanceAnywayResponse>("/api/fleet/solidcraft/candidate/advance", postJson({ version })),
     toast,
   });
 }

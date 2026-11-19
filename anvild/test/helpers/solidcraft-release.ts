@@ -75,9 +75,14 @@ export const sha256Of = (buf: Buffer): string => createHash("sha256").update(buf
 
 const FAKE_SOLIDCRAFT = join(import.meta.dir, "..", "fixtures", "fake-solidcraft.ts");
 
-/** An executable that behaves like `solidcraft-cli` of `version` (it runs the fake server). */
-export function fakeCliScript(version: string): string {
-  return `#!/bin/sh\nFAKE_SC_VERSION='${version}' exec '${process.execPath}' '${FAKE_SOLIDCRAFT}' "$@"\n`;
+/**
+ * An executable that behaves like `solidcraft-cli` of `version` (it runs the fake server). `env`
+ * adds FAKE_SC_* settings baked into the script — the daemon runs a managed binary with a bare
+ * environment, so this is the only way a setting reaches it (e.g. `FAKE_SC_TABLE`, Phase B2).
+ */
+export function fakeCliScript(version: string, env: Record<string, string> = {}): string {
+  const extra = Object.entries(env).map(([k, v]) => `${k}='${v}' `).join("");
+  return `#!/bin/sh\n${extra}FAKE_SC_VERSION='${version}' exec '${process.execPath}' '${FAKE_SOLIDCRAFT}' "$@"\n`;
 }
 
 export interface FakeReleaseOptions {
@@ -89,6 +94,8 @@ export interface FakeReleaseOptions {
   withSolvecraft?: boolean;
   /** Extra entries appended inside (or outside) the top folder — for hostile archives. */
   extra?: ZipInput[];
+  /** FAKE_SC_* settings baked into the binary (see `fakeCliScript`). */
+  env?: Record<string, string>;
 }
 
 /** A zip laid out like the real release asset: one top folder holding the CLI and a licence. */
@@ -97,7 +104,7 @@ export function fakeReleaseZip(version: string, opts: FakeReleaseOptions = {}): 
   const entries: ZipInput[] = [
     { name: `${top}/` },
     { name: `${top}/LICENSE-MIT`, data: "MIT\n" },
-    ...(opts.noBinary ? [] : [{ name: `${top}/solidcraft-cli`, data: fakeCliScript(opts.reports ?? version), mode: 0o100755 } satisfies ZipInput]),
+    ...(opts.noBinary ? [] : [{ name: `${top}/solidcraft-cli`, data: fakeCliScript(opts.reports ?? version, opts.env), mode: 0o100755 } satisfies ZipInput]),
     ...(opts.withSolvecraft ? [{ name: `${top}/solvecraft-cli`, data: "#!/bin/sh\nexit 0\n", mode: 0o100755 } satisfies ZipInput] : []),
     ...(opts.extra ?? []),
   ];

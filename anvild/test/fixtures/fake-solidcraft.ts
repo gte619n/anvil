@@ -65,6 +65,7 @@
  *  - The "Boolean retry" warning text is invented (the real wording was not provoked).
  */
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { fakeEval } from "./fake-solidcraft-eval";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
 
@@ -1268,6 +1269,7 @@ async function main(): Promise<void> {
     console.log(`solidcraft-cli ${VERSION}`);
     return;
   }
+  if (argv[0] === "eval") return void process.exit(await fakeEval(argv.slice(1), { version: VERSION, volumeScale: VOLUME_SCALE, build, bboxOf }));
   if (argv[0] !== "mcp") {
     process.stderr.write("usage: fake-solidcraft mcp [--headless] [--compact] [--allow-path DIR]... [--in design.sc|script.json]\n");
     process.exit(2);

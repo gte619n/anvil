@@ -265,7 +265,105 @@
     },
     "B2": {
       "title": "replay gate and auto-advance",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/solidcraft-candidate.test.ts",
+          "names": [
+            "candidate selection > [B2] with releases 10, 30 and 50 hours old the 50-hour one is chosen; with only 10 and 30, none is",
+            "candidate selection > [B2] the NEWEST qualifying release is taken, not the first old-enough one",
+            "candidate selection > [B2] a plain-looking tag that is a prerelease, a draft, a nightly or an rc is never a candidate",
+            "candidate selection > [B2] releases are sorted by published_at, whatever order the API returns them in",
+            "candidate selection > [B2] the candidate must be newer than the pin by version number, and not previously rejected",
+            "candidate selection > [B2] the release list is read page by page until a short page",
+            "candidate selection > [B2] at most one advance per 24 hours",
+            "the hub's replay gate > [B2] all machines pass: the pin advances once, through the coordinator, with the release's sha256",
+            "the hub's replay gate > [B2] the pin does not advance again within 24 hours, and does after",
+            "the hub's replay gate > [B2] a part that differs on one member rejects the candidate, with its old and new numbers, and sends one notification naming it",
+            "the hub's replay gate > [B2] a rejected version is never retried, across checks and across a restart",
+            "the hub's replay gate > [B2] a candidate that crashes on replay on the hub holds the pin",
+            "the hub's replay gate > [B2] a design already broken under the pinned build is reported and ignored for the decision",
+            "the hub's replay gate > [B2] a member that hosts designs and is unreachable holds the pin and is named; it is not a rejection",
+            "the hub's replay gate > [B2] an unreachable member known to host no designs does not hold the pin; one that never reported does",
+            "the hub's replay gate > [B2] a member that cannot install or replay the candidate holds the pin; one without the feature takes no part",
+            "the hub's replay gate > [B2] if the hub cannot install the candidate nothing is asked of the members and nothing is rejected",
+            "the hub's replay gate > [B2] GitHub unreachable: the check is skipped and the pin is unchanged",
+            "the hub's replay gate > [B2] an asset digest that disagrees with SHA256SUMS.txt is never evaluated",
+            "the hub's replay gate > [B2] a hub restart mid-evaluation leaves the pin and the rejected list untouched, and the next check starts from scratch",
+            "the hub's replay gate > [B2] the pin is not advanced if it changed while the candidate was being evaluated",
+            "the hub's replay gate > [B2] two checks at once run one evaluation",
+            "the hub's replay gate > [B2] with no pin recorded the candidate must be newer than the hub's local build, and the first pin is set by a passing evaluation",
+            "the hub's replay gate > [B2] 'Advance anyway' pins a rejected candidate, only that one, and only a newer one",
+            "the hub's replay gate > [B2] 'Advance anyway' also takes a held candidate, reports a failed pin change, and waits for a running check",
+            "the hub's replay gate > [B2] the hub checks every 4 hours, and once soon after a start"
+          ]
+        },
+        {
+          "file": "test/unit/solidcraft-replay.test.ts",
+          "names": [
+            "reading an eval result > [B2] a feature error with exit code 0 counts as a failed replay",
+            "reading an eval result > [B2] a parameter error with exit code 0 counts as a failed replay",
+            "reading an eval result > [B2] a non-zero exit, a crash with no output and unreadable JSON are all failures",
+            "reading an eval result > [B2] older builds lack some keys: a result without params or timeline is read leniently",
+            "the comparison rule > [B2] edges, kernel, area, vertices and timings are ignored",
+            "the comparison rule > [B2] the volume tolerance is 1e-6 relative: at the boundary it is the same, just past it differs",
+            "the comparison rule > [B2] face count and body count are compared exactly, per body",
+            "the comparison rule > [B2] the bounding box is compared sorted, so the same solid facing another way is the same",
+            "the comparison rule > [B2] the four outcomes: same, differs with old and new numbers, candidate-error, baseline-broken",
+            "the fake binary's eval subcommand > [B2] the fake eval prints the real JSON shape and follows the real exit codes",
+            "the fake binary's eval subcommand > [B2] the per-version table makes two fake builds genuinely differ, one part at a time",
+            "replaying a machine's designs > [B2] identical builds give `same` for every part, with the numbers both produced",
+            "replaying a machine's designs > [B2] a part whose volume differs is `differs` with the old and new numbers; the others stay `same`",
+            "replaying a machine's designs > [B2] a candidate build that crashes on replay counts as a failure for that part",
+            "replaying a machine's designs > [B2] a feature that fails only under the candidate, with exit code 0, is a candidate-error",
+            "replaying a machine's designs > [B2] a design that already fails under the pinned build is reported as baseline-broken and does not hold the pin",
+            "replaying a machine's designs > [B2] designs are read from origin/<defaultBase> after a fetch, never from the working checkout",
+            "replaying a machine's designs > [B2] with no remote the local <defaultBase> branch is read, still not the checkout",
+            "replaying a machine's designs > [B2] only cad/<part>/design.json is read: part.json, nested folders and other files are never copied or replayed",
+            "replaying a machine's designs > [B2] designs in open session worktrees are replayed as advisory and never decide",
+            "replaying a machine's designs > [B2] a replay that outlasts the per-design timeout is stopped and counts against the candidate",
+            "replaying a machine's designs > [B2] at most `concurrency` designs are replayed at once",
+            "replaying a machine's designs > [B2] with no baseline build the designs are replayed under the candidate for errors only"
+          ]
+        },
+        {
+          "file": "test/web/settings-cad-gate.test.ts",
+          "names": [
+            "Settings → CAD card: replay gate > [B2] the last evaluation shows the candidate, when, the result and each machine's status",
+            "Settings → CAD card: replay gate > [B2] a held evaluation names the unreachable member on the card",
+            "Settings → CAD card: replay gate > [B2] per-part differences show the old and new numbers; broken-under-the-pin and advisory designs are listed apart",
+            "Settings → CAD card: replay gate > [B2] 'Check now' asks the hub to check and repaints with what it did",
+            "Settings → CAD card: replay gate > [B2] 'Advance anyway' shows the differences first, and only advances on confirm",
+            "Settings → CAD card: replay gate > [B2] a refused 'Advance anyway' shows the hub's reason and leaves the pin as it was",
+            "Settings → CAD card: replay gate > [B2] with nothing evaluated yet, after an advance, and against a hub without the gate, the card says what is true"
+          ]
+        },
+        {
+          "file": "test/integration/solidcraft-b2-replay.test.ts",
+          "names": [
+            "Phase B2 acceptance > [B2] with releases 10, 30 and 50 hours old the 50-hour one is chosen; with only 10 and 30, none is",
+            "Phase B2 acceptance > [B2] part.json.measured deliberately stale: the candidate still passes, because the comparison is pinned build against candidate",
+            "Phase B2 acceptance > [B2] the local checkout is on a feature branch with a different design: the replay reads origin/<defaultBase>",
+            "Phase B2 acceptance > [B2] all parts identical: the pin advances once, and not again within 24 h",
+            "Phase B2 acceptance > [B2] one part's volume differs by more than its tolerance: the pin holds, the candidate is rejected with that part's old and new numbers, one notification is sent, and the next check does not retry it",
+            "Phase B2 acceptance > [B2] a member hosting designs is unreachable: the pin holds and the card names the member",
+            "Phase B2 acceptance > [B2] during evaluation the pinned build keeps serving sessions (the candidate is installed beside it)",
+            "Phase B2 surface > [B2] 'Advance anyway' through the hub route pins a rejected candidate across the fleet",
+            "Phase B2 surface > [B2] designs in an open session worktree are listed as advisory and do not hold the pin",
+            "Phase B2 surface > [B2] GitHub unreachable: the check is skipped and the pin is unchanged",
+            "Phase B2 surface > [B2] the member replay route installs the candidate beside the pin, reports, and leaves the pin alone",
+            "Phase B2 surface > [B2] the new routes follow the managed-CLI posture, and are 404 without the solidcraft-pin feature"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/solidcraft-b2.test.ts",
+          "names": [
+            "[B2 real] a real exported plate script, read from origin/main of a real repository, replays to `same` under the pinned build and the candidate",
+            "[B2 real] a script whose fillet cannot be computed is a failed replay even though the real eval exits 0"
+          ]
+        }
+      ]
     },
     "B3": {
       "title": "autopilot CAD",
