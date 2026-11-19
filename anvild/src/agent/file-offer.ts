@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { DOWNLOADS_DIRNAME } from "../browser/downloads";
 import { relative } from "node:path";
 import type { FileOffer } from "@protocol";
 import { resolveInside } from "../fs/session-fs";
@@ -69,6 +70,8 @@ export function buildFileOffer(sessionId: string, cwd: string, rawPath: string):
   }
   const name = abs.split("/").pop() || "download";
   const rel = relative(cwd, abs) || name;
+  // A file in the browser's download quarantine never gets a download card (agent-cad-and-browser §4.12).
+  if (rel === DOWNLOADS_DIRNAME || rel.startsWith(`${DOWNLOADS_DIRNAME}/`)) return null;
   return {
     name,
     path: abs,

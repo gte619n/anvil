@@ -4,7 +4,7 @@
  * Supervisor, no Session class — so permissions.ts and driver.ts can import it without a cycle.
  * (mcp-integrations spec §4.4/§4.5; agent-cad-and-browser §4.12)
  */
-import type { McpIntegration, McpIntegrationKind, PermissionDecision, PermissionSuggestion, Session as SessionData } from "@protocol";
+import type { McpIntegration, McpIntegrationKind, PermissionDecision, PermissionSuggestion, Session as SessionData, ToolResultImage } from "@protocol";
 
 /**
  * Built-in tools that read from MCP servers WITHOUT an `mcp__` name, so they would slip past the
@@ -123,6 +123,12 @@ export type McpKindVerdict =
       always?: boolean;
       /** Deny with no card when nobody is there to answer (see `isUnattended`). */
       denyWhenUnattended?: boolean;
+      /** Extra things the card shows (Phase C3 hard stops): the reason in words, and a picture of
+       *  what the answer applies to. Sent on the wire as `permission.request.reason` / `.image`. */
+      card?: { reason?: string; image?: ToolResultImage };
+      /** Deny, and retire the card, when nobody has answered after this long (Phase C3: a hard stop
+       *  that times out is denied). Absent → the card waits as long as the hook does. */
+      timeoutMs?: number;
       /** Called with the owner's answer before the call proceeds, so the kind can record an approval
        *  (e.g. "Allow <site> this session"). `allow_always` is NOT recorded in `session.mcpAllowed`
        *  for a kind prompt — its meaning belongs to the kind. Return `{ deny }` to refuse after all. */

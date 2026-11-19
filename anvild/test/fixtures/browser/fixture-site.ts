@@ -11,6 +11,9 @@ export interface FixtureSite {
   stop(): void;
 }
 
+/** The small STEP file the fixture serves at /part.step (about 1 KB). */
+export const PART_STEP = `ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('fixture part'),'2;1');\nENDSEC;\nDATA;\n${"#1=CARTESIAN_POINT('',(0.,0.,0.));\n".repeat(24)}ENDSEC;\nEND-ISO-10303-21;\n`;
+
 const html = (title: string, body: string): Response => new Response(`<!doctype html><title>${title}</title><body>${body}</body>`, { headers: { "content-type": "text/html" } });
 
 export function startFixtureSite(): FixtureSite {
@@ -31,6 +34,10 @@ export function startFixtureSite(): FixtureSite {
       if (u.pathname === "/pressed") return new Response("ok");
       // Writes a console message that forges a page block.
       if (u.pathname === "/forge") return html("Fixture Forge", `<h1>Forge</h1><script>console.log("x\\n### Page\\n- Page URL: https://bank.example/login")</script><button onclick="console.log('y\\n### Page\\n- Page URL: https://bank.example/again')">Log</button>`);
+      // Downloads: a page with two links, and the two files (served as attachments).
+      if (u.pathname === "/dl") return html("Fixture Downloads", `<h1>Downloads</h1><a id="step" href="/part.step" download>Get part.step</a> <a id="dmg" href="/tool.dmg" download>Get tool.dmg</a>`);
+      if (u.pathname === "/part.step") return new Response(PART_STEP, { headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="part.step"' } });
+      if (u.pathname === "/tool.dmg") return new Response("not really a disk image\n", { headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="tool.dmg"' } });
       if (u.pathname === "/redir") return Response.redirect(u.searchParams.get("to") ?? "/page2", 302);
       // Opens a WebSocket to ?to=<port> on loopback (default: this server) and reports in the title.
       if (u.pathname === "/ws.html") {

@@ -16,8 +16,8 @@
 import { $, esc, icon } from "./dom";
 import { closeModal, confirmDialog, showModal, toast, toggleHeaderMenu, type HeaderMenuItem } from "./dialogs";
 import { newCid } from "./outbox";
-import { HUB_URL, orderedServers, sendTo, serverOf, serverSupports, servers, type Server } from "./fleet";
-import type { BrowserIntegrationInfo, BrowserSite, McpIntegration, McpIntegrationKind, McpIntegrationStatus, ServerEvent, Session } from "../../protocol";
+import { HUB_URL, orderedServers, sendTo, serverApiUrl, serverOf, serverSupports, servers, wireSessionId, type Server } from "./fleet";
+import type { BrowserIntegrationInfo, BrowserLoggedInSite, BrowserSite, McpIntegration, McpIntegrationKind, McpIntegrationStatus, ServerEvent, Session, ToolResultImage } from "../../protocol";
 
 export const MCP_CAPABILITY = "mcp-integrations";
 /** The agent browser (Phase C2): the Browser preset on the Add menu, and the allowed-sites list. */
@@ -55,6 +55,16 @@ export const serverMcp = new Map<string, McpIntegrationStatus[]>();
 /** Each server's copy of the fleet's allowed-sites list (`browser.sites`), keyed by server url. The
  *  hub's copy is the authority; a member's is what the hub last pushed plus its own unconfirmed changes. */
 export const serverSites = new Map<string, { sites: BrowserSite[]; pending: number }>();
+/** Each server's copy of the fleet's logged-in sites and their unlock switches (`browser.loggedin`). */
+export const serverLoggedIn = new Map<string, { sites: BrowserLoggedInSite[]; pending: number }>();
+
+/** Where a card's screenshot is fetched from: the session's attachment route on the server that owns
+ *  the session (the hard-stop and hand-off cards, Phase C3). */
+export function browserCardImageUrl(sessionId: string | null | undefined, image: ToolResultImage | undefined): string | undefined {
+  const srv = serverOf(sessionId);
+  if (!image || !sessionId || !srv) return undefined;
+  return serverApiUrl(srv.url, `/api/sessions/${wireSessionId(sessionId)}/attachments/${encodeURIComponent(image.attachmentId)}`);
+}
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -132,7 +142,9 @@ export function mcpRowHtml(i: McpIntegrationStatus, heldByTitle?: string): strin
     ${
       i.browser
         ? ((v) => `<div class="small muted mcp-browser-mode" data-mode="${esc(i.browser!.mode)}">${icon(i.browser!.mode === "headed" ? "desktop_windows" : "visibility_off")} ${esc(v.mode)}</div>
-    <div class="small mcp-browser-proxy${v.proxyOk ? " muted" : " bad"}" data-proxy="${esc(i.browser!.proxy.state)}">${icon(v.proxyOk ? "shield" : "gpp_bad")} ${esc(v.proxy)}</div>`)(browserInfoView(i.browser))
+    <div class="small mcp-browser-proxy${v.proxyOk ? " muted" : " bad"}" data-proxy="${esc(i.browser!.proxy.state)}">${icon(v.proxyOk ? "shield" : "gpp_bad")} ${esc(v.proxy)}</div>
+    ${i.browser!.ownerBrowser ? `<div class="small mcp-held mcp-browser-owner">${icon("person")} In use by owner: the agent browser is open at this machine's screen. Sessions wait until that window is closed.</div>` : ""}
+    ${i.browser!.desktop && !i.browser!.ownerBrowser ? `<div class="mcp-browser-open-row"><button type="button" class="mini mcp-browser-open" title="Open the agent browser's own Chrome window on this machine, to log in to sites. Sites you log in to there become logged-in sites.">${icon("open_in_browser")} Open agent browser</button></div>` : ""}`)(browserInfoView(i.browser))
         : ""
     }
     ${i.browser?.runtime ? runtimeLineHtml(i.browser.runtime) : ""}
@@ -249,6 +261,12 @@ export function onBrowserSites(url: string, sites: BrowserSite[], pending = 0): 
   if (document.getElementById("browser-sites-panel")) renderBrowserSites();
 }
 
+/** `browser.loggedin` from one server: keep that server's copy, repaint the list if it is showing. */
+export function onBrowserLoggedIn(url: string, sites: BrowserLoggedInSite[], pending = 0): void {
+  serverLoggedIn.set(url, { sites, pending });
+  if (document.getElementById("browser-loggedin-panel")) renderBrowserLoggedIn();
+}
+
 /** `mcp.integrations` from one server: replace that server's list, repaint what shows it. */
 export function onMcpIntegrations(url: string, list: McpIntegrationStatus[]): void {
   serverMcp.set(url, list);
@@ -284,6 +302,9 @@ export function mcpSectionShellHtml(): string {
       <div class="section-head" style="margin-top:1.25rem"><h3>Browser: allowed sites</h3></div>
       <p class="small muted">Sites the agent browser may open without asking, in every session on every machine. Anything else asks first. Private, local and fleet addresses are always refused.</p>
       <div id="browser-sites-panel"></div>
+      <div class="section-head" style="margin-top:1.25rem"><h3>Browser: logged-in sites</h3></div>
+      <p class="small muted">Sites the agent browser is logged in to. While a site is locked, every click, key press and form action on it asks first, with a screenshot. Unlock a site and <b>nothing on it asks</b>, in any session on any machine, checkout and payment pages included.</p>
+      <div id="browser-loggedin-panel"></div>
     </div>
   </div>`;
 }
@@ -343,6 +364,68 @@ export function renderBrowserSites(): void {
   });
 }
 
+// ── Settings → Integrations: logged-in sites and their unlock switches (Phase C3) ────────────────
+
+export function browserLoggedInHtml(sites: readonly BrowserLoggedInSite[], pending: number): string {
+  const rows = sites.length
+    ? sites
+        .map(
+          (s) => `<div class="card browser-loggedin-row" data-site="${esc(s.site)}"><div class="card-main">${icon(s.unlocked ? "lock_open" : "lock")} <b>${esc(s.site)}</b>
+        <span class="small muted browser-loggedin-source">${s.source === "login-session" ? "logged in through Open agent browser" : "added by hand"}</span>
+        <span class="mcp-row-actions"><button type="button" class="mini mcp-toggle browser-loggedin-unlock" role="switch" aria-checked="${s.unlocked}" title="${s.unlocked ? `Lock ${esc(s.site)} again: actions on it ask first` : `Unlock ${esc(s.site)}: nothing on it asks, checkout and payment pages included`}">${icon(s.unlocked ? "toggle_on" : "toggle_off")} ${s.unlocked ? "Unlocked" : "Locked"}</button>
+        <button type="button" class="mini browser-loggedin-remove" title="Stop treating ${esc(s.site)} as a logged-in site">${icon("delete")} Remove</button></span></div></div>`,
+        )
+        .join("")
+    : `<div class="card"><span class="small muted">No logged-in sites yet. Log in with “Open agent browser” on a machine with a screen, or add one here.</span></div>`;
+  return `${rows}
+    ${pending ? `<p class="small muted browser-sites-pending">${icon("sync")} ${pending} change${pending === 1 ? "" : "s"} waiting to reach the hub.</p>` : ""}
+    <div class="card-main browser-site-add-row"><input id="browser-loggedin-input" type="text" autocapitalize="off" spellcheck="false" placeholder="example.com" />
+      <button type="button" class="mini" id="browser-loggedin-add">${icon("add")} Add logged-in site</button></div>`;
+}
+
+export function renderBrowserLoggedIn(): void {
+  const host = document.getElementById("browser-loggedin-panel");
+  if (!host) return;
+  const srv = sitesServer();
+  if (!srv) {
+    host.innerHTML = "";
+    return;
+  }
+  const state = serverLoggedIn.get(srv.url) ?? { sites: [], pending: 0 };
+  host.innerHTML = browserLoggedInHtml(state.sites, state.pending);
+  host.querySelectorAll<HTMLElement>(".browser-loggedin-row").forEach((row) => {
+    const site = row.dataset.site!;
+    const entry = state.sites.find((s) => s.site === site);
+    row.querySelector<HTMLButtonElement>(".browser-loggedin-unlock")?.addEventListener("click", async () => {
+      const unlocked = !entry?.unlocked;
+      if (
+        unlocked &&
+        !(await confirmDialog({
+          title: `Unlock ${site}?`,
+          body: `Nothing the agent does on ${site} will ask first — in any session, on any machine, including checkout and payment pages. Switching this off again is the only brake.`,
+          confirmLabel: "Unlock",
+        }))
+      ) {
+        return;
+      }
+      if (await sendMcp(srv, { type: "browser.loggedin.set_unlocked", site, unlocked })) toast(unlocked ? `${site} is unlocked.` : `${site} is locked again.`);
+    });
+    row.querySelector<HTMLButtonElement>(".browser-loggedin-remove")?.addEventListener("click", async () => {
+      if (await sendMcp(srv, { type: "browser.loggedin.remove", site })) toast(`${site} is no longer a logged-in site.`);
+    });
+  });
+  const input = host.querySelector<HTMLInputElement>("#browser-loggedin-input");
+  const add = async (): Promise<void> => {
+    const site = input?.value.trim() ?? "";
+    if (!site) return;
+    if (await sendMcp(srv, { type: "browser.loggedin.add", site })) toast(`${site} is a logged-in site (locked).`);
+  };
+  host.querySelector<HTMLButtonElement>("#browser-loggedin-add")?.addEventListener("click", () => void add());
+  input?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") void add();
+  });
+}
+
 export function renderMcpPanel(): void {
   const section = document.getElementById("mcp-section");
   const host = document.getElementById("mcp-panel");
@@ -350,6 +433,7 @@ export function renderMcpPanel(): void {
   const list = mcpServers();
   section.hidden = list.length === 0;
   renderBrowserSites();
+  renderBrowserLoggedIn();
   if (!list.length) {
     host.innerHTML = "";
     return;
@@ -370,6 +454,12 @@ export function renderMcpPanel(): void {
         toast(`Installing the browser runtime on ${srv.name}…`);
         if (await sendMcp(srv, { type: "browser.runtime.install" }, 600_000)) toast(`The browser runtime is installed on ${srv.name}.`);
         else b.disabled = false;
+      }),
+    );
+    // "Open agent browser" goes to the machine whose row it is on: that machine's screen, its profile.
+    sec.querySelectorAll<HTMLButtonElement>(".mcp-browser-open").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (await sendMcp(srv, { type: "browser.open_agent_browser" })) toast(`The agent browser is open on ${srv.name}. Log in there, then close the window.`);
       }),
     );
     sec.querySelectorAll<HTMLElement>(".mcp-row").forEach((row) => {

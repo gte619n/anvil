@@ -57,6 +57,7 @@ import {
   type TelemetrySnapshotEvent,
   type McpIntegrationsEvent,
   type BrowserSitesEvent,
+  type BrowserLoggedInEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
@@ -84,6 +85,8 @@ import { ModelLabelStore } from "../models/store";
 import { CLAUDE_TOKEN_KEY } from "../auth/store";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
+import { HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, buildHumanToolsServer } from "../agent/human-tools";
+import { isOrdinarySession } from "../agent/mcp-external";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { RateLimitTracker } from "../budget/tracker";
@@ -276,6 +279,9 @@ export class Supervisor {
   /** MCP integration registry: store, health, exclusive lock, commands and the permission gate's
    *  lookups (mcp-integrations spec). Inert unless the "mcp-integrations" feature is on. */
   readonly mcp: McpIntegrationService;
+  /** `request_human` hand-offs (agent browser Phase C3). The autopilot track assigns
+   *  `human.onUnattendedHumanRequest` to mark a builder's work unit blocked. */
+  readonly human: HumanRequestService;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
   /** Team orchestration domain — plan lifecycle, member spawn/queue/drain, relay guard, integration
@@ -358,10 +364,13 @@ export class Supervisor {
       notice: (id, markdown) => {
         this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
       },
+      saveImage: (sessionId, mediaType, dataBase64) => this.attachStore.add(sessionId, "screenshot", mediaType, dataBase64).id,
+      onConsumeExit: (id) => this.cancelHumanRequests(id), // a dead turn cannot receive "I've cleared it"
       prober: cfg.mcp?.prober,
       clock: cfg.mcp?.clock,
       intervalMs: cfg.mcp?.intervalMs,
     });
+    this.human = new HumanRequestService({ screenshot: (sessionId) => this.mcp.browser?.screenshot(sessionId) });
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
       getSession: (id) => this.sessions.get(id),
@@ -896,6 +905,34 @@ export class Supervisor {
     }
   }
 
+  // ── Agent browser logged-in sites, unlock switches and "Open agent browser" (Phase C3) ───────
+  private browserCommand<T>(run: (browser: NonNullable<McpIntegrationService["browser"]>) => T): T {
+    const browser = this.requireBrowser();
+    try {
+      return run(browser);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  browserLoggedInEvent(): BrowserLoggedInEvent {
+    return this.requireBrowser().loggedIn.event();
+  }
+  browserLoggedInAdd(site: string): void {
+    this.browserCommand((b) => b.loggedIn.add(site, "owner"));
+  }
+  browserLoggedInRemove(site: string): void {
+    this.browserCommand((b) => b.loggedIn.remove(site));
+  }
+  browserLoggedInSetUnlocked(site: string, unlocked: unknown): void {
+    if (typeof unlocked !== "boolean") throw new BadCommand("unlocked must be true or false");
+    this.browserCommand((b) => b.loggedIn.setUnlocked(site, unlocked));
+  }
+  /** Open the owner's Chrome window on this machine's agent profile (refused with no desktop session
+   *  or while a session is using the browser). */
+  browserOpenAgentBrowser(): void {
+    this.browserCommand((b) => b.openAgentBrowser());
+  }
+
   /**
    * A new Claude credential just landed (a pair, a rotation, a paste, or a roster mutation). Sessions
    * build their agent env per spawn, so nothing needs a restart to pick it up — but a session whose
@@ -1172,6 +1209,8 @@ export class Supervisor {
     // attach would otherwise never see them and the session would look stuck. Re-surface all of them
     // (a session can hold several at once, like permissions). (arch §6.6).
     for (const pendingQuestion of s.questionRequestEvents()) events.push(pendingQuestion);
+    for (const pendingHuman of s.humanRequestEvents()) events.push(pendingHuman); // parked request_human cards
+
     // Re-surface the live sub-agent set so a client attaching MID fan-out sees the running sub-agents at
     // once (§sub-agents, D9/ID13) — the subagent.activity channel is ephemeral (no seq), so without this
     // a reconnect would show a frozen pane until the next heartbeat. Empty when no sub-agents ran this turn.
@@ -1798,6 +1837,8 @@ export class Supervisor {
       const isLead = s.data.teamRole === "lead";
       const isMember = s.data.teamRole === "member" && !!s.data.parentId;
       const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
+      // An ordinary session with the agent browser switched on also gets `request_human` (Phase C3).
+      const hasBrowser = !!this.mcp.browser && isOrdinarySession(s.data) && this.mcp.store.list().some((i) => i.kind === "browser" && i.enabled && s.data.mcpIntegrations?.includes(i.id));
       // The session's in-process servers (its role server, if any). `mcp.serversFor` passes them
       // through unchanged and adds the session's ready MCP integrations (ordinary sessions only).
       const inProcessServers: Record<string, McpSdkServerConfigWithInstance> | undefined = isDefault
@@ -1808,7 +1849,9 @@ export class Supervisor {
             ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
             : isPlanner
               ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-              : undefined;
+              : hasBrowser
+                ? { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s) }
+                : undefined;
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -1817,7 +1860,7 @@ export class Supervisor {
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
         this.mcp.serversFor(s, inProcessServers),
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser ? HUMAN_TOOL_IDS : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
@@ -1863,6 +1906,23 @@ export class Supervisor {
       // sibling is still parked would orphan that prompt (its push vanishes). (arch §6.6)
       if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion()) this.clearNotifications(sessionId);
     }
+  }
+
+  /** "I've cleared it": answer a parked `request_human` hand-off — may come from any device. */
+  resolveHumanRequest(requestId: string): void {
+    const sessionId = this.human.sessionFor(requestId);
+    if (!this.human.respond(requestId)) throw new BadCommand(`no pending request for a person: ${requestId}`);
+    const s = sessionId ? this.sessions.get(sessionId) : undefined;
+    s?.humanResolved(requestId);
+    if (s) {
+      s.setStatus(s.settleStatus("running_tool"));
+      if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion() && !s.hasPendingHuman()) this.clearNotifications(sessionId);
+    }
+  }
+  /** Cancel a session's parked hand-offs (reset, new topic, deletion) and retire their cards. */
+  private cancelHumanRequests(sessionId: string): void {
+    this.human.cancelSession(sessionId);
+    this.sessions.get(sessionId)?.resolveAllHumans();
   }
 
   /** Answer (or cancel) a parked AskUserQuestion (arch §6.6) — may come from any device. */
@@ -2031,6 +2091,7 @@ export class Supervisor {
     this.reflectedSessions.delete(id);
     this.prWatchers.delete(id);
     this.mcp.onSessionGone(id); // free any exclusive MCP integration lock the session held
+    this.human.cancelSession(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
@@ -2105,6 +2166,7 @@ export class Supervisor {
     this.terminalMgr.kill(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
+    this.cancelHumanRequests(id);
     this.mcp.onSessionReset(id); // forget "always allow <integration>" + free its exclusive locks
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
@@ -2259,6 +2321,7 @@ export class Supervisor {
     this.drivers.delete(id);
     this.broker.resolveSession(id, "deny"); // unblock any parked permission
     this.questionBroker.resolveSession(id); // cancel any parked AskUserQuestion
+    this.cancelHumanRequests(id);
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
     s.data.claudeSessionId = undefined; // the key line: forget the prior topic (no resume next turn)
@@ -2352,6 +2415,8 @@ export class Supervisor {
       const opts = (q0?.options ?? []).slice(0, 3).map((o) => o.label).filter(Boolean).join(" · ");
       const more = event.questions.length > 1 ? ` (+${event.questions.length - 1} more)` : "";
       payload = { title, body: `${first}${more}${opts ? `\n${opts}` : ""}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
+    } else if (event.type === "human.request") {
+      payload = { title, body: `Needs you at the browser — ${event.reason}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
       // A goal in flight ends a turn on every iteration. Suppressing the "your turn" push here is
       // what makes a 10-iteration goal send ONE notification instead of ten (design D3). The

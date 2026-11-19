@@ -760,7 +760,15 @@ function showOneOff(): void {
 // requestId so a replayed/re-surfaced request (cold attach) doesn't stack duplicate cards.
 const permCards = new Map<string, HTMLElement>();
 
-export function showPermission(requestId: string, tool: string, inputObj: unknown, suggestions: PermissionSuggestion[], displayName?: string): void {
+export function showPermission(
+  requestId: string,
+  tool: string,
+  inputObj: unknown,
+  suggestions: PermissionSuggestion[],
+  displayName?: string,
+  /** What an agent-browser hard-stop card adds: why the daemon asks, and the page screenshot. */
+  extra?: { reason?: string; imageUrl?: string },
+): void {
   if (permCards.has(requestId)) return; // already shown (re-attach replay)
   dropSessionHero(); // a request landed in a blank session — retire the title card
   hideThinking(); // the turn is parked on this decision, not working
@@ -773,6 +781,8 @@ export function showPermission(requestId: string, tool: string, inputObj: unknow
     // `displayName` is the integration's label for an MCP integration tool ("Echo · ping") — shown
     // in place of the raw `mcp__echo__ping`, which stays in the tooltip.
     `<div class="perm-head">${icon("encrypted")}<span>Permission needed · <b title="${esc(tool)}">${esc(displayName ?? tool)}</b></span></div>` +
+    (extra?.reason ? `<div class="perm-reason">${esc(extra.reason)}</div>` : "") +
+    (extra?.imageUrl ? `<img class="att-img perm-shot" loading="lazy" alt="The page this applies to" src="${esc(extra.imageUrl)}" />` : "") +
     `<pre class="perm-input">${json}</pre>` +
     `<div class="perm-btns"></div>`;
   const btns = card.querySelector(".perm-btns")!;
@@ -816,11 +826,52 @@ export function clearPermissionCards(): void {
 // "Other" free-text field (the SDK always offers one).
 const questionCards = new Map<string, HTMLElement>();
 
+// ── Hand-off cards (request_human, agent browser Phase C3) ───────────────────────
+// The agent hit something only a person may clear (a bot check, a CAPTCHA, a login). Inline like the
+// other cards, keyed by requestId; one button, "I've cleared it".
+const humanCards = new Map<string, HTMLElement>();
+
+export function showHumanRequest(requestId: string, reason: string, imageUrl?: string): void {
+  if (humanCards.has(requestId)) return; // already shown (re-attach replay)
+  dropSessionHero();
+  hideThinking(); // the turn is parked on the owner, not working
+  const card = document.createElement("div");
+  card.className = "bubble question human-request";
+  card.setAttribute("role", "alert");
+  card.dataset.req = requestId;
+  card.innerHTML =
+    `<div class="q-head">${icon("front_hand")}<span>The agent needs you at the browser</span></div>` +
+    `<div class="human-reason">${esc(reason)}</div>` +
+    (imageUrl ? `<img class="att-img perm-shot" loading="lazy" alt="The page the agent is on" src="${esc(imageUrl)}" />` : "") +
+    `<div class="perm-btns"><button type="button" class="perm-btn allow human-cleared">${icon("check")} I've cleared it</button></div>`;
+  card.querySelector<HTMLButtonElement>(".human-cleared")!.onclick = () => {
+    const cmd = { type: "human.request.respond", requestId };
+    if (!sendTo(activeId(), cmd)) enqueue({ cid: newCid(), cmd: cmd as never });
+    resolveHumanUI(requestId, "Cleared");
+    showThinking("running_tool");
+  };
+  humanCards.set(requestId, card);
+  conversation.appendChild(card);
+  scrollDown();
+}
+
+/** Mark a hand-off card answered (here, on another device, or superseded). */
+export function resolveHumanUI(requestId: string, label?: string): void {
+  const card = humanCards.get(requestId);
+  if (!card) return;
+  humanCards.delete(requestId);
+  card.classList.add("resolved");
+  card.querySelectorAll<HTMLButtonElement>("button").forEach((b) => (b.disabled = true));
+  const btns = card.querySelector(".perm-btns");
+  if (btns && label) btns.innerHTML = `<span class="perm-done">${icon("check")} ${esc(label)}</span>`;
+}
+
 /** Forget the per-request permission/question card maps (the cards themselves are detached when the
  *  conversation pane is cleared — conversation.ts calls this from clearConversation). */
 export function clearCardMaps(): void {
   permCards.clear();
   questionCards.clear();
+  humanCards.clear();
 }
 
 export function showQuestion(requestId: string, questions: Question[]): void {

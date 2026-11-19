@@ -1,5 +1,5 @@
 import type { HookCallback, PreToolUseHookInput } from "@anthropic-ai/claude-agent-sdk";
-import type { PermissionDecision, PermissionSuggestion } from "@protocol";
+import type { PermissionDecision, PermissionSuggestion, ToolResultImage } from "@protocol";
 import { newId } from "../util/ids";
 import { isDangerous, isReadOnly } from "./danger-list";
 import { isUnattended, protectedVerdict, type ProtectedVerdict } from "./protected";
@@ -276,11 +276,25 @@ async function decideMcp(
     if (!lock.ok) return { behavior: "deny", reason: `${again.integration.label} is in use by ${lock.title}` };
     return { behavior: "allow", updatedInput, reason };
   };
-  const ask = async (suggestions: PermissionSuggestion[]) => {
+  const ask = async (suggestions: PermissionSuggestion[], card?: { reason?: string; image?: ToolResultImage }, timeoutMs?: number): Promise<ResolvedDecision & { timedOut?: true }> => {
     const requestId = newId("perm");
     const answer = broker.request(requestId, session.id);
-    session.requestPermission(requestId, tool, input, suggestions);
-    return answer;
+    session.requestPermission(requestId, tool, input, suggestions, card);
+    if (!timeoutMs || timeoutMs <= 0) return answer;
+    // A prompt with a time limit: when it runs out the card is retired on every device and the call
+    // is denied, exactly as if the owner had said no.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<ResolvedDecision & { timedOut: true }>((res) => {
+      timer = setTimeout(() => res({ decision: "deny", timedOut: true }), timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    const first = await Promise.race([answer, timedOut]);
+    clearTimeout(timer);
+    if ("timedOut" in first && first.timedOut && broker.resolve(requestId, "deny")) {
+      session.permissionResolved(requestId);
+      session.setStatus(session.settleStatus("thinking"));
+    }
+    return first;
   };
 
   if (guard?.kind === "always-prompt") {
@@ -314,7 +328,8 @@ async function decideMcp(
     if (verdict.denyWhenUnattended && isUnattended(session)) {
       return { behavior: "deny", reason: `${verdict.reason} (denied: this session is unattended)` };
     }
-    const ans = await ask(verdict.suggestions);
+    const ans = await ask(verdict.suggestions, verdict.card, verdict.timeoutMs);
+    if (ans.timedOut) return { behavior: "deny", reason: `${verdict.reason} (denied: nobody answered in time)` };
     if (ans.decision === "deny") {
       // The kind may answer a refusal with something safe in place of the call (same tool, its input).
       const instead = verdict.onDeny?.();

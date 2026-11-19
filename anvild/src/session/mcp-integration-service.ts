@@ -37,7 +37,10 @@ export interface McpIntegrationServiceDeps {
    *  (its proxy, its allowed-sites list, its gate); otherwise nothing of it is created or written. */
   browserEnabled?: boolean;
   /** Test seams for the browser (fake desktop probe, resolver, …). */
-  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs" | "nodePath" | "npmPath" | "runtimeInstaller">>;
+  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs" | "nodePath" | "npmPath" | "runtimeInstaller" | "agentBrowserLauncher" | "chromePath" | "hardStopTimeoutMs" | "maxDownloadBytes">>;
+  /** Persist an image as an attachment of a session, returning its id (the agent browser's hard-stop
+   *  and hand-off cards show a page screenshot). */
+  saveImage?: (sessionId: string, mediaType: string, dataBase64: string) => string;
   /** Send an event to every connected client. */
   broadcast: (event: ServerEvent) => void;
   /** How many clients are connected — the health loop only runs while there is one. */
@@ -55,6 +58,9 @@ export interface McpIntegrationServiceDeps {
   denyParked?: (sessionId: string, key: string) => void;
   /** Put one notice line in the session's transcript. */
   notice: (sessionId: string, markdown: string) => void;
+  /** The session's consume loop exited (its turn died or was stopped): nothing parked on behalf of
+   *  that turn can be answered any more (Phase C3: a `request_human` card). */
+  onConsumeExit?: (sessionId: string) => void;
   // ── test seams ──
   prober?: McpProber;
   clock?: () => number;
@@ -98,6 +104,9 @@ export class McpIntegrationService {
         notice: deps.notice,
         clock,
         reprobe: () => void this.probe("change"),
+        lockHeld: () => this.store.list().some((i) => i.kind === "browser" && this.lock.holder(i.id) !== undefined),
+        statusChanged: () => this.broadcastIfChanged(),
+        saveImage: deps.saveImage,
         ...deps.browser,
       });
       this.browser.start();
@@ -452,10 +461,14 @@ export class McpIntegrationService {
       }
     },
     onTurnEnd: (session) => this.afterTurn(session.id),
-    onConsumeExit: (session) => this.afterTurn(session.id),
+    onConsumeExit: (session) => {
+      this.afterTurn(session.id);
+      this.deps.onConsumeExit?.(session.id);
+    },
   };
 
   private afterTurn(sessionId: string): void {
+    this.browser?.onTurnEnd(sessionId); // Phase C3: downloads left in the output folder go to quarantine
     if (this.lock.releaseSession(sessionId).length) this.broadcastIfChanged();
     if (this.pendingRebuild.has(sessionId)) (this.deps.defer ?? defaultDefer)(() => this.applyPendingRebuild(sessionId));
   }

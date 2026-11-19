@@ -360,6 +360,38 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      // Agent browser logged-in sites, their unlock switches, "Open agent browser" and the
+      // request_human answer (Phase C3). Same gate: refused unless the "browser" feature is on.
+      case "browser.loggedin.list":
+        send(deps.supervisor.browserLoggedInEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.add":
+        deps.supervisor.browserLoggedInAdd(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.remove":
+        deps.supervisor.browserLoggedInRemove(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.set_unlocked":
+        deps.supervisor.browserLoggedInSetUnlocked(cmd.site, cmd.unlocked);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.open_agent_browser":
+        deps.supervisor.browserOpenAgentBrowser();
+        if (cid) send(ack(cid));
+        return;
+
+      case "human.request.respond":
+        deps.supervisor.resolveHumanRequest(cmd.requestId);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.list":
         send(deps.supervisor.promptsEvent());
         if (cid) send(ack(cid));

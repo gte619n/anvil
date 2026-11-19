@@ -576,7 +576,134 @@
     },
     "C3": {
       "title": "logged-in sites, hard stops, downloads, hand-off",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/browser-loggedin.test.ts",
+          "names": [
+            "LoggedInSitesStore > [C3] a logged-in site has site, source, unlocked and addedAt; add, unlock, lock and remove persist and reload; a new site starts LOCKED",
+            "LoggedInSitesStore > [C3] a corrupt file unlocks nothing and is kept aside; a hand-edited row unlocks only with the literal true, and a row that is not a site is dropped",
+            "LoggedInSitesStore > [C3] a member's own changes are queued in order, survive the hub's list replacing the local one, and leave the queue when confirmed",
+            "LoggedInSitesStore > [C3] on the authority the later change wins: a queued unlock cannot undo a lock set afterwards, a queued add cannot bring back a site removed afterwards, and a tie leaves the site locked",
+            "LoggedInSitesService > [C3] list, add, remove and set-unlocked: a site is its registrable domain, each change is broadcast as browser.loggedin, and only a listed site can be unlocked",
+            "the cookie snapshot > [C3] reads the profile's cookie hosts from a real SQLite cookie database, by registrable domain, without changing the file",
+            "the cookie snapshot > [C3] a profile with no cookie database has no cookies; a file that is not a database is 'unknown' (tolerated, never thrown)",
+            "the cookie snapshot > [C3] a site gained cookies when it has a cookie that was not there before — a new site, a new cookie, or one set again; untouched sites did not",
+            "Open agent browser > [C3] the command line is the installed Chrome on the agent profile with --password-store=basic and --use-mock-keychain — no proxy, no debugging port, no automation switch",
+            "Open agent browser > [C3] the command-line check refuses anything else: an extra flag, a URL, another profile, a missing or changed password-store",
+            "Open agent browser > [C3] a run snapshots cookies before launch and after exit and reports the sites that gained cookies; the launcher gets exactly the built command and a clean environment"
+          ]
+        },
+        {
+          "file": "test/unit/browser-hardstops.test.ts",
+          "names": [
+            "on a LOCKED logged-in site > [C3] the allow list is closed: of every tool in the table only read-class tools run without a prompt; every other call prompts — under bypass",
+            "on a LOCKED logged-in site > [C3] scrolling: browser_press_key with exactly PageDown, PageUp, Home or End runs without a prompt; every other key — and every near-miss spelling — prompts",
+            "on a LOCKED logged-in site > [C3] navigation: an https URL on the same site runs without a prompt; http on the same site, another site, a new tab elsewhere and going back all prompt",
+            "on a LOCKED logged-in site > [C3] the prompt is a hard stop: always (so bypass and any remembered allow cannot skip it), three options with no always-allow, the page screenshot attached, and a time limit",
+            "on a LOCKED logged-in site > [C3] gamed spec: the decision ignores what the model says it is doing — a click described as harmless, or as a scroll, prompts exactly like any other; a read described as a purchase does not",
+            "on a LOCKED logged-in site > [C3] the card must show the page as it is now: with no current screenshot the call is denied with an instruction to take one (a screenshot is a read, so it never asks)",
+            "on a LOCKED logged-in site > [C3] an unattended (builder) session is denied without a card",
+            "on a LOCKED logged-in site > [C3] when the page's address is unknown it is treated as a logged-in site, never as 'not logged in': only reads run",
+            "unlock (item 44) and sites that are not logged-in > [C3] choosing Unlock <site> sets the site's unlock switch and lets the call through; Allow once does not unlock",
+            "unlock (item 44) and sites that are not logged-in > [C3] on an UNLOCKED logged-in site nothing asks — every tool in the table, including on a checkout or payment page — and locking it again makes the next click prompt",
+            "unlock (item 44) and sites that are not logged-in > [C3] on an allowed site that is not logged-in a click, a key press and a form fill do not prompt; a site that only has cookies from agent sessions is not logged-in",
+            "unlock (item 44) and sites that are not logged-in > [C3] headless fallback: a logged-in site is refused entirely — unlocked or not — at navigation and when a page lands on it"
+          ]
+        },
+        {
+          "file": "test/unit/browser-downloads.test.ts",
+          "names": [
+            "constants > [C3] the quarantine is .anvil-downloads/, the limit is 200 MB, and the allowed extensions are exactly the listed fourteen",
+            "reading results > [C3] parses the Downloaded file line from a real result, ignores the earlier Downloading line, and handles several in one result",
+            "reading results > [C3] Playwright's own page-*.yml, page-*.png and console-*.log files are recognised and are not downloads; look-alikes are",
+            "reading results > [C3] file names the model asked for through a filename argument are remembered as not-downloads",
+            "quarantineFile > [C3] a 1 KB part.step is moved into .anvil-downloads/ with its bytes intact and no execute bit, and is gone from .anvil-browser/",
+            "quarantineFile > [C3] every allowed extension is kept, in any letter case; a second file of the same name gets a unique name instead of replacing the first",
+            "quarantineFile > [C3] a .dmg is deleted and reported — as are .exe, .sh, .app, .html, .js, a double extension ending in a refused one, and a file with no extension",
+            "quarantineFile > [C3] a file over the size limit is deleted and reported; one exactly at the limit is kept (a sparse file stands in for 200 MB + 1)",
+            "quarantineFile > [C3] a symbolic link is never followed: the link is deleted and reported, and what it points at is untouched",
+            "quarantineFile > [C3] the name is sanitized: path separators, control characters, leading dots and odd characters cannot shape where the file lands",
+            "quarantineFile > [C3] gamed result text: a Downloaded line naming a file outside this session's .anvil-browser/ moves nothing — not /etc/hosts, not a worktree file, not a file in a subfolder or through a link",
+            "quarantineFile > [C3] a .anvil-downloads that is a link to somewhere else is not written through: the download is deleted and reported",
+            "quarantineFile > [C3] .anvil-downloads/ is added to the checkout's git exclude through the helper the caller passes",
+            "the end-of-turn sweep > [C3] files left in .anvil-browser/ that are not Playwright's own and were not asked for by filename are treated as downloads; Playwright's page and console files and the model's own files stay put",
+            "the end-of-turn sweep > [C3] the sweep only takes files that appeared since the last sweep",
+            "reports > [C3] each outcome becomes one notice line for the transcript and one line of context for the model",
+            "quarantinePath (for import_reference) > [C3] returns the absolute path of a quarantined file by its bare name, and throws for anything that is not a plain file directly in the quarantine",
+            "never executed > [C3] Bash that executes a file in .anvil-downloads/ is denied: as the command word, through a shell or interpreter, with open, with chmod +x, after cd into the folder, or piped into a shell",
+            "never executed > [C3] reading, listing and deliberately copying a quarantined file is not denied, and the rule has no opinion on other tools or other folders",
+            "never executed > [C3] a file in the quarantine gets no file-offer card, whatever its type; the same file copied out does"
+          ]
+        },
+        {
+          "file": "test/unit/browser-human.test.ts",
+          "names": [
+            "request_human > [C3] the server is anvil_human with one tool, request_human {reason}; anvil_human is a reserved MCP key",
+            "request_human > [C3] request_human parks a card with the reason and the latest page screenshot, and returns only when the owner answers I've cleared it — from any device",
+            "request_human > [C3] with no screenshot the card has none; an empty reason is refused at once; two requests are two cards answered separately",
+            "request_human > [C3] in an unattended (builder) session request_human returns an error immediately, parks nothing, and calls onUnattendedHumanRequest(sessionId, reason) so the work unit can be blocked",
+            "request_human > [C3] resetting the session, or its turn dying, cancels a parked request: the card is retired and the tool returns an error",
+            "which sessions get it > [C3] an ordinary session with the browser switched on gets the anvil_human server, its tool id and the browser paragraph in its system prompt; one without the browser gets none of them",
+            "which sessions get it > [C3] the tool is the session's own in-process tool at the permission gate (not an integration call), and it exists only with the browser feature"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c3-loggedin.test.ts",
+          "names": [
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] on a LOCKED logged-in site under bypass: a snapshot, a PageDown key press and a same-site https navigation do not prompt; a click, an Enter key press and a form fill each prompt with a screenshot attached and no always-allow option",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] on an allowed site that is not logged-in, a click, an Enter key press and a form fill do not prompt — in a bypass session and in an ordinary one",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] the card shows the page as it is now: after any action the screenshot is stale, so the next action is denied until the model takes a new one; a screenshot of another page does not count",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] gamed spec: a misleading element text changes nothing — the decision uses only the tool's class and the page site the daemon tracked",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] a hard stop is denied without a card in an unattended (builder) session",
+            "Phase C3: a hard-stop prompt that times out > [C3] a hard-stop prompt nobody answers times out and is denied: the card is retired on every device and a late answer is refused",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] a site becomes logged-in when the profile gains a cookie for it during an Open agent browser session — with no list edit — and does NOT when cookies appear outside such a session",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] while Open agent browser is running the browser is in use by owner: its row says so, every session's browser call is denied, and a second open is refused; closing the window frees it",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] Open agent browser is refused where nobody is logged in at the screen, while a session holds the browser, and without Chrome — and nothing is launched",
+            "Phase C3 acceptance: what makes a site logged-in (item 28) > [C3] the logged-in list and the agent profile's cookies are off limits to the session's own tools",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] choosing Unlock <site> allows the call; a later click on that site in a NEW session and on a SECOND daemon after hub sync does not prompt, including on a /checkout page; switching the unlock off in Settings makes the next click prompt again",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] Unlock chosen on a member reaches the hub and every other member; removing the site on the hub removes it everywhere",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] an unlock queued on a member that was cut off cannot undo a lock the owner set on the hub afterwards",
+            "Phase C3 acceptance: unlock is persistent and fleet-wide (item 44; fleet simulator) > [C3] in headless fallback mode an unlocked logged-in site is still refused, at navigation and when a page lands on it",
+            "Phase C3 acceptance: uploads and script evaluation, on every site > [C3] an upload of a path outside the worktree is denied; inside it, it prompts — on a site that is not logged-in, on a locked one and on an unlocked one, under bypass",
+            "Phase C3 acceptance: uploads and script evaluation, on every site > [C3] a script-evaluation call on a public site is denied — logged-in or not, unlocked or not, under bypass — and browser_run_code_unsafe always is",
+            "Phase C3 acceptance: downloads > [C3] a 1 KB part.step download lands in .anvil-downloads/ with no file card; a .dmg is deleted and reported; a file over the limit is deleted and reported",
+            "Phase C3 acceptance: downloads > [C3] an injected size limit works the same way: a file one byte over it is deleted and reported, one at it is kept",
+            "Phase C3 acceptance: downloads > [C3] the Downloaded line arriving one result late still gets handled; Playwright's own page and console files, and a file the model asked for by filename, are not moved",
+            "Phase C3 acceptance: downloads > [C3] a download no result ever names is caught by the sweep when the turn ends; a Downloaded line that names a file outside .anvil-browser/ moves nothing",
+            "Phase C3 acceptance: downloads > [C3] files in the quarantine are never executed: session Bash that runs one is denied under every policy, while copying one out is not",
+            "Phase C3 acceptance: hand-off > [C3] request_human parks until I've cleared it; in an unattended session it returns an error at once and reports the session through onUnattendedHumanRequest",
+            "Phase C3: real daemons over HTTP and WebSocket > [C3] browser.loggedin arrives on connect; list / add / remove / set_unlocked are acked, validated and broadcast to every client; human.request.respond is dispatched; every command, open_agent_browser included, is refused on a daemon with the feature off",
+            "Phase C3: real daemons over HTTP and WebSocket > [C3] two real daemons: a site listed and unlocked on the hub reaches the member's clients, and an unlock on the member reaches the hub's — over the real sync routes, which refuse an unknown hub or member, a foreign origin and a non-JSON body"
+          ]
+        },
+        {
+          "file": "test/web/browser-c3.test.ts",
+          "names": [
+            "logged-in sites in Settings → Integrations > [C3] web: the list is hidden without the browser capability; with it each logged-in site shows its source, a Locked / Unlocked switch and a remove button",
+            "logged-in sites in Settings → Integrations > [C3] web: switching a site to Unlocked asks first, saying nothing on it will ask — checkout and payment pages included — and sends browser.loggedin.set_unlocked only on confirm; switching back to Locked sends at once",
+            "logged-in sites in Settings → Integrations > [C3] web: remove sends browser.loggedin.remove; typing a site and pressing Add logged-in site sends browser.loggedin.add; a refusal is shown",
+            "logged-in sites in Settings → Integrations > [C3] web: a site name is shown as text, never as markup",
+            "Open agent browser > [C3] web: the button is shown only on a machine that reports a desktop session, and pressing it sends browser.open_agent_browser to that machine",
+            "Open agent browser > [C3] web: while the owner has it open the row says In use by owner and the button is gone",
+            "the hard-stop card > [C3] web: the card shows the reason, the page screenshot and exactly three options — Allow once, Unlock <site>, Deny — with no always-allow",
+            "the hard-stop card > [C3] web: each option sends its decision for that request: Unlock <site> sends allow_always, and the card then shows what was chosen",
+            "the hard-stop card > [C3] web: an ordinary permission card is unchanged — no reason line, no image — and a reason is shown as text, never as markup",
+            "the hand-off card > [C3] web: a human.request shows the agent's reason and the latest page screenshot with one button, I've cleared it, which sends human.request.respond for that request and retires the card",
+            "the hand-off card > [C3] web: with no screenshot the card has no image; a card answered on another device is retired by human.resolved"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/browser-c3.test.ts",
+          "names": [
+            "real Chrome: downloads and hard stops > [C3] real: Chrome, node and the pinned runtime are present, and the headless launch line through the real proxy starts the server with its 25 tools",
+            "real Chrome: downloads and hard stops > [C3] real: a real download of a small part.step lands in the quarantine via the real result text, with no file card",
+            "real Chrome: downloads and hard stops > [C3] real: a .dmg download is deleted and reported",
+            "real Chrome: downloads and hard stops > [C3] real: with the fixture's site logged-in and locked, a real browser_click is gated while browser_snapshot is not, and the card carries a non-empty PNG from a real screenshot result; after Unlock the same click goes through to the real server"
+          ]
+        }
+      ]
     },
     "C4": {
       "title": "throwaway test daemon",

@@ -130,7 +130,7 @@ describe("the preset", () => {
     expect(args.slice(-2)).toEqual(["--isolated", "--headless"]);
     expect(args).not.toContain("--user-data-dir");
     expect(existsSync(join(rig.dir, "browser-profile"))).toBe(false);
-    expect(row().browser).toEqual({ mode: "headless", modeReason: "Headless with a throwaway profile: nobody is logged in at this machine's screen.", proxy: { state: "ready", sessions: 1 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" } });
+    expect(row().browser).toEqual({ mode: "headless", modeReason: "Headless with a throwaway profile: nobody is logged in at this machine's screen.", proxy: { state: "ready", sessions: 1 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" }, desktop: false });
   });
 
   test("[C2] the worktree's .git/info/exclude gains .anvil-browser/ when the session folder is a checkout", async () => {
@@ -140,14 +140,15 @@ describe("the preset", () => {
     mkdirSync(join(wt, ".git", "info"), { recursive: true });
     writeFileSync(join(wt, ".git", "info", "exclude"), "");
     await browserSession(rig, integration, { cwd: wt });
-    expect(readFileSync(join(wt, ".git", "info", "exclude"), "utf8")).toBe(".anvil-browser/\n");
+    // (Phase C3 adds the download quarantine next to it.)
+    expect(readFileSync(join(wt, ".git", "info", "exclude"), "utf8")).toBe(".anvil-browser/\n.anvil-downloads/\n");
   });
 
   test("[C2] the row in mcp.integrations carries the mode with its reason and the proxy state", async () => {
     rig = browserRig();
     await addBrowser(rig);
     expect(row().health).toEqual({ state: "ready" });
-    expect(row().browser).toEqual({ mode: "headed", modeReason: "Headed, with the agent profile: evan is logged in at the screen.", proxy: { state: "ready", sessions: 0 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" } });
+    expect(row().browser).toEqual({ mode: "headed", modeReason: "Headed, with the agent profile: evan is logged in at the screen.", proxy: { state: "ready", sessions: 0 }, runtime: { state: "installed", package: "@playwright/mcp@0.0.86" }, desktop: true });
     expect(rig.sup.mcpIntegrationsEvent().integrations[0]!.browser?.mode).toBe("headed");
   });
 });

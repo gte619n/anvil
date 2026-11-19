@@ -62,6 +62,12 @@ export function browserRig(opts: BrowserRigOptions = {}): McpRig {
       runtimeInstaller: async () => {
         throw new Error("unexpected browser runtime install in a test");
       },
+      // "Open agent browser" must never start a real Chrome from a test: tests that exercise it pass
+      // their own fake launcher.
+      chromePath: () => "/opt/anvil-test/Google Chrome",
+      agentBrowserLauncher: () => {
+        throw new Error("unexpected Chrome launch in a test");
+      },
       ...opts.browser,
     },
   });

@@ -9,6 +9,7 @@ import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
 import { makeCanUseTool, type QuestionBroker } from "./questions";
+import { BROWSER_SESSION_PROMPT, HUMAN_MCP_SERVER_NAME } from "./human-tools";
 import { inProcessKeys } from "./mcp-external";
 import { MCP_RESOURCE_TOOLS, isInProcessTool, parseMcpTool, type McpSessionGate } from "./mcp-gate";
 import type { Session } from "../session/session";
@@ -235,6 +236,8 @@ export class AgentDriver {
         `repository checkout or any absolute path outside this worktree — even if you discover its location via ` +
         "`git worktree list`, git metadata, or documentation. All work for this task must stay in this worktree so it can be reviewed as a branch.";
     }
+    // A session with the agent browser has the `anvil_human` server (agent-cad-and-browser Phase C3).
+    if (this.mcpServers && Object.hasOwn(this.mcpServers, HUMAN_MCP_SERVER_NAME)) append += BROWSER_SESSION_PROMPT;
     return { type: "preset", preset: "claude_code", append };
   }
 

@@ -596,6 +596,29 @@ export interface BrowserIntegrationInfo {
   /** The pinned server runtime the daemon installs into its own state folder (never run from a
    *  session's worktree). `missing`: the browser cannot start until `browser.runtime.install` succeeds. */
   runtime?: { state: "installed" | "installing" | "missing"; package: string; reason?: string };
+  /** Phase C3. Whether someone is logged in at this machine's screen — "Open agent browser" is only
+   *  offered where this is true. */
+  desktop?: boolean;
+  /** Phase C3. Present while the owner has the agent browser open ("Open agent browser"): it is "in
+   *  use by owner" and no session can use it until that Chrome is closed. */
+  ownerBrowser?: { since: number };
+}
+/** One logged-in site (Phase C3, spec §4.14 items 28 and 44). While `unlocked` is false every click,
+ *  key press and form action on the site asks first; once true nothing on it asks. */
+export interface BrowserLoggedInSite {
+  site: string; // registrable domain, as BrowserSite.site
+  /** `owner`: listed by hand. `login-session`: the agent profile gained cookies for it while the
+   *  owner had "Open agent browser" open. */
+  source: "owner" | "login-session";
+  unlocked: boolean;
+  addedAt: number; // ms since epoch
+}
+/** The logged-in sites list with each site's unlock switch. Hub-authoritative and hub-synced exactly
+ *  like `browser.sites`. */
+export interface BrowserLoggedInEvent extends Envelope {
+  type: "browser.loggedin";
+  sites: BrowserLoggedInSite[];
+  pending?: number;
 }
 /** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
  *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
@@ -1340,6 +1363,12 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   tool: string;
   input: unknown;
   suggestions: PermissionSuggestion[];
+  /** Why the daemon is asking, in words fit to show above the buttons (agent browser hard stops,
+   *  Phase C3). Absent on every other prompt; an older client ignores it. */
+  reason?: string;
+  /** A picture of what the answer applies to — the page screenshot on an agent-browser hard-stop
+   *  card (Phase C3). An attachment of this session, fetched like a tool-result image. */
+  image?: ToolResultImage;
   /** [BE2-8] Set when this event is RE-SURFACED on resume (not a fresh prompt). Its `seq` is the
    *  session's current lastSeq — equal to a delta-resuming client's watermark — so a client that drops
    *  events with `seq <= watermark` would otherwise silently discard a pending permission prompt (the
@@ -1366,6 +1395,24 @@ export interface QuestionRequestEvent extends Envelope, SessionScoped {
  *  requestId (sub-agents can fan out several at once, like permissions). (§6.6) */
 export interface QuestionResolvedEvent extends Envelope, SessionScoped {
   type: "question.resolved";
+  requestId: RequestId;
+}
+/** The agent asked for a person (`request_human`, agent browser Phase C3; "browser" capability): a
+ *  bot check, a CAPTCHA or a login only the owner can clear. The turn is parked until any device
+ *  answers with `human.request.respond`. */
+export interface HumanRequestEvent extends Envelope, SessionScoped {
+  type: "human.request";
+  requestId: RequestId;
+  /** The agent's own words for what it needs. Untrusted text: shown, never acted on. */
+  reason: string;
+  /** The latest page screenshot the agent took, when there is one. */
+  image?: ToolResultImage;
+  /** Set when re-surfaced on resume — see PermissionRequestEvent.replay. Apply regardless of seq. */
+  replay?: boolean;
+}
+/** A parked `human.request` was answered or superseded — clients retire exactly that card. */
+export interface HumanResolvedEvent extends Envelope, SessionScoped {
+  type: "human.resolved";
   requestId: RequestId;
 }
 export interface StatusEvent extends Envelope, SessionScoped {
@@ -1517,6 +1564,7 @@ export type ServerEvent =
   | EnvironmentsEvent
   | McpIntegrationsEvent
   | BrowserSitesEvent
+  | BrowserLoggedInEvent
   | PromptsEvent
   | ModelLabelsEvent
   | ClaudeCliStatusEvent
@@ -1564,6 +1612,8 @@ export type ServerEvent =
   | PermissionResolvedEvent
   | QuestionRequestEvent
   | QuestionResolvedEvent
+  | HumanRequestEvent
+  | HumanResolvedEvent
   | StatusEvent
   | SubAgentActivityEvent
   | SubAgentSettledEvent
@@ -1843,6 +1893,36 @@ export interface BrowserSiteRemoveCmd extends Envelope, Correlated {
  *  npm registry once). Acked when it is installed; a `command.error` says why it could not be. */
 export interface BrowserRuntimeInstallCmd extends Envelope, Correlated {
   type: "browser.runtime.install";
+}
+/** Agent browser logged-in sites and their unlock switches (Phase C3; "browser" capability).
+ *  Hub-authoritative like the allowed sites. Client commands only. */
+export interface BrowserLoggedInListCmd extends Envelope, Correlated {
+  type: "browser.loggedin.list"; // reply: a fresh `browser.loggedin`
+}
+export interface BrowserLoggedInAddCmd extends Envelope, Correlated {
+  type: "browser.loggedin.add";
+  site: string; // a hostname or URL; stored as its registrable domain, locked
+}
+export interface BrowserLoggedInRemoveCmd extends Envelope, Correlated {
+  type: "browser.loggedin.remove";
+  site: string;
+}
+export interface BrowserLoggedInSetUnlockedCmd extends Envelope, Correlated {
+  type: "browser.loggedin.set_unlocked";
+  site: string;
+  /** true: nothing on the site asks any more, in any session on any machine. false: lock it again. */
+  unlocked: boolean;
+}
+/** Open the agent browser's own Chrome window on the machine that receives this, so the owner can
+ *  log in to sites at the desk. Refused where nobody is logged in at the screen, and while a session
+ *  is using the browser. Sites that gain cookies while it is open become logged-in sites. */
+export interface BrowserOpenAgentBrowserCmd extends Envelope, Correlated {
+  type: "browser.open_agent_browser";
+}
+/** "I've cleared it": answer a parked `human.request` — may come from any device. */
+export interface HumanRequestRespondCmd extends Envelope, Correlated {
+  type: "human.request.respond";
+  requestId: RequestId;
 }
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
@@ -2247,6 +2327,12 @@ export type ClientCommand =
   | BrowserSiteAddCmd
   | BrowserSiteRemoveCmd
   | BrowserRuntimeInstallCmd
+  | BrowserLoggedInListCmd
+  | BrowserLoggedInAddCmd
+  | BrowserLoggedInRemoveCmd
+  | BrowserLoggedInSetUnlockedCmd
+  | BrowserOpenAgentBrowserCmd
+  | HumanRequestRespondCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd

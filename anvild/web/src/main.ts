@@ -104,7 +104,7 @@ import {
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
 // The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
 // Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
-import { initMcp, onBrowserSites, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
+import { browserCardImageUrl, initMcp, onBrowserLoggedIn, onBrowserSites, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
 import { initLoops, onLoopRun, onLoopRuns, onLoopsHome, onLoopsList, onLoopUpdated, openLoops, openLoopsDeepLink } from "./loops";
 import {
   closeSettings,
@@ -183,6 +183,8 @@ import {
   initDialogs,
   resolvePermissionUI,
   resolveQuestionUI,
+  resolveHumanUI,
+  showHumanRequest,
   selectedIcon,
   showModal,
   showNewSession,
@@ -1622,6 +1624,10 @@ function onEvent(url: string, e: ServerEvent): void {
       // Each daemon sends its own copy of the fleet's list; Settings shows the hub's (mcp.ts).
       onBrowserSites(url, e.sites, e.pending ?? 0);
       return;
+    case "browser.loggedin":
+      // Logged-in sites and their unlock switches (Phase C3); same hub-synced shape as the sites list.
+      onBrowserLoggedIn(url, e.sites, e.pending ?? 0);
+      return;
     case "prompts":
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
       // own prompts event so it can't clobber the hub's synced library.
@@ -1841,7 +1847,21 @@ function handleSessionEvent(e: ServerEvent): void {
       if (panelView === "git" && e.sessionId === activeId) requestGitStatus(); // refresh the SCM buttons
       return;
     case "permission.request":
-      showPermission(e.requestId, e.tool, e.input, e.suggestions, permissionToolName(e.tool, e.sessionId));
+      showPermission(
+        e.requestId,
+        e.tool,
+        e.input,
+        e.suggestions,
+        permissionToolName(e.tool, e.sessionId),
+        // An agent-browser hard stop says why it asks and shows the page (Phase C3).
+        e.reason || e.image ? { reason: e.reason, imageUrl: browserCardImageUrl(e.sessionId, e.image) } : undefined,
+      );
+      return;
+    case "human.request":
+      showHumanRequest(e.requestId, e.reason, browserCardImageUrl(e.sessionId, e.image));
+      return;
+    case "human.resolved":
+      resolveHumanUI(e.requestId);
       return;
     case "permission.resolved":
       // Retire EXACTLY this card (answered here, on another device, or superseded). Per-request so a

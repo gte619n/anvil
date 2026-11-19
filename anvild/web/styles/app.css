@@ -341,6 +341,13 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .browser-site-add-row { margin-top: 8px; gap: 6px; }
 .browser-site-add-row input { flex: 1; min-width: 0; }
 .browser-sites-pending { display: flex; align-items: center; gap: 4px; }
+.browser-loggedin-row .card-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.browser-loggedin-row .browser-loggedin-unlock[aria-checked="true"] { color: var(--danger); border-color: var(--danger); }
+.mcp-row .mcp-browser-open-row { margin-top: 8px; }
+.bubble.permission .perm-reason { margin-top: 8px; font-weight: 600; overflow-wrap: anywhere; }
+.bubble .perm-shot { display: block; max-width: 100%; max-height: 320px; margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; cursor: zoom-in; }
+.bubble.human-request .human-reason { margin: 6px 0; overflow-wrap: anywhere; }
+.bubble.human-request .perm-btns { display: flex; margin-top: 8px; }
 .mcp-warning { display: flex; align-items: center; gap: 6px; }
 .modal-box label[hidden] { display: none; } /* [hidden] loses to `.modal-box label { display: block }` — the Add-integration dialog swaps its Command/URL rows */
 .mcp-warning .msym { font-size: 16px; color: var(--danger); }

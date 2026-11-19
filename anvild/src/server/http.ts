@@ -24,6 +24,7 @@ import { setClaudeToken } from "../auth/store";
 import { setOpenRouterKey } from "../auth/openrouter";
 import { FleetStore } from "../fleet/store";
 import type { SitesOpBody, SitesOpReply, SitesSyncBody, SitesSyncReply } from "../browser/sites-sync";
+import type { LoggedInOpBody, LoggedInOpReply, LoggedInSyncBody, LoggedInSyncReply } from "../browser/loggedin";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import { serveCad } from "../cad/service";
@@ -523,6 +524,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (supervisor.mcp.browser) {
         ws.send(JSON.stringify(supervisor.browserSitesEvent()));
         void supervisor.mcp.browser.sites.syncNow();
+        ws.send(JSON.stringify(supervisor.browserLoggedInEvent())); // Phase C3: logged-in sites + unlock switches
+        void supervisor.mcp.browser.loggedIn.syncNow();
       }
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
@@ -1042,6 +1045,27 @@ export function createServer(opts: ServerOptions): ServerHandle {
     if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies SitesOpReply, { status: 403 });
     if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies SitesOpReply, { status: 403 });
     return Response.json(browser.sites.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies SitesOpReply);
+  });
+  // The logged-in sites list and its unlock switches (Phase C3, §4.14 items 28 and 44;
+  // src/browser/loggedin.ts). The same two routes with the same two gates as the allowed sites.
+  route("POST", "/api/browser/loggedin/sync", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies LoggedInSyncReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<LoggedInSyncBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    return Response.json(browser.loggedIn.receiveSync({ hubServerId: body.hubServerId!, hubUrl: body.hubUrl, sites: body.sites ?? [], confirmed: body.confirmed }) satisfies LoggedInSyncReply);
+  });
+  route("POST", "/api/browser/loggedin/op", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies LoggedInOpReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<LoggedInOpBody>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies LoggedInOpReply, { status: 403 });
+    if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies LoggedInOpReply, { status: 403 });
+    return Response.json(browser.loggedIn.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies LoggedInOpReply);
   });
 
   // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
