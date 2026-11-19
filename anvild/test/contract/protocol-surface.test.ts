@@ -18,19 +18,11 @@ import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
+import { extractWireTypes } from "./wire-types";
 
 const HERE = import.meta.dir;
 const PROTOCOL_SRC = join(HERE, "..", "..", "protocol.ts");
 const GOLDEN_PATH = join(HERE, "protocol-surface.golden.json");
-
-/** Extract every `type: "wire.name"` literal from the protocol source, sorted + de-duped. */
-export function extractWireTypes(src: string): string[] {
-  const out = new Set<string>();
-  const re = /^\s*type:\s*"([^"]+)"/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(src)) !== null) out.add(m[1]!);
-  return [...out].sort();
-}
 
 const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8")) as {
   protocolVersion: number;

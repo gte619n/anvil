@@ -8,7 +8,7 @@
 import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
-import { extractWireTypes } from "./protocol-surface.test";
+import { extractWireTypes } from "./wire-types";
 
 const HERE = import.meta.dir;
 const wireTypes = extractWireTypes(readFileSync(join(HERE, "..", "..", "protocol.ts"), "utf8"));
