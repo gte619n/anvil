@@ -1480,7 +1480,7 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-dim-error { color: var(--danger); font-size: 13px; }
 .cad-dim-error[hidden] { display: none; }
 .cad-part-actions { display: flex; gap: 8px; margin-top: 10px; }
-.cad-part-open { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; padding: 5px 12px; cursor: pointer; }
+.cad-part-open, .cad-part-action { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; padding: 5px 12px; cursor: pointer; }
 .cad-expect-blurb, .cad-expect-reason { margin: 6px 0; font-size: 13px; }
 .cad-expect-reason-label { font-weight: 600; }
 .cad-expect-rows { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }

@@ -174,7 +174,7 @@ export function createCadCards(deps: CadCardsDeps) {
     release.dataset.slot = "release";
     release.hidden = true;
     if (gate.state === "pass" && deps.release) {
-      const b = el("button", "cad-part-open cad-part-release-btn", "Release");
+      const b = el("button", "cad-part-action cad-part-release-btn", "Release");
       b.type = "button";
       b.onclick = () => {
         b.disabled = true;
@@ -185,7 +185,7 @@ export function createCadCards(deps: CadCardsDeps) {
     }
     actions.append(open);
     if (gate.gap && deps.clearGap) {
-      const clear = el("button", "cad-part-open cad-part-clear-gap", "Clear gap");
+      const clear = el("button", "cad-part-action cad-part-clear-gap", "Clear gap");
       clear.type = "button";
       clear.onclick = () => {
         clear.disabled = true;

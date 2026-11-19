@@ -245,8 +245,9 @@ describe("real SolidCraft through the manager", () => {
     }
     expect(readdirSync(dir).sort()).toEqual([".cache", "design.json", "part.json"]); // part.json: the daemon's own (Phase A2)
     expect(readFileSync(join(dir, "design.json"), "utf8")).toBe(designBefore);
-    // (Phase A3: the daemon's own preview of the part is the one thing that lives in .cache.)
-    expect(readdirSync(join(dir, ".cache")).filter((n) => !/^preview-\d+\.glb$/.test(n))).toEqual([]);
+    // (Phase A3: the daemon's own preview of the part is the one thing that lives in .cache — with,
+    // since Phase A4, the daemon's own card thumbnail of the same revision.)
+    expect(readdirSync(join(dir, ".cache")).filter((n) => !/^preview-\d+\.glb$/.test(n) && !/^thumb-\d+\.png$/.test(n))).toEqual([]);
     near((await tools.measure!({ summary: true })).json.total.volume_mm3, V80); // still the plate, still alive
     // The undo stack is intact: one undo still reverts the whole batch.
     expect((await tools.undo!({})).isError).toBe(false);
