@@ -14,6 +14,9 @@ export interface DispatchDeps {
   /** Hub-only: replicate the stored Todoist token to fleet members (defined in http.ts, where the
    *  FleetStore lives). Omitted/no-op on leaf members. */
   propagateTodoist?: (targets?: string[]) => void;
+  /** Hub-only: re-check every member's fleet skill library and push where it drifted (defined in
+   *  http.ts, which owns the FleetStore). Resolves when the sweep finishes. */
+  syncSkills?: () => Promise<void>;
 }
 
 type Send = (event: ServerEvent) => void;
@@ -313,6 +316,46 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       case "prompt.remove":
         deps.supervisor.removePrompt(cmd.id);
         if (cid) send(ack(cid));
+        return;
+
+      // Fleet skill library (docs/plans/2026-11-19-fleet-skills.md). Every write broadcasts a fresh
+      // `skills` event and replicates to members from inside the supervisor; here we just ack/error.
+      case "skill.list":
+        send(deps.supervisor.skillsEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "skill.save":
+        deps.supervisor.saveSkill(cmd.name, cmd.body, cmd.headless);
+        if (cid) send(ack(cid));
+        return;
+
+      case "skill.import":
+        ackWhenDone(deps.supervisor.importSkills(cmd.source, { ref: cmd.ref, subdir: cmd.subdir, headless: cmd.headless }), send, cid);
+        return;
+
+      case "skill.update":
+        void deps.supervisor
+          .updateSkills(cmd.name)
+          .then((r) => {
+            if (r.errors.length) send(cmdError(`couldn't update ${r.errors.join("; ")}`, cid));
+            else if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "skill.remove":
+        deps.supervisor.removeSkill(cmd.name);
+        if (cid) send(ack(cid));
+        return;
+
+      case "skill.set_headless":
+        deps.supervisor.setSkillHeadless(cmd.name, cmd.headless);
+        if (cid) send(ack(cid));
+        return;
+
+      case "skill.sync":
+        ackWhenDone(deps.syncSkills ? deps.syncSkills() : Promise.resolve(), send, cid);
         return;
 
       case "todoist.status":

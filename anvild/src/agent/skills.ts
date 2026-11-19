@@ -10,6 +10,10 @@
  *     and `.mcp.json`; the synthesized wrapper exposes skills and nothing else. Crucially, the `plugins`
  *     option does NOT load `settings.json` permission allow-rules, so `settingSources: []` stays intact.
  *
+ *     A third source, `fleet`, is the hub-synced fleet skill library (src/skills/fleet-store.ts,
+ *     docs/plans/2026-11-19-fleet-skills.md): the same skills on every machine, invoked `/fleet:<name>`.
+ *     A user skill with the same name as a fleet skill is hidden so the menu doesn't show it twice.
+ *
  *  2. `buildCommandInfo()` — turns the SDK `init` message's `slash_commands` into the `CommandInfo[]`
  *     the composer's `/` autocomplete renders, enriching each with its SKILL.md one-line description.
  *
@@ -20,6 +24,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CommandInfo } from "@protocol";
+import { parseFrontmatter } from "../skills/fleet-store";
 
 /** A local plugin dir handed to the SDK's `plugins` option. Structurally matches `SdkPluginConfig`. */
 export interface LocalPlugin {
@@ -27,10 +32,35 @@ export interface LocalPlugin {
   path: string;
 }
 
-type SkillSourceName = "user" | "project";
+type SkillSourceName = "user" | "project" | "fleet";
 interface SkillSource {
   name: SkillSourceName;
   skillsDir: string;
+  /** Link only these entries (one symlink each) instead of the whole dir — used to filter. */
+  only?: string[];
+}
+
+/** The fleet skill library's `skills/` dir on this machine. Set once at boot by the supervisor
+ *  (`setFleetSkillsDir`); undefined ⇒ no fleet library (unit tests, pre-feature boot). */
+let fleetDir: string | undefined;
+/** The skills-only plugin unattended runs load (autopilot planning + dev pipeline) — just the fleet
+ *  skills flagged `headless`. Rebuilt by `refreshHeadlessSkills` whenever the library changes. */
+let headlessPlugin: LocalPlugin | undefined;
+
+export function setFleetSkillsDir(dir: string | undefined): void {
+  fleetDir = dir;
+}
+
+/** Entries (skill dir names) in `dir`, best-effort. */
+function skillNames(dir: string | undefined): string[] {
+  if (!dir) return [];
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((e) => (e.isDirectory() || e.isSymbolicLink()) && !e.name.startsWith("."))
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
 }
 
 /** `~/.claude/skills` — the user's personal skills. */
@@ -53,12 +83,19 @@ function projectSkillsDir(cwd: string): string | undefined {
 }
 
 /** The ambient skill sources for a session, de-duplicated (a home-dir cwd can alias user↔project). */
-function skillSources(cwd: string): SkillSource[] {
+function skillSources(cwd: string, fleet: string | undefined): SkillSource[] {
   const sources: SkillSource[] = [];
+  const fleetNames = skillNames(fleet);
   const user = userSkillsDir();
-  if (existsSync(user)) sources.push({ name: "user", skillsDir: user });
+  if (existsSync(user)) {
+    // A user skill shadowed by a same-named fleet skill (e.g. one just promoted to the fleet) is
+    // dropped so `/` doesn't offer both `user:foo` and `fleet:foo`.
+    const shadowed = skillNames(user).filter((n) => fleetNames.includes(n));
+    sources.push(shadowed.length ? { name: "user", skillsDir: user, only: skillNames(user).filter((n) => !fleetNames.includes(n)) } : { name: "user", skillsDir: user });
+  }
   const project = projectSkillsDir(cwd);
   if (project && project !== user) sources.push({ name: "project", skillsDir: project });
+  if (fleet && fleetNames.length) sources.push({ name: "fleet", skillsDir: fleet });
   return sources;
 }
 
@@ -71,8 +108,14 @@ function synthPluginDir(stateDir: string, sessionId: string, src: SkillSource): 
     mkdirSync(manifestDir, { recursive: true });
     writeFileSync(join(manifestDir, "plugin.json"), JSON.stringify({ name: src.name, version: "0.0.0" }));
     const link = join(root, "skills");
-    rmSync(link, { force: true }); // re-point on every start so it can't go stale
-    symlinkSync(src.skillsDir, link, "dir");
+    rmSync(link, { recursive: true, force: true }); // re-point on every start so it can't go stale
+    if (src.only) {
+      // Filtered view: a real dir holding one symlink per included skill.
+      mkdirSync(link, { recursive: true });
+      for (const name of src.only) symlinkSync(join(src.skillsDir, name), join(link, name), "dir");
+    } else {
+      symlinkSync(src.skillsDir, link, "dir");
+    }
     return root;
   } catch {
     return undefined;
@@ -84,32 +127,45 @@ function synthPluginDir(stateDir: string, sessionId: string, src: SkillSource): 
  * dirs. Empty when neither exists. Keep `settingSources: []` alongside this: skills load, on-disk
  * permission rules do not.
  */
-export function skillPlugins(opts: { cwd: string; sessionId: string; stateDir: string }): LocalPlugin[] {
+export function skillPlugins(opts: { cwd: string; sessionId: string; stateDir: string; fleetSkillsDir?: string }): LocalPlugin[] {
   const plugins: LocalPlugin[] = [];
-  for (const src of skillSources(opts.cwd)) {
+  for (const src of skillSources(opts.cwd, opts.fleetSkillsDir ?? fleetDir)) {
     const root = synthPluginDir(opts.stateDir, opts.sessionId, src);
     if (root) plugins.push({ type: "local", path: root });
   }
   return plugins;
 }
 
-/** Minimal SKILL.md frontmatter reader (no YAML dep): pulls single-line `name:`/`description:`. */
+/**
+ * Rebuild the plugin unattended runs load: a skills-only wrapper exposing just `names` (the fleet
+ * skills flagged headless). Called at boot and after every library change. An empty list clears it.
+ */
+export function refreshHeadlessSkills(opts: { stateDir: string; fleetSkillsDir: string; names: string[] }): void {
+  if (opts.names.length === 0) {
+    headlessPlugin = undefined;
+    return;
+  }
+  const root = synthPluginDir(opts.stateDir, "_headless", { name: "fleet", skillsDir: opts.fleetSkillsDir, only: opts.names });
+  headlessPlugin = root ? { type: "local", path: root } : undefined;
+}
+
+/**
+ * The SDK options that give an UNATTENDED query (autopilot planning, the dev pipeline) the headless
+ * fleet skills. Spread into the query options next to `settingSources: []` — like the interactive path,
+ * this loads skills only, never on-disk permission rules. `{}` when there are none.
+ */
+export function headlessSkillOptions(): { plugins?: LocalPlugin[]; skills?: "all" } {
+  if (!headlessPlugin || !existsSync(headlessPlugin.path)) return {};
+  return { plugins: [headlessPlugin], skills: "all" };
+}
+
+/** A SKILL.md's frontmatter, or undefined if unreadable. */
 function frontmatter(file: string): { name?: string; description?: string } | undefined {
-  let text: string;
   try {
-    text = readFileSync(file, "utf8");
+    return parseFrontmatter(readFileSync(file, "utf8"));
   } catch {
     return undefined;
   }
-  if (!text.startsWith("---")) return undefined;
-  const end = text.indexOf("\n---", 3);
-  if (end < 0) return undefined;
-  const out: { name?: string; description?: string } = {};
-  for (const raw of text.slice(3, end).split("\n")) {
-    const m = /^(name|description):\s*(.*)$/.exec(raw.trim());
-    if (m) out[m[1] as "name" | "description"] = (m[2] ?? "").replace(/^["']|["']$/g, "").trim();
-  }
-  return out;
 }
 
 /** The one-line description for a skill in `skillsDir`, matched by directory name first, then by the
@@ -147,15 +203,16 @@ const BUILTIN_DESCRIPTIONS: Record<string, string> = {
  * SKILL.md description; everything else (built-in commands + skills) is reported bare as "builtin",
  * enriched with a blurb when we have one. The context controls are guaranteed present (§context).
  */
-export function buildCommandInfo(slashCommands: readonly string[], cwd: string): CommandInfo[] {
+export function buildCommandInfo(slashCommands: readonly string[], cwd: string, fleetSkillsDir: string | undefined = fleetDir): CommandInfo[] {
   const dirs: Record<SkillSourceName, string | undefined> = {
     user: existsSync(userSkillsDir()) ? userSkillsDir() : undefined,
     project: projectSkillsDir(cwd),
+    fleet: fleetSkillsDir && existsSync(fleetSkillsDir) ? fleetSkillsDir : undefined,
   };
   const out: CommandInfo[] = slashCommands.map((name) => {
     const colon = name.indexOf(":");
     const ns = colon > 0 ? name.slice(0, colon) : "";
-    if ((ns === "user" || ns === "project") && dirs[ns]) {
+    if ((ns === "user" || ns === "project" || ns === "fleet") && dirs[ns]) {
       const description = skillDescription(dirs[ns]!, name.slice(colon + 1));
       return description ? { name, description, source: ns } : { name, source: ns };
     }

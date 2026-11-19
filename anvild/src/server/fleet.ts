@@ -654,6 +654,62 @@ export async function propagateTodoist(opts: {
   );
 }
 
+/** One member's result from a fleet-skill check or push. */
+export interface SkillSyncResult {
+  serverId?: string;
+  url: string;
+  ok: boolean;
+  hash?: string;
+  error?: string;
+}
+
+/**
+ * Ask a member daemon for its fleet skill library hash (`GET /api/skills/replica`) — the cheap half of
+ * the hub's periodic sweep, so an in-sync member is never sent the whole bundle. Same transport rules
+ * as {@link propagateTodoist} (https-then-http per member). A 404 = a member that predates the feature.
+ */
+export async function checkMemberSkills(m: { url: string; host?: string; serverId?: string }, fetchImpl: typeof fetch = fetch): Promise<SkillSyncResult> {
+  let lastError = "no reachable transport";
+  for (const base of memberBases(m)) {
+    try {
+      const res = await fetchImpl(`${base}/api/skills/replica`, { signal: AbortSignal.timeout(8_000) });
+      if (res.status === 404) return { serverId: m.serverId, url: m.url, ok: false, error: "this member's Anvil predates fleet skills — update it" };
+      const data = (await res.json().catch(() => ({}))) as rest.skills.ReplicaState;
+      if (res.ok && data.ok !== false) return { serverId: data.serverId ?? m.serverId, url: m.url, ok: true, hash: data.hash };
+      lastError = data.error ?? `HTTP ${res.status}`;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { serverId: m.serverId, url: m.url, ok: false, error: lastError };
+}
+
+/**
+ * Push the hub's whole fleet skill library to a member (`POST /api/skills/replica`). The member validates
+ * the bundle before touching disk, replaces its library wholesale, and echoes its resulting hash.
+ */
+export async function pushMemberSkills(m: { url: string; host?: string; serverId?: string }, bundle: rest.skills.Bundle, fetchImpl: typeof fetch = fetch): Promise<SkillSyncResult> {
+  let lastError = "no reachable transport";
+  const body = JSON.stringify(bundle);
+  for (const base of memberBases(m)) {
+    try {
+      const res = await fetchImpl(`${base}/api/skills/replica`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (res.status === 404) return { serverId: m.serverId, url: m.url, ok: false, error: "this member's Anvil predates fleet skills — update it" };
+      const data = (await res.json().catch(() => ({}))) as rest.skills.ReplicaState;
+      if (res.ok && data.ok !== false) return { serverId: data.serverId ?? m.serverId, url: m.url, ok: true, hash: data.hash };
+      lastError = data.error ?? `HTTP ${res.status}`;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { serverId: m.serverId, url: m.url, ok: false, error: lastError };
+}
+
 /**
  * Replicate the hub's adb client identity (~/.android/adbkey pair) to member daemons, so every server
  * presents the identity the phone already paired with and RSA-trusts — "pair with the hub once, debug

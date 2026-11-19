@@ -41,6 +41,7 @@ import {
   setSessionHash,
 } from "./overlays";
 import { initPush } from "./push";
+import { initSkills, onSkills } from "./skills";
 import { initSetupTakeover } from "./setup";
 import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 // The sidebar seam (session list + team board + drag-to-reorder + favicon) lives in sidebar.ts (P7
@@ -341,6 +342,7 @@ initLoops({
 // declarations; `activeId` is a reassigned scalar declared further down, so it's injected as a lazy
 // read. The dialog helpers + environment modals it used to receive here are imported from
 // dialogs.ts directly now.
+initSkills({ sendAwait });
 initSettings({
   sessions,
   environments,
@@ -1615,6 +1617,10 @@ function onEvent(url: string, e: ServerEvent): void {
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
       // own prompts event so it can't clobber the hub's synced library.
       if (url === HUB_URL) onPrompts(e.prompts);
+      return;
+    case "skills":
+      // The fleet skill library is hub-authoritative (it lives on the hub, members hold replicas).
+      if (url === HUB_URL) onSkills(e);
       return;
     case "model.labels":
       // Model labels are hub-authoritative (the hub resolves them from the Models API). Ignore a
