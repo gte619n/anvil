@@ -1,5 +1,8 @@
 import { sameServerUrl } from "./api";
 import { createCadCards } from "./cad-cards";
+import { openCadPart } from "./cad";
+import { makeCadPartIo } from "./cad-io";
+import { createCadDesignStore } from "./cad-live";
 import {
   HUB_URL,
   anyOpen,
@@ -1615,8 +1618,12 @@ function onEvent(url: string, e: ServerEvent): void {
       onEnvironments(url, e.environments);
       return;
     case "cad.design":
+      if (serverSupports(serverByUrl(url), "cad-work")) cadDesigns.put(serverByUrl(url)?.url ?? url, e); // the live viewer and the parameters panel
       cadCards.onDesign(serverByUrl(url)?.url ?? url, e); // part card in the chat (hidden without "cad-work")
       return;
+    case "cad.parts.list.result":
+    case "cad.param.set.result":
+      return; // replies: taken by the sendAwait that asked
     case "cad.expectations.request":
       cadCards.onRequest(serverByUrl(url)?.url ?? url, e); // expectation change / adopt card
       return;
@@ -1748,9 +1755,55 @@ const cadCards = createCadCards({
   active: () => (activeId ? { sessionId: wireSessionId(activeId), url: (serverOf(activeId) ?? hub()).url } : undefined),
   container: () => conversation,
   respond: (url, requestId, approve) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.respond", requestId, approve }),
-  // Phase A3 opens the live viewer from this event; until then the card only reports the gate.
+  // "Open" on a part card: the live viewer listens for this (below).
   open: (url, ev) => void window.dispatchEvent(new CustomEvent("anvil:cad-open", { detail: { url, cwd: ev.cwd, part: ev.part, rev: ev.rev } })),
   scrollDown: () => scrollDown(),
+});
+
+// The live CAD viewer (spec §4.9, Phase A3): opening a PART follows it — every new revision is
+// swapped into the same scene — with the parameters panel and the gate strip beside it. Driven by the
+// same global `cad.design` events as the cards; nothing here exists without "cad-work".
+const cadDesigns = createCadDesignStore();
+function openCadPartViewer(url: string, cwd: string, part: string): void {
+  const srv = serverByUrl(url);
+  if (!srv || !serverSupports(srv, "cad-work")) return;
+  const ask = async (cmd: Record<string, unknown> & { type: string }, timeoutMs = 120_000): Promise<ServerEvent> => sendAwait(srv, { ...cmd, cid: newCid() }, timeoutMs);
+  const rebuild = (): void =>
+    void ask({ type: "cad.design.refresh", cwd, part })
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch((e) => toast(`Rebuild failed: ${e instanceof Error ? e.message : String(e)}`));
+  openCadPart(
+    {
+      part,
+      current: () => cadDesigns.get(srv.url, cwd, part),
+      subscribe: (fn) => cadDesigns.subscribe(srv.url, cwd, part, fn),
+      setParam: async (name, expression) => {
+        try {
+          const res = await ask({ type: "cad.param.set", cwd, part, name, expression });
+          if (res.type === "cad.param.set.result") return { ok: res.ok, ...(res.error ? { error: res.error } : {}) };
+          return { ok: false, error: res.type === "command.error" ? res.message : "unexpected reply" };
+        } catch (e) {
+          return { ok: false, error: e instanceof Error && e.message === "offline" ? "Not connected to the server." : e instanceof Error ? e.message : String(e) };
+        }
+      },
+      rebuild,
+      parts: async () => {
+        const res = await ask({ type: "cad.parts.list", cwd }, 20_000);
+        return res.type === "cad.parts.list.result" ? res.parts.map((p) => p.part) : [];
+      },
+      openPart: (other) => openCadPartViewer(srv.url, cwd, other),
+    },
+    makeCadPartIo({ server: () => srv, cwd }),
+  );
+  // Nothing known yet, or nothing to draw (a part opened from the list, a restarted daemon): ask the
+  // daemon to build it from design.json. The `cad.design` that follows fills the viewer in.
+  if (!cadDesigns.get(srv.url, cwd, part)?.preview) rebuild();
+}
+window.addEventListener("anvil:cad-open", (e) => {
+  const d = (e as CustomEvent<{ url?: string; cwd?: string; part?: string }>).detail;
+  if (d && typeof d.url === "string" && typeof d.cwd === "string" && typeof d.part === "string") openCadPartViewer(d.url, d.cwd, d.part);
 });
 // The cards are current state, not replayed history: redraw them once a rebuilt pane has been filled.
 conversationCleared.add(() => void setTimeout(() => cadCards.restore(), 0));

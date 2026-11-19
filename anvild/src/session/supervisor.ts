@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync as ensureDir } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
 import {
   PROTOCOL_VERSION,
   type AttachmentRef,
@@ -59,10 +59,11 @@ import {
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import type { CadStatusEvent } from "@protocol";
+import type { CadParamSetResultEvent, CadPartsListResultEvent, CadStatusEvent } from "@protocol";
 import { featureEnabled } from "../config";
 import type { CadManagerOptions } from "../cadwork/manager";
-import { CadworkService } from "./cadwork-service";
+import { CadworkService, CWD_REFUSED } from "./cadwork-service";
+import { gitToplevel } from "../cadwork/partfolder";
 import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
 import { discoverSelfBaseUrl } from "../server/fleet";
@@ -71,7 +72,7 @@ import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
 import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
-import { AgentDriver, type TurnUsage } from "../agent/driver";
+import { AgentDriver, type QueryFn, type TurnUsage } from "../agent/driver";
 import { setManagedCliPath } from "../agent/cli";
 import * as claudeCli from "../daemon/claude-cli";
 import { skillPlugins } from "../agent/skills";
@@ -182,6 +183,9 @@ export interface SupervisorConfig {
   features?: readonly string[];
   /** Test seam: options for the CAD process manager (fake clock, spawn, FAKE_SC_* env). */
   cadManager?: CadManagerOptions;
+  /** Test seam: the SDK `query` every session driver is built with (a capturing one proves that a
+   *  code path asked no model). Omitted → the SDK's own. */
+  sessionQueryFn?: QueryFn;
   /** The concierge's reach into the fleet (anvil-fleet-concierge): member roster + REST-backed
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
@@ -334,6 +338,7 @@ export class Supervisor {
       clonesDir: this.clonesDir,
       renderer: this.renderer,
     });
+    this.sessionQueryFn = cfg.sessionQueryFn;
     this.cadwork = new CadworkService({
       enabled: featureEnabled({ features: cfg.features }, "cad-work"),
       getSession: (id) => this.sessions.get(id),
@@ -1716,7 +1721,7 @@ export class Supervisor {
                 : this.ordinaryMcpServers(s),
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
         this.planReviewer(s),
-        undefined, // queryFn — keep the SDK default
+        this.sessionQueryFn, // queryFn — the SDK default unless a test injected one
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
         (commands) => this.onSessionCommands(id, commands),
         (err) => this.onTurnError(err),
@@ -1754,6 +1759,62 @@ export class Supervisor {
   /** Answer an expectations card (`cad.expectations.respond`, spec §4.8) — may come from any device. */
   respondCadExpectations(requestId: string, approve: boolean): void {
     if (!this.cadwork.respond(requestId, approve)) throw new BadCommand(`no pending expectations card: ${requestId}`);
+  }
+
+  /**
+   * The worktree a client's CAD command may address (`cad.parts.list`, `cad.param.set`,
+   * `cad.design.refresh`, the preview route). A client sends a path; the daemon only ever acts on one
+   * it already knows: the git worktree of an existing session's cwd, or a registered environment's
+   * repo. Anything else — however plausible — is refused.
+   */
+  cadWorktree(cwd: unknown): string {
+    if (!this.cadwork.enabled) throw new BadCommand("cad-work is not enabled on this machine");
+    const refuse = (): never => {
+      throw new BadCommand(`cad: ${JSON.stringify(cwd)} ${CWD_REFUSED}`);
+    };
+    if (typeof cwd !== "string" || !isAbsolute(cwd)) return refuse();
+    let real: string;
+    try {
+      real = realpathSync(cwd);
+    } catch {
+      return refuse();
+    }
+    const top = (dir: string | undefined): string | undefined => {
+      if (!dir) return undefined;
+      const hit = this.cadTopCache.get(dir);
+      if (hit && Date.now() - hit.at < 30_000) return hit.top;
+      const t = gitToplevel(dir);
+      this.cadTopCache.set(dir, { top: t, at: Date.now() });
+      return t;
+    };
+    for (const s of this.sessions.values()) if (top(s.data.cwd) === real) return real;
+    for (const e of this.envStore.list()) if (top(e.repoRoot) === real) return real;
+    return refuse();
+  }
+  private readonly sessionQueryFn?: QueryFn;
+  private readonly cadTopCache = new Map<string, { top: string | undefined; at: number }>();
+
+  /** `cad.parts.list` (spec §4.8): the parts of a known worktree with their gate state. */
+  cadPartsListEvent(cwd: unknown, cid?: string): CadPartsListResultEvent {
+    const worktree = this.cadWorktree(cwd);
+    return { v: PROTOCOL_VERSION, type: "cad.parts.list.result", ts: now(), ...(cid ? { cid } : {}), cwd: worktree, parts: this.cadwork.listParts(worktree) };
+  }
+
+  /** `cad.param.set` (spec §4.8): the owner's parameter change. No model is involved. */
+  async setCadParam(cwd: unknown, part: unknown, name: unknown, expression: unknown, cid?: string): Promise<CadParamSetResultEvent> {
+    const worktree = this.cadWorktree(cwd);
+    let r: { ok: boolean; error?: string };
+    try {
+      r = await this.cadwork.setParam(worktree, part, name, expression);
+    } catch (e) {
+      r = { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    return { v: PROTOCOL_VERSION, type: "cad.param.set.result", ts: now(), ...(cid ? { cid } : {}), cwd: worktree, part: String(part), name: String(name), ok: r.ok, ...(r.error ? { error: r.error } : {}) };
+  }
+
+  /** `cad.design.refresh` (spec §4.8): rebuild a part from `design.json` on disk. */
+  async refreshCadDesign(cwd: unknown, part: unknown): Promise<void> {
+    await this.cadwork.refreshDesign(this.cadWorktree(cwd), part);
   }
 
   /** Whether this machine can do CAD right now (`cad.status`, spec §4.8). */

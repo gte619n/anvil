@@ -6,12 +6,15 @@
  *   2. MEASURE   design bodies only (bodies made by a `BaseFeature` — a STEP import — are left
  *                out), the hole table, feature errors and warnings.
  *   3. GATE      evaluate (./gate.ts), write `part.json.measured`, set the part's verdict.
- *   4. PREVIEW   — Phase A3 (see the marked hook at the end of `makeRefreshJob`).
+ *   4. PREVIEW   export the design bodies to `.cache/preview-<rev>.glb` (metres, Y up) and keep the
+ *                newest three. An empty design has no preview. A failed export never touches the gate.
  *   5. BROADCAST `onResult` hands the outcome to the service, which sends `cad.design`.
  *
  * FAIL CLOSED: anything that throws in here ends as an `unverified` gate result with the error
  * listed, never as `pass`, and never as an exception into the manager's queue.
  */
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { join, relative } from "node:path";
 import { evaluateGate, failingLines, gateError, type GateInput, type GateResult, type Measurement } from "./gate";
 import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
 import { repoKey, type LockStore, type PartLock } from "./locks";
@@ -19,6 +22,7 @@ import type { CadParamInfo, FeatureIssue, RefreshJob, SlotContext } from "./mana
 import type { McpToolResult } from "./mcp-client";
 import type { PartRef } from "./partfolder";
 import { evaluateExpectations, lockedBlockSha, readPartFile, writeMeasured, type Measured } from "./partfile";
+import { CACHE_DIR } from "./poststep";
 import { readRules } from "./rules";
 
 export interface RefreshOutcome {
@@ -29,16 +33,77 @@ export interface RefreshOutcome {
   holes: HoleRow[];
   params: CadParamInfo[];
   scriptSha?: string;
-  /** How long measuring and evaluating took. */
+  /** How long measuring and evaluating took (the preview export included). */
   ms: number;
   forced: boolean;
+  /** The revision this refresh is (`cad.design.rev`), when the service numbers them. */
+  rev?: number;
+  /** Worktree-relative path of the preview written by this refresh; absent for an empty design. */
+  preview?: string;
+  /** Why no preview was written although the design has bodies. */
+  previewError?: string;
+}
+
+/** How many `.cache/preview-<rev>.glb` files are kept per part (§4.3 step 4). */
+export const PREVIEWS_KEPT = 3;
+const PREVIEW_RE = /^preview-(\d+)\.glb$/;
+export const previewName = (rev: number): string => `preview-${rev}.glb`;
+/** A worktree-relative path that names a preview of `part` — the only shape the preview route serves. */
+export const PREVIEW_PATH_RE = /^cad\/([a-z0-9][a-z0-9-]{0,39})\/\.cache\/preview-(\d+)\.glb$/;
+
+/** The revisions that have a preview file in a part's cache folder, ascending. */
+export function previewRevs(partDir: string): number[] {
+  try {
+    return readdirSync(join(partDir, CACHE_DIR))
+      .map((n) => PREVIEW_RE.exec(n)?.[1])
+      .filter((n): n is string => n !== undefined)
+      .map(Number)
+      .sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+/** Delete every preview older than the newest `keep`. Returns the revisions removed. */
+export function prunePreviews(partDir: string, keep = PREVIEWS_KEPT): number[] {
+  const revs = previewRevs(partDir);
+  const drop = revs.slice(0, Math.max(0, revs.length - keep));
+  for (const r of drop) rmSync(join(partDir, CACHE_DIR, previewName(r)), { force: true });
+  return drop;
+}
+
+/** The newest preview on disk for a part as `{ rev, path }` (path worktree-relative), if any. */
+export function newestPreview(ref: PartRef): { rev: number; path: string } | undefined {
+  const rev = previewRevs(ref.dir).at(-1);
+  return rev === undefined ? undefined : { rev, path: relative(ref.worktree, join(ref.dir, CACHE_DIR, previewName(rev))) };
+}
+
+/**
+ * Step 4: write `.cache/preview-<rev>.glb` through the part's own process and prune. Design bodies
+ * only — an imported reference is not the part. Never throws: the preview is a picture, not a check.
+ */
+export async function exportPreview(call: Call, ref: PartRef, rev: number, designBodies: string[]): Promise<{ preview?: string; error?: string }> {
+  if (designBodies.length === 0) return {}; // nothing to show yet; not an error
+  try {
+    const dir = join(ref.dir, CACHE_DIR);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, previewName(rev));
+    const r = await call("export", { path, format: "glb", bodies: designBodies });
+    if (r.isError || !existsSync(path)) return { error: r.text.slice(0, 300) || "no preview file was written" };
+    prunePreviews(ref.dir);
+    return { preview: relative(ref.worktree, path) };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 export interface RefreshDeps {
   locks: LockStore;
   /** Record a daemon-made change to a lock (pinning the first evaluated numbers) and sync it. */
   pinValues(lock: PartLock): void;
-  /** Step 5, and where Phase A3 hangs the preview: called once per refresh with the outcome. */
+  /** The number the refresh about to be broadcast gets (`cad.design.rev`). Omitted → no preview is written. */
+  nextRev?(ref: PartRef): number;
+  /** Step 5: called once per refresh with the outcome (measurement, gate, preview). */
   onResult(outcome: RefreshOutcome, slot: SlotContext): void | Promise<void>;
   now?: () => string;
   /** Test seam: replace the gate's evaluation (to prove a throwing gate fails closed). */
@@ -126,9 +191,11 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
     const { ref } = slot;
     const call: Call = (tool, args) => slot.call(tool, args);
     let outcome: RefreshOutcome;
+    let designBodies: string[] | undefined;
     try {
       deps.beforeMeasure?.(ref);
       const design = await readDesign(call);
+      designBodies = design.designBodies;
       const scriptSha = slot.scriptSha();
       let measurement: Measurement | undefined;
       let holes: HoleRow[] = [];
@@ -188,10 +255,19 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
       ...(outcome.gate.state === "fail" && failing.length ? { reason: `the gate fails — ${failing.join("; ")}` } : {}),
     });
 
-    // ── PHASE A3 HOOK (§4.3 step 4) ──────────────────────────────────────────────────────────────
-    // Export `.cache/preview-<rev>.glb` here with `slot.call("export", …)` and prune older previews,
-    // then pass the path on through the outcome so step 5 can put it in `cad.design.preview`.
-    // ─────────────────────────────────────────────────────────────────────────────────────────────
+    // Step 4: the preview. Its number is the revision this refresh will be broadcast as.
+    if (deps.nextRev) {
+      try {
+        outcome.rev = deps.nextRev(ref);
+        if (designBodies === undefined) designBodies = (await readDesign(call)).designBodies; // the gate half threw
+        const p = await exportPreview(call, ref, outcome.rev, designBodies);
+        if (p.preview) outcome.preview = p.preview;
+        if (p.error) outcome.previewError = p.error;
+      } catch (e) {
+        outcome.previewError = e instanceof Error ? e.message : String(e);
+      }
+      outcome.ms = performance.now() - t0;
+    }
 
     try {
       await deps.onResult(outcome, slot); // step 5: the service broadcasts `cad.design`

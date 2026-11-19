@@ -31,7 +31,10 @@ import type {
   Sprite,
 } from "three";
 import type { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { InspectHandle, CadNode } from "./cad-inspect";
+import type { InspectHandle, InspectState, CadNode } from "./cad-inspect";
+import type { CadDesignEvent } from "../../protocol";
+import { createCadLive } from "./cad-live";
+import { createCadParams } from "./cad-params";
 import type { Pt3 } from "./cad-measure";
 import {
   distance3,
@@ -67,8 +70,12 @@ interface Viewer {
   inspector?: InspectHandle | null; // model-tree drawer + section/explode state.
   measure?: MeasureState | null; // Phase 10 measurement overlay.
   chrome?: Chrome;
+  /** Set while the viewer follows a part (live mode): torn down with the viewer. */
+  live?: { dispose(): void } | null;
 }
 let active: Viewer | null = null;
+/** Bumped by every `replaceModel`: a swap that finds a newer one started steps aside. */
+let swapSeq = 0;
 
 // ── Phase 10 measurement overlay state ────────────────────────────────────────────────────────────
 interface MeasureState {
@@ -77,12 +84,14 @@ interface MeasureState {
   marker: Object3D; // the snap cursor (a small sphere).
   pending: Pt3 | null; // first clicked point, awaiting the second.
   // Per-mesh cached geometry buffers (world-space positions + edge midpoints) for snapping.
-  cache: { mesh: Mesh; positions: Float32Array; mids: Pt3[] }[];
+  cache: SnapCache;
   onMove: (e: PointerEvent) => void;
   onClick: (e: PointerEvent) => void;
   hoverPt: Pt3 | null;
   objects: Object3D[]; // created lines/labels/markers to dispose.
 }
+
+type SnapCache = { mesh: Mesh; positions: Float32Array; mids: Pt3[] }[];
 
 const budgetForDevice = (): LodBudget => {
   // D22: phones get a conservative triangle/byte ceiling. Reuse the repo's native-shell detection;
@@ -132,6 +141,7 @@ function buildChrome(path: string): Chrome {
     `<button type="button" class="cad-btn" data-act="explode" title="Exploded view">${icon("open_in_full")}</button>` +
     `<button type="button" class="cad-btn" data-act="measure" title="Measure (approximate / mesh)">${icon("straighten")}</button>` +
     `<button type="button" class="cad-btn" data-act="ecad3d" title="3D board" hidden>${icon("view_in_ar")}</button>` +
+    `<button type="button" class="cad-btn" data-act="params" title="Parameters" hidden>${icon("tune")}</button>` +
     `<button type="button" class="cad-btn" data-act="snapshot" title="Snapshot (PNG)">${icon("photo_camera")}</button>` +
     `<button type="button" class="cad-btn" data-act="close" title="Close">${icon("close")}</button>` +
     `</div>` +
@@ -185,30 +195,8 @@ function showError(area: HTMLElement, reason: string, downloadUrl: string, name:
   );
 }
 
-// ── public entry ────────────────────────────────────────────────────────────────────────────────
-export function openCadViewer(path: string, io: CadIo): void {
-  const kind = classifyCad(path);
-  const chrome = buildChrome(path);
-  const name = fileNameOf(path);
-
-  // Release any viewer still open before replacing `active`. Opening file-after-file via the chat
-  // chips otherwise orphans the previous WebGLRenderer (its context is never forceContextLoss'd), and
-  // Android WebView's small live-context cap then fails EVERY later open with "Error creating WebGL
-  // context" — the viewer stops working for anything until the page reloads.
-  releaseActiveViewer();
-
-  active = {
-    units: "—",
-    zUp: false,
-    view: "iso",
-    wireframe: false,
-    fileName: name,
-    path,
-    io,
-    chrome,
-  };
-
-  // Toolbar + HUD wiring. All buttons are delegated off the wrap so we add one listener.
+/** Toolbar + HUD wiring. All buttons are delegated off the wrap so we add one listener. */
+function wireChrome(chrome: Chrome): void {
   chrome.wrap.addEventListener("click", (e) => {
     const t = e.target as HTMLElement;
     // Section-axis mini buttons (X/Y/Z) live inside the wrap but drive the inspector, not an action.
@@ -235,6 +223,33 @@ export function openCadViewer(path: string, io: CadIo): void {
   chrome.explodePos.addEventListener("input", () => {
     active?.inspector?.setExplode(Number(chrome.explodePos.value));
   });
+
+}
+
+// ── public entry ────────────────────────────────────────────────────────────────────────────────
+export function openCadViewer(path: string, io: CadIo): void {
+  const kind = classifyCad(path);
+  const chrome = buildChrome(path);
+  const name = fileNameOf(path);
+
+  // Release any viewer still open before replacing `active`. Opening file-after-file via the chat
+  // chips otherwise orphans the previous WebGLRenderer (its context is never forceContextLoss'd), and
+  // Android WebView's small live-context cap then fails EVERY later open with "Error creating WebGL
+  // context" — the viewer stops working for anything until the page reloads.
+  releaseActiveViewer();
+
+  active = {
+    units: "—",
+    zUp: false,
+    view: "iso",
+    wireframe: false,
+    fileName: name,
+    path,
+    io,
+    chrome,
+  };
+
+  wireChrome(chrome);
 
   showModal(chrome.wrap);
 
@@ -364,6 +379,12 @@ async function handleAction(act: string, chrome: Chrome): Promise<void> {
     case "snapshot":
       openSnapshotMenu(chrome);
       break;
+    case "params": {
+      // Live mode: the parameters sheet (a bottom sheet on a phone, a side panel on a wide screen).
+      const open = chrome.wrap.querySelector(".cad-shell")?.classList.toggle("cad-params-open");
+      chrome.wrap.querySelector<HTMLElement>('.cad-tools [data-act="params"]')?.classList.toggle("on", !!open);
+      break;
+    }
   }
 }
 
@@ -465,40 +486,13 @@ async function init3d(path: string, kind: CadKind, chrome: Chrome, io: CadIo): P
 
   const model = loaded.object;
   scene.add(model);
-  active!.model = model;
-  active!.units = loaded.units;
-  active!.zUp = loaded.zUp;
-  chrome.unitsBadge.textContent = loaded.units;
-
-  active!.tree = loaded.tree ?? null;
-
-  // D20: normalize up-axis if the model reads Z-up, then frame it.
-  applyUpAxis(THREE, model);
-  recomputeBox(THREE, model);
+  adoptModel(THREE, active!, loaded);
   fitToView();
 
   hideStatus(chrome.statusArea);
 
   // Phase 3: build the model-tree drawer + section/explode controller now that the model + box exist.
-  try {
-    const { buildInspector } = await import("./cad-inspect");
-    const insp = buildInspector({
-      THREE,
-      model,
-      box: active!.box!,
-      renderer: renderer as unknown as { localClippingEnabled: boolean; clippingPlanes: unknown[] },
-      camera,
-      controls,
-      extrasTree: active!.tree,
-      fit: fitToView,
-    });
-    active!.inspector = insp;
-    // The drawer lives inside the shell so it composites over the canvas but under the toolbar.
-    const shell = chrome.wrap.querySelector<HTMLElement>(".cad-shell");
-    shell?.appendChild(insp.panel);
-  } catch {
-    // Inspector is an enhancement; a failure must never block the core viewer.
-  }
+  await attachInspector(THREE, active!);
 
   // Render loop (damped controls need continuous frames).
   const tick = (): void => {
@@ -507,6 +501,280 @@ async function init3d(path: string, kind: CadKind, chrome: Chrome, io: CadIo): P
     renderer.render(scene, camera);
   };
   tick();
+  publishProbe();
+}
+
+/** Take a freshly loaded model as THE model of the viewer: units, up-axis, wireframe, bounding box.
+ *  Shared by the first load and by `replaceModel`, and it never touches the camera. */
+function adoptModel(THREE: typeof import("three"), v: Viewer, loaded: LoadResult, keepAxis = false): void {
+  const model = loaded.object;
+  v.model = model;
+  v.tree = loaded.tree ?? null;
+  if (v.live) {
+    // A part's preview is SolidCraft's GLB: metres, Y up. Parts are dimensioned in millimetres, so
+    // show it at 1000× and call the unit mm — a 120 mm plate measures 120, not 0.12.
+    model.scale.setScalar(1000);
+    v.units = "mm";
+    v.zUp = false;
+  } else {
+    v.units = loaded.units;
+    if (!keepAxis) v.zUp = loaded.zUp;
+  }
+  if (v.chrome) v.chrome.unitsBadge.textContent = v.units;
+  // D20: normalize up-axis if the model reads Z-up.
+  applyUpAxis(THREE, model);
+  if (v.wireframe) setWireframe(model, true);
+  recomputeBox(THREE, model);
+}
+
+/** Build the model-tree drawer + section/explode controller for the viewer's current model. With
+ *  `restore`, the previous model's state (section, hidden parts, explode) is re-applied to this one. */
+async function attachInspector(THREE: typeof import("three"), v: Viewer, restore?: InspectState): Promise<void> {
+  if (!v.model || !v.box || !v.renderer || !v.camera || !v.controls || !v.chrome) return;
+  try {
+    const { buildInspector } = await import("./cad-inspect");
+    if (active !== v) return;
+    const insp = buildInspector({
+      THREE,
+      model: v.model,
+      box: v.box,
+      renderer: v.renderer as unknown as { localClippingEnabled: boolean; clippingPlanes: unknown[] },
+      camera: v.camera,
+      controls: v.controls,
+      extrasTree: v.tree,
+      fit: fitToView,
+      restore,
+    });
+    v.inspector = insp;
+    // The drawer lives inside the shell so it composites over the canvas but under the toolbar.
+    v.chrome.wrap.querySelector<HTMLElement>(".cad-shell")?.appendChild(insp.panel);
+    if (restore) v.chrome.sectionPos.value = String(insp.sectionPos());
+  } catch {
+    // Inspector is an enhancement; a failure must never block the core viewer.
+  }
+}
+
+/** Free a model's GPU resources (geometry, materials and their textures). The WebGL context stays. */
+function disposeModel(model: Object3D): void {
+  model.traverse((o: Object3D) => {
+    const m = o as Mesh;
+    (m.geometry as BufferGeometry | undefined)?.dispose?.();
+    if (!m.material) return;
+    for (const mat of Array.isArray(m.material) ? m.material : [m.material]) {
+      for (const val of Object.values(mat as unknown as Record<string, unknown>)) {
+        const tex = val as { isTexture?: boolean; dispose?: () => void } | null;
+        if (tex && typeof tex === "object" && tex.isTexture) tex.dispose?.();
+      }
+      mat.dispose();
+    }
+  });
+}
+
+/**
+ * Swap the scene's model IN PLACE (agent-cad-and-browser spec §4.9, D12). The renderer and its WebGL
+ * context, the camera (position, target, zoom, projection), the section plane, hidden / isolated
+ * parts, the explode amount and the measurements are all left as they are; only the geometry changes.
+ * The old model's GPU resources are freed. Never opens a second WebGL context — a part revises many
+ * times a minute, and Android WebView allows only a handful of live contexts.
+ *
+ * Throws when no 3D viewer is open, when the file cannot be loaded, or when it is over the device's
+ * triangle budget (the model on screen is kept in every case). A swap overtaken by a newer one
+ * resolves without touching the scene.
+ */
+export async function replaceModel(path: string): Promise<{ triangles: number; replaced: boolean }> {
+  const v = active;
+  if (!v?.renderer || !v.scene || !v.camera || !v.controls) throw new Error("No 3D viewer is open to swap a model into.");
+  const kind = classifyCad(path);
+  if (kind !== "mesh" && kind !== "brep") throw new Error(`Cannot swap in a .${extOf(path) || "?"} file.`);
+  const seq = ++swapSeq;
+  const THREE = await import("three");
+  const budget = budgetForDevice();
+  // The status area is not used: a swap must not flash a loading card over the model.
+  const loaded = await loadModel(THREE, path, kind, v.io, budget, document.createElement("div"));
+  if (active !== v || seq !== swapSeq || !v.scene) {
+    disposeModel(loaded.object); // the viewer closed, or a newer revision is already on its way
+    return { triangles: loaded.triangles, replaced: false };
+  }
+  if (loaded.tooLarge) {
+    disposeModel(loaded.object);
+    throw new Error(`Too large to view on this device (${loaded.triangles.toLocaleString()} triangles exceeds the ${budget.maxTriangles.toLocaleString()} limit).`);
+  }
+
+  // State that belongs to the old model's objects is read off before they go.
+  const restore = v.inspector?.getState();
+  v.inspector?.dispose();
+  v.inspector = null;
+  const old = v.model;
+  if (old) {
+    v.scene.remove(old);
+    disposeModel(old);
+  }
+  v.scene.add(loaded.object);
+  v.path = path;
+  if (!v.live) v.fileName = fileNameOf(path);
+  adoptModel(THREE, v, loaded, true); // keeps the up-axis the user chose; NO fitToView — the camera stays
+  await attachInspector(THREE, v, restore);
+  // Measurements already drawn stay; snapping now follows the new geometry.
+  if (v.measure?.on && v.model) {
+    v.measure.cache.length = 0;
+    v.measure.cache.push(...buildSnapCache(THREE, v.model));
+    v.measure.hoverPt = null;
+    v.measure.marker.visible = false;
+  }
+  return { triangles: loaded.triangles, replaced: true };
+}
+
+// ── live mode: the viewer follows a part (spec §4.9, Phase A3) ─────────────────────────────────────
+/** Where a live viewer gets a part's state from and sends the owner's actions to. Wired by main.ts. */
+export interface CadPartSource {
+  part: string;
+  /** The newest `cad.design` known for the part, if any. */
+  current(): CadDesignEvent | undefined;
+  /** Hear every later `cad.design` of the part. Returns unsubscribe. */
+  subscribe(fn: (ev: CadDesignEvent) => void): () => void;
+  /** Send `cad.param.set` and wait for its result. */
+  setParam(name: string, expression: string): Promise<{ ok: boolean; error?: string }>;
+  /** Send `cad.design.refresh` (Rebuild). */
+  rebuild(): void;
+  /** The parts of the same worktree (`cad.parts.list`), for the part switcher. */
+  parts?(): Promise<string[]>;
+  /** Open another part of the worktree. */
+  openPart?(part: string): void;
+}
+
+const NO_GEOMETRY = `<div class="cad-card" data-role="no-geometry">${icon("deployed_code")} Nothing to show yet — this part has no geometry.</div>`;
+
+/**
+ * Open the viewer on a PART in live mode: Follow / Paused with an "N behind" badge, Reload, Rebuild,
+ * a busy line, and the parameters panel with the gate strip. `io.fetchBytes(path)` must serve the
+ * `preview` path a `cad.design` names (see `makeCadPartIo`). Each new revision is swapped in place
+ * with `replaceModel`; the renderer is created once, for the first revision that has geometry.
+ */
+export function openCadPart(src: CadPartSource, io: CadIo): void {
+  const chrome = buildChrome(`cad/${src.part}`);
+  releaseActiveViewer();
+  const v: Viewer = { units: "mm", zUp: false, view: "iso", wireframe: false, fileName: src.part, path: "", io, chrome };
+  active = v;
+  wireChrome(chrome);
+  const shell = chrome.wrap.querySelector<HTMLElement>(".cad-shell")!;
+  shell.classList.add("cad-live-mode");
+  shell.dataset.part = src.part;
+  chrome.axisBtn.hidden = true; // a preview is always Y-up
+  const paramsBtn = chrome.wrap.querySelector<HTMLElement>('.cad-tools [data-act="params"]');
+  if (paramsBtn) paramsBtn.hidden = false;
+  showModal(chrome.wrap);
+
+  const show = async (ev: CadDesignEvent): Promise<void> => {
+    if (active !== v || !ev.preview) return;
+    if (v.renderer) {
+      await replaceModel(ev.preview);
+      hideStatus(chrome.statusArea);
+      return;
+    }
+    showStatus(chrome.statusArea, `<div class="cad-card">${icon("hourglass_empty")} Loading…</div>`);
+    try {
+      await init3d(ev.preview, "mesh", chrome, io);
+    } catch (e) {
+      if (active === v) {
+        dropRenderer(v); // a half-built scene must not be mistaken for a live one by the next revision
+        showStatus(chrome.statusArea, `<div class="cad-card cad-error">${icon("error")} ${esc(e instanceof Error ? e.message : String(e))}</div>`);
+      }
+      throw e;
+    }
+  };
+  const clear = (): void => {
+    if (active !== v) return;
+    if (v.model && v.scene) {
+      v.inspector?.dispose();
+      v.inspector = null;
+      v.scene.remove(v.model);
+      disposeModel(v.model);
+      v.model = undefined;
+    }
+    showStatus(chrome.statusArea, NO_GEOMETRY);
+  };
+
+  const params = createCadParams({ setParam: src.setParam });
+  const live = createCadLive({ part: src.part, show, clear, rebuild: src.rebuild });
+  shell.append(live.el, params.el);
+  if (window.innerWidth >= 900) {
+    shell.classList.add("cad-params-open"); // room for both on a wide screen; a phone opens it from the toolbar
+    paramsBtn?.classList.add("on");
+  }
+
+  const feed = (ev: CadDesignEvent): void => {
+    params.onDesign(ev);
+    live.onDesign(ev);
+  };
+  const off = src.subscribe(feed);
+  v.live = {
+    dispose() {
+      off();
+      live.dispose();
+      params.dispose();
+    },
+  };
+  const cur = src.current();
+  if (cur) feed(cur);
+  if (!cur?.preview) showStatus(chrome.statusArea, NO_GEOMETRY);
+
+  // The parts list: the other parts of this worktree, one tap away.
+  void src
+    .parts?.()
+    .then((names) => {
+      if (active !== v || names.length < 2 || !src.openPart) return;
+      const pick = document.createElement("select");
+      pick.className = "cad-live-parts";
+      pick.dataset.live = "parts";
+      pick.setAttribute("aria-label", "Part");
+      for (const n of names) {
+        const o = document.createElement("option");
+        o.value = n;
+        o.textContent = n;
+        o.selected = n === src.part;
+        pick.append(o);
+      }
+      pick.onchange = () => src.openPart!(pick.value);
+      live.el.prepend(pick);
+    })
+    .catch(() => undefined);
+}
+
+/** Test probe (the real-bundle Playwright spec, test/golden/live.pw.ts). Published ONLY when the page
+ *  set `window.__ANVIL_CAD_TEST__` before the app loaded; production pages never do. Read-only. */
+function publishProbe(): void {
+  const w = window as unknown as { __ANVIL_CAD_TEST__?: boolean; __anvilCadProbe?: () => unknown };
+  if (!w.__ANVIL_CAD_TEST__) return;
+  w.__anvilCadProbe = () => {
+    const v = active;
+    if (!v?.camera || !v.renderer) return null;
+    let triangles = 0;
+    let vertices = 0;
+    v.model?.traverse((o: Object3D) => {
+      const g = (o as Mesh).geometry as BufferGeometry | undefined;
+      const pos = g?.getAttribute?.("position");
+      if (!g || !pos) return;
+      vertices += pos.count;
+      triangles += (g.getIndex()?.count ?? pos.count) / 3;
+    });
+    v.camera.updateMatrixWorld();
+    const b = v.box;
+    return {
+      camera: [...v.camera.matrixWorld.elements],
+      projection: [...v.camera.projectionMatrix.elements],
+      target: v.controls ? v.controls.target.toArray() : null,
+      zoom: v.camera.zoom,
+      triangles,
+      vertices,
+      modelId: v.model?.uuid ?? null,
+      size: b ? [b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z] : null,
+      units: v.units,
+      sectionOn: v.inspector?.isSectionOn() ?? false,
+      sectionPos: v.inspector?.sectionPos() ?? null,
+      gpuGeometries: v.renderer.info.memory.geometries,
+      canvases: document.querySelectorAll(".cad-stage canvas").length,
+    };
+  };
 }
 
 interface LoadResult {
@@ -798,14 +1066,18 @@ function toggleWireframe(): void {
   const v = active;
   if (!v?.model) return;
   v.wireframe = !v.wireframe;
-  v.model.traverse((o: Object3D) => {
+  setWireframe(v.model, v.wireframe);
+}
+
+function setWireframe(model: Object3D, on: boolean): void {
+  model.traverse((o: Object3D) => {
     const m = o as Mesh;
     const mat = m.material;
     if (!mat) return;
     const mats = Array.isArray(mat) ? mat : [mat];
     for (const one of mats) {
       const w = one as Material & { wireframe?: boolean };
-      if ("wireframe" in w) w.wireframe = v.wireframe;
+      if ("wireframe" in w) w.wireframe = on;
     }
   });
 }
@@ -839,23 +1111,11 @@ function makeLabel(THREE: typeof import("three"), text: string): Sprite {
   return sprite;
 }
 
-async function toggleMeasure(chrome: Chrome): Promise<void> {
-  const v = active;
-  if (!v?.renderer || !v.scene || !v.camera || !v.model) return;
-  const THREE = await import("three");
-
-  if (v.measure?.on) {
-    teardownMeasure();
-    chrome.readout.hidden = true;
-    chrome.wrap.querySelector<HTMLElement>('[data-act="measure"]')?.classList.remove("on");
-    return;
-  }
-
-  // Build per-mesh world-space position + edge-midpoint caches once on entry.
-  const raycaster = new THREE.Raycaster();
-  (raycaster.params as unknown as { Line?: { threshold: number } }).Line = { threshold: 0 };
-  const cache: MeasureState["cache"] = [];
-  v.model.traverse((o: Object3D) => {
+/** World-space vertex positions + edge midpoints per mesh, for snapping (built on entering measure
+ *  mode, and again when the model is swapped under it). */
+function buildSnapCache(THREE: typeof import("three"), model: Object3D): SnapCache {
+  const cache: SnapCache = [];
+  model.traverse((o: Object3D) => {
     const m = o as Mesh;
     if (!(m as unknown as { isMesh?: boolean }).isMesh) return;
     const geom = m.geometry as BufferGeometry | undefined;
@@ -876,6 +1136,25 @@ async function toggleMeasure(chrome: Chrome): Promise<void> {
     const mids = edgeMidpoints(world, indices);
     cache.push({ mesh: m, positions: world, mids });
   });
+  return cache;
+}
+
+async function toggleMeasure(chrome: Chrome): Promise<void> {
+  const v = active;
+  if (!v?.renderer || !v.scene || !v.camera || !v.model) return;
+  const THREE = await import("three");
+
+  if (v.measure?.on) {
+    teardownMeasure();
+    chrome.readout.hidden = true;
+    chrome.wrap.querySelector<HTMLElement>('[data-act="measure"]')?.classList.remove("on");
+    return;
+  }
+
+  // Build per-mesh world-space position + edge-midpoint caches once on entry.
+  const raycaster = new THREE.Raycaster();
+  (raycaster.params as unknown as { Line?: { threshold: number } }).Line = { threshold: 0 };
+  const cache = buildSnapCache(THREE, v.model);
 
   const group = new THREE.Group();
   v.scene.add(group);
@@ -926,10 +1205,11 @@ async function toggleMeasure(chrome: Chrome): Promise<void> {
 
   const units = v.units;
   const readout = chrome.readout;
-  const bbox = v.box;
-  const bboxDims = bbox
-    ? `bbox ${formatLength(bbox.max.x - bbox.min.x, units)} × ${formatLength(bbox.max.y - bbox.min.y, units)} × ${formatLength(bbox.max.z - bbox.min.z, units)}`
-    : "";
+  // Read when used, not once: in live mode the model (and so its box) changes under the overlay.
+  const bboxDims = (): string => {
+    const bbox = v.box;
+    return bbox ? `bbox ${formatLength(bbox.max.x - bbox.min.x, units)} × ${formatLength(bbox.max.y - bbox.min.y, units)} × ${formatLength(bbox.max.z - bbox.min.z, units)}` : "";
+  };
 
   const addDimension = (a: Pt3, b: Pt3): void => {
     const st = active?.measure;
@@ -959,10 +1239,10 @@ async function toggleMeasure(chrome: Chrome): Promise<void> {
       marker.scale.setScalar(worldRadiusAt(pt) * 0.45);
       const coord = `x ${formatLength(pt.x, units)}  y ${formatLength(pt.y, units)}  z ${formatLength(pt.z, units)}`;
       const live = st.pending ? `  ·  dragging from first point: ~ ${formatLength(distance3(st.pending, pt), units)} (mesh)` : "";
-      readout.textContent = `${coord}${live}   |   ${bboxDims}`;
+      readout.textContent = `${coord}${live}   |   ${bboxDims()}`;
     } else {
       marker.visible = false;
-      readout.textContent = bboxDims;
+      readout.textContent = bboxDims();
     }
   };
 
@@ -982,7 +1262,7 @@ async function toggleMeasure(chrome: Chrome): Promise<void> {
 
   v.measure = { on: true, group, marker, pending: null, cache, onMove, onClick, hoverPt: null, objects: [] };
   readout.hidden = false;
-  readout.textContent = bboxDims;
+  readout.textContent = bboxDims();
   chrome.wrap.querySelector<HTMLElement>('[data-act="measure"]')?.classList.add("on");
 }
 
@@ -1178,11 +1458,6 @@ async function runSnapshotTarget(key: string, chrome: Chrome): Promise<void> {
 }
 
 // ── teardown (release the WebGL context) ──────────────────────────────────────────────────────────
-function disposeMaterial(mat: Material | Material[]): void {
-  const mats = Array.isArray(mat) ? mat : [mat];
-  for (const m of mats) m.dispose();
-}
-
 /** Dispose the active 3D viewer (renderer/geometry/controls/inspector/measure) without closing the
  *  modal — shared by closeViewer and the KiCad 2D↔3D toggle. */
 function teardownActive(): void {
@@ -1193,15 +1468,20 @@ function teardownActive(): void {
   active = null;
   if (!v) return;
 
+  v.live?.dispose();
+  v.live = null;
+  dropRenderer(v);
+}
+
+/** Stop the render loop and release the renderer, its WebGL context and the model. `v` itself stays
+ *  usable (live mode builds a new renderer for the next revision after a failed first load). */
+function dropRenderer(v: Viewer): void {
   if (v.raf) cancelAnimationFrame(v.raf);
+  v.raf = undefined;
   v.controls?.dispose();
 
   // Dispose geometries + materials across the model graph.
-  v.model?.traverse((o: Object3D) => {
-    const m = o as Mesh;
-    (m.geometry as BufferGeometry | undefined)?.dispose?.();
-    if (m.material) disposeMaterial(m.material);
-  });
+  if (v.model) disposeModel(v.model);
 
   const r = v.renderer;
   if (r) {
@@ -1211,6 +1491,11 @@ function teardownActive(): void {
     r.forceContextLoss?.();
     r.domElement.remove();
   }
+  v.renderer = undefined;
+  v.scene = undefined;
+  v.camera = undefined;
+  v.controls = undefined;
+  v.model = undefined;
 }
 
 /** Fully release the active viewer (3D renderer/context + ECAD cleanup) WITHOUT touching the modal.

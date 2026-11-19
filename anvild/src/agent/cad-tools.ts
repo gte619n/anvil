@@ -57,6 +57,9 @@ export interface CadToolDeps {
   proposeExpectations(ref: PartRef, expectations: unknown, reason: unknown): Promise<{ ok: true; approved?: boolean } | { ok: false; error: string }>;
   /** Forces a refresh and returns the gate result in full. */
   checkPart(ref: PartRef): Promise<GateResult>;
+  /** What the owner changed in the parameters panel since this session's last call (§4.9). Reading
+   *  delivers: each note is returned once, and rides on the tool result that asked. */
+  takeOwnerNotes?(): string[];
 }
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -123,11 +126,16 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
   const guarded = async (fn: () => Promise<ToolOut>): Promise<ToolOut> => {
     const why = deps.unavailable();
     if (why) return fail(`CAD is not available on this machine: ${why}`);
+    let out: ToolOut;
     try {
-      return await fn();
+      out = await fn();
     } catch (e) {
-      return fail(e instanceof Error ? e.message : String(e));
+      out = fail(e instanceof Error ? e.message : String(e));
     }
+    // The owner may have changed a parameter in the panel while this call was queued or between
+    // calls: say so on the very next result, whichever tool it is.
+    for (const n of deps.takeOwnerNotes?.() ?? []) out.content.push({ type: "text", text: `[anvil] ${n}` });
+    return out;
   };
   const selected = (): PartRef => {
     if (!current) throw new Error("no part is open: call open_part { part } first");

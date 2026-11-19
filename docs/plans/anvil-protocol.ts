@@ -636,9 +636,42 @@ export interface CadDesignEvent extends Envelope {
   params: CadParam[];
   gate: CadGateResult;
   busy: boolean; // a request is running or queued
+  /** The part's next request is held because every SolidCraft slot on this machine is taken (Phase A3). */
+  waiting?: boolean;
   by: "agent" | "panel" | "reload";
   /** Sessions that have this part open: the chat card belongs in these. */
   sessionIds?: string[];
+}
+/** One part of a worktree, as `cad.parts.list` answers it (Phase A3). */
+export interface CadPartInfo {
+  part: string;
+  hasDesign: boolean; // cad/<part>/design.json exists
+  live: boolean; // a SolidCraft process is up for it
+  busy: boolean;
+  rev: number; // 0 until the part has been refreshed on this machine
+  preview?: string; // worktree-relative path of the newest preview GLB, if one exists
+  gate: CadGateResult; // from the last refresh, else from the measurement stored in part.json
+}
+/** Reply to `cad.parts.list` (Phase A3): every part folder of the worktree with its gate state. */
+export interface CadPartsListResultEvent extends Envelope {
+  type: "cad.parts.list.result";
+  cid?: Cid;
+  cwd: string; // the worktree, as the daemon resolved it
+  parts: CadPartInfo[];
+}
+/**
+ * Reply to `cad.param.set` (Phase A3), to the sender only. `ok: false` carries SolidCraft's own error
+ * for a bad expression or an unknown name; nothing was changed. On success the new state arrives as
+ * a `cad.design` with `by: "panel"`.
+ */
+export interface CadParamSetResultEvent extends Envelope {
+  type: "cad.param.set.result";
+  cid?: Cid;
+  cwd: string;
+  part: string;
+  name: string;
+  ok: boolean;
+  error?: string;
 }
 /** One row of an expectations card: a labelled value before and after. */
 export interface CadExpectationsRow {
@@ -1544,6 +1577,8 @@ export type ServerEvent =
   | CadDesignEvent
   | CadExpectationsRequestEvent
   | CadExpectationsResolvedEvent
+  | CadPartsListResultEvent
+  | CadParamSetResultEvent
   | ClaudeCliStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
@@ -1754,6 +1789,33 @@ export interface CadExpectationsRespondCmd extends Envelope, Correlated {
   type: "cad.expectations.respond";
   requestId: RequestId;
   approve: boolean;
+}
+/**
+ * The parts of a worktree with their gate state (agent-cad-and-browser spec §4.8, Phase A3). `cwd` must
+ * be the worktree of an existing session or a registered environment's repo; anything else is refused.
+ * Answered with `cad.parts.list.result`.
+ */
+export interface CadPartsListCmd extends Envelope, Correlated {
+  type: "cad.parts.list";
+  cwd: string;
+}
+/**
+ * The OWNER changes a parameter from the parameters panel. Runs in the part's queue (behind an agent
+ * call that is in flight), re-derives the expectation formulas and accepts the new numbers. No model
+ * is involved. Answered with `cad.param.set.result`, and a `cad.design` with `by: "panel"`.
+ */
+export interface CadParamSetCmd extends Envelope, Correlated {
+  type: "cad.param.set";
+  cwd: string;
+  part: string;
+  name: string;
+  expression: string;
+}
+/** Rebuild a part from `design.json` on disk (the viewer's Rebuild). The next `cad.design` has `by: "reload"`. */
+export interface CadDesignRefreshCmd extends Envelope, Correlated {
+  type: "cad.design.refresh";
+  cwd: string;
+  part: string;
 }
 /** Answer a parked AskUserQuestion (§6.6) — may come from any device. */
 export interface QuestionRespondCmd extends Envelope, Correlated {
@@ -2214,6 +2276,9 @@ export type ClientCommand =
   | PermissionRespondCmd
   | QuestionRespondCmd
   | CadExpectationsRespondCmd
+  | CadPartsListCmd
+  | CadParamSetCmd
+  | CadDesignRefreshCmd
   | InterruptCmd
   // files
   | FsListCmd

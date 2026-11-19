@@ -69,3 +69,27 @@ export function makeCadIo(opts: {
     },
   };
 }
+
+/**
+ * The CadIo of a PART in live mode (agent-cad-and-browser spec §4.9, Phase A3). A part belongs to a
+ * worktree, not to a session, and its preview is a git-excluded file, so it is served by the daemon's
+ * own route — `GET /api/cad/preview?cwd=<worktree>&path=<cad.design.preview>` — which accepts nothing
+ * but `cad/<part>/.cache/preview-<rev>.glb` of a worktree the daemon knows.
+ */
+export function makeCadPartIo(opts: { server: () => Server; cwd: string }): CadIo {
+  const url = (p: string): string => serverApiUrl(opts.server().url, `/api/cad/preview?cwd=${encodeURIComponent(opts.cwd)}&path=${encodeURIComponent(p)}`);
+  const get = (p: string): Promise<Response> => okOrThrow(fetch(url(p)), p);
+  return {
+    locate: async (p): Promise<CadLocateResult> => ({ kind: "file", path: p }),
+    fileUrl: url,
+    cadUrl: url,
+    gerberUrl: url,
+    fetchBytes: async (p) => new Uint8Array(await (await get(p)).arrayBuffer()),
+    fetchText: async (p) => (await get(p)).text(),
+    listSiblings: async () => [],
+    // No save-to-project here (that route is a session's); inserting into the chat still works.
+    insertSnapshot: async (name, png) => {
+      await attachImageBlob(name, png);
+    },
+  };
+}

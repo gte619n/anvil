@@ -1400,6 +1400,45 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 /* Toast */
 .cad-toast { position: absolute; bottom: 110px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 999px; font-size: 12px; z-index: 7; animation: modal-fade 0.15s ease; }
 
+/* ── CAD live mode (agent-cad-and-browser §4.9): Follow / Paused bar, parameters sheet, gate strip ── */
+.cad-live { position: absolute; top: 44px; right: 12px; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; max-width: calc(100% - 24px); z-index: 3; font-size: 12px; }
+.cad-live button, .cad-live select { min-height: 32px; padding: 4px 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text); font: inherit; cursor: pointer; }
+.cad-live-follow.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cad-live-behind { padding: 4px 9px; border-radius: 999px; background: var(--warn); color: #1a1c20; font-weight: 600; }
+.cad-live-busy { padding: 4px 9px; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
+.cad-live-busy.waiting { color: var(--text); border-color: var(--warn); }
+.cad-live-error { flex-basis: 100%; text-align: right; color: var(--danger); overflow-wrap: anywhere; }
+/* Phone first: a bottom sheet above the toolbar. Wide screens: a panel down the left side. */
+.cad-params { position: absolute; left: 0; right: 0; bottom: 0; max-height: 55%; display: none; flex-direction: column; background: var(--bg); border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; box-shadow: 0 -8px 24px rgba(0,0,0,0.25); z-index: 6; padding-bottom: env(safe-area-inset-bottom, 0); }
+.cad-shell.cad-params-open .cad-params { display: flex; }
+.cad-params-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 13px; }
+.cad-params-close { width: 36px; height: 36px; border: none; background: transparent; color: var(--text); font-size: 20px; line-height: 1; border-radius: 8px; cursor: pointer; }
+.cad-params-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 14px; }
+.cad-params-empty { padding: 12px 0; color: var(--muted); font-size: 13px; }
+.cad-param { display: grid; grid-template-columns: minmax(48px, auto) minmax(0, 1fr) auto; align-items: center; column-gap: 10px; padding: 5px 0; }
+.cad-param-name { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.cad-param-input { min-width: 0; min-height: 36px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; font-size: 16px; }
+.cad-param-pending .cad-param-input { opacity: 0.6; }
+.cad-param-bad .cad-param-input { border-color: var(--danger); }
+.cad-param-value { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.cad-param-error { grid-column: 1 / -1; margin-top: 3px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
+.cad-gate { flex: 0 0 auto; max-height: 40%; overflow-y: auto; padding: 9px 14px 11px; border-top: 1px solid var(--border); border-left: 4px solid var(--warn); font-size: 13px; }
+.cad-gate.cad-pass { border-left-color: var(--ok, #2e9d57); }
+.cad-gate.cad-fail { border-left-color: var(--danger, #d04545); }
+.cad-gate-state { font-weight: 600; }
+.cad-gate-state.cad-pass { color: var(--ok, #2e9d57); }
+.cad-gate-state.cad-fail { color: var(--danger, #d04545); }
+.cad-gate-by { margin-left: 8px; font-size: 12px; color: var(--muted); }
+.cad-gate-checks, .cad-gate-advisory { margin: 6px 0 0; padding-left: 18px; }
+.cad-gate-checks li { overflow-wrap: anywhere; }
+.cad-gate-advisory { opacity: 0.8; }
+.cad-gate-note { margin-top: 6px; }
+@media (min-width: 900px) {
+  .cad-params { top: 0; right: auto; bottom: 0; width: 320px; max-height: none; border-top: none; border-right: 1px solid var(--border); border-radius: 0; box-shadow: none; }
+  .cad-shell.cad-params-open .cad-hud { left: 320px; }
+  .cad-shell.cad-params-open .cad-readout, .cad-shell.cad-params-open .cad-slider { left: 332px; }
+}
+
 /* ── CAD cards in the chat (agent-cad-and-browser §4.9): part card, expectation change, adopt ── */
 .bubble.cad-part { align-self: stretch; max-width: 100%; border: 1px solid var(--border); border-left-width: 4px; border-radius: 12px; background: var(--panel); padding: 11px 13px; }
 .bubble.cad-part.cad-pass { border-left-color: var(--ok, #2e9d57); }

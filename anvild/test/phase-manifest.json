@@ -370,7 +370,73 @@
     },
     "A3": {
       "title": "live preview and parameters panel",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/integration/cad-a3-preview.test.ts",
+          "names": [
+            "Phase A3 acceptance > [A3] acceptance 1: ten mutating calls in 200 ms produce ten script writes, at most two cad.design events, and the last event's rev matches the final state",
+            "Phase A3 acceptance > [A3] acceptance 2: cad.param.set L=120 with no session turn running gives one cad.design with by:\"panel\", the new volume, design.json containing the new expression, and zero model queries",
+            "Phase A3 acceptance > [A3] acceptance 3: a bad expression returns the SolidCraft error and changes neither file",
+            "Phase A3 acceptance > [A3] acceptance 4: a panel edit queued during an agent call runs after it, and the agent's following tool result contains \"owner changed L\"",
+            "Phase A3 acceptance > [A3] acceptance 5: a change made to design.json on disk while a request is running is not overwritten: .cache/design.conflict.json exists and the part is fail with the conflict message",
+            "Phase A3 clients (§7, §4.8) > [A3] two clients send cad.param.set at once: queued in arrival order, two cad.design events",
+            "Phase A3 clients (§7, §4.8) > [A3] an arbitrary cwd from a client is refused by every cad command and by the preview route",
+            "Phase A3 clients (§7, §4.8) > [A3] the daemon serves the newest preview on the route the viewer uses; cad.parts.list and cad.design.refresh answer over the socket"
+          ]
+        },
+        {
+          "file": "test/unit/cad-preview.test.ts",
+          "names": [
+            "[A3] a refresh writes .cache/preview-<rev>.glb — a valid GLB of the design in metres, Y up — and cad.design names it",
+            "[A3] previews older than the newest three are deleted, and rev rises by one per refresh",
+            "[A3] prunePreviews keeps the newest N by revision number and ignores other files",
+            "[A3] an empty design has no preview and no error",
+            "[A3] a failed export is reported on the outcome and never throws or writes a path",
+            "[A3] after a daemon restart the next rev is above every preview left on disk, so the newest file is never pruned",
+            "[A3] busy: a request still running after BUSY_NOTICE_MS is announced with the same rev, and cleared when the queue drains",
+            "[A3] a panel edit while the cap is full waits for a slot, and cad.design says \"waiting\" until it gets one"
+          ]
+        },
+        {
+          "file": "test/unit/cad-params.test.ts",
+          "names": [
+            "[A3] cwd is validated server-side: only the worktree of an existing session or a registered environment is accepted",
+            "[A3] with cad-work off every cad command is refused, whatever the cwd",
+            "[A3] cad.param.set refuses a bad part name, a part with no design, and a missing name or expression — without starting SolidCraft",
+            "[A3] the preview route's file: only cad/<part>/.cache/preview-<rev>.glb of that worktree, never a link out of it",
+            "[A3] cad.parts.list reports every part folder with its gate state, preview and liveness, and starts nothing",
+            "[A3] the owner-change note names the parameter and value, reaches every session on the part, and is delivered once"
+          ]
+        },
+        {
+          "file": "test/web/cad-live.test.ts",
+          "names": [
+            "[A3] Follow is on by default and every new rev is shown; the same rev again (a busy-only event) is not a swap",
+            "[A3] Paused keeps the model, the badge counts revisions behind (\"1 behind\", \"2 behind\"), and Reload jumps to the newest and stays paused",
+            "[A3] revisions that arrive while a swap is in flight collapse into one more swap, to the newest",
+            "[A3] Rebuild asks for a rebuild; waiting for a slot and a failed load are said in words; an empty design clears the model",
+            "[A3] the design store keeps the newest event per server, worktree and part, and tells that part's listeners only",
+            "[A3] the panel lists the user parameters with expression and value, and the gate strip under it shows state, failing checks and advisories",
+            "[A3] editing a value sends cad.param.set once; the daemon's event (which arrives before the reply) brings the canonical text",
+            "[A3] a bad expression shows the SolidCraft error and leaves the old value; typing again clears the error",
+            "[A3] an event does not write over a field the owner is typing in"
+          ]
+        }
+      ],
+      "playwright": [
+        "test/golden/live.pw.ts"
+      ],
+      "playwrightConfig": "test/golden/live.playwright.config.ts",
+      "real": [
+        {
+          "file": "test/real/cad-a3.test.ts",
+          "names": [
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: after the plate batch a preview-<rev>.glb exists, is a valid GLB with a mesh, and is served by the daemon route the viewer uses",
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: an owner cad.param.set L=120 yields a new preview whose bounding box is 120 mm long, the documented volume, and a passing gate",
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: old previews are pruned to three, and script write + refresh time for the plate is recorded"
+          ]
+        }
+      ]
     },
     "A4": {
       "title": "inputs, gaps, release",

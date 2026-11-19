@@ -261,7 +261,7 @@ describe("cad gate (the refresh, against the fake)", () => {
     expect(ev).toMatchObject({ type: "cad.design", cwd: repo, part: "plate", by: "agent", sessionIds: ["sess_cad"] });
     expect(ev.gate.state).toBe("fail");
     expect(ev.rev).toBeGreaterThan(1);
-    expect(ev.preview).toBeUndefined(); // Phase A3
+    expect(ev.preview).toBe(`cad/plate/.cache/preview-${ev.rev}.glb`); // Phase A3: every refresh of a part with geometry writes a preview
     expect(ev.params.map((p: any) => p.name)).toEqual(["L", "W", "T", "inset"]);
   });
 

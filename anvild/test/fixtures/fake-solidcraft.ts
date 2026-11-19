@@ -1047,7 +1047,48 @@ function exportBytes(m: Model, label: string, name: string): Buffer {
           `FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }'));\nENDSEC;\nDATA;\n/* fake-solidcraft ${note} */\nENDSEC;\nEND-ISO-10303-21;\n`,
       );
     case "Glb": {
-      let json = JSON.stringify({ asset: { version: "2.0", generator: "fake-solidcraft" }, extras: { bodies } });
+      // A real, loadable GLB like SolidCraft's: metres, Y up (CAD x,y,z mm → x, z, -y metres), one
+      // box mesh per body spanning its bounding box. The geometry rides in a data: URI so the file
+      // is a single JSON chunk.
+      const nodes: Json[] = [];
+      const meshes: Json[] = [];
+      const accessors: Json[] = [];
+      const bufferViews: Json[] = [];
+      const chunks: Buffer[] = [];
+      let offset = 0;
+      const IDX = [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1, 1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0];
+      for (const body of m.bodies) {
+        const { min, max } = bboxOf(body);
+        const toGl = (x: number, y: number, z: number): V3 => [x / 1000, z / 1000, -y / 1000];
+        const corners: V3[] = [
+          toGl(min[0], min[1], min[2]), toGl(max[0], min[1], min[2]), toGl(max[0], max[1], min[2]), toGl(min[0], max[1], min[2]),
+          toGl(min[0], min[1], max[2]), toGl(max[0], min[1], max[2]), toGl(max[0], max[1], max[2]), toGl(min[0], max[1], max[2]),
+        ];
+        const pos = Buffer.alloc(96);
+        corners.forEach((c, i) => c.forEach((v, k) => pos.writeFloatLE(v, i * 12 + k * 4)));
+        const idx = Buffer.alloc(72);
+        IDX.forEach((v, i) => idx.writeUInt16LE(v, i * 2));
+        const lo = [0, 1, 2].map((k) => Math.fround(Math.min(...corners.map((c) => c[k]!))));
+        const hi = [0, 1, 2].map((k) => Math.fround(Math.max(...corners.map((c) => c[k]!))));
+        bufferViews.push({ buffer: 0, byteOffset: offset, byteLength: 96, target: 34962 }, { buffer: 0, byteOffset: offset + 96, byteLength: 72, target: 34963 });
+        accessors.push({ bufferView: bufferViews.length - 2, componentType: 5126, count: 8, type: "VEC3", min: lo, max: hi }, { bufferView: bufferViews.length - 1, componentType: 5123, count: 36, type: "SCALAR" });
+        meshes.push({ name: body.name, primitives: [{ attributes: { POSITION: accessors.length - 2 }, indices: accessors.length - 1 }] });
+        nodes.push({ name: body.name, mesh: meshes.length - 1 });
+        chunks.push(pos, idx);
+        offset += 168;
+      }
+      const bin = Buffer.concat(chunks);
+      let json = JSON.stringify({
+        asset: { version: "2.0", generator: "fake-solidcraft" },
+        extras: { bodies },
+        scene: 0,
+        scenes: [{ nodes: nodes.map((_, i) => i) }],
+        nodes,
+        meshes,
+        accessors,
+        bufferViews,
+        buffers: [{ byteLength: bin.length, uri: `data:application/octet-stream;base64,${bin.toString("base64")}` }],
+      });
       json += " ".repeat((4 - (Buffer.byteLength(json) % 4)) % 4);
       const head = Buffer.alloc(20);
       head.write("glTF", 0, "latin1");
@@ -1360,7 +1401,7 @@ const TOOLS: Record<string, { description: string; readOnly: boolean; required?:
     },
   },
   export: {
-    description: "Write the bodies to a file: {path, format?: step|stp|3mf|stl|stla|glb} (default: from the extension).",
+    description: "Write the bodies to a file: {path, format?: step|stp|3mf|stl|stla|glb, bodies?: [names]} (default: from the extension).",
     readOnly: true,
     required: ["path"],
     run: (a) => {
@@ -1368,7 +1409,15 @@ const TOOLS: Record<string, { description: string; readOnly: boolean; required?:
       const label = EXPORTS[String(a.format ?? extname(path).slice(1)).toLowerCase()];
       if (!label) throw new ToolError(`${path}: fake-solidcraft does not write format \`${a.format ?? extname(path).slice(1)}\``);
       if (model.bodies.length === 0) throw new ToolError("nothing to export: the design has no bodies");
-      const bytes = exportBytes(model, label, basename(path));
+      // `bodies` (names) limits the export, as the real tool does; an unknown name is the same error.
+      let source = model;
+      if (Array.isArray(a.bodies)) {
+        const wanted = new Set(a.bodies.map(String));
+        const picked = model.bodies.filter((b) => wanted.has(b.name));
+        if (picked.length !== wanted.size || picked.length === 0) throw new ToolError("nothing to export: the design has no bodies");
+        source = { ...model, bodies: picked };
+      }
+      const bytes = exportBytes(source, label, basename(path));
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, bytes);
       return { bytes: bytes.length, format: label, path };

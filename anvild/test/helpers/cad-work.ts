@@ -292,6 +292,25 @@ export function approveCards(x: { service: CadworkService; openCards: () => any[
 }
 
 /**
+ * The agent's half of building the reference plate, on any set of `anvil_cad` tools: open the part,
+ * record its expectations, then model it (the hole pattern as its own request, so one `undo` removes
+ * exactly that feature). Throws on the first tool error. The owner's half — adopting the rules — is
+ * the caller's.
+ */
+export async function modelPlate(tools: ToolCaller, opts: { process?: string; expectations?: unknown } = {}): Promise<void> {
+  const must = async (p: Promise<ToolReply>): Promise<ToolReply> => {
+    const r = await p;
+    if (r.isError) throw new Error(r.text);
+    return r;
+  };
+  const { REFERENCE_PLATE } = await import("./fake-solidcraft");
+  await must(tools.open_part!({ part: "plate" }));
+  await must(tools.record_expectations!({ part: "plate", process: opts.process ?? "fdm-0.4", expectations: opts.expectations ?? PLATE_EXPECTATIONS }));
+  await must(tools.batch!({ commands: REFERENCE_PLATE.slice(0, 15) }));
+  await must(tools.batch!({ commands: REFERENCE_PLATE.slice(15) }));
+}
+
+/**
  * The reference plate, built the way an agent is meant to: open, record expectations, model (the
  * hole pattern as its own request, so one `undo` removes exactly that feature), then the owner adopts
  * the repo's rules file. Returns the session and the gate after all of it.
@@ -308,11 +327,7 @@ export async function buildPlate(
     if (r.isError) throw new Error(r.text);
     return r;
   };
-  const { REFERENCE_PLATE } = await import("./fake-solidcraft");
-  await must(tools.open_part!({ part: "plate" }));
-  await must(tools.record_expectations!({ part: "plate", process: opts.process ?? "fdm-0.4", expectations: opts.expectations ?? PLATE_EXPECTATIONS }));
-  await must(tools.batch!({ commands: REFERENCE_PLATE.slice(0, 15) }));
-  await must(tools.batch!({ commands: REFERENCE_PLATE.slice(15) }));
+  await modelPlate(tools, { process: opts.process, expectations: opts.expectations });
   let gate = (await must(tools.check_part!({ part: "plate" }))).json;
   if (opts.adopt !== false && x.openCards().length) {
     approveCards(x);

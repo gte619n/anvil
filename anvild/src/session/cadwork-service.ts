@@ -7,13 +7,14 @@
  * is the `cad.status` event, and the tools refuse with its reason — nothing is withdrawn from a live
  * driver.
  */
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
   PROTOCOL_VERSION,
   type CadDesignEvent,
+  type CadPartInfo,
   type CadExpectationsRequestEvent,
   type CadExpectationsResolvedEvent,
   type CadExpectationsRow,
@@ -28,8 +29,9 @@ import { isUnattended } from "../agent/protected";
 import { evaluateGate, pendingAdoptions, type GateInput, type GateResult } from "../cadwork/gate";
 import { LockStore, LockSync, repoKey, type LockSyncOptions, type PartLock } from "../cadwork/locks";
 import { CadManager, type CadManagerOptions, type CadParamInfo, type SlotContext } from "../cadwork/manager";
-import { solidcraftEnv } from "../cadwork/mcp-client";
-import { gitToplevel, type PartRef } from "../cadwork/partfolder";
+import { realClock, solidcraftEnv, type CadClock } from "../cadwork/mcp-client";
+import { gitToplevel, listParts, partRef, type PartRef } from "../cadwork/partfolder";
+import { CACHE_DIR, DESIGN_FILE, DISK_CONFLICT_REASON, readDesignFile } from "../cadwork/poststep";
 import {
   evaluateExpectations,
   expectationsShapeError,
@@ -44,7 +46,7 @@ import {
   type ExpectationsInput,
   type PartFile,
 } from "../cadwork/partfile";
-import { makeRefreshJob, readLocked, type RefreshOutcome } from "../cadwork/refresh";
+import { makeRefreshJob, newestPreview, previewRevs, readLocked, PREVIEW_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
 import { lineDiff } from "../cadwork/rules";
 import { newId } from "../util/ids";
 import { currentManagedSolidcraft, resolveSolidcraftCli, type ResolvedSolidcraft } from "../solidcraft/binary";
@@ -90,7 +92,15 @@ export interface PartSnapshot {
   outcome: RefreshOutcome;
   by: "agent" | "panel" | "reload";
   busy: boolean;
+  /** Its next request is held because every SolidCraft slot is taken. */
+  waiting?: boolean;
 }
+
+/** How long a part's queue must stay busy before a `cad.design` is sent just to say so. A refresh
+ *  that lands sooner carries `busy` itself, so a short burst costs no extra event. */
+export const BUSY_NOTICE_MS = 250;
+/** Why `cad.param.set` / `cad.parts.list` / `cad.design.refresh` refuse a `cwd`. */
+export const CWD_REFUSED = "is not the worktree of a session or a registered environment on this machine";
 
 type CardKind = CadExpectationsRequestEvent["kind"];
 interface Card {
@@ -139,11 +149,16 @@ export class CadworkService {
   private readonly cards = new Map<string, Card>();
   private readonly nextBy = new Map<string, "panel" | "reload">();
   private readonly offProtected?: () => void;
+  private readonly clock: CadClock;
+  private readonly busyTimers = new Map<string, unknown>();
+  /** What the owner changed in the panel that each session's agent has not been told yet. */
+  private readonly ownerNotes = new Map<string, string[]>();
 
   constructor(private readonly deps: CadworkServiceDeps) {
     this.resolveCli = deps.resolveCli ?? (() => resolveSolidcraftCli());
     this.readVersion = deps.readVersion ?? readSolidcraftVersion;
     this.manager = new CadManager({ resolveCli: this.resolveCli, ...deps.manager });
+    this.clock = deps.manager?.clock ?? realClock;
     const stateDir = deps.stateDir ?? mkdtempSync(join(tmpdir(), "anvil-cadwork-state-"));
     this.locks = new LockStore(stateDir);
     this.lockSync = new LockSync(this.locks, { ...deps.lockSync, onRemoteChange: () => this.recheckOpenParts() });
@@ -154,6 +169,7 @@ export class CadworkService {
         makeRefreshJob({
           locks: this.locks,
           pinValues: (lock) => this.lockSync.approvePart(lock),
+          nextRev: (ref) => this.nextRev(ref),
           onResult: (outcome, slot) => this.onRefreshed(outcome, slot),
           evaluateImpl: deps.gateImpl,
           beforeMeasure: deps.beforeMeasure,
@@ -161,6 +177,9 @@ export class CadworkService {
       );
       this.manager.subscribe((e) => {
         if (e.type === "reloaded") this.nextBy.set(e.key, "reload");
+        else if (e.type === "busy") this.onBusy(e.key, e.part, e.busy);
+        else if (e.type === "waiting") this.onWaiting(e.key, e.part, e.waiting);
+        else if (e.type === "conflict") this.onConflict(e.key, e.part);
       });
     }
   }
@@ -240,6 +259,7 @@ export class CadworkService {
       recordExpectations: (ref, process, expectations) => this.recordExpectations(sessionId, ref, process, expectations),
       proposeExpectations: (ref, expectations, reason) => this.proposeExpectations(sessionId, ref, expectations, reason),
       checkPart: (ref) => this.checkPart(sessionId, ref),
+      takeOwnerNotes: () => this.takeOwnerNotes(sessionId),
     };
   }
 
@@ -392,8 +412,10 @@ export class CadworkService {
       tool: "execute",
       args: { command: "parameters.change", params: { changes: { [name]: String(expression) } } },
       kind: "mutate",
+      refreshAfter: true, // measured and broadcast in the same queue slot: one `cad.design` per owner edit
       afterWrite: (slot, done) => {
         if (done.result.isError) return; // refused (unknown name, bad expression): nothing changed
+        if (slot.state().conflict) return; // design.json changed on disk meanwhile: the change was not written, so nothing is accepted
         this.nextBy.set(ref.key, "panel");
         const locked = readLocked(ref, this.locks);
         if (locked.part.kind !== "ok" || !locked.part.file.expectations || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file)) return;
@@ -402,8 +424,187 @@ export class CadworkService {
       },
     });
     if (reply.result.isError) return { ok: false, error: reply.result.text, notes: reply.notes };
-    await this.manager.forceRefresh(ref);
+    if (reply.state.conflict) {
+      // Not written (§4.2): the file on disk wins, and the part is `fail` until it is rebuilt from it.
+      return { ok: false, error: reply.notes.find((n) => n.includes(DISK_CONFLICT_REASON)) ?? DISK_CONFLICT_REASON, notes: reply.notes };
+    }
+    // Every agent working on the part hears about it on its next anvil_cad result, once (§4.9).
+    const value = this.manager.status(ref)?.params.find((p) => p.name === name)?.value;
+    const shown = typeof value === "number" && Number.isFinite(value) && String(value) !== expression.trim() ? ` (= ${num(value)})` : "";
+    const note = `owner changed ${name} to ${expression}${shown} in cad/${ref.part} since your last call. Read the parameters again before relying on earlier values; the expectations were re-derived for the new value.`;
+    for (const sid of this.partSessions.get(ref.key) ?? []) {
+      const list = this.ownerNotes.get(sid) ?? [];
+      list.push(note);
+      this.ownerNotes.set(sid, list);
+    }
     return { ok: true, gate: this.snapshots.get(ref.key)?.outcome.gate, notes: reply.notes };
+  }
+
+  /** The owner-change notes a session's agent has not seen yet. Reading them delivers them: once. */
+  takeOwnerNotes(sessionId: string): string[] {
+    const list = this.ownerNotes.get(sessionId);
+    if (!list?.length) return [];
+    this.ownerNotes.delete(sessionId);
+    return list;
+  }
+
+  // ── the panel's commands (spec §4.8, Phase A3) ───────────────────────────────────────────────────
+
+  /**
+   * The part a client command names, or a refusal. `worktree` must already have been checked by the
+   * caller (see `Supervisor.cadWorktree`): the service trusts it, and only checks the part name.
+   */
+  private refFor(worktree: string, part: unknown): PartRef {
+    return partRef(worktree, part); // throws BadPartName / UnsafePartFolder
+  }
+
+  /** `cad.parts.list`: every part folder of a worktree with its gate state. Starts nothing. */
+  listParts(worktree: string): CadPartInfo[] {
+    const out: CadPartInfo[] = [];
+    for (const name of listParts(worktree)) {
+      let ref: PartRef;
+      try {
+        ref = this.refFor(worktree, name);
+      } catch {
+        continue; // a linked folder is not a part
+      }
+      const snap = this.snapshots.get(ref.key) ?? this.diskSnapshot(ref);
+      const st = this.manager.status(ref);
+      out.push({
+        part: name,
+        hasDesign: existsSync(join(ref.dir, DESIGN_FILE)),
+        live: st?.live ?? false,
+        busy: st?.busy ?? false,
+        rev: snap.rev,
+        ...(snap.outcome.preview ? { preview: snap.outcome.preview } : {}),
+        gate: snap.outcome.gate,
+      });
+    }
+    return out;
+  }
+
+  /** `cad.param.set`: the owner's change, by name. Refuses a part that does not exist. */
+  async setParam(worktree: string, part: unknown, name: unknown, expression: unknown): Promise<{ ok: boolean; error?: string }> {
+    const why = this.unavailableReason();
+    if (why) return { ok: false, error: `CAD is not available on this machine: ${why}` };
+    if (typeof name !== "string" || !name.trim()) return { ok: false, error: "cad.param.set: `name` must be a parameter name" };
+    if ((typeof expression !== "string" && typeof expression !== "number") || !String(expression).trim()) return { ok: false, error: "cad.param.set: `expression` must be a value or a formula" };
+    const ref = this.refFor(worktree, part);
+    if (!existsSync(join(ref.dir, DESIGN_FILE)) && !this.manager.status(ref)?.live) return { ok: false, error: `cad/${ref.part} has no design yet` };
+    const r = await this.setParamAsOwner(ref, name.trim(), String(expression).trim());
+    return r.ok ? { ok: true } : { ok: false, error: r.error ?? "the change was refused" };
+  }
+
+  /** `cad.design.refresh`: rebuild the part from `design.json` on disk. The `cad.design` that follows has `by: "reload"`. */
+  async refreshDesign(worktree: string, part: unknown): Promise<void> {
+    const why = this.unavailableReason();
+    if (why) throw new Error(`CAD is not available on this machine: ${why}`);
+    const ref = this.refFor(worktree, part);
+    if (!existsSync(ref.dir)) throw new Error(`cad/${ref.part} does not exist`);
+    await this.manager.reload(ref);
+  }
+
+  /** The absolute file behind a `cad.design.preview` path, or undefined when it is not one (or is gone). */
+  previewFile(worktree: string, relPath: string): string | undefined {
+    const m = PREVIEW_PATH_RE.exec(relPath);
+    if (!m || isAbsolute(relPath)) return undefined;
+    let ref: PartRef;
+    try {
+      ref = this.refFor(worktree, m[1]);
+    } catch {
+      return undefined;
+    }
+    const abs = join(ref.dir, CACHE_DIR, `preview-${Number(m[2])}.glb`);
+    try {
+      // The real file must sit in the part's own cache folder: a link out of it is not served.
+      return realpathSync(abs) === abs ? abs : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private nextRev(ref: PartRef): number {
+    // Above every preview already on disk, so a daemon restart never reuses (or prunes) a newer file.
+    return Math.max(this.snapshots.get(ref.key)?.rev ?? 0, previewRevs(ref.dir).at(-1) ?? 0) + 1;
+  }
+
+  /** What is known about a part that has not been refreshed since the daemon started: the gate from
+   *  the measurement stored in `part.json`, and the newest preview left on disk. */
+  private diskSnapshot(ref: PartRef): PartSnapshot {
+    const st = this.manager.status(ref);
+    const disk = readDesignFile(ref.dir);
+    const newest = newestPreview(ref);
+    let gate: GateResult;
+    try {
+      gate = this.gateFromDisk(ref, disk.scriptSha);
+    } catch (e) {
+      gate = { state: "unverified", checks: [], warnings: [e instanceof Error ? e.message : String(e)], staleBuild: false };
+    }
+    return {
+      ref,
+      rev: newest?.rev ?? 0,
+      outcome: { ref, gate, holes: [], params: st?.params ?? [], scriptSha: disk.scriptSha, ms: 0, forced: false, ...(newest ? { preview: newest.path } : {}) },
+      by: "agent",
+      busy: st?.busy ?? false,
+    };
+  }
+
+  private ensureSnapshot(key: string, part: string): PartSnapshot {
+    let snap = this.snapshots.get(key);
+    if (!snap) this.snapshots.set(key, (snap = this.diskSnapshot(partRefOf(key, part))));
+    return snap;
+  }
+
+  /** The queue of a part started or drained: keep `cad.design.busy` true while it works. */
+  private onBusy(key: string, part: string, busy: boolean): void {
+    const armed = this.busyTimers.get(key);
+    if (armed !== undefined) this.clock.clearTimeout(armed);
+    this.busyTimers.delete(key);
+    if (busy) {
+      // Not at once: most requests finish in milliseconds and their refresh says `busy` itself.
+      this.busyTimers.set(
+        key,
+        this.clock.setTimeout(() => {
+          this.busyTimers.delete(key);
+          if (!this.manager.status(key)?.busy) return;
+          const snap = this.ensureSnapshot(key, part);
+          if (snap.busy) return;
+          snap.busy = true;
+          this.broadcast(this.designEvent(snap));
+        }, BUSY_NOTICE_MS),
+      );
+      return;
+    }
+    const snap = this.snapshots.get(key);
+    if (snap && (snap.busy || snap.waiting)) {
+      snap.busy = false;
+      snap.waiting = false;
+      this.broadcast(this.designEvent(snap));
+    }
+  }
+
+  /**
+   * `design.json` changed on disk while a request ran (§4.2): nothing was overwritten and the part is
+   * `fail`. Said at once, without touching the process — the next request reloads from disk, and it
+   * is the Rebuild (or that reload) that clears it.
+   */
+  private onConflict(key: string, part: string): void {
+    const snap = this.ensureSnapshot(key, part);
+    const gate = snap.outcome.gate;
+    snap.outcome = {
+      ...snap.outcome,
+      gate: { ...gate, state: "fail", checks: [...gate.checks.filter((c) => c.id !== "design"), { id: "design", expected: "design.json loaded as written", measured: DISK_CONFLICT_REASON, ok: false, hard: true }] },
+    };
+    this.broadcast(this.designEvent(snap));
+  }
+
+  /** A part is (or is no longer) held for a SolidCraft slot: said at once, the UI shows "waiting for a CAD slot". */
+  private onWaiting(key: string, part: string, waiting: boolean): void {
+    const snap = this.ensureSnapshot(key, part);
+    if (!!snap.waiting === waiting) return;
+    snap.waiting = waiting;
+    if (waiting) snap.busy = true;
+    this.broadcast(this.designEvent(snap));
   }
 
   /** Answer an expectations card (`cad.expectations.respond`). False when there is no such card. */
@@ -421,6 +622,7 @@ export class CadworkService {
 
   /** Deny every card parked for a session (reset, kill): a waiting tool call is released. */
   cancelSession(sessionId: string): void {
+    this.ownerNotes.delete(sessionId);
     for (const card of [...this.cards.values()]) {
       if (card.sessionId !== sessionId) continue;
       this.cards.delete(card.requestId);
@@ -447,10 +649,11 @@ export class CadworkService {
       cwd: s.ref.worktree,
       part: s.ref.part,
       rev: s.rev,
-      // `preview` is added by Phase A3 (the newest .cache/preview-<rev>.glb).
+      ...(s.outcome.preview ? { preview: s.outcome.preview } : {}),
       params: s.outcome.params,
       gate: s.outcome.gate,
       busy: s.busy,
+      ...(s.waiting ? { waiting: true } : {}),
       by: s.by,
       sessionIds: [...(this.partSessions.get(s.ref.key) ?? [])],
     };
@@ -475,7 +678,7 @@ export class CadworkService {
     const prev = this.snapshots.get(ref.key);
     const by = this.nextBy.get(ref.key) ?? "agent";
     this.nextBy.delete(ref.key);
-    const snap: PartSnapshot = { ref, rev: (prev?.rev ?? 0) + 1, outcome, by, busy: (this.manager.status(ref)?.queued ?? 0) > 0 };
+    const snap: PartSnapshot = { ref, rev: outcome.rev ?? (prev?.rev ?? 0) + 1, outcome, by, busy: (this.manager.status(ref)?.queued ?? 0) > 0 };
     this.snapshots.set(ref.key, snap);
     this.broadcast(this.designEvent(snap));
     this.syncAdoptCards(ref, outcome.gate, outcome.params);
@@ -618,6 +821,8 @@ export class CadworkService {
   /** Stop every SolidCraft process (daemon shutdown). */
   async shutdown(): Promise<void> {
     this.offProtected?.();
+    for (const t of this.busyTimers.values()) this.clock.clearTimeout(t);
+    this.busyTimers.clear();
     for (const card of [...this.cards.values()]) card.settle?.(false);
     this.cards.clear();
     await this.manager.shutdown();

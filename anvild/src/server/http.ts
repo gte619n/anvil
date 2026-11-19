@@ -1434,6 +1434,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
     }
   });
 
+  // The live CAD viewer's model (agent-cad-and-browser spec §4.3 step 4, §4.9): the preview GLB a
+  // `cad.design` event names. Not the session files route, on purpose: a part belongs to a WORKTREE
+  // (a session's cwd may be a sub-folder of it, and the parts list opens parts no session touched),
+  // and the file is git-excluded. `cwd` passes the same check as the cad.* commands, and `path` must
+  // be exactly `cad/<part>/.cache/preview-<rev>.glb` — nothing else under the worktree is reachable.
+  route("GET", "/api/cad/preview", (_req, url) => {
+    let worktree: string;
+    try {
+      worktree = supervisor.cadWorktree(url.searchParams.get("cwd") ?? "");
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
+    const abs = supervisor.cadwork.previewFile(worktree, url.searchParams.get("path") ?? "");
+    if (!abs) return new Response("not found", { status: 404 });
+    // A revision's file never changes once written (a new revision is a new name).
+    return new Response(Bun.file(abs), { headers: { "content-type": "model/gltf-binary", "cache-control": "private, max-age=3600" } });
+  });
+
   // Resolve a (possibly bare-basename) worktree path to one concrete file, or the candidates when it's
   // ambiguous. The CAD viewer calls this before loading so a prose-named chip ("model.stl" living in two
   // dirs) becomes a single concrete path — otherwise the loader AND "Download original" both dead-end on

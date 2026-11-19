@@ -140,6 +140,12 @@ export interface CadRequest {
    * atomically with the change, so no other caller's request can slip in between.
    */
   afterWrite?: (slot: SlotContext, done: { result: McpToolResult; wrote: boolean }) => void | Promise<void>;
+  /**
+   * Run the pending refresh INSIDE this request's queue slot, straight after the script write (and
+   * `afterWrite`), before the request resolves. `cad.param.set` uses it (§4.3: forced synchronously),
+   * so two owner edits queued back to back each get their own measurement and their own `cad.design`.
+   */
+  refreshAfter?: boolean;
 }
 
 export interface CadReply {
@@ -176,6 +182,10 @@ export type RefreshJob = (ctx: SlotContext & { forced: boolean }) => Promise<voi
 
 export type CadManagerEvent =
   | { type: "waiting"; key: string; part: string; waiting: boolean }
+  /** The part's queue started (true) or drained (false) — what `cad.design.busy` follows. */
+  | { type: "busy"; key: string; part: string; busy: boolean }
+  /** `design.json` changed on disk during a change: nothing was overwritten, the part is `fail`. */
+  | { type: "conflict"; key: string; part: string }
   | { type: "started"; key: string; part: string; pid?: number; replayed: boolean }
   | { type: "stopped"; key: string; part: string; reason: "idle" | "evicted" | "reload" | "exit" | "shutdown" }
   | { type: "reloaded"; key: string; part: string }
@@ -206,6 +216,8 @@ interface Job {
   resolve: (v: any) => void;
   reject: (e: Error) => void;
   refreshFirst: boolean;
+  /** Restart the process from `design.json` on disk before this job, even if the file is unchanged. */
+  reload: boolean;
 }
 
 interface PartRec {
@@ -340,6 +352,7 @@ export class CadManager {
         result = req.kind === "mutate" ? await this.call(rec, req.tool, args, timeout) : await this.undoRedo(rec, req.kind, timeout, slot.notes);
         wrote = await this.afterMutation(rec, result, req.kind, slot.notes);
         if (req.afterWrite) await req.afterWrite(slot, { result, wrote });
+        if (req.refreshAfter) await this.runRefresh(rec, slot, true);
       }
       return { result, notes: slot.notes, reloaded: slot.reloaded, waitedForSlot: slot.waitedForSlot, wrote, state: this.stateOf(rec), scriptSha: rec.scriptSha };
     });
@@ -374,6 +387,15 @@ export class CadManager {
     if (!this.refreshJob) return;
     this.rec(ref).refreshDirty = true;
     await this.enqueue(ref, async () => undefined, true);
+  }
+
+  /**
+   * Rebuild a part from `design.json` on disk (the viewer's Rebuild, `cad.design.refresh`): in queue
+   * order, the process is restarted from the file — disk wins, which also clears a disk conflict —
+   * and the refresh runs straight after. Emits `reloaded`.
+   */
+  async reload(ref: PartRef): Promise<{ notes: string[]; state: PartState }> {
+    return this.enqueue(ref, async (rec, slot) => ({ notes: slot.notes, state: this.stateOf(rec) }), true, true);
   }
 
   /** Stop every process and fail whatever is still queued. */
@@ -418,10 +440,10 @@ export class CadManager {
     return rec;
   }
 
-  private enqueue<T>(ref: PartRef, body: (rec: PartRec, slot: SlotContext) => Promise<T>, refreshFirst = false): Promise<T> {
+  private enqueue<T>(ref: PartRef, body: (rec: PartRec, slot: SlotContext) => Promise<T>, refreshFirst = false, reload = false): Promise<T> {
     if (this.closed) return Promise.reject(new CadError("shutdown", "the CAD manager is shutting down"));
     const rec = this.rec(ref);
-    const p = new Promise<T>((resolve, reject) => rec.queue.push({ body, resolve, reject, refreshFirst }));
+    const p = new Promise<T>((resolve, reject) => rec.queue.push({ body, resolve, reject, refreshFirst, reload }));
     void this.pump(rec);
     return p;
   }
@@ -431,11 +453,12 @@ export class CadManager {
     if (rec.pumping) return;
     rec.pumping = true;
     this.clearIdle(rec);
+    this.emit({ type: "busy", key: rec.ref.key, part: rec.ref.part, busy: true });
     try {
       while (rec.queue.length > 0) {
         const job = rec.queue.shift()!;
         try {
-          const slot = await this.prepare(rec);
+          const slot = await this.prepare(rec, job.reload);
           if (job.refreshFirst) await this.runRefresh(rec, slot, true);
           job.resolve(await job.body(rec, slot));
         } catch (e) {
@@ -451,6 +474,7 @@ export class CadManager {
       rec.pumping = false;
       rec.lastUsed = this.clock.now();
       this.armIdle(rec);
+      this.emit({ type: "busy", key: rec.ref.key, part: rec.ref.part, busy: false });
       this.wake(); // this part is idle now: someone waiting for a slot may evict it
     }
   }
@@ -489,15 +513,17 @@ export class CadManager {
   // ── process lifecycle ─────────────────────────────────────────────────────────────────────────
 
   /** Runs at DEQUEUE: the disk check, then make sure a process is up (waiting for a slot if needed). */
-  private async prepare(rec: PartRec): Promise<SlotContext> {
+  private async prepare(rec: PartRec, forceReload = false): Promise<SlotContext> {
     const notes: string[] = [];
     let reloaded = false;
     let waited = false;
     let disk = readDesignFile(rec.ref.dir);
-    if (rec.client?.alive && disk.sha !== rec.diskSha) {
+    const diskChanged = rec.started && disk.sha !== rec.diskSha;
+    if (rec.client?.alive && (disk.sha !== rec.diskSha || forceReload)) {
       await this.stop(rec, "reload");
       reloaded = true;
     }
+    if (forceReload) reloaded = true; // a Rebuild is a reload even when no process was up
     if (!rec.client?.alive) {
       if (rec.client) {
         // It died a moment ago and its exit has not been processed yet: give its slot back now,
@@ -521,7 +547,11 @@ export class CadManager {
       if (waited) notes.push(`This call waited for a CAD slot (at most ${this.maxProcs} SolidCraft process${this.maxProcs === 1 ? "" : "es"} run at once on this machine).`);
       if (reloaded) {
         rec.refreshDirty = true;
-        notes.push(`cad/${rec.ref.part}/design.json was changed on disk, so the design was reloaded from it before this call. Earlier undo history is gone.`);
+        notes.push(
+          forceReload && !diskChanged
+            ? `cad/${rec.ref.part} was rebuilt from design.json on disk. Earlier undo history is gone.`
+            : `cad/${rec.ref.part}/design.json was changed on disk, so the design was reloaded from it before this call. Earlier undo history is gone.`,
+        );
         this.emit({ type: "reloaded", key: rec.ref.key, part: rec.ref.part });
       }
     }
@@ -833,6 +863,7 @@ export class CadManager {
     }
     if (out.kind === "conflict") {
       rec.conflict = true;
+      this.emit({ type: "conflict", key: rec.ref.key, part: rec.ref.part });
       notes.push(
         `${DISK_CONFLICT_REASON}: cad/${rec.ref.part}/design.json was edited while this request ran, so it was NOT overwritten. ` +
           `What this request produced is in cad/${rec.ref.part}/.cache/design.conflict.json. The file on disk wins: the next call reloads the design from it.`,
