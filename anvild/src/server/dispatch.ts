@@ -333,6 +333,23 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      // Agent browser allowed sites (Phase C2). Refused with a command.error unless the "browser"
+      // feature is on. Every client of this daemon gets the `browser.sites` broadcast on a change.
+      case "browser.sites.list":
+        send(deps.supervisor.browserSitesEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.site.add":
+        deps.supervisor.browserSiteAdd(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.site.remove":
+        deps.supervisor.browserSiteRemove(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
       case "prompt.list":
         send(deps.supervisor.promptsEvent());
         if (cid) send(ack(cid));

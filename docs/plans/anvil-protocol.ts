@@ -575,10 +575,38 @@ export interface McpIntegrationStatus extends McpIntegration {
   health: McpHealth;
   heldBy?: SessionId; // the session holding the exclusive lock
   checkedAt: number; // ms since epoch of the last health probe (0 = never probed)
+  /** Present on a `browser` integration only ("browser" capability): how the agent browser would
+   *  start on this machine, and whether its network block can run. Additive. */
+  browser?: BrowserIntegrationInfo;
 }
 export interface McpIntegrationsEvent extends Envelope {
   type: "mcp.integrations";
   integrations: McpIntegrationStatus[];
+}
+
+// ── Agent browser (agent-cad-and-browser spec, Phase C2). Behind the "browser" capability. ────────
+export interface BrowserIntegrationInfo {
+  /** `headed`: the installed Chrome with the dedicated profile, on the logged-in desktop.
+   *  `headless`: no desktop session (or a headed launch failed) — a throwaway profile. */
+  mode: "headed" | "headless";
+  /** Why that mode, in words fit to show. */
+  modeReason: string;
+  /** The loopback proxy that is the browser's only route out. `stopped` = the browser cannot start. */
+  proxy: { state: "ready" | "stopped"; reason?: string; sessions: number };
+}
+/** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
+ *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
+export interface BrowserSite {
+  site: string;
+  addedAt: number; // ms since epoch
+}
+/** The allowed-sites list. Hub-authoritative and hub-synced: the hub stores it and pushes it to every
+ *  member; each daemon keeps a local copy and broadcasts this to its own clients. `pending` counts
+ *  changes made on a member that the hub has not confirmed yet. */
+export interface BrowserSitesEvent extends Envelope {
+  type: "browser.sites";
+  sites: BrowserSite[];
+  pending?: number;
 }
 /**
  * A saved prompt snippet the user fires into the composer with one click (a sidebar button). Stored
@@ -1485,6 +1513,7 @@ export type ServerEvent =
   | BudgetEvent
   | EnvironmentsEvent
   | McpIntegrationsEvent
+  | BrowserSitesEvent
   | PromptsEvent
   | ModelLabelsEvent
   | ClaudeCliStatusEvent
@@ -1792,6 +1821,20 @@ export interface SessionSetMcpIntegrationsCmd extends Envelope, Correlated {
   type: "session.set_mcp_integrations";
   sessionId: SessionId;
   ids: string[];
+}
+/** Agent browser allowed sites ("browser" capability). Hub-authoritative: clients send these to the
+ *  hub; a member that receives one applies it locally and forwards it to the hub. Client commands
+ *  only — nothing inside a session can add a site (a session asks through its permission card). */
+export interface BrowserSitesListCmd extends Envelope, Correlated {
+  type: "browser.sites.list"; // reply: a fresh `browser.sites`
+}
+export interface BrowserSiteAddCmd extends Envelope, Correlated {
+  type: "browser.site.add";
+  site: string; // a hostname or URL; stored as its registrable domain
+}
+export interface BrowserSiteRemoveCmd extends Envelope, Correlated {
+  type: "browser.site.remove";
+  site: string;
 }
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
@@ -2192,6 +2235,9 @@ export type ClientCommand =
   | McpIntegrationRemoveCmd
   | McpIntegrationCheckCmd
   | SessionSetMcpIntegrationsCmd
+  | BrowserSitesListCmd
+  | BrowserSiteAddCmd
+  | BrowserSiteRemoveCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd

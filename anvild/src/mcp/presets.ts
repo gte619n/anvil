@@ -7,7 +7,7 @@
  * `registerMcpPreset`) and its own approval model through `registerMcpKindGate` (agent/mcp-gate.ts);
  * until a kind is registered, `mcp.integration.add` refuses it.
  */
-import type { McpIntegration, McpIntegrationKind, McpTransport, Session as SessionData } from "@protocol";
+import type { McpHealth, McpIntegration, McpIntegrationKind, McpIntegrationStatus, McpTransport, Session as SessionData } from "@protocol";
 
 export interface McpPresetContext {
   session: SessionData;
@@ -29,6 +29,16 @@ export interface McpPreset {
    * integration out of this session with a reason the owner sees.
    */
   resolveTransport?: (integration: McpIntegration, ctx: McpPresetContext) => McpTransport | { skip: string };
+  /** The kind defines its own key, transport and `exclusive`: `mcp.integration.add` takes them from
+   *  `defaults()` whatever the client sent, and `update` cannot change them. */
+  fixed?: boolean;
+  /** A health check beyond the generic one (which only resolves the command on PATH). Consulted when
+   *  the generic probe says `ready`; its answer replaces it. */
+  health?: (integration: McpIntegration) => McpHealth;
+  /** Extra fields for this kind's rows in `mcp.integrations` (the browser's mode and proxy state). */
+  statusExtra?: (integration: McpIntegration) => Partial<McpIntegrationStatus>;
+  /** The operator pressed Check: clear whatever the kind was holding against a retry. */
+  onCheck?: (integration: McpIntegration) => void;
 }
 
 const presets = new Map<McpIntegrationKind, McpPreset>();

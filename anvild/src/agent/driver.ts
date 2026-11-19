@@ -75,9 +75,10 @@ export class AgentDriver {
    *  card once the write's tool.result confirms success (UI refinement §8). */
   private readonly pendingOffers = new Map<string, string>();
 
-  /** In-flight MCP integration calls (toolUseId → server key), so their tool.result can refresh the
-   *  integration's exclusive lock (mcp-integrations spec §4.5). */
-  private readonly mcpCalls = new Map<string, string>();
+  /** In-flight MCP integration calls (toolUseId → server key, tool and input), so their tool.result
+   *  can refresh the integration's exclusive lock (mcp-integrations spec §4.5) and be handed, paired
+   *  with its call, to the integration kind's result hook (agent-cad-and-browser Phase C2). */
+  private readonly mcpCalls = new Map<string, { key: string; tool: string; input: Record<string, unknown> }>();
 
   constructor(
     private readonly session: Session,
@@ -328,15 +329,15 @@ export class AgentDriver {
       for (const b of content) {
         if (b?.type !== "tool_use" || typeof b.name !== "string" || typeof b.id !== "string") continue;
         if (isInProcessTool(b.name, inProcessKeys(this.mcpServers))) continue;
-        const key = parseMcpTool(b.name)?.key;
-        if (key) this.mcpCalls.set(b.id, key);
+        const parsed = parseMcpTool(b.name);
+        if (parsed) this.mcpCalls.set(b.id, { key: parsed.key, tool: parsed.tool, input: b.input && typeof b.input === "object" ? (b.input as Record<string, unknown>) : {} });
       }
     } else if (msg.type === "user") {
       for (const b of content) {
-        const key = b?.type === "tool_result" && typeof b.tool_use_id === "string" ? this.mcpCalls.get(b.tool_use_id) : undefined;
-        if (!key) continue;
+        const call = b?.type === "tool_result" && typeof b.tool_use_id === "string" ? this.mcpCalls.get(b.tool_use_id) : undefined;
+        if (!call) continue;
         this.mcpCalls.delete(b.tool_use_id);
-        this.mcpGate.onToolResult(this.session, key);
+        this.mcpGate.onToolResult(this.session, call.key, { tool: call.tool, input: call.input, content: b.content, isError: b.is_error === true });
       }
     }
   }

@@ -300,7 +300,7 @@ async function decideMcp(
     }
   }
   if (verdict?.kind === "deny") return { behavior: "deny", reason: verdict.reason };
-  if (verdict?.kind === "allow") return finish(input, verdict.reason ?? `${integration.label}: allowed`);
+  if (verdict?.kind === "allow") return finish(verdict.updatedInput ?? input, verdict.reason ?? `${integration.label}: allowed`);
 
   const bypass = session.data.autonomy === "bypass";
   if (verdict?.kind === "prompt") {
@@ -309,7 +309,12 @@ async function decideMcp(
       return { behavior: "deny", reason: `${verdict.reason} (denied: this session is unattended)` };
     }
     const ans = await ask(verdict.suggestions);
-    if (ans.decision === "deny") return { behavior: "deny", reason: `denied by user (${verdict.reason})` };
+    if (ans.decision === "deny") {
+      // The kind may answer a refusal with something safe in place of the call (same tool, its input).
+      const instead = verdict.onDeny?.();
+      if (instead && "allow" in instead) return finish(instead.allow.updatedInput, instead.allow.reason ?? `denied by user (${verdict.reason})`);
+      return { behavior: "deny", reason: instead && "deny" in instead ? instead.deny : `denied by user (${verdict.reason})` };
+    }
     const after = verdict.onAnswer?.(ans.decision);
     if (after && "deny" in after) return { behavior: "deny", reason: after.deny };
     return finish(ans.updatedInput ?? input, verdict.reason);

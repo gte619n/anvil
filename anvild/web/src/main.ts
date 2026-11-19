@@ -104,7 +104,7 @@ import {
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
 // The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
 // Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
-import { initMcp, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
+import { initMcp, onBrowserSites, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
 import { initLoops, onLoopRun, onLoopRuns, onLoopsHome, onLoopsList, onLoopUpdated, openLoops, openLoopsDeepLink } from "./loops";
 import {
   closeSettings,
@@ -1617,6 +1617,10 @@ function onEvent(url: string, e: ServerEvent): void {
     case "mcp.integrations":
       // Per machine, never merged: each server's list is kept under its own url.
       onMcpIntegrations(url, e.integrations);
+      return;
+    case "browser.sites":
+      // Each daemon sends its own copy of the fleet's list; Settings shows the hub's (mcp.ts).
+      onBrowserSites(url, e.sites, e.pending ?? 0);
       return;
     case "prompts":
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's

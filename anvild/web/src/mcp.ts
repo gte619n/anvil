@@ -16,10 +16,22 @@
 import { $, esc, icon } from "./dom";
 import { closeModal, confirmDialog, showModal, toast, toggleHeaderMenu, type HeaderMenuItem } from "./dialogs";
 import { newCid } from "./outbox";
-import { orderedServers, sendTo, serverOf, serverSupports, type Server } from "./fleet";
-import type { McpIntegration, McpIntegrationKind, McpIntegrationStatus, ServerEvent, Session } from "../../protocol";
+import { HUB_URL, orderedServers, sendTo, serverOf, serverSupports, servers, type Server } from "./fleet";
+import type { BrowserIntegrationInfo, BrowserSite, McpIntegration, McpIntegrationKind, McpIntegrationStatus, ServerEvent, Session } from "../../protocol";
 
 export const MCP_CAPABILITY = "mcp-integrations";
+/** The agent browser (Phase C2): the Browser preset on the Add menu, and the allowed-sites list. */
+export const BROWSER_CAPABILITY = "browser";
+/** What "Add → Browser" sends. The daemon fixes the key, command and exclusivity itself (its preset
+ *  is the authority); this only has to name the kind. */
+export const BROWSER_INTEGRATION: Omit<McpIntegration, "id"> = {
+  key: "browser",
+  kind: "browser",
+  label: "Browser",
+  transport: { type: "stdio", command: "npx", args: ["-y", "@playwright/mcp@0.0.86"] },
+  exclusive: true,
+  enabled: true,
+};
 /** Mirrors the daemon's key grammar (src/mcp/validate.ts) so the form can say what is wrong at once. */
 export const MCP_KEY_RE = /^[a-z][a-z0-9]{1,23}$/;
 
@@ -40,6 +52,9 @@ export function initMcp(deps: McpDeps): void {
 
 /** Each server's integrations, keyed by server url (they are per machine, never merged). */
 export const serverMcp = new Map<string, McpIntegrationStatus[]>();
+/** Each server's copy of the fleet's allowed-sites list (`browser.sites`), keyed by server url. The
+ *  hub's copy is the authority; a member's is what the hub last pushed plus its own unconfirmed changes. */
+export const serverSites = new Map<string, { sites: BrowserSite[]; pending: number }>();
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -63,6 +78,18 @@ export function healthView(i: McpIntegrationStatus): { cls: "connected" | "disco
   return { cls: "disconnected", text: `Unavailable: ${i.health.reason}` };
 }
 
+/** The two lines a browser integration's row adds: how it would start here, and its network block. */
+export function browserInfoView(b: BrowserIntegrationInfo): { mode: string; proxy: string; proxyOk: boolean } {
+  const proxyOk = b.proxy.state === "ready";
+  return {
+    mode: b.modeReason,
+    proxyOk,
+    proxy: proxyOk
+      ? `Network block ready${b.proxy.sessions ? ` (${b.proxy.sessions} session${b.proxy.sessions === 1 ? "" : "s"})` : ""}: private, local and fleet addresses are refused`
+      : `Network block stopped: ${b.proxy.reason ?? "unknown"}. The browser cannot start without it.`,
+  };
+}
+
 /** What the transport looks like on a row: the command line, or the URL. */
 export function transportText(i: McpIntegration): string {
   return i.transport.type === "http" ? i.transport.url : [i.transport.command, ...i.transport.args].join(" ");
@@ -83,6 +110,12 @@ export function mcpRowHtml(i: McpIntegrationStatus, heldByTitle?: string): strin
     </div>
     <div class="small muted mcp-health">${esc(h.text)}${i.exclusive ? " · one session at a time" : ""}</div>
     ${i.heldBy ? `<div class="small mcp-held">${icon("lock")} In use by ${esc(heldByTitle ?? "another session")}</div>` : ""}
+    ${
+      i.browser
+        ? ((v) => `<div class="small muted mcp-browser-mode" data-mode="${esc(i.browser!.mode)}">${icon(i.browser!.mode === "headed" ? "desktop_windows" : "visibility_off")} ${esc(v.mode)}</div>
+    <div class="small mcp-browser-proxy${v.proxyOk ? " muted" : " bad"}" data-proxy="${esc(i.browser!.proxy.state)}">${icon(v.proxyOk ? "shield" : "gpp_bad")} ${esc(v.proxy)}</div>`)(browserInfoView(i.browser))
+        : ""
+    }
     <div class="small muted mcp-transport"><code>${esc(transportText(i))}</code></div>
   </div>`;
 }
@@ -189,6 +222,12 @@ export function toolsMenuModel(s: Session, list: readonly McpIntegrationStatus[]
 
 // ── Event intake ─────────────────────────────────────────────────────────────────────────────────
 
+/** `browser.sites` from one server: keep that server's copy, repaint the list if it is showing. */
+export function onBrowserSites(url: string, sites: BrowserSite[], pending = 0): void {
+  serverSites.set(url, { sites, pending });
+  if (document.getElementById("browser-sites-panel")) renderBrowserSites();
+}
+
 /** `mcp.integrations` from one server: replace that server's list, repaint what shows it. */
 export function onMcpIntegrations(url: string, list: McpIntegrationStatus[]): void {
   serverMcp.set(url, list);
@@ -220,7 +259,67 @@ export function mcpSectionShellHtml(): string {
     <p class="small muted">Local tool servers (MCP) a session can switch on from its Tools menu. Each call asks first, until you allow that integration for the session.</p>
     <div id="mcp-panel"></div>
     <p class="small muted mcp-warning">${icon("warning")} Third-party servers run as the daemon's user.</p>
+    <div id="browser-sites-section" hidden>
+      <div class="section-head" style="margin-top:1.25rem"><h3>Browser: allowed sites</h3></div>
+      <p class="small muted">Sites the agent browser may open without asking, in every session on every machine. Anything else asks first. Private, local and fleet addresses are always refused.</p>
+      <div id="browser-sites-panel"></div>
+    </div>
   </div>`;
+}
+
+// ── Settings → Integrations: the browser's allowed sites ─────────────────────────────────────────
+
+/** The server whose list is shown and edited: the hub when it has the browser, else the first
+ *  machine that does (a fleet whose hub is older). */
+export function sitesServer(): Server | undefined {
+  const hubSrv = servers.get(HUB_URL);
+  if (serverSupports(hubSrv, BROWSER_CAPABILITY)) return hubSrv;
+  return orderedServers().find((s) => serverSupports(s, BROWSER_CAPABILITY));
+}
+
+export function browserSitesHtml(sites: readonly BrowserSite[], pending: number): string {
+  const rows = sites.length
+    ? sites
+        .map(
+          (s) => `<div class="card browser-site-row" data-site="${esc(s.site)}"><div class="card-main">${icon("public")} <b>${esc(s.site)}</b>
+        <span class="mcp-row-actions"><button type="button" class="mini browser-site-remove" title="Stop allowing ${esc(s.site)}; the next visit asks again">${icon("delete")} Remove</button></span></div></div>`,
+        )
+        .join("")
+    : `<div class="card"><span class="small muted">No sites yet. Answer “Always allow” on a browser prompt, or add one here.</span></div>`;
+  return `${rows}
+    ${pending ? `<p class="small muted browser-sites-pending">${icon("sync")} ${pending} change${pending === 1 ? "" : "s"} waiting to reach the hub.</p>` : ""}
+    <div class="card-main browser-site-add-row"><input id="browser-site-input" type="text" autocapitalize="off" spellcheck="false" placeholder="example.com" />
+      <button type="button" class="mini" id="browser-site-add">${icon("add")} Allow site</button></div>`;
+}
+
+export function renderBrowserSites(): void {
+  const section = document.getElementById("browser-sites-section");
+  const host = document.getElementById("browser-sites-panel");
+  if (!section || !host) return;
+  const srv = sitesServer();
+  section.hidden = !srv;
+  if (!srv) {
+    host.innerHTML = "";
+    return;
+  }
+  const state = serverSites.get(srv.url) ?? { sites: [], pending: 0 };
+  host.innerHTML = browserSitesHtml(state.sites, state.pending);
+  host.querySelectorAll<HTMLElement>(".browser-site-row").forEach((row) => {
+    const site = row.dataset.site!;
+    row.querySelector<HTMLButtonElement>(".browser-site-remove")?.addEventListener("click", async () => {
+      if (await sendMcp(srv, { type: "browser.site.remove", site })) toast(`${site} will ask again.`);
+    });
+  });
+  const input = host.querySelector<HTMLInputElement>("#browser-site-input");
+  const add = async (): Promise<void> => {
+    const site = input?.value.trim() ?? "";
+    if (!site) return;
+    if (await sendMcp(srv, { type: "browser.site.add", site })) toast(`Allowed ${site}.`);
+  };
+  host.querySelector<HTMLButtonElement>("#browser-site-add")?.addEventListener("click", () => void add());
+  input?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") void add();
+  });
 }
 
 export function renderMcpPanel(): void {
@@ -229,6 +328,7 @@ export function renderMcpPanel(): void {
   if (!section || !host) return;
   const list = mcpServers();
   section.hidden = list.length === 0;
+  renderBrowserSites();
   if (!list.length) {
     host.innerHTML = "";
     return;
@@ -241,8 +341,7 @@ export function renderMcpPanel(): void {
     if (!srv) return;
     sec.querySelector<HTMLButtonElement>(".mcp-check")?.addEventListener("click", () => void sendMcp(srv, { type: "mcp.integration.check" }));
     sec.querySelector<HTMLButtonElement>(".mcp-add")?.addEventListener("click", (ev) => {
-      // One preset in this build; the menu is where later presets (the browser) appear.
-      toggleHeaderMenu(ev.currentTarget as HTMLElement, [{ icon: "terminal", label: "Custom", title: "A stdio command or a local http server", run: () => showAddCustom(srv) }]);
+      toggleHeaderMenu(ev.currentTarget as HTMLElement, addMenuItems(srv));
     });
     sec.querySelectorAll<HTMLElement>(".mcp-row").forEach((row) => {
       const i = (serverMcp.get(srv.url) ?? []).find((x) => x.id === row.dataset.mcpId);
@@ -261,6 +360,22 @@ export function renderMcpPanel(): void {
       });
     });
   });
+}
+
+/** The Add menu for one machine: Browser (when the machine has the browser feature and no browser
+ *  integration yet), then Custom. */
+export function addMenuItems(srv: Server): HeaderMenuItem[] {
+  const items: HeaderMenuItem[] = [];
+  if (serverSupports(srv, BROWSER_CAPABILITY) && !(serverMcp.get(srv.url) ?? []).some((i) => i.kind === "browser")) {
+    items.push({
+      icon: "travel_explore",
+      label: "Browser",
+      title: "The agent browser: Chrome through Anvil's network block, asking before each new site",
+      run: () => void sendMcp(srv, { type: "mcp.integration.add", integration: BROWSER_INTEGRATION }).then((ok) => ok && toast("Added the agent browser. Switch it on from a session's Tools menu.")),
+    });
+  }
+  items.push({ icon: "terminal", label: "Custom", title: "A stdio command or a local http server", run: () => showAddCustom(srv) });
+  return items;
 }
 
 /** Send one `mcp.*` command and surface a refusal as a toast. Resolves true on success. */

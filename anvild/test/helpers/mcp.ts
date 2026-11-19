@@ -86,13 +86,13 @@ export interface McpRig {
   cleanup(): Promise<void>;
 }
 
-export function mcpRig(opts: { features?: string[]; stateDir?: string } = {}): McpRig {
+export function mcpRig(opts: { features?: string[]; stateDir?: string; browser?: NonNullable<ConstructorParameters<typeof Supervisor>[0]["mcp"]>["browser"]; realProber?: boolean } = {}): McpRig {
   const dir = opts.stateDir ?? mkdtempSync(join(tmpdir(), "anvil-mcp-"));
   const registry = new RecordingRegistry();
   const clock = fakeClock();
   const prober = fakeProber();
   const sup = new Supervisor(
-    { stateDir: dir, envFile: join(dir, "env"), features: opts.features ?? ["mcp-integrations"], mcp: { prober, clock, intervalMs: 0 } },
+    { stateDir: dir, envFile: join(dir, "env"), features: opts.features ?? ["mcp-integrations"], mcp: { ...(opts.realProber ? {} : { prober }), clock, intervalMs: 0, browser: opts.browser } },
     registry,
   );
   return {
@@ -121,10 +121,21 @@ export interface HookOutcome {
 
 /** Call the PreToolUse hook directly, as the SDK would. Resolves when the hook decides. */
 export function callHook(session: Session, broker: PermissionBroker, tool: string, mcp: McpHookContext | undefined, input: Record<string, unknown> = {}): Promise<HookOutcome> {
+  return callHookFull(session, broker, tool, mcp, input).then(({ decision, reason }) => ({ decision, reason }));
+}
+
+export interface FullHookOutcome extends HookOutcome {
+  /** The input the tool will actually run with (the gate may have replaced it). */
+  updatedInput?: Record<string, unknown>;
+}
+
+/** As `callHook`, and also returns the input the hook hands back to the SDK. */
+export function callHookFull(session: Session, broker: PermissionBroker, tool: string, mcp: McpHookContext | undefined, input: Record<string, unknown> = {}): Promise<FullHookOutcome> {
   const hook = makePreToolUseHook(session, broker, undefined, mcp);
   return (hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input } as never, "tu", { signal: new AbortController().signal }) as Promise<any>).then((out) => ({
     decision: out.hookSpecificOutput.permissionDecision,
     reason: out.hookSpecificOutput.permissionDecisionReason,
+    updatedInput: out.hookSpecificOutput.updatedInput,
   }));
 }
 

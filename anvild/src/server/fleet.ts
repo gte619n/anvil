@@ -595,7 +595,7 @@ export async function ackPair(opts: {
  * HTTP request to an HTTPS server") — silently stranding the member without a token forever. Trying
  * both schemes lets propagation self-correct a stale registry entry.
  */
-function memberBases(m: { url: string; host?: string }): string[] {
+export function memberBases(m: { url: string; host?: string }): string[] {
   let host = m.host ?? "";
   let port = "7701";
   try {

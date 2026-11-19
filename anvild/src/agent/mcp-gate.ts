@@ -36,14 +36,27 @@ export interface McpSessionGate {
   isAllowed(session: McpGateSession, integration: McpIntegration): boolean;
   /** Record "Always allow <label> this session" (persists + broadcasts the session). */
   rememberAllowed(session: McpGateSession, integration: McpIntegration): void;
-  /** A tool result arrived from `key`: refresh the lock so a long call does not count as idle. */
-  onToolResult(session: McpGateSession, key: string): void;
+  /** A tool result arrived from `key`: refresh the lock so a long call does not count as idle, and
+   *  hand the result to the integration kind's result hook (Phase C2: the browser reads the page URL
+   *  out of it). `result` is absent when the driver could not pair the result with its call. */
+  onToolResult(session: McpGateSession, key: string, result?: McpToolResult): void;
   /** The session-init message's `mcp_servers` list: record servers the SDK reported `failed`. */
   onInit(session: McpGateSession, servers: { name: string; status: string }[]): void;
   /** A turn ended with a result: release this session's locks and apply any deferred driver rebuild. */
   onTurnEnd(session: McpGateSession): void;
   /** The driver's consume loop exited (error or stop): release this session's locks. */
   onConsumeExit(session: McpGateSession): void;
+}
+
+/** One finished integration tool call, as the driver saw it on the SDK stream. */
+export interface McpToolResult {
+  /** The tool's own name, without the `mcp__<key>__` prefix. */
+  tool: string;
+  /** The input the MODEL sent (before any rewrite by the gate). */
+  input: Record<string, unknown>;
+  /** The result's `content` exactly as the SDK delivered it (a string, or content blocks). */
+  content: unknown;
+  isError: boolean;
 }
 
 /** What the driver hands the PreToolUse hook. Passing it at all switches the MCP branch on; a hook
@@ -93,8 +106,9 @@ export type McpKindVerdict =
   /** Refuse outright, whatever the policy. */
   | { kind: "deny"; reason: string }
   /** Run with no prompt (the kind already holds an approval that covers this call). The exclusive
-   *  lock is still taken. */
-  | { kind: "allow"; reason?: string }
+   *  lock is still taken. `updatedInput` REPLACES the tool's input (Phase C2: the browser turns a
+   *  navigation into one to `about:blank` after the owner refused a site). */
+  | { kind: "allow"; reason?: string; updatedInput?: Record<string, unknown> }
   | {
       /** Park a card with the kind's own choices. */
       kind: "prompt";
@@ -109,6 +123,10 @@ export type McpKindVerdict =
        *  (e.g. "Allow <site> this session"). `allow_always` is NOT recorded in `session.mcpAllowed`
        *  for a kind prompt — its meaning belongs to the kind. Return `{ deny }` to refuse after all. */
       onAnswer?: (decision: PermissionDecision) => void | { deny: string };
+      /** Called when the owner answers Deny. The call is denied with the returned `deny` text (or the
+       *  default one); returning `allow` instead runs the SAME tool with a replacement input — the
+       *  kind's way of doing something safe in place of the refused call. */
+      onDeny?: () => void | { deny: string } | { allow: { updatedInput: Record<string, unknown>; reason?: string } };
     };
 
 export type McpKindGate = (ctx: McpKindGateContext) => McpKindVerdict | Promise<McpKindVerdict>;
@@ -128,7 +146,32 @@ export function mcpKindGate(kind: McpIntegrationKind): McpKindGate | undefined {
   return kindGates.get(kind);
 }
 
-/** Test-only: drop every registered kind gate. */
+/** Test-only: drop every registered kind gate and result hook. */
 export function resetMcpKindGatesForTest(): void {
   kindGates.clear();
+  kindResultHooks.clear();
+}
+
+// ── Per-kind result hooks ───────────────────────────────────────────────────────────────────────
+// The other half of a kind's approval model: what it learns from each tool RESULT. The registry
+// (`McpSessionGate.onToolResult`) calls the hook of the integration's kind after refreshing the lock.
+
+export interface McpKindResultContext {
+  session: McpGateSession;
+  integration: McpIntegration;
+  result: McpToolResult;
+}
+export type McpKindResultHook = (ctx: McpKindResultContext) => void;
+
+const kindResultHooks = new Map<McpIntegrationKind, McpKindResultHook>();
+
+export function registerMcpKindResultHook(kind: McpIntegrationKind, hook: McpKindResultHook): () => void {
+  kindResultHooks.set(kind, hook);
+  return () => {
+    if (kindResultHooks.get(kind) === hook) kindResultHooks.delete(kind);
+  };
+}
+
+export function mcpKindResultHook(kind: McpIntegrationKind): McpKindResultHook | undefined {
+  return kindResultHooks.get(kind);
 }

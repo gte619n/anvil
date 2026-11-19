@@ -56,6 +56,7 @@ import {
   type ResumeWatermarksEvent,
   type TelemetrySnapshotEvent,
   type McpIntegrationsEvent,
+  type BrowserSitesEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
@@ -92,7 +93,7 @@ import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
-import { McpIntegrationService } from "./mcp-integration-service";
+import { McpIntegrationService, type McpIntegrationServiceDeps } from "./mcp-integration-service";
 import type { McpProber } from "../mcp/health";
 import type { McpIntegrationFields, McpIntegrationInput } from "../mcp/store";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -186,7 +187,7 @@ export interface SupervisorConfig {
    *  read here: it switches the MCP integration registry on. */
   features?: readonly string[];
   /** Test seams for the MCP integration registry (fake prober / fake clock / no timer). */
-  mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number };
+  mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number; browser?: McpIntegrationServiceDeps["browser"] };
 }
 
 /**
@@ -339,6 +340,8 @@ export class Supervisor {
     this.mcp = new McpIntegrationService({
       stateDir: cfg.stateDir,
       enabled: featureEnabled(cfg, "mcp-integrations"),
+      browserEnabled: featureEnabled(cfg, "browser"),
+      browser: cfg.mcp?.browser,
       broadcast: (event) => this.registry.toAll(event),
       clientCount: () => this.registry.all().length,
       sessions: () => this.sessions.values(),
@@ -859,6 +862,29 @@ export class Supervisor {
   }
   setSessionMcpIntegrations(sessionId: string, ids: string[]): void {
     this.mcp.setSessionIntegrations(sessionId, ids);
+  }
+
+  // ── Agent browser allowed sites (Phase C2) — delegated to the browser's AllowedSitesService ───
+  private requireBrowser(): NonNullable<McpIntegrationService["browser"]> {
+    if (!this.mcp.browser) throw new BadCommand("the agent browser is not enabled on this server");
+    return this.mcp.browser;
+  }
+  browserSitesEvent(): BrowserSitesEvent {
+    return this.requireBrowser().sites.event();
+  }
+  browserSiteAdd(site: string): void {
+    try {
+      this.requireBrowser().sites.add(site);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  browserSiteRemove(site: string): void {
+    try {
+      this.requireBrowser().sites.remove(site);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
   }
 
   /**

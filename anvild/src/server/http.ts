@@ -23,6 +23,7 @@ import { bindDegradeStateDir } from "../auth/degrade";
 import { setClaudeToken } from "../auth/store";
 import { setOpenRouterKey } from "../auth/openrouter";
 import { FleetStore } from "../fleet/store";
+import type { SitesOpBody, SitesOpReply, SitesSyncBody, SitesSyncReply } from "../browser/sites-sync";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import { serveCad } from "../cad/service";
@@ -167,6 +168,9 @@ export interface ServerOptions {
   /** [BE2-15] Test-only override of the caller-identity resolver (the real one shells out to the
    *  tailscale CLI, which makes identity-gated routes untestable hermetically). */
   resolveIdentity?: () => Promise<{ trust: PeerTrust; reject?: string }>;
+  /** Test-only override of this daemon's base URL as other machines reach it — what a hub tells its
+   *  members so they can forward allowed-site approvals (the real one shells out to `tailscale`). */
+  selfBaseUrl?: () => Promise<string | undefined>;
 }
 
 /** The fleet fan-out network surface the rotate/invite paths reach the tailnet through ([BE2-15]). */
@@ -242,6 +246,15 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     registry,
   );
+
+  // Agent browser (Phase C2; only with the "browser" feature on): hand its allowed-sites sync the
+  // fleet — who the members are, which hub paired this machine, and where this daemon answers.
+  supervisor.mcp.browser?.setFleet({
+    selfServerId: identity.serverId,
+    members: () => fleet.list().map((m) => ({ url: m.url, host: m.host, serverId: m.serverId })),
+    pairedHubId: () => pairedHub.get()?.hubServerId ?? null,
+    selfUrl: opts.selfBaseUrl ?? (() => supervisor.selfBaseUrl()),
+  });
 
   // Frozen update API v1 (stable-update-service spec §4.3). The state store persists the pre-pull SHA +
   // phase across the very restart it coordinates; `settleAfterBoot` is the in-daemon half of the
@@ -503,6 +516,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (supervisor.mcp.enabled) {
         ws.send(JSON.stringify(supervisor.mcpIntegrationsEvent()));
         supervisor.mcp.onClientConnected();
+      }
+      // Agent browser allowed sites ("browser" feature only). A client connecting to the hub is also
+      // a cue to push the list to members and collect what they queued while unreachable.
+      if (supervisor.mcp.browser) {
+        ws.send(JSON.stringify(supervisor.browserSitesEvent()));
+        void supervisor.mcp.browser.sites.syncNow();
       }
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
@@ -994,6 +1013,30 @@ export function createServer(opts: ServerOptions): ServerHandle {
     } catch (e) {
       return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies rest.FleetHandoffResponse, { status: 400 });
     }
+  });
+
+  // Agent browser allowed-sites sync (agent-cad-and-browser §4.14 item 43; src/browser/sites-sync.ts).
+  // Both routes answer 404 unless the "browser" feature is on.
+  //  - /sync: the hub pushes the authoritative list to this member. Same gate as the fleet-repo
+  //    routes: not a proven different tailnet user, and the caller names the hub that paired us.
+  //  - /op: a member forwards approvals made on it to this hub. The caller must name a member in
+  //    this hub's fleet.
+  route("POST", "/api/browser/sites/sync", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesSyncReply, { status: 404 });
+    const body = await jsonBody<SitesSyncBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    return Response.json(browser.sites.receiveSync({ hubServerId: body.hubServerId!, hubUrl: body.hubUrl, sites: body.sites ?? [], confirmed: body.confirmed }) satisfies SitesSyncReply);
+  });
+  route("POST", "/api/browser/sites/op", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesOpReply, { status: 404 });
+    const body = await jsonBody<SitesOpBody>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies SitesOpReply, { status: 403 });
+    if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies SitesOpReply, { status: 403 });
+    return Response.json(browser.sites.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies SitesOpReply);
   });
 
   // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token

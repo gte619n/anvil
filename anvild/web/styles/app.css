@@ -328,6 +328,13 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .mcp-row .mcp-held .msym { font-size: 15px; }
 .mcp-row .mcp-toggle[aria-checked="true"] .msym { color: var(--accent); }
 .mcp-server-head { margin: 10px 0 8px; }
+.mcp-row .mcp-browser-mode, .mcp-row .mcp-browser-proxy { margin-top: 6px; display: flex; align-items: center; gap: 4px; overflow-wrap: anywhere; }
+.mcp-row .mcp-browser-mode .msym, .mcp-row .mcp-browser-proxy .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-row .mcp-browser-proxy.bad { color: var(--danger); }
+.browser-site-row .card-main { display: flex; align-items: center; gap: 6px; }
+.browser-site-add-row { margin-top: 8px; gap: 6px; }
+.browser-site-add-row input { flex: 1; min-width: 0; }
+.browser-sites-pending { display: flex; align-items: center; gap: 4px; }
 .mcp-warning { display: flex; align-items: center; gap: 6px; }
 .modal-box label[hidden] { display: none; } /* [hidden] loses to `.modal-box label { display: block }` — the Add-integration dialog swaps its Command/URL rows */
 .mcp-warning .msym { font-size: 16px; color: var(--danger); }

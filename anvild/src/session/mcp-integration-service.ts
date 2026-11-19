@@ -13,8 +13,11 @@ import type { McpSdkServerConfigWithInstance, McpServerConfig } from "@anthropic
 import { PROTOCOL_VERSION, type McpIntegration, type McpIntegrationStatus, type McpIntegrationsEvent, type ServerEvent, type Session as SessionData } from "@protocol";
 import { now } from "../util/envelope";
 import { buildMcpServers, isOrdinarySession, type McpChildEnv } from "../agent/mcp-external";
-import type { McpGateSession, McpSessionGate } from "../agent/mcp-gate";
-import { McpHealthTracker, type McpProbeTrigger, type McpProber } from "../mcp/health";
+import { mcpKindResultHook, type McpGateSession, type McpSessionGate } from "../agent/mcp-gate";
+import { BrowserService, isBrowserPreset, type BrowserServiceDeps } from "../browser/service";
+import { mcpPreset } from "../mcp/presets";
+import { defaultMcpChildEnv } from "../agent/mcp-external";
+import { McpHealthTracker, defaultMcpProber, type McpProbeTrigger, type McpProber } from "../mcp/health";
 import { McpLock } from "../mcp/lock";
 import { McpIntegrationStore, type McpIntegrationFields, type McpIntegrationInput } from "../mcp/store";
 import { BadCommand } from "./errors";
@@ -30,6 +33,11 @@ export interface McpIntegrationServiceDeps {
   stateDir: string;
   /** Whether the "mcp-integrations" feature is switched on (`ANVIL_FEATURES`). */
   enabled: boolean;
+  /** Whether the "browser" feature is ALSO on. Only then does the browser preset exist on this daemon
+   *  (its proxy, its allowed-sites list, its gate); otherwise nothing of it is created or written. */
+  browserEnabled?: boolean;
+  /** Test seams for the browser (fake desktop probe, resolver, …). */
+  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs">>;
   /** Send an event to every connected client. */
   broadcast: (event: ServerEvent) => void;
   /** How many clients are connected — the health loop only runs while there is one. */
@@ -61,6 +69,8 @@ export class McpIntegrationService {
   readonly store: McpIntegrationStore;
   readonly lock: McpLock;
   readonly health: McpHealthTracker;
+  /** The agent browser (Phase C2). Defined only with both "mcp-integrations" and "browser" on. */
+  readonly browser: BrowserService | undefined;
   /** Sessions whose driver must be rebuilt once their current turn ends. */
   private readonly pendingRebuild = new Set<string>();
   private lastBroadcast: string;
@@ -71,7 +81,26 @@ export class McpIntegrationService {
     const clock = deps.clock ?? Date.now;
     this.store = new McpIntegrationStore(deps.stateDir, clock);
     this.lock = new McpLock(clock);
-    this.health = new McpHealthTracker(deps.prober, clock);
+    // A kind's own health check (the browser's: node, Chrome, the proxy) refines a generic `ready`.
+    const generic = deps.prober ?? defaultMcpProber;
+    this.health = new McpHealthTracker(async (i) => {
+      const base = await generic(i);
+      return base.state === "ready" ? (mcpPreset(i.kind)?.health?.(i) ?? base) : base;
+    }, clock);
+    if (deps.enabled && deps.browserEnabled) {
+      this.browser = new BrowserService({
+        stateDir: deps.stateDir,
+        childEnv: deps.childEnv ?? defaultMcpChildEnv(),
+        broadcast: deps.broadcast,
+        dropIdleDriver: deps.dropIdleDriver,
+        requestRebuild: (id) => this.requestRebuild(id),
+        hasIntegration: (id) => this.store.get(id) !== undefined,
+        notice: deps.notice,
+        clock,
+        ...deps.browser,
+      });
+      this.browser.start();
+    }
     this.lastBroadcast = this.signature();
     const every = deps.intervalMs ?? MCP_HEALTH_INTERVAL_MS;
     if (deps.enabled && every > 0) {
@@ -94,6 +123,7 @@ export class McpIntegrationService {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.browser?.stop();
   }
 
   // ── read side ─────────────────────────────────────────────────────────────────────────────────
@@ -103,7 +133,7 @@ export class McpIntegrationService {
     return this.store.list().map((i) => {
       const h = this.health.get(i);
       const heldBy = i.exclusive ? this.lock.holder(i.id) : undefined;
-      return { ...i, health: h.health, checkedAt: h.checkedAt, ...(heldBy ? { heldBy } : {}) };
+      return { ...i, health: h.health, checkedAt: h.checkedAt, ...(heldBy ? { heldBy } : {}), ...(mcpPreset(i.kind)?.statusExtra?.(i) ?? {}) };
     });
   }
 
@@ -215,7 +245,13 @@ export class McpIntegrationService {
     this.requireEnabled();
     let added: McpIntegration;
     try {
-      added = this.store.add(input);
+      // The browser exists only on a daemon with the "browser" feature on (the preset registry is
+      // per process; this is the per-daemon check).
+      if (input && typeof input === "object" && !this.browser && isBrowserPreset(mcpPreset(input.kind))) throw new Error('the "browser" integration is not available on this server');
+      // A fixed kind (the browser) takes its key, transport and exclusivity from its preset.
+      const preset = input && typeof input === "object" ? mcpPreset(input.kind) : undefined;
+      const fixed = preset?.fixed ? preset.defaults?.() : undefined;
+      added = this.store.add(fixed ? { ...fixed, label: typeof input.label === "string" && input.label.trim() ? input.label : fixed.label, enabled: input.enabled !== false } : input);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
@@ -228,6 +264,12 @@ export class McpIntegrationService {
     this.requireEnabled();
     if (!fields || typeof fields !== "object") throw new BadCommand("fields is required");
     try {
+      const current = this.store.get(id);
+      if (current && mcpPreset(current.kind)?.fixed) {
+        // Only the name and the on/off switch of a fixed kind can change.
+        const { transport: _transport, exclusive: _exclusive, ...rest } = fields;
+        fields = rest;
+      }
       this.store.update(id, fields);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
@@ -247,11 +289,13 @@ export class McpIntegrationService {
   remove(id: string): void {
     this.requireEnabled();
     const key = this.store.get(id)?.key;
+    const removedKind = this.store.get(id)?.kind;
     if (!this.store.remove(id)) throw new BadCommand(`no such integration: ${id}`);
     this.denyParked(key);
     this.lock.release(id);
     this.health.forget(id);
     for (const s of this.referencing([id])) {
+      if (removedKind === "browser") this.browser?.forgetSession(s.id);
       s.data.mcpIntegrations = without(s.data.mcpIntegrations, id);
       s.data.mcpAllowed = without(s.data.mcpAllowed, id);
       this.requestRebuild(s.id);
@@ -266,6 +310,7 @@ export class McpIntegrationService {
   async check(): Promise<void> {
     this.requireEnabled();
     if (this.probing) await this.probing; // an automatic probe in flight must not swallow the operator's
+    for (const i of this.store.list()) mcpPreset(i.kind)?.onCheck?.(i);
     await this.probe("check");
   }
 
@@ -283,6 +328,7 @@ export class McpIntegrationService {
       // Switched off for this session: the allow and the lock go with it, immediately.
       s.data.mcpAllowed = without(s.data.mcpAllowed, id);
       this.lock.release(id, sessionId);
+      if (this.store.get(id)?.kind === "browser") this.browser?.forgetSession(sessionId); // its proxy and site approvals too
     }
     const changed = before.length !== next.length || before.some((id, i) => next[i] !== id);
     s.data.mcpIntegrations = next.length ? next : undefined;
@@ -317,12 +363,14 @@ export class McpIntegrationService {
   onSessionReset(sessionId: string): void {
     const s = this.deps.getSession(sessionId);
     if (s) s.data.mcpAllowed = undefined;
+    this.browser?.forgetSession(sessionId);
     this.pendingRebuild.delete(sessionId);
     if (this.lock.releaseSession(sessionId).length) this.broadcastIfChanged();
   }
 
   /** The session was deleted or archived. */
   onSessionGone(sessionId: string): void {
+    this.browser?.forgetSession(sessionId);
     this.pendingRebuild.delete(sessionId);
     if (this.lock.releaseSession(sessionId).length) this.broadcastIfChanged();
   }
@@ -376,9 +424,16 @@ export class McpIntegrationService {
       this.deps.persist();
       this.deps.broadcastUpdated(session.data);
     },
-    onToolResult: (session, key) => {
+    onToolResult: (session, key, result) => {
       const i = this.store.byKey(key);
-      if (i) this.lock.refresh(i.id, session.id);
+      if (!i) return;
+      this.lock.refresh(i.id, session.id);
+      if (!result) return;
+      try {
+        mcpKindResultHook(i.kind)?.({ session, integration: i, result });
+      } catch (e) {
+        console.error(`[mcp] ${i.label} result hook failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     },
     onInit: (session, servers) => {
       if (!this.enabled) return;
