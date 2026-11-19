@@ -20,17 +20,23 @@ export function scriptFormatNumber(script: unknown): number | undefined {
   return m ? Number(m[1]) : undefined;
 }
 
-export type FormatCheck = { ok: true } | { ok: false; error: string };
+export type FormatCheck = { ok: true } | { ok: false; error: string; reason: "older-build" | "no-format" };
+
+/** Why a script with no readable `about.format` is refused (decision 51: the check never skips). */
+export const NO_FORMAT_MESSAGE = "the design does not say which SolidCraft format it is (`about.format` is missing or is not a number)";
 
 /**
- * May a build that reads formats up to `localFormat` replay this script? A script with no format
- * passes (older exports had none); a script from a newer format is refused.
+ * May a build that reads formats up to `localFormat` replay this script? The ONE format check: the
+ * CAD process manager (every load) and the replay gate both use it. A script from a newer format is
+ * refused; so is one with no readable format (decision 51, from the A1 review: a missing number must
+ * not let an older build silently rewrite a newer design).
  */
 export function checkScriptFormat(script: unknown, localFormat: number, localVersion?: string): FormatCheck {
   const n = scriptFormatNumber(script);
-  if (n === undefined || n <= localFormat) return { ok: true };
+  if (n === undefined) return { ok: false, error: NO_FORMAT_MESSAGE, reason: "no-format" };
+  if (n <= localFormat) return { ok: true };
   const build = localVersion ? `SolidCraft ${localVersion}` : "the local SolidCraft";
-  return { ok: false, error: `${OLDER_BUILD_MESSAGE} (the design is format ${n}; ${build} reads up to ${localFormat})` };
+  return { ok: false, error: `${OLDER_BUILD_MESSAGE} (the design is format ${n}; ${build} reads up to ${localFormat})`, reason: "older-build" };
 }
 
 const formatByVersion = new Map<string, Promise<number>>();

@@ -78,8 +78,11 @@
  *  - A through hole reports its axis `origin` at the hole's bottom and `extent` [0, length]. The
  *    real kernel reports an origin far below the part with a matching offset extent.
  *  - `timeline.export_script` returns the EXECUTED commands (parameters first, as `parameters.add`
- *    with their current expressions), not the real tool's `timeline.add` feature records. The envelope
- *    is the same: { about: { design, format: "solidcraft/<N>", replay, version }, commands: […] }.
+ *    with their current expressions), each other step wrapped as the real tool's `timeline.add`
+ *    record with a fake feature `{type: "fake", id: <command>, params}`, so the daemon's script screen
+ *    and its `batch` load see the real shape. Replaying such a step (batch or `--in`) records a
+ *    feature that fails to compute instead of refusing it. The envelope is the same:
+ *    { about: { design, format: "solidcraft/<N>", replay, version }, commands: […] }.
  *  - `save` writes one small JSON document for both .sc and .json (the real .sc is a zip), and
  *    `open` replays either that or an exported script. The real `open` rejects a script (it wants a
  *    design file; scripts go through `batch {path}`), and opens STEP/mesh files, which this does not.
@@ -1176,7 +1179,11 @@ function exportScript(m: Model): { about: Json; commands: Cmd[] } {
       ...m.params.map((q) => ({ command: "parameters.add", params: { expression: q.expression, name: q.name, unit: q.unit } })),
       ...log.flatMap((c, idx) => {
         if (c.command.startsWith("parameters.")) return [];
-        if (c.command !== "file.insert_step") return [c];
+        if (c.command === "timeline.add") return [c]; // a replayed import is already a script step
+        // Every other modeling step as the real export writes a feature: `timeline.add {feature}`.
+        // The real feature objects are the kernel's own; the fake's are `{type: "fake", id, params}`
+        // (the same shape test/fixtures/fake-solidcraft-eval.ts replays).
+        if (c.command !== "file.insert_step") return [{ command: "timeline.add", params: { feature: { id: c.command, params: c.params, type: "fake" } } }];
         // As the real tool writes an import: the STEP text embedded, no path.
         const f = m.timeline.find((x) => x.log === idx);
         const stem = basename(String(c.params.file), extname(String(c.params.file)));
@@ -1221,6 +1228,32 @@ function crashIf(id: string): void {
 /** Run one command against the session. Mutating commands are validated by a full rebuild first. */
 function execute(command: string, params: Json, verbose: boolean): Json {
   crashIf(command);
+  // A replayed design-script step (what `timeline.export_script` writes and the daemon now loads
+  // with `batch`): `timeline.add {feature}`. As in the real tool, a replayed feature that fails to
+  // compute is RECORDED with its error and the step succeeds; only a step that cannot run at all
+  // (an unknown command, a malformed feature) fails the batch.
+  if (command === "timeline.add") {
+    const f = params.feature as Json | undefined;
+    let inner: Cmd;
+    if (f?.type === "fake" && typeof f.id === "string" && f.id !== "timeline.add") {
+      crashIf(f.id);
+      if (!isKnown(f.id)) throw new UnknownCommand(`unknown command \`${f.id}\``);
+      inner = { command: f.id, params: (f.params ?? {}) as Json };
+    } else if (f?.type === "import" && typeof f.step === "string") {
+      inner = { command, params };
+    } else {
+      throw new UnknownCommand("invalid parameters for `timeline.add`: invalid feature: unknown variant (fake-solidcraft replays only its own `fake` features and imports)");
+    }
+    const next = build([...log, inner], log.length + 1); // history, not a new feature: failures are recorded
+    log.push(inner);
+    redo = [];
+    model = next;
+    revision++;
+    const last = next.timeline[next.timeline.length - 1];
+    const r = { ...next.results[next.results.length - 1]! };
+    if (!verbose && "feature" in r) delete r.bodies;
+    return last && last.log === log.length - 1 ? { error: (last as Json).error ?? null, feature: last.id, name: last.name, warning: last.warning ?? null, ...r } : r;
+  }
   if (!isKnown(command)) throw new ToolError(`unknown command \`${command}\``);
   const ro = READ_ONLY[command];
   if (ro) return ro(model, params);
@@ -1273,7 +1306,12 @@ function loadCommands(path: string): { name: string; commands: Cmd[]; newer?: Js
     const notice = `Saved by a newer SolidCraft (format ${format}, this version reads up to ${FORMAT}). If something's missing, update.`;
     newer = { format, not_understood: [], notice, reads_up_to: FORMAT, unknown_changes: [] };
   }
-  return { name: String(doc.name ?? doc.about?.design ?? basename(path, extname(path))), commands: commands as Cmd[], newer };
+  // A script's `timeline.add {feature: {type: "fake"}}` step is the fake's own command, wrapped.
+  const unwrapped = (commands as Cmd[]).map((c) => {
+    const f = c?.command === "timeline.add" ? (c.params?.feature as Json | undefined) : undefined;
+    return f?.type === "fake" && typeof f.id === "string" ? { command: f.id, params: (f.params ?? {}) as Json } : c;
+  });
+  return { name: String(doc.name ?? doc.about?.design ?? basename(path, extname(path))), commands: unwrapped, newer };
 }
 function openDesign(path: string): Json {
   const { commands, newer } = loadCommands(path);
@@ -1302,7 +1340,7 @@ function batch(a: Json): Json {
       }),
     );
   };
-  const unknown = steps.findIndex((s) => !isKnown(s.command) && !STEP_TOOLS.includes(s.command));
+  const unknown = steps.findIndex((s) => !isKnown(s.command) && s.command !== "timeline.add" && !STEP_TOOLS.includes(s.command));
   if (unknown >= 0) failed(unknown, `unknown command \`${steps[unknown]!.command}\``, 0, "nothing was run: the batch was checked before its first step");
   const before = { log: [...log], redo: [...redo], model, revision };
   const results: Json[] = [];

@@ -10,7 +10,7 @@
  *   await tools.open_part({ part: "plate" });
  *   await tools.batch({ commands: REFERENCE_PLATE });
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetCadProtectedForTest } from "../../src/agent/cad-protected";
@@ -285,12 +285,39 @@ export function plateBuild(commands: { command: string; params: Record<string, u
   return commands.filter((c) => !(c.command === "parameters.add" && String(c.params.name) in PLATE_PARAMETERS));
 }
 
-/** Write a design.json for a part by hand (a checkout, a hand edit). */
+type Step = { command: string; params: Record<string, unknown> };
+/**
+ * Fake modelling commands as the steps of an exported design script, the shape the fake's
+ * `timeline.export_script` writes and the daemon's script screen accepts: `parameters.add` (and an
+ * existing `timeline.add`) stay, every other command becomes `timeline.add {feature: {type: "fake",
+ * id, params}}`.
+ */
+export function scriptSteps(commands: unknown[]): unknown[] {
+  return commands.map((c) => {
+    const x = c as Step;
+    return x && (x.command === "parameters.add" || x.command === "timeline.add") ? x : { command: "timeline.add", params: { feature: { id: x.command, params: x.params ?? {}, type: "fake" } } };
+  });
+}
+/** The inverse: the fake commands a design script's steps stand for. */
+export function plainSteps(commands: unknown[]): any[] {
+  return commands.map((c) => {
+    const f = (c as Step)?.command === "timeline.add" ? ((c as Step).params?.feature as Record<string, unknown> | undefined) : undefined;
+    return f?.type === "fake" ? { command: f.id, params: f.params } : c;
+  });
+}
+/** design.json as written, with its fake steps shown as the commands they stand for. */
+export function readDesignPlain(path: string): any {
+  const doc = JSON.parse(readFileSync(path, "utf8"));
+  return Array.isArray(doc?.commands) ? { ...doc, commands: plainSteps(doc.commands) } : doc;
+}
+
+/** Write a design.json for a part by hand (a checkout, a hand edit): an exported script, so each
+ *  fake modelling command is written as the `timeline.add` step SolidCraft's export would write. */
 export function writeDesign(worktree: string, part: string, commands: unknown[], about: Record<string, unknown> = { design: part, format: "solidcraft/58", version: "0.44.1" }): string {
   const dir = join(worktree, "cad", part);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "design.json");
-  writeFileSync(path, JSON.stringify({ about, commands }, null, 2) + "\n");
+  writeFileSync(path, JSON.stringify({ about, commands: scriptSteps(commands) }, null, 2) + "\n");
   return path;
 }
 

@@ -19,6 +19,7 @@ import {
   NAME_KEYS,
   isBareFileName,
   isPlainName,
+  prescanScriptText,
   screenScript,
   screenScriptText,
   unsafeString,
@@ -487,5 +488,36 @@ describe("design-script screen", () => {
     expect(Object.keys(fixture.featureTypes)).toEqual(expect.arrayContaining(["import", "mesh_import", "sketch", "extrude"]));
     expect(fixture.featureTypes.sketch).toContain("feature.sketch.links[].source.font");
     expect(fixture.featureTypes.mesh_import).toEqual(expect.arrayContaining(["feature.meshes[].positions", "feature.meshes[].triangles", "feature.file"]));
+  });
+
+  test("[B2] a file packed with tiny objects or strings is refused by a pre-scan before JSON.parse; real-shaped scripts and embedded data pass it", () => {
+    // ~40 MB of `{}` and `"a"` values: refused on the count alone, in one pass, before parsing.
+    const packed = `{"about":{},"commands":[{"command":"parameters.add","params":{"x":[${'{},"a",'.repeat(5_000_000)}0]}}]}`;
+    expect(packed.length).toBeLessThan(MAX_SCRIPT_BYTES);
+    const realParse = JSON.parse;
+    let parsed = 0;
+    JSON.parse = ((t: string, r?: any) => {
+      parsed++;
+      return realParse(t, r);
+    }) as typeof JSON.parse;
+    let r: ReturnType<typeof screenScriptText>;
+    const t0 = performance.now();
+    try {
+      r = screenScriptText(packed);
+    } finally {
+      JSON.parse = realParse;
+    }
+    const ms = performance.now() - t0;
+    expect(parsed).toBe(0);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe(`the script has more than ${MAX_NODES} values`);
+    expect(ms).toBeLessThan(2_000);
+    // Quotes and braces INSIDE a string (embedded STEP text) do not count.
+    const big = JSON.stringify({ about: { format: "solidcraft/58" }, commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "r", file: "r.step", step: '{"x"}'.repeat(500_000) } } }] });
+    expect(prescanScriptText(big)).toBeUndefined();
+    expect(screenScriptText(big).ok).toBe(true);
+    // A script near the node cap still passes the pre-scan (the cap itself is screenScript's).
+    const many = JSON.stringify({ about: {}, commands: [{ command: "parameters.add", params: { v: Array.from({ length: MAX_NODES / 2 }, () => ({})) } }] });
+    expect(prescanScriptText(many)).toBeUndefined();
   });
 });

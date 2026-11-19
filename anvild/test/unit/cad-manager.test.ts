@@ -12,6 +12,7 @@ import {
   DEFAULT_MAX_PROCS,
   IDLE_EXIT_MS,
   OLDER_SOLIDCRAFT,
+  REFUSED_DESIGN,
   REQUEST_TIMEOUT_MS,
   UNREPLAYABLE_FILE,
   WAITING_FOR_SLOT,
@@ -20,7 +21,7 @@ import {
 } from "../../src/cadwork/manager";
 import { BadPartName, UnsafePartFolder, CAD_EXCLUDE_LINES, PART_NAME_RE, ensureCadExcludes, gitToplevel, isValidPartName, listParts, partRef, type PartRef } from "../../src/cadwork/partfolder";
 import { DISK_CONFLICT_REASON, designFileText, scriptSha } from "../../src/cadwork/poststep";
-import { BOX, FakeClock, cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempDir, tempRepo, until, writeDesign } from "../helpers/cad-work";
+import { BOX, FakeClock, cleanupTemp, fakeManager, readDesignPlain, recordingSpawn, stopManagers, tempDir, tempRepo, until, writeDesign } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT, REFERENCE_PLATE } from "../helpers/fake-solidcraft";
 
 afterEach(async () => {
@@ -33,7 +34,8 @@ const exec = (m: CadManager, ref: PartRef, command: string, params: Record<strin
 const box = (m: CadManager, ref: PartRef, name = "Box", size = 10) => exec(m, ref, "solid.box", BOX(name, size).params);
 const measure = async (m: CadManager, ref: PartRef) => (await m.request(ref, { tool: "measure", args: { summary: true }, kind: "read" })).result.json;
 const volume = async (m: CadManager, ref: PartRef) => (await measure(m, ref)).total.volume_mm3 as number;
-const design = (ref: PartRef) => JSON.parse(readFileSync(join(ref.dir, "design.json"), "utf8"));
+/** design.json with its fake `timeline.add` steps shown as the commands they stand for. */
+const design = (ref: PartRef) => readDesignPlain(join(ref.dir, "design.json"));
 const designBytes = (ref: PartRef) => readFileSync(join(ref.dir, "design.json"), "utf8");
 const alive = (pid: number) => {
   try {
@@ -103,7 +105,7 @@ describe("part folders", () => {
 });
 
 describe("cad manager", () => {
-  test("[A1] a process starts with the amended flags, only the part folder allowed, and --in on replay", async () => {
+  test("[A1] a process starts with the amended flags, only the part folder allowed, and a design is loaded by batch, never --in", async () => {
     const repo = tempRepo();
     const log = recordingSpawn();
     const m = fakeManager({ spawn: log.spawn });
@@ -118,8 +120,10 @@ describe("cad manager", () => {
     const log2 = recordingSpawn();
     const m2 = fakeManager({ spawn: log2.spawn });
     expect((await m2.open(ref)).hasDesign).toBe(true);
-    const replay = log2.cmds.find((c) => c.includes("--in"))!;
-    expect(replay).toEqual([FAKE_SOLIDCRAFT, "mcp", "--headless", "--compact", "--allow-path", `${repo}/cad/plate`, "--require-allow-path", "--in", `${repo}/cad/plate/design.json`]);
+    // Decision 88: SolidCraft's sandbox does not cover `--in`, so the replay starts EMPTY, with the
+    // same flags, and the script is sent as a batch.
+    expect(log2.cmds).toEqual([[FAKE_SOLIDCRAFT, "mcp", "--headless", "--compact", "--allow-path", `${repo}/cad/plate`, "--require-allow-path"]]);
+    expect((await volume(m2, ref))).toBe(1000);
     for (const cmd of [...log.cmds, ...log2.cmds]) {
       expect(cmd).not.toContain("--allow-any-path");
       expect(cmd[cmd.indexOf("--allow-path") + 1]).not.toBe(repo); // never the worktree root
@@ -180,8 +184,10 @@ describe("cad manager", () => {
     expect(first.state.status).toBe("unverified");
     expect(design(ref).about.design).toBe("plate");
     expect(design(ref).commands).toEqual([{ command: "solid.box", params: { height: 10, length: 10, name: "Box", width: 10 } }]);
-    expect(designBytes(ref)).toBe(designFileText("plate", design(ref))); // canonical: sorted keys, stable about
-    expect(first.scriptSha).toBe(scriptSha(design(ref).commands));
+    // The file holds the exported script's `timeline.add` step for it (the screen's allowed shape).
+    expect(JSON.parse(designBytes(ref)).commands).toEqual([{ command: "timeline.add", params: { feature: { id: "solid.box", params: { height: 10, length: 10, name: "Box", width: 10 }, type: "fake" } } }]);
+    expect(designBytes(ref)).toBe(designFileText("plate", JSON.parse(designBytes(ref)))); // canonical: sorted keys, stable about
+    expect(first.scriptSha).toBe(scriptSha(JSON.parse(designBytes(ref)).commands));
     expect(m.status(ref)!.scriptSha).toBe(first.scriptSha!);
     const before = designBytes(ref);
 
@@ -225,7 +231,8 @@ describe("cad manager", () => {
     // Nothing is lost: the next request restarts it from design.json.
     expect(await volume(m, ref)).toBe(1000);
     expect(m.status(ref)!.pid).not.toBe(pid);
-    expect(log.cmds.filter((c) => c.includes("--in"))).toHaveLength(1);
+    expect(log.cmds).toHaveLength(2); // the restart (loaded by batch; never --in)
+    expect(log.cmds.some((c) => c.includes("--in"))).toBe(false);
   });
 
   test("[A1] the cap defaults to 4 and reads ANVIL_CAD_MAX_PROCS", () => {
@@ -408,13 +415,13 @@ describe("cad manager", () => {
     const handEdit = () => designBytes(ref);
     const reply = await box(m, ref, "Second", 5);
     const onDisk = handEdit();
-    expect(JSON.parse(onDisk).commands).toEqual([BOX("Hand", 30)]); // NOT overwritten
+    expect(readDesignPlain(join(ref.dir, "design.json")).commands).toEqual([BOX("Hand", 30)]); // NOT overwritten
     expect(reply.wrote).toBe(false);
     expect(reply.state.status).toBe("fail");
     expect(reply.state.reason).toBe("design changed on disk during a change");
     expect(reply.state.conflict).toBe(true);
     expect(reply.notes.join(" ")).toContain(DISK_CONFLICT_REASON);
-    const conflict = JSON.parse(readFileSync(join(ref.dir, ".cache", "design.conflict.json"), "utf8"));
+    const conflict = readDesignPlain(join(ref.dir, ".cache", "design.conflict.json"));
     expect(conflict.commands.map((c: any) => c.params.name)).toEqual(["Box", "Second"]); // what the request produced
     expect(m.status(ref)!.state.status).toBe("fail");
     // The next request rebuilds from disk (disk wins), which clears the failure.
@@ -454,8 +461,9 @@ describe("cad manager", () => {
     const original = designBytes(ref);
     const opened = await m.open(ref);
     expect(opened.state.status).toBe("fail");
-    expect(opened.state.replayFailure).toBe("step 2 (no.such): unknown command `no.such`"); // the failing command, by index
-    expect(opened.state.reason).toBe("design.json failed to replay: step 2 (no.such): unknown command `no.such`");
+    // The failing step, by index; it is a `timeline.add` step of the script (the batch load reports the step's command).
+    expect(opened.state.replayFailure).toBe("step 2 (timeline.add): unknown command `no.such`");
+    expect(opened.state.reason).toBe("design.json failed to replay: step 2 (timeline.add): unknown command `no.such`");
     expect(opened.notes.join(" ")).toContain("started EMPTY");
     expect((await measure(m, ref)).body_count).toBe(0);
     // Reads and failed changes leave the file exactly as it was.
@@ -475,6 +483,62 @@ describe("cad manager", () => {
     expect(again.state.reason).toContain("design.json failed to replay");
     expect(again.result.json.body_count).toBe(0);
     expect(designBytes(ref)).toBe("not json\n");
+  });
+
+  test("[A1] every load is screened first: a design.json carrying a file-writing step is refused, nothing is spawned, and the part fails with the screen's reason until the file changes", async () => {
+    const repo = tempRepo();
+    const log = recordingSpawn();
+    const m = fakeManager({ spawn: log.spawn });
+    const outside = tempDir("anvil-cad-victim-");
+    const victim = join(outside, "victim.txt");
+    writeFileSync(victim, "original\n");
+    const path = writeDesign(repo, "plate", [BOX()]);
+    const doc = JSON.parse(readFileSync(path, "utf8"));
+    doc.commands.push({ command: "parameters.export", params: { path: victim } });
+    writeFileSync(path, JSON.stringify(doc));
+    const bytes = readFileSync(path, "utf8");
+    const ref = partRef(repo, "plate");
+    const err = (await m.open(ref).catch((e) => e)) as CadError;
+    expect(err).toBeInstanceOf(CadError);
+    expect(err.code).toBe("refused");
+    expect(err.message).toContain(REFUSED_DESIGN);
+    expect(err.message).toContain("step 2 (parameters.export)");
+    expect(log.cmds).toEqual([]); // nothing spawned
+    expect(m.status(ref)!.state.status).toBe("fail");
+    expect(m.status(ref)!.state.reason).toContain(REFUSED_DESIGN);
+    // A Rebuild is a load as well.
+    expect(((await m.reload(ref).catch((e) => e)) as CadError).code).toBe("refused");
+    expect(log.cmds).toEqual([]);
+    expect(readFileSync(victim, "utf8")).toBe("original\n");
+    expect(readFileSync(path, "utf8")).toBe(bytes);
+    // Restoring a clean file lets it load (by batch, never --in).
+    writeDesign(repo, "plate", [BOX()]);
+    expect((await m.open(ref)).state.status).toBe("unverified");
+    expect(log.cmds).toHaveLength(1);
+    expect(log.cmds[0]).not.toContain("--in");
+    expect(await volume(m, ref)).toBe(1000);
+  });
+
+  test("[A1] a design loaded by batch cannot be undone away: the agent's undo stops at the loaded design", async () => {
+    const repo = tempRepo();
+    writeDesign(repo, "plate", [BOX("A", 10), BOX("B", 5)]);
+    const m = fakeManager();
+    const ref = partRef(repo, "plate");
+    await m.open(ref);
+    expect(await volume(m, ref)).toBe(1125);
+    const before = designBytes(ref);
+    const u = await m.request(ref, { tool: "undo", kind: "undo" });
+    expect(u.result.isError).toBe(true);
+    expect(u.result.text).toBe("nothing to undo");
+    expect(await volume(m, ref)).toBe(1125);
+    expect(designBytes(ref)).toBe(before);
+    // The agent's own change is still undoable, back to (and not past) the loaded design.
+    await box(m, ref, "C", 2);
+    expect(await volume(m, ref)).toBe(1133);
+    expect((await m.request(ref, { tool: "undo", kind: "undo" })).result.isError).toBe(false);
+    expect(await volume(m, ref)).toBe(1125);
+    expect((await m.request(ref, { tool: "undo", kind: "undo" })).result.isError).toBe(true);
+    expect(await volume(m, ref)).toBe(1125);
   });
 
   test("[A1] a design from a newer format is refused by Anvil itself, and the local format is learned once per binary", async () => {
@@ -502,7 +566,7 @@ describe("cad manager", () => {
     // The format is read from the process started for the part itself: one spawn per attempt, no
     // separate probe process (the A1 review's finding: a failed probe used to skip the check).
     expect(log.cmds).toHaveLength(2);
-    expect(log.cmds.every((c) => c.includes("--in"))).toBe(true);
+    expect(log.cmds.some((c) => c.includes("--in"))).toBe(false); // the format is checked BEFORE the script is sent
     await until(() => m.liveCount() === 0, "the refused processes to be gone");
     // The same format replays.
     expect((await m.open(partRef(repo, "same"))).state.status).toBe("unverified");

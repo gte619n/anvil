@@ -308,11 +308,11 @@ function screenParams(command: string, params: Record<string, unknown>, budget: 
  */
 export function screenScript(script: unknown): ScreenResult {
   const whole = (reason: string): ScreenResult => ({ ok: false, reason: cut(reason), index: -1, command: "" });
-  if (!isRecord(script)) return whole("a design script must be an object with a `commands` list");
+  if (!isRecord(script)) return whole(NOT_A_SCRIPT_REASON);
   for (const k of Object.keys(script)) if (k !== "about" && k !== "commands") return whole(`unexpected top-level key \`${frag(k)}\`; a design script has only \`about\` and \`commands\``);
   if (script.about !== undefined && !isRecord(script.about)) return whole("`about` must be an object");
   const commands = script.commands;
-  if (!Array.isArray(commands)) return whole("`commands` must be a list");
+  if (!Array.isArray(commands)) return whole(script.commands === undefined ? NOT_A_SCRIPT_REASON : "`commands` must be a list");
   if (commands.length > MAX_NODES) return whole(`the script has more than ${MAX_NODES} values`);
   const budget: Budget = { nodes: MAX_NODES, chars: MAX_INSPECTED_CHARS };
   for (let index = 0; index < commands.length; index++) {
@@ -345,8 +345,42 @@ function utf8Length(text: string): number {
   return n;
 }
 
+/** The refusal reasons that mean "this file is not a design script at all" (nothing could replay it). */
+export const NOT_JSON_REASON = "the design script is not valid JSON";
+export const NOT_A_SCRIPT_REASON = "a design script must be an object with a `commands` list";
+
 /**
- * The same check on the file's text: the size cap first, then JSON, then `screenScript`. Returns
+ * Before JSON.parse: count the objects and strings outside any string, in one pass with no
+ * allocation. Every object and every string value of a script that can pass `screenScript` is a
+ * node, and every key holds a node, so a script that passes has at most about 2 × MAX_NODES of them
+ * (embedded STEP text is one string; embedded mesh data is numbers and arrays, which are not
+ * counted here). A file packed with tiny objects or strings is refused here instead of after a
+ * multi-gigabyte parse (B2 review, decision 115). Arrays of numbers are not caught by this; they
+ * are bounded by the 64 MB size cap and cheap to parse by comparison.
+ */
+export function prescanScriptText(text: string): string | undefined {
+  const limit = 2 * MAX_NODES + 1024;
+  let count = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      if (c === 92) i++; // backslash: skip the escaped character
+      else if (c === 34) inString = false;
+      continue;
+    }
+    if (c === 34) {
+      inString = true;
+      count++;
+    } else if (c === 123) count++;
+    else continue;
+    if (count > limit) return `the script has more than ${MAX_NODES} values`;
+  }
+  return undefined;
+}
+
+/**
+ * The same check on the file's text: the size cap first, then a structural pre-scan, then JSON, then `screenScript`. Returns
  * the parsed script when it passes, so a caller parses once. A parse failure never quotes the
  * file: what could not be parsed may be something that is not a design at all.
  */
@@ -355,11 +389,13 @@ export function screenScriptText(text: string): ({ ok: true; script: { about?: R
   if (text.length > MAX_SCRIPT_BYTES || (text.length * 3 > MAX_SCRIPT_BYTES && utf8Length(text) > MAX_SCRIPT_BYTES)) {
     return { ok: false, reason: `the design script is larger than ${MAX_SCRIPT_BYTES / (1024 * 1024)} MB`, index: -1, command: "" };
   }
+  const packed = prescanScriptText(text);
+  if (packed) return { ok: false, reason: packed, index: -1, command: "" };
   let script: unknown;
   try {
     script = JSON.parse(text);
   } catch {
-    return { ok: false, reason: "the design script is not valid JSON", index: -1, command: "" };
+    return { ok: false, reason: NOT_JSON_REASON, index: -1, command: "" };
   }
   const r = screenScript(script);
   return r.ok ? { ok: true, script: script as never } : r;

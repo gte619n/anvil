@@ -378,10 +378,14 @@ describe("design format guard", () => {
       expect(r.error).toContain("58");
       expect(r.error).toContain("0.43.0");
     }
-    // The same or an older format replays; a script with no format is not refused.
+    // The same or an older format replays. A script with no readable format is REFUSED: merge
+    // decision (one format check for the manager and the replay gate), following decision 51 from
+    // the A1 review — a missing number must not let an older build rewrite a newer design.
     expect(checkScriptFormat(script, 58)).toEqual({ ok: true });
     expect(checkScriptFormat({ about: { format: "solidcraft/48" } }, 58)).toEqual({ ok: true });
-    expect(checkScriptFormat({ commands: [] }, 48)).toEqual({ ok: true });
+    const none = checkScriptFormat({ commands: [] }, 48);
+    expect(none.ok).toBe(false);
+    if (!none.ok) expect(none.reason).toBe("no-format");
     expect(scriptFormatNumber({ about: { format: "fusion/3" } })).toBeUndefined();
   });
 

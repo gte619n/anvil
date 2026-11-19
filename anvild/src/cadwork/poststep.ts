@@ -15,6 +15,8 @@
  * refresh keys its measurement to.
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  */
+import { scriptFormatNumber } from "../solidcraft/format";
+import { MAX_SCRIPT_BYTES, prescanScriptText } from "../solidcraft/script-screen";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -65,15 +67,12 @@ export function fileSha(path: string): string | null {
   }
 }
 
-/** The number in `about.format` ("solidcraft/58" → 58), or undefined when absent/unreadable. */
-export function formatNumber(script: unknown): number | undefined {
-  const raw = (script as { about?: { format?: unknown } } | undefined)?.about?.format;
-  const m = /(\d+)\s*$/.exec(typeof raw === "string" || typeof raw === "number" ? String(raw) : "");
-  return m ? Number(m[1]) : undefined;
-}
+/** The number in `about.format` ("solidcraft/58" → 58), or undefined when absent/unreadable. One
+ *  implementation, shared with the replay gate: ../solidcraft/format.ts. */
+export const formatNumber = scriptFormatNumber;
 
 /** Read `design.json` as far as it can be read: its file sha, and (when it parses) its script. */
-export function readDesignFile(partDir: string): { sha: string | null; script?: DesignScript; scriptSha?: string; parseError?: string } {
+export function readDesignFile(partDir: string): { sha: string | null; text?: string; script?: DesignScript; scriptSha?: string; parseError?: string } {
   const path = join(partDir, DESIGN_FILE);
   let bytes: Buffer;
   try {
@@ -82,12 +81,18 @@ export function readDesignFile(partDir: string): { sha: string | null; script?: 
     return { sha: null };
   }
   const sha = sha256(bytes);
+  const text = bytes.toString("utf8");
+  // Never parse what the script screen would refuse on size or structure (it is read on every
+  // dequeue): a 64 MB file of tiny values costs gigabytes to parse (decision 115).
+  if (bytes.length > MAX_SCRIPT_BYTES) return { sha, text, parseError: "design.json is too large" };
+  const packed = prescanScriptText(text);
+  if (packed) return { sha, text, parseError: packed };
   try {
-    const doc = JSON.parse(bytes.toString("utf8"));
-    if (!doc || typeof doc !== "object" || !Array.isArray(doc.commands)) return { sha, parseError: "design.json has no `commands` array" };
-    return { sha, script: doc as DesignScript, scriptSha: scriptSha(doc.commands) };
+    const doc = JSON.parse(text);
+    if (!doc || typeof doc !== "object" || !Array.isArray(doc.commands)) return { sha, text, parseError: "design.json has no `commands` array" };
+    return { sha, text, script: doc as DesignScript, scriptSha: scriptSha(doc.commands) };
   } catch (e) {
-    return { sha, parseError: e instanceof Error ? e.message : String(e) };
+    return { sha, text, parseError: e instanceof Error ? e.message : String(e) };
   }
 }
 

@@ -272,7 +272,8 @@ describe("Phase A1 functional edge cases", () => {
     const opened = await tools.open_part!({ part: "plate" });
     expect(opened.isError).toBe(false);
     expect(opened.json.state).toBe("fail");
-    expect(opened.json.reason).toBe("design.json failed to replay: step 5 (solid.bogus): unknown command `solid.bogus`");
+    // The failing step of the script, a `timeline.add` (the batch load names the step's command).
+    expect(opened.json.reason).toBe("design.json failed to replay: step 5 (timeline.add): unknown command `solid.bogus`");
     expect(opened.json.has_design).toBe(true);
     expect(opened.json.parameters).toEqual([]); // empty: not even the four parameters before the bad step
     expect(opened.notes.join(" ")).toContain("started EMPTY");

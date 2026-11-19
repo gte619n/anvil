@@ -283,4 +283,45 @@ describe("real SolidCraft through the manager", () => {
     expect((await other.tools.open_part!({ part: "plate" })).isError).toBe(true);
     expect(readdirSync(outside2)).toEqual([]);
   }, 120_000);
+
+  test.skipIf(!REAL)("[A1] real: a design.json is screened before it is loaded — one carrying parameters.export to an outside file is refused and the file is untouched; a clean one loads by batch to 23335.2 mm³", async () => {
+    // Build the reference plate once, through the tools, so design.json is a REAL export.
+    const repo = tempRepo("anvil-cad-real-");
+    const first = real(repo);
+    expect((await first.tools.open_part!({ part: "plate" })).isError).toBe(false);
+    expect((await first.tools.batch!({ commands: REFERENCE_PLATE })).isError).toBe(false);
+    await first.service.shutdown();
+    const path = join(repo, "cad", "plate", "design.json");
+    const clean = readFileSync(path, "utf8");
+
+    // The clean export passes the screen and loads (no --in: a batch on an empty process).
+    const second = real(repo);
+    const opened = await second.tools.open_part!({ part: "plate" });
+    expect(opened.isError).toBe(false);
+    near((await second.tools.measure!({ summary: true })).json.total.volume_mm3, V80);
+    await second.service.shutdown();
+
+    // The same script with a step that writes outside the part folder: SolidCraft would write it
+    // with `--in` (decision 88). The screen refuses it, nothing starts, the victim is unchanged.
+    const outside = tempDir("anvil-cad-victim-");
+    const victim = join(outside, "authorized_keys");
+    writeFileSync(victim, "ssh-ed25519 AAAA original\n");
+    const doc = JSON.parse(clean);
+    doc.commands.push({ command: "parameters.export", params: { path: victim } });
+    writeFileSync(path, JSON.stringify(doc, null, 2) + "\n");
+    const hostile = readFileSync(path, "utf8");
+    const third = real(repo);
+    const refused = await third.tools.open_part!({ part: "plate" });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("refused by Anvil's script screen");
+    expect(refused.text).toContain("parameters.export");
+    expect(third.manager.liveCount()).toBe(0); // nothing was spawned for it
+    expect(third.manager.status(partRef(repo, "plate"))?.state.status).toBe("fail");
+    expect(third.manager.status(partRef(repo, "plate"))?.state.reason).toContain("refused by Anvil's script screen");
+    // Rebuild (cad.design.refresh) is a load too, and is refused the same way.
+    await expect(third.manager.reload(partRef(repo, "plate"))).rejects.toThrow("refused by Anvil's script screen");
+    expect(readFileSync(victim, "utf8")).toBe("ssh-ed25519 AAAA original\n");
+    expect(readdirSync(outside)).toEqual(["authorized_keys"]);
+    expect(readFileSync(path, "utf8")).toBe(hostile); // not rewritten either
+  }, 180_000);
 });

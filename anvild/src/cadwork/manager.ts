@@ -5,9 +5,12 @@
  * (`realpath(worktree)/cad/<part>`). Every caller — the agent's tools now, the parameters panel
  * later — goes through ONE strict FIFO queue per part, so two writers can never interleave.
  *
- *  - Start:    `mcp --headless --compact --allow-path <part dir> --require-allow-path [--in design.json]`
- *              with only PATH/HOME/TMPDIR/SOLIDCRAFT_GPU=cpu. Replay is `--in`. The live process
- *              never calls `save`, `open` or `new_design`.
+ *  - Start:    the script screen (solidcraft/script-screen.ts) runs on design.json first; a refused
+ *              design is not loaded and nothing is spawned. Then `mcp --headless --compact
+ *              --allow-path <part dir> --require-allow-path` (cwd = the part dir, NO `--in`: the
+ *              sandbox does not cover a script loaded at start, decision 88) with only
+ *              PATH/HOME/TMPDIR/SOLIDCRAFT_GPU=cpu, and the script is sent as one `batch`. The live
+ *              process never calls `save`, `open` or `new_design`.
  *  - Limits:   idle exit after 10 min with an empty queue; at most `ANVIL_CAD_MAX_PROCS` (4) live.
  *              A part that needs a slot evicts an idle process first, else waits ("waiting for a
  *              CAD slot" is visible in `status()` and as a `waiting` event).
@@ -39,7 +42,9 @@ import {
   type McpToolResult,
 } from "./mcp-client";
 import { assertPartFolderSafe, ensureCadExcludes, type PartRef } from "./partfolder";
-import { CACHE_DIR, DESIGN_FILE, DISK_CONFLICT_REASON, formatNumber, readDesignFile, writeScript, type PoststepFs } from "./poststep";
+import { CACHE_DIR, DESIGN_FILE, DISK_CONFLICT_REASON, readDesignFile, writeScript, type PoststepFs } from "./poststep";
+import { NOT_A_SCRIPT_REASON, NOT_JSON_REASON, screenScriptText } from "../solidcraft/script-screen";
+import { OLDER_BUILD_MESSAGE, checkScriptFormat, scriptFormatNumber } from "../solidcraft/format";
 
 export const DEFAULT_MAX_PROCS = 4;
 export const IDLE_EXIT_MS = 10 * 60_000;
@@ -47,14 +52,28 @@ export const REQUEST_TIMEOUT_MS = 120_000;
 export const BATCH_TIMEOUT_MS = 600_000;
 export const REFRESH_DEBOUNCE_MS = 500;
 export const WAITING_FOR_SLOT = "waiting for a CAD slot";
-export const OLDER_SOLIDCRAFT = "this machine's SolidCraft is older than the design";
+export const OLDER_SOLIDCRAFT = OLDER_BUILD_MESSAGE;
+/** The start of the message (and part state) for a design.json the script screen refused. */
+export const REFUSED_DESIGN = "design.json was refused by Anvil's script screen";
+
+/** A failed `batch` load, as the replay gate words it: "step N (command): error". */
+function batchFailure(r: McpToolResult): string {
+  let error = r.text;
+  try {
+    const j = JSON.parse(r.text) as { failed?: { command?: string; error?: string; index?: number } };
+    if (j.failed) error = `step ${(j.failed.index ?? 0) + 1} (${j.failed.command ?? "?"}): ${j.failed.error ?? "refused"}`;
+  } catch {
+    /* plain text */
+  }
+  return error.trim().slice(0, 600) || "the batch was refused";
+}
 export const UNREPLAYABLE_FILE = "design.unreplayable.json";
 
 /** The light read the manager takes after start and after every change (A0: 2.2 KB, 0.5 ms). */
 const SNAPSHOT_ARGS = { measure: false, sketches: false, timeline: "summary", bodies: "names" } as const;
 const DEPTH_ARGS = { measure: false, sketches: false, timeline: false, bodies: false } as const;
 
-export type CadErrorCode = "unavailable" | "format" | "process" | "timeout" | "rpc" | "script" | "shutdown" | "unsafe";
+export type CadErrorCode = "unavailable" | "format" | "process" | "timeout" | "rpc" | "script" | "shutdown" | "unsafe" | "refused";
 
 /** A request that could not be carried out (as opposed to a tool answering `isError`). */
 export class CadError extends Error {
@@ -251,6 +270,10 @@ interface PartRec {
   lastRefreshAt: number;
   /** The gate's verdict and the script it is about. */
   verdict?: PartVerdict & { scriptSha?: string };
+  /** design.json (this sha) was refused by the script screen: nothing is running for it. */
+  refused?: { sha: string; reason: string };
+  /** Undo depth right after the script was loaded: the agent's `undo` never goes below it. */
+  loadDepth: number;
 }
 
 export function maxProcsFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -434,6 +457,7 @@ export class CadManager {
         lastUsed: this.clock.now(),
         refreshDirty: false,
         lastRefreshAt: -Infinity,
+        loadDepth: 0,
       };
       this.parts.set(ref.key, rec);
     }
@@ -625,12 +649,32 @@ export class CadManager {
       if (ensureCadExcludes(ref.worktree) !== undefined) this.excluded.add(ref.worktree);
     }
 
+    // SCREEN FIRST (decisions 62, 88, 115). A design.json is untrusted input, and SolidCraft runs
+    // whatever commands it is given. Track B's screen runs before ANY load (start, reload, verify,
+    // replay): a design it refuses is not loaded and nothing is spawned for it; the part is `fail`
+    // with the screen's reason until the file changes. A file that is not a design script at all
+    // (not JSON, no `commands`) cannot be replayed by any build: it takes the "started EMPTY" path
+    // below, loading nothing from it.
+    let script: { about?: Record<string, unknown>; commands: unknown[] } | undefined;
+    let replayFailure: string | undefined;
+    rec.refused = undefined;
+    if (disk.sha !== null) {
+      const screened = screenScriptText(disk.text ?? "");
+      if (screened.ok) script = screened.script;
+      else if (screened.reason === NOT_JSON_REASON || screened.reason === NOT_A_SCRIPT_REASON) replayFailure = screened.reason;
+      else {
+        rec.refused = { sha: disk.sha, reason: screened.reason };
+        throw new CadError(
+          "refused",
+          `${REFUSED_DESIGN}: cad/${ref.part}/design.json was not loaded (${screened.reason}). Nothing was started and the file was not touched; restore it from git or ask the owner.`,
+        );
+      }
+    }
+
     // Anvil enforces the format number itself: SolidCraft does not check `about.format` on a script.
-    // Fail closed: a script that parses but does not say which format it is cannot be checked, so
-    // it is refused before anything is started. (A file that is not a script at all — not JSON, no
-    // `commands` — cannot be replayed by any build; it takes the replay-failure path below.)
-    const designFormat = disk.script ? formatNumber(disk.script) : undefined;
-    if (disk.script && designFormat === undefined) {
+    // Fail closed (decision 51): a script that does not say which format it is cannot be checked, so
+    // it is refused before anything is started. One implementation with the replay gate: format.ts.
+    if (script && scriptFormatNumber(script) === undefined) {
       throw new CadError(
         "format",
         `cad/${ref.part}/design.json does not say which SolidCraft format it is (\`about.format\` is missing or is not a number), so it cannot be opened safely. ` +
@@ -640,34 +684,26 @@ export class CadManager {
 
     // The working folder is the part folder (absolute; decision 115): any plain name SolidCraft
     // resolves against its working folder (a font, say) can then only resolve inside the part folder.
+    // NO `--in` (decision 88): SolidCraft's file sandbox does not apply to a script loaded at start,
+    // only to tool calls on a running server. The process starts EMPTY and the script is sent as a
+    // `batch`, the way the replay gate does it (solidcraft/replay-client.ts).
     const common = { extraEnv: this.spawnEnv(), spawn: this.opts.spawn, clock: this.clock, cwd: ref.dir };
-    const base = this.baseCmd(cli.path, ref.dir);
-    let client: McpClient | undefined;
-    let replayFailure: string | undefined;
-    if (disk.sha !== null) {
-      try {
-        client = await McpClient.start({ cmd: [...base, "--in", join(ref.dir, DESIGN_FILE)], ...common });
-      } catch (e) {
-        // `--in` exits 1 with `error: step N (cmd): …` (or `error: <path>: …`) on a script it cannot
-        // run at all. That is the design's problem, not the machine's: start empty and say so.
-        const line = e instanceof McpExitError ? /^error: (.+)$/m.exec(e.stderrTail)?.[1] : undefined;
-        if (!line) throw e;
-        replayFailure = line.trim();
-      }
-    }
-    if (!client) client = await McpClient.start({ cmd: base, ...common });
-    // The build's own format number comes from THIS process's script export — no second process,
-    // and no way to skip the check: if the number cannot be learned, the design is not opened.
-    if (designFormat !== undefined) {
+    const client: McpClient = await McpClient.start({ cmd: this.baseCmd(cli.path, ref.dir), ...common });
+    // The build's own format number comes from THIS process's script export (of the empty design) —
+    // no second process, and no way to skip the check: if the number cannot be learned, the design is
+    // not opened.
+    if (script) {
       let local: number | undefined;
       try {
         const r = await client.callTool("execute", { command: "timeline.export_script", params: {} }, this.requestTimeoutMs);
-        local = r.isError ? undefined : formatNumber(r.json?.script);
+        local = r.isError ? undefined : scriptFormatNumber(r.json?.script);
       } catch {
         local = undefined;
       }
-      if (local === undefined || designFormat > local) {
+      const verdict = local === undefined ? undefined : checkScriptFormat(script, local);
+      if (local === undefined || !verdict?.ok) {
         client.kill();
+        const designFormat = scriptFormatNumber(script);
         throw new CadError(
           "format",
           local === undefined
@@ -675,8 +711,20 @@ export class CadManager {
             : `${OLDER_SOLIDCRAFT}: cad/${ref.part}/design.json is format ${designFormat} and this build reads up to ${local}. Update SolidCraft on this machine; the file was not touched.`,
         );
       }
+      if (script.commands.length > 0) {
+        let r: McpToolResult;
+        try {
+          r = await client.callTool("batch", { commands: script.commands }, this.batchTimeoutMs);
+        } catch (e) {
+          client.kill();
+          throw e;
+        }
+        // A step the build cannot run at all (or that its sandbox stopped) rolls the whole batch
+        // back: the design's problem, not the machine's — the process is left EMPTY and we say so.
+        // A feature that fails to compute does NOT fail the batch; the snapshot below reads it.
+        if (r.isError) replayFailure = batchFailure(r);
+      }
     }
-
     if (replayFailure) {
       // Keep the file that did not replay: the first successful change will overwrite design.json.
       try {
@@ -702,8 +750,10 @@ export class CadManager {
     void client.exited.then(() => this.onExit(rec, client));
     this.emit({ type: "started", key: ref.key, part: ref.part, pid: client.pid, replayed: disk.sha !== null && !replayFailure });
 
-    // `--in` starts even when features fail, so read the timeline straight away.
+    // A loaded script may carry failed features, so read the timeline straight away. The undo
+    // steps the load itself added are the floor the agent's `undo` cannot go below.
     await this.snapshot(rec);
+    rec.loadDepth = rec.depth;
     if (rec.featureErrors.length) notes.push(this.featureNote(rec));
   }
 
@@ -811,6 +861,10 @@ export class CadManager {
     const stack = dir === "undo" ? rec.undoStack : rec.redoStack;
     const other = dir === "undo" ? rec.redoStack : rec.undoStack;
     const start = rec.depth;
+    // The design was loaded as a batch of undo steps (no `--in`): those are not the agent's to undo.
+    if (dir === "undo" && rec.undoStack.length === 0 && (await this.depthNow(rec)) <= rec.loadDepth) {
+      return { isError: true, content: [{ type: "text", text: "nothing to undo" }], texts: ["nothing to undo"], text: "nothing to undo", images: [] } as unknown as McpToolResult;
+    }
     const target = stack.pop();
     let last = await this.call(rec, dir, {}, timeoutMs);
     if (last.isError) {
@@ -890,6 +944,7 @@ export class CadManager {
 
   private stateOf(rec: PartRec): PartState {
     const base = { featureErrors: rec.featureErrors, featureWarnings: rec.featureWarnings, conflict: rec.conflict, ...(rec.replayFailure ? { replayFailure: rec.replayFailure } : {}) };
+    if (rec.refused && !rec.client?.alive) return { status: "fail", reason: `${REFUSED_DESIGN}: ${rec.refused.reason}`, ...base };
     if (rec.conflict) return { status: "fail", reason: DISK_CONFLICT_REASON, ...base };
     if (rec.replayFailure) return { status: "fail", reason: `design.json failed to replay: ${rec.replayFailure}`, ...base };
     if (rec.featureErrors.length) return { status: "fail", reason: `failed features: ${rec.featureErrors.map((f) => `${f.feature}: ${f.message}`).join("; ")}`, ...base };

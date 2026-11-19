@@ -130,7 +130,7 @@
             "part folders > [A1] a part name is a name, never a path",
             "part folders > [A1] the key is realpath(worktree)/cad/<part>, whatever path the worktree was reached by",
             "part folders > [A1] generated folders are excluded through .git/info/exclude, never .gitignore",
-            "cad manager > [A1] a process starts with the amended flags, only the part folder allowed, and --in on replay",
+            "cad manager > [A1] a process starts with the amended flags, only the part folder allowed, and a design is loaded by batch, never --in",
             "cad manager > [A1] each part gets its own process and the same part shares one",
             "cad manager > [A1] every caller shares one strict FIFO queue per part",
             "cad manager > [A1] the script is rewritten after every successful change, and not after a read or a failure",
@@ -153,7 +153,9 @@
             "cad manager > [A1] shutdown stops every process and refuses new work",
             "cad manager > [A1] with no binary the request fails as unavailable and nothing is spawned",
             "cad manager > [A1] a design.json with a missing or non-numeric format is refused before anything starts, and a build that cannot report its format opens nothing",
-            "cad manager > [A1] a symlinked cad folder or part folder is refused, and nothing is written outside the worktree"
+            "cad manager > [A1] a symlinked cad folder or part folder is refused, and nothing is written outside the worktree",
+            "cad manager > [A1] every load is screened first: a design.json carrying a file-writing step is refused, nothing is spawned, and the part fails with the screen's reason until the file changes",
+            "cad manager > [A1] a design loaded by batch cannot be undone away: the agent's undo stops at the loaded design"
           ]
         },
         {
@@ -219,7 +221,8 @@
             "real SolidCraft through the manager > [A1] real: set_parameter refuses an unknown name, undo reverts a whole batch, and a broken feature marks the part failed",
             "real SolidCraft through the manager > [A1] real: file commands never reach SolidCraft, exports land in .cache/exports, a screenshot is an image, a newer format is refused",
             "real SolidCraft through the manager > [A1] real: every command id the binary reports is either allow-listed or refused, and refused commands leave the part folder untouched",
-            "real SolidCraft through the manager > [A1] real: a symlinked part folder or cad folder is refused and nothing is written outside the worktree"
+            "real SolidCraft through the manager > [A1] real: a symlinked part folder or cad folder is refused and nothing is written outside the worktree",
+            "real SolidCraft through the manager > [A1] real: a design.json is screened before it is loaded — one carrying parameters.export to an outside file is refused and the file is untouched; a clean one loads by batch to 23335.2 mm³"
           ]
         }
       ]
@@ -729,7 +732,8 @@
             "design-script screen > [B2] a refusal is short whatever the script holds: fragments are cut to 80 characters and the reason to 300",
             "design-script screen > [B2] worst-case strings at the caps screen quickly: 1 MB of letters, of %41, of a:, of /.., and a 64 MB embedded STEP",
             "design-script screen > [B2] screening time grows no faster than the input: doubling the size at most about doubles the time",
-            "design-script screen > [B2] the allow list is exactly what the real export was seen to write, minus the one id that opens a file"
+            "design-script screen > [B2] the allow list is exactly what the real export was seen to write, minus the one id that opens a file",
+            "design-script screen > [B2] a file packed with tiny objects or strings is refused by a pre-scan before JSON.parse; real-shaped scripts and embedded data pass it"
           ]
         },
         {
