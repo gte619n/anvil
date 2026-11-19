@@ -434,6 +434,7 @@ export class LoopService {
     run.laps.push({ n: 1, summary: result.summary, verdicts: [{ check: "tasks triaged into drafts", v: "pass" }], at: now() });
     run.status = "shipped";
     run.reason = `${result.created} draft${result.created === 1 ? "" : "s"} created`;
+    if (result.created === 0) run.noop = true; // nothing new — the daily digest doesn't count it
     run.endedAt = now();
     this.store.putRun(run);
     this.broadcastRun(run);
@@ -466,8 +467,9 @@ export class LoopService {
   }
 
   /** Daily digest (spec §4 Phase 4): once per calendar day (after 09:00 local), if any loop opted in,
-   *  send one summary push — how many loops are at your gate / shipped / stopped. In-memory day marker
-   *  (best-effort; resets on restart). */
+   *  send one summary push — how many loops are at your gate / shipped / stopped. Shipped/stopped only
+   *  count runs that ended in the last 24h (and not no-op runs); a loop waiting at your gate always
+   *  counts. All zero → no push. In-memory day marker (best-effort; resets on restart). */
   private lastDigestDay?: string;
   private maybeDigest(nowD: Date): void {
     if (nowD.getHours() < 9) return;
@@ -475,14 +477,18 @@ export class LoopService {
     if (this.lastDigestDay === day) return;
     this.lastDigestDay = day;
     if (!this.store.list().some((l) => l.notify.dailyDigest)) return;
+    const since = nowD.getTime() - 24 * 60 * 60_000;
     let atGate = 0, shipped = 0, stopped = 0;
     for (const l of this.store.list()) {
       const r = this.store.latestRun(l.id);
       if (!r) continue;
-      if (r.status === "at-gate") atGate++;
-      else if (r.status === "shipped") shipped++;
+      if (r.status === "at-gate") { atGate++; continue; }
+      const ended = r.endedAt ? Date.parse(r.endedAt) : NaN;
+      if (r.noop || !(ended >= since)) continue; // nothing new from this loop
+      if (r.status === "shipped") shipped++;
       else if (["failed", "over-budget", "no-progress"].includes(r.status)) stopped++;
     }
+    if (atGate + shipped + stopped === 0) return;
     this.deps.notify?.("Anvil loops — daily digest", `${atGate} at your gate · ${shipped} shipped · ${stopped} stopped`, "loops-digest", "#loops");
   }
 

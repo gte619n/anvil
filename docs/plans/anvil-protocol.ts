@@ -1114,6 +1114,7 @@ export interface LoopRun {
   gate?: { openedAt?: Iso8601; sentBackNote?: string };
   reason?: string; // terminal explanation (budget, no-progress, error)
   dryRun?: boolean; // a throwaway first lap (Phase 3 intake) — report only, gate verbs refuse it
+  noop?: boolean; // the run finished but produced nothing (e.g. Todoist intake with 0 new drafts) — digest skips it
   startedAt: Iso8601;
   endedAt?: Iso8601;
 }
