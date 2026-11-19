@@ -13,6 +13,11 @@ import type { Session as SessionData } from "@protocol";
  *                       `bypass`, offering only Allow once / Deny. An `allow_always` answer is treated
  *                       as allow-once and never remembered. With `denyWhenUnattended`, an unattended
  *                       session (`isUnattended`) is denied instead, because no one is there to answer.
+ *  - `owner-card`     — the tool parks its OWN typed owner card on every call (old and new values,
+ *                       Approve / Deny, no "always allow"), so a generic permission card in front of
+ *                       it would only ask the same question twice. The gate lets the call through
+ *                       with no prompt under every policy, never remembers it, and DENIES it in an
+ *                       unattended session, where no one could answer the card.
  *  - `undefined`      — the rule has no opinion; the normal permission flow applies.
  *
  * This module is deliberately dependency-light (types only — no Supervisor, no Session class) so
@@ -29,6 +34,7 @@ export type ProtectedVerdict =
       /** Deny, with no card, when the session is unattended (see `isUnattended`). */
       denyWhenUnattended?: boolean;
     }
+  | { kind: "owner-card"; reason: string }
   | undefined;
 
 /** The slice of a session a rule (and `isUnattended`) may read. A real `Session` satisfies it. */

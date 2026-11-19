@@ -596,6 +596,86 @@ export interface CadStatusEvent extends Envelope {
   version?: string; // the SolidCraft build this machine runs, e.g. "0.44.1"
   pinned?: string; // the fleet-pinned version, once the hub manages the install
 }
+/** One user parameter of a part's design (agent-cad-and-browser spec §4.8). */
+export interface CadParam {
+  name: string;
+  expression: string;
+  value: number;
+  unit: string;
+  error?: string;
+}
+/** One line of the geometry gate (§4.5). `hard: false` is an advisory: shown, never blocking. */
+export interface CadGateCheck {
+  id: string;
+  expected: number | string;
+  measured: number | string;
+  ok: boolean;
+  hard: boolean;
+}
+/** The geometry gate's verdict on a part (§4.5): is it what the owner approved? */
+export interface CadGateResult {
+  state: "pass" | "fail" | "unverified" | "concept" | "gap";
+  checks: CadGateCheck[];
+  warnings: string[]; // SolidCraft feature warnings, e.g. "Boolean retry"
+  needsAdoption?: "expectations" | "rules" | "ownerParams";
+  staleBuild: boolean; // measured under a different SolidCraft version
+}
+/**
+ * A part was measured and checked again (§4.8). Broadcast to every client after each refresh of a
+ * part, and re-sent for every known part when a socket opens. Drives the part card in the chat (one
+ * per part touched in a turn, updated in place) and, from Phase A3, the live viewer and the
+ * parameters panel. Not session-scoped and not replayed from the event log: it is current state.
+ * Additive and capability-gated ("cad-work"); clients without CAD UI ignore it.
+ */
+export interface CadDesignEvent extends Envelope {
+  type: "cad.design";
+  cwd: string; // the worktree the part lives in
+  part: string;
+  rev: number; // increments on every refresh of this part
+  preview?: string; // worktree-relative path of the newest GLB (Phase A3)
+  params: CadParam[];
+  gate: CadGateResult;
+  busy: boolean; // a request is running or queued
+  by: "agent" | "panel" | "reload";
+  /** Sessions that have this part open: the chat card belongs in these. */
+  sessionIds?: string[];
+}
+/** One row of an expectations card: a labelled value before and after. */
+export interface CadExpectationsRow {
+  label: string;
+  old?: string;
+  new?: string;
+}
+/**
+ * The owner is asked to approve a change to what a part is checked against (§4.5, §4.9). Always a
+ * typed card with Approve / Deny and NO "always allow":
+ *  - `propose`            the agent asks to change locked expectations (`reason` is the agent's).
+ *  - `adopt-expectations` `part.json` does not match the lock store (a hand edit, a fresh clone).
+ *  - `adopt-ownerParams`  the owner-typed dimensions in `part.json` differ from the approved ones.
+ *  - `adopt-rules`        `cad/rules.json` changed (`rulesDiff` shows what).
+ * Answered with `cad.expectations.respond`; retired by `cad.expectations.resolved`. Broadcast to all
+ * clients (it names its session) and re-sent, with `replay`, when a socket opens.
+ */
+export interface CadExpectationsRequestEvent extends Envelope {
+  type: "cad.expectations.request";
+  requestId: RequestId;
+  sessionId: SessionId;
+  cwd: string;
+  part: string;
+  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules";
+  reason?: string;
+  rows: CadExpectationsRow[];
+  rulesDiff?: { op: " " | "+" | "-"; line: string }[];
+  replay?: boolean;
+}
+/** An expectations card was answered (on any device) or superseded: retire exactly that card. */
+export interface CadExpectationsResolvedEvent extends Envelope {
+  type: "cad.expectations.resolved";
+  requestId: RequestId;
+  approved: boolean;
+  /** The files changed again before anyone answered; a newer card replaces this one. */
+  superseded?: boolean;
+}
 /**
  * The Claude Code CLI this daemon spawns sessions with (docs/plans/2026-11-10-managed-claude-cli-updates.md).
  * The CLI is bundled with the pinned agent-sdk, but can be advanced to the latest published version
@@ -1461,6 +1541,9 @@ export type ServerEvent =
   | PromptsEvent
   | ModelLabelsEvent
   | CadStatusEvent
+  | CadDesignEvent
+  | CadExpectationsRequestEvent
+  | CadExpectationsResolvedEvent
   | ClaudeCliStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
@@ -1665,6 +1748,12 @@ export interface PermissionRespondCmd extends Envelope, Correlated {
   requestId: RequestId;
   decision: PermissionDecision;
   updatedInput?: unknown; // optional edited tool input
+}
+/** Answer an expectations card (`cad.expectations.request`, §4.8) — may come from any device. */
+export interface CadExpectationsRespondCmd extends Envelope, Correlated {
+  type: "cad.expectations.respond";
+  requestId: RequestId;
+  approve: boolean;
 }
 /** Answer a parked AskUserQuestion (§6.6) — may come from any device. */
 export interface QuestionRespondCmd extends Envelope, Correlated {
@@ -2124,6 +2213,7 @@ export type ClientCommand =
   | PromptSendCmd
   | PermissionRespondCmd
   | QuestionRespondCmd
+  | CadExpectationsRespondCmd
   | InterruptCmd
   // files
   | FsListCmd

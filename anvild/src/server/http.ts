@@ -26,6 +26,7 @@ import { FleetStore } from "../fleet/store";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import { serveCad } from "../cad/service";
+import { LOCKS_APPROVE_PATH, LOCKS_PUSH_PATH, type LocksApproveBody, type LocksApproveReply, type LocksPushBody } from "../cadwork/locks";
 import { UpdateStateStore } from "../daemon/update-state";
 import { updateApply, updateCheck, updateStatus, settleAfterBoot, type UpdateApiDeps } from "../daemon/update-api";
 import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
@@ -132,6 +133,8 @@ export interface ServerHandle {
   stop: () => void;
   /** Graceful shutdown: flush + reap drivers/terminals, then stop the HTTP server (arch §5). */
   shutdown: () => Promise<void>;
+  /** The daemon's supervisor (functional tests drive its services directly). */
+  supervisor: Supervisor;
 }
 
 export interface ServerOptions {
@@ -501,7 +504,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
-      if (supervisor.cadwork.enabled) ws.send(JSON.stringify(supervisor.cadStatusEvent())); // can this machine do CAD right now? (spec §4.8)
+      if (supervisor.cadwork.enabled) {
+        ws.send(JSON.stringify(supervisor.cadStatusEvent())); // can this machine do CAD right now? (spec §4.8)
+        // Current part state and any expectations card still waiting: neither is replayed from a session log.
+        for (const ev of supervisor.cadwork.designEvents()) ws.send(JSON.stringify(ev));
+        for (const ev of supervisor.cadwork.pendingCardEvents()) ws.send(JSON.stringify(ev));
+      }
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
@@ -807,6 +815,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
       void net.ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
       pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
+      if (supervisor.cadwork.enabled) void supervisor.cadwork.lockSync.broadcast([member.serverId]); // …and the CAD approvals
       return { ok: true, member };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -990,6 +999,51 @@ export function createServer(opts: ServerOptions): ServerHandle {
       return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies rest.FleetHandoffResponse, { status: 400 });
     }
   });
+
+  // ── CAD lock store sync (agent-cad-and-browser spec §4.14 #42; cadwork/locks.ts) ─────────────────
+  // What the owner approved for a part is hub-authoritative and fleet-wide. Two routes, both with
+  // the fleet posture: tailnet-gated, a PROVEN different tailnet user is rejected, JSON only (a
+  // cross-origin "simple request" cannot set that content-type).
+  //   POST /api/fleet/cad-locks          hub → member: the hub's whole store (replaces the member's copy)
+  //   POST /api/fleet/cad-locks/approve  member → hub: approvals made on that member (merged, latest wins)
+  supervisor.cadwork.lockSync.setRole(() => {
+    const paired = pairedHub.get();
+    if (paired) return { kind: "member", serverId: identity.serverId, hubServerId: paired.hubServerId };
+    const members = fleet.list();
+    if (members.length > 0) return { kind: "hub", serverId: identity.serverId, selfUrl: () => supervisor.selfBaseUrl(), members: () => fleet.list().map((m) => ({ serverId: m.serverId, url: m.url, host: m.host })) };
+    return { kind: "standalone", serverId: identity.serverId };
+  });
+  const jsonOnly = (req: Request): Response | null =>
+    (req.headers.get("content-type") || "").toLowerCase().includes("application/json") ? null : new Response("application/json required", { status: 415 });
+  route("POST", LOCKS_PUSH_PATH, async (req, _url, _m, ctx) => {
+    if (!supervisor.cadwork.enabled) return Response.json({ ok: false, error: "cad-work is not enabled on this machine" }, { status: 404 });
+    const wrong = jsonOnly(req);
+    if (wrong) return wrong;
+    const body = await jsonBody<LocksPushBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId); // not another tailnet user, and from the hub this member is paired to
+    if (gate) return gate;
+    supervisor.cadwork.lockSync.acceptFromHub(body);
+    return Response.json({ ok: true, serverId: identity.serverId });
+  });
+  route("POST", LOCKS_APPROVE_PATH, async (req, _url, _m, ctx) => {
+    if (!supervisor.cadwork.enabled) return Response.json({ ok: false, error: "cad-work is not enabled on this machine" }, { status: 404 });
+    const wrong = jsonOnly(req);
+    if (wrong) return wrong;
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const body = await jsonBody<LocksApproveBody>(req);
+    // Only a machine this hub has paired may add approvals to the fleet's store.
+    if (!body.serverId || !fleet.list().some((m) => m.serverId === body.serverId)) return Response.json({ ok: false, error: "unknown fleet member" }, { status: 403 });
+    return Response.json(supervisor.cadwork.lockSync.acceptFromMember(body) satisfies LocksApproveReply);
+  });
+  if (supervisor.cadwork.enabled) {
+    // Shortly after boot: a hub hands every member its store (and its address); a member sends
+    // whatever it queued while the hub was out of reach. Then a slow retry for whoever was missed.
+    const cadSyncBoot = setTimeout(() => void supervisor.cadwork.lockSync.broadcast().then(() => supervisor.cadwork.lockSync.retry()).catch(() => undefined), 5_000);
+    const cadSyncRetry = setInterval(() => void supervisor.cadwork.lockSync.retry().catch(() => undefined), 10 * 60_000);
+    (cadSyncBoot as { unref?: () => void }).unref?.();
+    (cadSyncRetry as { unref?: () => void }).unref?.();
+  }
 
   // Hub→member Todoist replication landing point (anvil-multi-server.md): the hub POSTs its token
   // here so this daemon can run autopilot for its own linked environments. Validated against the
@@ -1534,6 +1588,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   return {
     port: server.port ?? opts.port,
+    supervisor,
     stop: () => server.stop(true),
     shutdown: async () => {
       await supervisor.shutdown();

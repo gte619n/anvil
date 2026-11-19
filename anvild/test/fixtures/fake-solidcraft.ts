@@ -26,7 +26,11 @@
  * solid.fillet (vertical corner edges of a box/plate), solid.hole (simple, drilled or counterbore;
  * through or blind; from a sketch's points or a position; drilled along -Z),
  * solid.pattern.rectangular (of hole / cylinder features), file.insert_step (a fixed reference
- * body), inspect.interference (axis-aligned bounding-box overlap), timeline.export_script.
+ * body; its timeline type is `BaseFeature`, as the real import's is), inspect.interference
+ * (axis-aligned bounding-box overlap), inspect.measure {bodies} (the measure reply for the named
+ * bodies; null or [] means all), view.pick {rays, all} (rays against the closed-form solids: enough to
+ * tell a hole from a boss from a fillet on Z-axis cylinders, and a blind hole's floor),
+ * timeline.export_script.
  * Anything else answers "unknown command `x`" as the real tool does.
  *
  * TEST HOOKS (environment variables):
@@ -182,10 +186,16 @@ interface Face {
   normal?: V3;
   cylinder?: { axis: V3; origin: V3; radius: number; length: number };
 }
+/** Material removed from a body: a vertical drilled or cut cylinder, or the corner a fillet rounds off. */
+type Void =
+  | { kind: "cyl"; x: number; y: number; r: number; z0: number; z1: number }
+  | { kind: "fillet"; ox: number; oy: number; sx: 0 | 1; sy: 0 | 1; r: number; z0: number; z1: number };
 interface Body {
   name: string;
   feature: number;
   solids: Solid[];
+  /** What was cut away — only `view.pick` reads it (volume and faces are kept in closed form). */
+  voids: Void[];
   volume: number;
   faces: Face[];
   /** An imported reference body: geometry is opaque and nothing modifies it. */
@@ -345,7 +355,7 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
   };
   const newBody = (feature: number, name: unknown): Body => {
     bodyCount++;
-    const b: Body = { name: typeof name === "string" && name ? name : `Body${bodyCount}`, feature, solids: [], volume: 0, faces: [] };
+    const b: Body = { name: typeof name === "string" && name ? name : `Body${bodyCount}`, feature, solids: [], voids: [], volume: 0, faces: [] };
     m.bodies.push(b);
     return b;
   };
@@ -441,6 +451,8 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
     const bb = bboxOf(b);
     const floor = blind ? zBottom : bb.min[2];
     openFace(b, zTop, 1, PI * R * R);
+    if (cb) b.voids.push({ kind: "cyl", x, y, r: R, z0: zStep, z1: zTop });
+    b.voids.push({ kind: "cyl", x, y, r, z0: blind ? zBottom : floor, z1: zStep });
     if (cb) {
       b.faces.push(planeFace(`F${f.id}:cbore:base${suffix}`, [0, 0, 1], PI * (R * R - r * r), [x, y, zStep]));
       b.faces.push(cylFace(`F${f.id}:cbore:side:0${suffix}`, x, y, zStep, zTop, R));
@@ -582,6 +594,7 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
           }
           if (inside <= 0 || MISS_CUTS) return [];
           b.volume -= PI * r * r * inside;
+          b.voids.push({ kind: "cyl", x, y, r, z0, z1: z0 + h });
           b.faces.push(cylFace(`F${f.id}:side${suffix}`, x, y, z0, z0 + inside, r));
           return [b.name];
         };
@@ -630,6 +643,7 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
           const names = [fy?.name, fx?.name].filter(Boolean).sort();
           const ox = sx ? s.max[0] - r : s.min[0] + r;
           const oy = sy ? s.max[1] - r : s.min[1] + r;
+          b.voids.push({ kind: "fillet", ox, oy, sx, sy, r, z0: s.min[2], z1: s.max[2] });
           blends.push({ b, face: cylFace(`F${f.id}:blend(${names.join("|")})`, ox, oy, s.min[2], s.max[2], r, 0.25) });
           changed.add(b.name);
         }
@@ -698,13 +712,13 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
         const src: { name: string; volume: number; faces: number; min: V3; max: V3 }[] = marker
           ? JSON.parse(marker[1]!).bodies
           : [{ name: stem, volume: 1000, faces: 6, min: [0, 0, 0], max: [10, 10, 10] }];
-        const f = feature(command, "ImportFeature", "Import", p.name ?? stem);
+        const f = feature(command, "BaseFeature", "Import", p.name ?? stem); // the real timeline type of a STEP import
         const made: string[] = [];
         for (const s of src) {
           let name = src.length === 1 ? stem : s.name;
           while (m.bodies.some((b) => b.name === name)) name += "_1";
           const faces: Face[] = Array.from({ length: s.faces }, (_, k) => planeFace(`F${f.id}:import:${k}`, [0, 0, 1], 0, s.min));
-          m.bodies.push({ name, feature: f.id, solids: [{ kind: "box", min: s.min, max: s.max }], volume: s.volume, faces, fixed: true });
+          m.bodies.push({ name, feature: f.id, solids: [{ kind: "box", min: s.min, max: s.max }], voids: [], volume: s.volume, faces, fixed: true });
           made.push(name);
         }
         m.results.push({
@@ -768,6 +782,15 @@ function measure(m: Model, a: Json): Json {
     bodies = bodies.filter((b) => b.name === a.body);
     if (bodies.length === 0) throw new ToolError("invalid parameters for `inspect.measure`: unknown body name");
   }
+  // `inspect.measure {bodies}`: a name or a list of names; null or an EMPTY list means all, as the real command does.
+  const pick: string[] | undefined = typeof a.bodies === "string" ? [a.bodies] : Array.isArray(a.bodies) && a.bodies.length ? a.bodies : undefined;
+  if (pick) {
+    bodies = pick.map((n) => {
+      const b = m.bodies.find((x) => x.name === n);
+      if (!b) throw new ToolError("invalid parameters for `inspect.measure`: unknown body name");
+      return b;
+    });
+  }
   const summary = a.summary === true;
   const volume = bodies.reduce((s, b) => s + b.volume, 0) * VOLUME_SCALE;
   return {
@@ -804,6 +827,104 @@ function topology(m: Model, a: Json): Json {
     })),
   };
 }
+// ── view.pick: rays against the closed-form solids ──────────────────────────────────────────────
+const EPS = 1e-6;
+/** Is the point in the body's material? */
+function inside(b: Body, p: V3): boolean {
+  const inSolid = b.solids.some((s) =>
+    s.kind === "box"
+      ? p[0] >= s.min[0] && p[0] <= s.max[0] && p[1] >= s.min[1] && p[1] <= s.max[1] && p[2] >= s.min[2] && p[2] <= s.max[2]
+      : Math.hypot(p[0] - s.x, p[1] - s.y) <= s.r && p[2] >= s.z0 && p[2] <= s.z1,
+  );
+  if (!inSolid) return false;
+  for (const v of b.voids) {
+    if (p[2] <= v.z0 || p[2] >= v.z1) continue;
+    if (v.kind === "cyl") {
+      if (Math.hypot(p[0] - v.x, p[1] - v.y) < v.r) return false;
+    } else {
+      // The corner outside the fillet's arc: beyond the arc centre on both axes, and further than r from it.
+      const bx = v.sx ? p[0] > v.ox : p[0] < v.ox;
+      const by = v.sy ? p[1] > v.oy : p[1] < v.oy;
+      if (bx && by && Math.hypot(p[0] - v.ox, p[1] - v.oy) > v.r) return false;
+    }
+  }
+  return true;
+}
+/** Every ray parameter t > 0 at which the ray meets one of the body's primitive surfaces, with that surface's normal. */
+function candidates(b: Body, o: V3, d: V3): { t: number; n: V3 }[] {
+  const out: { t: number; n: V3 }[] = [];
+  const plane = (axis: 0 | 1 | 2, value: number) => {
+    if (Math.abs(d[axis]) < 1e-12) return;
+    const n: V3 = [0, 0, 0];
+    n[axis] = 1;
+    out.push({ t: (value - o[axis]) / d[axis], n });
+  };
+  const cylinder = (x: number, y: number, r: number) => {
+    const [ox, oy] = [o[0] - x, o[1] - y];
+    const a = d[0] * d[0] + d[1] * d[1];
+    if (a < 1e-12) return;
+    const h = ox * d[0] + oy * d[1];
+    const disc = h * h - a * (ox * ox + oy * oy - r * r);
+    if (disc < 0) return;
+    for (const t of [(-h - Math.sqrt(disc)) / a, (-h + Math.sqrt(disc)) / a]) {
+      out.push({ t, n: [(o[0] + t * d[0] - x) / r, (o[1] + t * d[1] - y) / r, 0] });
+    }
+  };
+  for (const s of b.solids) {
+    if (s.kind === "box") {
+      for (const axis of [0, 1, 2] as const) {
+        plane(axis, s.min[axis]);
+        plane(axis, s.max[axis]);
+      }
+    } else {
+      cylinder(s.x, s.y, s.r);
+      plane(2, s.z0);
+      plane(2, s.z1);
+    }
+  }
+  for (const v of b.voids) {
+    if (v.kind === "cyl") cylinder(v.x, v.y, v.r);
+    else cylinder(v.ox, v.oy, v.r);
+    plane(2, v.z0);
+    plane(2, v.z1);
+  }
+  return out.filter((c) => Number.isFinite(c.t) && c.t > EPS);
+}
+/** `view.pick {rays, all}`: per ray, where it crosses a body's surface, nearest first; `[]` for a miss. */
+function pick(m: Model, p: Json): Json {
+  if (!Array.isArray(p.rays)) throw new ToolError("invalid parameters for `view.pick`: `rays` must be a list of {origin, dir}");
+  if (p.rays.length > 1024) throw new ToolError("invalid parameters for `view.pick`: at most 1024 rays");
+  const hits = p.rays.map((ray: Json) => {
+    const o = ray?.origin as V3;
+    const raw = ray?.dir as V3;
+    if (!Array.isArray(o) || !Array.isArray(raw) || o.length !== 3 || raw.length !== 3) throw new ToolError("invalid parameters for `view.pick`: a ray needs `origin` and `dir`");
+    const len = Math.hypot(raw[0], raw[1], raw[2]);
+    if (!(len > 0)) throw new ToolError("invalid parameters for `view.pick`: a ray's `dir` is zero");
+    const d: V3 = [raw[0] / len, raw[1] / len, raw[2] / len];
+    const found: Json[] = [];
+    for (const b of m.bodies) {
+      const seen: number[] = [];
+      for (const c of candidates(b, o, d).sort((x, y) => x.t - y.t)) {
+        if (seen.some((t) => Math.abs(t - c.t) < 1e-7)) continue;
+        const at = (t: number): V3 => [o[0] + t * d[0], o[1] + t * d[1], o[2] + t * d[2]];
+        const [before, after] = [inside(b, at(c.t - EPS)), inside(b, at(c.t + EPS))];
+        if (before === after) continue; // not on the body's real boundary here
+        seen.push(c.t);
+        // The outward normal points from material to air: along the ray when it is leaving material.
+        const along = c.n[0] * d[0] + c.n[1] * d[1] + c.n[2] * d[2];
+        const flip = before ? along < 0 : along > 0;
+        const point = at(c.t);
+        const normal = (flip ? c.n.map((v) => -v) : c.n) as V3;
+        const face = b.faces.findIndex((f) => (f.cylinder ? Math.abs(Math.hypot(point[0] - f.cylinder.origin[0], point[1] - f.cylinder.origin[1]) - f.cylinder.radius) < 1e-6 : false));
+        found.push({ body: b.name, depth: c.t, face: Math.max(0, face), normal, pixel: { dir: raw, origin: o }, point });
+      }
+    }
+    found.sort((x, y) => x.depth - y.depth);
+    return p.all === true ? found : found.slice(0, 1);
+  });
+  return { frame: "rays", hits };
+}
+
 function interference(m: Model, p: Json): Json {
   const pick: Body[] = Array.isArray(p.bodies)
     ? p.bodies.map((n: string) => {
@@ -962,6 +1083,8 @@ let revision = 0;
 
 const READ_ONLY: Record<string, (m: Model, p: Json) => Json> = {
   "inspect.interference": interference,
+  "inspect.measure": (m, p) => measure(m, p),
+  "view.pick": pick,
   "timeline.export_script": (m, p) => {
     const script = exportScript(m);
     const path = p.path === undefined ? null : allowedPath(p.path, "timeline.export_script");
@@ -997,6 +1120,8 @@ const COMMANDS: { id: string; label: string; params: string }[] = [
   { id: "solid.pattern.rectangular", label: "Rectangular Pattern", params: "features: [names], dir1, count1, spacing1, dir2?, count2?, spacing2?, name?" },
   { id: "file.insert_step", label: "Insert STEP", params: "path; STEP import: brings the file's solids in as a fixed reference body" },
   { id: "inspect.interference", label: "Interference", params: "bodies?: [names] → interferences: pairs that overlap" },
+  { id: "inspect.measure", label: "Measure", params: "bodies?: name | [names] (default: all) → the same reply as the measure tool" },
+  { id: "view.pick", label: "Pick", params: "rays: [{origin: [x,y,z], dir: [x,y,z]}] (max 1024), all?: bool → hits: per ray [{body, depth, face, normal, point}], nearest first" },
   { id: "timeline.export_script", label: "Export Script", params: "path?: write the script to this file → script: {commands: [...]} that rebuilds the design" },
 ];
 const LABELS: Record<string, string> = Object.fromEntries(COMMANDS.map((c) => [c.id, c.label]));

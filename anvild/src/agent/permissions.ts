@@ -144,6 +144,13 @@ async function decide(
   if (guard?.kind === "deny") {
     return { behavior: "deny", reason: guard.reason };
   }
+  if (guard?.kind === "owner-card") {
+    // The tool itself asks the owner, on a typed card, every time it runs. Unattended: nobody can answer.
+    if (isUnattended(session)) {
+      return { behavior: "deny", reason: `${guard.reason} (denied: this session is unattended)` };
+    }
+    return { behavior: "allow", updatedInput: input, reason: `protected: ${guard.reason}` };
+  }
   if (guard?.kind === "always-prompt") {
     // Nobody is there to answer in an unattended (autopilot builder) session: deny without a card
     // rather than park the run forever.

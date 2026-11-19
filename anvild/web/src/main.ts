@@ -1,4 +1,5 @@
 import { sameServerUrl } from "./api";
+import { createCadCards } from "./cad-cards";
 import {
   HUB_URL,
   anyOpen,
@@ -15,12 +16,14 @@ import {
   persistRouting,
   rosterServer,
   sendTo,
+  serverByUrl,
   serverOf,
   serverOfEnv,
   serverSupports,
   serverTeams,
   servers,
   sessionServer,
+  wireSessionId,
   type Server,
 } from "./fleet";
 import { $, esc, icon, sessIcon } from "./dom";
@@ -62,6 +65,7 @@ import {
   armAttachDiagnostic,
   clearAttachDiagnostic,
   clearConversation,
+  conversationCleared,
   commitAnswerRefs,
   commitAssistant,
   conversation,
@@ -1610,6 +1614,15 @@ function onEvent(url: string, e: ServerEvent): void {
     case "environments":
       onEnvironments(url, e.environments);
       return;
+    case "cad.design":
+      cadCards.onDesign(serverByUrl(url)?.url ?? url, e); // part card in the chat (hidden without "cad-work")
+      return;
+    case "cad.expectations.request":
+      cadCards.onRequest(serverByUrl(url)?.url ?? url, e); // expectation change / adopt card
+      return;
+    case "cad.expectations.resolved":
+      cadCards.onResolved(serverByUrl(url)?.url ?? url, e);
+      return;
     case "prompts":
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
       // own prompts event so it can't clobber the hub's synced library.
@@ -1728,6 +1741,20 @@ function onEvent(url: string, e: ServerEvent): void {
   }
 }
 
+// CAD cards in the chat (agent-cad-and-browser spec §4.9): the part card, the expectation-change card
+// and the adopt card. Driven by global `cad.*` events; hidden unless the server has "cad-work".
+const cadCards = createCadCards({
+  supported: (url) => serverSupports(serverByUrl(url), "cad-work"),
+  active: () => (activeId ? { sessionId: wireSessionId(activeId), url: (serverOf(activeId) ?? hub()).url } : undefined),
+  container: () => conversation,
+  respond: (url, requestId, approve) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.respond", requestId, approve }),
+  // Phase A3 opens the live viewer from this event; until then the card only reports the gate.
+  open: (url, ev) => void window.dispatchEvent(new CustomEvent("anvil:cad-open", { detail: { url, cwd: ev.cwd, part: ev.part, rev: ev.rev } })),
+  scrollDown: () => scrollDown(),
+});
+// The cards are current state, not replayed history: redraw them once a rebuilt pane has been filled.
+conversationCleared.add(() => void setTimeout(() => cadCards.restore(), 0));
+
 function handleSessionEvent(e: ServerEvent): void {
   // A turn the user cancelled (Stop): drop the in-flight churn the daemon is still draining
   // (deltas, tool results, a partial assistant message, "working" statuses) so the conversation
@@ -1792,6 +1819,7 @@ function handleSessionEvent(e: ServerEvent): void {
       saveConvoCache();
       return;
     case "message.user":
+      if (e.sessionId === activeId) cadCards.newTurn(); // the next cad.design for a part starts a new part card
       appendUser(e.rendered.html, e.attachments, e.ts, e.cid, e.rendered.source); // cid retires the matching optimistic bubble
       return;
     case "assistant.delta":

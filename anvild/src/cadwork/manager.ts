@@ -81,9 +81,19 @@ export interface CadParamInfo {
   error?: string;
 }
 
-/** Phase A1 knows two states; the gate (A2) adds `pass` and its own reasons on top. */
+/** What the gate last concluded about the script the process now holds (set by the refresh). */
+export interface PartVerdict {
+  status: "pass" | "fail" | "unverified";
+  reason?: string;
+}
+
+/**
+ * A part's state. The manager itself knows `unverified` (changed since the last check) and `fail`
+ * (a disk conflict, a script that did not replay, failed features); the gate's refresh adds its own
+ * verdict through `SlotContext.setVerdict` — including `pass` — which holds until the script changes.
+ */
 export interface PartState {
-  status: "unverified" | "fail";
+  status: "unverified" | "fail" | "pass";
   /** Why it is `fail` (a disk conflict, a script that did not replay, failed features). */
   reason?: string;
   featureErrors: FeatureIssue[];
@@ -92,6 +102,8 @@ export interface PartState {
   conflict: boolean;
   /** `design.json` could not be replayed at start (the process started empty). */
   replayFailure?: string;
+  /** `status` is the GATE's verdict (expectations vs measurement), not a failure of the design itself. */
+  fromGate?: boolean;
 }
 
 export interface PartStatus {
@@ -122,6 +134,12 @@ export interface CadRequest {
   /** `read` skips the post-step; `mutate` runs it; `undo`/`redo` revert one agent request. */
   kind: CadRequestKind;
   timeoutMs?: number;
+  /**
+   * Runs INSIDE the same queue slot, after the request and its script write and before anything
+   * else (the refresh included). The owner's parameter change uses it to update the accepted numbers
+   * atomically with the change, so no other caller's request can slip in between.
+   */
+  afterWrite?: (slot: SlotContext, done: { result: McpToolResult; wrote: boolean }) => void | Promise<void>;
 }
 
 export interface CadReply {
@@ -147,6 +165,10 @@ export interface SlotContext {
   waitedForSlot: boolean;
   state(): PartState;
   scriptSha(): string | undefined;
+  /** User parameters as of the last change. */
+  params(): CadParamInfo[];
+  /** Record the gate's verdict for the script the process holds now (the refresh calls this). */
+  setVerdict(verdict: PartVerdict): void;
 }
 
 /** The refresh a later phase installs: measure, gate, preview, broadcast (§4.3 steps 2–5). */
@@ -215,6 +237,8 @@ interface PartRec {
   lastUsed: number;
   refreshDirty: boolean;
   lastRefreshAt: number;
+  /** The gate's verdict and the script it is about. */
+  verdict?: PartVerdict & { scriptSha?: string };
 }
 
 export function maxProcsFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -315,6 +339,7 @@ export class CadManager {
       } else {
         result = req.kind === "mutate" ? await this.call(rec, req.tool, args, timeout) : await this.undoRedo(rec, req.kind, timeout, slot.notes);
         wrote = await this.afterMutation(rec, result, req.kind, slot.notes);
+        if (req.afterWrite) await req.afterWrite(slot, { result, wrote });
       }
       return { result, notes: slot.notes, reloaded: slot.reloaded, waitedForSlot: slot.waitedForSlot, wrote, state: this.stateOf(rec), scriptSha: rec.scriptSha };
     });
@@ -334,8 +359,21 @@ export class CadManager {
    */
   async forceRefresh(ref: PartRef | string): Promise<void> {
     const rec = this.parts.get(typeof ref === "string" ? ref : ref.key);
-    if (!rec || !this.refreshJob || !rec.refreshDirty) return;
+    // Nothing pending and nothing running: nothing to wait for. While the queue is running, a
+    // refresh may be in flight (it clears the dirty flag when it STARTS), so queue behind it.
+    if (!rec || !this.refreshJob || (!rec.refreshDirty && !rec.pumping)) return;
     await this.enqueue(rec.ref, async () => undefined, true);
+  }
+
+  /**
+   * Run the refresh for a part NOW, in queue order, and wait for it — even when the script has not
+   * changed. `check_part` uses this: `part.json`, `cad/rules.json` or the lock store may have changed
+   * with the design untouched. Starts the process if it is not up. A no-op with no refresh job.
+   */
+  async refreshNow(ref: PartRef): Promise<void> {
+    if (!this.refreshJob) return;
+    this.rec(ref).refreshDirty = true;
+    await this.enqueue(ref, async () => undefined, true);
   }
 
   /** Stop every process and fail whatever is still queued. */
@@ -441,6 +479,10 @@ export class CadManager {
       waitedForSlot: info.waitedForSlot,
       state: () => this.stateOf(rec),
       scriptSha: () => rec.scriptSha,
+      params: () => rec.params,
+      setVerdict: (verdict) => {
+        rec.verdict = { ...verdict, scriptSha: rec.scriptSha };
+      },
     };
   }
 
@@ -818,6 +860,10 @@ export class CadManager {
     if (rec.conflict) return { status: "fail", reason: DISK_CONFLICT_REASON, ...base };
     if (rec.replayFailure) return { status: "fail", reason: `design.json failed to replay: ${rec.replayFailure}`, ...base };
     if (rec.featureErrors.length) return { status: "fail", reason: `failed features: ${rec.featureErrors.map((f) => `${f.feature}: ${f.message}`).join("; ")}`, ...base };
+    // The gate's verdict stands while it is about the current script and nothing is waiting to be re-checked.
+    if (rec.verdict && !rec.refreshDirty && rec.verdict.scriptSha === rec.scriptSha) {
+      return { status: rec.verdict.status, ...(rec.verdict.reason ? { reason: rec.verdict.reason } : {}), ...base, fromGate: true };
+    }
     return { status: "unverified", ...base };
   }
 

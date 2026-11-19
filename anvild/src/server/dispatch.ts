@@ -241,6 +241,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "cad.expectations.respond":
+        deps.supervisor.respondCadExpectations(cmd.requestId, cmd.approve === true);
+        if (cid) send(ack(cid));
+        return;
+
       case "question.respond":
         deps.supervisor.resolveQuestion(cmd.requestId, cmd.answers ?? [], Boolean(cmd.cancelled));
         if (cid) send(ack(cid));

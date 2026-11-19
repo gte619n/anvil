@@ -845,8 +845,12 @@ export function serializeTranscript(maxNodes: number): string {
   return clone.innerHTML;
 }
 
+/** Called whenever the pane is emptied to be rebuilt, so state that is NOT part of the replayed
+ *  history (the CAD part and expectation cards) can redraw itself afterwards. */
+export const conversationCleared = new Set<() => void>();
 export function clearConversation(): void {
   conversation.innerHTML = "";
+  for (const fn of conversationCleared) fn();
   ui.streaming = null;
   tailSpacer = null; // detached by the innerHTML reset
   thinkingEl = null; // detached by the innerHTML reset

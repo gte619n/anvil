@@ -339,6 +339,7 @@ export class Supervisor {
       getSession: (id) => this.sessions.get(id),
       registry: this.registry,
       manager: cfg.cadManager,
+      stateDir: cfg.stateDir, // the lock store: <stateDir>/cadwork/locks.json
     });
     if (this.cadwork.enabled) void this.cadwork.refreshStatus(); // learn the SolidCraft version; broadcasts cad.status
     this.gitProjection = new GitProjectionService({
@@ -1750,6 +1751,11 @@ export class Supervisor {
     return Object.keys(servers).length > 0 ? servers : undefined;
   }
 
+  /** Answer an expectations card (`cad.expectations.respond`, spec §4.8) — may come from any device. */
+  respondCadExpectations(requestId: string, approve: boolean): void {
+    if (!this.cadwork.respond(requestId, approve)) throw new BadCommand(`no pending expectations card: ${requestId}`);
+  }
+
   /** Whether this machine can do CAD right now (`cad.status`, spec §4.8). */
   cadStatusEvent(): CadStatusEvent {
     return this.cadwork.statusEvent();
@@ -2016,6 +2022,7 @@ export class Supervisor {
     this.fileWatchMgr.clear(id);
     this.terminalMgr.kill(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
+    this.cadwork.cancelSession(id); // …and any expectations card a CAD tool is waiting on
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
@@ -2169,6 +2176,7 @@ export class Supervisor {
     await this.drivers.get(id)?.stop(); // drop the live query so the next prompt starts fresh
     this.drivers.delete(id);
     this.broker.resolveSession(id, "deny"); // unblock any parked permission
+    this.cadwork.cancelSession(id); // …and any expectations card a CAD tool is waiting on
     this.questionBroker.resolveSession(id); // cancel any parked AskUserQuestion
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();

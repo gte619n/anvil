@@ -18,13 +18,15 @@ import {
   refusedCommand,
   refusedStep,
 } from "../../src/agent/cad-tools";
+import { registerCadProtectedRules } from "../../src/agent/cad-protected";
+import { CAD_OWNER_CARD_TOOL_IDS } from "../../src/agent/cad-tool-ids";
 import { isReadOnly } from "../../src/agent/danger-list";
 import { PermissionBroker, makePreToolUseHook } from "../../src/agent/permissions";
 import { QuestionBroker, makeCanUseTool } from "../../src/agent/questions";
 import type { CadManager } from "../../src/cadwork/manager";
 import { CadworkService, NO_SOLIDCRAFT } from "../../src/session/cadwork-service";
 import type { Session } from "../../src/session/session";
-import { BOX, callable, cleanupTemp, fakeCadSession, recordingSpawn, stopServices, tempDir, tempRepo } from "../helpers/cad-work";
+import { BOX, STUB_GATE_DEPS, callable, cleanupTemp, fakeCadSession, recordingSpawn, stopServices, tempDir, tempRepo } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT, REFERENCE_PLATE } from "../helpers/fake-solidcraft";
 
 afterEach(async () => {
@@ -53,10 +55,11 @@ describe("anvil_cad names and permission classes", () => {
   test("[A1] the server is named anvil_cad and exposes exactly the A1 tools", () => {
     expect(CAD_MCP_SERVER_NAME).toBe("anvil_cad");
     const { manager } = recordingManager();
-    const defs = cadTools({ sessionId: "s", worktree: "/tmp", manager, unavailable: () => undefined, offerFile: () => true });
+    const defs = cadTools({ sessionId: "s", worktree: "/tmp", manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS });
     const names = defs.map((d) => d.name).sort();
     expect(names).toEqual(
-      ["batch", "body_topology", "check_parameters", "compare_picture", "describe_command", "execute", "export_part", "inspect_design", "list_commands", "measure", "open_part", "redo", "screenshot", "set_parameter", "skill_reference", "undo"],
+      // The A1 tools, plus Phase A2's check_part, propose_expectations and record_expectations.
+      ["batch", "body_topology", "check_parameters", "check_part", "compare_picture", "describe_command", "execute", "export_part", "inspect_design", "list_commands", "measure", "open_part", "propose_expectations", "record_expectations", "redo", "screenshot", "set_parameter", "skill_reference", "undo"],
     );
     // SolidCraft's own file tools are not there under any name.
     for (const hidden of ["open", "save", "export", "new_design", "crash_reports"]) expect(names).not.toContain(hidden);
@@ -64,7 +67,7 @@ describe("anvil_cad names and permission classes", () => {
     expect([...CAD_TOOL_IDS].sort()).toEqual(names.map((n) => `mcp__anvil_cad__${n}`));
     expect(CAD_READ_ONLY_TOOL_IDS.filter((id) => CAD_MUTATING_TOOL_IDS.includes(id))).toEqual([]);
     expect(CAD_TOOL_IDS).toHaveLength(names.length);
-    const server = buildCadToolsServer({ sessionId: "s", worktree: "/tmp", manager, unavailable: () => undefined, offerFile: () => true });
+    const server = buildCadToolsServer({ sessionId: "s", worktree: "/tmp", manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS });
     // (Not `server.name`: other suites replace the SDK module process-wide with a stub that names
     // every server "mock". The name that matters is the key the driver registers it under.)
     expect(server.type).toBe("sdk");
@@ -75,11 +78,11 @@ describe("anvil_cad names and permission classes", () => {
 
   test("[A1] isReadOnly knows the read-only anvil_cad tools and none of the mutating ones", () => {
     expect([...CAD_READ_ONLY_TOOL_IDS].sort()).toEqual(
-      ["body_topology", "compare_picture", "describe_command", "inspect_design", "list_commands", "measure", "screenshot", "skill_reference"].map((t) => `mcp__anvil_cad__${t}`),
+      ["body_topology", "check_part", "compare_picture", "describe_command", "inspect_design", "list_commands", "measure", "screenshot", "skill_reference"].map((t) => `mcp__anvil_cad__${t}`),
     );
     for (const id of CAD_READ_ONLY_TOOL_IDS) expect(isReadOnly(id)).toBe(true);
     expect([...CAD_MUTATING_TOOL_IDS].sort()).toEqual(
-      ["batch", "check_parameters", "execute", "export_part", "open_part", "redo", "set_parameter", "undo"].map((t) => `mcp__anvil_cad__${t}`),
+      ["batch", "check_parameters", "execute", "export_part", "open_part", "propose_expectations", "record_expectations", "redo", "set_parameter", "undo"].map((t) => `mcp__anvil_cad__${t}`),
     );
     for (const id of CAD_MUTATING_TOOL_IDS) expect(isReadOnly(id)).toBe(false);
     expect(isReadOnly("mcp__anvil_cad__release_part")).toBe(false); // an unknown anvil_cad tool is not read-only by default
@@ -127,6 +130,17 @@ describe("anvil_cad names and permission classes", () => {
     // Under allowlist: every read-only id passes silently, every mutating id prompts.
     for (const id of CAD_READ_ONLY_TOOL_IDS) expect(await decide("allowlist", id)).toEqual({ prompted: false, decision: "allow" });
     for (const id of CAD_MUTATING_TOOL_IDS) expect(await decide("allowlist", id)).toEqual({ prompted: true, decision: "allow" });
+    // With the daemon's CAD rules registered (as they are whenever cad-work is on), the one tool that
+    // parks its own owner card is let through without a second, generic prompt; the rest are unchanged.
+    const off = registerCadProtectedRules(tempDir());
+    try {
+      for (const id of CAD_MUTATING_TOOL_IDS) {
+        expect(await decide("allowlist", id)).toEqual({ prompted: !CAD_OWNER_CARD_TOOL_IDS.includes(id), decision: "allow" });
+      }
+      expect(CAD_OWNER_CARD_TOOL_IDS).toEqual(["mcp__anvil_cad__propose_expectations"]);
+    } finally {
+      off();
+    }
   });
 
   test("[A1] the hook always decides an anvil_cad tool, so canUseTool is never needed and stays fail-closed", async () => {
@@ -197,7 +211,7 @@ describe("anvil_cad tools", () => {
     }
 
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     for (const command of ["file.save", "file.open", "file.export", "file.new", "file.insert_step", "file.save_as", "file.trash", "save"]) {
       const r = await tools.execute!({ command, params: { path: "/tmp/x.sc" } });
@@ -226,7 +240,7 @@ describe("anvil_cad tools", () => {
 
   test("[A1] the pass-through tools map to the right SolidCraft tool and request kind", async () => {
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     await tools.set_parameter!({ name: "L", expression: "120 mm" });
     await tools.set_parameter!({ name: "W", value: 60 });
@@ -364,7 +378,7 @@ describe("anvil_cad tools", () => {
     for (const f of CAD_COMMAND_ALLOW) expect("only" in f ? f.only.length > 0 : f.allow === "*").toBe(true);
 
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     for (const command of ["future.thing", "doc.open", "plugin.run", "diagnostics.crash_test"]) {
       const r = await tools.execute!({ command, params: {} });
@@ -410,7 +424,7 @@ describe("anvil_cad tools", () => {
     for (const [command, params] of fine) expect(refusedStep(command, params)).toBeUndefined();
 
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     const r = await tools.execute!({ command: "solid.box", params: { length: 1, width: 1, height: 1, path: "cad/plate/design.json" } });
     expect(r.isError).toBe(true);
@@ -421,7 +435,7 @@ describe("anvil_cad tools", () => {
 
   test("[A1] bookkeeping bypasses are refused: edit.undo, edit.redo, checkpoints, tool names as batch steps, engine.commands", async () => {
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     for (const command of ["edit.undo", "edit.redo", "edit.checkpoint", "edit.restore_checkpoint", "edit.repeat"]) {
       const r = await tools.execute!({ command, params: {} });
@@ -442,7 +456,7 @@ describe("anvil_cad tools", () => {
   test("[A1] compare_picture gives one answer for every refusal, so it cannot be used to learn which files exist", async () => {
     const repo = tempRepo();
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: repo, manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: repo, manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     mkdirSync(join(repo, "cad", "plate", "refs"), { recursive: true });
     writeFileSync(join(repo, "secret.png"), "png");
@@ -460,7 +474,7 @@ describe("anvil_cad tools", () => {
   test("[A1] compare_picture only reads a picture inside the part folder", async () => {
     const repo = tempRepo();
     const { manager, requests } = recordingManager();
-    const tools = callable(cadTools({ sessionId: "s", worktree: repo, manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    const tools = callable(cadTools({ sessionId: "s", worktree: repo, manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     mkdirSync(join(repo, "cad", "plate", "refs"), { recursive: true });
     writeFileSync(join(repo, "cad", "plate", "refs", "photo.png"), "png");
@@ -501,7 +515,8 @@ describe("anvil_cad tools", () => {
     expect(decodeURIComponent(emitted[0].file.downloadUrl)).toContain("cad/plate/.cache/exports/plate.step");
     // Exports are generated, so git does not see them; the script it does.
     const status = Bun.spawnSync(["git", "-C", repo, "status", "--porcelain", "--untracked-files=all"]).stdout.toString();
-    expect(status.trim()).toBe("?? cad/plate/design.json");
+    // (part.json is the placeholder expectations the helper records so that modeling is allowed.)
+    expect(status.trim()).toBe("?? cad/plate/design.json\n?? cad/plate/part.json");
     // A format the binary cannot write is reported per format, without losing the others.
     emitted.length = 0;
     const mixed = await tools.export_part!({ part: "plate", formats: ["stl", "obj"] });

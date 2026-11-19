@@ -226,7 +226,147 @@
     },
     "A2": {
       "title": "expectations, gate, rules",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/integration/cad-a2-gate.test.ts",
+          "names": [
+            "Phase A2 acceptance > [A2] acceptance 1: modeling on a dimensioned part before record_expectations is refused",
+            "Phase A2 acceptance > [A2] acceptance 2: the plate with the documented volume formula and holes [{diameter: 3.4, count: 4}] passes; removing the pattern feature fails naming the hole count and the volume",
+            "Phase A2 acceptance > [A2] acceptance 3: a second record_expectations is refused; propose_expectations parks a card; Deny leaves part.json byte-identical; Approve rewrites it and updates the lock store",
+            "Phase A2 acceptance > [A2] acceptance 4: propose_expectations prompts under bypass and after an earlier always-allow for another tool, and its card offers no always-allow",
+            "Phase A2 acceptance > [A2] acceptance 5: an Edit to cad/plate/part.json is denied under bypass",
+            "Phase A2 acceptance > [A2] acceptance 6: rewriting part.json's expectations on disk (as Bash would) gives unverified with needsAdoption expectations, even with lockedBy owner; adopting on the card restores pass",
+            "Phase A2 acceptance > [A2] acceptance 7: with expectations bbox [L, W, T], an agent set_parameter L=120 fails with \"expected value moved without owner approval\"; the same change by the owner passes",
+            "Phase A2 acceptance > [A2] acceptance 8: a tolerance edited on disk to 1.0 and adopted is still fail on the cap check",
+            "Phase A2 acceptance > [A2] acceptance 9: changing cad/rules.json on disk gives unverified with needsAdoption rules",
+            "Phase A2 acceptance > [A2] acceptance 10: an envelope smaller than the part fails on the envelope check; minWall gives an advisory line and the state is still pass",
+            "Phase A2 edge cases and gaming (§7) > [A2] a cut that misses (success reported, volume unchanged) fails the volume check",
+            "Phase A2 edge cases and gaming (§7) > [A2] the owner denies an expectation change: nothing is written and the agent is told it was denied",
+            "Phase A2 edge cases and gaming (§7) > [A2] gamed: the agent cannot set expectations after measuring — modeling is refused first, and later changes need the owner",
+            "Phase A2 edge cases and gaming (§7) > [A2] gamed: editing part.json by any route leaves a hash the lock store does not know, so the part is unverified until the owner adopts it",
+            "Phase A2 edge cases and gaming (§7) > [A2] gamed: expectations written as bare parameter names do not follow the parameters — by set_parameter, execute or batch",
+            "Phase A2 edge cases and gaming (§7) > [A2] gamed: tolerances so loose anything passes are capped on every evaluation, not only when recorded",
+            "Phase A2 edge cases and gaming (§7) > [A2] gamed: loosening rules.json — the Edit always prompts, and any change needs adoption",
+            "Phase A2 edge cases and gaming (§7) > [A2] gamed: an always-prompt card cannot be answered once with \"always allow\" — it has no such option and is checked before the remembered-allow lookup",
+            "Phase A2 edge cases and gaming (§7) > [A2] a session with the anvil_cad server gets the CAD paragraph in its system prompt, and other sessions do not",
+            "Phase A2 lock store hub sync (§4.14 item 42) > [A2] hub sync: a part approved on machine 1 is pass on machine 2 with no adopt card once synced",
+            "Phase A2 lock store hub sync (§4.14 item 42) > [A2] hub sync: a hash the hub does not know is unverified with an adopt card on machine 2, and adopting there applies on machine 1",
+            "Phase A2 lock store hub sync (§4.14 item 42) > [A2] hub sync: a member that cannot reach the hub uses its copy, applies its own approval locally, queues it, and delivers it when the hub is back",
+            "Phase A2 lock store hub sync (§4.14 item 42) > [A2] hub sync routes keep the fleet posture: JSON only, a proven other user is rejected, a member takes pushes only from its own hub, a hub takes approvals only from its members",
+            "Phase A2 lock store hub sync (§4.14 item 42) > [A2] a socket that opens later is sent the current cad.design of every part and every card still waiting"
+          ]
+        },
+        {
+          "file": "test/unit/cad-expr.test.ts",
+          "names": [
+            "cad expr > [A2] numbers, the four operators, powers, parentheses and unary minus follow ordinary precedence",
+            "cad expr > [A2] parameter names and pi are looked up; the plate's documented volume formula gives 23335.167 mm³",
+            "cad expr > [A2] anything else is refused with a clear error: unknown names, functions, units, bad syntax, division by zero",
+            "cad expr > [A2] it never runs code: object-prototype names are unknown parameters and the source uses no eval or Function"
+          ]
+        },
+        {
+          "file": "test/unit/cad-partfile.test.ts",
+          "names": [
+            "cad partfile > [A2] a part.json round-trips: stable key order, defaults filled, schema 1",
+            "cad partfile > [A2] a corrupt part.json or a wrong schema is reported with the parse error and is never overwritten",
+            "cad partfile > [A2] measured is written by the daemon only when there is a valid part.json, and not rewritten when unchanged",
+            "cad partfile > [A2] the locked hash covers the expectations, the process and the status, and not the measurement",
+            "cad partfile > [A2] expectations evaluate to sorted numbers, and shape and tolerance problems are named"
+          ]
+        },
+        {
+          "file": "test/unit/cad-locks.test.ts",
+          "names": [
+            "cad lock store > [A2] it keeps, per repo and part, the approved hash, who approved, the evaluated numbers and ownerParams; per repo the rules hash",
+            "cad lock store > [A2] the repo key is the remote URL when there is one, else the main checkout's real path, shared by its worktrees",
+            "cad lock store > [A2] a corrupt lock file is quarantined and the store starts empty (every part needs adopting again)",
+            "cad lock store > [A2] conflicts: the latest approval per (repo, part) wins by timestamp; a tie keeps the copy already held",
+            "cad lock store hub sync > [A2] a standalone daemon just uses the local file: nothing is sent anywhere",
+            "cad lock store hub sync > [A2] an approval on the hub is stored there and broadcast to every member, with the hub's address",
+            "cad lock store hub sync > [A2] an approval on a member is applied locally, sent to the hub, and reaches the other members",
+            "cad lock store hub sync > [A2] a member that cannot reach the hub applies locally, queues (durably), and delivers later",
+            "cad lock store hub sync > [A2] a member that has never heard from the hub queues, and delivers when the hub's first push arrives",
+            "cad lock store hub sync > [A2] conflict between machines: the later approval wins fleet-wide, whichever arrives last",
+            "cad lock store hub sync > [A2] a member only takes a push from the hub it is paired with as its address book, and a hub notes members it missed"
+          ]
+        },
+        {
+          "file": "test/unit/cad-holes.test.ts",
+          "names": [
+            "cad holes > [A2] the plate's four counterbored holes are ONE row: ⌀3.4 through, with the counterbore listed",
+            "cad holes > [A2] a part with one blind hole and one boss has exactly the blind hole; fillets, bosses and missed cuts are not holes",
+            "cad holes > [A2] concavity needs 6 of 8 rays: a slot end (4 of 8) and a fillet (2 of 8) are not holes; a floor makes a hole blind",
+            "cad holes > [A2] coaxial sections stack into one row keyed by the smallest diameter; separate axes and bodies add up",
+            "cad holes > [A2] many cylinders are picked in chunks of whole cylinders under the 1024-ray limit, and errors are thrown, not swallowed"
+          ]
+        },
+        {
+          "file": "test/unit/cad-rules.test.ts",
+          "names": [
+            "cad rules > [A2] the file is read with the sha256 of its exact bytes; a missing or malformed file is reported, not guessed",
+            "cad rules > [A2] hard: the sorted bounding box must fit the sorted envelope, whatever the part's orientation",
+            "cad rules > [A2] hard: for cnc every hole diameter must be within holeTolerance of a listed drill; fdm has no drill rule",
+            "cad rules > [A2] advisory: minWall and minInsideRadius are shown, never block, and say plainly that they are not measured",
+            "cad rules > [A2] a process that is not in the file fails with \"unknown process\"",
+            "cad rules > [A2] the adopt card's diff marks added and removed lines"
+          ]
+        },
+        {
+          "file": "test/unit/cad-gate.test.ts",
+          "names": [
+            "cad gate (evaluateGate) > [A2] GateResult has exactly the spec's shape, and a part that matches everything passes",
+            "cad gate (evaluateGate) > [A2] gate code that throws gives unverified, never pass (fail closed)",
+            "cad gate (evaluateGate) > [A2] a corrupt part.json or a wrong schema is unverified with the parse error",
+            "cad gate (evaluateGate) > [A2] lock-store hashes must match: a changed part.json, ownerParams or rules.json is unverified with needsAdoption",
+            "cad gate (evaluateGate) > [A2] tolerances are capped at 0.1 mm and 1% on every evaluation, even when the loose block was approved",
+            "cad gate (evaluateGate) > [A2] accepted numbers are held: a formula that now evaluates differently fails with old and new listed, and the old numbers stay the target",
+            "cad gate (evaluateGate) > [A2] no timeline feature may have an error, whatever the numbers say",
+            "cad gate (evaluateGate) > [A2] sorted bounding box, volume, body count and the hole table are each a hard check within tolerance",
+            "cad gate (evaluateGate) > [A2] the rules of the part's process are hard checks; advisories are listed and never change the state",
+            "cad gate (evaluateGate) > [A2] staleBuild is set when the measurement was taken under a different SolidCraft version, and a concept part is never pass",
+            "cad gate (the refresh, against the fake) > [A2] the refresh measures, evaluates, writes part.json.measured and sets PartState to pass",
+            "cad gate (the refresh, against the fake) > [A2] a refresh that throws, or a gate that throws, leaves the part unverified and never pass",
+            "cad gate (the refresh, against the fake) > [A2] a corrupt part.json makes the part unverified with the parse error, and the file is not overwritten",
+            "cad gate (the refresh, against the fake) > [A2] a Boolean retry warning with matching numbers passes, with the warning listed",
+            "cad gate (the refresh, against the fake) > [A2] only design bodies are measured: an imported reference body (BaseFeature) is left out of volume, box and body count",
+            "cad gate (the refresh, against the fake) > [A2] a fresh clone or another machine: an approved part is unverified with an adopt card, and one approval restores pass",
+            "cad gate (the refresh, against the fake) > [A2] gateFromDisk judges the stored measurement without starting SolidCraft, and flags a stale build"
+          ]
+        },
+        {
+          "file": "test/unit/cad-protected.test.ts",
+          "names": [
+            "cad protected rules > [A2] Edit, Write, MultiEdit and NotebookEdit to cad/<part>/part.json are denied under every policy, bypass included",
+            "cad protected rules > [A2] Edit and Write to cad/rules.json always prompt — under bypass, after an earlier always-allow, with no always-allow offered — and are denied when unattended",
+            "cad protected rules > [A2] Bash commands that reach for the daemon's CAD and browser state, solidcraft-cli, or a remote-debugging browser are denied",
+            "cad protected rules > [A2] propose_expectations is let through with no generic prompt (its own card is the prompt) and denied when unattended",
+            "cad protected rules > [A2] the rules are registered once per daemon, by the service when cad-work is on, and tests can reset the registry"
+          ]
+        },
+        {
+          "file": "test/web/cad-cards.test.ts",
+          "names": [
+            "[A2] the part card shows the name, the gate state, every failing check, advisory lines and warnings, with slots left for the thumbnail and Release",
+            "[A2] there is one card per part per turn, updated in place; a new turn starts a new card",
+            "[A2] the cards are hidden without the cad-work capability, and shown only in a session that has the part open",
+            "[A2] the expectation-change card shows old and new side by side and the agent's reason, with Approve and Deny only",
+            "[A2] the adopt card shows the values or the rules diff, and untrusted text is never parsed as HTML"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/cad-a2.test.ts",
+          "names": [
+            "real SolidCraft through the gate > [A2] real: the plate with the documented volume formula and holes [{diameter: 3.4, count: 4}] passes the gate",
+            "real SolidCraft through the gate > [A2] real: removing the pattern feature fails the gate, naming the hole count and the volume",
+            "real SolidCraft through the gate > [A2] real: the hole table of a part with one blind hole and one boss is exactly the blind hole",
+            "real SolidCraft through the gate > [A2] real: a parameter change that breaks a feature fails the gate on the feature-error check",
+            "real SolidCraft through the gate > [A2] real: measured timings of the refresh on the reference plate are recorded"
+          ]
+        }
+      ]
     },
     "A3": {
       "title": "live preview and parameters panel",

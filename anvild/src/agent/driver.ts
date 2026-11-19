@@ -5,6 +5,7 @@ import { sdkModelId } from "./models";
 import type { CommandInfo, ContextUsage, Model, ModelTierInfo } from "@protocol";
 import { InputQueue, userMessage, type InlineAttachment } from "./input-queue";
 import { askUserQuestionToolIds, asyncLaunchedToolIds, extractResultUsage, signalsTurnActivity, extractSessionId, mapMessage, subAgentSignals, toolResultImages } from "./map";
+import { CAD_MCP_SERVER_NAME, CAD_SYSTEM_PROMPT } from "./cad-tool-ids";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
@@ -189,6 +190,7 @@ export class AgentDriver {
   private systemPrompt(): { type: "preset"; preset: "claude_code"; append?: string } {
     const s = this.session.data;
     let append = AgentDriver.TOOLING_GUIDANCE;
+    if (this.mcpServers && CAD_MCP_SERVER_NAME in this.mcpServers) append += CAD_SYSTEM_PROMPT; // sessions with the anvil_cad server (spec §4.4)
     if (s.isDefault) {
       append +=
         "\n\nYOU ARE THE ANVIL CONCIERGE. You are a single, persistent, general-purpose assistant for the " +

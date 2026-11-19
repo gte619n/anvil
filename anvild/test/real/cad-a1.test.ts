@@ -53,7 +53,7 @@ describe("real SolidCraft through the manager", () => {
     expect(doc.commands.length).toBeGreaterThan(0);
     expect(manager.status(partRef(repo, "plate"))!.scriptSha).toBe(scriptSha(doc.commands));
     // SolidCraft wrote nothing itself: the part folder holds the script (and our .cache), no .sc.
-    expect(readdirSync(join(repo, "cad", "plate")).filter((f) => f !== ".cache")).toEqual(["design.json"]);
+    expect(readdirSync(join(repo, "cad", "plate")).filter((f) => f !== ".cache").sort()).toEqual(["design.json", "part.json"]); // part.json: the expectations (Phase A2)
 
     // A fresh process, outside the manager, replays the committed file to the same numbers.
     const fresh = await startFake({ cli: [SOLIDCRAFT_CLI], allow: [join(repo, "cad", "plate")], inFile: path, env: { SOLIDCRAFT_GPU: "cpu" } });
@@ -86,7 +86,11 @@ describe("real SolidCraft through the manager", () => {
     near(after.json.total.volume_mm3, V80);
     expect(after.json.bodies[0].faces).toBe(22);
     expect(manager.status(ref)!.pid).not.toBe(pid);
-    expect(manager.status(ref)!.state.status).toBe("unverified"); // replayed with no failed features
+    // Replayed with no failed features and no replay failure. (`status` itself is the gate's verdict
+    // since Phase A2, which this suite's placeholder expectations do not describe.)
+    expect(manager.status(ref)!.state.featureErrors).toEqual([]);
+    expect(manager.status(ref)!.state.replayFailure).toBeUndefined();
+    expect(manager.status(ref)!.state.conflict).toBe(false);
   }, 120_000);
 
   test.skipIf(!REAL)("[A1] real: editing design.json on disk then measuring reflects the edited file", async () => {
@@ -150,7 +154,7 @@ describe("real SolidCraft through the manager", () => {
       expect((await tools.execute!({ command, params: { path: join(dir, "x.sc") } })).isError).toBe(true);
     }
     expect((await tools.batch!({ commands: [{ command: "save", params: { path: join(dir, "x.sc") } }] })).isError).toBe(true);
-    expect(readdirSync(dir).filter((f) => f !== ".cache")).toEqual(["design.json"]);
+    expect(readdirSync(dir).filter((f) => f !== ".cache").sort()).toEqual(["design.json", "part.json"]);
     near((await tools.measure!({ summary: true })).json.total.volume_mm3, V80); // still the plate: file.new did not run
 
     const exported = await tools.export_part!({ part: "plate", formats: ["step", "3mf", "glb"] });
@@ -239,7 +243,7 @@ describe("real SolidCraft through the manager", () => {
     for (const step of ["undo", "redo", "set_parameter", "save"]) {
       expect((await tools.batch!({ commands: [{ command: step, params: { name: "L", value: 1, path: join(dir, "x.sc") } }] })).isError).toBe(true);
     }
-    expect(readdirSync(dir).sort()).toEqual([".cache", "design.json"]);
+    expect(readdirSync(dir).sort()).toEqual([".cache", "design.json", "part.json"]); // part.json: the daemon's own (Phase A2)
     expect(readFileSync(join(dir, "design.json"), "utf8")).toBe(designBefore);
     expect(readdirSync(join(dir, ".cache"))).toEqual([]);
     near((await tools.measure!({ summary: true })).json.total.volume_mm3, V80); // still the plate, still alive

@@ -16,13 +16,17 @@
  * bridged tools. `execute` / `batch` are DEFAULT-DENY: only the command ids in the allow-list
  * (`./cad-command-allow.ts`) run, and no step may carry a path, a file name or an address.
  *
- * Later phases add their tools to `cadTools()`: `record_expectations`, `propose_expectations`,
- * `request_dimensions`, `check_part` (A2), `import_reference`, `release_part`, `report_gap` (A4).
+ *  - `record_expectations` (once, before modeling), `propose_expectations` (the owner's card) and
+ *    `check_part` (the gate in full). Modeling calls are refused on a part with no expectations.
+ *
+ * Later phases add their tools to `cadTools()`: `request_dimensions`, `import_reference`,
+ * `release_part`, `report_gap` (A4).
  */
 import { z } from "zod";
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { advisoryLines, failingLines, type GateResult } from "../cadwork/gate";
 import type { CadManager, CadReply, PartState } from "../cadwork/manager";
 import type { McpToolResult } from "../cadwork/mcp-client";
 import { EXPORTS_DIR, listParts, partRef, type PartRef } from "../cadwork/partfolder";
@@ -44,6 +48,15 @@ export interface CadToolDeps {
   unavailable(): string | undefined;
   /** Surface a file the daemon wrote as a download card in the session. False when it could not be offered. */
   offerFile(absPath: string): boolean | Promise<boolean>;
+  /** This session works on the part (its chat gets the part card and the adopt cards). */
+  touch(ref: PartRef): void;
+  /** Why modeling is refused on the part right now (no expectations recorded), else undefined. */
+  modelingRefusal(ref: PartRef): string | undefined;
+  recordExpectations(ref: PartRef, process: unknown, expectations: unknown): { ok: true } | { ok: false; error: string };
+  /** Parks the owner's card and resolves when they answer. */
+  proposeExpectations(ref: PartRef, expectations: unknown, reason: unknown): Promise<{ ok: true; approved?: boolean } | { ok: false; error: string }>;
+  /** Forces a refresh and returns the gate result in full. */
+  checkPart(ref: PartRef): Promise<GateResult>;
 }
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -74,12 +87,26 @@ function toContent(result: McpToolResult, notes: string[]): ToolOut {
 
 function replyContent(ref: PartRef, reply: CadReply): ToolOut {
   const notes = [...reply.notes];
-  if (reply.state.status === "fail" && notes.length === 0) notes.push(stateLine(ref.part, reply.state));
+  // A design that is itself broken (conflict, failed replay, failed features) is said on every reply.
+  // The gate's verdict is not: it fails all the way through a build, and check_part reports it.
+  if (reply.state.status === "fail" && !reply.state.fromGate && notes.length === 0) notes.push(stateLine(ref.part, reply.state));
   return toContent(reply.result, notes);
 }
 
 const anyObject = z.record(z.string(), z.unknown());
 const stepSchema = z.object({ command: z.string(), params: anyObject.optional() });
+const exprSchema = z.union([z.number(), z.string()]);
+/** What `record_expectations` / `propose_expectations` take (the daemon stamps who and when). */
+const expectationsSchema = z.object({
+  bbox: z.array(exprSchema).length(3).describe("Overall size in mm, any order: three numbers or formulas."),
+  volume: exprSchema.describe("Volume in mm³: a number or a formula."),
+  bodies: z.number().int().describe("How many solid bodies the part is (usually 1)."),
+  holes: z
+    .array(z.object({ diameter: exprSchema, count: z.number().int(), kind: z.enum(["through", "blind"]).optional() }))
+    .describe("One row per hole diameter (a counterbored hole counts by its smallest diameter). [] for none."),
+  tolerance: z.object({ length: z.number().optional(), volumeRel: z.number().optional() }).optional().describe("Defaults 0.01 mm and 0.001; at most 0.1 mm and 0.01."),
+  noInterferenceWith: z.array(z.string()).optional(),
+});
 /** Formats `export_part` writes (the names SolidCraft's `export` takes) and their file extensions. */
 export const EXPORT_FORMATS = { step: "step", "3mf": "3mf", glb: "glb", stl: "stl", obj: "obj", iges: "iges" } as const;
 
@@ -111,9 +138,14 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       const ref = selected();
       return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind: "read" }));
     });
-  const mutate = (name: string, args: Record<string, unknown>, kind: "mutate" | "undo" | "redo" = "mutate") =>
+  /** A MODELING call: refused on a dimensioned part that has no expectations yet (spec §4.5). */
+  const mutate = (name: string, args: Record<string, unknown>, kind: "mutate" | "undo" | "redo" = "mutate", modeling = true) =>
     guarded(async () => {
       const ref = selected();
+      if (modeling) {
+        const refused = deps.modelingRefusal(ref);
+        if (refused) return fail(refused);
+      }
       return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind }));
     });
   /** Drop keys the agent may not set (paths), and undefined ones. */
@@ -135,6 +167,8 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
           const created = !existsSync(ref.dir);
           const opened = await deps.manager.open(ref);
           current = ref;
+          deps.touch(ref);
+          const needs = deps.modelingRefusal(ref);
           const summary = {
             part: ref.part,
             folder: relative(ref.worktree, ref.dir),
@@ -144,8 +178,10 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
             ...(opened.state.reason ? { reason: opened.state.reason } : {}),
             parameters: opened.params,
             parts_in_repo: listParts(ref.worktree),
+            modeling: needs ? "refused until expectations are recorded" : "allowed",
           };
           const out = ok(JSON.stringify(summary));
+          if (needs) out.content.push({ type: "text", text: `[anvil] ${needs}` });
           for (const n of opened.notes) out.content.push({ type: "text", text: `[anvil] ${n}` });
           return out;
         }),
@@ -199,7 +235,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       "Try parameter values on the open part WITHOUT keeping them: {set: {name: value}}. Returns what the measure and the " +
         "feature errors would be; the design is unchanged afterwards.",
       { set: anyObject, report: z.array(z.string()).optional(), summary: z.boolean().optional(), bodies: z.unknown().optional() },
-      async (a) => mutate("check_parameters", clean(a)),
+      async (a) => mutate("check_parameters", clean(a), "mutate", false), // keeps nothing, so it is not a modeling call
     ),
     tool("undo", "Undo your last change to the open part as a whole (a batch is undone in one go).", {}, async () => mutate("undo", {}, "undo")),
     tool("redo", "Redo the change the last undo reverted.", {}, async () => mutate("redo", {}, "redo")),
@@ -292,6 +328,59 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async (a) => read("skill_reference", clean(a)),
     ),
 
+    // ── expectations and the gate (spec §4.5) ───────────────────────────────────────────────────
+    tool(
+      "record_expectations",
+      "Record what a part must be, BEFORE modeling it: {part, process, expectations}. Allowed once, for a part that has " +
+        "none; modeling is refused until it is done, and afterwards only the owner can change it (propose_expectations). " +
+        "`process` is an id from cad/rules.json. A value may be a number or a formula over the design's parameter names " +
+        '(+ - * / ^ ( ) and pi), e.g. bbox ["L","W","T"] or volume "L*W*T - 4*pi*1.7^2*T". The gate then checks the part ' +
+        "against these numbers.",
+      {
+        part: z.string().describe("The part name (not a path)."),
+        process: z.string().describe('A process id from cad/rules.json, e.g. "fdm-0.4".'),
+        expectations: expectationsSchema,
+      },
+      async ({ part, process, expectations }) =>
+        guarded(async () => {
+          const ref = partRef(deps.worktree, part);
+          const r = deps.recordExpectations(ref, process, expectations);
+          if (!r.ok) return fail(r.error);
+          return ok(JSON.stringify({ part: ref.part, recorded: true, process, note: "Expectations are locked. Model the part, then call check_part." }));
+        }),
+    ),
+    tool(
+      "propose_expectations",
+      "Ask the OWNER to change a part's locked expectations: {part, expectations, reason}. Shows them a card with each old " +
+        "and new value and your reason, and waits for Approve or Deny. Nothing changes unless they approve. Give the full " +
+        "new expectations, not a patch.",
+      { part: z.string().describe("The part name (not a path)."), expectations: expectationsSchema, reason: z.string().describe("Why the expectations should change, for the owner to judge.") },
+      async ({ part, expectations, reason }) =>
+        guarded(async () => {
+          const ref = partRef(deps.worktree, part);
+          const r = await deps.proposeExpectations(ref, expectations, reason);
+          if (!r.ok) return fail(r.error);
+          if (!r.approved) return ok(JSON.stringify({ part: ref.part, approved: false, note: "The owner DENIED the change. The expectations are exactly as they were; nothing was written." }));
+          return ok(JSON.stringify({ part: ref.part, approved: true, note: "The owner approved. The new expectations are locked; call check_part." }));
+        }),
+    ),
+    tool(
+      "check_part",
+      "Measure a part now and return the geometry gate in full: {part}. `state` is pass, fail, unverified (not approved or " +
+        "not measured yet), concept or gap; `failing` lists each failed check with what was expected and what was measured. " +
+        "A part is not done while the gate fails or is unverified.",
+      { part: z.string().describe("The part name (not a path).") },
+      async ({ part }) =>
+        guarded(async () => {
+          const ref = partRef(deps.worktree, part);
+          if (!existsSync(join(ref.dir, DESIGN_FILE)) && !deps.manager.status(ref)?.live) return fail(`cad/${ref.part} has no design yet: open_part it and build something first`);
+          const gate = await deps.checkPart(ref);
+          const out = ok(JSON.stringify({ part: ref.part, ...gate, failing: failingLines(gate), advisory: advisoryLines(gate) }));
+          if (gate.needsAdoption) out.content.push({ type: "text", text: `[anvil] The owner has been shown a card to adopt the ${gate.needsAdoption === "rules" ? "changed cad/rules.json" : gate.needsAdoption}; the part stays unverified until they approve it.` });
+          return out;
+        }),
+    ),
+
     // ── files ───────────────────────────────────────────────────────────────────────────────────
     tool(
       "export_part",
@@ -336,7 +425,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
             exports.push({ format: e.format, path: relative(ref.worktree, e.path), bytes: e.result.json?.bytes, offered });
           }
           const notes = [...done.notes];
-          if (done.state.status === "fail") notes.push(stateLine(ref.part, done.state));
+          if (done.state.status === "fail" && !done.state.fromGate) notes.push(stateLine(ref.part, done.state));
           const res: ToolOut = { content: [{ type: "text", text: JSON.stringify({ part: ref.part, exports, ...(errors.length ? { errors } : {}) }) }], ...(errors.length ? { isError: true } : {}) };
           for (const n of notes) res.content.push({ type: "text", text: `[anvil] ${n}` });
           return res;

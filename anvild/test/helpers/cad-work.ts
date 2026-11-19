@@ -13,7 +13,8 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cadTools } from "../../src/agent/cad-tools";
+import { resetCadProtectedForTest } from "../../src/agent/cad-protected";
+import { cadTools, type CadToolDeps } from "../../src/agent/cad-tools";
 import { CadManager, type CadManagerOptions } from "../../src/cadwork/manager";
 import { defaultMcpSpawn, type CadClock, type McpSpawn } from "../../src/cadwork/mcp-client";
 import { CadworkService, type CadworkServiceDeps } from "../../src/session/cadwork-service";
@@ -172,27 +173,98 @@ export function recordingSession(cwd: string, id = "sess_cad", data: Record<stri
 
 const services: CadworkService[] = [];
 
+/** The gate half of `CadToolDeps` for suites that drive the tools against a bare manager (no service):
+ *  modeling is never refused and the expectation tools answer "nothing happened". */
+export const STUB_GATE_DEPS: Pick<CadToolDeps, "touch" | "modelingRefusal" | "recordExpectations" | "proposeExpectations" | "checkPart"> = {
+  touch: () => undefined,
+  modelingRefusal: () => undefined,
+  recordExpectations: () => ({ ok: true }),
+  proposeExpectations: async () => ({ ok: true, approved: false }),
+  checkPart: async () => {
+    throw new Error("no gate in this suite");
+  },
+};
+
+/** Expectations that say nothing true about any part: for suites that are about the manager and the
+ *  tools, not the gate. Recorded through the REAL record_expectations tool (see `fakeCadSession`). */
+export const PLACEHOLDER_EXPECTATIONS = { bbox: [1, 1, 1], volume: 1, bodies: 1, holes: [] };
+export const PLACEHOLDER_PROCESS = "placeholder";
+
 /**
  * A REAL CadworkService with its real manager, plus one session's agent tools. The binary is
  * whatever the service resolves — the functional suite points `ANVIL_SOLIDCRAFT_CLI` at the fake.
  */
-export function fakeCadSession(worktree: string, deps: Partial<CadworkServiceDeps> = {}, sessionId = "sess_cad") {
-  const { session, emitted } = recordingSession(worktree, sessionId);
+export function fakeCadSession(
+  worktree: string,
+  deps: Partial<CadworkServiceDeps> = {},
+  sessionId = "sess_cad",
+  /**
+   * `auto` (default): `open_part` on a part with no expectations records `PLACEHOLDER_EXPECTATIONS`
+   * through the real record_expectations tool, so suites about the manager and the tools (Phase A1)
+   * can model without restating the rule every time. `manual`: nothing is recorded for the test —
+   * what the gate suites (Phase A2) use.
+   */
+  opts: { expectations?: "auto" | "manual"; sessionData?: Record<string, unknown> } = {},
+) {
+  const { session, emitted } = recordingSession(worktree, sessionId, opts.sessionData);
   const sessions = new Map<string, Session>([[sessionId, session]]);
   const broadcasts: any[] = [];
   const service = new CadworkService({
     enabled: true,
     getSession: (id) => sessions.get(id),
     registry: { toAll: (ev) => void broadcasts.push(ev) },
+    stateDir: tempDir("anvil-cad-state-"),
     ...deps,
   });
   services.push(service);
   const defs = cadTools(service.toolDeps(sessionId, worktree));
-  return { service, manager: service.manager, tools: callable(defs as any), defs, session, sessions, emitted, broadcasts };
+  const tools = callable(defs as any);
+  if ((opts.expectations ?? "auto") === "auto") {
+    const open = tools.open_part!;
+    tools.open_part = async (args = {}) => {
+      const r = await open(args);
+      if (!r.isError && r.json?.modeling !== "allowed") {
+        const rec = await tools.record_expectations!({ part: args.part, process: PLACEHOLDER_PROCESS, expectations: PLACEHOLDER_EXPECTATIONS });
+        if (rec.isError) throw new Error(`placeholder expectations were refused: ${rec.text}`);
+        r.notes = r.notes.filter((n) => !n.includes("has no expectations yet"));
+        r.text = r.text.split("\n").filter((l) => !l.includes("has no expectations yet")).join("\n");
+      }
+      return r;
+    };
+  }
+  /** Every expectations card broadcast so far that nobody has answered. */
+  const openCards = () => {
+    const done = new Set(broadcasts.filter((e) => e.type === "cad.expectations.resolved").map((e) => e.requestId));
+    return broadcasts.filter((e) => e.type === "cad.expectations.request" && !done.has(e.requestId));
+  };
+  /** The newest `cad.design` for a part. */
+  const design = (part: string) => broadcasts.filter((e) => e.type === "cad.design" && e.part === part).at(-1);
+  return { service, manager: service.manager, tools, defs, session, sessions, emitted, broadcasts, openCards, design };
 }
 export async function stopServices(): Promise<void> {
   await Promise.all(services.splice(0).map((s) => s.shutdown().catch(() => undefined)));
+  resetCadProtectedForTest();
 }
+
+/** A rules file with one FDM and one CNC process. */
+export const RULES = {
+  schema: 1,
+  processes: [
+    { id: "fdm-0.4", kind: "fdm", envelope: [250, 210, 220] },
+    { id: "cnc-3axis", kind: "cnc", envelope: [300, 200, 100], drills: [3.4, 4.2, 5, 6.5], holeTolerance: 0.05 },
+  ],
+};
+export function writeRules(worktree: string, rules: unknown = RULES): string {
+  mkdirSync(join(worktree, "cad"), { recursive: true });
+  const path = join(worktree, "cad", "rules.json");
+  writeFileSync(path, JSON.stringify(rules, null, 2) + "\n");
+  return path;
+}
+
+/** The reference plate's documented volume: the slab, less the four rounded corners, less four
+ *  counterbored holes (⌀3.4 through, ⌀6.5 × 3.3 deep). 23335.167 mm³ at L=80, W=50, T=6. */
+export const PLATE_VOLUME = "L*W*T - (4 - pi)*5^2*T - 4*(pi*1.7^2*(T - 3.3) + pi*3.25^2*3.3)";
+export const PLATE_EXPECTATIONS = { bbox: ["L", "W", "T"], volume: PLATE_VOLUME, bodies: 1, holes: [{ diameter: 3.4, count: 4 }] };
 
 /** Write a design.json for a part by hand (a checkout, a hand edit). */
 export function writeDesign(worktree: string, part: string, commands: unknown[], about: Record<string, unknown> = { design: part, format: "solidcraft/58", version: "0.44.1" }): string {
@@ -204,3 +276,48 @@ export function writeDesign(worktree: string, part: string, commands: unknown[],
 }
 
 export const BOX = (name = "Box", size = 10) => ({ command: "solid.box", params: { length: size, width: size, height: size, name } });
+
+/** Approve every expectations card that is waiting (what the owner's taps do), until none is left. */
+export function approveCards(x: { service: CadworkService; openCards: () => any[] }): string[] {
+  const kinds: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const open = x.openCards();
+    if (open.length === 0) break;
+    for (const c of open) {
+      kinds.push(c.kind);
+      x.service.respond(c.requestId, true);
+    }
+  }
+  return kinds;
+}
+
+/**
+ * The reference plate, built the way an agent is meant to: open, record expectations, model (the
+ * hole pattern as its own request, so one `undo` removes exactly that feature), then the owner adopts
+ * the repo's rules file. Returns the session and the gate after all of it.
+ */
+export async function buildPlate(
+  repo: string,
+  opts: { deps?: Partial<CadworkServiceDeps>; expectations?: unknown; process?: string; rules?: unknown | null; sessionId?: string; cli: string; adopt?: boolean } = { cli: "" },
+) {
+  if (opts.rules !== null) writeRules(repo, opts.rules ?? RULES);
+  const x = fakeCadSession(repo, { resolveCli: () => ({ path: opts.cli, source: "env" }), ...opts.deps }, opts.sessionId ?? "sess_cad", { expectations: "manual" });
+  const { tools } = x;
+  const must = async (p: Promise<ToolReply>): Promise<ToolReply> => {
+    const r = await p;
+    if (r.isError) throw new Error(r.text);
+    return r;
+  };
+  const { REFERENCE_PLATE } = await import("./fake-solidcraft");
+  await must(tools.open_part!({ part: "plate" }));
+  await must(tools.record_expectations!({ part: "plate", process: opts.process ?? "fdm-0.4", expectations: opts.expectations ?? PLATE_EXPECTATIONS }));
+  await must(tools.batch!({ commands: REFERENCE_PLATE.slice(0, 15) }));
+  await must(tools.batch!({ commands: REFERENCE_PLATE.slice(15) }));
+  let gate = (await must(tools.check_part!({ part: "plate" }))).json;
+  if (opts.adopt !== false && x.openCards().length) {
+    approveCards(x);
+    gate = (await must(tools.check_part!({ part: "plate" }))).json;
+  }
+  const check = async () => (await must(tools.check_part!({ part: "plate" }))).json;
+  return { ...x, gate, check, partJson: join(repo, "cad", "plate", "part.json") };
+}
