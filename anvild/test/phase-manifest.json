@@ -698,7 +698,14 @@
             "Phase B1 surface > [B1] without the solidcraft-pin feature the capability is not advertised and every route is a 404",
             "Phase B1 surface > [B1] a hub reports a member without the feature as unsupported and does not send it the pin",
             "Phase B1 surface > [B1] solidcraft.status is sent on connect, on a pin change, and in reply to solidcraft.status.get",
-            "Phase B1 surface > [B1] a good zip becomes the manager's binary, and still is after the daemon restarts"
+            "Phase B1 surface > [B1] a good zip becomes the manager's binary, and still is after the daemon restarts",
+            "Phase B1 acceptance > [B1] an off-pin daemon with cad-work emits cad.status {available:false} with the reason, and every anvil_cad call refuses with it"
+          ]
+        },
+        {
+          "file": "test/unit/cadwork-pin.test.ts",
+          "names": [
+            "cad pin wiring > [B1] cad.status and tool refusals follow the pin; a pin advance rebuilds live parts so measured.solidcraft is the new build; pin back lists those designs"
           ]
         }
       ],

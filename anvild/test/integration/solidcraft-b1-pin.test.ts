@@ -17,6 +17,7 @@ import type { rest, SolidcraftStatusEvent } from "@protocol";
 import { resolveSolidcraftCli, setManagedSolidcraftCli } from "../../src/solidcraft/binary";
 import { solidcraftCliPath, solidcraftRoot, solidcraftVersionDir } from "../../src/solidcraft/install";
 import { pinAvailability } from "../../src/solidcraft/pin";
+import { cadTools } from "../../src/agent/cad-tools";
 import type { SolidcraftTestHooks } from "../../src/server/fleet-solidcraft";
 import type { PeerTrust } from "../../src/server/pairing";
 import { fakeReleaseZip, fakeVerifier, memoryDownloader, type FakeVerifierOptions } from "../helpers/solidcraft-release";
@@ -37,6 +38,7 @@ interface Daemon {
   serverName: string;
   download: ReturnType<typeof memoryDownloader>;
   stop: () => void;
+  supervisor: ReturnType<typeof createServer>["supervisor"];
 }
 const cleanups: (() => void)[] = [];
 afterAll(() => {
@@ -83,7 +85,7 @@ async function boot(o: BootOptions = {}): Promise<Daemon> {
   });
   const base = `http://127.0.0.1:${srv.port}`;
   const health = (await (await fetch(`${base}/api/health`)).json()) as rest.HealthResponse;
-  const d: Daemon = { base, dir, serverId: health.serverId, serverName: health.serverName, download, stop: () => srv.stop() };
+  const d: Daemon = { base, dir, serverId: health.serverId, serverName: health.serverName, download, stop: () => srv.stop(), supervisor: srv.supervisor };
   cleanups.push(() => {
     srv.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -181,6 +183,46 @@ describe("Phase B1 acceptance", () => {
     // A member that IS on the pin gets the opposite answer from the same rule.
     const ok = await localStatus(m1);
     expect(pinAvailability(ok.local.version, ok.pin)).toEqual({ available: true, pinned: "0.44.1" });
+  });
+
+  test("[B1] an off-pin daemon with cad-work emits cad.status {available:false} with the reason, and every anvil_cad call refuses with it", async () => {
+    const stale = await boot({ features: ["solidcraft-pin", "cad-work"], zips: { "0.43.0": OLD.zip, "0.44.1": WRONG.zip } });
+    const cadStatus = () =>
+      new Promise<any>((resolve, reject) => {
+        const ws = new WebSocket(`${stale.base.replace("http", "ws")}/ws`);
+        ws.onmessage = (m) => {
+          const ev = JSON.parse(String(m.data));
+          if (ev.type === "cad.status") {
+            ws.close();
+            resolve(ev);
+          }
+        };
+        ws.onerror = () => reject(new Error("ws error"));
+      });
+    // On the pin: CAD is available as far as the pin is concerned.
+    const on = await post(stale, "/api/solidcraft/pin/apply", { pin: { version: "0.43.0", sha256: OLD.sha256, pinnedAt: "2026-11-18T10:00:00.000Z" } });
+    expect(on.status).toBe(200);
+    // The fleet moves to 0.44.1 and this machine's copy is refused: it stays on 0.43.0, off the pin.
+    const off = await post(stale, "/api/solidcraft/pin/apply", { pin: { version: "0.44.1", sha256: NEW.sha256, pinnedAt: "2026-11-19T10:00:00.000Z" } });
+    expect(off.status).toBe(500);
+    let ev: any;
+    for (let i = 0; i < 200; i++) {
+      ev = await cadStatus();
+      if (ev.available === false && String(ev.reason).includes("pinned to 0.44.1")) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(ev).toMatchObject({ type: "cad.status", available: false, pinned: "0.44.1" });
+    expect(ev.reason).toContain("runs SolidCraft 0.43.0 but the fleet is pinned to 0.44.1");
+    // Every anvil_cad tool refuses with that reason, the read-only ones included.
+    const defs = cadTools(stale.supervisor.cadwork.toolDeps("sess_offpin", stale.dir)) as any[];
+    const args: Record<string, unknown> = { open_part: { part: "plate" }, measure: {}, execute: { command: "inspect.measure", params: {} }, batch: { commands: [{ command: "inspect.measure", params: {} }] }, inspect_design: {}, check_part: { part: "plate" } };
+    for (const [name, a] of Object.entries(args)) {
+      const r = await defs.find((d) => d.name === name).handler(a, {});
+      expect(r.isError).toBe(true);
+      expect(r.content[0].text).toContain("CAD is not available on this machine");
+      expect(r.content[0].text).toContain("runs SolidCraft 0.43.0 but the fleet is pinned to 0.44.1");
+    }
+    expect(stale.supervisor.cadwork.manager.liveCount()).toBe(0);
   });
 
   test("[B1] a zip whose sha differs is deleted and reported, and the pin does not move", async () => {

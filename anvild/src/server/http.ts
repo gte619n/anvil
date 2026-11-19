@@ -36,6 +36,7 @@ import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } f
 import { FleetCliRolloutCoordinator, httpMemberCliClient } from "./fleet-cli-rollout";
 import { resolveLatest as resolveLatestCli } from "../daemon/claude-cli";
 import { mountSolidcraft, type SolidcraftTestHooks } from "./fleet-solidcraft";
+import { wireCadPin, type CadPinRoot, type CadPinWiring } from "../session/cadwork-pin";
 import { FleetJobs } from "./fleet-jobs";
 import { resolveTargetSha } from "../daemon/selfupdate";
 import { FileExists, FileNotFound } from "../fs/session-fs";
@@ -789,13 +790,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   // ── SolidCraft fleet pin (agent-cad-and-browser spec §4.10) ───────────────────────────────────
   // Everything lives in ./fleet-solidcraft.ts; undefined (and no routes) unless "solidcraft-pin" is on.
+  // Track A ↔ B (merge item (b)): with cad-work on, cad.status follows the pin and the "Pin back"
+  // list is read from the part files this daemon knows (./../session/cadwork-pin.ts).
+  let cadPin: CadPinWiring | undefined;
+  const cadRoots = (): CadPinRoot[] => [
+    ...supervisor.environmentsEvent().environments.map((e) => ({ path: e.repoRoot, environment: e.name })),
+    ...supervisor.list().filter((s) => !s.archived).map((s) => ({ path: supervisor.cadwork.worktreeOf(s) ?? s.cwd })),
+  ];
   const solidcraft = mountSolidcraft({
+    rewrittenDesigns: supervisor.cadwork.enabled ? (version) => cadPin?.rewrittenDesigns(version) ?? [] : undefined,
+    onLocalChange: () => void cadPin?.onPinChanged().catch(() => undefined),
     stateDir: opts.stateDir,
     features: opts.features,
     hooks: opts.solidcraft,
     self: { serverId: identity.serverId, serverName: identity.serverName },
     members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName, url: m.url })),
     // Replay gate (Phase B2): what this machine hosts, its open worktrees (advisory), and who checks.
+    // Worktrees: B2's default, confirmed at the merge — a fresh-worktree session's cwd IS its
+    // worktree root, which is where `cad/` lives.
     environments: () => supervisor.environmentsEvent().environments.map((e) => ({ name: e.name, repoRoot: e.repoRoot, defaultBase: e.defaultBase })),
     worktrees: () => supervisor.list().filter((s) => s.worktree && !s.archived).map((s) => ({ path: s.cwd, label: s.title || s.worktree!.branch })),
     notify: (title, body, tag) => supervisor.pushSystemAlert(title, body, tag),
@@ -803,6 +815,10 @@ export function createServer(opts: ServerOptions): ServerHandle {
     broadcast: (event) => registry.toAll(event),
     route,
   });
+  if (solidcraft && supervisor.cadwork.enabled) {
+    cadPin = wireCadPin({ cadwork: supervisor.cadwork, pin: solidcraft.service, roots: cadRoots, serverName: identity.serverName });
+    void cadPin.onPinChanged().catch(() => undefined); // the first verdict; until then CAD fails closed
+  }
 
   // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
   // /api/health, return the Anvil daemons found (deduped by serverId) as add-suggestions.

@@ -256,9 +256,35 @@ export class CadworkService {
     return this.deps.enabled;
   }
 
+  // ── Fleet pin (merge wiring (b); decision 40). Set by ./cadwork-pin.ts when "solidcraft-pin" is on.
+  /** Track B's verdict: is this machine on the fleet's pinned SolidCraft? */
+  private pinSource?: () => Promise<{ available: boolean; reason?: string; pinned?: string }>;
+  /** The last verdict; `undefined` while a source is set but has not answered yet (fail closed). */
+  private pinVerdict?: { available: boolean; reason?: string; pinned?: string };
+
+  /** Gate CAD availability on the fleet pin (spec §4.10: a machine off the pin refuses every call). */
+  setPinSource(source: (() => Promise<{ available: boolean; reason?: string; pinned?: string }>) | undefined): void {
+    this.pinSource = source;
+    this.pinVerdict = undefined;
+  }
+
   /** Whether CAD can run on this machine right now. Cheap and synchronous: re-resolved every call,
    *  so an install or a pin change takes effect without a restart. */
   status(): CadStatus {
+    const local = this.localStatus();
+    if (!this.pinSource) return local;
+    const pin = this.pinVerdict;
+    if (!pin) return { ...local, available: false, reason: "CAD is unavailable here until this machine has checked the fleet's SolidCraft pin" };
+    if (!pin.available) return { ...local, available: false, reason: pin.reason ?? "CAD is unavailable here: this machine is not on the fleet's SolidCraft pin", ...(pin.pinned ? { pinned: pin.pinned } : {}) };
+    return { ...local, ...(pin.pinned ? { pinned: pin.pinned } : {}) };
+  }
+
+  /** Every SolidCraft process up right now (the pin wiring restarts them after the build changes). */
+  liveParts(): PartRef[] {
+    return this.manager.liveRefs();
+  }
+
+  private localStatus(): CadStatus {
     const pinned = currentManagedSolidcraft()?.version;
     const cli = this.resolveCli();
     if (!cli) return { available: false, reason: NO_SOLIDCRAFT, ...(pinned ? { pinned } : {}) };
@@ -282,6 +308,13 @@ export class CadworkService {
   /** Ask the binary for its version, then broadcast `cad.status` if anything changed. Called at
    *  boot; Track B calls it again whenever the pin moves. */
   async refreshStatus(): Promise<CadStatus> {
+    if (this.pinSource) {
+      try {
+        this.pinVerdict = await this.pinSource();
+      } catch (e) {
+        this.pinVerdict = { available: false, reason: `CAD is unavailable here: the SolidCraft pin could not be checked (${e instanceof Error ? e.message : String(e)})` };
+      }
+    }
     const cli = this.resolveCli();
     if (cli && existsSync(cli.path) && !cli.version) {
       const v = await this.readVersion(cli.path);

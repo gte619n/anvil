@@ -380,6 +380,8 @@ export interface MountSolidcraftOptions {
   isHub?: () => boolean;
   /** Send an event to every connected client. */
   broadcast: (event: SolidcraftStatusEvent) => void;
+  /** Called on every change of this machine's pin/install state (Track A refreshes cad.status). */
+  onLocalChange?: () => void;
   route: (method: string, path: string, handler: Handler) => void;
 }
 
@@ -416,7 +418,10 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     env: hooks.env,
     exists: hooks.exists,
     primeResolver: hooks.primeResolver,
-    onChange: () => void statusEvent().then(o.broadcast, () => {}),
+    onChange: () => {
+      void statusEvent().then(o.broadcast, () => {});
+      o.onLocalChange?.();
+    },
     candidateVersion: () => keptCandidate(),
   });
   // The candidate this machine keeps on disk beside the pin: the one the hub's gate is evaluating

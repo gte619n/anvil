@@ -344,6 +344,11 @@ export class CadManager {
     };
   }
 
+  /** The parts whose SolidCraft process is up right now. */
+  liveRefs(): PartRef[] {
+    return [...this.parts.values()].filter((r) => r.client?.alive).map((r) => r.ref);
+  }
+
   /** Every part this manager has touched. */
   statuses(): PartStatus[] {
     return [...this.parts.keys()].map((k) => this.status(k)!);
