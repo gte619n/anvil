@@ -276,7 +276,14 @@
             "design-script screen > [B2] a string that is an absolute path, has a `..` segment or holds a URL is refused wherever it sits",
             "design-script screen > [B2] the two import exceptions: `file` must be a bare name, and the embedded STEP text is not inspected",
             "design-script screen > [B2] the envelope is shape-checked: commands is a list of { command, params } and nothing else",
-            "design-script screen > [B2] screenScriptText applies the 64 MB cap and JSON parsing before the screen, and returns the parsed script"
+            "design-script screen > [B2] screenScriptText applies the 64 MB cap and JSON parsing before the screen, and returns the parsed script",
+            "design-script screen > [B2] a name key such as font may hold only a plain name, so a script cannot make SolidCraft open a file",
+            "design-script screen > [B2] a mesh import's vertex and triangle arrays are embedded data: any size, numbers only",
+            "design-script screen > [B2] the script is bounded: string length, key length, text in total, values and nesting",
+            "design-script screen > [B2] a refusal is short whatever the script holds: fragments are cut to 80 characters and the reason to 300",
+            "design-script screen > [B2] worst-case strings at the caps screen quickly: 1 MB of letters, of %41, of a:, of /.., and a 64 MB embedded STEP",
+            "design-script screen > [B2] screening time grows no faster than the input: doubling the size at most about doubles the time",
+            "design-script screen > [B2] the allow list is exactly what the real export was seen to write, minus the one id that opens a file"
           ]
         },
         {
@@ -296,6 +303,8 @@
             "the hub's replay gate > [B2] a candidate that crashes on replay on the hub holds the pin",
             "the hub's replay gate > [B2] a member whose only trouble is a timed-out or refused design holds the pin by name and is not a rejection",
             "the hub's replay gate > [B2] a member that hosts designs but did not compare against the pinned build holds the pin",
+            "the hub's replay gate > [B2] a report made against the wrong baseline is never a rejection, even when it says a part differs",
+            "the hub's replay gate > [B2] a committed design that is refused is notified once per version of the file, naming the design and the command",
             "the hub's replay gate > [B2] a member that could not read its designs holds the pin, and is not remembered as hosting none",
             "the hub's replay gate > [B2] a design already broken under the pinned build is reported and ignored for the decision",
             "the hub's replay gate > [B2] a member that hosts designs and is unreachable holds the pin and is named; it is not a rejection",
@@ -337,6 +346,7 @@
             "the screen and the sandbox > [B2] with the screen bypassed, the sandbox alone stops a write outside its folder",
             "the screen and the sandbox > [B2] the sandboxed build runs in a fresh folder holding only the script, with a throwaway HOME and exactly four environment variables",
             "the screen and the sandbox > [B2] a build that cannot be started, hangs, or answers nonsense gives no verdict",
+            "the screen and the sandbox > [B2] a timed-out build is killed together with everything it started",
             "replaying a machine's designs > [B2] identical builds give `same` for every part, with the numbers both produced",
             "replaying a machine's designs > [B2] a part whose volume differs is `differs` with the old and new numbers; the others stay `same`",
             "replaying a machine's designs > [B2] two builds that differ only in where a hole is are told apart by the centre of mass",
@@ -350,6 +360,8 @@
             "replaying a machine's designs > [B2] only cad/<part>/design.json is read: part.json, nested folders and other files are never copied or replayed",
             "replaying a machine's designs > [B2] a design.json that is a symbolic link is skipped with a note, and one over 64 MB is refused without being read",
             "replaying a machine's designs > [B2] designs in open session worktrees are replayed as advisory and never decide",
+            "replaying a machine's designs > [B2] a worktree design that is a symbolic link is skipped, and no refusal ever quotes a file's content",
+            "replaying a machine's designs > [B2] a large design made of text the screen must read does not stall the machine's replay",
             "replaying a machine's designs > [B2] a replay that outlasts the per-design timeout is stopped and counts against the candidate",
             "replaying a machine's designs > [B2] a machine's whole replay is bounded: designs not reached in time are reported, and the machine does not pass",
             "replaying a machine's designs > [B2] at most `concurrency` designs are replayed at once",
@@ -396,7 +408,8 @@
           "names": [
             "[B2 real] a real exported plate script, read from origin/main of a real repository, replays to `same` under the pinned build and the candidate",
             "[B2 real] a script whose fillet cannot be computed is a failed replay even though the real eval exits 0",
-            "[B2 real] a design carrying file-writing commands is refused and writes nothing outside the sandbox; with the screen bypassed the sandbox alone still stops the write"
+            "[B2 real] a design carrying file-writing commands is refused and writes nothing outside the sandbox; with the screen bypassed the sandbox alone still stops the write",
+            "[B2 real] a script whose sketch text names a font file by path or environment reference is refused; with the screen bypassed the sandboxed build does not open the file"
           ]
         }
       ]

@@ -580,7 +580,14 @@ describe("Phase B2 surface", () => {
     expect(row.report!.parts.map((p) => [p.part, p.outcome])).toEqual([["bracket", "refused"], ["plate", "same"]]);
     expect((await localStatus(hub)).pin!.version).toBe("0.44.1");
     expect(r.rejected).toEqual([]); // the design is at fault, not the candidate
-    expect(w.notes).toEqual([]);
+    // One notification, about the design (not about the candidate), naming it and the command.
+    expect(w.notes.length).toBe(1);
+    expect(w.notes[0]!.title).toBe("Design bracket is not replayed");
+    expect(w.notes[0]!.body).toContain("timeline.export_script");
+    expect(w.notes[0]!.body).toContain(m1.serverName);
+    w.clock.t += 4 * HOUR;
+    expect((await checkNow(hub)).check!.outcome).toBe("held");
+    expect(w.notes.length).toBe(1); // not repeated at the next check
     expect(readFileSync(victim, "utf8")).toBe("the real key\n");
     expect(readdirSync(outside)).toEqual(["authorized_keys"]);
   });

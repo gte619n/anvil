@@ -19,6 +19,7 @@
  *
  * The JSON-RPC client is deliberately minimal and private to the replay.
  */
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -80,19 +81,42 @@ export async function sandboxedReplay(build: SandboxBuild, scriptText: string, c
     return { status: "could-not-run", error: `could not make a sandbox folder: ${e instanceof Error ? e.message : String(e)}` };
   }
   const box = { root, work: join(root, "work"), home: join(root, "home"), tmp: join(root, "tmp") };
-  let proc: ReturnType<typeof Bun.spawn> | undefined;
+  let proc: ChildProcess | undefined;
+  let exited: Promise<number | null> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  /** Kill the build AND anything it started: it leads its own process group. */
+  const killAll = (): void => {
+    const pid = proc?.pid;
+    if (pid === undefined) return;
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        proc?.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  };
   try {
     for (const d of [box.work, box.home, box.tmp]) mkdirSync(d);
     writeFileSync(join(box.work, "design.json"), scriptText);
     opts.onBox?.(box);
 
+    let ended: string | undefined;
+    const waiting = new Map<number, (m: any) => void>();
+    const fail = (why: string): void => {
+      ended ??= why;
+      for (const resolve of waiting.values()) resolve({ dead: ended });
+      waiting.clear();
+    };
+    let stderr = "";
     try {
-      proc = Bun.spawn([build.path, "mcp", "--headless", "--compact", "--allow-path", box.work, "--require-allow-path"], {
+      proc = spawn(build.path, ["mcp", "--headless", "--compact", "--allow-path", box.work, "--require-allow-path"], {
         cwd: box.work,
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
+        stdio: ["pipe", "pipe", "pipe"],
+        // Its own process group, so a timeout reaches whatever it started as well.
+        detached: true,
         // Exactly these four. No credentials, no real HOME.
         env: { PATH: opts.pathEnv ?? "/usr/bin:/bin:/usr/sbin:/sbin", TMPDIR: box.tmp, HOME: box.home, SOLIDCRAFT_GPU: "cpu" },
       });
@@ -100,54 +124,47 @@ export async function sandboxedReplay(build: SandboxBuild, scriptText: string, c
       return { status: "could-not-run", error: `could not start SolidCraft ${build.version}: ${e instanceof Error ? e.message : String(e)}` };
     }
     const p = proc;
-    let stderr = "";
-    void (async () => {
-      const dec = new TextDecoder();
-      for await (const chunk of p.stderr as ReadableStream<Uint8Array>) stderr = (stderr + dec.decode(chunk, { stream: true })).slice(-4000);
-    })().catch(() => {});
-
+    exited = new Promise((resolve) => {
+      p.once("error", (e) => {
+        fail(`could not start SolidCraft ${build.version}: ${e.message}`);
+        resolve(null);
+      });
+      p.once("exit", (code, signal) => {
+        fail(`SolidCraft ${build.version} stopped (${signal ? `signal ${signal}` : `exit ${code}`})${stderr.trim() ? `: ${firstLine(stderr)}` : ""}`);
+        resolve(code);
+      });
+    });
+    p.stdin?.on("error", () => {}); // a build that dies mid-write must not raise EPIPE here
+    p.stderr?.setEncoding("utf8").on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-4000)));
     // One message per line each way; replies are matched by id.
-    const waiting = new Map<number, (m: any) => void>();
-    let ended: string | undefined;
-    const fail = (why: string): void => {
-      ended ??= why;
-      for (const resolve of waiting.values()) resolve({ dead: ended });
-      waiting.clear();
-    };
-    void (async () => {
-      const dec = new TextDecoder();
-      let buf = "";
-      for await (const chunk of p.stdout as ReadableStream<Uint8Array>) {
-        buf += dec.decode(chunk, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-          try {
-            const m = JSON.parse(line);
-            if (typeof m?.id === "number") {
-              waiting.get(m.id)?.(m);
-              waiting.delete(m.id);
-            }
-          } catch {
-            /* not a message */
+    let buf = "";
+    p.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+      buf += chunk;
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const m = JSON.parse(line);
+          if (typeof m?.id === "number") {
+            waiting.get(m.id)?.(m);
+            waiting.delete(m.id);
           }
+        } catch {
+          /* not a message */
         }
       }
-      const code = await p.exited;
-      fail(`SolidCraft ${build.version} stopped (exit ${code})${stderr.trim() ? `: ${firstLine(stderr)}` : ""}`);
-    })().catch((e) => fail(String(e)));
+    });
     timer = setTimeout(() => {
       fail(`SolidCraft ${build.version} did not finish within ${Math.round(timeoutMs / 1000)} s and was stopped`);
-      p.kill("SIGKILL");
+      killAll();
     }, timeoutMs);
 
     let nextId = 1;
     const write = (msg: unknown): void => {
       try {
-        (p.stdin as { write(s: string): unknown; flush?(): unknown }).write(`${JSON.stringify(msg)}\n`);
-        (p.stdin as { flush?(): unknown }).flush?.();
+        p.stdin?.write(`${JSON.stringify(msg)}\n`);
       } catch (e) {
         fail(`could not write to SolidCraft ${build.version}: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -210,14 +227,22 @@ export async function sandboxedReplay(build: SandboxBuild, scriptText: string, c
   } finally {
     if (timer) clearTimeout(timer);
     try {
-      (proc?.stdin as { end?(): unknown } | undefined)?.end?.();
+      proc?.stdin?.end();
     } catch {
       /* already closed */
     }
-    if (proc) {
-      // stdin EOF ends the server in a few ms; do not wait on one that will not go.
-      const gone = await Promise.race([proc.exited.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 2_000))]);
-      if (!gone) proc.kill("SIGKILL");
+    if (proc && exited) {
+      // stdin EOF ends the server in a few ms; do not wait on one that will not go. Either way the
+      // whole group is signalled, so nothing it started outlives the replay.
+      const gone = await Promise.race([exited.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 2_000))]);
+      if (!gone) killAll();
+      else {
+        try {
+          process.kill(-proc.pid!, "SIGKILL"); // stragglers left in the group by a build that exited
+        } catch {
+          /* the group is empty */
+        }
+      }
     }
     rmSync(root, { recursive: true, force: true });
   }

@@ -679,6 +679,7 @@ export interface SolidcraftReplayPart {
   old?: SolidcraftReplayNumbers; // under the pinned build, when it replayed
   new?: SolidcraftReplayNumbers; // under the candidate, when it replayed
   error?: string; // the candidate's failure, the pinned build's (`baseline-broken`), or why it was refused / inconclusive
+  sha?: string; // sha256 of the design file as read (so a refusal is notified once per version of the file)
 }
 /** One machine's replay of everything it hosts. */
 export interface SolidcraftReplayReport {

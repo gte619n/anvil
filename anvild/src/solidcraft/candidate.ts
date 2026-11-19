@@ -50,6 +50,7 @@ export const RESTART_CHECK_GAP_MS = 60 * 60_000;
 export const RETRY_BASE_MS = CHECK_EVERY_MS;
 export const RETRY_CAP_MS = 24 * 60 * 60_000;
 export const MAX_REJECTED = 50;
+export const MAX_REFUSED_NOTIFIED = 500;
 export const MAX_REJECTED_FAILURES = 50;
 /**
  * Install refusals that are about the BUILD, not the moment: the zip is not the recorded one, or
@@ -151,6 +152,8 @@ interface CandidateState {
   retry?: { version: string; attempts: number; nextAt: string; reason: string };
   /** Whether each member hosted designs the last time it answered. Unknown counts as "may host". */
   hosts: Record<string, boolean>;
+  /** Committed designs whose refusal was already notified: `environment|part|sha`. Newest last. */
+  refusedNotified?: string[];
 }
 
 /** `<stateDir>/solidcraft-candidate.json`. An unreadable file is treated as empty (nothing is unsafe about re-evaluating). */
@@ -172,6 +175,7 @@ export class CandidateStore {
         ...(typeof raw.lastAdvanceAt === "string" ? { lastAdvanceAt: raw.lastAdvanceAt } : {}),
         ...(raw.inFlight && isSolidcraftVersion(raw.inFlight.version) ? { inFlight: raw.inFlight } : {}),
         ...(typeof raw.lastCheckStartedAt === "string" ? { lastCheckStartedAt: raw.lastCheckStartedAt } : {}),
+        ...(Array.isArray(raw.refusedNotified) ? { refusedNotified: raw.refusedNotified.filter((k) => typeof k === "string").slice(-MAX_REFUSED_NOTIFIED) } : {}),
         ...(raw.retry && isSolidcraftVersion(raw.retry.version) && typeof raw.retry.nextAt === "string" ? { retry: raw.retry } : {}),
       };
     } catch {
@@ -428,6 +432,12 @@ export class CandidateGate {
       return finish("rejected", `SolidCraft ${ref.version} was rejected: ${reason}. The pin is unchanged.`);
     };
     const fromReport = (base: Pick<SolidcraftGateMachine, "serverId" | "serverName" | "isHub">, report: SolidcraftReplayReport): SolidcraftGateMachine => {
+      // FIRST: with a pin, a machine that hosts designs must have compared against exactly the
+      // pinned build. One that compared against something else (or nothing) has not compared at
+      // all, so nothing in its report — not even a difference — is a verdict on the candidate.
+      if (pin && report.hostsDesigns && report.baseline !== pin.version) {
+        return { ...base, state: "held", holds: true, detail: `it compared against ${report.baseline ? `SolidCraft ${report.baseline}` : "no build"}, not the pinned ${pin.version}`, report };
+      }
       // A replay that ran and differed (or ran and failed) rejects the candidate.
       const rejecting = report.parts.filter(rejectsCandidate);
       if (rejecting.length) return { ...base, state: "fail", holds: true, detail: describeFailure(rejecting[0]!), report };
@@ -435,12 +445,30 @@ export class CandidateGate {
       if (report.errors?.length) return { ...base, state: "held", holds: true, detail: report.errors[0], report };
       const holding = report.parts.filter(holdsPin);
       if (holding.length) return { ...base, state: "held", holds: true, detail: describeFailure(holding[0]!), report };
-      // With a pin, a machine that hosts designs must have compared against exactly the pinned
-      // build. One that compared against something else (or nothing) has not compared at all.
-      if (pin && report.hostsDesigns && report.baseline !== pin.version) {
-        return { ...base, state: "held", holds: true, detail: `it compared against ${report.baseline ? `SolidCraft ${report.baseline}` : "no build"}, not the pinned ${pin.version}`, report };
-      }
       return { ...base, state: report.hostsDesigns ? "pass" : "no-designs", holds: false, report };
+    };
+    /**
+     * A committed design the screen refused holds the pin whatever the candidate is, and would do
+     * so silently for ever. Tell the owner ONCE per version of the file (environment, part and the
+     * file's sha256), naming the design and why.
+     */
+    const notifyRefused = (): void => {
+      const known = new Set(s.refusedNotified ?? []);
+      for (const m of machines) {
+        for (const p of m.report?.parts ?? []) {
+          if (p.outcome !== "refused") continue;
+          const key = `${p.environment}|${p.part}|${p.sha ?? p.error ?? ""}`.slice(0, 400);
+          if (known.has(key)) continue;
+          known.add(key);
+          (s.refusedNotified ??= []).push(key);
+          this.deps.notify?.(
+            `Design ${p.part} is not replayed`,
+            `${p.part} (${p.environment}, on ${m.serverName}) was refused by the design-script check: ${p.error ?? "no detail"}. SolidCraft updates are held until it is fixed.`,
+            `solidcraft-refused-${p.environment}-${p.part}`.slice(0, 120),
+          );
+        }
+      }
+      if (s.refusedNotified && s.refusedNotified.length > MAX_REFUSED_NOTIFIED) s.refusedNotified = s.refusedNotified.slice(-MAX_REFUSED_NOTIFIED);
     };
 
     // The hub first: its install is the proof that the candidate is a real, verified build.
@@ -487,6 +515,7 @@ export class CandidateGate {
       }),
     );
 
+    notifyRefused();
     const failed = machines.filter((m) => m.state === "fail");
     if (failed.length) {
       const failures = failed.flatMap((m) => (m.report?.parts ?? []).filter(rejectsCandidate).map((p) => ({ ...p, serverName: m.serverName })));

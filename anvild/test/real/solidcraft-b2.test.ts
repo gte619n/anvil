@@ -224,3 +224,88 @@ test.skipIf(!REAL)(
   },
   10 * 60_000,
 );
+
+/** A real exported script holding a sketch text (its font is `links[].source.font`), built now by the real binary. */
+async function textScript(cli: string): Promise<Script> {
+  const dir = tmp("anvil-sc-real-b2-text-");
+  const sc = await startFake({ cli: [cli], allow: [dir], env: { SOLIDCRAFT_GPU: "cpu" } });
+  try {
+    const built = await sc.call("batch", { commands: REFERENCE_PLATE });
+    if (built.isError) throw new Error(`[B2 real] could not build the plate: ${built.text}`);
+    for (const [command, params] of [
+      ["sketch.create", { plane: "XY", name: "Marks", offset: "T" }],
+      ["sketch.text", { text: "ANVIL", at: [0, 0], height: 5, font: "Helvetica" }],
+      ["sketch.finish", {}],
+    ] as const) {
+      const r = await sc.call("execute", { command, params });
+      if (r.isError) throw new Error(`[B2 real] ${command} failed: ${r.text}`);
+    }
+    const exported = await sc.call("execute", { command: "timeline.export_script", params: {} });
+    if (exported.isError || !exported.json?.script?.commands) throw new Error(`[B2 real] no script exported: ${exported.text.slice(0, 300)}`);
+    return exported.json.script as Script;
+  } finally {
+    await sc.close();
+  }
+}
+
+test.skipIf(!REAL)(
+  "[B2 real] a script whose sketch text names a font file by path or environment reference is refused; with the screen bypassed the sandboxed build does not open the file",
+  async () => {
+    const { pinned, candidate } = realBuilds();
+    const base = await textScript(candidate.path);
+    const withFont = (font: string): string => {
+      const s = structuredClone(base);
+      const link = s.commands.map((c) => c.params?.feature?.sketch?.links?.[0]).find((l) => l?.source?.font !== undefined);
+      if (!link) throw new Error("[B2 real] the exported script has no sketch text link with a font");
+      link.source.font = font;
+      return JSON.stringify(s);
+    };
+    // The real export's own font value is a plain name, and passes.
+    expect(screenScriptText(JSON.stringify(base)).ok).toBe(true);
+    expect(screenScriptText(withFont("Inter-Bold.ttf")).ok).toBe(true);
+
+    // A planted file standing for something under the real HOME, and a path beside it that does not exist.
+    const home = tmp("anvil-sc-real-b2-home-");
+    const planted = join(home, "secret.ttf");
+    writeFileSync(planted, "not a font: a secret\n");
+    const missing = join(home, "no-such-file.ttf");
+    const fonts = [`%HOME%/x.ttf`, "~/x.ttf", "fonts/x.ttf", "$HOME/x.ttf", planted, missing];
+
+    // 1. End to end: every one is refused by the screen and never reaches a build.
+    const files: Record<string, string> = { "cad/label/design.json": JSON.stringify(base) };
+    fonts.forEach((f, i) => (files[`cad/font${i}/design.json`] = withFont(f)));
+    const repo = fixtureRepo(tmp("anvil-sc-real-b2-font-"), files);
+    const report = await replayMachine({ candidate, baseline: pinned, environments: [{ name: "real-fixtures", repoRoot: repo.repoRoot, defaultBase: "main" }], timeoutMs: 180_000 });
+    expect(report.parts.map((p) => [p.part, p.outcome])).toEqual([...fonts.map((_, i) => [`font${i}`, "refused"]), ["label", "same"]]);
+    for (const p of report.parts.slice(0, fonts.length)) expect(p.error).toContain("source.font");
+    expect(report.pass).toBe(false);
+
+    // 2. The screen bypassed. Under the sandbox the build answers the SAME way for the file that
+    //    exists and the one that does not: it refuses to look outside its folder, so the reply is
+    //    no oracle for what is on the machine, and the planted file is not opened.
+    const warningFor = async (font: string): Promise<string> => {
+      const text = withFont(font);
+      const r = await sandboxedReplay(candidate, text, (JSON.parse(text) as Script).commands, { timeoutMs: 180_000, tmpRoot: tmp("anvil-sc-real-b2-box-") });
+      expect(r.status).toBe("replayed");
+      if (r.status !== "replayed") return "";
+      const marks = (r.doc.timeline as { name: string; warning?: string; error?: string }[]).find((t) => t.name === "Marks");
+      return String(marks?.warning ?? marks?.error ?? "");
+    };
+    const [forPlanted, forMissing] = [await warningFor(planted), await warningFor(missing)];
+    console.log(`[B2 real] sandboxed font, existing file: ${forPlanted.slice(0, 200)}`);
+    expect(forPlanted).toContain("outside the folders this agent may use");
+    expect(forMissing).toContain("outside the folders this agent may use");
+    // Word for word the same up to the list of allowed folders (whose temp names differ per run).
+    const verdict = (w: string, file: string): string => w.replaceAll(file, "<file>").split(" (")[0]!;
+    expect(verdict(forPlanted, planted)).toBe("projected reference lost: invalid value: font file `<file>`: <file>: outside the folders this agent may use");
+    expect(verdict(forMissing, missing)).toBe(verdict(forPlanted, planted));
+    // `%HOME%` and `~` expand to the throwaway HOME of the box, never to the daemon's.
+    for (const f of ["%HOME%/x.ttf", "~/x.ttf"]) {
+      const w = await warningFor(f);
+      expect(w).toContain("sc-box-");
+      expect(w).not.toContain(process.env.HOME ?? "/no-home");
+    }
+    expect(readFileSync(planted, "utf8")).toBe("not a font: a secret\n");
+  },
+  10 * 60_000,
+);

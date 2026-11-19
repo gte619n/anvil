@@ -34,7 +34,8 @@
  * With no baseline build there is nothing to compare against: each design is replayed under the
  * candidate only. The hub accepts that only when no pin is recorded.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SolidcraftReplayDifference, SolidcraftReplayNumbers, SolidcraftReplayOutcome, SolidcraftReplayPart, SolidcraftReplayReport } from "@protocol";
@@ -349,11 +350,21 @@ export async function readEnvironmentDesigns(env: ReplayEnvironment, destDir: st
   return { ref, designs, notes, errors };
 }
 
-/** Copy the designs sitting in a session worktree (its files as they are now) into `destDir`. */
-export function readWorktreeDesigns(worktreePath: string, destDir: string): FoundDesign[] {
+/**
+ * Copy the designs sitting in a session worktree (its files as they are now) into `destDir`.
+ *
+ * Nothing here follows a symbolic link: an agent can leave `cad/x/design.json` (or `cad/x`, or
+ * `cad`) pointing anywhere on the machine, and reading through it would carry that file's content
+ * into a report the whole fleet sees. A link is skipped, with a note in `notes`.
+ */
+export function readWorktreeDesigns(worktreePath: string, destDir: string, notes: string[] = []): FoundDesign[] {
   const out: FoundDesign[] = [];
   let parts: string[];
   try {
+    if (!lstatSync(join(worktreePath, "cad")).isDirectory()) {
+      notes.push("a worktree's cad folder is a symbolic link or not a folder; skipped");
+      return out;
+    }
     parts = readdirSync(join(worktreePath, "cad")).sort();
   } catch {
     return out;
@@ -361,7 +372,15 @@ export function readWorktreeDesigns(worktreePath: string, destDir: string): Foun
   for (const part of parts) {
     const src = join(worktreePath, "cad", part, "design.json");
     try {
-      const st = statSync(src);
+      if (lstatSync(join(worktreePath, "cad", part)).isSymbolicLink()) {
+        notes.push(`cad/${part} in a worktree is a symbolic link; skipped`);
+        continue;
+      }
+      const st = lstatSync(src); // lstat: the link itself, never what it points at
+      if (st.isSymbolicLink()) {
+        notes.push(`cad/${part}/design.json in a worktree is a symbolic link, not a design file; skipped`);
+        continue;
+      }
       if (!st.isFile()) continue;
       const path = `cad/${part}/design.json`;
       if (st.size > MAX_SCRIPT_BYTES) {
@@ -444,7 +463,7 @@ export async function replayMachine(o: ReplayMachineOptions): Promise<Solidcraft
       notes.push(`open session worktrees could not be listed (${e instanceof Error ? e.message : String(e)})`);
     }
     for (const [i, w] of worktrees.entries()) {
-      for (const design of readWorktreeDesigns(w.path, join(tmp, `wt${i}`))) {
+      for (const design of readWorktreeDesigns(w.path, join(tmp, `wt${i}`), notes)) {
         jobs.push({ design, advisory: true, base: { part: design.part, environment: w.environment ?? "", path: design.path, worktree: w.label } });
       }
     }
@@ -457,8 +476,9 @@ export async function replayMachine(o: ReplayMachineOptions): Promise<Solidcraft
         return { ...job.base, outcome: "inconclusive", error: "not replayed: this machine's replay ran out of time" };
       }
       // Layer 1: the screen. A refused script is never handed to SolidCraft, under either build.
-      const screened = screenScriptText(readFileSync(job.design.file, "utf8"));
-      if (!screened.ok) return { ...job.base, outcome: "refused", error: screened.reason };
+      const raw = readFileSync(job.design.file, "utf8");
+      const screened = screenScriptText(raw);
+      if (!screened.ok) return { ...job.base, outcome: "refused", error: screened.reason, sha: createHash("sha256").update(raw).digest("hex") };
       const text = JSON.stringify(screened.script);
       // Layer 2: the sandbox, once per build.
       const opts = { timeoutMs: Math.max(1_000, Math.min(timeoutMs, deadline - now())), tmpRoot: tmp, ...(pathEnv ? { pathEnv } : {}) };

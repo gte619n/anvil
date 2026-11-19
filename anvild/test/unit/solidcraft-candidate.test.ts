@@ -339,7 +339,8 @@ describe("the hub's replay gate", () => {
     const machines = r.gate.status().lastEvaluation!.machines;
     expect(machines.map((m) => [m.serverName, m.state, m.holds])).toEqual([["HUB", "pass", false], ["M1", "held", true], ["M2", "held", true]]);
     expect(r.gate.status().rejected).toEqual([]); // not a permanent rejection
-    expect(r.notes).toEqual([]);
+    // The candidate is not reported as turned down; the refused DESIGN is reported, once.
+    expect(r.notes.map((n) => n.title)).toEqual(["Design trap is not replayed"]);
     expect(r.advances).toEqual([]);
     // Next check the slow design replays: only the refused one still holds.
     r.plan.m1 = {};
@@ -376,6 +377,65 @@ describe("the hub's replay gate", () => {
     expect((await rig({ plan: { m1: { report: report([part("plate")], { baseline: "0.44.1" }) } } }).gate.check()).outcome).toBe("advanced");
     // A machine that hosts NO designs has nothing to compare, so its baseline does not matter.
     expect((await rig({ plan: { m1: { report: report([], { baseline: "0.43.0" }) } } }).gate.check()).outcome).toBe("advanced");
+  });
+
+  test("[B2] a report made against the wrong baseline is never a rejection, even when it says a part differs", async () => {
+    // The member compared the candidate against 0.43.0 (it is off the pin) and saw a difference.
+    // That is no verdict on the candidate against the PINNED build: held, not rejected for good.
+    const wrong = report([part("plate"), DIFFERS], { baseline: "0.43.0" });
+    const r = rig({ plan: { m1: { report: wrong } } });
+    const check = await r.gate.check();
+    expect(check.outcome).toBe("held");
+    expect(check.detail).toContain("it compared against SolidCraft 0.43.0, not the pinned 0.44.1");
+    const st = r.gate.status();
+    expect(st.rejected).toEqual([]);
+    expect(st.lastEvaluation!.machines.find((m) => m.serverName === "M1")).toMatchObject({ state: "held", holds: true });
+    expect(r.notes).toEqual([]);
+    expect(r.advances).toEqual([]);
+    // No baseline at all, with a candidate-error: the same.
+    const none = report([part("plate", { outcome: "candidate-error", error: "feature Corners failed" })]);
+    delete (none as { baseline?: string }).baseline;
+    expect((await rig({ plan: { m2: { report: none } } }).gate.check()).outcome).toBe("held");
+    // Control: the same difference against the pinned build does reject.
+    expect((await rig({ plan: { m1: { report: report([part("plate"), DIFFERS], { baseline: "0.44.1" }) } } }).gate.check()).outcome).toBe("rejected");
+  });
+
+  test("[B2] a committed design that is refused is notified once per version of the file, naming the design and the command", async () => {
+    const reason = "step 3 (occurrence.pattern): this command is not on Anvil's list of commands allowed in a design script (extend ALLOWED_COMMANDS in script-screen.ts if it is legitimate)";
+    const refusedPart = (sha: string) => part("gearbox", { environment: "lapo", outcome: "refused", error: reason, sha });
+    const r = rig({ plan: { m1: { report: report([part("plate"), refusedPart("a".repeat(64))]) } } });
+    expect((await r.gate.check()).outcome).toBe("held");
+    expect(r.notes.length).toBe(1);
+    expect(r.notes[0]!.title).toBe("Design gearbox is not replayed");
+    expect(r.notes[0]!.body).toContain("gearbox (lapo, on M1)");
+    expect(r.notes[0]!.body).toContain("occurrence.pattern");
+    expect(r.notes[0]!.body).toContain("extend ALLOWED_COMMANDS");
+    expect(r.notes[0]!.body).toContain("held until it is fixed");
+    // Every four hours the same file is refused again: no more notifications…
+    for (let i = 0; i < 6; i++) {
+      r.clock.t += 4 * HOUR;
+      expect((await r.gate.check()).outcome).toBe("held");
+    }
+    expect(r.notes.length).toBe(1);
+    // …nor after a restart, nor when a second machine hosts the same file.
+    const again = rig({ dir: r.deps.stateDir, clock: r.clock, plan: { m1: { report: report([refusedPart("a".repeat(64))]) }, m2: { report: report([refusedPart("a".repeat(64))]) } } });
+    await again.gate.check();
+    expect(again.notes).toEqual([]);
+    // The file changes and is still refused: that is news.
+    again.plan.m1 = { report: report([refusedPart("b".repeat(64))]) };
+    again.plan.m2 = {};
+    again.clock.t += 4 * HOUR;
+    await again.gate.check();
+    expect(again.notes.length).toBe(1);
+    // An ADVISORY (worktree) refusal is listed on the card and never notified.
+    const adv = rig({ plan: { m1: { report: report([part("plate")], { advisory: [part("wip", { worktree: "session", outcome: "refused", error: reason, sha: "c".repeat(64) })] }) } } });
+    expect((await adv.gate.check()).outcome).toBe("advanced");
+    expect(adv.notes).toEqual([]);
+    // The memory of what was notified is bounded.
+    const many = rig({ plan: { m1: { report: report(Array.from({ length: 700 }, (_, i) => part(`p${i}`, { outcome: "refused", error: reason, sha: String(i).padStart(64, "0") }))) } } });
+    await many.gate.check();
+    expect(many.notes.length).toBe(700);
+    expect(JSON.parse(readFileSync(join(many.deps.stateDir, CANDIDATE_FILE), "utf8")).refusedNotified.length).toBe(500);
   });
 
   test("[B2] a member that could not read its designs holds the pin, and is not remembered as hosting none", async () => {

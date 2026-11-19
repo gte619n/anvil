@@ -394,6 +394,37 @@ describe("the screen and the sandbox", () => {
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(await replayInSandbox({ path: chatty, version: "1.0.0" }, "{}", [], { timeoutMs: 500, tmpRoot: tmp() })).toMatchObject({ ok: false, conclusive: false });
   }, 30_000);
+  test("[B2] a timed-out build is killed together with everything it started", async () => {
+    const dir = tmp();
+    const pidFile = join(dir, "grandchild.pid");
+    const spawner = join(dir, "spawner-cli");
+    // A stand-in build that starts a long-lived child of its own, then hangs.
+    writeFileSync(spawner, `#!/bin/sh\nsleep 300 &\necho $! > '${pidFile}'\nwait\n`);
+    chmodSync(spawner, 0o755);
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const r = await sandboxedReplay({ path: spawner, version: "1.0.0" }, "{}", [], { tmpRoot: tmp(), timeoutMs: 800 });
+    expect(r).toEqual({ status: "could-not-run", error: expect.stringContaining("did not finish within") });
+    const grandchild = Number(readFileSync(pidFile, "utf8").trim());
+    expect(grandchild).toBeGreaterThan(1);
+    for (let i = 0; i < 100 && alive(grandchild); i++) await new Promise((x) => setTimeout(x, 20));
+    expect(alive(grandchild)).toBe(false); // the `sleep 300` did not outlive the replay
+    // The same for a build that EXITS by itself but leaves a child behind in its group.
+    const leaver = join(dir, "leaver-cli");
+    const pidFile2 = join(dir, "left.pid");
+    writeFileSync(leaver, `#!/bin/sh\nsleep 300 &\necho $! > '${pidFile2}'\nexit 3\n`);
+    chmodSync(leaver, 0o755);
+    expect((await sandboxedReplay({ path: leaver, version: "1.0.0" }, "{}", [], { tmpRoot: tmp(), timeoutMs: 5_000 })).status).toBe("could-not-run");
+    const left = Number(readFileSync(pidFile2, "utf8").trim());
+    for (let i = 0; i < 100 && alive(left); i++) await new Promise((x) => setTimeout(x, 20));
+    expect(alive(left)).toBe(false);
+  }, 30_000);
 });
 
 describe("replaying a machine's designs", () => {
@@ -491,7 +522,7 @@ describe("replaying a machine's designs", () => {
     // A file that is not a script at all is not "broken under the pin": it is refused, and holds.
     const junk = fixtureRepo(tmp(), { ...DESIGNS, "cad/garbage/design.json": "not a script" });
     const j = await replayMachine({ candidate: b.candidate, baseline: b.pinned, environments: ENV(junk.repoRoot) });
-    expect(j.parts.find((p) => p.part === "garbage")).toMatchObject({ outcome: "refused", error: expect.stringContaining("not JSON") });
+    expect(j.parts.find((p) => p.part === "garbage")).toMatchObject({ outcome: "refused", error: "the design script is not valid JSON" });
     expect(j.pass).toBe(false);
   });
 
@@ -659,6 +690,63 @@ describe("replaying a machine's designs", () => {
     expect(thrown.pass).toBe(true);
     expect(thrown.notes).toEqual(["open session worktrees could not be listed (session store offline)"]);
   });
+
+  test("[B2] a worktree design that is a symbolic link is skipped, and no refusal ever quotes a file's content", async () => {
+    const b = builds({});
+    const repo = fixtureRepo(tmp(), DESIGNS);
+    const secretDir = tmp();
+    const SECRET = "hunter2-TOP-SECRET-0123456789";
+    writeFileSync(join(secretDir, "id_rsa"), `-----BEGIN KEY-----\n${SECRET}\n`);
+    mkdirSync(join(secretDir, "cad-elsewhere", "inner"), { recursive: true });
+    writeFileSync(join(secretDir, "cad-elsewhere", "inner", "design.json"), SECRET);
+    const wt = tmp();
+    // 1. cad/leak/design.json is a link to a secret file.
+    mkdirSync(join(wt, "cad/leak"), { recursive: true });
+    symlinkSync(join(secretDir, "id_rsa"), join(wt, "cad/leak/design.json"));
+    // 2. cad/linked is a link to a folder elsewhere that holds a design.json.
+    symlinkSync(join(secretDir, "cad-elsewhere", "inner"), join(wt, "cad/linked"));
+    // 3. A real file that is simply not JSON, with the same secret in it.
+    mkdirSync(join(wt, "cad/junk"), { recursive: true });
+    writeFileSync(join(wt, "cad/junk/design.json"), `{"commands": [${SECRET}]}`);
+    // 4. And an honest one.
+    mkdirSync(join(wt, "cad/wip"), { recursive: true });
+    writeFileSync(join(wt, "cad/wip/design.json"), designJson("wip", box()));
+    // A second worktree whose whole cad folder is a link.
+    const wt2 = tmp();
+    symlinkSync(join(secretDir, "cad-elsewhere"), join(wt2, "cad"));
+
+    const r = await replayMachine({ candidate: b.candidate, baseline: b.pinned, environments: ENV(repo.repoRoot), worktrees: () => [{ path: wt, label: "agent session" }, { path: wt2, label: "other" }] });
+    expect(r.advisory.map((p) => [p.part, p.outcome])).toEqual([["junk", "refused"], ["wip", "same"]]); // neither link was read
+    expect(r.advisory[0]!.error).toBe("the design script is not valid JSON");
+    expect(r.notes).toEqual([
+      "cad/leak/design.json in a worktree is a symbolic link, not a design file; skipped",
+      "cad/linked in a worktree is a symbolic link; skipped",
+      "a worktree's cad folder is a symbolic link or not a folder; skipped",
+    ]);
+    expect(JSON.stringify(r)).not.toContain("SECRET"); // nothing of any of the three files is in the report
+    expect(JSON.stringify(r)).not.toContain("hunter2");
+    expect(r.pass).toBe(true);
+    // The same for a committed file that is not JSON: refused, and its content stays out of the report.
+    const junk = fixtureRepo(tmp(), { "cad/junk/design.json": `{"commands": [${SECRET}]}` });
+    const j = await replayMachine({ candidate: b.candidate, baseline: b.pinned, environments: ENV(junk.repoRoot) });
+    expect(j.parts[0]).toMatchObject({ outcome: "refused", error: "the design script is not valid JSON", sha: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(JSON.stringify(j)).not.toContain("hunter2");
+  });
+
+  test("[B2] a large design made of text the screen must read does not stall the machine's replay", async () => {
+    // 150 KB of letters in one comment took the old screen 14 s, with the event loop blocked.
+    const b = builds({});
+    const big = rawScript("big", [{ command: "parameters.add", params: { name: "L", expression: "80 mm", comment: "a".repeat(1024 * 1024) } }, ...asDesignSteps(box())]);
+    const repo = fixtureRepo(tmp(), { "cad/big/design.json": big, "cad/plate/design.json": designJson("plate", plate()) });
+    let ticks = 0;
+    const heartbeat = setInterval(() => ticks++, 20);
+    const started = Date.now();
+    const r = await replayMachine({ candidate: b.candidate, baseline: b.pinned, environments: ENV(repo.repoRoot) });
+    clearInterval(heartbeat);
+    expect(r.parts.map((p) => [p.part, p.outcome])).toEqual([["big", "same"], ["plate", "same"]]);
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(ticks).toBeGreaterThan(5); // the event loop kept turning throughout
+  }, 30_000);
 
   test("[B2] a replay that outlasts the per-design timeout is stopped and counts against the candidate", async () => {
     const b = builds({ "0.45.0": { parts: { block: { delayMs: 30_000 } } } });
