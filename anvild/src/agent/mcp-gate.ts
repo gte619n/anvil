@@ -6,6 +6,13 @@
  */
 import type { McpIntegration, McpIntegrationKind, PermissionDecision, PermissionSuggestion, Session as SessionData } from "@protocol";
 
+/**
+ * Built-in tools that read from MCP servers WITHOUT an `mcp__` name, so they would slip past the
+ * integration branch in `decide()`. Disallowed for every session through the SDK's `disallowedTools`
+ * (driver.ts) and denied again by `decide()` itself (mcp-integrations spec §4.3).
+ */
+export const MCP_RESOURCE_TOOLS: readonly string[] = ["ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool"];
+
 /** The slice of a session the gate reads. A real `Session` satisfies it. */
 export interface McpGateSession {
   id: string;

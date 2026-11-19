@@ -3,7 +3,7 @@ import type { PermissionDecision, PermissionSuggestion } from "@protocol";
 import { newId } from "../util/ids";
 import { isDangerous, isReadOnly } from "./danger-list";
 import { isUnattended, protectedVerdict, type ProtectedVerdict } from "./protected";
-import { isInProcessTool, mcpKindGate, parseMcpTool, type McpHookContext, type McpKindVerdict, type McpSessionGate } from "./mcp-gate";
+import { MCP_RESOURCE_TOOLS, isInProcessTool, mcpKindGate, parseMcpTool, type McpHookContext, type McpKindVerdict, type McpSessionGate } from "./mcp-gate";
 import type { Session } from "../session/session";
 
 interface ResolvedDecision {
@@ -159,6 +159,12 @@ async function decide(
     return { behavior: "deny", reason: guard.reason };
   }
 
+  // The built-in MCP resource readers carry no `mcp__` name, so the branch below would never see
+  // them. The driver also lists them in `disallowedTools`; this is the second lock, under every policy.
+  if (MCP_RESOURCE_TOOLS.includes(tool)) {
+    return { behavior: "deny", reason: `${tool} is not available: MCP resources are read only through an integration's own tools` };
+  }
+
   // MCP branch (mcp-integrations spec §4.4). Runs before the remembered-allow lookup and the `bypass`
   // short-circuit below. A tool of one of the session's own in-process servers (`anvil`,
   // `anvil_team`, `anvil_cad`, … — whatever is in the driver's server map) keeps the existing
@@ -249,6 +255,9 @@ async function decideMcp(
   const found = gate.lookup(session, parsed.key);
   if ("deny" in found) return { behavior: "deny", reason: found.deny };
   const integration = found.integration;
+  // What the owner is being asked about. If the integration is edited while a card is parked, the
+  // answer was for a different thing and must not carry over (see `finish`).
+  const asked = JSON.stringify(integration);
 
   const busy = gate.heldByOther(session, integration);
   if (busy) return { behavior: "deny", reason: `${integration.label} is in use by ${busy.title}` };
@@ -257,6 +266,9 @@ async function decideMcp(
   const finish = (updatedInput: Record<string, unknown>, reason: string): Decision => {
     const again = gate.lookup(session, parsed.key);
     if ("deny" in again) return { behavior: "deny", reason: again.deny };
+    if (JSON.stringify(again.integration) !== asked) {
+      return { behavior: "deny", reason: `${again.integration.label} was changed while this call was waiting; call it again` };
+    }
     const lock = gate.acquire(session, again.integration);
     if (!lock.ok) return { behavior: "deny", reason: `${again.integration.label} is in use by ${lock.title}` };
     return { behavior: "allow", updatedInput, reason };

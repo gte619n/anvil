@@ -23,6 +23,20 @@ export function keyProblem(key: unknown): string | undefined {
     return "key must be 2-24 characters: a lowercase letter, then lowercase letters or digits (no underscores)";
   }
   if (RESERVED_MCP_KEYS.includes(key)) return `key "${key}" is reserved for Anvil's own tools`;
+  // A key is used as a property name in the driver's server map; one that names something every
+  // object already has (`constructor`) would look "already used" there.
+  if (key in Object.prototype) return `key "${key}" is not allowed`;
+  return undefined;
+}
+
+/**
+ * Why `command` cannot follow `/usr/bin/env -i NAME=value …` safely, or undefined when it can. `env`
+ * reads a word containing `=` as one more assignment (so the NEXT word would run instead) and a word
+ * starting with `-` as one of its own options; macOS `env` has no `--` to stop that.
+ */
+export function envWrapProblem(command: string): string | undefined {
+  if (command.includes("=")) return 'command must not contain "="';
+  if (command.startsWith("-")) return 'command must not start with "-"';
   return undefined;
 }
 
@@ -53,6 +67,8 @@ export function transportProblem(t: unknown): string | undefined {
   if (tr.type === "stdio") {
     if (typeof tr.command !== "string" || !tr.command.trim()) return "command is required";
     if (/[\0\n\r]/.test(tr.command)) return "command must be a single line";
+    const wrapErr = envWrapProblem(tr.command.trim());
+    if (wrapErr) return wrapErr;
     if (!Array.isArray(tr.args) || tr.args.some((a) => typeof a !== "string" || a.includes("\0"))) return "args must be a list of strings";
     return undefined;
   }
@@ -61,7 +77,8 @@ export function transportProblem(t: unknown): string | undefined {
 
 /** A clean copy of a transport that already passed `transportProblem` (drops unknown fields). */
 export function normalizeTransport(t: McpTransport): McpTransport {
-  return t.type === "http" ? { type: "http", url: t.url.trim() } : { type: "stdio", command: t.command.trim(), args: [...t.args] };
+  // The URL is stored and forwarded in its parsed, normalized form — exactly what was validated.
+  return t.type === "http" ? { type: "http", url: new URL(t.url.trim()).href } : { type: "stdio", command: t.command.trim(), args: [...t.args] };
 }
 
 /** Whether a value read back from disk is a structurally usable integration record. Lenient about the

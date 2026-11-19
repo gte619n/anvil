@@ -10,7 +10,7 @@ import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from
 import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
 import { makeCanUseTool, type QuestionBroker } from "./questions";
 import { inProcessKeys } from "./mcp-external";
-import { isInProcessTool, parseMcpTool, type McpSessionGate } from "./mcp-gate";
+import { MCP_RESOURCE_TOOLS, isInProcessTool, parseMcpTool, type McpSessionGate } from "./mcp-gate";
 import type { Session } from "../session/session";
 import type { MarkdownRenderer } from "../render/markdown";
 
@@ -27,11 +27,7 @@ export interface TurnUsage {
 /** Called once per completed turn so the supervisor can refresh the shared rate-limit gauge. */
 export type ResultRecorder = (usage: TurnUsage) => void;
 
-/**
- * Built-in tools that read from MCP servers WITHOUT an `mcp__` name, so they would slip past the
- * integration gate in `decide()`. Disallowed for every session (mcp-integrations spec §4.3).
- */
-export const MCP_RESOURCE_TOOLS: readonly string[] = ["ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool"];
+export { MCP_RESOURCE_TOOLS };
 
 /** The SDK `query` entrypoint — injectable so tests can drive `consume()` without a subprocess. */
 export type QueryFn = typeof query;

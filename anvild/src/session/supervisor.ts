@@ -346,6 +346,12 @@ export class Supervisor {
       persist: () => this.persist(),
       broadcastUpdated: (data) => this.broadcastUpdated(data),
       dropIdleDriver: (id) => this.dropIdleDriver(id),
+      denyParked: (id, key) => {
+        const s = this.sessions.get(id);
+        for (const p of [...(s?.pendingPermissions.values() ?? [])]) {
+          if (p.tool.startsWith(`mcp__${key}__`)) this.resolvePermission(p.requestId, "deny");
+        }
+      },
       notice: (id, markdown) => {
         this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
       },

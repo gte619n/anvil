@@ -8,8 +8,8 @@
  *
  * A PATH lookup cannot see a server that starts and then hangs or crashes, so the tracker also takes a
  * report from the SDK's session-init message: a server that came back `failed` is held `unavailable`
- * until an operator-driven probe (see `HOLD_CLEARING`) — the automatic before-turn, client-connect and
- * timer probes do not clear it, or the very next turn would attach it again and pay the same startup stall.
+ * until the operator presses Check or edits/toggles THAT integration (see `HOLD_CLEARING`) — the
+ * automatic before-turn, client-connect and timer probes do not clear it, or the very next turn would attach it again and pay the same startup stall.
  */
 import { accessSync, constants, statSync } from "node:fs";
 import { connect } from "node:net";
@@ -24,10 +24,11 @@ export type McpProber = (integration: McpIntegration) => Promise<McpHealth> | Mc
  *  session with integrations · `timer` the 60 s loop · `change` an integration was added or updated. */
 export type McpProbeTrigger = "start" | "check" | "connect" | "set" | "turn" | "timer" | "change";
 
-/** Triggers that clear a failed-at-session-start hold: the ones an operator causes on purpose (Check,
- *  toggling a session's tools, editing an integration) plus a daemon restart. A client merely
- *  reconnecting, the before-turn probe and the timer do not. */
-const HOLD_CLEARING: ReadonlySet<McpProbeTrigger> = new Set(["start", "check", "set", "change"]);
+/** Triggers that clear EVERY failed-at-session-start hold: the operator's Check, and a daemon restart.
+ *  Nothing else does — not a client reconnecting, the before-turn probe or the timer, and not an edit
+ *  or a Tools toggle that concerns some other integration or session. One integration's own edit or
+ *  on/off switch clears its own hold through `forget(id)`. */
+const HOLD_CLEARING: ReadonlySet<McpProbeTrigger> = new Set(["start", "check"]);
 
 export const TCP_PROBE_TIMEOUT_MS = 1000;
 

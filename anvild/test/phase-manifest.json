@@ -321,6 +321,21 @@
             "permission cards > [C1] a permission card for an integration tool shows the integration label, not the raw mcp__ name",
             "permission cards > [C1] other tools keep their own name on the card: built-ins, the daemon's own servers, and unknown keys"
           ]
+        },
+        {
+          "file": "test/integration/mcp-c1-review.test.ts",
+          "names": [
+            "C1 review findings > [C1] review 1: updating an integration denies its parked card, so a late 'always' is neither an allow nor remembered",
+            "C1 review findings > [C1] review 1: the approval is for the definition that was shown — an edit behind an open card denies the call even when the card is answered 'always'",
+            "C1 review findings > [C1] review 1: removing an integration denies its parked card",
+            "C1 review findings > [C1] review 2: a failed-at-start hold survives another integration's edit and another session's Tools toggle; its own edit or Check clears it",
+            "C1 review findings > [C1] review 2: through the service — toggling Tools on another session and adding another integration leave a failed server unavailable",
+            "C1 review findings > [C1] review 3: a command env would misread (NAME=value, or an option) is refused by the store, and wrapStdio never emits it",
+            "C1 review findings > [C1] review 3: a hand-edited store with such a command is skipped by name at build time, never launched",
+            "C1 review findings > [C1] review 4: the permission gate itself denies the three MCP resource tools, under every policy including bypass",
+            "C1 review findings > [C1] review 5: a key that names an Object.prototype member is refused by the store and never reads as 'already used'",
+            "C1 review findings > [C1] review 6: an http URL is stored and forwarded in its normalized form"
+          ]
         }
       ],
       "real": [

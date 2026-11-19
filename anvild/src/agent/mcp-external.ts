@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import type { McpSdkServerConfigWithInstance, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { McpIntegrationStatus, McpTransport, Session as SessionData } from "@protocol";
 import { mcpPreset, substituteCwd } from "../mcp/presets";
-import { RESERVED_MCP_KEYS, keyProblem, loopbackUrlProblem, transportProblem } from "../mcp/validate";
+import { RESERVED_MCP_KEYS, envWrapProblem, keyProblem, loopbackUrlProblem, transportProblem } from "../mcp/validate";
 
 export interface McpSkipped {
   /** The integration's id (so the registry can tell which one). */
@@ -43,8 +43,14 @@ export function isOrdinarySession(s: SessionData): boolean {
  * Wrap a stdio command so the server never sees the session's credentials: `/usr/bin/env -i` with
  * only PATH, HOME and TMPDIR. (The SDK's own `env` option ADDS to the inherited environment — it
  * cannot remove the session token — so the wrap is the control. C0 A4.)
+ *
+ * @throws when `command` is a word `env` would read as its own (`NAME=value`, or an option): the wrap
+ * never emits a line that runs something other than `command`. The store refuses such a command, and
+ * `buildMcpServers` reports one that got past it (a hand-edited store) as skipped.
  */
 export function wrapStdio(command: string, args: readonly string[], env: McpChildEnv): { command: string; args: string[] } {
+  const bad = envWrapProblem(command);
+  if (bad) throw new Error(bad);
   return { command: "/usr/bin/env", args: ["-i", `PATH=${env.PATH}`, `HOME=${env.HOME}`, `TMPDIR=${env.TMPDIR}`, command, ...args] };
 }
 
@@ -92,7 +98,7 @@ export function buildMcpServers(
       continue;
     }
     const keyErr = keyProblem(i.key);
-    if (keyErr || RESERVED_MCP_KEYS.includes(i.key) || i.key in servers) {
+    if (keyErr || RESERVED_MCP_KEYS.includes(i.key) || Object.hasOwn(servers, i.key)) {
       skip(keyErr ?? `key "${i.key}" is already used by another server in this session`);
       continue;
     }
@@ -124,9 +130,13 @@ export function buildMcpServers(
         skip(bad);
         continue;
       }
-      servers[i.key] = { type: "http", url: transport.url, alwaysLoad: true };
+      servers[i.key] = { type: "http", url: new URL(transport.url).href, alwaysLoad: true }; // the parsed form that was checked
     } else {
-      servers[i.key] = { ...wrapStdio(transport.command, substituteCwd(transport.args, session.cwd), childEnv), alwaysLoad: true };
+      try {
+        servers[i.key] = { ...wrapStdio(transport.command, substituteCwd(transport.args, session.cwd), childEnv), alwaysLoad: true };
+      } catch (e) {
+        skip(e instanceof Error ? e.message : String(e));
+      }
     }
   }
   return { servers, skipped };

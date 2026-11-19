@@ -42,6 +42,9 @@ export interface McpIntegrationServiceDeps {
    *  (`claudeSessionId` is kept, so the conversation resumes). Returns false when the session is
    *  mid-turn and was left alone. */
   dropIdleDriver: (sessionId: string) => boolean;
+  /** Deny every permission card parked in `sessionId` for a tool of the server `key` (the integration
+   *  behind them was edited or removed, so an answer would be for something else). */
+  denyParked?: (sessionId: string, key: string) => void;
   /** Put one notice line in the session's transcript. */
   notice: (sessionId: string, markdown: string) => void;
   // ── test seams ──
@@ -229,7 +232,9 @@ export class McpIntegrationService {
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
     }
-    // An updated integration is a different thing than the one the owner allowed.
+    // An updated integration is a different thing than the one the owner allowed — or is being asked
+    // about on a card that is still open.
+    this.denyParked(this.store.get(id)?.key);
     this.forgetAllowed(id);
     if (this.store.get(id)?.enabled === false || this.store.get(id)?.exclusive === false) this.lock.release(id);
     this.health.forget(id); // the old result describes the old definition
@@ -241,7 +246,9 @@ export class McpIntegrationService {
 
   remove(id: string): void {
     this.requireEnabled();
+    const key = this.store.get(id)?.key;
     if (!this.store.remove(id)) throw new BadCommand(`no such integration: ${id}`);
+    this.denyParked(key);
     this.lock.release(id);
     this.health.forget(id);
     for (const s of this.referencing([id])) {
@@ -318,6 +325,12 @@ export class McpIntegrationService {
   onSessionGone(sessionId: string): void {
     this.pendingRebuild.delete(sessionId);
     if (this.lock.releaseSession(sessionId).length) this.broadcastIfChanged();
+  }
+
+  /** Deny the cards parked for `key`'s tools in every session. */
+  private denyParked(key: string | undefined): void {
+    if (!key || !this.deps.denyParked) return;
+    for (const s of this.deps.sessions()) this.deps.denyParked(s.id, key);
   }
 
   private forgetAllowed(integrationId: string): void {
