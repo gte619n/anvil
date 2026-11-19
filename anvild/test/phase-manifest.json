@@ -288,7 +288,9 @@
             "cad lock store hub sync > [A2] a member that cannot reach the hub applies locally, queues (durably), and delivers later",
             "cad lock store hub sync > [A2] a member that has never heard from the hub queues, and delivers when the hub's first push arrives",
             "cad lock store hub sync > [A2] conflict between machines: the later approval wins fleet-wide, whichever arrives last",
-            "cad lock store hub sync > [A2] a member only takes a push from the hub it is paired with as its address book, and a hub notes members it missed"
+            "cad lock store hub sync > [A2] a member only takes a push from the hub it is paired with as its address book, and a hub notes members it missed",
+            "cad lock store hub sync > [A2] review 8: pairing does not wipe earlier local approvals — on first contact with a hub a member uploads what it approved before, merged by time",
+            "cad lock store hub sync > [A2] review 5: an approval is found under any identity of its repo — the remote anywhere, the path only on the machine that made it"
           ]
         },
         {
@@ -331,7 +333,7 @@
             "cad gate (the refresh, against the fake) > [A2] a Boolean retry warning with matching numbers passes, with the warning listed",
             "cad gate (the refresh, against the fake) > [A2] only design bodies are measured: an imported reference body (BaseFeature) is left out of volume, box and body count",
             "cad gate (the refresh, against the fake) > [A2] a fresh clone or another machine: an approved part is unverified with an adopt card, and one approval restores pass",
-            "cad gate (the refresh, against the fake) > [A2] gateFromDisk judges the stored measurement without starting SolidCraft, and flags a stale build"
+            "cad gate (the refresh, against the fake) > [A2] review 6: numbers stored in part.json are never a pass — a part not measured in this session is unverified, whatever `measured` says"
           ]
         },
         {
@@ -341,7 +343,9 @@
             "cad protected rules > [A2] Edit and Write to cad/rules.json always prompt — under bypass, after an earlier always-allow, with no always-allow offered — and are denied when unattended",
             "cad protected rules > [A2] Bash commands that reach for the daemon's CAD and browser state, solidcraft-cli, or a remote-debugging browser are denied",
             "cad protected rules > [A2] propose_expectations is let through with no generic prompt (its own card is the prompt) and denied when unattended",
-            "cad protected rules > [A2] the rules are registered once per daemon, by the service when cad-work is on, and tests can reset the registry"
+            "cad protected rules > [A2] the rules are registered once per daemon, by the service when cad-work is on, and tests can reset the registry",
+            "cad protected rules > [A2] review 2: Edit, Write, MultiEdit and NotebookEdit to cad/<part>/design.json always prompt with no always-allow, under every policy, and are denied when unattended",
+            "cad protected rules > [A2] review 3: the file tools cannot write anywhere under the daemon's state dir — absolute, relative or through a symlink — except in session worktrees and cloned repos"
           ]
         },
         {
@@ -351,7 +355,33 @@
             "[A2] there is one card per part per turn, updated in place; a new turn starts a new card",
             "[A2] the cards are hidden without the cad-work capability, and shown only in a session that has the part open",
             "[A2] the expectation-change card shows old and new side by side and the agent's reason, with Approve and Deny only",
-            "[A2] the adopt card shows the values or the rules diff, and untrusted text is never parsed as HTML"
+            "[A2] the adopt card shows the values or the rules diff, and untrusted text is never parsed as HTML",
+            "[A2] review 10: a part whose numbers the agent set says so and offers Confirm numbers; owner-approved numbers do not",
+            "[A2] review 2 and 10: the `initial` and `confirm` cards show the daemon's caution, the numbers with process and status, and Approve / Deny only"
+          ]
+        },
+        {
+          "file": "test/integration/cad-a2-review.test.ts",
+          "names": [
+            "Phase A2 review > [A2] review 1: expectations cannot be set after measuring through deferred pinning — the numbers are fixed at record time from declared parameters, and undeclared formulas are refused",
+            "Phase A2 review > [A2] review 1: a lock entry with no accepted numbers is invalid (needs adoption, 'no accepted value'), never pinned later; a proposal whose formulas do not evaluate is refused before any card",
+            "Phase A2 review > [A2] review 2: a hand-written design.json does not open the agent-initial route — record_expectations becomes an owner card, is denied unattended, and writes nothing on Deny",
+            "Phase A2 review > [A2] review 4: a propose approval is for what the card showed — a process changed on disk while it was open is not laundered; every card shows process and status",
+            "Phase A2 review > [A2] review 5: adding a remote after approval does not orphan the locks — they are found under either identity of the repo",
+            "Phase A2 review > [A2] review 7: adopting ownerParams records what the card showed — a card drawn for other values approves nothing",
+            "Phase A2 review > [A2] review 10: the gate says who approved the numbers; Confirm numbers raises the owner's card (numbers, process, status) and approving it makes the owner the approver"
+          ]
+        },
+        {
+          "file": "test/unit/danger-list.test.ts",
+          "names": [
+            "[A2] review 3: a write outside the worktree is flagged however the path is spelled — relative paths resolve against the cwd"
+          ]
+        },
+        {
+          "file": "test/unit/cad-tools.test.ts",
+          "names": [
+            "anvil_cad tools > [A2] review 9: component.from_bodies and component.move_bodies are not allowed — on 0.44.1 they apply and then the script cannot be exported"
           ]
         }
       ],
@@ -363,7 +393,10 @@
             "real SolidCraft through the gate > [A2] real: removing the pattern feature fails the gate, naming the hole count and the volume",
             "real SolidCraft through the gate > [A2] real: the hole table of a part with one blind hole and one boss is exactly the blind hole",
             "real SolidCraft through the gate > [A2] real: a parameter change that breaks a feature fails the gate on the feature-error check",
-            "real SolidCraft through the gate > [A2] real: measured timings of the refresh on the reference plate are recorded"
+            "real SolidCraft through the gate > [A2] real: measured timings of the refresh on the reference plate are recorded",
+            "real SolidCraft through the gate > [A2] real review 1: recording formulas, building a 13×17×19 box, measuring, then setting the parameters to the measurement does NOT pass — the numbers were fixed at record time",
+            "real SolidCraft through the gate > [A2] real review 2: a hand-written design.json, replayed and measured, cannot be given expectations by the agent — it is the owner's card, and Deny writes nothing",
+            "real SolidCraft through the gate > [A2] real review 9: after every allowed command exercised here the script still exports and design.json is rewritten; component.from_bodies / move_bodies, which break the export, are refused"
           ]
         }
       ]

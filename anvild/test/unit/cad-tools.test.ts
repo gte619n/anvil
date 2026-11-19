@@ -352,6 +352,29 @@ describe("anvil_cad tools", () => {
     expect(readdirSync(join(repo, "cad", "plate")).filter((f) => f.endsWith(".png"))).toEqual([]); // nothing written
   });
 
+  test("[A2] review 9: component.from_bodies and component.move_bodies are not allowed — on 0.44.1 they apply and then the script cannot be exported", async () => {
+    for (const id of ["component.from_bodies", "component.move_bodies"]) {
+      expect(isAllowedCommand(id)).toBe(false);
+      expect(refusedCommand(id)).toContain(id);
+      expect(refusedStep(id, { bodies: ["Body1"] })).toBeString();
+    }
+    // The rest of the family, which does export, is still there.
+    for (const id of ["component.create", "component.activate", "component.rename", "component.copy_bodies"]) expect(isAllowedCommand(id)).toBe(true);
+    // Through the tools: refused before it reaches SolidCraft, in execute and inside a batch.
+    const repo = tempRepo();
+    const { tools } = fakeCadSession(repo);
+    await tools.open_part!({ part: "plate" });
+    expect((await tools.execute!({ command: "solid.box", params: { length: 10, width: 10, height: 10, name: "B" } })).isError).toBe(false);
+    const before = readFileSync(join(repo, "cad", "plate", "design.json"), "utf8");
+    const one = await tools.execute!({ command: "component.from_bodies", params: { bodies: ["B"] } });
+    expect(one.isError).toBe(true);
+    expect(one.text).toContain("component.from_bodies");
+    const many = await tools.batch!({ commands: [{ command: "solid.box", params: { length: 5, width: 5, height: 5, name: "C" } }, { command: "component.move_bodies", params: { bodies: ["B"] } }] });
+    expect(many.isError).toBe(true);
+    expect(many.text).toContain("step 2");
+    expect(readFileSync(join(repo, "cad", "plate", "design.json"), "utf8")).toBe(before);
+  });
+
   test("[A1] execute and batch are default-deny: only allow-listed command ids run, and a new unknown id is refused", async () => {
     // Everything the reference plate and the fake's command table use is allowed…
     for (const step of REFERENCE_PLATE) expect(refusedStep(step.command, step.params)).toBeUndefined();

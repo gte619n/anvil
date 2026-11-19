@@ -17,11 +17,11 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import { evaluateGate, failingLines, gateError, type GateInput, type GateResult, type Measurement } from "./gate";
 import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
-import { repoKey, type LockStore, type PartLock } from "./locks";
+import { repoIdentity, type LockStore, type RepoIdentity } from "./locks";
 import type { CadParamInfo, FeatureIssue, RefreshJob, SlotContext } from "./manager";
 import type { McpToolResult } from "./mcp-client";
 import type { PartRef } from "./partfolder";
-import { evaluateExpectations, lockedBlockSha, readPartFile, writeMeasured, type Measured } from "./partfile";
+import { readPartFile, writeMeasured, type Measured } from "./partfile";
 import { CACHE_DIR } from "./poststep";
 import { readRules } from "./rules";
 
@@ -99,8 +99,8 @@ export async function exportPreview(call: Call, ref: PartRef, rev: number, desig
 
 export interface RefreshDeps {
   locks: LockStore;
-  /** Record a daemon-made change to a lock (pinning the first evaluated numbers) and sync it. */
-  pinValues(lock: PartLock): void;
+  /** This machine's serverId: a lock found by the repo's PATH counts only when made here. */
+  machine?(): string | undefined;
   /** The number the refresh about to be broadcast gets (`cad.design.rev`). Omitted → no preview is written. */
   nextRev?(ref: PartRef): number;
   /** Step 5: called once per refresh with the outcome (measurement, gate, preview). */
@@ -176,10 +176,11 @@ export async function measureDesign(call: Call, designBodies: string[]): Promise
   return { bbox: size.sort((a, b) => a - b) as [number, number, number], volume, faces, bodies: designBodies.length, holes: mergeHoleTables(tables) };
 }
 
-/** Everything the gate reads that is not the live process: the repo files and the lock store. */
-export function readLocked(ref: PartRef, locks: LockStore): Pick<GateInput, "part" | "lock" | "rules" | "rulesLock"> & { repo: string } {
-  const repo = repoKey(ref.worktree);
-  return { repo, part: readPartFile(ref.dir), lock: locks.getPart(repo, ref.part), rules: readRules(ref.worktree), rulesLock: locks.getRules(repo) };
+/** Everything the gate reads that is not the live process: the repo files and the lock store. An
+ *  approval is found under ANY identity of the repo (its remote, its main checkout's path). */
+export function readLocked(ref: PartRef, locks: LockStore, machine?: string): Pick<GateInput, "part" | "lock" | "rules" | "rulesLock"> & { repo: string; identity: RepoIdentity } {
+  const identity = repoIdentity(ref.worktree);
+  return { repo: identity.key, identity, part: readPartFile(ref.dir), lock: locks.findPart(identity, ref.part, machine), rules: readRules(ref.worktree), rulesLock: locks.findRules(identity, machine) };
 }
 
 const paramValues = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
@@ -208,19 +209,10 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
         measureError = `could not measure: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      const locked = readLocked(ref, deps.locks);
+      // The accepted numbers were fixed when the expectations were approved. Nothing is pinned here:
+      // a refresh only ever READS the lock store.
+      const locked = readLocked(ref, deps.locks, deps.machine?.());
       const params = paramValues(design.params);
-      // The first time every formula of a freshly recorded block evaluates, the daemon pins those
-      // numbers as the accepted ones (the parameters did not exist yet when the block was recorded).
-      if (locked.part.kind === "ok" && locked.part.file.expectations && locked.lock && !locked.lock.values && locked.lock.sha === lockedBlockSha(locked.part.file)) {
-        try {
-          const pinned = { ...locked.lock, values: evaluateExpectations(locked.part.file.expectations, params), at: now() };
-          deps.pinValues(pinned);
-          locked.lock = pinned;
-        } catch {
-          /* not evaluable yet — the gate reports which formula */
-        }
-      }
       const state = slot.state();
       const gate = evaluateGate(
         {

@@ -27,6 +27,17 @@ test("flags writes outside the worktree", () => {
   expect(isDangerous("Write", { file_path: "/proj/wt/src/a.ts" }, "/proj/wt").danger).toBe(false);
 });
 
+test("[A2] review 3: a write outside the worktree is flagged however the path is spelled — relative paths resolve against the cwd", () => {
+  for (const fp of ["../other/file.ts", "../../.anvil/cadwork/locks.json", "src/../../escape.txt", "/proj/wt-sibling/a.ts", "/proj"]) {
+    expect(isDangerous("Write", { file_path: fp }, "/proj/wt")).toEqual({ danger: true, reason: "write outside the session worktree" });
+    expect(isDangerous("Edit", { file_path: fp }, "/proj/wt").danger).toBe(true);
+  }
+  expect(isDangerous("NotebookEdit", { notebook_path: "../nb.ipynb" }, "/proj/wt").danger).toBe(true);
+  for (const fp of ["src/a.ts", "./src/a.ts", "a/../b.ts", "/proj/wt/deep/x.ts", "cad/plate/notes.md"]) {
+    expect(isDangerous("Write", { file_path: fp }, "/proj/wt").danger).toBe(false);
+  }
+});
+
 test("isReadOnly", () => {
   expect(isReadOnly("Read")).toBe(true);
   expect(isReadOnly("Grep")).toBe(true);

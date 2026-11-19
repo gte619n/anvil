@@ -27,6 +27,8 @@ export interface CadCardsDeps {
   respond(url: string, requestId: string, approve: boolean): void;
   /** "Open" on a part card (Phase A3 points this at the live viewer). */
   open(url: string, ev: CadDesignEvent): void;
+  /** "Confirm numbers" on a part card: send `cad.expectations.confirm` (the daemon raises the owner card). */
+  confirm?(url: string, ev: CadDesignEvent): void;
   scrollDown?(): void;
 }
 
@@ -42,12 +44,16 @@ const TITLE: Record<CadExpectationsRequestEvent["kind"], string> = {
   "adopt-expectations": "Adopt expectations",
   "adopt-ownerParams": "Adopt dimensions",
   "adopt-rules": "Adopt manufacturing rules",
+  initial: "Set expectations",
+  confirm: "Confirm numbers",
 };
 const BLURB: Record<CadExpectationsRequestEvent["kind"], string> = {
   propose: "The agent asks to change what this part is checked against.",
   "adopt-expectations": "This part's expectations were not approved on this fleet (a fresh clone, or the file was edited). Approve to check the part against these values.",
   "adopt-ownerParams": "The dimensions recorded in part.json differ from the ones you entered.",
   "adopt-rules": "cad/rules.json changed. Approve to check every part of this repo against the new rules.",
+  initial: "The agent asks to set what this part is checked against.",
+  confirm: "These numbers were set by the agent. Approve to make them yours.",
 };
 
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] => {
@@ -106,6 +112,13 @@ export function createCadCards(deps: CadCardsDeps) {
       if (gate.staleBuild) list.append(el("li", "cad-check-warning", "Measured with a different SolidCraft version than this machine runs."));
       card.append(list);
     }
+    // Where the numbers came from: an agent's own numbers pass the gate, but they are not the owner's
+    // until the owner says so (one tap raises the standard card with the numbers, process and status).
+    if (gate.approvedBy === "agent-initial") {
+      const by = el("div", "cad-part-note cad-part-unconfirmed", "Expected numbers were set by the agent and have not been confirmed by you.");
+      by.dataset.role = "unconfirmed";
+      card.append(by);
+    }
     const actions = el("div", "cad-part-actions");
     const open = el("button", "cad-part-open", "Open");
     open.type = "button";
@@ -113,7 +126,17 @@ export function createCadCards(deps: CadCardsDeps) {
     const release = el("span", "cad-part-release"); // Phase A4 puts "Release" here when the gate passes
     release.dataset.slot = "release";
     release.hidden = true;
-    actions.append(open, release);
+    actions.append(open);
+    if (gate.approvedBy === "agent-initial" && deps.confirm) {
+      const confirm = el("button", "cad-part-open cad-part-confirm", "Confirm numbers");
+      confirm.type = "button";
+      confirm.onclick = () => {
+        confirm.disabled = true;
+        deps.confirm!(url, ev);
+      };
+      actions.append(confirm);
+    }
+    actions.append(release);
     card.append(actions);
   }
 
@@ -140,6 +163,7 @@ export function createCadCards(deps: CadCardsDeps) {
     const head = el("div", "perm-head");
     head.append(el("span", undefined, `${TITLE[ev.kind] ?? "Expectations"} · `), el("b", undefined, ev.part));
     card.append(head, el("div", "cad-expect-blurb", BLURB[ev.kind] ?? ""));
+    if (ev.note) card.append(el("div", "cad-expect-note", ev.note));
     if (ev.reason) {
       const why = el("div", "cad-expect-reason");
       why.append(el("span", "cad-expect-reason-label", "Agent's reason: "), el("span", undefined, ev.reason));
@@ -148,7 +172,8 @@ export function createCadCards(deps: CadCardsDeps) {
     if (ev.rows.length) {
       const table = el("table", "cad-expect-rows");
       const hr = el("tr");
-      hr.append(el("th", undefined, ""), el("th", undefined, ev.kind === "propose" ? "Now" : "Approved"), el("th", undefined, ev.kind === "propose" ? "Proposed" : "In the file"));
+      const heads = ev.kind === "propose" ? ["Now", "Proposed"] : ev.kind === "initial" ? ["Now", "Asked for"] : ev.kind === "confirm" ? ["Now", "To confirm"] : ["Approved", "In the file"];
+      hr.append(el("th", undefined, ""), el("th", undefined, heads[0]), el("th", undefined, heads[1]));
       table.append(hr);
       for (const r of ev.rows) {
         const tr = el("tr", r.old !== r.new ? "cad-row-changed" : undefined);

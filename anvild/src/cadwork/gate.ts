@@ -28,7 +28,7 @@
  * PHASE A4 HOOK: interference with reference bodies. The refresh passes its checks in
  * `GateInput.extraChecks`; nothing here needs restructuring.
  */
-import { evaluateExpectations, lockedBlockSha, TOLERANCE_CAPS, type EvaluatedExpectations, type MeasuredHole, type PartRead } from "./partfile";
+import { evaluateExpectations, lockedBlockSha, TOLERANCE_CAPS, type EvaluatedExpectations, type LockedBy, type MeasuredHole, type PartRead } from "./partfile";
 import type { PartLock, RulesLock } from "./locks";
 import { sortKeys } from "./poststep";
 import { checkRules, type RulesRead } from "./rules";
@@ -51,6 +51,9 @@ export interface GateResult {
   needsAdoption?: "expectations" | "rules" | "ownerParams";
   /** Measured under a different SolidCraft version than the one running. */
   staleBuild: boolean;
+  /** Who approved the numbers the part is checked against (only when an approval is in force).
+   *  `agent-initial`: the agent recorded them and the owner has not confirmed them. */
+  approvedBy?: LockedBy;
 }
 
 /** What was measured, of the DESIGN bodies only (imported reference bodies are excluded). */
@@ -96,6 +99,10 @@ export const ADOPTION_CHECKS = { expectations: "lock.expectations", ownerParams:
 const fmt = (v: number): string => String(Math.round(v * 1e4) / 1e4);
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(sortKeys(a ?? null)) === JSON.stringify(sortKeys(b ?? null));
 const close = (a: number, b: number): boolean => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(a), Math.abs(b));
+/** Accepted numbers that can actually be checked against: all four present and finite. */
+export function hasValues(v: EvaluatedExpectations | undefined): v is EvaluatedExpectations {
+  return !!v && Array.isArray(v.bbox) && v.bbox.length === 3 && v.bbox.every((n) => typeof n === "number" && Number.isFinite(n)) && typeof v.volume === "number" && Number.isFinite(v.volume) && Number.isInteger(v.bodies) && Array.isArray(v.holes);
+}
 const short = (sha: string | undefined): string => (sha ? sha.slice(0, 12) : "none");
 
 /** How the accepted numbers differ from the ones the formulas give now ("bbox[2] 80 → 120"). */
@@ -145,6 +152,7 @@ function evaluate(input: GateInput): GateResult {
   const m = input.measurement;
   let concept = false;
   let process: string | undefined;
+  let approvedBy: LockedBy | undefined;
 
   if (input.part.kind === "invalid") {
     unverified = true;
@@ -161,7 +169,11 @@ function evaluate(input: GateInput): GateResult {
     process = file.process;
     const lock = input.lock;
     const sha = lockedBlockSha(file);
-    const lockOk = !!lock && lock.sha === sha;
+    // An approval of expectations that carries no accepted numbers is not an approval: nothing is
+    // ever pinned later, so such an entry (a tampered or pre-fix store) needs adopting like any other.
+    const noValues = !!lock && lock.sha === sha && !!file.expectations && !hasValues(lock.values);
+    const lockOk = !!lock && lock.sha === sha && !noValues;
+    if (lockOk) approvedBy = lock!.approvedBy;
     if (!lock && !file.expectations && file.status === "dimensioned") {
       unverified = true;
       checks.push({ id: "expectations", expected: "expectations recorded before modeling (record_expectations)", measured: "none recorded", ok: false, hard: true });
@@ -169,7 +181,13 @@ function evaluate(input: GateInput): GateResult {
       checks.push({
         id: ADOPTION_CHECKS.expectations,
         expected: `the expectations the owner approved (${short(lock?.sha)})`,
-        measured: lockOk ? `unchanged (${short(sha)})` : lock ? `part.json was changed outside the approval flow (${short(sha)})` : `not approved on this fleet yet (${short(sha)})`,
+        measured: lockOk
+          ? `unchanged (${short(sha)})`
+          : noValues
+            ? `the approval on record holds no accepted numbers, so it does not count (${short(sha)})`
+            : lock
+              ? `part.json was changed outside the approval flow (${short(sha)})`
+              : `not approved on this fleet yet (${short(sha)})`,
         ok: lockOk,
         hard: true,
       });
@@ -212,7 +230,12 @@ function evaluate(input: GateInput): GateResult {
           hard: true,
         });
       }
-      const target = accepted ?? now;
+      // The target is ONLY what was accepted. With no accepted numbers there is nothing to check the
+      // part against — never the formulas as they evaluate now, which the agent controls.
+      // (An approval whose hash matches but which holds no numbers says so; a part that simply needs
+      // adopting already fails on `lock.expectations`.)
+      if (noValues) checks.push({ id: "accepted", expected: "the expected values the owner accepted", measured: "no accepted value", ok: false, hard: true });
+      const target = accepted;
       // The clamp keeps a loosened tolerance from hiding a real mismatch behind the cap failure.
       const tol = { length: Math.min(exp.tolerance.length, TOLERANCE_CAPS.length), volumeRel: Math.min(exp.tolerance.volumeRel, TOLERANCE_CAPS.volumeRel) };
       if (target && m) checks.push(...geometryChecks(target, tol, m));
@@ -263,6 +286,7 @@ function evaluate(input: GateInput): GateResult {
     warnings: [...input.warnings],
     ...(needsAdoption ? { needsAdoption } : {}),
     staleBuild: !!(m && input.solidcraft && m.solidcraft !== input.solidcraft),
+    ...(approvedBy ? { approvedBy } : {}),
   };
 }
 

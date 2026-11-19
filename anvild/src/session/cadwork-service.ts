@@ -26,8 +26,8 @@ import { registerCadProtectedRules } from "../agent/cad-protected";
 import { buildCadToolsServer, CAD_MCP_SERVER_NAME, type CadToolDeps } from "../agent/cad-tools";
 import { buildFileOffer, maybeTaildrop } from "../agent/file-offer";
 import { isUnattended } from "../agent/protected";
-import { evaluateGate, pendingAdoptions, type GateInput, type GateResult } from "../cadwork/gate";
-import { LockStore, LockSync, repoKey, type LockSyncOptions, type PartLock } from "../cadwork/locks";
+import { evaluateGate, hasValues, pendingAdoptions, type GateInput, type GateResult } from "../cadwork/gate";
+import { LockStore, LockSync, repoIdentity, type LockSyncOptions, type PartLock, type RulesLock } from "../cadwork/locks";
 import { CadManager, type CadManagerOptions, type CadParamInfo, type SlotContext } from "../cadwork/manager";
 import { realClock, solidcraftEnv, type CadClock } from "../cadwork/mcp-client";
 import { gitToplevel, listParts, partRef, type PartRef } from "../cadwork/partfolder";
@@ -80,6 +80,9 @@ export interface CadworkServiceDeps {
   stateDir?: string;
   /** Fetch / timeout overrides for the lock store's hub sync (tests). */
   lockSync?: LockSyncOptions;
+  /** Folders under `stateDir` that sessions legitimately write in (their worktrees, cloned repos).
+   *  Everything else under the state dir is denied to the file tools. Default: `worktrees`, `repos`. */
+  writableStateRoots?: string[];
   /** Test seams for the refresh (a gate that throws must end as `unverified`). */
   gateImpl?: (input: GateInput) => GateResult;
   beforeMeasure?: (ref: PartRef) => void;
@@ -109,7 +112,7 @@ interface Card {
   ref: PartRef;
   kind: CardKind;
   body: Omit<CadExpectationsRequestEvent, "v" | "ts" | "replay">;
-  /** propose: settles the tool call that is waiting on the owner. */
+  /** propose / initial: settles the tool call that is waiting on the owner. */
   settle?: (approved: boolean) => void;
   /** adopt: the hash of exactly what the card showed. Approval records THIS and nothing else. */
   sha?: string;
@@ -117,7 +120,31 @@ interface Card {
 
 export const NO_EXPECTATIONS = "has no expectations yet";
 export type ExpectationsReply = { ok: true; note?: string } | { ok: false; error: string };
+/** The caution on an `initial` card: the numbers were written after the part existed. */
+export const INITIAL_AFTER_GEOMETRY = "this part already has geometry; these numbers were written after it existed";
+/** A declared parameter value: a number, optionally followed by `mm` or `deg`. Nothing else — the
+ *  declared values are what the expectations are evaluated from, so they must be plain numbers. */
+const DECLARED_RE = /^\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(mm|deg)?\s*$/;
+const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z_0-9]*$/;
 
+/** Read `record_expectations`' `parameters` argument: every value a plain number (with an optional
+ *  `mm` / `deg`). Returns the numbers and the expressions to create the parameters with. */
+export function parseDeclared(raw: unknown): { ok: true; values: Record<string, number>; expressions: Record<string, string> } | { ok: false; error: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "`parameters` must be an object mapping every parameter name the expectations use to its value (use {} when every expectation is a plain number)" };
+  const values: Record<string, number> = {};
+  const expressions: Record<string, string> = {};
+  for (const [name, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!PARAM_NAME_RE.test(name) || name === "pi") return { ok: false, error: `\`parameters\`: ${JSON.stringify(name)} is not a parameter name` };
+    const m = typeof v === "number" ? (Number.isFinite(v) ? [String(v), String(v), undefined] : null) : typeof v === "string" ? DECLARED_RE.exec(v) : null;
+    if (!m) return { ok: false, error: `\`parameters.${name}\` must be a number, optionally with mm or deg (e.g. 80 or "80 mm"), not ${JSON.stringify(v)}` };
+    values[name] = Number(m[1]);
+    expressions[name] = typeof v === "number" ? String(v) : (v as string).trim();
+  }
+  return { ok: true, values, expressions };
+}
+
+/** Why a part that was not refreshed since the daemon started is `unverified`. */
+export const NOT_MEASURED = "not measured in this session";
 export const NO_SOLIDCRAFT = "SolidCraft is not installed on this machine (no solidcraft-cli found)";
 
 /** `solidcraft-cli --version` → "0.44.1", with the same bare environment the manager uses. */
@@ -164,11 +191,11 @@ export class CadworkService {
     this.lockSync = new LockSync(this.locks, { ...deps.lockSync, onRemoteChange: () => this.recheckOpenParts() });
     if (deps.enabled) {
       // The protected rules of §4.4, once per daemon (the registry ignores a repeat registration).
-      this.offProtected = registerCadProtectedRules(stateDir);
+      this.offProtected = registerCadProtectedRules(stateDir, deps.writableStateRoots ?? [join(stateDir, "worktrees"), join(stateDir, "repos")]);
       this.manager.setRefresh(
         makeRefreshJob({
           locks: this.locks,
-          pinValues: (lock) => this.lockSync.approvePart(lock),
+          machine: () => this.machine(),
           nextRev: (ref) => this.nextRev(ref),
           onResult: (outcome, slot) => this.onRefreshed(outcome, slot),
           evaluateImpl: deps.gateImpl,
@@ -256,7 +283,7 @@ export class CadworkService {
       offerFile: (absPath) => this.offerFile(sessionId, absPath),
       touch: (ref) => this.touch(sessionId, ref),
       modelingRefusal: (ref) => this.modelingRefusal(ref),
-      recordExpectations: (ref, process, expectations) => this.recordExpectations(sessionId, ref, process, expectations),
+      recordExpectations: (ref, process, parameters, expectations) => this.recordExpectations(sessionId, ref, process, parameters, expectations),
       proposeExpectations: (ref, expectations, reason) => this.proposeExpectations(sessionId, ref, expectations, reason),
       checkPart: (ref) => this.checkPart(sessionId, ref),
       takeOwnerNotes: () => this.takeOwnerNotes(sessionId),
@@ -289,26 +316,52 @@ export class CadworkService {
     if (part.kind === "missing") return none;
     if (part.file.status === "concept") {
       // `concept` is honoured only when the lock store agrees: writing it into the file by hand does not skip the rule.
-      const lock = this.locks.getPart(repoKey(ref.worktree), ref.part);
+      const lock = this.findLock(ref);
       if (lock && lock.status === "concept" && lock.sha === lockedBlockSha(part.file)) return undefined;
       return `cad/${ref.part}/part.json says the part is a concept, but that was not approved on this fleet. The owner has to adopt it (a card was shown) before modeling.`;
     }
     return part.file.expectations ? undefined : none;
   }
 
+  /** This machine's serverId (a lock found by a repo's path counts only when it was made here). */
+  private machine(): string | undefined {
+    return this.lockSync.currentRole().serverId;
+  }
+  /** The approval of a part under ANY identity of its repo. */
+  private findLock(ref: PartRef): PartLock | undefined {
+    return this.locks.findPart(repoIdentity(ref.worktree), ref.part, this.machine());
+  }
+  /** Record an approval, stamped with both identities of the repo so a changed remote cannot orphan it. */
+  private approve(ref: PartRef, lock: Omit<PartLock, "repo" | "part" | "remote" | "path">): void {
+    const id = repoIdentity(ref.worktree);
+    this.lockSync.approvePart({ ...lock, repo: id.key, part: ref.part, ...(id.remote ? { remote: id.remote } : {}), path: id.path });
+  }
+  private approveRules(worktree: string, lock: Omit<RulesLock, "repo" | "remote" | "path">): void {
+    const id = repoIdentity(worktree);
+    this.lockSync.approveRules({ ...lock, repo: id.key, ...(id.remote ? { remote: id.remote } : {}), path: id.path });
+  }
+
   /**
-   * `record_expectations`: the ONE time an agent may set a part's expectations — for a part that has
-   * none, and that nothing was ever approved for. Writes the block and its lock-store entry
-   * (`agent-initial`). Formulas over parameters that do not exist yet are pinned by the first refresh
-   * in which they all evaluate.
+   * `record_expectations { part, process, parameters, expectations }`.
+   *
+   * The numbers a part is checked against are fixed HERE, at record time, from the `parameters` the
+   * call declares — never later, and never from the design as it happens to be: every formula must
+   * evaluate from the declared values alone or the call is refused. The declared parameters are then
+   * created in the design (`parameters.add`) in the same queued job, so the design starts from
+   * exactly those values, and "moved without owner approval" applies from the first moment.
+   *
+   * The agent may do this on its own (`agent-initial`) ONLY for a part that does not exist yet: no
+   * `design.json`, nothing in the live process (no feature, body or parameter), and no approval on
+   * record under any identity of the repo. For a part that already has geometry the same call
+   * becomes an OWNER CARD (kind `initial`) — the numbers were written after the part existed — and
+   * is refused outright when nobody is there to answer.
    */
-  recordExpectations(sessionId: string, ref: PartRef, process: unknown, input: unknown): ExpectationsReply {
+  async recordExpectations(sessionId: string, ref: PartRef, process: unknown, parameters: unknown, input: unknown): Promise<ExpectationsReply & { approved?: boolean; by?: "agent-initial" | "owner" }> {
     this.touch(sessionId, ref);
     if (typeof process !== "string" || !process.trim()) return { ok: false, error: "record_expectations: `process` must name a process in cad/rules.json (for example \"fdm-0.4\")" };
     const part = readPartFile(ref.dir);
     if (part.kind === "invalid") return { ok: false, error: `cad/${ref.part}/part.json cannot be read (${part.error}); it was not touched` };
-    const repo = repoKey(ref.worktree);
-    const lock = this.locks.getPart(repo, ref.part);
+    const lock = this.findLock(ref);
     if (lock && !(part.kind === "ok" && part.file.expectations) && lock.status !== "concept") {
       return { ok: false, error: `Expectations were already approved for cad/${ref.part}, but part.json no longer has them. They cannot be recorded again: restore cad/${ref.part}/part.json from git.` };
     }
@@ -318,15 +371,111 @@ export class CadworkService {
     if (part.kind === "ok" && part.file.status === "concept") {
       return { ok: false, error: `cad/${ref.part} is a concept: its dimensions have to be confirmed by the owner (request_dimensions) before expectations are recorded.` };
     }
+    const declared = parseDeclared(parameters);
+    if (!declared.ok) return { ok: false, error: `record_expectations: ${declared.error}` };
     const why = expectationsShapeError(input, { stamped: false });
     if (why) return { ok: false, error: `record_expectations: ${why}` };
-    const exp = stampExpectations(input as ExpectationsInput, "agent-initial", new Date().toISOString());
-    const caps = toleranceCapErrors(exp.tolerance);
+    const draft = stampExpectations(input as ExpectationsInput, "agent-initial", new Date().toISOString());
+    const caps = toleranceCapErrors(draft.tolerance);
     if (caps.length) return { ok: false, error: `record_expectations refused: ${caps.join("; ")}. Defaults are ${DEFAULT_TOLERANCE.length} mm and ${DEFAULT_TOLERANCE.volumeRel}.` };
-    const file: PartFile = { schema: 1, process: process.trim(), ...(part.kind === "ok" && part.file.material ? { material: part.file.material } : {}), status: "dimensioned", expectations: exp };
-    writePartFile(ref.dir, file);
-    this.lockSync.approvePart({ repo, part: ref.part, sha: lockedBlockSha(file), approvedBy: "agent-initial", status: "dimensioned", ...this.valuesNow(ref, exp), at: exp.lockedAt });
-    return { ok: true };
+    // Every formula is evaluated NOW, from the declared values and nothing else.
+    let values: EvaluatedExpectations;
+    try {
+      values = evaluateExpectations(draft, declared.values);
+    } catch (e) {
+      return { ok: false, error: `record_expectations refused: ${e instanceof Error ? e.message : String(e)}. Every parameter a formula uses must be listed in \`parameters\` with its value (e.g. parameters: { "L": 80 }); the expected numbers are fixed from those values now, before anything is modeled.` };
+    }
+
+    // What does the part hold right now? (Starts the process: an existing design.json is replayed.)
+    const hadDesign = existsSync(join(ref.dir, DESIGN_FILE));
+    const live = await this.manager.run(ref, async (slot) => {
+      const r = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: "names" });
+      const j = r.json ?? {};
+      return { features: Array.isArray(j.timeline) ? j.timeline.length : 0, bodies: Array.isArray(j.bodies) ? j.bodies.length : 0, params: slot.params() };
+    });
+    for (const p of live.params) {
+      const want = declared.values[p.name];
+      if (want !== undefined && Math.abs(p.value - want) > 1e-9 * Math.max(1, Math.abs(want))) {
+        return { ok: false, error: `record_expectations refused: the design already has ${p.name} = ${num(p.value)}, not the declared ${num(want)}. Declare the value the design has, or change the parameter first.` };
+      }
+    }
+    const pristine = !hadDesign && live.features === 0 && live.bodies === 0 && live.params.length === 0 && !lock;
+    const file = (exp: Expectations): PartFile => ({ schema: 1, process: process.trim(), ...(part.kind === "ok" && part.file.material ? { material: part.file.material } : {}), status: "dimensioned", expectations: exp });
+    let exp = draft;
+    let by: "agent-initial" | "owner" = "agent-initial";
+
+    if (!pristine) {
+      // The part exists already: only the owner can say what it must be.
+      const session = this.deps.getSession(sessionId);
+      if (!session) return { ok: false, error: "the session is gone" };
+      if (isUnattended(session)) return { ok: false, error: `record_expectations was denied: cad/${ref.part} already has geometry (or an earlier approval), so its expectations need the owner's approval, and this session is unattended` };
+      exp = { ...draft, lockedBy: "owner" };
+      by = "owner";
+      const requestId = newId("cadx");
+      const approved = await new Promise<boolean>((resolve) => {
+        this.park({
+          requestId,
+          sessionId,
+          ref,
+          kind: "initial",
+          settle: resolve,
+          body: {
+            type: "cad.expectations.request",
+            requestId,
+            sessionId,
+            cwd: ref.worktree,
+            part: ref.part,
+            kind: "initial",
+            note: INITIAL_AFTER_GEOMETRY,
+            rows: [{ label: "Process", new: process.trim() }, { label: "Status", new: "dimensioned" }, ...expectationRows(undefined, exp, declared.values)],
+          },
+        });
+        setStatus(session, "awaiting_permission");
+      });
+      setStatus(session, "running_tool");
+      if (!approved) return { ok: true, approved: false };
+      const now_ = readPartFile(ref.dir);
+      if (now_.kind === "invalid" || (now_.kind === "ok" && now_.file.expectations)) return { ok: false, error: `the owner approved, but cad/${ref.part}/part.json changed while the card was open; nothing was written` };
+    }
+
+    // One queued job: create the declared parameters, check the design really starts from the
+    // declared values, then write part.json and the approval. Nothing else can slip in between.
+    const have = new Set(live.params.map((p) => p.name));
+    const toAdd = Object.keys(declared.values).filter((n) => !have.has(n));
+    let failure: string | undefined;
+    const write = (params: CadParamInfo[]): void => {
+      for (const n of Object.keys(declared.values)) {
+        const got = params.find((p) => p.name === n)?.value;
+        if (got === undefined || Math.abs(got - declared.values[n]!) > 1e-9 * Math.max(1, Math.abs(declared.values[n]!))) {
+          failure = `SolidCraft made ${n} = ${got === undefined ? "nothing" : num(got)}, not the declared ${num(declared.values[n]!)}`;
+          return;
+        }
+      }
+      const f = file(exp);
+      writePartFile(ref.dir, f);
+      this.approve(ref, { sha: lockedBlockSha(f), approvedBy: by, status: "dimensioned", values, declared: declared.values, at: exp.lockedAt });
+    };
+    if (toAdd.length) {
+      const reply = await this.manager.request(ref, {
+        tool: "batch",
+        args: { commands: toAdd.map((name) => ({ command: "parameters.add", params: { name, expression: declared.expressions[name] } })), verbose: false },
+        kind: "mutate",
+        afterWrite: (slot, done) => {
+          if (done.result.isError) failure = `the declared parameters could not be created: ${done.result.text}`;
+          else if (slot.state().conflict) failure = DISK_CONFLICT_REASON;
+          else write(slot.params());
+        },
+      });
+      if (failure) {
+        if (!reply.result.isError) await this.manager.request(ref, { tool: "undo", kind: "undo" }).catch(() => undefined); // leave the design as it was
+        return { ok: false, error: `record_expectations refused: ${failure}. Nothing was recorded.` };
+      }
+    } else {
+      await this.manager.run(ref, async (slot) => write(slot.params()));
+      if (failure) return { ok: false, error: `record_expectations refused: ${failure}. Nothing was recorded.` };
+    }
+    if (by === "owner") this.recheck(ref);
+    return { ok: true, approved: true, by };
   }
 
   /** `{ values }` when every formula evaluates with the part's current parameters, else `{}`. */
@@ -339,9 +488,14 @@ export class CadworkService {
   }
 
   /**
-   * `propose_expectations`: park a card showing each old and new value and the agent's reason, and
-   * wait for the owner. Deny changes nothing. Approve rewrites `part.json` and the lock store
-   * (`owner`). Asked EVERY time, under every autonomy policy; refused when nobody can answer.
+   * `propose_expectations`: park a card showing each old and new value (evaluated), the process and
+   * status they are approved under, and the agent's reason, and wait for the owner. Deny changes
+   * nothing. Approve rewrites `part.json` and the lock store (`owner`). Asked EVERY time, under every
+   * autonomy policy; refused when nobody can answer, and refused before any card is drawn when a
+   * formula does not evaluate against the design's parameters (a card always shows numbers).
+   *
+   * The approval is for exactly what the card showed: if `part.json`'s locked block changed while
+   * the card was open, nothing is written and a fresh card is raised.
    */
   async proposeExpectations(sessionId: string, ref: PartRef, input: unknown, reason: unknown): Promise<ExpectationsReply & { approved?: boolean }> {
     this.touch(sessionId, ref);
@@ -349,47 +503,60 @@ export class CadworkService {
     if (!session) return { ok: false, error: "the session is gone" };
     if (isUnattended(session)) return { ok: false, error: "propose_expectations was denied: this session is unattended, so no one can approve a change to the expectations" };
     if (typeof reason !== "string" || !reason.trim()) return { ok: false, error: "propose_expectations: give a `reason` the owner can judge the change by" };
-    const part = readPartFile(ref.dir);
-    if (part.kind !== "ok" || !part.file.expectations) return { ok: false, error: `cad/${ref.part} has no expectations to change: call record_expectations first` };
     const why = expectationsShapeError(input, { stamped: false });
     if (why) return { ok: false, error: `propose_expectations: ${why}` };
-    const before = part.file.expectations;
-    // A proposal that says nothing about tolerance keeps the current one.
-    const proposed = stampExpectations({ ...(input as ExpectationsInput), tolerance: { ...before.tolerance, ...((input as ExpectationsInput).tolerance ?? {}) } }, "owner", new Date().toISOString());
-    const caps = toleranceCapErrors(proposed.tolerance);
-    if (caps.length) return { ok: false, error: `propose_expectations refused: ${caps.join("; ")}` };
-    const params = paramMap(this.manager.status(ref)?.params ?? []);
-    const requestId = newId("cadx");
-    const approved = await new Promise<boolean>((resolve) => {
-      this.park({
-        requestId,
-        sessionId,
-        ref,
-        kind: "propose",
-        settle: resolve,
-        body: { type: "cad.expectations.request", requestId, sessionId, cwd: ref.worktree, part: ref.part, kind: "propose", reason: reason.trim(), rows: expectationRows(before, proposed, params) },
+    const opened = await this.manager.open(ref); // the parameters the formulas are evaluated with
+    for (let round = 0; round < 3; round++) {
+      const part = readPartFile(ref.dir);
+      if (part.kind !== "ok" || !part.file.expectations) return { ok: false, error: `cad/${ref.part} has no expectations to change: call record_expectations first` };
+      const before = part.file.expectations;
+      // A proposal that says nothing about tolerance keeps the current one.
+      const proposed = stampExpectations({ ...(input as ExpectationsInput), tolerance: { ...before.tolerance, ...((input as ExpectationsInput).tolerance ?? {}) } }, "owner", new Date().toISOString());
+      const caps = toleranceCapErrors(proposed.tolerance);
+      if (caps.length) return { ok: false, error: `propose_expectations refused: ${caps.join("; ")}` };
+      const params = paramMap(this.manager.status(ref)?.params ?? opened.params);
+      try {
+        evaluateExpectations(proposed, params);
+      } catch (e) {
+        return { ok: false, error: `propose_expectations refused: ${e instanceof Error ? e.message : String(e)}. Every formula must evaluate against the design's parameters before the owner is asked, so the card can show numbers.` };
+      }
+      const shown = lockedBlockSha(part.file);
+      const requestId = newId("cadx");
+      const approved = await new Promise<boolean>((resolve) => {
+        this.park({
+          requestId,
+          sessionId,
+          ref,
+          kind: "propose",
+          settle: resolve,
+          body: {
+            type: "cad.expectations.request",
+            requestId,
+            sessionId,
+            cwd: ref.worktree,
+            part: ref.part,
+            kind: "propose",
+            reason: reason.trim(),
+            rows: [{ label: "Process", old: part.file.process, new: part.file.process }, { label: "Status", old: part.file.status, new: part.file.status }, ...expectationRows(before, proposed, params, this.findLock(ref)?.values)],
+          },
+        });
+        setStatus(session, "awaiting_permission");
       });
-      setStatus(session, "awaiting_permission");
-    });
-    setStatus(session, "running_tool");
-    if (!approved) return { ok: true, approved: false };
-    // Written only now, from the file as it is now: nothing else in part.json is disturbed.
-    const cur = readPartFile(ref.dir);
-    if (cur.kind !== "ok") return { ok: false, error: `the owner approved, but cad/${ref.part}/part.json can no longer be read; nothing was written` };
-    const file: PartFile = { ...cur.file, expectations: proposed };
-    writePartFile(ref.dir, file);
-    this.lockSync.approvePart({
-      repo: repoKey(ref.worktree),
-      part: ref.part,
-      sha: lockedBlockSha(file),
-      approvedBy: "owner",
-      status: file.status,
-      ...this.valuesNow(ref, proposed),
-      ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}),
-      at: proposed.lockedAt,
-    });
-    this.recheck(ref);
-    return { ok: true, approved: true };
+      setStatus(session, "running_tool");
+      if (!approved) return { ok: true, approved: false };
+      // Written only now, and only if the file is still what the card showed.
+      const cur = readPartFile(ref.dir);
+      if (cur.kind !== "ok") return { ok: false, error: `the owner approved, but cad/${ref.part}/part.json can no longer be read; nothing was written` };
+      if (lockedBlockSha(cur.file) !== shown) continue; // process, status or the expectations changed meanwhile: ask again, showing what is there now
+      const values = this.valuesNow(ref, proposed).values;
+      if (!values) return { ok: false, error: `the owner approved, but the formulas no longer evaluate against the design's parameters; nothing was written` };
+      const file: PartFile = { ...cur.file, expectations: proposed };
+      writePartFile(ref.dir, file);
+      this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
+      this.recheck(ref);
+      return { ok: true, approved: true };
+    }
+    return { ok: false, error: `cad/${ref.part}/part.json kept changing while the owner was being asked; nothing was written` };
   }
 
   /** `check_part`: force a refresh (so nothing is judged on a stale measurement) and return the gate in full. */
@@ -417,10 +584,11 @@ export class CadworkService {
         if (done.result.isError) return; // refused (unknown name, bad expression): nothing changed
         if (slot.state().conflict) return; // design.json changed on disk meanwhile: the change was not written, so nothing is accepted
         this.nextBy.set(ref.key, "panel");
-        const locked = readLocked(ref, this.locks);
-        if (locked.part.kind !== "ok" || !locked.part.file.expectations || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file)) return;
+        const locked = readLocked(ref, this.locks, this.machine());
+        if (locked.part.kind !== "ok" || !locked.part.file.expectations || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file) || !hasValues(locked.lock.values)) return;
         const next = this.valuesNow(ref, locked.part.file.expectations, slot.params());
-        if (next.values) this.lockSync.approvePart({ ...locked.lock, values: next.values, at: new Date().toISOString() });
+        const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
+        if (next.values) this.approve(ref, { ...rest, values: next.values, at: new Date().toISOString() });
       },
     });
     if (reply.result.isError) return { ok: false, error: reply.result.text, notes: reply.notes };
@@ -458,8 +626,12 @@ export class CadworkService {
     return partRef(worktree, part); // throws BadPartName / UnsafePartFolder
   }
 
-  /** `cad.parts.list`: every part folder of a worktree with its gate state. Starts nothing. */
-  listParts(worktree: string): CadPartInfo[] {
+  /**
+   * `cad.parts.list`: every part folder of a worktree with its gate state. A part whose process is
+   * up is refreshed first, so its state is of the design as it is now; any other part is reported
+   * `unverified` (never from the numbers stored in `part.json`). Starts no process.
+   */
+  async listParts(worktree: string): Promise<CadPartInfo[]> {
     const out: CadPartInfo[] = [];
     for (const name of listParts(worktree)) {
       let ref: PartRef;
@@ -468,8 +640,10 @@ export class CadworkService {
       } catch {
         continue; // a linked folder is not a part
       }
-      const snap = this.snapshots.get(ref.key) ?? this.diskSnapshot(ref);
+      if (this.manager.status(ref)?.live && !this.unavailableReason()) await this.manager.refreshNow(ref).catch(() => undefined);
       const st = this.manager.status(ref);
+      const refreshed = st?.live ? this.snapshots.get(ref.key) : undefined;
+      const snap = refreshed ?? this.diskSnapshot(ref);
       out.push({
         part: name,
         hasDesign: existsSync(join(ref.dir, DESIGN_FILE)),
@@ -613,10 +787,11 @@ export class CadworkService {
     if (!card) return false;
     this.cards.delete(requestId);
     let approved = approve;
-    if (card.kind !== "propose" && approve) approved = this.adopt(card);
+    const toolCard = card.kind === "propose" || card.kind === "initial"; // the waiting tool call does the writing
+    if (!toolCard && approve) approved = card.kind === "confirm" ? this.confirm(card) : this.adopt(card);
     this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId, approved } satisfies CadExpectationsResolvedEvent);
     card.settle?.(approved);
-    if (card.kind !== "propose") this.recheck(card.ref, card.kind === "adopt-rules");
+    if (!toolCard) this.recheck(card.ref, card.kind === "adopt-rules");
     return true;
   }
 
@@ -687,13 +862,16 @@ export class CadworkService {
   /** One adopt card per pending adoption, in the chat of an attended session working on the part. */
   private syncAdoptCards(ref: PartRef, gate: GateResult, params: CadParamInfo[]): void {
     const wanted = new Set(pendingAdoptions(gate));
-    const locked = readLocked(ref, this.locks);
+    const locked = readLocked(ref, this.locks, this.machine());
     const attended = [...(this.partSessions.get(ref.key) ?? [])].map((id) => this.deps.getSession(id)).find((s) => s && !isUnattended(s));
     const build: Partial<Record<CardKind, () => { sha: string; rows: CadExpectationsRow[]; rulesDiff?: CadExpectationsRequestEvent["rulesDiff"] } | undefined>> = {
       "adopt-expectations": () => {
         if (locked.part.kind !== "ok") return undefined;
         const f = locked.part.file;
         const p = paramMap(params);
+        // A card always shows evaluated numbers: expectations that do not evaluate cannot be adopted
+        // (the gate says which formula fails), so no card is drawn for them.
+        if (f.expectations && !this.valuesNow(ref, f.expectations, params).values) return undefined;
         const rows: CadExpectationsRow[] = [
           { label: "Process", new: f.process },
           { label: "Status", ...(locked.lock ? { old: locked.lock.status } : {}), new: f.status },
@@ -707,7 +885,7 @@ export class CadworkService {
         const now_ = locked.part.file.ownerParams ?? {};
         const old = locked.lock?.ownerParams ?? {};
         const names = [...new Set([...Object.keys(old), ...Object.keys(now_)])].sort();
-        return { sha: JSON.stringify(names.map((n) => [n, now_[n] ?? null])), rows: names.map((n) => ({ label: n, ...(old[n] !== undefined ? { old: String(old[n]) } : {}), ...(now_[n] !== undefined ? { new: String(now_[n]) } : {}) })) };
+        return { sha: ownerParamsCardSha(locked.part.file.ownerParams), rows: names.map((n) => ({ label: n, ...(old[n] !== undefined ? { old: String(old[n]) } : {}), ...(now_[n] !== undefined ? { new: String(now_[n]) } : {}) })) };
       },
       "adopt-rules": () => {
         if (locked.rules.kind === "missing") return undefined;
@@ -737,36 +915,75 @@ export class CadworkService {
     }
   }
 
-  /** The owner tapped Approve on an adopt card: record the hashes of exactly what the card showed. */
+  /** The owner tapped Approve on an adopt card: record exactly what the card showed, and nothing
+   *  else — every kind compares the card's hash with what is on disk now. */
   private adopt(card: Card): boolean {
     const { ref } = card;
-    const locked = readLocked(ref, this.locks);
+    const locked = readLocked(ref, this.locks, this.machine());
     const at = new Date().toISOString();
     if (card.kind === "adopt-rules") {
       if (locked.rules.kind === "missing" || locked.rules.sha !== card.sha) return false; // changed since the card was drawn
-      this.lockSync.approveRules({ repo: locked.repo, sha: locked.rules.sha, text: locked.rules.text, at });
+      this.approveRules(ref.worktree, { sha: locked.rules.sha, text: locked.rules.text, at });
       return true;
     }
     if (locked.part.kind !== "ok") return false;
     const file = locked.part.file;
     if (card.kind === "adopt-expectations") {
       if (lockedBlockSha(file) !== card.sha) return false;
-      const lock: PartLock = {
-        repo: locked.repo,
-        part: ref.part,
-        sha: card.sha,
-        approvedBy: "owner",
-        status: file.status,
-        ...(file.expectations ? this.valuesNow(ref, file.expectations) : {}),
-        ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}),
-        at,
-      };
-      this.lockSync.approvePart(lock);
+      // The accepted numbers are fixed here, at approval. Formulas that do not evaluate cannot be approved.
+      const values = file.expectations ? this.valuesNow(ref, file.expectations).values : undefined;
+      if (file.expectations && !values) return false;
+      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(values ? { values } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
       return true;
     }
-    if (!locked.lock) return false;
-    const { ownerParams: _old, ...rest } = locked.lock;
-    this.lockSync.approvePart({ ...rest, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+    if (card.kind !== "adopt-ownerParams" || !locked.lock) return false;
+    if (ownerParamsCardSha(file.ownerParams) !== card.sha) return false; // not the dimensions the card showed
+    const { ownerParams: _old, repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
+    this.approve(ref, { ...rest, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+    return true;
+  }
+
+  /**
+   * "Confirm numbers" (`cad.expectations.confirm`): raise the standard owner card for a part whose
+   * numbers the agent recorded. Approving it makes the owner the approver of exactly that block.
+   */
+  confirmNumbers(sessionId: string, ref: PartRef): ExpectationsReply {
+    const session = this.deps.getSession(sessionId);
+    if (!session) return { ok: false, error: "no such session" };
+    const locked = readLocked(ref, this.locks, this.machine());
+    if (locked.part.kind !== "ok" || !locked.part.file.expectations) return { ok: false, error: `cad/${ref.part} has no expectations to confirm` };
+    const file = locked.part.file;
+    const sha = lockedBlockSha(file);
+    if (!locked.lock || locked.lock.sha !== sha || !hasValues(locked.lock.values)) return { ok: false, error: `cad/${ref.part}'s expectations are not approved as they stand; adopt them on their card instead` };
+    if (locked.lock.approvedBy !== "agent-initial") return { ok: false, error: `cad/${ref.part}'s numbers are already approved by the ${locked.lock.approvedBy}` };
+    this.touch(sessionId, ref);
+    for (const c of [...this.cards.values()]) if (c.kind === "confirm" && c.ref.key === ref.key) return { ok: true, note: "a card is already open" };
+    const requestId = newId("cadx");
+    const v = locked.lock.values;
+    this.park({
+      requestId,
+      sessionId,
+      ref,
+      kind: "confirm",
+      sha,
+      body: {
+        type: "cad.expectations.request",
+        requestId,
+        sessionId,
+        cwd: ref.worktree,
+        part: ref.part,
+        kind: "confirm",
+        rows: [{ label: "Process", new: file.process }, { label: "Status", new: file.status }, ...expectationRows(undefined, file.expectations!, paramMap(this.manager.status(ref)?.params ?? []), v), { label: "Recorded by", old: "the agent", new: "you, once approved" }],
+      },
+    });
+    return { ok: true };
+  }
+
+  private confirm(card: Card): boolean {
+    const locked = readLocked(card.ref, this.locks, this.machine());
+    if (locked.part.kind !== "ok" || !locked.lock || lockedBlockSha(locked.part.file) !== card.sha || locked.lock.sha !== card.sha || !hasValues(locked.lock.values)) return false;
+    const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
+    this.approve(card.ref, { ...rest, approvedBy: "owner", at: new Date().toISOString() });
     return true;
   }
 
@@ -785,21 +1002,15 @@ export class CadworkService {
   }
 
   /**
-   * The gate for a part WITHOUT starting SolidCraft: from the measurement stored in `part.json`. Used
-   * where no process is up (a parts list, Phase A5's verify). `staleBuild` is set when that
-   * measurement was taken under a different SolidCraft version than the one this machine runs.
+   * What can be said about a part WITHOUT a live measurement of its current script (a parts list for
+   * a part whose process is not up). It is NEVER `pass`: `part.json.measured` is a committed file the
+   * agent can rewrite, so the last known numbers are shown by whoever reads the file but prove
+   * nothing — the state is `unverified` ("not measured in this session") until a refresh has run.
    */
   gateFromDisk(ref: PartRef, scriptSha: string | undefined): GateResult {
-    const locked = readLocked(ref, this.locks);
-    const m = locked.part.kind === "ok" ? locked.part.file.measured : undefined;
-    return evaluateGate({
-      ...locked,
-      measurement: m ? { bbox: m.bbox, volume: m.volume, faces: m.faces, bodies: m.bodies, holes: m.holes, scriptSha: m.scriptSha, solidcraft: m.solidcraft } : undefined,
-      scriptSha,
-      solidcraft: this.status().version,
-      featureErrors: [],
-      warnings: m?.warnings ?? [],
-    });
+    const locked = readLocked(ref, this.locks, this.machine());
+    const g = evaluateGate({ ...locked, measurement: undefined, measureError: NOT_MEASURED, scriptSha, solidcraft: this.status().version, featureErrors: [], warnings: [] });
+    return g.state === "pass" ? { ...g, state: "unverified" } : g; // belt and braces: without a measurement it cannot pass
   }
 
   /** Emit a `file.offer` for a file the daemon wrote for this session (an export). False when the
@@ -830,6 +1041,8 @@ export class CadworkService {
   }
 }
 
+/** What an adopt-ownerParams card stands for: the dimensions in the file when it was drawn. */
+const ownerParamsCardSha = (p: Record<string, number> | undefined): string => JSON.stringify(Object.keys(p ?? {}).sort().map((n) => [n, p![n]]));
 const paramMap = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
 const partRefOf = (key: string, part: string): PartRef => ({ key, part, dir: key, worktree: key.slice(0, key.length - `/cad/${part}`.length) });
 const num = (v: number): string => String(Math.round(v * 1e4) / 1e4);

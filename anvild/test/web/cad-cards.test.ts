@@ -242,3 +242,60 @@ test("[A2] the adopt card shows the values or the rules diff, and untrusted text
   c.onResolved(HUB, { v: 4, ts: "t", type: "cad.expectations.resolved", requestId: "cadx_e", approved: true } as any);
   expect(exp.querySelector(".cad-expect-outcome")!.textContent).toBe("Approved");
 });
+
+test("[A2] review 10: a part whose numbers the agent set says so and offers Confirm numbers; owner-approved numbers do not", () => {
+  const confirmed: any[] = [];
+  const c = mod.createCadCards({
+    supported: () => capability,
+    active: () => active,
+    container: pane,
+    respond: () => undefined,
+    open: () => undefined,
+    confirm: (url, ev) => void confirmed.push({ url, part: ev.part, cwd: ev.cwd }),
+  });
+  c.onDesign(HUB, design({}, { approvedBy: "agent-initial" }));
+  const card = pane().querySelector<HTMLElement>(".cad-part")!;
+  expect(card.dataset.cadState).toBe("pass"); // an agent's own numbers still pass…
+  const note = card.querySelector<HTMLElement>('[data-role="unconfirmed"]')!;
+  expect(note.textContent).toBe("Expected numbers were set by the agent and have not been confirmed by you."); // …but it is said whose they are
+  const btn = card.querySelector<HTMLButtonElement>(".cad-part-confirm")!;
+  expect(btn.textContent).toBe("Confirm numbers");
+  btn.click();
+  expect(confirmed).toEqual([{ url: HUB, part: "plate", cwd: "/repo" }]);
+  expect(btn.disabled).toBe(true);
+  // Once the owner approved (the daemon's next cad.design), the note and the button are gone.
+  c.onDesign(HUB, design({ rev: 2 }, { approvedBy: "owner" }));
+  expect(pane().querySelectorAll(".cad-part")).toHaveLength(1);
+  expect(pane().querySelector('[data-role="unconfirmed"]')).toBeNull();
+  expect(pane().querySelector(".cad-part-confirm")).toBeNull();
+  // No approval in force (unverified): nothing to confirm either.
+  c.onDesign(HUB, design({ rev: 3 }, { state: "unverified", needsAdoption: "expectations" }));
+  expect(pane().querySelector(".cad-part-confirm")).toBeNull();
+});
+
+test("[A2] review 2 and 10: the `initial` and `confirm` cards show the daemon's caution, the numbers with process and status, and Approve / Deny only", () => {
+  const c = cards();
+  c.onRequest(
+    HUB,
+    request({
+      requestId: "cadx_i",
+      kind: "initial",
+      reason: undefined,
+      note: "this part already has geometry; these numbers were written after it existed",
+      rows: [{ label: "Process", new: "fdm-0.4" }, { label: "Status", new: "dimensioned" }, { label: "Volume (mm³)", new: "1000" }],
+    }),
+  );
+  const initial = pane().querySelector<HTMLElement>('.cad-expect[data-req="cadx_i"]')!;
+  expect(initial.dataset.cadKind).toBe("initial");
+  expect(initial.querySelector(".perm-head")!.textContent).toBe("Set expectations · plate");
+  expect(initial.querySelector(".cad-expect-note")!.textContent).toBe("this part already has geometry; these numbers were written after it existed");
+  expect([...initial.querySelectorAll(".cad-row-label")].map((e) => e.textContent)).toEqual(["Process", "Status", "Volume (mm³)"]);
+  expect([...initial.querySelectorAll(".perm-btn")].map((b) => b.textContent)).toEqual(["Approve", "Deny"]);
+  c.onRequest(HUB, request({ requestId: "cadx_c", kind: "confirm", reason: undefined, note: "<b>bold</b>", rows: [{ label: "Process", new: "fdm-0.4" }] }));
+  const confirm = pane().querySelector<HTMLElement>('.cad-expect[data-req="cadx_c"]')!;
+  expect(confirm.querySelector(".perm-head")!.textContent).toBe("Confirm numbers · plate");
+  expect(confirm.querySelector(".cad-expect-note")!.textContent).toBe("<b>bold</b>"); // text, never markup
+  expect(confirm.querySelector(".cad-expect-note b")).toBeNull();
+  (confirm.querySelector(".perm-btn.allow") as HTMLButtonElement).click();
+  expect(sent).toEqual([{ url: HUB, requestId: "cadx_c", approve: true }]);
+});

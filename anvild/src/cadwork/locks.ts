@@ -8,7 +8,12 @@
  * file only when its hash matches.
  *
  * The repo key is the remote URL when there is one, else the repo's real path — so every worktree
- * and every clone of one repo shares its approvals.
+ * and every clone of one repo shares its approvals. Every entry also records BOTH identities of the
+ * repo it was made in (remote URL, main checkout path), and a lookup matches on either: adding or
+ * changing a remote does not orphan what was approved (`repoIdentity`, `LockStore.findPart`).
+ *
+ * An entry for a part WITH expectations must carry the accepted numbers (`values`). One without is
+ * invalid — the gate treats it as no approval at all. Nothing is ever "pinned later".
  *
  * FILE: `<stateDir>/cadwork/locks.json`. A file that does not parse is moved aside
  * (`locks.json.corrupt-<time>`) and the store starts empty: every part then needs adopting again,
@@ -36,8 +41,14 @@ export interface PartLock {
   sha: string;
   approvedBy: LockedBy;
   status: PartStatusKind;
-  /** The evaluated numbers the owner last accepted (absent for a concept part with no expectations). */
+  /** The evaluated numbers that were accepted, fixed at the moment of approval (absent ONLY for a
+   *  concept part with no expectations; an entry for expectations without them is invalid). */
   values?: EvaluatedExpectations;
+  /** The parameter values declared with `record_expectations` — what the design started from. */
+  declared?: Record<string, number>;
+  /** The repo's other identities at approval time (see `repoIdentity`). */
+  remote?: string;
+  path?: string;
   ownerParams?: Record<string, number>;
   /** ISO time of the approval — the conflict rule's clock. */
   at: string;
@@ -52,6 +63,16 @@ export interface RulesLock {
   text: string;
   at: string;
   machine?: string;
+  remote?: string;
+  path?: string;
+}
+
+/** The names a repo is known by: its remote URL (when it has one) and its main checkout's real path. */
+export interface RepoIdentity {
+  /** The key new approvals are stored under: the remote when there is one, else the path. */
+  key: string;
+  remote?: string;
+  path: string;
 }
 
 export interface LockSnapshot {
@@ -87,26 +108,43 @@ function git(cwd: string, args: string[]): string | undefined {
 }
 
 /**
- * The key approvals are stored under for the repo containing `worktree`: its remote URL (`origin`,
- * else the first remote) with a trailing `.git` or `/` removed; with no remote, the real path of the
- * MAIN checkout (so a session's linked worktree shares the repo's approvals).
+ * Both identities of the repo containing `worktree`: its remote URL (`origin`, else the first remote)
+ * with a trailing `.git` or `/` removed, and the real path of the MAIN checkout (so a session's linked
+ * worktree shares the repo's approvals).
  */
-export function repoKey(worktree: string): string {
-  const remote = git(worktree, ["config", "--get", "remote.origin.url"]) ?? (() => {
+export function repoIdentity(worktree: string): RepoIdentity {
+  const remoteRaw = git(worktree, ["config", "--get", "remote.origin.url"]) ?? (() => {
     const first = git(worktree, ["remote"])?.split("\n")[0]?.trim();
     return first ? git(worktree, ["config", "--get", `remote.${first}.url`]) : undefined;
   })();
-  if (remote) return remote.trim().replace(/\/+$/, "").replace(/\.git$/, "");
+  const remote = remoteRaw ? remoteRaw.trim().replace(/\/+$/, "").replace(/\.git$/, "") : undefined;
+  let path = worktree;
   const common = git(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
   try {
     if (common) {
       const real = realpathSync(common);
-      return real.endsWith("/.git") ? dirname(real) : real;
-    }
-    return realpathSync(worktree);
+      path = real.endsWith("/.git") ? dirname(real) : real;
+    } else path = realpathSync(worktree);
   } catch {
-    return worktree;
+    /* keep the path as given */
   }
+  return { key: remote || path, ...(remote ? { remote } : {}), path };
+}
+
+/** The key approvals are stored under for the repo containing `worktree` (see `repoIdentity`). */
+export function repoKey(worktree: string): string {
+  return repoIdentity(worktree).key;
+}
+
+/**
+ * Whether an entry belongs to a repo, by ANY of its identities. The remote matches anywhere in the
+ * fleet. A path names a folder on one machine, so a path-only match also needs the entry to have
+ * been made on this machine (`machine`); the entry's own key is matched as it always was.
+ */
+function sameRepo(lock: { repo: string; remote?: string; path?: string; machine?: string }, id: RepoIdentity, machine: string | undefined): boolean {
+  if (lock.repo === id.key) return true;
+  if (id.remote && (lock.repo === id.remote || lock.remote === id.remote)) return true;
+  return (lock.repo === id.path || lock.path === id.path) && lock.machine === machine;
 }
 
 let quarantineSeq = 0;
@@ -133,6 +171,18 @@ export class LockStore {
   }
   getRules(repo: string): RulesLock | undefined {
     return this.rules.get(repo);
+  }
+  /** The newest approval of a part under ANY identity of its repo (a remote added later, or removed). */
+  findPart(id: RepoIdentity, part: string, machine?: string): PartLock | undefined {
+    let best: PartLock | undefined;
+    for (const p of this.parts.values()) if (p.part === part && sameRepo(p, id, machine) && isNewer(p, best)) best = p;
+    return best;
+  }
+  /** The newest approved rules of a repo under any of its identities. */
+  findRules(id: RepoIdentity, machine?: string): RulesLock | undefined {
+    let best: RulesLock | undefined;
+    for (const r of this.rules.values()) if (sameRepo(r, id, machine) && isNewer(r, best)) best = r;
+    return best;
   }
   snapshot(): LockSnapshot {
     return { parts: [...this.parts.values()], rules: [...this.rules.values()] };
@@ -417,8 +467,16 @@ export class LockSync {
     return { ok: true, ...(role.serverId ? { hubServerId: role.serverId } : {}), ...this.store.snapshot() };
   }
 
-  /** MEMBER: the hub's store arrived. It replaces the local copy; anything queued is then sent. */
+  /** MEMBER: the hub's store arrived. It replaces the local copy; anything queued is then sent.
+   *  On FIRST contact with a hub, everything approved here before pairing is queued for upload first,
+   *  so the hub's store (merged by time) gains it instead of this machine losing it. */
   acceptFromHub(body: Partial<LocksPushBody>): void {
+    if (typeof body.hubServerId === "string" && this.store.hub()?.serverId !== body.hubServerId) {
+      const queued = new Set(this.store.pending().map((q) => JSON.stringify(q.lock)));
+      const local = this.store.snapshot();
+      for (const lock of local.parts) if (!queued.has(JSON.stringify(lock))) this.store.enqueue({ id: this.newId(), kind: "part", lock });
+      for (const lock of local.rules) if (!queued.has(JSON.stringify(lock))) this.store.enqueue({ id: this.newId(), kind: "rules", lock });
+    }
     if (typeof body.hubServerId === "string") this.store.setHub({ serverId: body.hubServerId, ...(typeof body.hubUrl === "string" && body.hubUrl ? { url: body.hubUrl } : this.store.hub()?.url ? { url: this.store.hub()!.url } : {}) });
     if (this.store.replaceFromHub(body)) this.onRemoteChange();
     if (this.store.pending().length) this.background(this.flush());

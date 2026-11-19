@@ -51,7 +51,9 @@ export const CAD_COMMAND_ALLOW: readonly CommandFamily[] = [
   { family: "inspect", allow: "*", except: ["compare_picture"] },
   { family: "material", only: ["assign", "list", "inspect"] },
   // Only what a plain part build can need; nothing that links, inserts or extracts another design.
-  { family: "component", only: ["create", "from_bodies", "activate", "list", "properties", "rename", "delete", "move_bodies", "copy_bodies", "metadata", "metadata.set"] },
+  // NOT `from_bodies` / `move_bodies`: on 0.44.1 they apply and then `timeline.export_script` fails,
+  // so the change could never be written to design.json (A2 review; real suite "script still exports").
+  { family: "component", only: ["create", "activate", "list", "properties", "rename", "delete", "copy_bodies", "metadata", "metadata.set"] },
   { family: "occurrence", only: ["properties", "move", "ground", "align", "copy", "reparent"] },
   { family: "document", only: ["units", "metadata", "metadata.set", "metadata.remove", "inspect", "revision"] },
   // Ray picks and camera placement only.

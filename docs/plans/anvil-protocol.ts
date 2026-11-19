@@ -619,6 +619,10 @@ export interface CadGateResult {
   warnings: string[]; // SolidCraft feature warnings, e.g. "Boolean retry"
   needsAdoption?: "expectations" | "rules" | "ownerParams";
   staleBuild: boolean; // measured under a different SolidCraft version
+  /** Who approved the numbers the part is checked against, when an approval is in force.
+   *  "agent-initial": the agent recorded them and the owner has not confirmed them (the part card
+   *  offers "Confirm numbers", `cad.expectations.confirm`). */
+  approvedBy?: "agent-initial" | "owner" | "planner";
 }
 /**
  * A part was measured and checked again (§4.8). Broadcast to every client after each refresh of a
@@ -686,6 +690,10 @@ export interface CadExpectationsRow {
  *  - `adopt-expectations` `part.json` does not match the lock store (a hand edit, a fresh clone).
  *  - `adopt-ownerParams`  the owner-typed dimensions in `part.json` differ from the approved ones.
  *  - `adopt-rules`        `cad/rules.json` changed (`rulesDiff` shows what).
+ *  - `initial`            the agent asks to record expectations for a part that ALREADY has geometry
+ *                         (or an earlier approval), so the numbers were written after it existed.
+ *  - `confirm`            the owner asked to confirm numbers the agent recorded (`cad.expectations.confirm`).
+ * Every card shows the evaluated numbers together with the process and status they are approved under.
  * Answered with `cad.expectations.respond`; retired by `cad.expectations.resolved`. Broadcast to all
  * clients (it names its session) and re-sent, with `replay`, when a socket opens.
  */
@@ -695,8 +703,10 @@ export interface CadExpectationsRequestEvent extends Envelope {
   sessionId: SessionId;
   cwd: string;
   part: string;
-  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules";
+  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "initial" | "confirm";
   reason?: string;
+  /** A daemon-written caution shown on the card (e.g. "this part already has geometry…"). */
+  note?: string;
   rows: CadExpectationsRow[];
   rulesDiff?: { op: " " | "+" | "-"; line: string }[];
   replay?: boolean;
@@ -1791,6 +1801,17 @@ export interface CadExpectationsRespondCmd extends Envelope, Correlated {
   approve: boolean;
 }
 /**
+ * "Confirm numbers" on a part card: ask the daemon to raise the standard owner card (numbers, process,
+ * status) for a part whose expectations were recorded by the agent. Approving it makes the owner the
+ * approver, fleet-wide. `cwd` is checked like every cad command; the card appears in `sessionId`.
+ */
+export interface CadExpectationsConfirmCmd extends Envelope, Correlated {
+  type: "cad.expectations.confirm";
+  cwd: string;
+  part: string;
+  sessionId: SessionId;
+}
+/**
  * The parts of a worktree with their gate state (agent-cad-and-browser spec §4.8, Phase A3). `cwd` must
  * be the worktree of an existing session or a registered environment's repo; anything else is refused.
  * Answered with `cad.parts.list.result`.
@@ -2276,6 +2297,7 @@ export type ClientCommand =
   | PermissionRespondCmd
   | QuestionRespondCmd
   | CadExpectationsRespondCmd
+  | CadExpectationsConfirmCmd
   | CadPartsListCmd
   | CadParamSetCmd
   | CadDesignRefreshCmd

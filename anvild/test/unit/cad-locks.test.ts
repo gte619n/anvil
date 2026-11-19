@@ -263,4 +263,75 @@ describe("cad lock store hub sync", () => {
     expect(f.calls.some((c) => c.url.startsWith("http://evil"))).toBe(false);
     expect(f.m1.store.pending()).toHaveLength(1);
   });
+
+  test("[A2] review 8: pairing does not wipe earlier local approvals — on first contact with a hub a member uploads what it approved before, merged by time", async () => {
+    const f = fleet();
+    // m1 worked standalone before it was paired: two parts and the rules approved, nothing queued.
+    const mine = lock("plate", "2026-11-19T10:00:00.000Z", { machine: "srv_m1" });
+    const older = lock("gear", "2026-11-19T08:00:00.000Z", { machine: "srv_m1" });
+    f.m1.store.putPart(mine);
+    f.m1.store.putPart(older);
+    f.m1.store.putRules(rules("2026-11-19T10:00:00.000Z"));
+    expect(f.m1.store.pending()).toEqual([]);
+    expect(f.m1.store.hub()).toBeUndefined();
+    // The hub already holds a NEWER approval of `gear`, and its own part.
+    const hubGear = lock("gear", "2026-11-19T09:00:00.000Z", { machine: "srv_hub" });
+    f.hub.store.putPart(hubGear);
+    f.hub.store.putPart(lock("bracket", "2026-11-19T09:00:00.000Z"));
+
+    await f.hub.sync.broadcast(); // the first push the member ever gets
+    await f.m1.sync.settled();
+    await f.hub.sync.settled();
+    await f.m1.sync.settled();
+    // Nothing the member had approved was lost…
+    expect(f.m1.store.getPart(REPO, "plate")).toEqual(mine);
+    expect(f.m1.store.getRules(REPO)).toBeDefined();
+    // …it reached the hub (and through it the rest of the fleet)…
+    expect(f.hub.store.getPart(REPO, "plate")).toEqual(mine);
+    expect(f.hub.store.getRules(REPO)!.sha).toBe("rules-2026-11-19T10:00:00.000Z");
+    expect(f.m2.store.getPart(REPO, "plate")).toEqual(mine);
+    // …and the conflict rule held: the hub's later approval of `gear` won, on both sides.
+    expect(f.hub.store.getPart(REPO, "gear")).toEqual(hubGear);
+    expect(f.m1.store.getPart(REPO, "gear")).toEqual(hubGear);
+    expect(f.m1.store.getPart(REPO, "bracket")).toBeDefined();
+    expect(f.m1.store.pending()).toEqual([]);
+    expect(f.calls.some((c) => c.url.endsWith(LOCKS_APPROVE_PATH) && c.body.serverId === "srv_m1" && c.body.parts.length === 2 && c.body.rules.length === 1)).toBe(true);
+    // A later push from the same hub is not "first contact": nothing is uploaded again.
+    const approves = f.calls.filter((c) => c.url.endsWith(LOCKS_APPROVE_PATH)).length;
+    await f.hub.sync.broadcast();
+    await f.m1.sync.settled();
+    expect(f.calls.filter((c) => c.url.endsWith(LOCKS_APPROVE_PATH)).length).toBe(approves);
+    // While the hub cannot be reached for the upload, the approvals stay queued and stay in force.
+    const g = fleet();
+    g.m1.store.putPart(mine);
+    g.down.add(g.HUB);
+    g.m1.sync.acceptFromHub({ hubServerId: "srv_hub", hubUrl: g.HUB, parts: [], rules: [] });
+    await g.m1.sync.settled();
+    expect(g.m1.store.getPart(REPO, "plate")).toEqual(mine);
+    expect(g.m1.store.pending()).toHaveLength(1);
+  });
+
+  test("[A2] review 5: an approval is found under any identity of its repo — the remote anywhere, the path only on the machine that made it", () => {
+    const store = new LockStore(tempDir());
+    const repo = tempRepo();
+    const byPath = lock("plate", "2026-11-19T10:00:00.000Z", { repo, path: repo, machine: "srv_a" });
+    store.putPart(byPath);
+    store.putRules({ ...rules("2026-11-19T10:00:00.000Z"), repo, path: repo, machine: "srv_a" });
+    const withRemote = { key: "git@example.com:me/new", remote: "git@example.com:me/new", path: repo };
+    expect(store.getPart(withRemote.key, "plate")).toBeUndefined(); // the exact-key lookup would have lost it
+    expect(store.findPart(withRemote, "plate", "srv_a")).toEqual(byPath);
+    expect(store.findRules(withRemote, "srv_a")).toBeDefined();
+    expect(store.findPart(withRemote, "plate", "srv_b")).toBeUndefined(); // same path on another machine is another folder
+    expect(store.findPart(withRemote, "gear", "srv_a")).toBeUndefined();
+    // Stored under a remote and looked up after the remote was removed (path identity, same machine).
+    const byRemote = lock("gear", "2026-11-19T10:00:00.000Z", { repo: "git@example.com:me/new", remote: "git@example.com:me/new", path: repo, machine: "srv_a" });
+    store.putPart(byRemote);
+    expect(store.findPart({ key: repo, path: repo }, "gear", "srv_a")).toEqual(byRemote);
+    // Stored under a remote: found from any clone of it, on any machine.
+    expect(store.findPart({ key: "git@example.com:me/new", remote: "git@example.com:me/new", path: "/somewhere/else" }, "gear", "srv_z")).toEqual(byRemote);
+    // The newest of several matching entries wins.
+    const later = lock("plate", "2026-11-19T12:00:00.000Z", { repo: withRemote.key, remote: withRemote.remote, path: repo, machine: "srv_a" });
+    store.putPart(later);
+    expect(store.findPart(withRemote, "plate", "srv_a")).toEqual(later);
+  });
 });

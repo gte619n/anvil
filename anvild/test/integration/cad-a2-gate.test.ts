@@ -26,6 +26,10 @@ import type { Session } from "../../src/session/session";
 import { Supervisor } from "../../src/session/supervisor";
 import { PLATE_EXPECTATIONS, PLATE_VOLUME, RULES, approveCards, buildPlate, callable, cleanupTemp, fakeCadSession, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT, REFERENCE_PLATE } from "../helpers/fake-solidcraft";
+import { PLATE_PARAMETERS, plateBuild } from "../helpers/cad-work";
+
+/** The plate's modeling commands: the reference plate less the parameters `record_expectations` already created. */
+const PLATE_BUILD = plateBuild(REFERENCE_PLATE);
 
 const saved: Record<string, string | undefined> = {};
 beforeAll(() => {
@@ -116,8 +120,8 @@ async function supervisedPlate(autonomy = "bypass") {
   const s = await ctx.sup.create(createCmd(repo, { autonomy }));
   const tools = callable(cadTools(ctx.sup.cadwork.toolDeps(s.id, repo)) as any);
   await tools.open_part!({ part: "plate" });
-  expect((await tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: PLATE_EXPECTATIONS })).isError).toBe(false);
-  expect((await tools.batch!({ commands: REFERENCE_PLATE })).isError).toBe(false);
+  expect((await tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: PLATE_EXPECTATIONS })).isError).toBe(false);
+  expect((await tools.batch!({ commands: PLATE_BUILD })).isError).toBe(false);
   await tools.check_part!({ part: "plate" });
   for (const c of ctx.openCards()) ctx.sup.respondCadExpectations(c.requestId, true);
   expect((await tools.check_part!({ part: "plate" })).json.state).toBe("pass");
@@ -133,7 +137,7 @@ describe("Phase A2 acceptance", () => {
     expect(opened.json.modeling).toBe("refused until expectations are recorded"); // a brand-new part is `dimensioned`
     const attempts = [
       () => tools.execute!({ command: "solid.box", params: { length: 10, width: 10, height: 10 } }),
-      () => tools.batch!({ commands: REFERENCE_PLATE }),
+      () => tools.batch!({ commands: PLATE_BUILD }),
       () => tools.set_parameter!({ name: "L", expression: "120" }),
       () => tools.undo!({}),
       () => tools.redo!({}),
@@ -150,8 +154,8 @@ describe("Phase A2 acceptance", () => {
     expect((await tools.measure!({ summary: true })).json.body_count).toBe(0);
     expect(manager.status(partRef(repo, "plate"))!.scriptSha).toBeUndefined();
     // Once they are recorded, the same calls go through.
-    expect((await tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: PLATE_EXPECTATIONS })).isError).toBe(false);
-    expect((await tools.batch!({ commands: REFERENCE_PLATE })).isError).toBe(false);
+    expect((await tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: PLATE_EXPECTATIONS })).isError).toBe(false);
+    expect((await tools.batch!({ commands: PLATE_BUILD })).isError).toBe(false);
     expect((await tools.measure!({ summary: true })).json.body_count).toBe(1);
   });
 
@@ -183,7 +187,7 @@ describe("Phase A2 acceptance", () => {
     const repo = tempRepo();
     const x = await plate(repo);
     const key = repoKey(repo);
-    const second = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: { ...PLATE_EXPECTATIONS, volume: 1 } });
+    const second = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: { ...PLATE_EXPECTATIONS, volume: 1 } });
     expect(second.isError).toBe(true);
     expect(second.text).toContain("only once");
     expect(second.text).toContain("propose_expectations");
@@ -404,7 +408,7 @@ describe("Phase A2 acceptance", () => {
     const repo2 = tempRepo();
     const y = fakeCadSession(repo2, {}, "s2", { expectations: "manual" });
     await y.tools.open_part!({ part: "plate" });
-    const loose = await y.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: { ...PLATE_EXPECTATIONS, tolerance: { length: 1.0 } } });
+    const loose = await y.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: { ...PLATE_EXPECTATIONS, tolerance: { length: 1.0 } } });
     expect(loose.isError).toBe(true);
     expect(loose.text).toContain("looser than the cap of 0.1 mm");
     expect(existsSync(join(repo2, "cad", "plate", "part.json"))).toBe(false);
@@ -498,17 +502,17 @@ describe("Phase A2 edge cases and gaming (§7)", () => {
     writeRules(repo);
     await x.tools.open_part!({ part: "plate" });
     // 1. Build first, describe afterwards: there is nothing to measure, because nothing can be built.
-    expect((await x.tools.batch!({ commands: REFERENCE_PLATE })).isError).toBe(true);
+    expect((await x.tools.batch!({ commands: PLATE_BUILD })).isError).toBe(true);
     expect((await x.tools.measure!({ summary: true })).json.body_count).toBe(0);
     // 2. Record, build something else, then try to re-describe it to match.
-    await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: PLATE_EXPECTATIONS });
-    await x.tools.batch!({ commands: REFERENCE_PLATE.slice(0, 15) }); // one hole, not four
+    await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: PLATE_EXPECTATIONS });
+    await x.tools.batch!({ commands: PLATE_BUILD.slice(0, -1) }); // one hole, not four
     const measured = (await x.tools.measure!({ summary: true })).json.total.volume_mm3;
-    const again = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: { ...PLATE_EXPECTATIONS, volume: measured, holes: [{ diameter: 3.4, count: 1 }] } });
+    const again = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: { ...PLATE_EXPECTATIONS, volume: measured, holes: [{ diameter: 3.4, count: 1 }] } });
     expect(again.isError).toBe(true);
     // 3. Delete part.json and record afresh: the lock store remembers that this part was approved.
     rmSync(join(repo, "cad", "plate", "part.json"));
-    const afresh = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: { ...PLATE_EXPECTATIONS, volume: measured, holes: [{ diameter: 3.4, count: 1 }] } });
+    const afresh = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: { ...PLATE_EXPECTATIONS, volume: measured, holes: [{ diameter: 3.4, count: 1 }] } });
     expect(afresh.isError).toBe(true);
     expect(afresh.text).toContain("restore cad/plate/part.json from git");
     expect(existsSync(join(repo, "cad", "plate", "part.json"))).toBe(false);
@@ -735,8 +739,8 @@ async function builtOn(d: Daemon, repo: string) {
   writeRules(repo);
   const x = await sessionOn(d, repo);
   await x.tools.open_part!({ part: "plate" });
-  expect((await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: PLATE_EXPECTATIONS })).isError).toBe(false);
-  expect((await x.tools.batch!({ commands: REFERENCE_PLATE })).isError).toBe(false);
+  expect((await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: PLATE_EXPECTATIONS })).isError).toBe(false);
+  expect((await x.tools.batch!({ commands: PLATE_BUILD })).isError).toBe(false);
   expect((await x.check()).needsAdoption).toBe("rules");
   await x.approveAll(1);
   expect((await x.check()).state).toBe("pass");
@@ -912,11 +916,12 @@ describe("Phase A2 lock store hub sync (§4.14 item 42)", () => {
     writeRules(repo);
     const x = await sessionOn(d, repo);
     await x.tools.open_part!({ part: "plate" });
-    await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", expectations: PLATE_EXPECTATIONS });
-    await x.tools.batch!({ commands: REFERENCE_PLATE });
+    await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: PLATE_PARAMETERS, expectations: PLATE_EXPECTATIONS });
+    await x.tools.batch!({ commands: PLATE_BUILD });
     expect((await x.check()).needsAdoption).toBe("rules");
     await until(() => x.openCards().length === 1, "the adopt card");
-    await until(() => d.frames.filter((e) => e.type === "cad.design").length >= 2, "the checked design on the socket");
+    // (record_expectations now creates the declared parameters, so it is a refresh of its own: wait for the CHECKED design.)
+    await until(() => d.frames.filter((e) => e.type === "cad.design").at(-1)?.rev === x.sup.cadwork.snapshot(partRef(repo, "plate"))?.rev && d.frames.filter((e) => e.type === "cad.design").at(-1)?.busy === false, "the checked design on the socket");
     const live = d.frames.filter((e) => e.type === "cad.design").at(-1);
     expect(live).toMatchObject({ v: PROTOCOL_VERSION, type: "cad.design", cwd: repo, part: "plate", busy: false, by: "agent", sessionIds: [x.s.id] });
     expect(live.gate).toMatchObject({ state: "unverified", needsAdoption: "rules", staleBuild: false });

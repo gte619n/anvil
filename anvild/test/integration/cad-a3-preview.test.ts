@@ -453,14 +453,19 @@ describe("Phase A3 clients (§7, §4.8)", () => {
     expect(glb.meshes).toBe(1);
     expect(Math.round((glb.max[0]! - glb.min[0]!) * 1e6) / 1e6).toBe(0.08); // 80 mm, in metres
 
+    // The list refreshes a part whose process is up (its state is of the design as it is now, never
+    // of numbers stored in part.json), so it reports the revision after `ev`.
     c.send({ type: "cad.parts.list", cid: "list", cwd: repo });
     await until(() => c.frames.some((e) => e.cid === "list"), "the parts list");
-    expect(c.frames.find((e) => e.cid === "list")).toMatchObject({ type: "cad.parts.list.result", cwd: repo, parts: [{ part: "plate", hasDesign: true, live: true, rev: ev.rev, preview: ev.preview, gate: { state: "pass" } }] });
+    await caughtUp(d, c, repo);
+    const listed = designsOf(c.frames).at(-1);
+    expect(listed.rev).toBe(ev.rev + 1);
+    expect(c.frames.find((e) => e.cid === "list")).toMatchObject({ type: "cad.parts.list.result", cwd: repo, parts: [{ part: "plate", hasDesign: true, live: true, rev: listed.rev, preview: listed.preview, gate: { state: "pass" } }] });
 
     // A socket that opens later is handed the part's current state, preview included.
     const late = await d.client();
     await until(() => designsOf(late.frames).length > 0, "the current design on connect");
-    expect(designsOf(late.frames).at(-1)).toMatchObject({ rev: ev.rev, preview: ev.preview });
+    expect(designsOf(late.frames).at(-1)).toMatchObject({ rev: listed.rev, preview: listed.preview });
 
     // Rebuild: the part is restarted from design.json, and the event says so.
     const pid = d.sup.cadwork.manager.status(x.ref)!.pid;
@@ -469,7 +474,7 @@ describe("Phase A3 clients (§7, §4.8)", () => {
     expect(c.frames.find((e) => e.cid === "rebuild").type).toBe("ack");
     const after = designsOf(c.frames).at(-1);
     expect(after.by).toBe("reload");
-    expect(after.rev).toBe(ev.rev + 1);
+    expect(after.rev).toBe(listed.rev + 1);
     expect(after.gate.state).toBe("pass");
     expect(d.sup.cadwork.manager.status(x.ref)!.pid).not.toBe(pid);
     expect(existsSync(join(repo, after.preview))).toBe(true);

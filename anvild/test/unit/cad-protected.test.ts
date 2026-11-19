@@ -199,4 +199,78 @@ describe("cad protected rules", () => {
     resetCadProtectedForTest();
     expect(protectedVerdict(probe)).toBeUndefined();
   });
+
+  test("[A2] review 2: Edit, Write, MultiEdit and NotebookEdit to cad/<part>/design.json always prompt with no always-allow, under every policy, and are denied when unattended", async () => {
+    const target = join(repo, "cad", "plate", "design.json");
+    for (const autonomy of ["bypass", "mostly-autonomous", "allowlist", "prompt-all"]) {
+      for (const [tool, input] of [
+        ["Write", { file_path: target, content: "{}" }],
+        ["Edit", { file_path: "cad/plate/design.json", old_string: "a", new_string: "b" }],
+        ["MultiEdit", { file_path: "cad/plate/../plate/DESIGN.JSON", edits: [] }],
+        ["NotebookEdit", { notebook_path: target }],
+      ] as const) {
+        const s = fakeSession({ autonomy });
+        s.remembered.add(tool);
+        const r = await gate(s, tool, input as any);
+        expect(r.prompt).toBeDefined(); // asked, whatever the policy and whatever was remembered
+        expect(r.prompt!.suggestions.map((x) => x.decision)).toEqual(["allow", "deny"]);
+        expect(r.decision).toBe("allow");
+        expect((await gate(s, tool, input as any, "deny")).decision).toBe("deny"); // and asked again
+        expect(s.asked).toHaveLength(2);
+      }
+    }
+    const s = fakeSession();
+    expect((await gate(s, "Write", { file_path: target, content: "{}" }, "allow_always")).decision).toBe("allow");
+    expect(s.remembered.has("Write")).toBe(false);
+    const builder = fakeSession({ workUnitRole: "builder" });
+    const denied = await gate(builder, "Write", { file_path: target, content: "{}" });
+    expect(denied.decision).toBe("deny");
+    expect(denied.reason).toContain("unattended");
+    expect(builder.asked).toEqual([]);
+    // Reading the script, and writing other files of the part, are untouched.
+    expect(cadProtectedRule({ session: s.session, tool: "Read", input: { file_path: target }, cwd: repo })).toBeUndefined();
+    expect(cadProtectedRule({ session: s.session, tool: "Write", input: { file_path: join(repo, "cad", "plate", "notes.md") }, cwd: repo })).toBeUndefined();
+    expect(cadProtectedRule({ session: s.session, tool: "Write", input: { file_path: join(repo, "design.json") }, cwd: repo })).toBeUndefined();
+  });
+
+  test("[A2] review 3: the file tools cannot write anywhere under the daemon's state dir — absolute, relative or through a symlink — except in session worktrees and cloned repos", async () => {
+    resetCadProtectedForTest();
+    // A session whose worktree is where production puts it: under <stateDir>/worktrees.
+    const wt = join(state, "worktrees", "sess_1");
+    mkdirSync(join(wt, "src"), { recursive: true });
+    mkdirSync(join(state, "repos", "widgets"), { recursive: true });
+    mkdirSync(join(state, "cadwork"), { recursive: true });
+    writeFileSync(join(state, "cadwork", "locks.json"), "{}");
+    registerCadProtectedRules(state, [join(state, "worktrees"), join(state, "repos")]);
+    const link = join(wt, "innocent");
+    symlinkSync(join(state, "cadwork"), link);
+    const rel = (p: string) => require("node:path").relative(wt, p);
+    const denied: [string, Record<string, unknown>][] = [
+      ["Write", { file_path: join(state, "cadwork", "locks.json"), content: "{}" }],
+      ["Edit", { file_path: rel(join(state, "cadwork", "locks.json")), old_string: "a", new_string: "b" }], // ../../cadwork/locks.json
+      ["Write", { file_path: "innocent/locks.json", content: "{}" }], // through a symlink inside the worktree
+      ["MultiEdit", { file_path: join(state, "sessions.json"), edits: [] }],
+      ["Write", { file_path: join(state, "env"), content: "X=1" }],
+      ["Write", { file_path: join(state, "new-folder", "x.txt"), content: "" }],
+      ["NotebookEdit", { notebook_path: join(state, "solidcraft", "x.ipynb") }],
+      ["Write", { file_path: join(state, "worktrees"), content: "" }], // the root itself is not a session's file
+    ];
+    for (const autonomy of ["bypass", "mostly-autonomous", "allowlist"]) {
+      for (const [tool, input] of denied) {
+        const s = fakeSession({ autonomy, cwd: wt });
+        s.remembered.add(tool);
+        const r = await gate(s, tool, input);
+        expect([tool, input, r.decision]).toEqual([tool, input, "deny"]);
+        expect(r.reason).toContain("state folder");
+        expect(s.asked).toEqual([]); // refused outright
+      }
+    }
+    // The places a session works in stay writable, and so does everything outside the state dir.
+    const s = fakeSession({ cwd: wt });
+    for (const fp of [join(wt, "src", "a.ts"), "src/b.ts", join(state, "worktrees", "sess_2", "x.ts"), join(state, "repos", "widgets", "README.md"), join(repo, "README.md")]) {
+      expect((await gate(s, "Write", { file_path: fp, content: "" })).decision).toBe("allow");
+    }
+    // Reads are not this rule's business.
+    expect(cadProtectedRule({ session: s.session, tool: "Read", input: { file_path: join(state, "cadwork", "locks.json") }, cwd: wt })).toBeUndefined();
+  });
 });

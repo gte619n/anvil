@@ -1455,6 +1455,8 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-part-checks li { overflow-wrap: anywhere; }
 .cad-part-advisory { opacity: 0.8; }
 .cad-part-note { margin-top: 8px; font-size: 13px; }
+.cad-part-unconfirmed { color: var(--warn); }
+.cad-expect-note { margin: 6px 0; font-size: 13px; font-weight: 600; color: var(--warn); }
 .cad-part-actions { display: flex; gap: 8px; margin-top: 10px; }
 .cad-part-open { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; padding: 5px 12px; cursor: pointer; }
 .cad-expect-blurb, .cad-expect-reason { margin: 6px 0; font-size: 13px; }

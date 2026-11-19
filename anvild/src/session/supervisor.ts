@@ -63,7 +63,7 @@ import type { CadParamSetResultEvent, CadPartsListResultEvent, CadStatusEvent } 
 import { featureEnabled } from "../config";
 import type { CadManagerOptions } from "../cadwork/manager";
 import { CadworkService, CWD_REFUSED } from "./cadwork-service";
-import { gitToplevel } from "../cadwork/partfolder";
+import { gitToplevel, partRef } from "../cadwork/partfolder";
 import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
 import { discoverSelfBaseUrl } from "../server/fleet";
@@ -345,6 +345,7 @@ export class Supervisor {
       registry: this.registry,
       manager: cfg.cadManager,
       stateDir: cfg.stateDir, // the lock store: <stateDir>/cadwork/locks.json
+      writableStateRoots: [this.store.worktreeRoot(), this.clonesDir], // the only folders under the state dir a session may edit
     });
     if (this.cadwork.enabled) void this.cadwork.refreshStatus(); // learn the SolidCraft version; broadcasts cad.status
     this.gitProjection = new GitProjectionService({
@@ -1795,9 +1796,17 @@ export class Supervisor {
   private readonly cadTopCache = new Map<string, { top: string | undefined; at: number }>();
 
   /** `cad.parts.list` (spec §4.8): the parts of a known worktree with their gate state. */
-  cadPartsListEvent(cwd: unknown, cid?: string): CadPartsListResultEvent {
+  async cadPartsListEvent(cwd: unknown, cid?: string): Promise<CadPartsListResultEvent> {
     const worktree = this.cadWorktree(cwd);
-    return { v: PROTOCOL_VERSION, type: "cad.parts.list.result", ts: now(), ...(cid ? { cid } : {}), cwd: worktree, parts: this.cadwork.listParts(worktree) };
+    return { v: PROTOCOL_VERSION, type: "cad.parts.list.result", ts: now(), ...(cid ? { cid } : {}), cwd: worktree, parts: await this.cadwork.listParts(worktree) };
+  }
+
+  /** `cad.expectations.confirm`: the owner asks to confirm numbers the agent recorded; raises their card. */
+  confirmCadNumbers(cwd: unknown, part: unknown, sessionId: unknown): void {
+    const worktree = this.cadWorktree(cwd);
+    if (typeof sessionId !== "string" || !this.sessions.has(sessionId)) throw new BadCommand(`no such session: ${String(sessionId)}`);
+    const r = this.cadwork.confirmNumbers(sessionId, partRef(worktree, part));
+    if (!r.ok) throw new BadCommand(r.error);
   }
 
   /** `cad.param.set` (spec §4.8): the owner's parameter change. No model is involved. */

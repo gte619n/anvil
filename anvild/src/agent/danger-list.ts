@@ -55,7 +55,10 @@ export function isDangerous(toolName: string, input: Record<string, unknown>, cw
   // writes resolving outside the session worktree
   if (cwd && (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit")) {
     const fp = input.file_path ?? input.notebook_path;
-    if (typeof fp === "string" && fp.startsWith("/") && !resolve(fp).startsWith(resolve(cwd))) {
+    // Resolved the way the write will be: a relative path (`../../x`) is against the session's cwd.
+    const root = resolve(cwd);
+    const abs = typeof fp === "string" && fp ? resolve(root, fp) : undefined;
+    if (abs !== undefined && abs !== root && !abs.startsWith(root.replace(/\/+$/, "") + "/")) {
       return { danger: true, reason: "write outside the session worktree" };
     }
   }

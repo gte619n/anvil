@@ -249,7 +249,15 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
       // The parameters panel and the live viewer (agent-cad-and-browser spec §4.8, Phase A3). `cwd` is
       // checked by the supervisor against the worktrees it knows; a client never names an arbitrary path.
       case "cad.parts.list":
-        send(deps.supervisor.cadPartsListEvent(cmd.cwd, cid));
+        deps.supervisor
+          .cadPartsListEvent(cmd.cwd, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "cad.expectations.confirm":
+        deps.supervisor.confirmCadNumbers(cmd.cwd, cmd.part, cmd.sessionId);
+        if (cid) send(ack(cid));
         return;
 
       case "cad.param.set":

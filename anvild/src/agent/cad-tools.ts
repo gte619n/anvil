@@ -52,7 +52,9 @@ export interface CadToolDeps {
   touch(ref: PartRef): void;
   /** Why modeling is refused on the part right now (no expectations recorded), else undefined. */
   modelingRefusal(ref: PartRef): string | undefined;
-  recordExpectations(ref: PartRef, process: unknown, expectations: unknown): { ok: true } | { ok: false; error: string };
+  /** Fixes the expected numbers from the declared parameter values and creates those parameters. For
+   *  a part that already has geometry it parks an owner card and resolves when they answer. */
+  recordExpectations(ref: PartRef, process: unknown, parameters: unknown, expectations: unknown): Promise<{ ok: true; approved?: boolean; by?: "agent-initial" | "owner" } | { ok: false; error: string }>;
   /** Parks the owner's card and resolves when they answer. */
   proposeExpectations(ref: PartRef, expectations: unknown, reason: unknown): Promise<{ ok: true; approved?: boolean } | { ok: false; error: string }>;
   /** Forces a refresh and returns the gate result in full. */
@@ -339,22 +341,37 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
     // ── expectations and the gate (spec §4.5) ───────────────────────────────────────────────────
     tool(
       "record_expectations",
-      "Record what a part must be, BEFORE modeling it: {part, process, expectations}. Allowed once, for a part that has " +
+      "Record what a part must be, BEFORE modeling it: {part, process, parameters, expectations}. Allowed once, for a part that has " +
         "none; modeling is refused until it is done, and afterwards only the owner can change it (propose_expectations). " +
-        "`process` is an id from cad/rules.json. A value may be a number or a formula over the design's parameter names " +
-        '(+ - * / ^ ( ) and pi), e.g. bbox ["L","W","T"] or volume "L*W*T - 4*pi*1.7^2*T". The gate then checks the part ' +
-        "against these numbers.",
+        "`process` is an id from cad/rules.json. An expectation may be a number or a formula over parameter names " +
+        '(+ - * / ^ ( ) and pi), e.g. bbox ["L","W","T"] or volume "L*W*T - 4*pi*1.7^2*T". `parameters` lists EVERY ' +
+        'parameter name those formulas use with its value, e.g. {"L": 80, "W": 50, "T": 6} (use {} when every expectation ' +
+        "is a plain number). The expected numbers are fixed from those values right now, and the daemon creates those " +
+        "parameters in the design for you — do not add them again. A formula that uses an undeclared name is refused. " +
+        "Changing a declared parameter later moves the expectation away from what was accepted and fails the gate; only " +
+        "the owner can change the numbers. On a part that already has geometry this asks the owner on a card.",
       {
         part: z.string().describe("The part name (not a path)."),
         process: z.string().describe('A process id from cad/rules.json, e.g. "fdm-0.4".'),
+        parameters: z.record(z.string(), z.union([z.number(), z.string()])).describe('Every parameter the expectation formulas use, with its value: {"L": 80} or {"L": "80 mm"}. {} when there are no formulas.'),
         expectations: expectationsSchema,
       },
-      async ({ part, process, expectations }) =>
+      async ({ part, process, parameters, expectations }) =>
         guarded(async () => {
           const ref = partRef(deps.worktree, part);
-          const r = deps.recordExpectations(ref, process, expectations);
+          const r = await deps.recordExpectations(ref, process, parameters, expectations);
           if (!r.ok) return fail(r.error);
-          return ok(JSON.stringify({ part: ref.part, recorded: true, process, note: "Expectations are locked. Model the part, then call check_part." }));
+          if (r.approved === false) return ok(JSON.stringify({ part: ref.part, recorded: false, note: "The owner DENIED recording these expectations. Nothing was written." }));
+          return ok(
+            JSON.stringify({
+              part: ref.part,
+              recorded: true,
+              process,
+              approved_by: r.by ?? "agent-initial",
+              parameters_created: Object.keys(parameters ?? {}),
+              note: "Expectations are locked to the declared parameter values, and those parameters now exist in the design. Model the part from them, then call check_part.",
+            }),
+          );
         }),
     ),
     tool(

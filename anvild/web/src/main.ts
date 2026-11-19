@@ -1757,6 +1757,7 @@ const cadCards = createCadCards({
   respond: (url, requestId, approve) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.respond", requestId, approve }),
   // "Open" on a part card: the live viewer listens for this (below).
   open: (url, ev) => void window.dispatchEvent(new CustomEvent("anvil:cad-open", { detail: { url, cwd: ev.cwd, part: ev.part, rev: ev.rev } })),
+  confirm: (url, ev) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.confirm", cid: newCid(), cwd: ev.cwd, part: ev.part, sessionId: activeId ? wireSessionId(activeId) : "" }),
   scrollDown: () => scrollDown(),
 });
 
@@ -1790,8 +1791,12 @@ function openCadPartViewer(url: string, cwd: string, part: string): void {
       },
       rebuild,
       parts: async () => {
-        const res = await ask({ type: "cad.parts.list", cwd }, 20_000);
-        return res.type === "cad.parts.list.result" ? res.parts.map((p) => p.part) : [];
+        // The list refreshes every part whose process is up. One that is not up has only its last
+        // known numbers (never a verdict): opening it builds it from design.json.
+        const res = await ask({ type: "cad.parts.list", cwd }, 60_000);
+        if (res.type !== "cad.parts.list.result") return [];
+        if (res.parts.some((p) => p.part === part && !p.live && p.hasDesign) && cadDesigns.get(srv.url, cwd, part)?.preview) rebuild();
+        return res.parts.map((p) => p.part);
       },
       openPart: (other) => openCadPartViewer(srv.url, cwd, other),
     },

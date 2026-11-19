@@ -75,10 +75,10 @@ test("[A3] cwd is validated server-side: only the worktree of an existing sessio
   expect(() => sup.cadWorktree(out)).toThrow(CWD_REFUSED);
 
   // The three commands and the preview route all go through it.
-  expect(() => sup.cadPartsListEvent(stranger, "c1")).toThrow(CWD_REFUSED);
+  await expect(sup.cadPartsListEvent(stranger, "c1")).rejects.toThrow(CWD_REFUSED);
   await expect(sup.setCadParam(stranger, "plate", "L", "120", "c2")).rejects.toThrow(CWD_REFUSED);
   await expect(sup.refreshCadDesign(stranger, "plate")).rejects.toThrow(CWD_REFUSED);
-  expect(sup.cadPartsListEvent(repo, "c3")).toMatchObject({ type: "cad.parts.list.result", cid: "c3", cwd: repo, parts: [] });
+  expect(await sup.cadPartsListEvent(repo, "c3")).toMatchObject({ type: "cad.parts.list.result", cid: "c3", cwd: repo, parts: [] });
 });
 
 test("[A3] with cad-work off every cad command is refused, whatever the cwd", async () => {
@@ -86,7 +86,7 @@ test("[A3] with cad-work off every cad command is refused, whatever the cwd", as
   const repo = tempRepo();
   await sup.create(createCmd(repo));
   expect(() => sup.cadWorktree(repo)).toThrow("cad-work is not enabled");
-  expect(() => sup.cadPartsListEvent(repo)).toThrow("cad-work is not enabled");
+  await expect(sup.cadPartsListEvent(repo)).rejects.toThrow("cad-work is not enabled");
 });
 
 test("[A3] cad.param.set refuses a bad part name, a part with no design, and a missing name or expression — without starting SolidCraft", async () => {
@@ -142,7 +142,7 @@ test("[A3] cad.parts.list reports every part folder with its gate state, preview
   mkdirSync(join(repo, "cad", "Not A Part"), { recursive: true });
   symlinkSync(join(repo, "cad", "plate"), join(repo, "cad", "alias"));
   const live = x.manager.liveCount();
-  const parts = x.service.listParts(repo);
+  const parts = await x.service.listParts(repo);
   expect(parts.map((p) => p.part)).toEqual(["bracket", "plate"]); // not the invalid name, not the link
   const ev = x.design("plate");
   expect(parts[1]).toMatchObject({ part: "plate", hasDesign: true, live: true, rev: ev.rev, preview: ev.preview, gate: { state: ev.gate.state } });

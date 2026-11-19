@@ -12,6 +12,7 @@ import { partRef } from "../../src/cadwork/partfolder";
 import { evaluateExpectations, lockedBlockSha, stampExpectations, type PartFile } from "../../src/cadwork/partfile";
 import { validateRules, type RulesRead } from "../../src/cadwork/rules";
 import { PLATE_EXPECTATIONS, RULES, approveCards, buildPlate, cleanupTemp, fakeCadSession, stopServices, tempDir, tempRepo, writeRules } from "../helpers/cad-work";
+import { NOT_MEASURED } from "../../src/session/cadwork-service";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 
 afterEach(async () => {
@@ -47,7 +48,9 @@ const failing = (i: GateInput) => evaluateGate(i).checks.filter((c) => c.hard &&
 describe("cad gate (evaluateGate)", () => {
   test("[A2] GateResult has exactly the spec's shape, and a part that matches everything passes", () => {
     const r = evaluateGate(input());
-    expect(Object.keys(r).sort()).toEqual(["checks", "staleBuild", "state", "warnings"]);
+    // `approvedBy` (A2 review item 10): who approved the numbers, present while an approval is in force.
+    expect(Object.keys(r).sort()).toEqual(["approvedBy", "checks", "staleBuild", "state", "warnings"]);
+    expect(r.approvedBy).toBe(LOCK.approvedBy);
     expect(r.state).toBe("pass");
     expect(r.staleBuild).toBe(false);
     expect(r.needsAdoption).toBeUndefined();
@@ -376,18 +379,34 @@ describe("cad gate (the refresh, against the fake)", () => {
     expect(other.openCards()).toEqual([]);
   });
 
-  test("[A2] gateFromDisk judges the stored measurement without starting SolidCraft, and flags a stale build", async () => {
+  test("[A2] review 6: numbers stored in part.json are never a pass — a part not measured in this session is unverified, whatever `measured` says", async () => {
     const repo = tempRepo();
     const x = await buildPlate(repo, { cli: CLI });
     const ref = partRef(repo, "plate");
     const sha = x.manager.status(ref)!.scriptSha;
-    await x.service.refreshStatus();
-    const live = x.manager.liveCount();
-    expect(x.service.gateFromDisk(ref, sha)).toMatchObject({ state: "pass", staleBuild: false });
-    expect(x.service.gateFromDisk(ref, "a-different-script").state).toBe("unverified");
+    expect(x.gate.state).toBe("pass"); // live, measured now: a real pass
+    const good = JSON.parse(readFileSync(x.partJson, "utf8")).measured;
+    // The reviewer's repro: break the plate (the live gate fails)…
+    await x.tools.undo!({});
+    expect((await x.check()).state).toBe("fail");
+    // …then put the earlier GOOD measurement back into part.json, as Bash could, with the current script's sha.
     const file = JSON.parse(readFileSync(x.partJson, "utf8"));
-    writeFileSync(x.partJson, JSON.stringify({ ...file, measured: { ...file.measured, solidcraft: "0.43.0" } }, null, 2) + "\n");
-    expect(x.service.gateFromDisk(ref, sha).staleBuild).toBe(true);
-    expect(x.manager.liveCount()).toBe(live);
+    writeFileSync(x.partJson, JSON.stringify({ ...file, measured: { ...good, scriptSha: x.manager.status(ref)!.scriptSha } }, null, 2) + "\n");
+    const live = x.manager.liveCount();
+    for (const script of [x.manager.status(ref)!.scriptSha, sha, "a-different-script", undefined]) {
+      const g = x.service.gateFromDisk(ref, script);
+      expect(g.state).toBe("unverified");
+      expect(g.checks.find((c) => c.id === "measured")).toMatchObject({ ok: false, measured: NOT_MEASURED });
+      expect(g.checks.some((c) => c.id === "volume")).toBe(false); // the stored numbers are not even compared
+    }
+    expect(x.manager.liveCount()).toBe(live); // and it started nothing
+    // A parts list says the same of a part whose process is not up, and refreshes one that is.
+    const listed = await x.service.listParts(repo);
+    expect(listed.find((p) => p.part === "plate")!.gate.state).toBe("fail"); // live: measured again, the forged numbers ignored
+    await stopServices();
+    const cold = fakeCadSession(repo, { resolveCli: () => ({ path: CLI, source: "env" }) }, "sess_cold", { expectations: "manual" });
+    const coldList = await cold.service.listParts(repo);
+    expect(coldList.find((p) => p.part === "plate")).toMatchObject({ live: false, gate: { state: "unverified" } });
+    expect(cold.manager.liveCount()).toBe(0);
   });
 });

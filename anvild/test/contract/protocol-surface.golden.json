@@ -48,6 +48,7 @@
     "budget",
     "cad.design",
     "cad.design.refresh",
+    "cad.expectations.confirm",
     "cad.expectations.request",
     "cad.expectations.resolved",
     "cad.expectations.respond",
