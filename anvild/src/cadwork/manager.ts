@@ -25,7 +25,7 @@
  * first for a job queued with `refreshFirst` (what `forceRefresh()` does). With no job installed —
  * this phase — all of that is a no-op.
  */
-import { copyFileSync, mkdirSync, statSync } from "node:fs";
+import { copyFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSolidcraftCli } from "../solidcraft/binary";
 import {
@@ -38,7 +38,7 @@ import {
   type McpSpawn,
   type McpToolResult,
 } from "./mcp-client";
-import { ensureCadExcludes, type PartRef } from "./partfolder";
+import { assertPartFolderSafe, ensureCadExcludes, type PartRef } from "./partfolder";
 import { CACHE_DIR, DESIGN_FILE, DISK_CONFLICT_REASON, formatNumber, readDesignFile, writeScript, type PoststepFs } from "./poststep";
 
 export const DEFAULT_MAX_PROCS = 4;
@@ -54,7 +54,7 @@ export const UNREPLAYABLE_FILE = "design.unreplayable.json";
 const SNAPSHOT_ARGS = { measure: false, sketches: false, timeline: "summary", bodies: "names" } as const;
 const DEPTH_ARGS = { measure: false, sketches: false, timeline: false, bodies: false } as const;
 
-export type CadErrorCode = "unavailable" | "format" | "process" | "timeout" | "rpc" | "script" | "shutdown";
+export type CadErrorCode = "unavailable" | "format" | "process" | "timeout" | "rpc" | "script" | "shutdown" | "unsafe";
 
 /** A request that could not be carried out (as opposed to a tool answering `isError`). */
 export class CadError extends Error {
@@ -226,7 +226,6 @@ export class CadManager {
   private readonly parts = new Map<string, PartRec>();
   private readonly slots = new Set<object>();
   private waiters: (() => void)[] = [];
-  private readonly localFormats = new Map<string, Promise<number | undefined>>();
   private readonly excluded = new Set<string>();
   private readonly listeners = new Set<(e: CadManagerEvent) => void>();
   private refreshJob?: RefreshJob;
@@ -542,56 +541,29 @@ export class CadManager {
     return [cli, "mcp", "--headless", "--compact", "--allow-path", dir, "--require-allow-path"];
   }
 
-  /** The design format this binary writes, learned once per binary by exporting an empty design. */
-  private localFormat(cli: string, dir: string): Promise<number | undefined> {
-    let stamp = "";
-    try {
-      stamp = String(statSync(cli).mtimeMs);
-    } catch {
-      /* not a plain file path — key on the path alone */
-    }
-    const key = `${cli}\n${stamp}`;
-    let p = this.localFormats.get(key);
-    if (!p) {
-      p = (async () => {
-        let probe: McpClient | undefined;
-        try {
-          probe = await McpClient.start({ cmd: this.baseCmd(cli, dir), extraEnv: this.spawnEnv(), spawn: this.opts.spawn, clock: this.clock });
-          const r = await probe.callTool("execute", { command: "timeline.export_script", params: {} }, this.requestTimeoutMs);
-          return formatNumber(r.json?.script);
-        } catch {
-          return undefined;
-        } finally {
-          await probe?.close().catch(() => undefined);
-        }
-      })();
-      this.localFormats.set(key, p);
-      void p.then((n) => {
-        if (n === undefined) this.localFormats.delete(key); // could not learn it: ask again next time
-      });
-    }
-    return p;
-  }
-
   private async start(rec: PartRec, disk: ReturnType<typeof readDesignFile>, notes: string[]): Promise<void> {
     const { ref } = rec;
     const cli = this.resolveCli();
     if (!cli) throw new CadError("unavailable", "SolidCraft is not installed on this machine (no solidcraft-cli found)");
+    // Never start in (or create) a folder that is, or sits behind, a symbolic link out of the repo.
+    this.assertSafe(ref);
     mkdirSync(ref.dir, { recursive: true });
+    this.assertSafe(ref);
     if (!this.excluded.has(ref.worktree)) {
       if (ensureCadExcludes(ref.worktree) !== undefined) this.excluded.add(ref.worktree);
     }
 
     // Anvil enforces the format number itself: SolidCraft does not check `about.format` on a script.
-    const designFormat = formatNumber(disk.script);
-    if (designFormat !== undefined) {
-      const local = await this.localFormat(cli.path, ref.dir);
-      if (local !== undefined && designFormat > local) {
-        throw new CadError(
-          "format",
-          `${OLDER_SOLIDCRAFT}: cad/${ref.part}/design.json is format ${designFormat} and this build reads up to ${local}. Update SolidCraft on this machine; the file was not touched.`,
-        );
-      }
+    // Fail closed: a script that parses but does not say which format it is cannot be checked, so
+    // it is refused before anything is started. (A file that is not a script at all — not JSON, no
+    // `commands` — cannot be replayed by any build; it takes the replay-failure path below.)
+    const designFormat = disk.script ? formatNumber(disk.script) : undefined;
+    if (disk.script && designFormat === undefined) {
+      throw new CadError(
+        "format",
+        `cad/${ref.part}/design.json does not say which SolidCraft format it is (\`about.format\` is missing or is not a number), so it cannot be opened safely. ` +
+          `Restore the file from git; it was not touched.`,
+      );
     }
 
     const common = { extraEnv: this.spawnEnv(), spawn: this.opts.spawn, clock: this.clock };
@@ -610,6 +582,27 @@ export class CadManager {
       }
     }
     if (!client) client = await McpClient.start({ cmd: base, ...common });
+    // The build's own format number comes from THIS process's script export — no second process,
+    // and no way to skip the check: if the number cannot be learned, the design is not opened.
+    if (designFormat !== undefined) {
+      let local: number | undefined;
+      try {
+        const r = await client.callTool("execute", { command: "timeline.export_script", params: {} }, this.requestTimeoutMs);
+        local = r.isError ? undefined : formatNumber(r.json?.script);
+      } catch {
+        local = undefined;
+      }
+      if (local === undefined || designFormat > local) {
+        client.kill();
+        throw new CadError(
+          "format",
+          local === undefined
+            ? `could not learn which design format this machine's SolidCraft reads, so cad/${ref.part}/design.json (format ${designFormat}) was not opened. The file was not touched.`
+            : `${OLDER_SOLIDCRAFT}: cad/${ref.part}/design.json is format ${designFormat} and this build reads up to ${local}. Update SolidCraft on this machine; the file was not touched.`,
+        );
+      }
+    }
+
     if (replayFailure) {
       // Keep the file that did not replay: the first successful change will overwrite design.json.
       try {
@@ -638,6 +631,14 @@ export class CadManager {
     // `--in` starts even when features fail, so read the timeline straight away.
     await this.snapshot(rec);
     if (rec.featureErrors.length) notes.push(this.featureNote(rec));
+  }
+
+  private assertSafe(ref: PartRef): void {
+    try {
+      assertPartFolderSafe(ref);
+    } catch (e) {
+      throw new CadError("unsafe", e instanceof Error ? e.message : String(e));
+    }
   }
 
   private onExit(rec: PartRec, client: McpClient): void {

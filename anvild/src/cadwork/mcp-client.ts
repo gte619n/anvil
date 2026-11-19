@@ -312,7 +312,7 @@ export class McpClient {
           ? this.clock.setTimeout(() => {
               if (!this.waiting.delete(id)) return;
               const what = method === "tools/call" ? `\`${(params as any)?.name}\`` : method;
-              this.killedBecause = `SolidCraft did not answer ${what} within ${Math.round(timeoutMs / 1000)} s and was stopped`;
+              this.killedBecause = `SolidCraft did not answer ${what} within ${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)} s` : `${timeoutMs} ms`} and was stopped`;
               const tail = this.stderrTail();
               this.kill();
               reject(new McpTimeoutError(tail ? `${this.killedBecause}: ${tail}` : this.killedBecause, timeoutMs, tail));

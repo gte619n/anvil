@@ -3,7 +3,7 @@
  * tagged A1). Real manager, the fake SolidCraft as its binary, a fake clock where time matters.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   BATCH_TIMEOUT_MS,
@@ -18,7 +18,7 @@ import {
   maxProcsFromEnv,
   type CadManagerEvent,
 } from "../../src/cadwork/manager";
-import { BadPartName, CAD_EXCLUDE_LINES, PART_NAME_RE, ensureCadExcludes, gitToplevel, isValidPartName, listParts, partRef, type PartRef } from "../../src/cadwork/partfolder";
+import { BadPartName, UnsafePartFolder, CAD_EXCLUDE_LINES, PART_NAME_RE, ensureCadExcludes, gitToplevel, isValidPartName, listParts, partRef, type PartRef } from "../../src/cadwork/partfolder";
 import { DISK_CONFLICT_REASON, designFileText, scriptSha } from "../../src/cadwork/poststep";
 import { BOX, FakeClock, cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempDir, tempRepo, until, writeDesign } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT, REFERENCE_PLATE } from "../helpers/fake-solidcraft";
@@ -496,17 +496,90 @@ describe("cad manager", () => {
     expect(err.message).toContain("format 99");
     expect(err.message).toContain("reads up to 58");
     expect(designBytes(ref)).toBe(bytes);
+    expect(existsSync(join(ref.dir, ".cache"))).toBe(false); // refused before anything was written
     expect(m.liveCount()).toBe(0);
     expect(((await m.open(partRef(repo, "bracket")).catch((e) => e)) as CadError).code).toBe("format");
-    // One probe (an empty design, no --in) answered for both parts; nothing was started with --in.
-    expect(log.cmds).toHaveLength(1);
-    expect(log.cmds[0]).not.toContain("--in");
-    // The same format replays, still without a second probe.
+    // The format is read from the process started for the part itself: one spawn per attempt, no
+    // separate probe process (the A1 review's finding: a failed probe used to skip the check).
+    expect(log.cmds).toHaveLength(2);
+    expect(log.cmds.every((c) => c.includes("--in"))).toBe(true);
+    await until(() => m.liveCount() === 0, "the refused processes to be gone");
+    // The same format replays.
     expect((await m.open(partRef(repo, "same"))).state.status).toBe("unverified");
-    expect(log.cmds.filter((c) => !c.includes("--in"))).toHaveLength(1);
+    expect(log.cmds).toHaveLength(3);
     // A build that reads a higher format accepts the file the older one refused.
     const newer = fakeManager({ extraEnv: { FAKE_SC_FORMAT: "59" } });
     expect((await newer.open(partRef(repo, "bracket"))).hasDesign).toBe(true);
+    // A build that ENFORCES the format itself (the fake's default) is refused the same way, not
+    // started empty as an unreplayable design.
+    const strict = fakeManager();
+    const strictErr = (await strict.open(ref).catch((e) => e)) as CadError;
+    expect(strictErr.code).toBe("format");
+    expect(strictErr.message).toContain("format 99");
+    expect(designBytes(ref)).toBe(bytes);
+  });
+
+  test("[A1] a design.json with a missing or non-numeric format is refused before anything starts, and a build that cannot report its format opens nothing", async () => {
+    const repo = tempRepo();
+    const log = recordingSpawn();
+    const m = fakeManager({ spawn: log.spawn, extraEnv: { FAKE_SC_NEWER: "warn" } });
+    writeDesign(repo, "noformat", [BOX()], { design: "noformat", version: "0.44.1" });
+    writeDesign(repo, "badformat", [BOX()], { design: "badformat", format: "latest", version: "0.44.1" });
+    for (const part of ["noformat", "badformat"]) {
+      const ref = partRef(repo, part);
+      const bytes = designBytes(ref);
+      const err = (await m.open(ref).catch((e) => e)) as CadError;
+      expect(err).toBeInstanceOf(CadError);
+      expect(err.code).toBe("format");
+      expect(err.message).toContain("does not say which SolidCraft format");
+      expect(designBytes(ref)).toBe(bytes);
+      expect(existsSync(join(ref.dir, ".cache"))).toBe(false);
+    }
+    expect(log.cmds).toEqual([]); // nothing was spawned for either
+    expect(m.liveCount()).toBe(0);
+    // A brand-new part has no file, so there is nothing to check and it opens.
+    expect((await m.open(partRef(repo, "fresh"))).hasDesign).toBe(false);
+
+    // A process that cannot say which format it writes: the design is not opened (fail closed).
+    writeDesign(repo, "ok", [BOX()]);
+    const mute = fakeManager({ extraEnv: { FAKE_SC_CRASH_ON: "timeline.export_script" } });
+    const err = (await mute.open(partRef(repo, "ok")).catch((e) => e)) as CadError;
+    expect(err.code).toBe("format");
+    expect(err.message).toContain("could not learn which design format");
+    expect(mute.liveCount()).toBe(0);
+  });
+
+  test("[A1] a symlinked cad folder or part folder is refused, and nothing is written outside the worktree", async () => {
+    const repo = tempRepo();
+    const outside = tempDir("anvil-cad-outside-");
+    mkdirSync(join(repo, "cad"), { recursive: true });
+    symlinkSync(outside, join(repo, "cad", "evil"));
+    // The reference itself is refused…
+    expect(() => partRef(repo, "evil")).toThrow(UnsafePartFolder);
+    expect(() => partRef(repo, "evil")).toThrow("symbolic link");
+    // …and so is a reference built before the link existed (the check is repeated at start).
+    const m = fakeManager();
+    const stale = { key: join(repo, "cad", "evil"), worktree: repo, part: "evil", dir: join(repo, "cad", "evil") };
+    const err = (await m.open(stale).catch((e) => e)) as CadError;
+    expect(err).toBeInstanceOf(CadError);
+    expect(err.code).toBe("unsafe");
+    expect(m.liveCount()).toBe(0);
+    expect(readdirSync(outside)).toEqual([]);
+
+    // Two names linked to one folder never share a design: the alias is refused.
+    await m.request(partRef(repo, "real"), { tool: "execute", args: { command: "solid.box", params: BOX().params }, kind: "mutate" });
+    symlinkSync(join(repo, "cad", "real"), join(repo, "cad", "alias"));
+    expect(() => partRef(repo, "alias")).toThrow(UnsafePartFolder);
+    expect(listParts(repo)).toEqual(["real"]);
+
+    // A symlinked `cad` folder: every part under it is refused, and nothing lands in its target.
+    const repo2 = tempRepo();
+    const outside2 = tempDir("anvil-cad-outside-");
+    symlinkSync(outside2, join(repo2, "cad"));
+    expect(() => partRef(repo2, "plate")).toThrow("cad/ folder is a symbolic link");
+    const stale2 = { key: join(repo2, "cad", "plate"), worktree: repo2, part: "plate", dir: join(repo2, "cad", "plate") };
+    expect(((await m.open(stale2).catch((e) => e)) as CadError).code).toBe("unsafe");
+    expect(readdirSync(outside2)).toEqual([]);
   });
 
   test("[A1] undo and redo revert one agent request, however many SolidCraft steps it was", async () => {

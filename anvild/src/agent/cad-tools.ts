@@ -13,8 +13,8 @@
  *    a download card.
  *
  * NOT exposed: SolidCraft's own `open`, `save`, `export`, `new_design`, `crash_reports` and its
- * bridged tools — and `execute` / `batch` refuse the commands that would do the same thing behind
- * the daemon's back (see `refusedCommand`).
+ * bridged tools. `execute` / `batch` are DEFAULT-DENY: only the command ids in the allow-list
+ * (`./cad-command-allow.ts`) run, and no step may carry a path, a file name or an address.
  *
  * Later phases add their tools to `cadTools()`: `record_expectations`, `propose_expectations`,
  * `request_dimensions`, `check_part` (A2), `import_reference`, `release_part`, `report_gap` (A4).
@@ -27,7 +27,10 @@ import type { CadManager, CadReply, PartState } from "../cadwork/manager";
 import type { McpToolResult } from "../cadwork/mcp-client";
 import { EXPORTS_DIR, listParts, partRef, type PartRef } from "../cadwork/partfolder";
 import { DESIGN_FILE } from "../cadwork/poststep";
+import { refusedStep } from "./cad-command-allow";
 import { CAD_MCP_SERVER_NAME } from "./cad-tool-ids";
+
+export { CAD_COMMAND_ALLOW, isAllowedCommand, refusedCommand, refusedStep } from "./cad-command-allow";
 
 export { CAD_MCP_SERVER_NAME, CAD_MUTATING_TOOL_IDS, CAD_READ_ONLY_TOOL_IDS, CAD_TOOL_IDS } from "./cad-tool-ids";
 
@@ -51,54 +54,6 @@ interface ToolOut {
 }
 const ok = (text: string): ToolOut => ({ content: [{ type: "text", text }] });
 const fail = (text: string): ToolOut => ({ content: [{ type: "text", text }], isError: true });
-
-/** SolidCraft tools the agent must never reach, by any route. */
-const HIDDEN_TOOLS = new Set(["open", "save", "export", "new_design", "crash_reports"]);
-
-/**
- * Why `execute` / `batch` will not run this command, or undefined when it may run. The list was
- * read off the real binary (`list_commands {filter:"file."}`, SolidCraft 0.44.1): every `file.*`
- * command saves, opens, exports, imports, moves or deletes a file, so the whole prefix is closed —
- * a command a future release adds there is refused until someone decides otherwise.
- */
-export function refusedCommand(id: unknown): string | undefined {
-  const c = String(id ?? "").trim().toLowerCase();
-  if (HIDDEN_TOOLS.has(c)) return `\`${c}\` is not available here: the daemon owns the design's files (design.json is written after every change; use export_part to export)`;
-  if (c === "file.insert_step") return "`file.insert_step` is reserved for import_reference, which is not available yet; a reference body cannot be imported in this version";
-  if (c.startsWith("file.")) return `\`${c}\` is not available here: the daemon owns the design's files (design.json is written after every change; use export_part to export)`;
-  if (c.startsWith("settings.")) return `\`${c}\` is not available here: it changes SolidCraft's own settings on this machine`;
-  return undefined;
-}
-
-/** Check one command and anything it wraps (`sketch.draw.dimensioned` carries a nested command). */
-function refusedStep(command: unknown, params: unknown, depth = 0): string | undefined {
-  const why = refusedCommand(command);
-  if (why) return why;
-  if (String(command).trim().toLowerCase() === "timeline.export_script" && params && typeof params === "object" && (params as Record<string, unknown>).path !== undefined) {
-    return "`timeline.export_script` may not take a `path` here: the daemon writes design.json itself";
-  }
-  if (depth > 6 || !params || typeof params !== "object") return undefined;
-  for (const v of Object.values(params as Record<string, unknown>)) {
-    if (!v || typeof v !== "object") continue;
-    const inner = v as Record<string, unknown>;
-    if (typeof inner.command === "string") {
-      const nested = refusedStep(inner.command, inner.params, depth + 1);
-      if (nested) return nested;
-    }
-    if (Array.isArray(v)) {
-      for (const item of v) {
-        if (item && typeof item === "object" && typeof (item as Record<string, unknown>).command === "string") {
-          const nested = refusedStep((item as Record<string, unknown>).command, (item as Record<string, unknown>).params, depth + 1);
-          if (nested) return nested;
-        }
-      }
-    }
-  }
-  if (typeof (params as Record<string, unknown>).command === "string") {
-    return refusedStep((params as Record<string, unknown>).command, (params as Record<string, unknown>).params, depth + 1);
-  }
-  return undefined;
-}
 
 const stateLine = (part: string, s: PartState): string => `cad/${part} is in a FAILED state: ${s.reason}`;
 
@@ -300,11 +255,14 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
         guarded(async () => {
           const ref = selected();
           // The daemon owns paths: the picture must be INSIDE the part folder (symlinks resolved).
-          if (isAbsolute(a.reference)) return fail("compare_picture: `reference` is a file name inside the part folder, not an absolute path");
+          // One answer for every refusal, so the tool cannot be used to learn which files exist.
+          const refuse = fail(`compare_picture: \`reference\` must name an existing picture inside cad/${ref.part}/ (for example "refs/photo.png")`);
+          if (isAbsolute(a.reference)) return refuse;
           const abs = resolve(ref.dir, a.reference);
-          if (!existsSync(abs)) return fail(`compare_picture: cad/${ref.part}/${a.reference} does not exist`);
+          if (abs !== ref.dir && !abs.startsWith(ref.dir + "/")) return refuse;
+          if (!existsSync(abs)) return refuse;
           const real = realpathSync(abs);
-          if (real !== ref.dir && !real.startsWith(ref.dir + "/")) return fail("compare_picture: `reference` must be inside the part folder");
+          if (real !== ref.dir && !real.startsWith(ref.dir + "/")) return refuse;
           return replyContent(ref, await deps.manager.request(ref, { tool: "compare_picture", args: { ...clean(a), reference: real }, kind: "read" }));
         }),
     ),

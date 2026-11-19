@@ -8,7 +8,7 @@
  * A part is addressed by NAME only. Nothing in the CAD tools takes a path from the agent: the name
  * is checked against `PART_NAME_RE` and every path is built here.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export const PART_NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -41,12 +41,54 @@ export interface PartRef {
   dir: string;
 }
 
-/** Build a part's reference. Throws `BadPartName` for anything that is not a plain part name. */
+/** `cad` or `cad/<part>` is a symlink (or resolves somewhere else): the part would live outside the worktree. */
+export class UnsafePartFolder extends Error {
+  constructor(part: string, what: string) {
+    super(`cad/${part} cannot be used: ${what}. A part folder must be a real folder inside this repo's cad/ folder, not a link.`);
+    this.name = "UnsafePartFolder";
+  }
+}
+
+const isSymlink = (p: string): boolean => {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false; // does not exist yet
+  }
+};
+
+/**
+ * Refuse a part whose folder is not really `<realpath(worktree)>/cad/<part>`: a symlinked `cad`, a
+ * symlinked `cad/<part>`, or anything that resolves elsewhere. Without this, `ln -s /outside
+ * cad/evil` would have the daemon and SolidCraft read and write outside the worktree, and two names
+ * linked to one folder would run two processes on one design.json. Called when a reference is built
+ * and again immediately before a process is started.
+ */
+export function assertPartFolderSafe(ref: Pick<PartRef, "worktree" | "part" | "dir">): void {
+  const cad = join(ref.worktree, CAD_DIR);
+  if (isSymlink(cad)) throw new UnsafePartFolder(ref.part, "this repo's cad/ folder is a symbolic link");
+  if (isSymlink(ref.dir)) throw new UnsafePartFolder(ref.part, "it is a symbolic link");
+  if (existsSync(ref.dir)) {
+    let real: string;
+    try {
+      real = realpathSync(ref.dir);
+    } catch {
+      throw new UnsafePartFolder(ref.part, "its real location could not be read");
+    }
+    if (real !== join(ref.worktree, CAD_DIR, ref.part)) throw new UnsafePartFolder(ref.part, "it resolves to a folder outside this repo's cad/ folder");
+    if (!lstatSync(ref.dir).isDirectory()) throw new UnsafePartFolder(ref.part, "it is not a folder");
+  }
+}
+
+/** Build a part's reference. Throws `BadPartName` for anything that is not a plain part name, and
+ *  `UnsafePartFolder` when the folder is (or sits behind) a symbolic link. */
 export function partRef(worktree: string, part: unknown): PartRef {
   if (!isValidPartName(part)) throw new BadPartName(part);
   const root = realpathSync(worktree);
   const dir = join(root, CAD_DIR, part);
-  return { key: dir, worktree: root, part, dir };
+  const ref = { key: dir, worktree: root, part, dir };
+  assertPartFolderSafe(ref);
+  return ref;
 }
 
 /** The part folders that exist under `<worktree>/cad/` (valid names only), sorted. */

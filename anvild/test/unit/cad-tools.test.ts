@@ -12,8 +12,11 @@ import {
   CAD_READ_ONLY_TOOL_IDS,
   CAD_TOOL_IDS,
   buildCadToolsServer,
+  CAD_COMMAND_ALLOW,
   cadTools,
+  isAllowedCommand,
   refusedCommand,
+  refusedStep,
 } from "../../src/agent/cad-tools";
 import { isReadOnly } from "../../src/agent/danger-list";
 import { PermissionBroker, makePreToolUseHook } from "../../src/agent/permissions";
@@ -189,7 +192,7 @@ describe("anvil_cad tools", () => {
       expect(refusedCommand(id)).toBeString();
     }
     expect(refusedCommand("file.insert_step")).toContain("import_reference");
-    for (const fine of ["solid.box", "parameters.add", "parameters.change", "sketch.create", "inspect.interference", "timeline.export_script", "profile.save", "inspect.measure"]) {
+    for (const fine of ["solid.box", "parameters.add", "parameters.change", "sketch.create", "inspect.interference", "timeline.export_script", "inspect.measure"]) {
       expect(refusedCommand(fine)).toBeUndefined();
     }
 
@@ -333,6 +336,125 @@ describe("anvil_cad tools", () => {
     expect(png.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     expect(shot.json).toMatchObject({ width: 32, height: 24, path: null });
     expect(readdirSync(join(repo, "cad", "plate")).filter((f) => f.endsWith(".png"))).toEqual([]); // nothing written
+  });
+
+  test("[A1] execute and batch are default-deny: only allow-listed command ids run, and a new unknown id is refused", async () => {
+    // Everything the reference plate and the fake's command table use is allowed…
+    for (const step of REFERENCE_PLATE) expect(refusedStep(step.command, step.params)).toBeUndefined();
+    for (const fine of ["solid.sweep", "surface.loft", "construct.plane.offset", "model.faces", "view.pick", "view.front", "material.assign", "parameters.rename", "timeline.suppress", "inspect.clearance"]) {
+      expect(isAllowedCommand(fine)).toBe(true);
+    }
+    // …and everything the A1 review reached is not: hidden open/recover, imports, exports, plugins,
+    // diagnostics, settings, whole families a part does not need, and ids no build has yet.
+    const reached = [
+      "doc.open", "doc.recover", "doc.recovery_list", "component.insert_design", "component.relink", "component.extract", "sketch.insert_dxf", "sketch.insert_svg",
+      "sketch.export_dxf", "canvas.insert", "pointcloud.insert", "parameters.export", "parameters.import", "library.export", "sheet.export_dxf",
+      "sheet.export_bend_table", "motion.export", "motion.export_animation", "render.export", "plugin.install", "plugin.run", "plugin.inspect",
+      "diagnostics.report_issue", "diagnostics.crash_test", "settings.profile.import", "timeline.add", "inspect.compare_picture", "body.print_face",
+      "future.thing", "solidcraft2.anything", "sketch", "", "solid.", ".box",
+    ];
+    for (const id of reached) {
+      expect(isAllowedCommand(id)).toBe(false);
+      expect(refusedCommand(id)).toBeString();
+    }
+    expect(refusedCommand("future.thing")).toContain("`future.thing`"); // the message names the command
+    // The table is one reviewable list: every entry is a family with `*` (+ exceptions) or an explicit list.
+    expect(CAD_COMMAND_ALLOW.length).toBeGreaterThan(10);
+    expect(CAD_COMMAND_ALLOW.map((f) => f.family)).not.toContain("file");
+    for (const f of CAD_COMMAND_ALLOW) expect("only" in f ? f.only.length > 0 : f.allow === "*").toBe(true);
+
+    const { manager, requests } = recordingManager();
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    await tools.open_part!({ part: "plate" });
+    for (const command of ["future.thing", "doc.open", "plugin.run", "diagnostics.crash_test"]) {
+      const r = await tools.execute!({ command, params: {} });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain(command);
+      const b = await tools.batch!({ commands: [BOX(), { command, params: {} }] });
+      expect(b.isError).toBe(true);
+      expect(b.text).toContain("step 2");
+    }
+    expect(requests).toEqual([]); // none of it reached SolidCraft
+  });
+
+  test("[A1] no step may carry a path, a file name or an address, at any depth", async () => {
+    const pathy: [string, unknown][] = [
+      ["timeline.export_script", { path: "x.json" }],
+      ["solid.box", { length: 1, width: 1, height: 1, PATH: "x" }],
+      ["solid.box", { length: 1, options: { deep: [{ file: "a.step" }] } }],
+      ["solid.box", { filename: "a" }],
+      ["solid.box", { url: "example.com/x" }],
+      ["solid.box", { dir: "out" }],
+      ["solid.box", { out: "x" }],
+      ["solid.box", { output: "x" }],
+      ["solid.extrude", { reference: "photo.png" }],
+      ["sketch.text", { text: "hi", font: "/Library/Fonts/Arial.ttf" }],
+      ["sketch.text", { text: "hi", font: "~/Fonts/a.ttf" }],
+      ["sketch.text", { text: "hi", font: "%APPDATA%\\a.ttf" }],
+      ["solid.box", { name: "../../etc" }],
+      ["solid.box", { name: "https://example.com/a" }],
+      ["solid.box", { name: "file:x" }],
+      ["solid.sweep", { profile: "s1", path: "/tmp/curve" }], // a geometry key is still value-checked
+      ["sketch.draw.dimensioned", { command: "sketch.rectangle.center", params: { center: [0, 0], corner: [1, 1], path: "x" } }],
+    ];
+    for (const [command, params] of pathy) expect(refusedStep(command, params)).toBeString();
+    // Numbers under those names are geometry (an axis direction), and a sweep's `path` is a curve.
+    const fine: [string, unknown][] = [
+      ["solid.revolve", { axis: { origin: [0, 0, 0], dir: [0, 0, 1] } }],
+      ["view.pick", { rays: [{ origin: [0, 0, 0], dir: [1, 0, 0] }], all: true }],
+      ["solid.sweep", { profile: "Sketch1", path: ["l1", "l2"] }],
+      ["solid.pipe", { path: ["l1"], diameter: 4 }],
+      ["solid.box", { length: "L/2 - inset", width: 1, height: 1, name: "Box" }],
+      ["solid.pattern.rectangular", { features: ["Hole"], dir1: [-1, 0, 0], count1: 2, spacing1: "L - 2*inset" }],
+    ];
+    for (const [command, params] of fine) expect(refusedStep(command, params)).toBeUndefined();
+
+    const { manager, requests } = recordingManager();
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    await tools.open_part!({ part: "plate" });
+    const r = await tools.execute!({ command: "solid.box", params: { length: 1, width: 1, height: 1, path: "cad/plate/design.json" } });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("the daemon owns every path");
+    expect((await tools.batch!({ commands: [{ command: "solid.box", params: { nested: { file: "x" } } }] })).isError).toBe(true);
+    expect(requests).toEqual([]);
+  });
+
+  test("[A1] bookkeeping bypasses are refused: edit.undo, edit.redo, checkpoints, tool names as batch steps, engine.commands", async () => {
+    const { manager, requests } = recordingManager();
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    await tools.open_part!({ part: "plate" });
+    for (const command of ["edit.undo", "edit.redo", "edit.checkpoint", "edit.restore_checkpoint", "edit.repeat"]) {
+      const r = await tools.execute!({ command, params: {} });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("undo and redo tools");
+    }
+    for (const step of ["undo", "redo", "set_parameter", "measure", "save"]) {
+      expect((await tools.batch!({ commands: [{ command: step, params: { name: "L", value: 1 } }] })).isError).toBe(true);
+    }
+    expect((await tools.batch!({ commands: [{ command: "set_parameter", params: { name: "L", value: 1 } }] })).text).toContain("parameters.change");
+    const all = await tools.execute!({ command: "engine.commands", params: {} });
+    expect(all.isError).toBe(true);
+    expect(all.text).toContain("list_commands");
+    expect((await tools.execute!({ command: "engine.describe", params: { id: "solid.box" } })).isError).toBe(true);
+    expect(requests).toEqual([]);
+  });
+
+  test("[A1] compare_picture gives one answer for every refusal, so it cannot be used to learn which files exist", async () => {
+    const repo = tempRepo();
+    const { manager, requests } = recordingManager();
+    const tools = callable(cadTools({ sessionId: "s", worktree: repo, manager, unavailable: () => undefined, offerFile: () => true }) as any);
+    await tools.open_part!({ part: "plate" });
+    mkdirSync(join(repo, "cad", "plate", "refs"), { recursive: true });
+    writeFileSync(join(repo, "secret.png"), "png");
+    symlinkSync(join(repo, "secret.png"), join(repo, "cad", "plate", "refs", "link.png"));
+    const texts = new Set<string>();
+    for (const reference of ["/etc/hosts", "/no/such/file", "../../secret.png", "../../no-such.png", "refs/link.png", "refs/missing.png"]) {
+      const r = await tools.compare_picture!({ reference });
+      expect(r.isError).toBe(true);
+      texts.add(r.text);
+    }
+    expect(texts.size).toBe(1);
+    expect(requests).toEqual([]);
   });
 
   test("[A1] compare_picture only reads a picture inside the part folder", async () => {

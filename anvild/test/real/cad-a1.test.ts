@@ -4,11 +4,12 @@
  * (`bun test/tools/phase-gate.ts A1 --require-real` sets it and fails on any skip).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isAllowedCommand, refusedCommand } from "../../src/agent/cad-command-allow";
 import { partRef } from "../../src/cadwork/partfolder";
 import { scriptSha } from "../../src/cadwork/poststep";
-import { cleanupTemp, fakeCadSession, stopServices, tempRepo, until, writeDesign } from "../helpers/cad-work";
+import { cleanupTemp, fakeCadSession, stopServices, tempDir, tempRepo, until, writeDesign } from "../helpers/cad-work";
 import { REFERENCE_PLATE, startFake } from "../helpers/fake-solidcraft";
 import { REAL, SOLIDCRAFT_CLI, hasSolidcraft } from "../helpers/real-tools";
 
@@ -171,4 +172,109 @@ describe("real SolidCraft through the manager", () => {
     expect(refused.isError).toBe(true);
     expect(refused.text).toContain("this machine's SolidCraft is older than the design");
   }, 180_000);
+
+  test.skipIf(!REAL)("[A1] real: every command id the binary reports is either allow-listed or refused, and refused commands leave the part folder untouched", async () => {
+    const repo = tempRepo("anvil-cad-real-");
+    const { tools, manager } = real(repo);
+    const ref = partRef(repo, "plate");
+    await tools.open_part!({ part: "plate" });
+    expect((await tools.batch!({ commands: REFERENCE_PLATE })).isError).toBe(false);
+    const dir = join(repo, "cad", "plate");
+    const designBefore = readFileSync(join(dir, "design.json"), "utf8");
+
+    // The binary's own list, read past the agent's tools (which refuse an unfiltered listing).
+    const listed = (await manager.request(ref, { tool: "list_commands", args: { fields: ["id", "params"] }, kind: "read" })).result.json as { id: string; params: string }[];
+    expect(listed.length).toBeGreaterThan(500);
+    const allowed = listed.filter((c) => isAllowedCommand(c.id));
+    const refused = listed.filter((c) => !isAllowedCommand(c.id));
+    for (const c of refused) expect(refusedCommand(c.id)).toBeString();
+    for (const c of allowed) expect(refusedCommand(c.id)).toBeUndefined();
+    expect(allowed.length).toBeGreaterThan(200);
+    expect(refused.length).toBeGreaterThan(200);
+    // No whole family the review named is reachable.
+    for (const family of ["file", "doc", "plugin", "diagnostics", "settings", "library", "canvas", "pointcloud", "render", "motion", "engine", "edit"]) {
+      expect(allowed.filter((c) => c.id.startsWith(family + "."))).toEqual([]);
+    }
+    // Allowed commands whose documentation mentions a path, file, folder, font or the clipboard:
+    // each was read and is geometry (a sweep's path curve, occurrence ids, timeline folders) or is
+    // covered by a parameter rule (a font file). A release that adds another one fails here until
+    // it has been read and either excepted in the table or added to this list.
+    const reviewed = [
+      "sketch.create", "sketch.spline.reverse", "sketch.text", "sketch.edit_text", "sketch.arc3d", "surface.sweep", "sketch.trim.path", "solid.sweep", "solid.pattern.path",
+      "solid.pipe", "construct.plane.offset", "construct.plane.at_angle", "construct.point.along_path", "construct.plane.along_path", "frame.end_cap", "component.activate",
+      "occurrence.properties", "occurrence.copy", "occurrence.move", "occurrence.align", "occurrence.reparent", "inspect.interference", "timeline.delete", "timeline.group",
+      "timeline.rename_group", "timeline.move_many", "timeline.suppress", "timeline.inspect", "timeline.export_script", "inspect.section",
+    ];
+    const mentions = allowed.filter((c) => /\b(path|file|url|folder|clipboard|font)\b/i.test(c.params ?? "")).map((c) => c.id);
+    expect(mentions.filter((id) => !reviewed.includes(id))).toEqual([]);
+
+    // The ids the review reached, each with the path that did the damage: all refused, nothing written.
+    const target = join(dir, "design.json");
+    const attempts: [string, Record<string, unknown>][] = [
+      ["doc.open", { path: join(dir, "design.json") }],
+      ["doc.recover", {}],
+      ["parameters.export", { path: target, format: "json" }],
+      ["parameters.export", { path: join(dir, "params.csv") }],
+      ["parameters.import", { path: target }],
+      ["sketch.export_dxf", { path: join(dir, "x.dxf") }],
+      ["sketch.insert_dxf", { path: join(dir, "x.dxf") }],
+      ["library.export", { path: join(dir, "lib.json") }],
+      ["component.insert_design", { path: target }],
+      ["plugin.inspect", { path: join(dir, "p.wasm") }],
+      ["plugin.run", { name: "x" }],
+      ["diagnostics.crash_test", {}],
+      ["diagnostics.report_issue", { title: "x" }],
+      ["edit.undo", {}],
+      ["edit.restore_checkpoint", { checkpoint: 1 }],
+      ["engine.commands", {}],
+      ["timeline.export_script", { path: join(dir, "script.json") }],
+      ["solid.box", { length: 1, width: 1, height: 1, path: target }],
+    ];
+    for (const [command, params] of attempts) {
+      const r = await tools.execute!({ command, params });
+      expect(r.isError).toBe(true);
+      const b = await tools.batch!({ commands: [{ command, params }] });
+      expect(b.isError).toBe(true);
+    }
+    for (const step of ["undo", "redo", "set_parameter", "save"]) {
+      expect((await tools.batch!({ commands: [{ command: step, params: { name: "L", value: 1, path: join(dir, "x.sc") } }] })).isError).toBe(true);
+    }
+    expect(readdirSync(dir).sort()).toEqual([".cache", "design.json"]);
+    expect(readFileSync(join(dir, "design.json"), "utf8")).toBe(designBefore);
+    expect(readdirSync(join(dir, ".cache"))).toEqual([]);
+    near((await tools.measure!({ summary: true })).json.total.volume_mm3, V80); // still the plate, still alive
+    // The undo stack is intact: one undo still reverts the whole batch.
+    expect((await tools.undo!({})).isError).toBe(false);
+    expect((await tools.measure!({ summary: true })).json.body_count).toBe(0);
+  }, 120_000);
+
+  test.skipIf(!REAL)("[A1] real: a symlinked part folder or cad folder is refused and nothing is written outside the worktree", async () => {
+    const repo = tempRepo("anvil-cad-real-");
+    const outside = tempDir("anvil-cad-real-outside-");
+    const { tools, manager } = real(repo);
+    mkdirSync(join(repo, "cad"), { recursive: true });
+    symlinkSync(outside, join(repo, "cad", "evil"));
+    const opened = await tools.open_part!({ part: "evil" });
+    expect(opened.isError).toBe(true);
+    expect(opened.text).toContain("symbolic link");
+    // With no part open, nothing runs; exporting the linked part is refused too.
+    expect((await tools.execute!({ command: "solid.box", params: { length: 1, width: 1, height: 1 } })).isError).toBe(true);
+    expect((await tools.export_part!({ part: "evil", formats: ["step"] })).isError).toBe(true);
+    expect(manager.liveCount()).toBe(0);
+    expect(readdirSync(outside)).toEqual([]);
+
+    // A real part still works, and an alias linked to it is refused (one folder, one process).
+    await tools.open_part!({ part: "plate" });
+    expect((await tools.execute!({ command: "solid.box", params: { length: 10, width: 10, height: 10 } })).isError).toBe(false);
+    symlinkSync(join(repo, "cad", "plate"), join(repo, "cad", "alias"));
+    expect((await tools.open_part!({ part: "alias" })).isError).toBe(true);
+    expect(manager.liveCount()).toBe(1);
+
+    const repo2 = tempRepo("anvil-cad-real-");
+    const outside2 = tempDir("anvil-cad-real-outside-");
+    symlinkSync(outside2, join(repo2, "cad"));
+    const other = real(repo2);
+    expect((await other.tools.open_part!({ part: "plate" })).isError).toBe(true);
+    expect(readdirSync(outside2)).toEqual([]);
+  }, 120_000);
 });

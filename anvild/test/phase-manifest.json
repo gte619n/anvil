@@ -151,7 +151,9 @@
             "cad manager > [A1] undo and redo revert one agent request, however many SolidCraft steps it was",
             "cad manager > [A1] the refresh hook runs after a change, is debounced in a burst, can be forced, and is a no-op when absent",
             "cad manager > [A1] shutdown stops every process and refuses new work",
-            "cad manager > [A1] with no binary the request fails as unavailable and nothing is spawned"
+            "cad manager > [A1] with no binary the request fails as unavailable and nothing is spawned",
+            "cad manager > [A1] a design.json with a missing or non-numeric format is refused before anything starts, and a build that cannot report its format opens nothing",
+            "cad manager > [A1] a symlinked cad folder or part folder is refused, and nothing is written outside the worktree"
           ]
         },
         {
@@ -199,7 +201,11 @@
             "anvil_cad tools > [A1] export_part writes into .cache/exports and offers one file card per file",
             "cadwork service > [A1] with no binary CAD is unavailable with a reason, and every tool refuses with it",
             "cadwork service > [A1] cad.status reports the version once the binary answers, and is broadcast only on change",
-            "cadwork service > [A1] only an ordinary session in a git repo, with the capability on, gets the anvil_cad server"
+            "cadwork service > [A1] only an ordinary session in a git repo, with the capability on, gets the anvil_cad server",
+            "anvil_cad tools > [A1] execute and batch are default-deny: only allow-listed command ids run, and a new unknown id is refused",
+            "anvil_cad tools > [A1] no step may carry a path, a file name or an address, at any depth",
+            "anvil_cad tools > [A1] bookkeeping bypasses are refused: edit.undo, edit.redo, checkpoints, tool names as batch steps, engine.commands",
+            "anvil_cad tools > [A1] compare_picture gives one answer for every refusal, so it cannot be used to learn which files exist"
           ]
         }
       ],
@@ -211,7 +217,9 @@
             "real SolidCraft through the manager > [A1] real: killing the process between two calls, the next call recovers the design",
             "real SolidCraft through the manager > [A1] real: editing design.json on disk then measuring reflects the edited file",
             "real SolidCraft through the manager > [A1] real: set_parameter refuses an unknown name, undo reverts a whole batch, and a broken feature marks the part failed",
-            "real SolidCraft through the manager > [A1] real: file commands never reach SolidCraft, exports land in .cache/exports, a screenshot is an image, a newer format is refused"
+            "real SolidCraft through the manager > [A1] real: file commands never reach SolidCraft, exports land in .cache/exports, a screenshot is an image, a newer format is refused",
+            "real SolidCraft through the manager > [A1] real: every command id the binary reports is either allow-listed or refused, and refused commands leave the part folder untouched",
+            "real SolidCraft through the manager > [A1] real: a symlinked part folder or cad folder is refused and nothing is written outside the worktree"
           ]
         }
       ]
