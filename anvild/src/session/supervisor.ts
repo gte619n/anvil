@@ -86,6 +86,7 @@ import { CLAUDE_TOKEN_KEY } from "../auth/store";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
 import { HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, buildHumanToolsServer } from "../agent/human-tools";
+import { TEST_MCP_SERVER_NAME, buildTestDaemonToolsServer } from "../agent/testdaemon-tools";
 import { isOrdinarySession } from "../agent/mcp-external";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
@@ -1850,7 +1851,9 @@ export class Supervisor {
             : isPlanner
               ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
               : hasBrowser
-                ? { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s) }
+                ? // …and the throwaway test daemon's tools (Phase C4). Their ids are deliberately NOT in
+                  // `allowedTools` below: every call goes through the permission hook.
+                  { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s), [TEST_MCP_SERVER_NAME]: buildTestDaemonToolsServer(this.mcp.browser!.testDaemons, s) }
                 : undefined;
       driver = new AgentDriver(
         s,

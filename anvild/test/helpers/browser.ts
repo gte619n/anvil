@@ -68,6 +68,17 @@ export function browserRig(opts: BrowserRigOptions = {}): McpRig {
       agentBrowserLauncher: () => {
         throw new Error("unexpected Chrome launch in a test");
       },
+      // …and no test may build a bundle or start a daemon unless it brings its own (fake) runner.
+      testDaemon: {
+        runner: {
+          build: async () => {
+            throw new Error("unexpected test-daemon build in a test");
+          },
+          spawn: () => {
+            throw new Error("unexpected test-daemon start in a test");
+          },
+        },
+      },
       ...opts.browser,
     },
   });

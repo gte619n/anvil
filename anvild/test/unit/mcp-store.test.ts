@@ -75,7 +75,7 @@ describe("McpIntegrationStore", () => {
       expect(() => store.add(echoInput({ key }))).toThrow();
     }
     expect(() => store.add(echoInput({ key: "anvil" }))).toThrow(/reserved/);
-    expect(RESERVED_MCP_KEYS).toEqual(["anvil", "anvil_team", "anvil_member", "anvil_planning", "anvil_cad", "anvil_human"]);
+    expect(RESERVED_MCP_KEYS).toEqual(["anvil", "anvil_team", "anvil_member", "anvil_planning", "anvil_cad", "anvil_human", "anvil_test"]);
     expect(store.list()).toEqual([]);
   });
 

@@ -113,7 +113,15 @@ export interface BrowserGateHooks {
   /** PHASE C4 — whether `browser_evaluate` may run: true only when the page is the session's own
    *  throwaway test daemon. Absent → `browser_evaluate` is always denied. */
   allowEvaluate?: (info: BrowserActionInfo) => boolean;
+  /** PHASE C4 — the origin (`http://127.0.0.1:<port>`, exactly) of the session's own running test
+   *  daemon. A page on it is the session's own: allowed without a site prompt, in every mode, and
+   *  never treated as a logged-in site. Compared by ORIGIN, so no other loopback port is covered. */
+  ownOrigin?: (sessionId: string) => string | undefined;
 }
+
+/** What the hard-stop policy is shown in place of the site of the session's own test daemon: not a
+ *  hostname, so it can never be on a logged-in list. */
+export const OWN_TEST_DAEMON_SITE = "(this session's test daemon)";
 
 export interface BrowserGateDeps {
   /** The fleet's allowed-sites list. */
@@ -179,6 +187,33 @@ export class BrowserGate {
     return this.deps.hooks.loggedInSites?.().includes(site) ?? false;
   }
 
+  /** Whether `url` is a page of the session's own running test daemon (Phase C4): same origin, exactly. */
+  private isOwn(sessionId: string, url: string | undefined): boolean {
+    const own = this.deps.hooks.ownOrigin?.(sessionId);
+    if (!own || !url) return false;
+    try {
+      return new URL(url).origin === own;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The session's test daemon was stopped (Phase C4). A page still showing it must be left before
+   * anything else — no prompt for the owner: it was the session's own page, and it is gone.
+   */
+  ownOriginGone(sessionId: string, origin: string): void {
+    const st = this.states.get(sessionId);
+    if (!st?.currentUrl || st.closing) return;
+    let on = false;
+    try {
+      on = new URL(st.currentUrl).origin === origin;
+    } catch {
+      on = false;
+    }
+    if (on) this.startClosing(st, "this session's test daemon was stopped, so the page that was showing it is dead");
+  }
+
   // ── before a call ───────────────────────────────────────────────────────────────────────────
 
   /** The kind gate registered with `registerMcpKindGate("browser", …)`. */
@@ -208,7 +243,7 @@ export class BrowserGate {
 
     if (st.hold) {
       // The owner may have allowed the site in Settings since the hold began.
-      if (st.hold.kind === "site" && this.siteAllowed(st, st.hold.site)) st.hold = undefined;
+      if (st.hold.kind === "site" && (this.siteAllowed(st, st.hold.site) || this.isOwn(ctx.session.id, st.hold.url))) st.hold = undefined;
       else return this.holdVerdict(ctx, st, rt.mode);
     }
 
@@ -239,7 +274,11 @@ export class BrowserGate {
 
     const current = st.currentUrl ? checkUrl(st.currentUrl) : undefined;
     const currentSite = current?.ok && "site" in current ? current.site : undefined;
-    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(currentSite ? { currentSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}) };
+    // The session's own test daemon is never a logged-in site: the hard-stop policy sees a name
+    // that is not a hostname in place of its site.
+    const onOwn = this.isOwn(ctx.session.id, st.currentUrl);
+    const shownSite = onOwn ? OWN_TEST_DAEMON_SITE : currentSite;
+    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(shownSite ? { currentSite: shownSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}) };
     const session = ctx.session;
 
     if (cls.cls === "script") {
@@ -282,6 +321,9 @@ export class BrowserGate {
       if (!target.ok) return deny(hasTarget ? target.reason : `that tab is on an address that is not allowed (${target.reason})`);
       if ("blank" in target) return { verdict: { kind: "allow", reason: "about:blank" } };
       const { site, url } = target;
+      // The session's own test daemon: no site prompt, in every mode; leaving a logged-in site for it
+      // is still the hard-stop policy's call.
+      if (this.isOwn(session.id, url)) return this.afterC3({ ...info, target: { site: OWN_TEST_DAEMON_SITE, url } }, { verdict: { kind: "allow", reason: "this session's own test daemon" } });
       if (!hasTarget && st.denied.has(site) && !this.siteAllowed(st, site)) return deny(`that tab is on ${site}, which the owner refused in this session`);
       if (mode === "headless" && this.loggedIn(site)) {
         return deny(`${site} is a logged-in site, and this machine's agent browser is running headless with a throwaway profile; it can only be opened in the headed browser, at the desk`);
@@ -306,7 +348,7 @@ export class BrowserGate {
 
     // Reads, inputs, housekeeping, and navigations with no target of their own (back, tab select or
     // close, a new empty tab). Where they lead is checked on the result.
-    return this.afterC3(info, { verdict: { kind: "allow", reason: currentSite ? `${currentSite} is an allowed site` : "no page is open on a site yet" } });
+    return this.afterC3(info, { verdict: { kind: "allow", reason: onOwn ? "this session's own test daemon" : currentSite ? `${currentSite} is an allowed site` : "no page is open on a site yet" } });
   }
 
   /** PHASE C3 HOOK: logged-in-site rules replace an allow here (see `BrowserGateHooks.actionPolicy`). */
@@ -412,11 +454,12 @@ export class BrowserGate {
       this.startClosing(st, `the page moved to an address that is not allowed (${where.reason})`);
       return { purge: true };
     }
-    if (mode === "headless" && this.loggedIn(where.site)) {
+    const own = this.isOwn(sessionId, where.url);
+    if (!own && mode === "headless" && this.loggedIn(where.site)) {
       this.startClosing(st, `the page moved to ${where.site}, a logged-in site that the headless browser may not open`);
       return { purge: true };
     }
-    if (this.siteAllowed(st, where.site)) {
+    if (own || this.siteAllowed(st, where.site)) {
       if (st.hold?.kind === "site") st.hold = undefined;
       return { purge: false };
     }

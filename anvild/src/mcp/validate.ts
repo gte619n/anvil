@@ -9,9 +9,9 @@ import type { McpIntegration, McpIntegrationKind, McpTransport } from "@protocol
  *  always splits unambiguously and a key can never collide with a daemon server (`anvil_team`, …). */
 export const MCP_KEY_RE = /^[a-z][a-z0-9]{1,23}$/;
 
-/** Keys the daemon's own in-process servers use (or will: `anvil_cad` is Track A's; `anvil_human` is the browser's hand-off, Phase C3). Never an
+/** Keys the daemon's own in-process servers use (or will: `anvil_cad` is Track A's; `anvil_human` is the browser's hand-off, Phase C3; `anvil_test` its throwaway test daemon, Phase C4). Never an
  *  integration key, whatever the grammar says. */
-export const RESERVED_MCP_KEYS: readonly string[] = ["anvil", "anvil_team", "anvil_member", "anvil_planning", "anvil_cad", "anvil_human"];
+export const RESERVED_MCP_KEYS: readonly string[] = ["anvil", "anvil_team", "anvil_member", "anvil_planning", "anvil_cad", "anvil_human", "anvil_test"];
 
 export const MCP_INTEGRATION_KINDS: readonly McpIntegrationKind[] = ["browser", "custom"];
 

@@ -274,7 +274,14 @@ export async function discoverSelfBaseUrl(opts: SelfBaseUrlOpts): Promise<string
   const runTailscale = opts.runTailscale ?? defaultRunTailscale;
   const probe = opts.probe ?? defaultProbe;
   const json = await runTailscale();
-  const dnsName = json ? parseTailscalePeers(json).find((p) => p.isSelf)?.dnsName : undefined;
+  // `tailscale` can print something that is not JSON (a login notice, a warning): that is "no name
+  // known", never an unhandled rejection in whoever asked for the URL (decision 25).
+  let dnsName: string | undefined;
+  try {
+    dnsName = json ? parseTailscalePeers(json).find((p) => p.isSelf)?.dnsName : undefined;
+  } catch {
+    dnsName = undefined;
+  }
   if (dnsName) {
     for (const base of [`https://${dnsName}`, `https://${dnsName}:${opts.port}`, `http://${dnsName}:${opts.port}`]) {
       if (await probe(base)) return base;

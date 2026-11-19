@@ -593,7 +593,9 @@ describe("Phase C3 acceptance: uploads and script evaluation, on every site", ()
 
   test("[C3] a script-evaluation call on a public site is denied — logged-in or not, unlocked or not, under bypass — and browser_run_code_unsafe always is", async () => {
     const s = await browserSession(rig, integration, { autonomy: "bypass" });
-    expect(browserOf(rig).hooks.allowEvaluate).toBeUndefined(); // Phase C4 sets it for the session's own test daemon
+    // Phase C4 sets the hook (evaluate on the session's own test daemon only); this session has none.
+    expect(typeof browserOf(rig).hooks.allowEvaluate).toBe("function");
+    expect(browserOf(rig).testDaemons.origin(s.id)).toBeUndefined();
     for (const url of ["https://plain.test/", "https://bank.test/", "https://open.test/checkout"]) {
       onPage(rig, s, url);
       const evalOut = await direct(rig, s, "browser_evaluate", { function: "() => document.cookie" });

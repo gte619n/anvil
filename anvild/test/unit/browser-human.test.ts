@@ -8,6 +8,7 @@ import { describe, test, expect, afterEach, beforeEach } from "bun:test";
 import type { McpIntegration } from "@protocol";
 import { BROWSER_SESSION_PROMPT, HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, humanTools } from "../../src/agent/human-tools";
 import { RESERVED_MCP_KEYS, keyProblem } from "../../src/mcp/validate";
+import { TEST_DAEMON_SESSION_PROMPT } from "../../src/agent/testdaemon-tools";
 import type { Session } from "../../src/session/session";
 import { addBrowser, browserOf, browserRig, browserSession, feedResult } from "../helpers/browser";
 import { callHook, echoInput, isPending, settle, type McpRig } from "../helpers/mcp";
@@ -142,11 +143,11 @@ describe("which sessions get it", () => {
   test("[C3] an ordinary session with the browser switched on gets the anvil_human server, its tool id and the browser paragraph in its system prompt; one without the browser gets none of them", async () => {
     const withBrowser = await browserSession(rig, integration);
     const d = driverOf(withBrowser);
-    expect(Object.keys(d.mcpServers ?? {}).sort()).toEqual(["anvil_human", "browser"]);
+    expect(Object.keys(d.mcpServers ?? {}).sort()).toEqual(["anvil_human", "anvil_test", "browser"]); // anvil_test: Phase C4's test daemon
     expect((d.mcpServers!.anvil_human as { type: string }).type).toBe("sdk");
     expect(d.extraAllowedTools).toEqual(["mcp__anvil_human__request_human"]);
     const prompt = d.systemPrompt().append!;
-    expect(prompt.endsWith(BROWSER_SESSION_PROMPT)).toBe(true);
+    expect(prompt.endsWith(BROWSER_SESSION_PROMPT + TEST_DAEMON_SESSION_PROMPT)).toBe(true); // Phase C4 adds its sentence to the paragraph
     // The one paragraph says the three things.
     expect(BROWSER_SESSION_PROMPT).toMatch(/bot check, a CAPTCHA/);
     expect(BROWSER_SESSION_PROMPT).toContain("mcp__anvil_human__request_human");

@@ -38,6 +38,7 @@ import {
 import { browserRuntimeCli, browserRuntimeProblem, installBrowserRuntime } from "./runtime";
 import { BrowserProxyManager, ownHosts, type BrowserProxyOptions, type ProxyFactory, type ProxyResolver } from "./proxy";
 import { BROWSER_SITES_FILE, resultFileLinks, toolResultText } from "./sites";
+import { TestDaemonService, type TestDaemonSeams } from "./testdaemon";
 import { classifyBrowserTool } from "./tools";
 import { AllowedSitesService, type BrowserFleetLink } from "./sites-sync";
 
@@ -90,6 +91,9 @@ export interface BrowserServiceDeps {
   hardStopTimeoutMs?: number;
   /** The per-file download limit (default 200 MB). */
   maxDownloadBytes?: number;
+  // ── Phase C4 ──
+  /** How the throwaway test daemon is built, started, probed and timed (test seams). */
+  testDaemon?: Partial<TestDaemonSeams>;
 }
 
 /** The entry "Add → Browser" creates. Every field but `label` and `enabled` is fixed by the preset. */
@@ -265,6 +269,8 @@ export class BrowserService {
   readonly sites: AllowedSitesService;
   /** PHASE C3: the logged-in sites and their unlock switches (hub-synced). */
   readonly loggedIn: LoggedInSitesService;
+  /** PHASE C4: each session's throwaway test daemon. */
+  readonly testDaemons: TestDaemonService;
   readonly gate: BrowserGate;
   private readonly shots = new Map<string, Shot>();
   /** Files each session asked Playwright to write by `filename` — not downloads. */
@@ -323,6 +329,33 @@ export class BrowserService {
       screenshot: (sessionId) => this.screenshot(sessionId, true),
       timeoutMs: deps.hardStopTimeoutMs,
     });
+    // Phase C4: the session's own test daemon. Its origin is the session's own page (no site prompt,
+    // never a logged-in site), and the only place `browser_evaluate` may run.
+    this.testDaemons = new TestDaemonService({
+      stateDir: deps.stateDir,
+      ports: {
+        proxyRunning: (sessionId) => this.proxies.running(sessionId),
+        registerTestDaemon: (sessionId, port) => this.registerTestDaemon(sessionId, port),
+        allowLoopbackPort: (sessionId, port) => this.allowLoopbackPort(sessionId, port),
+        revokeLoopbackPort: (sessionId, port) => this.revokeLoopbackPort(sessionId, port),
+      },
+      onStopped: (sessionId, origin) => this.gate.ownOriginGone(sessionId, origin),
+      notice: deps.notice,
+      ...deps.testDaemon,
+    });
+    this.hooks.ownOrigin = (sessionId) => this.testDaemons.origin(sessionId);
+    this.hooks.allowEvaluate = (info) => {
+      const sessionId = info.ctx.session.id;
+      const own = this.testDaemons.origin(sessionId);
+      const st = this.gate.state(sessionId);
+      // The TRACKED address of the current tab, and only when it is known: exactly this origin.
+      if (!own || !st.currentUrl || st.unknown !== undefined || st.hold || st.closing) return false;
+      try {
+        return new URL(st.currentUrl).origin === own;
+      } catch {
+        return false;
+      }
+    };
   }
 
   /** Register the preset, the kind gate, the result hook and the protected rule. Idempotent. */
@@ -330,6 +363,7 @@ export class BrowserService {
     if (this.started) return;
     this.started = true;
     attach(this);
+    this.testDaemons.reapOrphans(); // test daemons a crashed run of this daemon left behind
     this.unregister.push(() => detach(this), registerProtectedRule(this.protectedRule), registerProtectedRule(this.downloadsRule));
   }
 
@@ -340,6 +374,7 @@ export class BrowserService {
   stop(): void {
     for (const off of this.unregister.splice(0)) off();
     this.started = false;
+    this.testDaemons.stopAll(); // before the proxies go: revoke, kill, delete
     this.proxies.stop("the daemon is shutting down");
     this.sites.stop();
     this.loggedIn.stop();
@@ -508,6 +543,7 @@ export class BrowserService {
 
   /** The session's turn ended: anything left in its output folder that is a download is dealt with. */
   onTurnEnd(sessionId: string): void {
+    this.testDaemons.stop(sessionId, "the turn ended"); // Phase C4: a test daemon never outlives its turn
     const rt = this.runtimes.get(sessionId);
     if (!rt) return;
     const since = this.sweptAt.get(sessionId);
@@ -735,6 +771,7 @@ export class BrowserService {
 
   /** The session was reset, deleted or archived, or the browser was switched off for it. */
   forgetSession(sessionId: string): void {
+    this.testDaemons.stop(sessionId, "the session was reset, deleted or lost its browser");
     this.runtimes.delete(sessionId);
     this.proxies.closeSession(sessionId);
     this.gate.forget(sessionId);

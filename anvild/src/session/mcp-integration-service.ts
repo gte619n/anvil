@@ -37,7 +37,7 @@ export interface McpIntegrationServiceDeps {
    *  (its proxy, its allowed-sites list, its gate); otherwise nothing of it is created or written. */
   browserEnabled?: boolean;
   /** Test seams for the browser (fake desktop probe, resolver, …). */
-  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs" | "nodePath" | "npmPath" | "runtimeInstaller" | "agentBrowserLauncher" | "chromePath" | "hardStopTimeoutMs" | "maxDownloadBytes">>;
+  browser?: Partial<Pick<BrowserServiceDeps, "desktopProbe" | "resolver" | "commandExists" | "chromeInstalled" | "proxyFactory" | "onProxyDecision" | "selfHosts" | "fetchImpl" | "sitesIntervalMs" | "nodePath" | "npmPath" | "runtimeInstaller" | "agentBrowserLauncher" | "chromePath" | "hardStopTimeoutMs" | "maxDownloadBytes" | "testDaemon">>;
   /** Persist an image as an attachment of a session, returning its id (the agent browser's hard-stop
    *  and hand-off cards show a page screenshot). */
   saveImage?: (sessionId: string, mediaType: string, dataBase64: string) => string;

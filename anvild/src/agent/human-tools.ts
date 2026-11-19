@@ -29,6 +29,20 @@ export const BROWSER_SESSION_PROMPT =
   `Downloads land in \`.anvil-downloads/\` in your worktree; they are never run, and you must copy one out ` +
   `deliberately to use it.`;
 
+/**
+ * What a session's system prompt gains for the in-process servers it has: the browser paragraph with
+ * `anvil_human`, and one more sentence for each of the later phases' servers. `extra` maps a server
+ * name to its sentence (driver.ts passes the test daemon's, Phase C4).
+ */
+export function browserSessionPrompt(serverNames: readonly string[], extra: Readonly<Record<string, string>> = {}): string {
+  let out = serverNames.includes(HUMAN_MCP_SERVER_NAME) ? BROWSER_SESSION_PROMPT : "";
+  for (const [name, sentence] of Object.entries(extra)) {
+    if (!serverNames.includes(name)) continue;
+    out += out ? sentence : `\n\n${sentence.trimStart()}`;
+  }
+  return out;
+}
+
 /** The slice of a live session the hand-off touches. A real `Session` satisfies it. */
 export interface HumanSession {
   id: string;

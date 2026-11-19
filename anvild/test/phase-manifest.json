@@ -707,7 +707,91 @@
     },
     "C4": {
       "title": "throwaway test daemon",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/testdaemon-tools.test.ts",
+          "names": [
+            "the anvil_test server > [C4] the server is anvil_test with start_test_daemon {} and stop_test_daemon {}; the name is reserved, so no integration can take it",
+            "the anvil_test server > [C4] start_test_daemon returns {url} as JSON on its first line, says when an existing one is returned, and reports a refusal as an error result",
+            "the anvil_test server > [C4] stop_test_daemon stops this session's daemon and says whether there was one",
+            "the system prompt > [C4] a session with anvil_human and anvil_test gets the browser paragraph plus one sentence about the test daemon; without the servers it gets nothing"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-env.test.ts",
+          "names": [
+            "the environment > [C4] the test daemon's environment is exactly the ten listed variables, with ANVIL_HOST=127.0.0.1, the state and clones folders inside the new home, and nothing else",
+            "the environment > [C4] the web build's environment is PATH, TMPDIR, HOME and ANVIL_BUILD_OUT inside the temporary home — the worktree is not the output",
+            "which worktrees > [C4] a worktree that is not an Anvil checkout (no anvild/src/main.ts) is refused with a clear message; one without node_modules is told to install first",
+            "which worktrees > [C4] the port picker returns a free loopback port at or above 1024"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-selfurl.test.ts",
+          "names": [
+            "discoverSelfBaseUrl with unparsable tailscale output > [C4] non-JSON output from tailscale resolves — to the tailnet address when there is one, else undefined — and never rejects",
+            "discoverSelfBaseUrl with unparsable tailscale output > [C4] the parser itself still throws on non-JSON (its other callers report that as a warning), and valid output still yields the MagicDNS name"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-service.test.ts",
+          "names": [
+            "starting > [C4] start builds the worktree's bundle into the new home, then starts `bun run src/main.ts` from the worktree's anvild with exactly the listed environment, waits for /api/health, and only then registers and opens the port — register before allow",
+            "starting > [C4] one test daemon per session: a second call returns the existing one, concurrent calls share one start, and another session gets its own on another port",
+            "starting > [C4] refused before anything is built: a worktree that is not Anvil, and a session whose browser proxy is not running",
+            "a start that fails leaves nothing behind > [C4] a failed build starts no daemon, registers no port and deletes the temporary home; the error carries the build's output",
+            "a start that fails leaves nothing behind > [C4] a port that cannot be registered (this daemon's own, another session's) is never started on",
+            "a start that fails leaves nothing behind > [C4] a daemon that exits while starting, or never answers /api/health, is killed, its port revoked without ever being opened, and its home deleted",
+            "a start that fails leaves nothing behind > [C4] a daemon whose port cannot be opened in the session's proxy is killed and deleted, and the call fails",
+            "a start that fails leaves nothing behind > [C4] a stop that arrives while the bundle is still building cancels the start: no daemon is started and the home is deleted",
+            "ending > [C4] stop revokes the port, kills the process group and deletes the temporary home at once, clears the timer, and reports the origin that is gone; a second stop is a no-op",
+            "ending > [C4] the 15-minute timer stops the daemon by itself and says so in the session; stopping first disarms it",
+            "ending > [C4] stopAll (daemon shutdown) ends every session's test daemon; a daemon that exits by itself is cleaned up the same way",
+            "the crash ledger > [C4] a started daemon with a real pid is listed in <stateDir>/testdaemons.json and removed from it when stopped",
+            "the crash ledger > [C4] reapOrphans deletes a home a crashed run left behind, asks what the pid is before signalling it, and ignores rows that do not name a folder this code made"
+          ]
+        },
+        {
+          "file": "test/unit/testdaemon-gate.test.ts",
+          "names": [
+            "the session's own test daemon is an allowed page > [C4] navigating to the session's test-daemon origin needs no site prompt — under prompt-all, in an unattended session and in headless mode — and a result on it holds nothing",
+            "the session's own test daemon is an allowed page > [C4] only that exact origin: another loopback port, localhost, https on the same port, and another session's test daemon all get the ordinary site prompt",
+            "the session's own test daemon is an allowed page > [C4] the test daemon is never a logged-in site: with 127.0.0.1 on the logged-in list and locked, a click on the test daemon does not prompt and headless mode does not refuse it; a real logged-in site still stops",
+            "browser_evaluate > [C4] browser_evaluate is allowed when the tracked page is exactly the session's test-daemon origin, and denied everywhere else: an allowed site, another loopback port, about:blank, before any page, and for a session with no test daemon",
+            "browser_evaluate > [C4] the address must be KNOWN: after an evaluate (whose result never sets the address) the next evaluate is refused until a snapshot says the page is still on the test daemon",
+            "browser_evaluate > [C4] when the test daemon stops, the page that was showing it must be left (CLOSING, no owner prompt), browser_evaluate is denied at once, and its old address is an ordinary unapproved site again"
+          ]
+        },
+        {
+          "file": "test/integration/browser-c4-testdaemon.test.ts",
+          "names": [
+            "Acceptance: what is started > [C4] Acceptance: the started process's environment is exactly the listed variables plus PATH and TMPDIR, with ANVIL_HOST=127.0.0.1 and HOME a new temporary folder, and nothing of the daemon's own environment is inherited",
+            "Acceptance: what is started > [C4] Acceptance: it is told to listen on loopback only — ANVIL_HOST and its base URL are 127.0.0.1, and the port is one this daemon registered for the session before anything listened on it",
+            "Acceptance: what is started > [C4] a session whose repo is not Anvil is refused with a clear message, and nothing is built, started or opened",
+            "Acceptance: what is started > [C4] one test daemon per session: a second start_test_daemon returns the same URL and starts nothing",
+            "Acceptance: who can reach it > [C4] Acceptance: its port is reachable through the proxy from that session only — a second session's browser is refused on that port, before and after the second session starts a test daemon of its own",
+            "Acceptance: who can reach it > [C4] Acceptance: the live daemon's port stays refused for both sessions — a loopback server that is not the test daemon is never reachable, and this daemon's own port cannot be registered at all",
+            "Acceptance: how it ends > [C4] Acceptance: the process and its temporary home are gone after the turn ends, the port is closed in the proxy again, and a connection that was open to it is dropped",
+            "Acceptance: how it ends > [C4] Acceptance (§7): a test daemon that outlives everything else is killed by the 15-minute timer — process gone, home deleted, port closed, and the session is told",
+            "Acceptance: how it ends > [C4] it is also stopped by stop_test_daemon, when the session is reset, when it is deleted, when the browser is switched off for it, and when the daemon shuts down",
+            "the gate > [C4] browser_evaluate is allowed on the session's test-daemon origin and denied elsewhere — through the real permission hook, under bypass too — and denied again the moment the daemon stops",
+            "the gate > [C4] the test-daemon origin is the session's own: navigating to it asks nobody under prompt-all, a page on it is not held, and it is never treated as a logged-in site even when 127.0.0.1 is on the owner's list",
+            "permission and availability > [C4] start_test_daemon follows the session's autonomy policy as a mutating tool: prompt-all and allowlist park a card (Deny refuses it), mostly-autonomous and bypass run it; it is not in allowedTools, so the canUseTool backstop denies it",
+            "permission and availability > [C4] only an ordinary session with the browser switched on gets the anvil_test server: a plain session, the concierge and a team lead do not, and with the browser feature off nothing of it exists"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/browser-c4.test.ts",
+          "names": [
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: start_test_daemon builds the bundle into the temp home and boots this checkout's daemon; the live process's environment (ps eww) is exactly the listed variables, HOME a new temp folder, and the repo is not written",
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: it listens on loopback only — lsof shows one listener, on 127.0.0.1 — and a connection to a non-loopback local address on that port is refused",
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: the real headless browser, launched with C2's line through session A's proxy, loads the test daemon's root page; session B's proxy gets 403 on the same port and a loopback fixture standing in for the live daemon is refused for both",
+            "the worktree's real daemon, credential-less, through the real proxy > [C4] real: the child writes only under its own temp home — every file it holds open for writing is inside that home — and its process and temp home are gone after the turn ends"
+          ]
+        }
+      ]
     },
     "C5": {
       "title": "part sources",
