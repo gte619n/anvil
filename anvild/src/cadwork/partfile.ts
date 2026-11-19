@@ -65,6 +65,27 @@ export interface Measured {
   warnings: string[];
 }
 
+/** A reference body imported with `import_reference` (Phase A4). Informational: the gate reads the
+ *  design's embedded STEP text and `refs/<name>` itself, never trusting this record. */
+export interface PartReference {
+  /** The file name in `refs/` — the name `expectations.noInterferenceWith` lists. */
+  name: string;
+  /** Worktree-relative path of the file it was copied from. */
+  source: string;
+  /** sha256 of the imported bytes. */
+  sha256: string;
+  /** The bodies the import created (`created_bodies`). */
+  bodies: string[];
+  at: string;
+}
+
+/** The part is blocked on a feature SolidCraft cannot make (`report_gap`, D17). */
+export interface GapRecord {
+  feature: string;
+  detail: string;
+  at: string;
+}
+
 export interface PartFile {
   schema: 1;
   process: string;
@@ -72,6 +93,8 @@ export interface PartFile {
   status: PartStatusKind;
   ownerParams?: Record<string, number>;
   expectations?: Expectations;
+  refs?: PartReference[];
+  gap?: GapRecord;
   measured?: Measured;
 }
 
@@ -162,6 +185,13 @@ export function validatePartFile(doc: unknown): { ok: true; file: PartFile } | {
     const why = expectationsShapeError(doc.expectations, { stamped: true });
     if (why) return { ok: false, error: `part.json: ${why}` };
   }
+  if (doc.refs !== undefined) {
+    const okRef = (r: unknown): boolean => isObj(r) && typeof r.name === "string" && typeof r.source === "string" && typeof r.sha256 === "string" && typeof r.at === "string" && Array.isArray(r.bodies) && r.bodies.every((b) => typeof b === "string");
+    if (!Array.isArray(doc.refs) || !doc.refs.every(okRef)) return { ok: false, error: "part.json: `refs` must list the imported references ({name, source, sha256, bodies, at})" };
+  }
+  if (doc.gap !== undefined && !(isObj(doc.gap) && typeof doc.gap.feature === "string" && typeof doc.gap.detail === "string" && typeof doc.gap.at === "string")) {
+    return { ok: false, error: "part.json: `gap` must be {feature, detail, at}" };
+  }
   if (doc.measured !== undefined && !isObj(doc.measured)) return { ok: false, error: "part.json: `measured` must be an object" };
   return { ok: true, file: doc as unknown as PartFile };
 }
@@ -191,6 +221,8 @@ export function partFileText(file: PartFile): string {
   out.status = file.status;
   if (file.ownerParams !== undefined) out.ownerParams = file.ownerParams;
   if (file.expectations !== undefined) out.expectations = file.expectations;
+  if (file.refs !== undefined) out.refs = file.refs;
+  if (file.gap !== undefined) out.gap = file.gap;
   if (file.measured !== undefined) out.measured = file.measured;
   return JSON.stringify(out, null, 2) + "\n";
 }

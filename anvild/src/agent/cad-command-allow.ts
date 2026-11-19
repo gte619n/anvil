@@ -125,7 +125,7 @@ export function refusedCommand(id: unknown): string | undefined {
   const c = norm(id);
   if (isAllowedCommand(c)) return undefined;
   if (!c) return "a step needs a `command` id";
-  if (c === "file.insert_step") return "`file.insert_step` is reserved for import_reference, which is not available yet; a reference body cannot be imported in this version";
+  if (c === "file.insert_step") return "`file.insert_step` is reserved for import_reference { part, file }: the daemon copies the STEP into cad/<part>/refs/ and imports it as a fixed reference body";
   if (["open", "save", "export", "new_design", "crash_reports"].includes(c) || c.startsWith("file.") || c.startsWith("doc.")) return `\`${c}\` is not available here: ${OWNS_FILES}`;
   if (c === "undo" || c === "redo" || c.startsWith("edit.")) return `\`${c}\` is not available through execute or batch: use the undo and redo tools, which revert one of your requests as a whole`;
   if (c === "set_parameter") return "`set_parameter` is not available as a step: use the set_parameter tool, or the command `parameters.change` with {changes: {name: expression}}";

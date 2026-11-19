@@ -23,11 +23,18 @@ export interface McpChild {
   pid?: number;
 }
 
-/** Starts the child process. Injectable so the manager's tests can count and inspect every spawn. */
-export type McpSpawn = (cmd: string[], env: Record<string, string>) => McpChild;
+/** How the child is started beyond its command line and environment. */
+export interface McpSpawnOptions {
+  /** The child's working folder (absolute). The manager sets it to the part folder (decision 115):
+   *  SolidCraft resolves a plain name — a font, say — against its working folder. */
+  cwd?: string;
+}
 
-export const defaultMcpSpawn: McpSpawn = (cmd, env) => {
-  const proc = Bun.spawn(cmd, { stdin: "pipe", stdout: "pipe", stderr: "pipe", env });
+/** Starts the child process. Injectable so the manager's tests can count and inspect every spawn. */
+export type McpSpawn = (cmd: string[], env: Record<string, string>, opts?: McpSpawnOptions) => McpChild;
+
+export const defaultMcpSpawn: McpSpawn = (cmd, env, opts) => {
+  const proc = Bun.spawn(cmd, { stdin: "pipe", stdout: "pipe", stderr: "pipe", env, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
   return {
     write: (line) => {
       proc.stdin.write(line);
@@ -162,6 +169,8 @@ export interface McpStartOptions {
   baseEnv?: Record<string, string | undefined>;
   spawn?: McpSpawn;
   clock?: CadClock;
+  /** The child's working folder (absolute). */
+  cwd?: string;
   /** How long `initialize` may take (default 30 s). */
   initTimeoutMs?: number;
   /** Bytes of stderr kept for error messages (default 4096). */
@@ -244,7 +253,7 @@ export class McpClient {
     const env = solidcraftEnv(opts.baseEnv, opts.extraEnv);
     let child: McpChild;
     try {
-      child = (opts.spawn ?? defaultMcpSpawn)(opts.cmd, env);
+      child = (opts.spawn ?? defaultMcpSpawn)(opts.cmd, env, opts.cwd ? { cwd: opts.cwd } : undefined);
     } catch (e) {
       throw new McpExitError(`could not start SolidCraft (${opts.cmd[0]}): ${e instanceof Error ? e.message : String(e)}`, null, "");
     }

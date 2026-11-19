@@ -527,7 +527,8 @@ describe("Phase A3 clients (§7, §4.8)", () => {
     for (const headers of [{ origin: d.url }, {}] as Record<string, string>[]) {
       const r = await fetch(url, { headers });
       expect(r.status).toBe(200);
-      expect(r.headers.get("access-control-allow-origin")).toBeNull();
+      // Never `*`: an allowed Origin is named back exactly (a fleet peer's page can read it), none → none.
+      expect(r.headers.get("access-control-allow-origin")).toBe(headers.origin ?? null);
     }
     // Not a CAD route: the bundled native clients' permissive CORS is untouched.
     const health = await fetch(`${d.url}/api/health`, { headers: { origin: "https://evil.example" } });

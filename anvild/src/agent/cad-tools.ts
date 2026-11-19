@@ -19,8 +19,10 @@
  *  - `record_expectations` (once, before modeling), `propose_expectations` (the owner's card) and
  *    `check_part` (the gate in full). Modeling calls are refused on a part with no expectations.
  *
- * Later phases add their tools to `cadTools()`: `request_dimensions`, `import_reference`,
- * `release_part`, `report_gap` (A4).
+ * Phase A4: `import_reference` (a STEP from the repo or the download quarantine, as a fixed body),
+ * `open_part {concept: true}` + `request_dimensions` (a picture with no dimensions), `report_gap`,
+ * `release_part` (the release pack, after the owner's card). Each is optional on `CadToolDeps`, so a
+ * suite that drives the tools against a bare manager does not have to provide them.
  */
 import { z } from "zod";
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
@@ -62,6 +64,15 @@ export interface CadToolDeps {
   /** What the owner changed in the parameters panel since this session's last call (§4.9). Reading
    *  delivers: each note is returned once, and rides on the tool result that asked. */
   takeOwnerNotes?(): string[];
+  /** Phase A4 (see CadworkService). */
+  importReference?(ref: PartRef, file: unknown): Promise<{ ok: true; approved?: boolean; name?: string; bodies?: string[]; sha256?: string; replaced?: boolean } | { ok: false; error: string }>;
+  startConcept?(ref: PartRef, process: unknown): Promise<{ ok: true; note?: string } | { ok: false; error: string }>;
+  requestDimensions?(ref: PartRef, proposed: unknown): Promise<{ ok: true; approved: boolean; ownerParams?: Record<string, number> } | { ok: false; error: string }>;
+  reportGap?(ref: PartRef, feature: unknown, detail: unknown): Promise<{ ok: true; gate?: GateResult } | { ok: false; error: string }>;
+  exportRefusal?(ref: PartRef): string | undefined;
+  releasePart?(ref: PartRef): Promise<{ ok: true; approved: boolean; dir?: string; files?: string[]; offered?: number } | { ok: false; error: string }>;
+  pictureFile?(ref: PartRef, src: { picture?: unknown; attachment?: unknown }): { ok: true; abs: string; label: string } | { ok: false; error: string };
+  recordPicture?(ref: PartRef, overlap: number, picture: string): void;
 }
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -170,14 +181,25 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
         "Its design is the script cad/<part>/design.json, which the daemon rewrites after every change — never edit, save or " +
         "open design files yourself. Work on one part at a time, name every driving dimension as a parameter, and fetch " +
         "skill_reference before the first build.",
-      { part: z.string().describe('The part name, e.g. "plate". Not a path.') },
-      async ({ part }) =>
+      {
+        part: z.string().describe('The part name, e.g. "plate". Not a path.'),
+        concept: z.boolean().optional().describe("true for a BRAND-NEW part built from a picture with no dimensions: it may be modeled without expectations, and request_dimensions asks the owner for the numbers later."),
+        process: z.string().optional().describe('With concept: the process id from cad/rules.json, e.g. "fdm-0.4".'),
+      },
+      async ({ part, concept, process }) =>
         guarded(async () => {
           const ref = partRef(deps.worktree, part); // throws on anything that is not a plain name
           const created = !existsSync(ref.dir);
           const opened = await deps.manager.open(ref);
           current = ref;
           deps.touch(ref);
+          let conceptNote: string | undefined;
+          if (concept === true) {
+            if (!deps.startConcept) return fail("open_part: concept parts are not available here");
+            const c = await deps.startConcept(ref, process);
+            if (!c.ok) return fail(c.error);
+            conceptNote = c.note;
+          }
           const needs = deps.modelingRefusal(ref);
           const summary = {
             part: ref.part,
@@ -192,6 +214,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
           };
           const out = ok(JSON.stringify(summary));
           if (needs) out.content.push({ type: "text", text: `[anvil] ${needs}` });
+          if (conceptNote) out.content.push({ type: "text", text: `[anvil] ${conceptNote}` });
           for (const n of opened.notes) out.content.push({ type: "text", text: `[anvil] ${n}` });
           return out;
         }),
@@ -286,9 +309,14 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
     tool(
       "compare_picture",
       "Overlay the open part on a reference picture. `reference` is a file inside the part folder (cad/<part>/), given " +
-        "relative to it, e.g. \"refs/photo.png\".",
+        "relative to it, e.g. \"refs/photo.png\". Or `picture`: a PNG/JPEG anywhere in this repo, relative to its root " +
+        "(e.g. \".anvil-downloads/photo.jpg\"), or `attachment`: \"latest\" (or the file name) for an image the user attached " +
+        "in this chat — the daemon copies either into the part folder. On a concept part the overlap score is shown to the " +
+        "owner as advisory.",
       {
-        reference: z.string(),
+        reference: z.string().optional(),
+        picture: z.string().optional(),
+        attachment: z.string().optional(),
         view: z.string().optional(),
         camera: anyObject.optional(),
         bodies: z.array(z.string()).optional(),
@@ -300,16 +328,28 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async (a) =>
         guarded(async () => {
           const ref = selected();
+          const record = (reply: CadReply, label: string): ToolOut => {
+            const overlap = reply.result.json?.overlap;
+            if (!reply.result.isError && typeof overlap === "number") deps.recordPicture?.(ref, overlap, label);
+            return replyContent(ref, reply);
+          };
+          const rest = clean(a, ["picture", "attachment", "reference"]);
+          if (a.reference === undefined && (a.picture !== undefined || a.attachment !== undefined)) {
+            if (!deps.pictureFile) return fail("compare_picture: `picture` and `attachment` are not available here; use `reference`");
+            const pic = deps.pictureFile(ref, { picture: a.picture, attachment: a.attachment });
+            if (!pic.ok) return fail(pic.error);
+            return record(await deps.manager.request(ref, { tool: "compare_picture", args: { ...rest, reference: pic.abs }, kind: "read" }), pic.label);
+          }
           // The daemon owns paths: the picture must be INSIDE the part folder (symlinks resolved).
           // One answer for every refusal, so the tool cannot be used to learn which files exist.
           const refuse = fail(`compare_picture: \`reference\` must name an existing picture inside cad/${ref.part}/ (for example "refs/photo.png")`);
-          if (isAbsolute(a.reference)) return refuse;
+          if (typeof a.reference !== "string" || isAbsolute(a.reference)) return refuse;
           const abs = resolve(ref.dir, a.reference);
           if (abs !== ref.dir && !abs.startsWith(ref.dir + "/")) return refuse;
           if (!existsSync(abs)) return refuse;
           const real = realpathSync(abs);
           if (real !== ref.dir && !real.startsWith(ref.dir + "/")) return refuse;
-          return replyContent(ref, await deps.manager.request(ref, { tool: "compare_picture", args: { ...clean(a), reference: real }, kind: "read" }));
+          return record(await deps.manager.request(ref, { tool: "compare_picture", args: { ...rest, reference: real }, kind: "read" }), relative(ref.worktree, real));
         }),
     ),
     tool(
@@ -421,6 +461,8 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
           if (!existsSync(join(ref.dir, DESIGN_FILE)) && !deps.manager.status(ref)?.live) {
             return fail(`cad/${ref.part} has no design yet: open_part it and build something first`);
           }
+          const refused = deps.exportRefusal?.(ref);
+          if (refused) return fail(refused);
           const outDir = join(ref.dir, EXPORTS_DIR);
           mkdirSync(outDir, { recursive: true });
           const wanted = [...new Set(formats)];
@@ -454,6 +496,75 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
           const res: ToolOut = { content: [{ type: "text", text: JSON.stringify({ part: ref.part, exports, ...(errors.length ? { errors } : {}) }) }], ...(errors.length ? { isError: true } : {}) };
           for (const n of notes) res.content.push({ type: "text", text: `[anvil] ${n}` });
           return res;
+        }),
+    ),
+
+    // ── Phase A4 ────────────────────────────────────────────────────────────────────────────────
+    tool(
+      "import_reference",
+      "Import a STEP the part must FIT (a mating part, a housing) as a fixed reference body: {part, file}. `file` is a path " +
+        "in this repo relative to its root — downloads are in .anvil-downloads/ — at most 50 MB, .step/.stp. The daemon copies " +
+        "it to cad/<part>/refs/ and the part must not touch it (it joins noInterferenceWith; once expectations are locked the " +
+        "owner approves that on a card). Reference bodies are never measured as the part. Importing the same file again replaces it.",
+      { part: z.string().describe("The part name (not a path)."), file: z.string().describe('A STEP file in this repo, e.g. ".anvil-downloads/motor.step".') },
+      async ({ part, file }) =>
+        guarded(async () => {
+          if (!deps.importReference) return fail("import_reference is not available here");
+          const ref = partRef(deps.worktree, part);
+          const r = await deps.importReference(ref, file);
+          if (!r.ok) return fail(r.error);
+          if (r.approved === false) return ok(JSON.stringify({ part: ref.part, imported: false, note: "The owner DENIED adding this reference. Nothing was imported or written." }));
+          return ok(JSON.stringify({ part: ref.part, imported: true, reference: `refs/${r.name}`, bodies: r.bodies, sha256: r.sha256, replaced: r.replaced ?? false, note: "The part must not touch these bodies; check_part checks it." }));
+        }),
+    ),
+    tool(
+      "request_dimensions",
+      "For a CONCEPT part only: show the OWNER the named dimensions you propose, as editable numbers: {part, proposed: " +
+        '[{name, value, unit?: "mm", note?}]}. The owner types the real values; the daemon stores exactly those as the part\'s ' +
+        "dimensions and applies them to the design. Then call record_expectations with `parameters` equal to the returned " +
+        "owner values. Do not ask for dimensions in chat (AskUserQuestion) — use this.",
+      {
+        part: z.string().describe("The part name (not a path)."),
+        proposed: z.array(z.object({ name: z.string(), value: z.number(), unit: z.string().optional(), note: z.string().optional() })).min(1),
+      },
+      async ({ part, proposed }) =>
+        guarded(async () => {
+          if (!deps.requestDimensions) return fail("request_dimensions is not available here");
+          const ref = partRef(deps.worktree, part);
+          const r = await deps.requestDimensions(ref, proposed);
+          if (!r.ok) return fail(r.error);
+          if (!r.approved) return ok(JSON.stringify({ part: ref.part, confirmed: false, note: "The owner declined to give dimensions. Nothing was changed." }));
+          return ok(JSON.stringify({ part: ref.part, confirmed: true, ownerParams: r.ownerParams, note: "These are the owner's numbers and are now in the design. Call record_expectations with parameters equal to them exactly." }));
+        }),
+    ),
+    tool(
+      "report_gap",
+      "Say that SolidCraft cannot make a feature this part needs, instead of approximating it: {part, feature, detail}. The " +
+        "part is blocked (export and release refused; autopilot stops) until the owner clears it.",
+      { part: z.string().describe("The part name (not a path)."), feature: z.string().describe("The feature, e.g. \"variable fillet\"."), detail: z.string().describe("What you tried and what SolidCraft did.") },
+      async ({ part, feature, detail }) =>
+        guarded(async () => {
+          if (!deps.reportGap) return fail("report_gap is not available here");
+          const ref = partRef(deps.worktree, part);
+          const r = await deps.reportGap(ref, feature, detail);
+          if (!r.ok) return fail(r.error);
+          return ok(JSON.stringify({ part: ref.part, state: r.gate?.state ?? "gap", gap: { feature, detail }, note: "The owner sees this on the part card. Stop working on this feature." }));
+        }),
+    ),
+    tool(
+      "release_part",
+      "Release a part whose gate PASSES: {part}. The owner approves on a release card every time; on approval the daemon " +
+        "writes cad/<part>/release/<part>-<sha7>/ (STEP, 3MF for FDM, four views, a spec sheet, a signed manifest) and offers " +
+        "each file. Refused for a concept part, a part with a gap, or a gate that does not pass.",
+      { part: z.string().describe("The part name (not a path).") },
+      async ({ part }) =>
+        guarded(async () => {
+          if (!deps.releasePart) return fail("release_part is not available here");
+          const ref = partRef(deps.worktree, part);
+          const r = await deps.releasePart(ref);
+          if (!r.ok) return fail(r.error);
+          if (!r.approved) return ok(JSON.stringify({ part: ref.part, released: false, note: "The owner DENIED the release. Nothing was written." }));
+          return ok(JSON.stringify({ part: ref.part, released: true, folder: r.dir ? relative(deps.worktree, r.dir) : undefined, files: (r.files ?? []).map((f) => relative(deps.worktree, f)), offered: r.offered }));
         }),
     ),
   ];

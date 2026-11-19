@@ -86,16 +86,20 @@ export interface SpawnLog {
   cmds: string[][];
   /** The environment each one got. */
   envs: Record<string, string>[];
+  /** The working folder each one got (undefined: inherited). */
+  cwds: (string | undefined)[];
 }
 /** The real spawn, recording what it was asked to run. */
 export function recordingSpawn(): SpawnLog {
   const log: SpawnLog = {
     cmds: [],
     envs: [],
-    spawn: (cmd, env) => {
+    cwds: [],
+    spawn: (cmd, env, opts) => {
       log.cmds.push(cmd);
       log.envs.push(env);
-      return defaultMcpSpawn(cmd, env);
+      log.cwds.push(opts?.cwd);
+      return defaultMcpSpawn(cmd, env, opts);
     },
   };
   return log;

@@ -1758,8 +1758,36 @@ export class Supervisor {
   }
 
   /** Answer an expectations card (`cad.expectations.respond`, spec §4.8) — may come from any device. */
-  respondCadExpectations(requestId: string, approve: boolean): void {
-    if (!this.cadwork.respond(requestId, approve)) throw new BadCommand(`no pending expectations card: ${requestId}`);
+  respondCadExpectations(requestId: string, approve: boolean, values?: unknown): void {
+    let found: boolean;
+    try {
+      found = this.cadwork.respond(requestId, approve, values);
+    } catch (e) {
+      // A dimensions card answered with bad numbers: refused, and the card stays open.
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    if (!found) throw new BadCommand(`no pending expectations card: ${requestId}`);
+  }
+
+  /** `cad.release.request` (Phase A4): raise the release card for a part, with no model turn. */
+  async requestCadRelease(cwd: unknown, part: unknown, sessionId: unknown): Promise<void> {
+    const worktree = this.cadWorktree(cwd);
+    if (typeof sessionId !== "string" || !this.sessions.has(sessionId)) throw new BadCommand(`no such session: ${String(sessionId)}`);
+    try {
+      await this.cadwork.requestRelease(sessionId, partRef(worktree, part));
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** `cad.gap.clear` (Phase A4): the owner clears a part's reported gap. */
+  async clearCadGap(cwd: unknown, part: unknown): Promise<void> {
+    const worktree = this.cadWorktree(cwd);
+    try {
+      await this.cadwork.clearGap(worktree, part);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
   }
 
   /**

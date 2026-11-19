@@ -93,3 +93,8 @@ export function makeCadPartIo(opts: { server: () => Server; cwd: string }): CadI
     },
   };
 }
+
+/** The preview route's URL for a worktree-relative file of a part (a preview GLB or a thumbnail PNG). */
+export function cadPreviewUrl(server: Server, cwd: string, path: string): string {
+  return serverApiUrl(server.url, `/api/cad/preview?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}`);
+}

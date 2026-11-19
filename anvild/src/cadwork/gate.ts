@@ -23,12 +23,14 @@
  *   concept    — the part is a concept (dimensions not confirmed); never `pass`
  *   fail       — a hard check failed
  *   pass       — every hard check passed
- *   (`gap` is set by Phase A4's report_gap.)
+ *   gap        — the agent reported a feature SolidCraft cannot make (`report_gap`); outranks every
+ *                other state, because it can only ever block
  *
- * PHASE A4 HOOK: interference with reference bodies. The refresh passes its checks in
- * `GateInput.extraChecks`; nothing here needs restructuring.
+ * PHASE A4: the refresh passes the reference checks (integrity of each `refs/` file against the STEP
+ * text embedded in the design, and interference with each reference body) in `extraChecks`; a
+ * changed reference also sets `extraUnverified`. The gap comes in as `gap`.
  */
-import { evaluateExpectations, lockedBlockSha, TOLERANCE_CAPS, type EvaluatedExpectations, type LockedBy, type MeasuredHole, type PartRead } from "./partfile";
+import { evaluateExpectations, lockedBlockSha, TOLERANCE_CAPS, type EvaluatedExpectations, type GapRecord, type LockedBy, type MeasuredHole, type PartRead } from "./partfile";
 import type { PartLock, RulesLock } from "./locks";
 import { sortKeys } from "./poststep";
 import { checkRules, type RulesRead } from "./rules";
@@ -54,6 +56,8 @@ export interface GateResult {
   /** Who approved the numbers the part is checked against (only when an approval is in force).
    *  `agent-initial`: the agent recorded them and the owner has not confirmed them. */
   approvedBy?: LockedBy;
+  /** The part is blocked on an unsupported feature (`report_gap`); `state` is then `gap`. */
+  gap?: GapRecord;
 }
 
 /** What was measured, of the DESIGN bodies only (imported reference bodies are excluded). */
@@ -89,8 +93,13 @@ export interface GateInput {
   warnings: string[];
   /** The manager's own failure: a disk conflict, or a design.json that did not replay. */
   designFailure?: string;
-  /** Phase A4: interference checks against reference bodies. */
+  /** Phase A4: reference integrity and interference checks (and advisories such as a concept's
+   *  picture score). */
   extraChecks?: GateCheck[];
+  /** Phase A4: something the extra checks found makes the part unverifiable (a changed reference). */
+  extraUnverified?: boolean;
+  /** Phase A4: the gap the part is blocked on, when one is in force. */
+  gap?: GapRecord;
 }
 
 export const MOVED_WITHOUT_APPROVAL = "expected value moved without owner approval";
@@ -280,9 +289,10 @@ function evaluate(input: GateInput): GateResult {
     checks.push({ id: "measured", expected: "a measurement of the current design", measured: "the last measurement is of an older version of the design", ok: false, hard: true });
   }
   if (input.extraChecks) checks.push(...input.extraChecks);
+  if (input.extraUnverified) unverified = true;
 
   const needsAdoption = adopt.has("expectations") ? "expectations" : adopt.has("ownerParams") ? "ownerParams" : adopt.has("rules") ? "rules" : undefined;
-  const state: GateState = unverified || needsAdoption ? "unverified" : concept ? "concept" : checks.some((c) => c.hard && !c.ok) ? "fail" : "pass";
+  const state: GateState = input.gap ? "gap" : unverified || needsAdoption ? "unverified" : concept ? "concept" : checks.some((c) => c.hard && !c.ok) ? "fail" : "pass";
   return {
     state,
     checks,
@@ -290,6 +300,7 @@ function evaluate(input: GateInput): GateResult {
     ...(needsAdoption ? { needsAdoption } : {}),
     staleBuild: !!(m && input.solidcraft && m.solidcraft !== input.solidcraft),
     ...(approvedBy ? { approvedBy } : {}),
+    ...(input.gap ? { gap: { ...input.gap } } : {}),
   };
 }
 

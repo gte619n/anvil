@@ -8,9 +8,9 @@
  * driver.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
   PROTOCOL_VERSION,
@@ -19,6 +19,7 @@ import {
   type CadExpectationsRequestEvent,
   type CadExpectationsResolvedEvent,
   type CadExpectationsRow,
+  type CadDimensionRow,
   type CadStatusEvent,
   type ServerEvent,
   type Session as SessionInfo,
@@ -45,9 +46,16 @@ import {
   type EvaluatedExpectations,
   type Expectations,
   type ExpectationsInput,
+  type GapRecord,
   type PartFile,
+  type PartReference,
 } from "../cadwork/partfile";
-import { makeRefreshJob, newestPreview, previewRevs, readLocked, PREVIEW_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
+import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
+import { embeddedReferences, importFeatureName, referenceName, resolveReferenceSource, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
+import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
+import { holeTable, mergeHoleTables } from "../cadwork/holes";
+import { readRules } from "../cadwork/rules";
+import { advisoryLines, failingLines, type GateCheck } from "../cadwork/gate";
 import { lineDiff } from "../cadwork/rules";
 import { newId } from "../util/ids";
 import { currentManagedSolidcraft, resolveSolidcraftCli, type ResolvedSolidcraft } from "../solidcraft/binary";
@@ -85,6 +93,8 @@ export interface CadworkServiceDeps {
   /** Folders under `stateDir` that sessions legitimately write in (their worktrees, cloned repos).
    *  Everything else under the state dir is denied to the file tools. Default: `worktrees`, `repos`. */
   writableStateRoots?: string[];
+  /** Test seam: the reference size cap (default 50 MB, owner item 45). */
+  referenceMaxBytes?: number;
   /** Test seams for the refresh (a gate that throws must end as `unverified`). */
   gateImpl?: (input: GateInput) => GateResult;
   beforeMeasure?: (ref: PartRef) => void;
@@ -99,7 +109,14 @@ export interface PartSnapshot {
   busy: boolean;
   /** Its next request is held because every SolidCraft slot is taken. */
   waiting?: boolean;
+  /** A release pack of the current script that verifies on this machine (Phase A4). */
+  released?: { path: string; scriptSha: string; at: string };
+  /** part.json's status at the refresh. */
+  status?: "concept" | "dimensioned";
 }
+
+/** Broadcasts of `cad.design` per part are coalesced to one per this many ms (spec §6: ≤ 2/s). */
+export const DESIGN_BROADCAST_MS = 500;
 
 /** How long a part's queue must stay busy before a `cad.design` is sent just to say so. A refresh
  *  that lands sooner carries `busy` itself, so a short burst costs no extra event. */
@@ -114,10 +131,13 @@ interface Card {
   ref: PartRef;
   kind: CardKind;
   body: Omit<CadExpectationsRequestEvent, "v" | "ts" | "replay">;
-  /** propose / initial: settles the tool call that is waiting on the owner. */
-  settle?: (approved: boolean) => void;
+  /** propose / initial / dimensions / release: settles the tool call that is waiting on the owner.
+   *  A `dimensions` card also hands over the owner's typed numbers. */
+  settle?: (approved: boolean, values?: Record<string, number>) => void;
   /** adopt: the hash of exactly what the card showed. Approval records THIS and nothing else. */
   sha?: string;
+  /** dimensions: the names the owner must give a number for. */
+  dims?: string[];
 }
 
 export const NO_EXPECTATIONS = "has no expectations yet";
@@ -186,6 +206,12 @@ export class CadworkService {
   /** sha256 of every preview the daemon exported, by absolute path (`<stateDir>/cadwork/previews.json`). */
   private readonly previewShas = new Map<string, string>();
   private readonly previewShasFile: string;
+  private readonly stateDir: string;
+  /** Per part: when the last coalesced `cad.design` went out, in which busy period, and the trailing timer. */
+  private readonly emitState = new Map<string, { at: number; epoch: number; timer?: unknown }>();
+  private readonly busyEpoch = new Map<string, number>();
+  /** A concept part's last picture comparison (advisory, shown on the card). */
+  private readonly pictureScores = new Map<string, { overlap: number; picture: string; at: string }>();
 
   constructor(private readonly deps: CadworkServiceDeps) {
     this.resolveCli = deps.resolveCli ?? (() => resolveSolidcraftCli());
@@ -193,6 +219,7 @@ export class CadworkService {
     this.manager = new CadManager({ resolveCli: this.resolveCli, ...deps.manager });
     this.clock = deps.manager?.clock ?? realClock;
     const stateDir = deps.stateDir ?? mkdtempSync(join(tmpdir(), "anvil-cadwork-state-"));
+    this.stateDir = stateDir;
     this.locks = new LockStore(stateDir);
     this.previewShasFile = join(stateDir, "cadwork", "previews.json");
     try {
@@ -213,6 +240,7 @@ export class CadworkService {
           onResult: (outcome, slot) => this.onRefreshed(outcome, slot),
           evaluateImpl: deps.gateImpl,
           beforeMeasure: deps.beforeMeasure,
+          advisoryFor: (ref) => this.advisoryFor(ref),
         }),
       );
       this.manager.subscribe((e) => {
@@ -300,6 +328,14 @@ export class CadworkService {
       proposeExpectations: (ref, expectations, reason) => this.proposeExpectations(sessionId, ref, expectations, reason),
       checkPart: (ref) => this.checkPart(sessionId, ref),
       takeOwnerNotes: () => this.takeOwnerNotes(sessionId),
+      importReference: (ref, file) => this.importReference(sessionId, ref, file),
+      startConcept: (ref, process) => this.startConcept(sessionId, ref, process),
+      requestDimensions: (ref, proposed) => this.requestDimensions(sessionId, ref, proposed),
+      reportGap: (ref, feature, detail) => this.reportGap(sessionId, ref, feature, detail),
+      exportRefusal: (ref) => this.exportRefusal(ref),
+      releasePart: (ref) => this.releasePart(sessionId, ref),
+      pictureFile: (ref, src) => this.pictureFile(sessionId, ref, src),
+      recordPicture: (ref, overlap, picture) => this.recordPicture(ref, overlap, picture),
     };
   }
 
@@ -381,14 +417,36 @@ export class CadworkService {
     if ((part.kind === "ok" && part.file.expectations) || lock?.values) {
       return { ok: false, error: `cad/${ref.part} already has expectations. They can be recorded only once; to change them call propose_expectations { part, expectations, reason }, which asks the owner.` };
     }
+    const ownerParams = part.kind === "ok" ? part.file.ownerParams : undefined;
     if (part.kind === "ok" && part.file.status === "concept") {
-      return { ok: false, error: `cad/${ref.part} is a concept: its dimensions have to be confirmed by the owner (request_dimensions) before expectations are recorded.` };
+      // A concept is promoted only on the dimensions the OWNER typed (request_dimensions), in the file
+      // AND the lock store.
+      if (!ownerParams || !lock || lock.status !== "concept" || JSON.stringify(sortedEntries(lock.ownerParams)) !== JSON.stringify(sortedEntries(ownerParams))) {
+        return { ok: false, error: `cad/${ref.part} is a concept: its dimensions have to be confirmed by the owner (request_dimensions) before expectations are recorded.` };
+      }
     }
     const declared = parseDeclared(parameters);
     if (!declared.ok) return { ok: false, error: `record_expectations: ${declared.error}` };
+    if (ownerParams) {
+      // The owner's typed numbers ARE the dimensions: a record that declares anything else is refused.
+      const differ = Object.keys(ownerParams)
+        .sort()
+        .filter((n) => declared.values[n] === undefined || Math.abs(declared.values[n]! - ownerParams[n]!) > 1e-9 * Math.max(1, Math.abs(ownerParams[n]!)));
+      if (differ.length) {
+        return { ok: false, error: `record_expectations refused: the declared parameters differ from the dimensions the owner typed (${differ.map((n) => `${n} must be ${num(ownerParams[n]!)}, declared ${declared.values[n] === undefined ? "nothing" : num(declared.values[n]!)}`).join("; ")}). Declare exactly the owner's values.` };
+      }
+    }
     const why = expectationsShapeError(input, { stamped: false });
     if (why) return { ok: false, error: `record_expectations: ${why}` };
-    const draft = stampExpectations(input as ExpectationsInput, "agent-initial", new Date().toISOString());
+    // Every imported reference is something the part must not touch — those recorded in part.json and
+    // those imported before part.json existed (embedded in the design, with their file in refs/).
+    const embedded = embeddedReferences(readDesignFile(ref.dir).script).filter((e) => existsSync(join(ref.dir, REFS_DIR, e.file)));
+    const refRecords: PartReference[] = [...(part.kind === "ok" ? (part.file.refs ?? []) : [])];
+    for (const e of embedded) if (!refRecords.some((r) => r.name === e.file)) refRecords.push({ name: e.file, source: `${REFS_DIR}/${e.file}`, sha256: e.sha256, bodies: e.bodies, at: new Date().toISOString() });
+    const refNames = refRecords.map((r) => r.name);
+    const asked = (input as ExpectationsInput).noInterferenceWith ?? [];
+    const withRefs = refNames.length ? { ...(input as ExpectationsInput), noInterferenceWith: [...new Set([...asked, ...refNames])] } : (input as ExpectationsInput);
+    const draft = stampExpectations(withRefs, "agent-initial", new Date().toISOString());
     const caps = toleranceCapErrors(draft.tolerance);
     if (caps.length) return { ok: false, error: `record_expectations refused: ${caps.join("; ")}. Defaults are ${DEFAULT_TOLERANCE.length} mm and ${DEFAULT_TOLERANCE.volumeRel}.` };
     // Every formula is evaluated NOW, from the declared values and nothing else.
@@ -402,9 +460,13 @@ export class CadworkService {
     // What does the part hold right now? (Starts the process: an existing design.json is replayed.)
     const hadDesign = existsSync(join(ref.dir, DESIGN_FILE));
     const live = await this.manager.run(ref, async (slot) => {
-      const r = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: "names" });
+      const r = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: true });
       const j = r.json ?? {};
-      return { features: Array.isArray(j.timeline) ? j.timeline.length : 0, bodies: Array.isArray(j.bodies) ? j.bodies.length : 0, params: slot.params() };
+      const timeline: any[] = Array.isArray(j.timeline) ? j.timeline : [];
+      const bodies: any[] = Array.isArray(j.bodies) ? j.bodies : [];
+      const imports = new Set(timeline.filter((f) => f?.type === "BaseFeature").map((f) => f.id));
+      // Imported reference bodies (import_reference) are not the part: they do not make it "existing".
+      return { features: timeline.filter((f) => !imports.has(f?.id)).length, bodies: bodies.filter((b) => !imports.has(b?.feature)).length, onlyReferences: imports.size > 0, params: slot.params() };
     });
     for (const p of live.params) {
       const want = declared.values[p.name];
@@ -412,8 +474,19 @@ export class CadworkService {
         return { ok: false, error: `record_expectations refused: the design already has ${p.name} = ${num(p.value)}, not the declared ${num(want)}. Declare the value the design has, or change the parameter first.` };
       }
     }
-    const pristine = !hadDesign && live.features === 0 && live.bodies === 0 && live.params.length === 0 && !lock;
-    const file = (exp: Expectations): PartFile => ({ schema: 1, process: process.trim(), ...(part.kind === "ok" && part.file.material ? { material: part.file.material } : {}), status: "dimensioned", expectations: exp });
+    const pristine = (!hadDesign || live.onlyReferences) && live.features === 0 && live.bodies === 0 && live.params.length === 0 && !lock;
+    const keep = part.kind === "ok" ? part.file : undefined;
+    const file = (exp: Expectations): PartFile => ({
+      schema: 1,
+      process: process.trim(),
+      ...(keep?.material ? { material: keep.material } : {}),
+      status: "dimensioned",
+      ...(keep?.ownerParams ? { ownerParams: keep.ownerParams } : {}),
+      expectations: exp,
+      ...(refRecords.length ? { refs: refRecords } : {}),
+      // An owner-approved record is an approved expectation change: it clears a reported gap.
+      ...(keep?.gap && by !== "owner" ? { gap: keep.gap } : {}),
+    });
     let exp = draft;
     let by: "agent-initial" | "owner" = "agent-initial";
 
@@ -440,7 +513,7 @@ export class CadworkService {
             part: ref.part,
             kind: "initial",
             note: INITIAL_AFTER_GEOMETRY,
-            rows: [{ label: "Process", new: process.trim() }, { label: "Status", new: "dimensioned" }, ...expectationRows(undefined, exp, declared.values)],
+            rows: [{ label: "Process", new: process.trim() }, { label: "Status", ...(keep?.status === "concept" ? { old: "concept" } : {}), new: "dimensioned" }, ...expectationRows(undefined, exp, declared.values), ...(ownerParams ? [{ label: "Dimensions you typed", new: Object.keys(ownerParams).sort().map((n) => `${n} = ${num(ownerParams[n]!)}`).join(", ") }] : [])],
           },
         });
         setStatus(session, "awaiting_permission");
@@ -466,7 +539,8 @@ export class CadworkService {
       }
       const f = file(exp);
       writePartFile(ref.dir, f);
-      this.approve(ref, { sha: lockedBlockSha(f), approvedBy: by, status: "dimensioned", values, declared: declared.values, at: exp.lockedAt });
+      this.approve(ref, { sha: lockedBlockSha(f), approvedBy: by, status: "dimensioned", values, declared: declared.values, ...(f.ownerParams ? { ownerParams: f.ownerParams } : {}), at: exp.lockedAt });
+      if (by === "owner") this.clearGapRecord(ref);
     };
     if (toAdd.length) {
       const reply = await this.manager.request(ref, {
@@ -510,7 +584,15 @@ export class CadworkService {
    * The approval is for exactly what the card showed: if `part.json`'s locked block changed while
    * the card was open, nothing is written and a fresh card is raised.
    */
-  async proposeExpectations(sessionId: string, ref: PartRef, input: unknown, reason: unknown): Promise<ExpectationsReply & { approved?: boolean }> {
+  async proposeExpectations(
+    sessionId: string,
+    ref: PartRef,
+    input: unknown,
+    reason: unknown,
+    /** Runs after the owner approved and before anything is written; an error string writes nothing
+     *  (import_reference imports the reference here, so a failed import changes no expectation). */
+    opts: { beforeWrite?: () => Promise<string | undefined> } = {},
+  ): Promise<ExpectationsReply & { approved?: boolean }> {
     this.touch(sessionId, ref);
     const session = this.deps.getSession(sessionId);
     if (!session) return { ok: false, error: "the session is gone" };
@@ -563,15 +645,524 @@ export class CadworkService {
       if (lockedBlockSha(cur.file) !== shown) continue; // process, status or the expectations changed meanwhile: ask again, showing what is there now
       const values = this.valuesNow(ref, proposed).values;
       if (!values) return { ok: false, error: `the owner approved, but the formulas no longer evaluate against the design's parameters; nothing was written` };
-      const file: PartFile = { ...cur.file, expectations: proposed };
+      if (opts.beforeWrite) {
+        const err = await opts.beforeWrite();
+        if (err) return { ok: false, error: err };
+      }
+      const now2 = readPartFile(ref.dir);
+      const file: PartFile = { ...(now2.kind === "ok" ? now2.file : cur.file), expectations: proposed };
       writePartFile(ref.dir, file);
       // The parameter values the approved numbers were evaluated with (shown on the card) are now the accepted ones.
       const declared = paramMap(this.manager.status(ref)?.params ?? []);
       this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, declared, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
+      this.clearGapRecord(ref); // an approved expectation change clears a reported gap
       this.recheck(ref);
       return { ok: true, approved: true };
     }
     return { ok: false, error: `cad/${ref.part}/part.json kept changing while the owner was being asked; nothing was written` };
+  }
+
+  // ── Phase A4: references, concepts and dimensions, gaps, release ───────────────────────────────
+
+  /** Record a gap (or, with `gap` undefined, a CLEAR) in the lock store, fleet-synced. */
+  private setGap(ref: PartRef, gap: GapRecord | undefined, at = new Date().toISOString()): void {
+    const id = repoIdentity(ref.worktree);
+    this.lockSync.setGap({ repo: id.key, part: ref.part, ...(gap ? { gap } : {}), at, ...(id.remote ? { remote: id.remote } : {}), path: id.path });
+  }
+  /** The gap a part is blocked on right now (lock store first, then part.json). */
+  gapFor(ref: PartRef): GapRecord | undefined {
+    return gapOf(readPartFile(ref.dir), this.locks.findGap(repoIdentity(ref.worktree), ref.part, this.machine()));
+  }
+  /** Clear a part's gap in the store and in part.json (an owner action, or an approved expectation change). */
+  private clearGapRecord(ref: PartRef): boolean {
+    const part = readPartFile(ref.dir);
+    const had = !!this.gapFor(ref) || (part.kind === "ok" && !!part.file.gap);
+    if (!had) return false;
+    if (part.kind === "ok" && part.file.gap) {
+      const { gap: _g, ...rest } = part.file;
+      writePartFile(ref.dir, rest as PartFile);
+    }
+    this.setGap(ref, undefined);
+    return true;
+  }
+
+  /**
+   * `import_reference {part, file}`: check the source (./refs.ts), then — free while the part has no
+   * expectations, else only after the owner approves the standard `propose` card that adds the file to
+   * `noInterferenceWith` (denied when unattended) — copy it to `cad/<part>/refs/` and import it as a
+   * fixed body with `file.insert_step` in the part's queue. A re-import of the same name replaces the
+   * old import feature. A failed import puts the old `refs/` file back and records nothing.
+   */
+  async importReference(sessionId: string, ref: PartRef, file: unknown): Promise<{ ok: true; approved?: boolean; name?: string; bodies?: string[]; sha256?: string; replaced?: boolean } | { ok: false; error: string }> {
+    this.touch(sessionId, ref);
+    const src = resolveReferenceSource(ref.worktree, file, { maxBytes: this.deps.referenceMaxBytes ?? REFERENCE_MAX_BYTES });
+    if (!src.ok) return src;
+    const name = referenceName(src.rel);
+    const part = readPartFile(ref.dir);
+    if (part.kind === "invalid") return { ok: false, error: `cad/${ref.part}/part.json cannot be read (${part.error}); nothing was imported` };
+
+    let outcome: { ok: true; name: string; bodies: string[]; sha256: string; replaced: boolean } | { ok: false; error: string } = { ok: false, error: "not imported" };
+    const doImport = async (): Promise<string | undefined> => {
+      outcome = await this.insertReference(ref, name, src.rel, src.bytes, src.sha256);
+      return outcome.ok ? undefined : outcome.error;
+    };
+    const exp = part.kind === "ok" ? part.file.expectations : undefined;
+    if (!exp) {
+      await doImport();
+      return outcome;
+    }
+    // Expectations are locked: adding what the part must not touch is the owner's call, on the card.
+    const input: ExpectationsInput = { bbox: exp.bbox, volume: exp.volume, bodies: exp.bodies, holes: exp.holes, tolerance: exp.tolerance, noInterferenceWith: [...new Set([...(exp.noInterferenceWith ?? []), name])] };
+    const reason = `import_reference: ${src.rel} as refs/${name} (sha256 ${src.sha256.slice(0, 12)}, ${src.bytes.length} bytes) — the part must not touch it.`;
+    const r = await this.proposeExpectations(sessionId, ref, input, reason, { beforeWrite: doImport });
+    if (!r.ok) return r;
+    if (!r.approved) return { ok: true, approved: false };
+    return outcome;
+  }
+
+  private async insertReference(ref: PartRef, name: string, source: string, bytes: Buffer, sha256: string): Promise<{ ok: true; name: string; bodies: string[]; sha256: string; replaced: boolean } | { ok: false; error: string }> {
+    const dest = join(ref.dir, REFS_DIR, name);
+    let previous: Buffer | undefined;
+    try {
+      if (existsSync(dest) && !lstatSync(dest).isSymbolicLink()) previous = readFileSync(dest);
+    } catch {
+      /* none */
+    }
+    try {
+      storeReference(ref, name, bytes);
+    } catch (e) {
+      return { ok: false, error: `import_reference: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    const restore = (): void => {
+      try {
+        if (previous) storeReference(ref, name, previous);
+        else rmSync(dest, { force: true });
+      } catch {
+        /* best effort */
+      }
+    };
+    try {
+      // An earlier import of the same file is replaced (its feature deleted in the same batch).
+      const old = await this.manager.request(ref, { tool: "inspect_design", args: { measure: false, sketches: false, timeline: "summary", bodies: false }, kind: "read" });
+      const timeline: any[] = Array.isArray(old.result.json?.timeline) ? old.result.json.timeline : [];
+      const prior = timeline.find((f) => f?.type === "BaseFeature" && f?.name === importFeatureName(name));
+      const insert = { command: "file.insert_step", params: { path: dest, name: importFeatureName(name) } };
+      const reply = prior
+        ? await this.manager.request(ref, { tool: "batch", args: { commands: [{ command: "timeline.delete", params: { feature: prior.id } }, insert], verbose: true }, kind: "mutate" })
+        : await this.manager.request(ref, { tool: "execute", args: { ...insert, verbose: true }, kind: "mutate" });
+      if (reply.result.isError) {
+        restore();
+        return { ok: false, error: `import_reference: SolidCraft could not import refs/${name}: ${reply.result.text.slice(0, 500)}` };
+      }
+      if (reply.state.conflict) {
+        restore();
+        return { ok: false, error: `import_reference: ${DISK_CONFLICT_REASON}; nothing was recorded` };
+      }
+      const j = prior ? reply.result.json?.results?.at?.(-1) : reply.result.json;
+      const bodies: string[] = Array.isArray(j?.created_bodies) ? j.created_bodies.map(String) : [];
+      if (bodies.length === 0) {
+        restore();
+        return { ok: false, error: `import_reference: SolidCraft imported refs/${name} but reported no bodies` };
+      }
+      if (typeof j?.content_sha256 === "string" && j.content_sha256 !== sha256) {
+        restore();
+        return { ok: false, error: `import_reference: SolidCraft embedded different bytes than refs/${name} holds (${String(j.content_sha256).slice(0, 12)} ≠ ${sha256.slice(0, 12)})` };
+      }
+      const cur = readPartFile(ref.dir);
+      if (cur.kind === "ok") {
+        const record: PartReference = { name, source, sha256, bodies, at: new Date().toISOString() };
+        writePartFile(ref.dir, { ...cur.file, refs: [...(cur.file.refs ?? []).filter((x) => x.name !== name), record] });
+      }
+      return { ok: true, name, bodies, sha256, replaced: !!prior };
+    } catch (e) {
+      restore();
+      return { ok: false, error: `import_reference: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+
+  /**
+   * `open_part {part, concept: true, process}` (D16): a BRAND-NEW part (no design, no part.json, no
+   * approval anywhere, nothing in its process) becomes a concept in part.json AND the lock store, so
+   * it may be modeled without expectations. Anything else is left as it is.
+   */
+  async startConcept(sessionId: string, ref: PartRef, process: unknown): Promise<{ ok: true; note?: string } | { ok: false; error: string }> {
+    this.touch(sessionId, ref);
+    if (typeof process !== "string" || !process.trim()) return { ok: false, error: "open_part: `concept: true` needs `process` — the id in cad/rules.json the part will be made with" };
+    const part = readPartFile(ref.dir);
+    const lock = this.findLock(ref);
+    if (part.kind === "ok" && part.file.status === "concept" && lock?.status === "concept" && lock.sha === lockedBlockSha(part.file)) return { ok: true, note: `cad/${ref.part} is already a concept` };
+    const live = await this.manager.run(ref, async (slot) => {
+      const r = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: "names" });
+      return { features: Array.isArray(r.json?.timeline) ? r.json.timeline.length : 0, params: slot.params().length };
+    });
+    if (part.kind !== "missing" || lock || existsSync(join(ref.dir, DESIGN_FILE)) || live.features || live.params) {
+      return { ok: true, note: `concept: true is honoured only when creating a brand-new part; cad/${ref.part} already exists and was left as it is` };
+    }
+    const file: PartFile = { schema: 1, process: process.trim(), status: "concept" };
+    writePartFile(ref.dir, file);
+    this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "agent-initial", status: "concept", at: new Date().toISOString() });
+    return { ok: true };
+  }
+
+  /**
+   * `request_dimensions {part, proposed}` (§4.5, D16): a typed `dimensions` card whose numbers the
+   * OWNER edits. On submit the daemon stores exactly the owner's numbers as `ownerParams` (part.json
+   * and the lock store, fleet-synced) and applies them to the design (parameters.change for existing
+   * names, parameters.add for new ones) — the owner's value wins over the proposal. Denied without a
+   * card when unattended.
+   */
+  async requestDimensions(sessionId: string, ref: PartRef, proposed: unknown): Promise<{ ok: true; approved: boolean; ownerParams?: Record<string, number> } | { ok: false; error: string }> {
+    this.touch(sessionId, ref);
+    const session = this.deps.getSession(sessionId);
+    if (!session) return { ok: false, error: "the session is gone" };
+    if (isUnattended(session)) return { ok: false, error: "request_dimensions was denied: this session is unattended, so no one can type the dimensions" };
+    const part = readPartFile(ref.dir);
+    const lock = this.findLock(ref);
+    if (part.kind !== "ok" || part.file.status !== "concept" || lock?.status !== "concept" || lock.sha !== lockedBlockSha(part.file)) {
+      return { ok: false, error: `request_dimensions is for a concept part (open_part {part, concept: true, process}); cad/${ref.part} is not one` };
+    }
+    const rows = parseDimensionRows(proposed);
+    if (!rows.ok) return { ok: false, error: `request_dimensions: ${rows.error}` };
+    const requestId = newId("cadx");
+    const answer = await new Promise<{ approved: boolean; values?: Record<string, number> }>((resolve) => {
+      this.park({
+        requestId,
+        sessionId,
+        ref,
+        kind: "dimensions",
+        dims: rows.rows.map((r) => r.name),
+        settle: (approved, values) => resolve({ approved, values }),
+        body: {
+          type: "cad.expectations.request",
+          requestId,
+          sessionId,
+          cwd: ref.worktree,
+          part: ref.part,
+          kind: "dimensions",
+          note: "The agent built this part from a picture. Type the real dimensions: your numbers are what the part will be checked against.",
+          dimensions: rows.rows,
+          rows: rows.rows.map((r) => ({ label: r.name, new: `${num(r.value)}${r.unit ? ` ${r.unit}` : ""}` })),
+        },
+      });
+      setStatus(session, "awaiting_permission");
+    });
+    setStatus(session, "running_tool");
+    if (!answer.approved || !answer.values) return { ok: true, approved: false };
+    const values = answer.values;
+    // Apply exactly the owner's numbers to the design, in one queued change, then record them.
+    const have = new Set((this.manager.status(ref)?.params ?? []).map((p) => p.name));
+    const unit = new Map(rows.rows.map((r) => [r.name, r.unit]));
+    const expr = (n: string): string => `${values[n]}${unit.get(n) ? ` ${unit.get(n)}` : ""}`;
+    const change = Object.keys(values).filter((n) => have.has(n));
+    const add = Object.keys(values).filter((n) => !have.has(n));
+    const commands = [
+      ...(change.length ? [{ command: "parameters.change", params: { changes: Object.fromEntries(change.map((n) => [n, expr(n)])) } }] : []),
+      ...add.map((n) => ({ command: "parameters.add", params: { name: n, expression: expr(n) } })),
+    ];
+    let failure: string | undefined;
+    const reply = await this.manager.request(ref, {
+      tool: "batch",
+      args: { commands, verbose: false },
+      kind: "mutate",
+      afterWrite: (slot, done) => {
+        if (done.result.isError) return void (failure = `the dimensions could not be applied: ${done.result.text.slice(0, 300)}`);
+        if (slot.state().conflict) return void (failure = DISK_CONFLICT_REASON);
+        for (const n of Object.keys(values)) {
+          const got = slot.params().find((p) => p.name === n)?.value;
+          if (got === undefined || Math.abs(got - values[n]!) > 1e-9 * Math.max(1, Math.abs(values[n]!))) return void (failure = `SolidCraft made ${n} = ${got ?? "nothing"}, not ${values[n]}`);
+        }
+        this.nextBy.set(ref.key, "panel");
+        const cur = readPartFile(ref.dir);
+        if (cur.kind !== "ok") return void (failure = "part.json can no longer be read");
+        writePartFile(ref.dir, { ...cur.file, ownerParams: { ...values } });
+        const l = this.findLock(ref);
+        if (!l) return void (failure = "the concept's approval is gone");
+        const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = l;
+        this.approve(ref, { ...rest, ownerParams: { ...values }, at: new Date().toISOString() });
+      },
+    });
+    if (failure || reply.result.isError) return { ok: false, error: `request_dimensions: ${failure ?? reply.result.text}` };
+    this.recheck(ref);
+    return { ok: true, approved: true, ownerParams: { ...values } };
+  }
+
+  /** `report_gap {part, feature, detail}` (D17): the part is `gap` until the owner clears it. */
+  async reportGap(sessionId: string, ref: PartRef, feature: unknown, detail: unknown): Promise<{ ok: true; gate?: GateResult } | { ok: false; error: string }> {
+    this.touch(sessionId, ref);
+    if (typeof feature !== "string" || !feature.trim()) return { ok: false, error: "report_gap: name the `feature` SolidCraft cannot make" };
+    if (typeof detail !== "string" || !detail.trim()) return { ok: false, error: "report_gap: give the `detail` — what you tried and what SolidCraft did" };
+    const gap: GapRecord = { feature: feature.trim().slice(0, 200), detail: detail.trim().slice(0, 2000), at: new Date().toISOString() };
+    const part = readPartFile(ref.dir);
+    if (part.kind === "ok") writePartFile(ref.dir, { ...part.file, gap });
+    this.setGap(ref, gap, gap.at);
+    await this.manager.refreshNow(ref).catch(() => undefined);
+    return { ok: true, gate: this.snapshots.get(ref.key)?.outcome.gate };
+  }
+
+  /** "Clear gap" on the part card (`cad.gap.clear`): the OWNER says the gap no longer applies. */
+  async clearGap(worktree: string, part: unknown): Promise<void> {
+    const ref = this.refFor(worktree, part);
+    if (!this.clearGapRecord(ref)) throw new Error(`cad/${ref.part} has no gap to clear`);
+    if (this.manager.status(ref)?.live) await this.manager.refreshNow(ref).catch(() => undefined);
+  }
+
+  /** Why `export_part` is refused (a concept, a gap), or undefined. */
+  exportRefusal(ref: PartRef): string | undefined {
+    const part = readPartFile(ref.dir);
+    if (part.kind === "ok" && part.file.status === "concept") return `export_part is refused: cad/${ref.part} is a concept — its dimensions are not confirmed. Call request_dimensions, then record_expectations.`;
+    const gap = this.gapFor(ref);
+    if (gap) return `export_part is refused: cad/${ref.part} is blocked on an unsupported feature (${gap.feature}) until the owner clears the gap.`;
+    return undefined;
+  }
+
+  /** Does `dir` hold a release pack this machine made, unaltered (`verifyRelease` with this machine's key)? */
+  verifyReleaseDir(dir: string): ReleaseVerdict {
+    return verifyRelease(dir, releaseKey(this.stateDir));
+  }
+  /** The verified release of a part's current script, if any — what the "Released" badge shows. */
+  private releasedOf(ref: PartRef, scriptSha: string | undefined): PartSnapshot["released"] {
+    if (!scriptSha) return undefined;
+    const dir = releaseFolder(ref, scriptSha);
+    if (!existsSync(dir)) return undefined;
+    try {
+      const v = this.verifyReleaseDir(dir);
+      return v.ok ? { path: relative(ref.worktree, dir), scriptSha, at: v.manifest.createdAt } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * `release_part {part}` (§4.7) and the card's Release button: force a refresh; require `pass`,
+   * `dimensioned` and no gap; then ONE typed `release` card, every time, under every policy (denied
+   * when unattended). Approving numbers the agent set also confirms them (approvedBy → owner). Only
+   * then is the pack written — exactly the files of §4.7, atomically — and one `file.offer` sent per
+   * file. Anything short of that writes nothing.
+   */
+  async releasePart(sessionId: string, ref: PartRef, opts: { onParked?: () => void } = {}): Promise<{ ok: true; approved: boolean; dir?: string; files?: string[]; offered?: number } | { ok: false; error: string }> {
+    this.touch(sessionId, ref);
+    const session = this.deps.getSession(sessionId);
+    if (!session) return { ok: false, error: "the session is gone" };
+    if (isUnattended(session)) return { ok: false, error: "release_part was denied: this session is unattended, so no one can approve the release" };
+    if (!existsSync(join(ref.dir, DESIGN_FILE)) && !this.manager.status(ref)?.live) return { ok: false, error: `cad/${ref.part} has no design to release` };
+    await this.manager.refreshNow(ref);
+    const snap = this.snapshots.get(ref.key);
+    const part = readPartFile(ref.dir);
+    const gate = snap?.outcome.gate;
+    const refuse = (why: string) => ({ ok: false as const, error: `release_part refused: ${why}. Nothing was written.` });
+    if (!snap || !gate || !snap.outcome.measurement || !snap.outcome.scriptSha) return refuse(`cad/${ref.part} could not be measured`);
+    if (part.kind === "ok" && part.file.status === "concept") return refuse(`cad/${ref.part} is a concept — its dimensions are not confirmed (request_dimensions, then record_expectations)`);
+    if (gate.gap || gate.state === "gap") return refuse(`cad/${ref.part} is blocked on an unsupported feature (${gate.gap?.feature ?? "a reported gap"})`);
+    if (gate.state !== "pass") return refuse(`the gate is ${gate.state}${failingLines(gate).length ? ` — ${failingLines(gate).join("; ")}` : ""}`);
+    if (part.kind !== "ok" || part.file.status !== "dimensioned") return refuse(`cad/${ref.part}/part.json is not a dimensioned part`);
+    const rules = readRules(ref.worktree);
+    const proc = rules.kind === "ok" ? rules.file.processes.find((p) => p.id === part.file.process) : undefined;
+    if (!proc) return refuse(`process ${part.file.process} is not in cad/rules.json`);
+    const shownSha = snap.outcome.scriptSha;
+    const m = snap.outcome.measurement;
+    const agentNumbers = gate.approvedBy === "agent-initial";
+    const scriptBytes = snap.outcome.scriptBytes ?? 0;
+    const rows: CadExpectationsRow[] = [
+      { label: "Part", new: ref.part },
+      { label: "Process", new: `${proc.id} (${proc.kind})` },
+      { label: "Material", new: part.file.material ?? proc.material ?? "not specified" },
+      { label: "Numbers approved by", new: agentNumbers ? "the agent — NOT confirmed by you; approving confirms them" : (gate.approvedBy ?? "unknown") },
+      { label: "Script", new: `${shownSha.slice(0, 12)} · ${formatBytes(scriptBytes)}` },
+      ...gate.checks.filter((c) => c.hard && /^(bbox|volume|bodies|holes|interference)/.test(c.id)).map((c) => ({ label: c.id, old: showVal(c.expected), new: showVal(c.measured) })),
+      ...snap.outcome.holes.map((h) => ({ label: `Hole ⌀${num(h.diameter)}`, new: `×${h.count} ${h.kind}, depth ${num(h.depth)}${h.counterbore?.length ? `, counterbore ${h.counterbore.map((c) => `⌀${num(c.diameter)} × ${num(c.depth)}`).join(", ")}` : ""}` })),
+      ...[...advisoryLines(gate), ...gate.warnings].map((a) => ({ label: "Advisory", new: a })),
+      { label: "Bounding box (measured)", new: `${m.bbox.map(num).join(" × ")} mm` },
+    ];
+    const requestId = newId("cadx");
+    const approved = await new Promise<boolean>((resolve) => {
+      this.park({
+        requestId,
+        sessionId,
+        ref,
+        kind: "release",
+        settle: resolve,
+        body: {
+          type: "cad.expectations.request",
+          requestId,
+          sessionId,
+          cwd: ref.worktree,
+          part: ref.part,
+          kind: "release",
+          ...(agentNumbers ? { note: RELEASE_AGENT_NUMBERS } : {}),
+          rows,
+        },
+      });
+      setStatus(session, "awaiting_permission");
+      opts.onParked?.();
+    });
+    setStatus(session, "running_tool");
+    if (!approved) return { ok: true, approved: false };
+
+    // The owner saw these numbers on the release card: release is never on numbers nobody approved.
+    if (agentNumbers) {
+      const locked = readLocked(ref, this.locks, this.machine());
+      if (locked.part.kind !== "ok" || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file)) return refuse("part.json changed while the card was open");
+      const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
+      this.approve(ref, { ...rest, approvedBy: "owner", at: new Date().toISOString() });
+    }
+    await this.manager.refreshNow(ref);
+    const after = this.snapshots.get(ref.key);
+    if (!after || after.outcome.scriptSha !== shownSha) return refuse("the design changed while the card was open");
+    if (after.outcome.gate.state !== "pass") return refuse(`the gate is ${after.outcome.gate.state} now`);
+    const key = releaseKey(this.stateDir);
+    let written: { dir: string; files: string[] };
+    try {
+      written = await this.manager.run(ref, async (slot) => {
+        if (slot.scriptSha() !== shownSha) throw new Error("the design changed while the card was open");
+        const call = (tool: string, args: Record<string, unknown>) => slot.call(tool, args);
+        const design = await readDesign(call);
+        const tables = [];
+        for (const b of design.designBodies) tables.push(await holeTable(call, b, { positions: true }));
+        const g = after.outcome.gate;
+        const data: ReleaseData = {
+          part: ref.part,
+          scriptSha: shownSha,
+          solidcraft: design.version,
+          process: { id: proc.id, kind: proc.kind, ...(proc.generalTolerance ? { generalTolerance: proc.generalTolerance } : {}) },
+          ...(part.file.material ?? proc.material ? { material: part.file.material ?? proc.material } : {}),
+          bbox: m.bbox,
+          volume: m.volume,
+          bodies: m.bodies,
+          params: design.params,
+          holes: mergeHoleTables(tables),
+          checks: g.checks,
+          advisories: [...advisoryLines(g), ...g.warnings],
+          references: (part.file.refs ?? []).map((r) => ({ name: r.name, sha256: r.sha256 })),
+          approvedBy: agentNumbers ? "owner (confirmed with this release)" : String(g.approvedBy ?? "owner"),
+          createdAt: new Date().toISOString(),
+        };
+        return writeReleasePack(call, ref, data, design.designBodies, key);
+      });
+    } catch (e) {
+      return { ok: false, error: `release_part failed, nothing was written: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    let offered = 0;
+    for (const f of written.files) if (await this.offerFile(sessionId, f)) offered++;
+    const cur = this.snapshots.get(ref.key);
+    if (cur) {
+      cur.released = this.releasedOf(ref, cur.outcome.scriptSha);
+      this.emitDesign(cur, true);
+    }
+    return { ok: true, approved: true, dir: written.dir, files: written.files, offered };
+  }
+
+  /** `cad.release.request`: raise the release card with no model turn. Resolves once the card is up
+   *  (or rejects with the refusal); the release itself follows the owner's answer in the background. */
+  requestRelease(sessionId: string, ref: PartRef): Promise<void> {
+    return new Promise((resolve, reject) => {
+      void this.releasePart(sessionId, ref, { onParked: () => resolve() }).then(
+        (r) => (r.ok ? resolve() : reject(new Error(r.error))),
+        (e) => reject(e instanceof Error ? e : new Error(String(e))),
+      );
+    });
+  }
+
+  /**
+   * A picture for `compare_picture`, copied into `cad/<part>/.cache/pictures/` (SolidCraft reads only
+   * the part folder): `picture` names a PNG/JPEG in this repo (the download quarantine included), by
+   * the same rules as a reference source; `attachment` is "latest" or the name of an image the user
+   * attached in this session.
+   */
+  pictureFile(sessionId: string, ref: PartRef, src: { picture?: unknown; attachment?: unknown }): { ok: true; abs: string; label: string } | { ok: false; error: string } {
+    let bytes: Buffer;
+    let label: string;
+    if (src.picture !== undefined) {
+      const raw = src.picture;
+      if (typeof raw !== "string" || !raw || isAbsolute(raw) || raw.includes("\0")) return { ok: false, error: "compare_picture: `picture` must be a path inside this repo, relative to its root" };
+      const abs = resolve(ref.worktree, raw);
+      const rel = relative(ref.worktree, abs);
+      if (!rel || rel.startsWith("..") || isAbsolute(rel) || rel.split("/").includes(".git")) return { ok: false, error: `compare_picture: ${JSON.stringify(raw)} is outside this repo` };
+      if (!/\.(png|jpe?g)$/i.test(rel)) return { ok: false, error: "compare_picture: `picture` must be a PNG or JPEG" };
+      try {
+        const st = lstatSync(abs);
+        if (st.isSymbolicLink() || !st.isFile() || realpathSync(abs) !== abs) return { ok: false, error: `compare_picture: ${JSON.stringify(raw)} is not a regular file in this repo` };
+        if (st.size > PICTURE_MAX_BYTES) return { ok: false, error: `compare_picture: ${JSON.stringify(raw)} is larger than ${PICTURE_MAX_BYTES / 1024 / 1024} MB` };
+      } catch {
+        return { ok: false, error: `compare_picture: ${JSON.stringify(raw)} does not exist` };
+      }
+      bytes = readFileSync(abs);
+      label = rel;
+    } else {
+      const want = src.attachment;
+      if (typeof want !== "string" || !want) return { ok: false, error: "compare_picture: `attachment` is \"latest\" or the name of an image attached in this chat" };
+      const dir = join(this.stateDir, "sessions", sessionId, "attachments");
+      let picks: { bin: string; name: string; mtime: number }[] = [];
+      try {
+        for (const f of readdirSync(dir)) {
+          if (!f.endsWith(".json")) continue;
+          const meta = JSON.parse(readFileSync(join(dir, f), "utf8")) as { mediaType?: string; name?: string; ext?: string };
+          if (meta.mediaType !== "image/png" && meta.mediaType !== "image/jpeg") continue;
+          const ext = /^[a-z0-9]{1,12}$/.test(String(meta.ext)) ? String(meta.ext) : "bin";
+          const bin = join(dir, `${f.slice(0, -5)}.${ext}`);
+          if (existsSync(bin)) picks.push({ bin, name: String(meta.name ?? ""), mtime: statSync(bin).mtimeMs });
+        }
+      } catch {
+        picks = [];
+      }
+      const hit = want === "latest" ? picks.sort((a, b) => b.mtime - a.mtime)[0] : picks.filter((p) => p.name === want).sort((a, b) => b.mtime - a.mtime)[0];
+      if (!hit) return { ok: false, error: `compare_picture: no image ${want === "latest" ? "has been attached" : `named ${JSON.stringify(want)} was attached`} in this chat` };
+      bytes = readFileSync(hit.bin);
+      label = `attachment ${hit.name || basename(hit.bin)}`;
+    }
+    const dir = join(ref.dir, CACHE_DIR, "pictures");
+    mkdirSync(dir, { recursive: true });
+    const ext = bytes[0] === 0x89 ? ".png" : ".jpg";
+    const dest = join(dir, `picture-${createHash("sha256").update(bytes).digest("hex").slice(0, 16)}${ext}`);
+    const tmp = `${dest}.tmp-${process.pid}`;
+    writeFileSync(tmp, bytes);
+    renameSync(tmp, dest);
+    return { ok: true, abs: dest, label };
+  }
+
+  /** A concept part's picture comparison: shown on the card as an ADVISORY line, never a check that blocks. */
+  recordPicture(ref: PartRef, overlap: number, picture: string): void {
+    if (!Number.isFinite(overlap)) return;
+    this.pictureScores.set(ref.key, { overlap, picture, at: new Date().toISOString() });
+    void this.manager.refreshNow(ref).catch(() => undefined);
+  }
+  private advisoryFor(ref: PartRef): GateCheck[] {
+    const score = this.pictureScores.get(ref.key);
+    if (!score) return [];
+    const part = readPartFile(ref.dir);
+    if (part.kind !== "ok" || part.file.status !== "concept") return [];
+    return [{ id: "picture.overlap", expected: "advisory: the model's outline against the picture", measured: `${Math.round(score.overlap * 1000) / 10}% overlap with ${score.picture}`, ok: true, hard: false }];
+  }
+
+  /**
+   * Broadcast a part's `cad.design` with the rate bound of spec §6: at most one per
+   * DESIGN_BROADCAST_MS per part, with a trailing emit of the latest state. Immediate when forced
+   * (check_part, cad.param.set, release), when the last one went out long enough ago, or when it went
+   * out in the same busy period (the manager's own debounce already bounds a burst).
+   */
+  private emitDesign(snap: PartSnapshot, immediate: boolean): void {
+    const k = snap.ref.key;
+    let st = this.emitState.get(k);
+    if (!st) this.emitState.set(k, (st = { at: -Infinity, epoch: -1 }));
+    const now_ = this.clock.now();
+    const epoch = this.busyEpoch.get(k) ?? 0;
+    if (immediate || now_ - st.at >= DESIGN_BROADCAST_MS || st.epoch === epoch) {
+      if (st.timer !== undefined) this.clock.clearTimeout(st.timer);
+      st.timer = undefined;
+      st.at = now_;
+      st.epoch = epoch;
+      this.broadcast(this.designEvent(snap));
+      return;
+    }
+    if (st.timer !== undefined) return; // the trailing emit will carry the newest state
+    const s = st;
+    s.timer = this.clock.setTimeout(() => {
+      s.timer = undefined;
+      const latest = this.snapshots.get(k);
+      if (!latest) return;
+      s.at = this.clock.now();
+      s.epoch = this.busyEpoch.get(k) ?? 0;
+      this.broadcast(this.designEvent(latest));
+    }, Math.max(0, s.at + DESIGN_BROADCAST_MS - now_));
   }
 
   /** `check_part`: force a refresh (so nothing is judged on a stale measurement) and return the gate in full. */
@@ -734,7 +1325,9 @@ export class CadworkService {
 
   /** The absolute file behind a `cad.design.preview` path, or undefined when it is not one (or is gone). */
   previewFile(worktree: string, relPath: string): string | undefined {
-    const m = PREVIEW_PATH_RE.exec(relPath);
+    const glb = PREVIEW_PATH_RE.exec(relPath);
+    const png = THUMB_PATH_RE.exec(relPath);
+    const m = glb ?? png;
     if (!m || isAbsolute(relPath)) return undefined;
     let ref: PartRef;
     try {
@@ -742,7 +1335,7 @@ export class CadworkService {
     } catch {
       return undefined;
     }
-    const abs = join(ref.dir, CACHE_DIR, `preview-${Number(m[2])}.glb`);
+    const abs = join(ref.dir, CACHE_DIR, glb ? `preview-${Number(m[2])}.glb` : `thumb-${Number(m[2])}.png`);
     try {
       // The real file must sit in the part's own cache folder: a link out of it is not served.
       return realpathSync(abs) === abs ? abs : undefined;
@@ -785,6 +1378,7 @@ export class CadworkService {
 
   /** The queue of a part started or drained: keep `cad.design.busy` true while it works. */
   private onBusy(key: string, part: string, busy: boolean): void {
+    if (busy) this.busyEpoch.set(key, (this.busyEpoch.get(key) ?? 0) + 1);
     const armed = this.busyTimers.get(key);
     if (armed !== undefined) this.clock.clearTimeout(armed);
     this.busyTimers.delete(key);
@@ -836,15 +1430,24 @@ export class CadworkService {
   }
 
   /** Answer an expectations card (`cad.expectations.respond`). False when there is no such card. */
-  respond(requestId: string, approve: boolean): boolean {
+  respond(requestId: string, approve: boolean, values?: unknown): boolean {
     const card = this.cards.get(requestId);
     if (!card) return false;
+    // A dimensions card is answered with the owner's numbers: checked here, server-side. A bad set
+    // is refused and the card stays open for a corrected answer.
+    let typed: Record<string, number> | undefined;
+    if (card.kind === "dimensions" && approve) {
+      const v = checkDimensionValues(card.dims ?? [], values);
+      if (!v.ok) throw new Error(v.error);
+      typed = v.values;
+    }
     this.cards.delete(requestId);
     let approved = approve;
-    const toolCard = card.kind === "propose" || card.kind === "initial"; // the waiting tool call does the writing
+    // The waiting tool call does the writing for these.
+    const toolCard = card.kind === "propose" || card.kind === "initial" || card.kind === "dimensions" || card.kind === "release";
     if (!toolCard && approve) approved = card.kind === "confirm" ? this.confirm(card) : this.adopt(card);
     this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId, approved } satisfies CadExpectationsResolvedEvent);
-    card.settle?.(approved);
+    card.settle?.(approved, typed);
     if (!toolCard) this.recheck(card.ref, card.kind === "adopt-rules");
     return true;
   }
@@ -885,6 +1488,10 @@ export class CadworkService {
       ...(s.waiting ? { waiting: true } : {}),
       by: s.by,
       sessionIds: [...(this.partSessions.get(s.ref.key) ?? [])],
+      ...(s.outcome.thumbnail ? { thumbnail: s.outcome.thumbnail } : {}),
+      ...(s.outcome.scriptBytes !== undefined ? { scriptBytes: s.outcome.scriptBytes } : {}),
+      ...(s.released ? { released: s.released } : {}),
+      ...(s.status ? { status: s.status } : {}),
     };
   }
 
@@ -908,9 +1515,20 @@ export class CadworkService {
     const by = this.nextBy.get(ref.key) ?? "agent";
     this.nextBy.delete(ref.key);
     if (outcome.preview && outcome.previewSha) this.recordExport(join(ref.worktree, outcome.preview), outcome.previewSha);
-    const snap: PartSnapshot = { ref, rev: outcome.rev ?? (prev?.rev ?? 0) + 1, outcome, by, busy: (this.manager.status(ref)?.queued ?? 0) > 0 };
+    if (outcome.thumbnail && outcome.thumbnailSha) this.recordExport(join(ref.worktree, outcome.thumbnail), outcome.thumbnailSha);
+    const pf = readPartFile(ref.dir);
+    const released = this.releasedOf(ref, outcome.scriptSha);
+    const snap: PartSnapshot = {
+      ref,
+      rev: outcome.rev ?? (prev?.rev ?? 0) + 1,
+      outcome,
+      by,
+      busy: (this.manager.status(ref)?.queued ?? 0) > 0,
+      ...(released ? { released } : {}),
+      ...(pf.kind === "ok" ? { status: pf.file.status } : {}),
+    };
     this.snapshots.set(ref.key, snap);
-    this.broadcast(this.designEvent(snap));
+    this.emitDesign(snap, outcome.forced);
     this.syncAdoptCards(ref, outcome.gate, outcome.params);
   }
 
@@ -1092,6 +1710,7 @@ export class CadworkService {
   async shutdown(): Promise<void> {
     this.offProtected?.();
     for (const t of this.busyTimers.values()) this.clock.clearTimeout(t);
+    for (const st of this.emitState.values()) if (st.timer !== undefined) this.clock.clearTimeout(st.timer);
     this.busyTimers.clear();
     for (const card of [...this.cards.values()]) card.settle?.(false);
     this.cards.clear();
@@ -1161,3 +1780,43 @@ export function expectationRows(before: Expectations | undefined, after: Expecta
   return [row("Bounding box (mm)", "bbox"), row("Volume (mm³)", "volume"), row("Bodies", "bodies"), row("Holes", "holes"), row("Tolerance", "tolerance"), row("Must not touch", "refs")];
 }
 
+/** What a release card says when the numbers are the agent's own (decision 96). */
+export const RELEASE_AGENT_NUMBERS = "The expected numbers were set by the agent and you have not confirmed them. Approving this release also confirms them as yours.";
+const PICTURE_MAX_BYTES = 20 * 1024 * 1024;
+const sortedEntries = (o: Record<string, number> | undefined): [string, number][] => Object.keys(o ?? {}).sort().map((k) => [k, o![k]!]);
+const showVal = (v: number | string): string => (typeof v === "number" ? num(v) : v);
+function formatBytes(n: number): string {
+  return n >= 1024 * 1024 ? `${Math.round((n / 1024 / 1024) * 10) / 10} MB` : n >= 1024 ? `${Math.round((n / 1024) * 10) / 10} KB` : `${n} bytes`;
+}
+
+/** `request_dimensions.proposed`: 1–50 rows {name, value, unit?, note?}, names unique. */
+export function parseDimensionRows(raw: unknown): { ok: true; rows: CadDimensionRow[] } | { ok: false; error: string } {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 50) return { ok: false, error: "`proposed` must list 1 to 50 named dimensions: [{name, value, unit?, note?}]" };
+  const rows: CadDimensionRow[] = [];
+  for (const [i, r] of raw.entries()) {
+    const x = r as Record<string, unknown>;
+    if (!x || typeof x !== "object") return { ok: false, error: `proposed[${i}] must be {name, value, unit?, note?}` };
+    if (typeof x.name !== "string" || !PARAM_NAME_RE.test(x.name) || x.name === "pi") return { ok: false, error: `proposed[${i}].name must be a parameter name` };
+    if (rows.some((y) => y.name === x.name)) return { ok: false, error: `proposed[${i}].name ${x.name} is listed twice` };
+    if (typeof x.value !== "number" || !Number.isFinite(x.value)) return { ok: false, error: `proposed[${i}].value must be a number` };
+    if (x.unit !== undefined && x.unit !== "mm" && x.unit !== "") return { ok: false, error: `proposed[${i}].unit must be "mm" (dimensions are lengths)` };
+    if (x.note !== undefined && typeof x.note !== "string") return { ok: false, error: `proposed[${i}].note must be text` };
+    rows.push({ name: x.name, value: x.value, ...(x.unit ? { unit: "mm" } : {}), ...(typeof x.note === "string" && x.note.trim() ? { note: x.note.trim().slice(0, 200) } : {}) });
+  }
+  return { ok: true, rows };
+}
+
+/** The owner's answer to a dimensions card: a finite number for exactly the card's names. */
+export function checkDimensionValues(names: string[], raw: unknown): { ok: true; values: Record<string, number> } | { ok: false; error: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "the dimensions card needs a number for every dimension" };
+  const v = raw as Record<string, unknown>;
+  const extra = Object.keys(v).filter((k) => !names.includes(k));
+  if (extra.length) return { ok: false, error: `not on the card: ${extra.join(", ")}` };
+  const out: Record<string, number> = {};
+  for (const n of names) {
+    const x = v[n];
+    if (typeof x !== "number" || !Number.isFinite(x)) return { ok: false, error: `${n} must be a number` };
+    out[n] = x;
+  }
+  return { ok: true, values: out };
+}

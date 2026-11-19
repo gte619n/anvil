@@ -567,9 +567,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
             // request from a foreign browser Origin is refused with the WebSocket's own gate (SEC-H3,
             // ANVIL_ALLOWED_ORIGINS): a web page must not read a part's preview by guessing a path.
             if (isCadApiPath(url.pathname)) {
-              if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) return new Response("forbidden origin", { status: 403 });
-              if (req.method === "OPTIONS") return new Response(null, { status: 204 });
-              return handle(req, srv, url);
+              const origin = req.headers.get("origin");
+              if (!isAllowedWsOrigin(origin, req.headers.get("host"), configuredAllowedOrigins())) return new Response("forbidden origin", { status: 403 });
+              // An ALLOWED cross-origin page (a fleet peer's UI) is named back exactly, never `*`.
+              const cors: Record<string, string> = origin && origin !== "null" ? { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type", Vary: "Origin" } : {};
+              if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+              const res = await handle(req, srv, url);
+              if (res) for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+              return res;
             }
             if (isApi && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
             const res = await handle(req, srv, url);

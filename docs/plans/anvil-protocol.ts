@@ -623,6 +623,9 @@ export interface CadGateResult {
    *  "agent-initial": the agent recorded them and the owner has not confirmed them (the part card
    *  offers "Confirm numbers", `cad.expectations.confirm`). */
   approvedBy?: "agent-initial" | "owner" | "planner";
+  /** Phase A4: the part is blocked on a feature SolidCraft cannot make (`report_gap`); `state` is
+   *  then "gap" until the owner clears it ("Clear gap", `cad.gap.clear`) or approves an expectation change. */
+  gap?: { feature: string; detail: string; at: string };
 }
 /**
  * A part was measured and checked again (§4.8). Broadcast to every client after each refresh of a
@@ -645,6 +648,16 @@ export interface CadDesignEvent extends Envelope {
   by: "agent" | "panel" | "reload";
   /** Sessions that have this part open: the chat card belongs in these. */
   sessionIds?: string[];
+  /** Phase A4: worktree-relative path of a small PNG of the part (`cad/<part>/.cache/thumb-<rev>.png`),
+   *  served by the preview route (`GET /api/cad/preview?cwd=…&path=…`). Never inline image data. */
+  thumbnail?: string;
+  /** Phase A4: size of `design.json` in bytes (references are embedded; the card shows it above 5 MB). */
+  scriptBytes?: number;
+  /** Phase A4: a release pack of the CURRENT script exists and its HMAC verifies on this machine —
+   *  the only case the card shows "Released". */
+  released?: { path: string; scriptSha: string; at: string };
+  /** Phase A4: `part.json`'s status ("concept": built from a picture, dimensions unconfirmed). */
+  status?: "concept" | "dimensioned";
 }
 /** One part of a worktree, as `cad.parts.list` answers it (Phase A3). */
 export interface CadPartInfo {
@@ -683,6 +696,13 @@ export interface CadExpectationsRow {
   old?: string;
   new?: string;
 }
+/** One named dimension on a `dimensions` card (Phase A4): the agent's proposal, which the owner edits. */
+export interface CadDimensionRow {
+  name: string;
+  value: number;
+  unit?: string; // "mm" | "deg" | absent
+  note?: string;
+}
 /**
  * The owner is asked to approve a change to what a part is checked against (§4.5, §4.9). Always a
  * typed card with Approve / Deny and NO "always allow":
@@ -693,6 +713,12 @@ export interface CadExpectationsRow {
  *  - `initial`            the agent asks to record expectations for a part that ALREADY has geometry
  *                         (or an earlier approval), so the numbers were written after it existed.
  *  - `confirm`            the owner asked to confirm numbers the agent recorded (`cad.expectations.confirm`).
+ *  - `dimensions`         Phase A4, a concept part: the agent's proposed named dimensions in
+ *                         `dimensions`, shown as EDITABLE numbers. The owner's typed values go back in
+ *                         `cad.expectations.respond.values` and become the part's `ownerParams`.
+ *  - `release`            Phase A4: release the part (§4.7). `rows` hold expected and measured
+ *                         numbers, holes, advisories, script size and who approved the numbers;
+ *                         `note` says so when the agent set them (approving then also confirms them).
  * Every card shows the evaluated numbers together with the process and status they are approved under.
  * Answered with `cad.expectations.respond`; retired by `cad.expectations.resolved`. Broadcast to all
  * clients (it names its session) and re-sent, with `replay`, when a socket opens.
@@ -703,8 +729,10 @@ export interface CadExpectationsRequestEvent extends Envelope {
   sessionId: SessionId;
   cwd: string;
   part: string;
-  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "initial" | "confirm";
+  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "initial" | "confirm" | "dimensions" | "release";
   reason?: string;
+  /** `dimensions` cards only: the rows the owner edits. */
+  dimensions?: CadDimensionRow[];
   /** A daemon-written caution shown on the card (e.g. "this part already has geometry…"). */
   note?: string;
   rows: CadExpectationsRow[];
@@ -1799,6 +1827,26 @@ export interface CadExpectationsRespondCmd extends Envelope, Correlated {
   type: "cad.expectations.respond";
   requestId: RequestId;
   approve: boolean;
+  /** A `dimensions` card: the owner's typed number for EVERY row, by name. Checked by the daemon
+   *  (finite numbers, exactly the card's names); a bad set is refused and the card stays open. */
+  values?: Record<string, number>;
+}
+/**
+ * "Release" on a part card (Phase A4): ask the daemon to raise the release card for the part, with
+ * no model turn. The release itself still happens only when the owner approves that card. `cwd` is
+ * checked like every cad command; the card and the file cards appear in `sessionId`.
+ */
+export interface CadReleaseRequestCmd extends Envelope, Correlated {
+  type: "cad.release.request";
+  cwd: string;
+  part: string;
+  sessionId: SessionId;
+}
+/** "Clear gap" on a part card (Phase A4): the OWNER says the reported gap no longer applies. */
+export interface CadGapClearCmd extends Envelope, Correlated {
+  type: "cad.gap.clear";
+  cwd: string;
+  part: string;
 }
 /**
  * "Confirm numbers" on a part card: ask the daemon to raise the standard owner card (numbers, process,
@@ -2298,6 +2346,8 @@ export type ClientCommand =
   | QuestionRespondCmd
   | CadExpectationsRespondCmd
   | CadExpectationsConfirmCmd
+  | CadReleaseRequestCmd
+  | CadGapClearCmd
   | CadPartsListCmd
   | CadParamSetCmd
   | CadDesignRefreshCmd

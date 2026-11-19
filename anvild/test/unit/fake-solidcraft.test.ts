@@ -45,7 +45,7 @@ describe("MCP protocol", () => {
     expect(init.result.capabilities.tools).toEqual({ listChanged: false });
     const tools = (await sc.rpc("tools/list")).result.tools as { name: string; inputSchema: unknown }[];
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ["batch", "body_topology", "check_parameters", "describe_command", "execute", "export", "inspect_design", "list_commands", "measure", "new_design", "open", "redo", "save", "screenshot", "set_parameter", "skill_reference", "undo", "version"],
+      ["batch", "body_topology", "check_parameters", "compare_picture", "describe_command", "execute", "export", "inspect_design", "list_commands", "measure", "new_design", "open", "redo", "save", "screenshot", "set_parameter", "skill_reference", "undo", "version"],
     );
     expect((await sc.rpc("ping")).result).toEqual({});
     expect((await sc.rpc("foo/bar")).error).toEqual({ code: -32601, message: "method `foo/bar` not found" });

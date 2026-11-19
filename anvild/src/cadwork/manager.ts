@@ -638,7 +638,9 @@ export class CadManager {
       );
     }
 
-    const common = { extraEnv: this.spawnEnv(), spawn: this.opts.spawn, clock: this.clock };
+    // The working folder is the part folder (absolute; decision 115): any plain name SolidCraft
+    // resolves against its working folder (a font, say) can then only resolve inside the part folder.
+    const common = { extraEnv: this.spawnEnv(), spawn: this.opts.spawn, clock: this.clock, cwd: ref.dir };
     const base = this.baseCmd(cli.path, ref.dir);
     let client: McpClient | undefined;
     let replayFailure: string | undefined;

@@ -50,6 +50,17 @@
  *                         stays alive — the "SolidCraft hangs" case the manager's timeout must kill.
  *   FAKE_SC_MISS_CUTS=1   every cut (solid.hole, solid.cylinder cut, and their patterned copies)
  *                         reports success but removes nothing — the "cut that misses" case.
+ *   FAKE_SC_INTERFERENCE  "unchecked" | "truncated" | "budget": `inspect.interference` reports that
+ *                         flag (a pair left unchecked, a truncated list, an exhausted budget), with
+ *                         `count` 0 — the replies the gate must never read as "no interference".
+ *   FAKE_SC_OVERLAP       the `overlap` compare_picture reports (default 0.9).
+ *
+ * PHASE A4 SHAPES. `file.insert_step` embeds the STEP text in the script exactly as the real tool
+ * does: `timeline.export_script` writes the import as `timeline.add {feature: {type: "import", name,
+ * file, step, body_names}}` (no path), a replay rebuilds it from the embedded text alone, and the reply
+ * carries `content_sha256`. `timeline.delete {feature}` removes a feature (by id or name).
+ * `screenshot {view}` gives a different grey per view; `compare_picture {reference}` returns an
+ * overlay image part plus `{overlap, …}`.
  *
  * FAILED FEATURES (A0 evidence): a `solid.*` step that fails while it is being ADDED is an error
  * reply and adds nothing. One that fails LATER — after a parameter change, or while a script is
@@ -83,6 +94,7 @@
  *    named `…:bore:side:0` / `…:cbore:side:0` and fillets `…:blend(a|b)`.
  *  - The "Boolean retry" warning text is invented (the real wording was not provoked).
  */
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -97,6 +109,8 @@ const DELAY_MS = Number(process.env.FAKE_SC_DELAY_MS || 0);
 const WARN_ON = process.env.FAKE_SC_WARN_ON || "";
 const HANG_ON = process.env.FAKE_SC_HANG_ON || "";
 const MISS_CUTS = process.env.FAKE_SC_MISS_CUTS === "1";
+const INTERFERENCE = process.env.FAKE_SC_INTERFERENCE || "";
+const OVERLAP = Number(process.env.FAKE_SC_OVERLAP || 0.9);
 const BOOLEAN_RETRY = "Boolean retry: the boolean needed a second attempt at a looser tolerance; check the result";
 
 type Json = Record<string, any>;
@@ -210,6 +224,8 @@ interface Feature {
   error?: string | null;
   /** Re-apply this feature shifted by (dx, dy) for a pattern copy; returns the bodies it changed. */
   instance?: (dx: number, dy: number, suffix: string) => string[];
+  /** The command-log index that made it (`timeline.delete` removes that entry). */
+  log?: number;
 }
 interface Sketch {
   id: number;
@@ -373,8 +389,9 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
       soft[0]!
     );
   };
+  let curIdx = 0;
   const feature = (command: string, type: string, base: string, name: unknown): Feature => {
-    const f: Feature = { id: nextId++, name: typeof name === "string" && name ? name : autoName(base), type, warning: WARN_ON === command ? BOOLEAN_RETRY : null };
+    const f: Feature = { id: nextId++, name: typeof name === "string" && name ? name : autoName(base), type, warning: WARN_ON === command ? BOOLEAN_RETRY : null, log: curIdx };
     m.timeline.push(f);
     return f;
   };
@@ -465,6 +482,7 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
 
   const paramReplies: Json[] = [];
   for (const [idx, { command, params: p }] of log.entries()) {
+    curIdx = idx;
     const tolerant = idx < strictFrom && command.startsWith("solid.");
     const snap = tolerant ? { bodies: structuredClone(m.bodies), timeline: m.timeline.length, results: m.results.length, bodyCount, nextId, counters: { ...counters } } : undefined;
     try {
@@ -705,14 +723,20 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
         m.results.push(featureResult(f, [], [...changed]));
         break;
       }
+      case "timeline.add":
       case "file.insert_step": {
-        const path = readablePath(p.path, command);
-        const stem = basename(path, extname(path));
-        const marker = /\/\* fake-solidcraft (\{.*\}) \*\//.exec(readFileSync(path, "utf8"));
+        // A replayed import carries its STEP text (the real script shape); a live insert was given it
+        // by `execute` (see stepParams). Nothing reads the file again.
+        const imp = command === "timeline.add" ? (p.feature as Json | undefined) : p;
+        if (command === "timeline.add" && (imp?.type !== "import" || typeof imp?.step !== "string")) throw new UnknownCommand("fake-solidcraft only replays `timeline.add` imports");
+        const text: string = typeof imp!.step === "string" ? imp!.step : readFileSync(readablePath(p.path, command), "utf8");
+        const path: string = typeof p.path === "string" ? p.path : String(imp!.file ?? "reference.step");
+        const stem = basename(String(imp!.file ?? path), extname(String(imp!.file ?? path)));
+        const marker = /\/\* fake-solidcraft (\{.*\}) \*\//.exec(text);
         const src: { name: string; volume: number; faces: number; min: V3; max: V3 }[] = marker
           ? JSON.parse(marker[1]!).bodies
           : [{ name: stem, volume: 1000, faces: 6, min: [0, 0, 0], max: [10, 10, 10] }];
-        const f = feature(command, "BaseFeature", "Import", p.name ?? stem); // the real timeline type of a STEP import
+        const f = feature(command, "BaseFeature", "Import", imp!.name ?? stem); // the real timeline type of a STEP import
         const made: string[] = [];
         for (const s of src) {
           let name = src.length === 1 ? stem : s.name;
@@ -722,7 +746,7 @@ function build(log: readonly Cmd[], strictFrom: number = log.length): Model {
           made.push(name);
         }
         m.results.push({
-          bodies: made, component: f.id, component_name: stem, created_bodies: made, exporter: marker ? "SolidCraft" : "unknown", exporter_up: "z",
+          bodies: made, component: f.id, component_name: stem, content_sha256: createHash("sha256").update(text).digest("hex"), created_bodies: made, exporter: marker ? "SolidCraft" : "unknown", exporter_up: "z",
           feature: f.id, name: f.name, occurrence: f.id, path, system: marker ? "SolidCraft" : "unknown", warnings: [],
         });
         break;
@@ -934,8 +958,10 @@ function interference(m: Model, p: Json): Json {
       })
     : m.bodies;
   const out: Json[] = [];
+  const excluded = new Set((Array.isArray(p.exclude_pairs) ? p.exclude_pairs : []).flatMap((x: unknown) => (Array.isArray(x) && x.length === 2 ? [`${x[0]}\n${x[1]}`, `${x[1]}\n${x[0]}`] : [])));
   for (let i = 0; i < pick.length; i++) {
     for (let j = i + 1; j < pick.length; j++) {
+      if (excluded.has(`${pick[i]!.name}\n${pick[j]!.name}`)) continue;
       const [a, b] = [bboxOf(pick[i]!), bboxOf(pick[j]!)];
       const min = a.min.map((v, k) => Math.max(v, b.min[k]!)) as V3;
       const max = a.max.map((v, k) => Math.min(v, b.max[k]!)) as V3;
@@ -948,9 +974,17 @@ function interference(m: Model, p: Json): Json {
       });
     }
   }
+  if (INTERFERENCE) {
+    // The hook: the check did not complete, and it reports nothing found.
+    return {
+      budget_exceeded: INTERFERENCE === "budget", budget_s: 240, checked: pick.length, count: 0, interferences: [], ms: 0.1,
+      pairs_candidate: 1, pairs_cleared: 0, pairs_excluded: excluded.size / 2, pairs_intersected: 0, pairs_not_checked: 1,
+      skipped_pairs: 0, truncated: INTERFERENCE === "truncated", unchecked: INTERFERENCE === "unchecked" ? [[pick[0]?.name ?? "?", pick[1]?.name ?? "?"]] : [],
+    };
+  }
   return {
     budget_exceeded: false, budget_s: 240, checked: pick.length, count: out.length, interferences: out, ms: 0.1,
-    pairs_candidate: out.length, pairs_cleared: 0, pairs_excluded: 0, pairs_intersected: out.length, pairs_not_checked: 0,
+    pairs_candidate: out.length, pairs_cleared: 0, pairs_excluded: excluded.size / 2, pairs_intersected: out.length, pairs_not_checked: 0,
     skipped_pairs: 0, truncated: false, unchecked: [],
   };
 }
@@ -991,8 +1025,8 @@ function crc32(buf: Uint8Array): number {
   for (const b of buf) c = crcTable[(c ^ b) & 0xff]! ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
-/** A valid w×h 8-bit grey PNG. */
-function png(w: number, h: number): Buffer {
+/** A valid w×h 8-bit grey PNG (`shade` is the grey level). */
+function png(w: number, h: number, shade = 0xc0): Buffer {
   const chunk = (type: string, data: Buffer) => {
     const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
     const out = Buffer.alloc(body.length + 8);
@@ -1005,7 +1039,7 @@ function png(w: number, h: number): Buffer {
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
   ihdr[8] = 8; // bit depth; colour type 0 (grey), default compression/filter/interlace
-  const rows = Buffer.alloc((w + 1) * h, 0xc0);
+  const rows = Buffer.alloc((w + 1) * h, shade);
   for (let y = 0; y < h; y++) rows[y * (w + 1)] = 0; // filter byte per scanline
   return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", ihdr), chunk("IDAT", deflateSync(rows)), chunk("IEND", Buffer.alloc(0))]);
 }
@@ -1139,7 +1173,14 @@ function exportScript(m: Model): { about: Json; commands: Cmd[] } {
     about: { design: designName, format: `solidcraft/${FORMAT}`, replay: "solidcraft-cli eval script.json", version: VERSION },
     commands: [
       ...m.params.map((q) => ({ command: "parameters.add", params: { expression: q.expression, name: q.name, unit: q.unit } })),
-      ...log.filter((c) => !c.command.startsWith("parameters.")),
+      ...log.flatMap((c, idx) => {
+        if (c.command.startsWith("parameters.")) return [];
+        if (c.command !== "file.insert_step") return [c];
+        // As the real tool writes an import: the STEP text embedded, no path.
+        const f = m.timeline.find((x) => x.log === idx);
+        const stem = basename(String(c.params.file), extname(String(c.params.file)));
+        return [{ command: "timeline.add", params: { feature: { body_names: m.bodies.filter((b) => f && b.feature === f.id).map((b) => b.name), file: c.params.file, id: f?.id, name: c.params.name ?? stem, step: c.params.step, type: "import" } } }];
+      }),
     ],
   };
 }
@@ -1160,6 +1201,7 @@ const COMMANDS: { id: string; label: string; params: string }[] = [
   { id: "solid.hole", label: "Hole", params: "position: [x,y,z] | sketch + points?; diameter; depth? (default through all); type?: simple|drilled|counterbore; cb_diameter?, cb_depth?; targets?: [body], name?" },
   { id: "solid.pattern.rectangular", label: "Rectangular Pattern", params: "features: [names], dir1, count1, spacing1, dir2?, count2?, spacing2?, name?" },
   { id: "file.insert_step", label: "Insert STEP", params: "path; STEP import: brings the file's solids in as a fixed reference body" },
+  { id: "timeline.delete", label: "Delete", params: "feature: id or name" },
   { id: "inspect.interference", label: "Interference", params: "bodies?: [names] → interferences: pairs that overlap" },
   { id: "inspect.measure", label: "Measure", params: "bodies?: name | [names] (default: all) → the same reply as the measure tool" },
   { id: "view.pick", label: "Pick", params: "rays: [{origin: [x,y,z], dir: [x,y,z]}] (max 1024), all?: bool → hits: per ray [{body, depth, face, normal, point}], nearest first" },
@@ -1181,6 +1223,22 @@ function execute(command: string, params: Json, verbose: boolean): Json {
   if (!isKnown(command)) throw new ToolError(`unknown command \`${command}\``);
   const ro = READ_ONLY[command];
   if (ro) return ro(model, params);
+  if (command === "timeline.delete") {
+    const key = params.feature ?? params.features;
+    const f = model.timeline.find((x) => x.id === key || x.name === key);
+    if (!f || f.log === undefined) throw new ToolError(`invalid parameters for \`timeline.delete\`: no feature \`${key}\``);
+    const next = log.filter((_, i) => i !== f.log);
+    model = build(next);
+    log = next;
+    redo = [];
+    revision++;
+    return { deleted: [f.id] };
+  }
+  if (command === "file.insert_step") {
+    // The STEP text is read ONCE and travels in the command from here on (and in the script).
+    const path = readablePath(params.path, command);
+    params = { ...params, file: basename(path), step: readFileSync(path, "utf8") };
+  }
   const next = build([...log, { command, params }], log.length);
   log.push({ command, params });
   redo = [];
@@ -1389,7 +1447,8 @@ const TOOLS: Record<string, { description: string; readOnly: boolean; required?:
     readOnly: true,
     run: (a) => {
       const [width, height] = [Math.min(Number(a.width ?? 16), 64), Math.min(Number(a.height ?? 16), 64)];
-      const bytes = png(width, height);
+      const shades: Record<string, number> = { iso: 0xc0, front: 0x80, top: 0x60, right: 0xa0 };
+      const bytes = png(width, height, shades[String(a.view ?? "iso")] ?? 0xc0);
       const path = a.path === undefined ? null : allowedPath(a.path, "screenshot");
       if (path) writeFileSync(path, bytes);
       return {
@@ -1421,6 +1480,21 @@ const TOOLS: Record<string, { description: string; readOnly: boolean; required?:
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, bytes);
       return { bytes: bytes.length, format: label, path };
+    },
+  },
+  compare_picture: {
+    description: "Overlay the model's outline on a reference picture: {reference, view?}.",
+    readOnly: true,
+    required: ["reference"],
+    run: (a) => {
+      const ref = readablePath(a.reference, "compare_picture");
+      const bytes = png(16, 16, 0x40);
+      return {
+        content: [
+          { data: bytes.toString("base64"), mimeType: "image/png", type: "image" },
+          { text: JSON.stringify({ aspect_mismatch: 0.99, edges: {}, fit: "width", mm_per_px: { x: 0.5, y: 0.5 }, model: { bodies: model.bodies.length }, overlap: OVERLAP, picture: { source: ref }, stations: 9 }), type: "text" },
+        ],
+      };
     },
   },
   undo: {

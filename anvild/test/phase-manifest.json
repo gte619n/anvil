@@ -486,7 +486,89 @@
     },
     "A4": {
       "title": "inputs, gaps, release",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/integration/cad-a4-release.test.ts",
+          "names": [
+            "Phase A4 acceptance > [A4] acceptance 1: a part that overlaps its reference body fails the gate on interference; moved clear, it passes",
+            "Phase A4 acceptance > [A4] acceptance 2: a concept part refuses export_part and release_part; the owner's dimensions card with L=95 sets ownerParams.L = 95 in the file and the lock store and the design's L to 95 whatever the agent proposed; after record_expectations it is dimensioned",
+            "Phase A4 acceptance > [A4] acceptance 3: report_gap sets the state to gap and release_part is refused",
+            "Phase A4 acceptance > [A4] acceptance 4: release_part on a passing part writes exactly the files of §4.7; the manifest hashes match and the HMAC verifies; the sheet says Not a drawing, lists every parameter and one hole row per distinct diameter; one file.offer per file",
+            "Phase A4 acceptance > [A4] acceptance 4: on a failing part release_part writes nothing",
+            "Phase A4 acceptance > [A4] acceptance 4: a copied release folder with an edited STEP does not get the Released badge",
+            "Phase A4 extras > [A4] reference integrity: editing refs/x.step makes the part unverified with 'reference changed; re-import'; a reference missing from refs/ fails",
+            "Phase A4 extras > [A4] importing before expectations exist is free, adds the reference to noInterferenceWith at record time, and keeps the part open to agent-initial expectations",
+            "Phase A4 extras > [A4] after expectations exist, import_reference is the owner's card: Deny imports and writes nothing; unattended it is denied without a card",
+            "Phase A4 extras > [A4] the 50 MB cap (injected) and the source rules: .., absolute paths, a symlink, a symlink inside the quarantine and a non-STEP are refused before anything is copied",
+            "Phase A4 extras > [A4] an interference reply with unchecked pairs, a truncated list or an exhausted budget fails the gate",
+            "Phase A4 extras > [A4] the release card shows under bypass and after a remembered allow with no generic prompt, and is denied without a card when unattended",
+            "Phase A4 extras > [A4] a release of agent-initial numbers says so on the card and confirms them (approvedBy → owner); an owner-approved part's card has no such note",
+            "Phase A4 extras > [A4] a record whose declared parameter values differ from ownerParams is refused",
+            "Phase A4 extras > [A4] report_gap survives a manager restart and an edit of part.json; only the owner's Clear gap (or an approved expectation change) clears it",
+            "Phase A4 extras > [A4] cad.design broadcasts are bounded: 20 sequential awaited mutating calls within 2 s of fake-clock time give at most 5, the last showing the final state; forced refreshes still broadcast at once",
+            "Phase A4 extras > [A4] the part card's thumbnail is a PNG next to the preview, recorded by the daemon and served by the same route; the event carries its path and the script size, never image data",
+            "Phase A4 extras > [A4] a concept's compare_picture score (a repo picture or the newest chat attachment) is shown on the card as an ADVISORY line that never blocks"
+          ]
+        },
+        {
+          "file": "test/unit/cad-refs.test.ts",
+          "names": [
+            "reference sources > [A4] source paths that escape are refused: .., absolute, a symlink, a symlink inside the download quarantine, a linked parent folder, .git, and a non-STEP",
+            "reference sources > [A4] the 50 MB cap: a sparse 50 MB + 1 byte file is refused, and an injected cap applies",
+            "reference sources > [A4] a reference's name in refs/ is the file name reduced to safe characters, never a path or hidden",
+            "reference integrity and interference > [A4] embedded imports are read from the script's timeline.add import features; refs/x.step must have the embedded text's sha256, else 'reference changed; re-import' (unverified)",
+            "reference integrity and interference > [A4] interference: only count 0 with nothing unchecked, not truncated and within budget passes — an overlap names the pair and volume; unchecked, truncated or budget_exceeded fail",
+            "the manager's working folder > [A4] SolidCraft is spawned with its working folder set to the part folder (absolute), so a plain name it resolves stays inside the part (decision 115)"
+          ]
+        },
+        {
+          "file": "test/unit/cad-release.test.ts",
+          "names": [
+            "release pack > [A4] a pack holds exactly the §4.7 files (3MF only for FDM); the manifest hashes every file and its HMAC verifies with this machine's key (created 0600)",
+            "release pack > [A4] verifyRelease refuses an edited file, an extra or missing file, a renamed folder and another machine's key",
+            "release pack > [A4] re-releasing the same script replaces the folder atomically; a failing export writes nothing",
+            "release pack > [A4] the spec sheet is headed 'Not a drawing', escapes every user-derived string (a hostile part or parameter name stays text), and has one hole row per distinct diameter with centres",
+            "release pack > [A4] the hole table can carry each hole's centre (on request only; rows are keyed without it)"
+          ]
+        },
+        {
+          "file": "test/unit/cad-concept.test.ts",
+          "names": [
+            "concept parts and dimensions > [A4] proposed dimensions: 1–50 unique parameter names with finite numbers in mm; the owner's answer must give a finite number for exactly those names",
+            "concept parts and dimensions > [A4] open_part {concept: true} is honoured only for a brand-new part: an existing part, or one with a design, is left as it is",
+            "concept parts and dimensions > [A4] a concept written into part.json by hand is not honoured (the lock store must agree), and request_dimensions is only for a concept",
+            "concept parts and dimensions > [A4] request_dimensions is denied without a card in an unattended session"
+          ]
+        },
+        {
+          "file": "test/unit/cad-gap.test.ts",
+          "names": [
+            "gap state > [A4] gapOf: the store's gap wins; a gap only in part.json counts (a fresh clone) unless a later clear is on record; a clear in the store is not undone by the file",
+            "gap state > [A4] the gate's state is gap whenever a gap is in force — over pass, fail, concept and unverified — and the gap rides on the result",
+            "gap state > [A4] the lock store keeps gaps across a restart, merges them latest-wins, and a clear is a record that travels too",
+            "gap state > [A4] a gap reported on a member reaches the hub and the other members; the owner's clear follows the same way"
+          ]
+        },
+        {
+          "file": "test/web/cad-release.test.ts",
+          "names": [
+            "[A4] the part card shows the thumbnail from the preview route, Release while passing (sending cad.release.request), and the Released badge only when the event says the pack verified",
+            "[A4] a gap is shown with its text and a Clear gap button (sending cad.gap.clear); the script size shows only above 5 MB; a concept's picture score is an advisory line",
+            "[A4] the dimensions card has a numeric input per dimension, prefilled with the proposal; Submit sends the owner's typed numbers, a non-number is caught before sending, Deny sends a denial",
+            "[A4] the release card shows expected and measured numbers and says prominently when the numbers are the agent's; Approve / Deny only"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/cad-a4.test.ts",
+          "names": [
+            "real SolidCraft: references and the release pack > [A4] real: a STEP block imported as a reference into the plate it overlaps fails the gate on interference with a volume; re-imported clear it passes; the reference body is a BaseFeature body, excluded from the measurement",
+            "real SolidCraft: references and the release pack > [A4] real: editing refs/x.step makes the part unverified ('reference changed; re-import') — the sha of refs/ against the embedded text",
+            "real SolidCraft: references and the release pack > [A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded"
+          ]
+        }
+      ]
     },
     "A5": {
       "title": "merge guard",

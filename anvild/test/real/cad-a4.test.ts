@@ -1,0 +1,157 @@
+/**
+ * [A4] Real-tool suite for Phase A4 (agent-cad-and-browser spec §8.3): references, interference and
+ * the release pack on the REAL `solidcraft-cli`, through the real service, manager, refresh and lock
+ * store and the real agent tools. Skipped unless `ANVIL_REAL_TOOLS=1` (`bun test/tools/phase-gate.ts
+ * A4 --require-real` sets it and fails on any skip).
+ */
+import { afterEach, describe, expect, test } from "bun:test";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { partRef } from "../../src/cadwork/partfolder";
+import { REFERENCE_CHANGED } from "../../src/cadwork/refs";
+import { expectedReleaseFiles, MANIFEST } from "../../src/cadwork/release";
+import { buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
+import { REAL, SOLIDCRAFT_CLI, hasSolidcraft } from "../helpers/real-tools";
+
+afterEach(async () => {
+  await stopServices();
+  cleanupTemp();
+});
+
+type X = Awaited<ReturnType<typeof buildPlate>>;
+async function asOwner(x: X, call: Promise<ToolReply>): Promise<ToolReply> {
+  let settled = false;
+  void call.finally(() => (settled = true));
+  const seen = new Set<string>();
+  while (!settled) {
+    for (const c of x.openCards()) {
+      if (seen.has(c.requestId)) continue;
+      seen.add(c.requestId);
+      x.service.respond(c.requestId, true);
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return call;
+}
+const must = async (p: Promise<ToolReply>): Promise<ToolReply> => {
+  const r = await p;
+  if (r.isError) throw new Error(r.text);
+  return r;
+};
+
+/** A 10 mm block exported to STEP by the REAL binary, as its own part, at `corner`. */
+async function blockStep(x: X, repo: string, part: string, corner: number[]): Promise<string> {
+  await must(x.tools.open_part!({ part }));
+  await must(x.tools.record_expectations!({ part, process: "fdm-0.4", parameters: {}, expectations: { bbox: [10, 10, 10], volume: 1000, bodies: 1, holes: [] } }));
+  await must(x.tools.execute!({ command: "solid.box", params: { length: 10, width: 10, height: 10, corner, name: "Block" } }));
+  const r = await must(x.tools.export_part!({ part, formats: ["step"] }));
+  return join(repo, r.json.exports[0].path);
+}
+
+describe("real SolidCraft: references and the release pack", () => {
+  test.skipIf(!REAL)("[A4] real: a STEP block imported as a reference into the plate it overlaps fails the gate on interference with a volume; re-imported clear it passes; the reference body is a BaseFeature body, excluded from the measurement", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    expect(x.gate.state).toBe("pass");
+    const near = await blockStep(x, repo, "block", [0, 0, 0]); // inside the plate's corner region (plate: x ±40, y ±25, z 0…6)
+    const far = await blockStep(x, repo, "far", [100, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(near, join(repo, ".anvil-downloads", "block.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    const imp = await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" }));
+    expect(imp.isError).toBe(false);
+    expect(imp.json.imported).toBe(true);
+    const refBody = imp.json.bodies[0];
+    // The real binary marks the import's body as made by a BaseFeature, so it is not measured as the part.
+    const insp = (await x.tools.inspect_design!({ measure: false, sketches: false, timeline: "summary", bodies: true })).json;
+    const feat = insp.bodies.find((b: any) => b.name === refBody).feature;
+    expect(insp.timeline.find((f: any) => f.id === feat).type).toBe("BaseFeature");
+    let g = await x.check();
+    expect(g.state).toBe("fail");
+    const hit = g.checks.find((c: any) => c.id === "interference block.step");
+    expect(hit.ok).toBe(false);
+    expect(hit.measured).toMatch(new RegExp(`overlaps ${refBody} by 600 mm³`));
+    for (const id of ["volume", "bbox.max", "bodies", "holes ⌀3.4 count"]) expect(g.checks.find((c: any) => c.id === id).ok).toBe(true);
+    // The embedded text is the file's bytes.
+    const design = JSON.parse(readFileSync(join(repo, "cad", "plate", "design.json"), "utf8"));
+    const embedded = design.commands.find((c: any) => c.command === "timeline.add" && c.params.feature.type === "import").params.feature;
+    expect(new Bun.CryptoHasher("sha256").update(embedded.step).digest("hex")).toBe(new Bun.CryptoHasher("sha256").update(readFileSync(join(repo, "cad", "plate", "refs", "block.step"))).digest("hex"));
+    // Moved clear: the same reference, re-imported from its new position.
+    copyFileSync(far, join(repo, ".anvil-downloads", "block.step"));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" }))).json.replaced).toBe(true);
+    g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    expect(g.checks.find((c: any) => c.id === "interference block.step")).toMatchObject({ ok: true, measured: "no overlap" });
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: editing refs/x.step makes the part unverified ('reference changed; re-import') — the sha of refs/ against the embedded text", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const far = await blockStep(x, repo, "far", [100, 0, 0]);
+    mkdirSync(join(repo, "vendor"), { recursive: true });
+    copyFileSync(far, join(repo, "vendor", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    await asOwner(x, x.tools.import_reference!({ part: "plate", file: "vendor/far.step" }));
+    expect((await x.check()).state).toBe("pass");
+    const p = join(repo, "cad", "plate", "refs", "far.step");
+    const orig = readFileSync(p);
+    writeFileSync(p, Buffer.concat([orig, Buffer.from("\n")]));
+    const g = await x.check();
+    expect(g.state).toBe("unverified");
+    expect(g.failing.join("\n")).toContain(REFERENCE_CHANGED);
+    writeFileSync(p, orig);
+    expect((await x.check()).state).toBe("pass");
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    expect(x.gate.state).toBe("pass");
+    const t0 = performance.now();
+    const r = await asOwner(x, x.tools.release_part!({ part: "plate" }));
+    const ms = performance.now() - t0;
+    expect(r.isError).toBe(false);
+    expect(r.json.released).toBe(true);
+    const sha = x.manager.status(partRef(repo, "plate"))!.scriptSha!;
+    const dir = join(repo, "cad", "plate", "release", `plate-${sha.slice(0, 7)}`);
+    expect(readdirSync(dir).sort()).toEqual(expectedReleaseFiles("plate", "fdm"));
+    // The STEP opens in the real binary as one body.
+    const ev = Bun.spawnSync([SOLIDCRAFT_CLI, "eval", join(dir, "plate.step")], { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/", TMPDIR: process.env.TMPDIR ?? "/tmp", SOLIDCRAFT_GPU: "cpu" } });
+    const evJson = JSON.parse(ev.stdout.toString());
+    expect(evJson.body_count).toBe(1);
+    expect(Math.abs(evJson.bodies[0].volume_mm3 - 23335.166952)).toBeLessThan(1e-3);
+    // Four non-empty, mutually different PNGs.
+    const pngs = ["iso", "front", "top", "right"].map((v) => readFileSync(join(dir, `${v}.png`)));
+    for (const p of pngs) {
+      expect(p.length).toBeGreaterThan(100);
+      expect(p.subarray(1, 4).toString()).toBe("PNG");
+    }
+    const hashes = pngs.map((p) => new Bun.CryptoHasher("sha256").update(p).digest("hex"));
+    expect(new Set(hashes).size).toBe(4);
+    // A valid 3MF: a zip with the 3D model part.
+    const z = Bun.spawnSync(["unzip", "-l", join(dir, "plate.3mf")], { stdout: "pipe" });
+    expect(z.exitCode).toBe(0);
+    expect(z.stdout.toString()).toContain("3D/3dmodel.model");
+    // Manifest + HMAC.
+    const m = JSON.parse(readFileSync(join(dir, MANIFEST), "utf8"));
+    for (const [f, h] of Object.entries(m.files)) expect(new Bun.CryptoHasher("sha256").update(readFileSync(join(dir, f))).digest("hex")).toBe(h as string);
+    expect(x.service.verifyReleaseDir(dir)).toMatchObject({ ok: true });
+    expect(m.solidcraft).toMatch(/^\d+\.\d+\.\d+/);
+    // The hole table: one row, ⌀3.4 ×4, with four centres.
+    const html = readFileSync(join(dir, "spec-sheet.html"), "utf8");
+    const holes = html.split("<h2>Holes</h2>")[1]!.split("<h2>")[0]!;
+    expect((holes.match(/<tr>/g) ?? []).length - 1).toBe(1);
+    expect(holes).toContain("<td>3.4</td><td>4</td>");
+    expect(holes).toContain("⌀6.5 × 3.3"); // the counterbore, inside the same row
+    expect((holes.match(/\(-?\d+(\.\d+)?, -?\d+(\.\d+)?, -?\d+(\.\d+)?\)/g) ?? []).length).toBe(4);
+    expect(html).toContain("Not a drawing");
+    expect(existsSync(join(dir, "spec-sheet.md"))).toBe(true);
+    expect(x.emitted.filter((e) => e.type === "file.offer")).toHaveLength(9);
+    console.log(`[A4 real] release pack for the plate (forced refresh, card, STEP + 3MF + 4 views + sheets + manifest): ${ms.toFixed(0)} ms wall time`);
+    expect(ms).toBeGreaterThan(0);
+  }, 300_000);
+});

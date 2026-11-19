@@ -242,8 +242,18 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         return;
 
       case "cad.expectations.respond":
-        deps.supervisor.respondCadExpectations(cmd.requestId, cmd.approve === true);
+        deps.supervisor.respondCadExpectations(cmd.requestId, cmd.approve === true, cmd.values);
         if (cid) send(ack(cid));
+        return;
+
+      // Phase A4: the part card's Release button (the release still needs the card's approval) and
+      // "Clear gap". `cwd` is checked by the supervisor like every cad command.
+      case "cad.release.request":
+        ackWhenDone(deps.supervisor.requestCadRelease(cmd.cwd, cmd.part, cmd.sessionId), send, cid);
+        return;
+
+      case "cad.gap.clear":
+        ackWhenDone(deps.supervisor.clearCadGap(cmd.cwd, cmd.part), send, cid);
         return;
 
       // The parameters panel and the live viewer (agent-cad-and-browser spec §4.8, Phase A3). `cwd` is

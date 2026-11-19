@@ -32,7 +32,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { writeFileAtomic } from "../util/atomic";
-import type { EvaluatedExpectations, LockedBy, PartStatusKind } from "./partfile";
+import type { EvaluatedExpectations, GapRecord, LockedBy, PartStatusKind } from "./partfile";
 
 export interface PartLock {
   repo: string;
@@ -54,6 +54,21 @@ export interface PartLock {
   at: string;
   /** serverId of the machine the approval was made on. */
   machine?: string;
+}
+
+/**
+ * A part's gap state (Phase A4, `report_gap`): kept here as well as in `part.json`, so editing the
+ * file cannot clear it and every machine sees it. `gap` absent is a CLEAR (a tombstone, so the clear
+ * travels the fleet under the same latest-`at`-wins rule as an approval).
+ */
+export interface GapLock {
+  repo: string;
+  part: string;
+  gap?: GapRecord;
+  at: string;
+  machine?: string;
+  remote?: string;
+  path?: string;
 }
 
 export interface RulesLock {
@@ -78,14 +93,17 @@ export interface RepoIdentity {
 export interface LockSnapshot {
   parts: PartLock[];
   rules: RulesLock[];
+  /** Gap states (Phase A4). Absent in a store from an older daemon: then nothing is said about gaps. */
+  gaps?: GapLock[];
 }
 
-export type PendingApproval = { id: string; kind: "part"; lock: PartLock } | { id: string; kind: "rules"; lock: RulesLock };
+export type PendingApproval = { id: string; kind: "part"; lock: PartLock } | { id: string; kind: "rules"; lock: RulesLock } | { id: string; kind: "gap"; lock: GapLock };
 
 interface LockFile {
   schema: 1;
   parts: PartLock[];
   rules: RulesLock[];
+  gaps?: GapLock[];
   pending: PendingApproval[];
   hub?: { serverId: string; url?: string };
 }
@@ -153,6 +171,7 @@ export class LockStore {
   readonly file: string;
   private parts = new Map<string, PartLock>();
   private rules = new Map<string, RulesLock>();
+  private gaps = new Map<string, GapLock>();
   private queue: PendingApproval[] = [];
   private hubInfo: { serverId: string; url?: string } | undefined;
   private readonly listeners = new Set<() => void>();
@@ -184,8 +203,15 @@ export class LockStore {
     for (const r of this.rules.values()) if (sameRepo(r, id, machine) && isNewer(r, best)) best = r;
     return best;
   }
+  /** The newest gap record of a part under any identity of its repo (a clear is a record too). */
+  findGap(id: RepoIdentity, part: string, machine?: string): GapLock | undefined {
+    let best: GapLock | undefined;
+    for (const g of this.gaps.values()) if (g.part === part && sameRepo(g, id, machine) && isNewer(g, best)) best = g;
+    return best;
+  }
   snapshot(): LockSnapshot {
-    return { parts: [...this.parts.values()], rules: [...this.rules.values()] };
+    // `gaps` only when there are any: a store with none is the same document an older daemon wrote.
+    return { parts: [...this.parts.values()], rules: [...this.rules.values()], ...(this.gaps.size ? { gaps: [...this.gaps.values()] } : {}) };
   }
   pending(): PendingApproval[] {
     return [...this.queue];
@@ -208,6 +234,10 @@ export class LockStore {
     this.rules.set(lock.repo, lock);
     this.changed();
   }
+  putGap(lock: GapLock): void {
+    this.gaps.set(partKey(lock.repo, lock.part), lock);
+    this.changed();
+  }
 
   /** Fold approvals in under the conflict rule (latest `at` wins). Returns how many were taken. */
   merge(incoming: Partial<LockSnapshot>): number {
@@ -224,6 +254,12 @@ export class LockStore {
         taken++;
       }
     }
+    for (const g of validGaps(incoming.gaps)) {
+      if (isNewer(g, this.gaps.get(partKey(g.repo, g.part)))) {
+        this.gaps.set(partKey(g.repo, g.part), g);
+        taken++;
+      }
+    }
     if (taken) this.changed();
     return taken;
   }
@@ -234,9 +270,12 @@ export class LockStore {
     const before = JSON.stringify(this.snapshot());
     this.parts = new Map(validParts(snapshot.parts).map((p) => [partKey(p.repo, p.part), p]));
     this.rules = new Map(validRules(snapshot.rules).map((r) => [r.repo, r]));
+    // A hub too old to know about gaps says nothing about them: keep this machine's.
+    if (snapshot.gaps !== undefined) this.gaps = new Map(validGaps(snapshot.gaps).map((g) => [partKey(g.repo, g.part), g]));
     for (const q of this.queue) {
       if (q.kind === "part" && isNewer(q.lock, this.parts.get(partKey(q.lock.repo, q.lock.part)))) this.parts.set(partKey(q.lock.repo, q.lock.part), q.lock);
       if (q.kind === "rules" && isNewer(q.lock, this.rules.get(q.lock.repo))) this.rules.set(q.lock.repo, q.lock);
+      if (q.kind === "gap" && isNewer(q.lock, this.gaps.get(partKey(q.lock.repo, q.lock.part)))) this.gaps.set(partKey(q.lock.repo, q.lock.part), q.lock);
     }
     const changed = JSON.stringify(this.snapshot()) !== before;
     if (changed) this.changed();
@@ -277,7 +316,8 @@ export class LockStore {
       if (!raw || typeof raw !== "object" || raw.schema !== 1) throw new Error("not a schema-1 lock store");
       this.parts = new Map(validParts(raw.parts).map((p) => [partKey(p.repo, p.part), p]));
       this.rules = new Map(validRules(raw.rules).map((r) => [r.repo, r]));
-      this.queue = Array.isArray(raw.pending) ? raw.pending.filter((q) => q && typeof q.id === "string" && (q.kind === "part" || q.kind === "rules") && q.lock) : [];
+      this.gaps = new Map(validGaps(raw.gaps).map((g) => [partKey(g.repo, g.part), g]));
+      this.queue = Array.isArray(raw.pending) ? raw.pending.filter((q) => q && typeof q.id === "string" && (q.kind === "part" || q.kind === "rules" || q.kind === "gap") && q.lock) : [];
       this.hubInfo = raw.hub && typeof raw.hub.serverId === "string" ? { serverId: raw.hub.serverId, ...(typeof raw.hub.url === "string" ? { url: raw.hub.url } : {}) } : undefined;
     } catch (e) {
       // Quarantine, never guess: an unreadable store means nothing is approved on this machine.
@@ -291,13 +331,14 @@ export class LockStore {
       console.error(`[cad] lock store ${this.file} could not be read (${e instanceof Error ? e.message : String(e)}); moved aside to ${aside}. Every part needs adopting again.`);
       this.parts = new Map();
       this.rules = new Map();
+      this.gaps = new Map();
       this.queue = [];
       this.hubInfo = undefined;
     }
   }
 
   private save(): void {
-    const doc: LockFile = { schema: 1, parts: [...this.parts.values()], rules: [...this.rules.values()], pending: this.queue, ...(this.hubInfo ? { hub: this.hubInfo } : {}) };
+    const doc: LockFile = { schema: 1, parts: [...this.parts.values()], rules: [...this.rules.values()], ...(this.gaps.size ? { gaps: [...this.gaps.values()] } : {}), pending: this.queue, ...(this.hubInfo ? { hub: this.hubInfo } : {}) };
     writeFileAtomic(this.file, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
   }
 }
@@ -305,6 +346,13 @@ export class LockStore {
 function validParts(list: unknown): PartLock[] {
   if (!Array.isArray(list)) return [];
   return list.filter((p): p is PartLock => !!p && typeof p.repo === "string" && typeof p.part === "string" && typeof p.sha === "string" && typeof p.at === "string");
+}
+function validGaps(list: unknown): GapLock[] {
+  if (!Array.isArray(list)) return [];
+  return list.filter(
+    (g): g is GapLock =>
+      !!g && typeof g.repo === "string" && typeof g.part === "string" && typeof g.at === "string" && (g.gap === undefined || (!!g.gap && typeof g.gap.feature === "string" && typeof g.gap.detail === "string" && typeof g.gap.at === "string")),
+  );
 }
 function validRules(list: unknown): RulesLock[] {
   if (!Array.isArray(list)) return [];
@@ -417,6 +465,13 @@ export class LockSync {
     this.store.putRules(stamped);
     this.afterLocal(role, { id: this.newId(), kind: "rules", lock: stamped });
   }
+  /** A gap reported (or cleared) on THIS machine. Synced exactly like an approval. */
+  setGap(lock: GapLock): void {
+    const role = this.currentRole();
+    const stamped = { ...lock, ...(role.serverId ? { machine: role.serverId } : {}) };
+    this.store.putGap(stamped);
+    this.afterLocal(role, { id: this.newId(), kind: "gap", lock: stamped });
+  }
   private afterLocal(role: FleetRole, item: PendingApproval): void {
     if (role.kind === "member") {
       this.store.enqueue(item); // persisted before any network call: a crash cannot lose it
@@ -437,6 +492,7 @@ export class LockSync {
       serverId: role.serverId,
       parts: queued.filter((q) => q.kind === "part").map((q) => q.lock as PartLock),
       rules: queued.filter((q) => q.kind === "rules").map((q) => q.lock as RulesLock),
+      ...(queued.some((q) => q.kind === "gap") ? { gaps: queued.filter((q) => q.kind === "gap").map((q) => q.lock as GapLock) } : {}),
     };
     for (const base of bothSchemes(hub.url)) {
       try {
@@ -476,6 +532,7 @@ export class LockSync {
       const local = this.store.snapshot();
       for (const lock of local.parts) if (!queued.has(JSON.stringify(lock))) this.store.enqueue({ id: this.newId(), kind: "part", lock });
       for (const lock of local.rules) if (!queued.has(JSON.stringify(lock))) this.store.enqueue({ id: this.newId(), kind: "rules", lock });
+      for (const lock of local.gaps ?? []) if (!queued.has(JSON.stringify(lock))) this.store.enqueue({ id: this.newId(), kind: "gap", lock });
     }
     if (typeof body.hubServerId === "string") this.store.setHub({ serverId: body.hubServerId, ...(typeof body.hubUrl === "string" && body.hubUrl ? { url: body.hubUrl } : this.store.hub()?.url ? { url: this.store.hub()!.url } : {}) });
     if (this.store.replaceFromHub(body)) this.onRemoteChange();

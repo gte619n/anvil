@@ -58,8 +58,9 @@ describe("anvil_cad names and permission classes", () => {
     const defs = cadTools({ sessionId: "s", worktree: "/tmp", manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS });
     const names = defs.map((d) => d.name).sort();
     expect(names).toEqual(
-      // The A1 tools, plus Phase A2's check_part, propose_expectations and record_expectations.
-      ["batch", "body_topology", "check_parameters", "check_part", "compare_picture", "describe_command", "execute", "export_part", "inspect_design", "list_commands", "measure", "open_part", "propose_expectations", "record_expectations", "redo", "screenshot", "set_parameter", "skill_reference", "undo"],
+      // The A1 tools, plus Phase A2's check_part, propose_expectations and record_expectations, plus
+      // Phase A4's import_reference, release_part, report_gap and request_dimensions.
+      ["batch", "body_topology", "check_parameters", "check_part", "compare_picture", "describe_command", "execute", "export_part", "import_reference", "inspect_design", "list_commands", "measure", "open_part", "propose_expectations", "record_expectations", "redo", "release_part", "report_gap", "request_dimensions", "screenshot", "set_parameter", "skill_reference", "undo"],
     );
     // SolidCraft's own file tools are not there under any name.
     for (const hidden of ["open", "save", "export", "new_design", "crash_reports"]) expect(names).not.toContain(hidden);
@@ -78,11 +79,11 @@ describe("anvil_cad names and permission classes", () => {
 
   test("[A1] isReadOnly knows the read-only anvil_cad tools and none of the mutating ones", () => {
     expect([...CAD_READ_ONLY_TOOL_IDS].sort()).toEqual(
-      ["body_topology", "check_part", "compare_picture", "describe_command", "inspect_design", "list_commands", "measure", "screenshot", "skill_reference"].map((t) => `mcp__anvil_cad__${t}`),
+      ["body_topology", "check_part", "compare_picture", "describe_command", "inspect_design", "list_commands", "measure", "report_gap", "screenshot", "skill_reference"].map((t) => `mcp__anvil_cad__${t}`),
     );
     for (const id of CAD_READ_ONLY_TOOL_IDS) expect(isReadOnly(id)).toBe(true);
     expect([...CAD_MUTATING_TOOL_IDS].sort()).toEqual(
-      ["batch", "check_parameters", "execute", "export_part", "open_part", "propose_expectations", "record_expectations", "redo", "set_parameter", "undo"].map((t) => `mcp__anvil_cad__${t}`),
+      ["batch", "check_parameters", "execute", "export_part", "import_reference", "open_part", "propose_expectations", "record_expectations", "redo", "release_part", "request_dimensions", "set_parameter", "undo"].map((t) => `mcp__anvil_cad__${t}`),
     );
     for (const id of CAD_MUTATING_TOOL_IDS) expect(isReadOnly(id)).toBe(false);
     expect(isReadOnly("mcp__anvil_cad__release_part")).toBe(false); // an unknown anvil_cad tool is not read-only by default
@@ -137,7 +138,7 @@ describe("anvil_cad names and permission classes", () => {
       for (const id of CAD_MUTATING_TOOL_IDS) {
         expect(await decide("allowlist", id)).toEqual({ prompted: !CAD_OWNER_CARD_TOOL_IDS.includes(id), decision: "allow" });
       }
-      expect(CAD_OWNER_CARD_TOOL_IDS).toEqual(["mcp__anvil_cad__propose_expectations"]);
+      expect(CAD_OWNER_CARD_TOOL_IDS).toEqual(["mcp__anvil_cad__propose_expectations", "mcp__anvil_cad__request_dimensions", "mcp__anvil_cad__release_part"]);
     } finally {
       off();
     }

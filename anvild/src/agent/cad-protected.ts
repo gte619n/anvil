@@ -23,7 +23,7 @@
  *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to `cad/<part>/design.json`: the script is
  *     written by the daemon; a hand edit is the owner's to allow, each time.
  *  OWNER CARD (the tool's own typed card is the prompt; denied when unattended)
- *   - `propose_expectations`. (`record_expectations` parks the same kind of card itself, but only
+ *   - `propose_expectations`, `request_dimensions`, `release_part` (Phase A4). (`record_expectations` parks the same kind of card itself, but only
  *     for a part that already has geometry — see `CadworkService.recordExpectations`.)
  *
  * The Bash patterns are a tripwire, not a wall: a determined command can avoid them. What the gate
@@ -35,7 +35,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { gitToplevel } from "../cadwork/partfolder";
 import { isUnder, realish, relUnder, resolveToolPath, toolPathArg } from "./tool-paths";
-import { CAD_OWNER_CARD_TOOL_IDS } from "./cad-tool-ids";
+import { CAD_OWNER_CARD_TOOL_IDS, cadToolId } from "./cad-tool-ids";
 import { registerProtectedRule, type ProtectedContext, type ProtectedRule, type ProtectedVerdict } from "./protected";
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -121,6 +121,12 @@ export function refusedBash(command: string, dirs: Iterable<string> = stateDirs.
   return undefined;
 }
 
+const OWNER_CARD_REASON: Record<string, string> = {
+  [cadToolId("propose_expectations")]: "changing a part's locked expectations needs the owner's approval on its card",
+  [cadToolId("request_dimensions")]: "a concept part's dimensions are typed by the owner on their card",
+  [cadToolId("release_part")]: "releasing a part needs the owner's approval on its release card",
+};
+
 export const cadProtectedRule: ProtectedRule = (ctx): ProtectedVerdict => {
   if (FILE_TOOLS.has(ctx.tool)) {
     const target = resolveToolPath(toolPathArg(ctx.input), ctx.cwd);
@@ -149,7 +155,7 @@ export const cadProtectedRule: ProtectedRule = (ctx): ProtectedVerdict => {
     return why ? { kind: "deny", reason: why } : undefined;
   }
   if (CAD_OWNER_CARD_TOOL_IDS.includes(ctx.tool)) {
-    return { kind: "owner-card", reason: "changing a part's locked expectations needs the owner's approval on its card" };
+    return { kind: "owner-card", reason: OWNER_CARD_REASON[ctx.tool] ?? "this needs the owner's approval on its card" };
   }
   return undefined;
 };

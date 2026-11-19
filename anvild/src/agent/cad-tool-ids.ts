@@ -21,17 +21,35 @@ export const CAD_READ_ONLY_TOOLS = [
   // Runs the gate and returns its result. It changes nothing about the design (the daemon records
   // its own measurement in part.json), so it is allowed wherever `measure` is.
   "check_part",
+  // Phase A4: marks the part blocked on a feature SolidCraft cannot make. It can only ever BLOCK
+  // (export and release are refused until the owner clears it), so it never needs a prompt.
+  "report_gap",
 ] as const;
 
 /** Tools that change the design, create the part folder, or write files into it. */
-export const CAD_MUTATING_TOOLS = ["open_part", "execute", "batch", "set_parameter", "check_parameters", "undo", "redo", "export_part", "record_expectations", "propose_expectations"] as const;
+export const CAD_MUTATING_TOOLS = [
+  "open_part",
+  "execute",
+  "batch",
+  "set_parameter",
+  "check_parameters",
+  "undo",
+  "redo",
+  "export_part",
+  "record_expectations",
+  "propose_expectations",
+  // Phase A4.
+  "import_reference",
+  "request_dimensions",
+  "release_part",
+] as const;
 
 /**
  * Tools that park their own typed owner card on every call (spec §4.4 "always prompt, with no always
  * allow"). The protected check (`agent/cad-protected.ts`) lets them through the permission gate with
  * no generic prompt — the typed card IS the prompt — and denies them in an unattended session.
  */
-export const CAD_OWNER_CARD_TOOLS = ["propose_expectations"] as const;
+export const CAD_OWNER_CARD_TOOLS = ["propose_expectations", "request_dimensions", "release_part"] as const;
 
 export const cadToolId = (tool: string): string => `mcp__${CAD_MCP_SERVER_NAME}__${tool}`;
 
@@ -51,4 +69,8 @@ export const CAD_SYSTEM_PROMPT =
   "every driving dimension as a parameter and build from the parameters. Fetch skill_reference before the first build. " +
   "Call check_part to see the geometry gate; never say a part is done while the gate fails or is unverified. If SolidCraft " +
   "cannot make a feature the part needs, call report_gap instead of approximating it. Never edit cad/*/part.json or " +
-  "design.json yourself: the daemon writes them.";
+  "design.json yourself: the daemon writes them. A STEP the part must fit goes in with import_reference (a path in this " +
+  "repo, e.g. .anvil-downloads/x.step); the part must not touch it. A part built from a picture with no dimensions is a " +
+  "concept (open_part {part, concept: true, process}): model it, then call request_dimensions so the OWNER types the " +
+  "numbers, then record_expectations with exactly those values. release_part asks the owner on a card; never claim a " +
+  "release without it.";

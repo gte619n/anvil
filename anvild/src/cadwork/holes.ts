@@ -41,6 +41,9 @@ export interface HoleRow {
   depth: number;
   counterbore?: { diameter: number; depth: number }[];
   count: number;
+  /** Centre of each hole of the row (the middle of its narrowest bore, on the axis), mm. Only when
+   *  asked for (`{ positions: true }` — the release spec sheet); never part of what makes a row. */
+  positions?: V3[];
 }
 
 const RAYS_PER_STATION = 8;
@@ -104,7 +107,7 @@ interface Classified {
  * Build the table from a body's cylinders and the pick result for `cylinders.flatMap(raysFor)`
  * (`hits[i]` is the list for ray i, nearest first). Pure, so it can be tested on recorded data.
  */
-export function holesFromPicks(body: string, cylinders: Cylinder[], hits: (PickHit[] | null | undefined)[]): HoleRow[] {
+export function holesFromPicks(body: string, cylinders: Cylinder[], hits: (PickHit[] | null | undefined)[], opts: { positions?: boolean } = {}): HoleRow[] {
   if (hits.length !== cylinders.length * RAYS_PER_CYLINDER) throw new Error(`view.pick answered ${hits.length} rays; ${cylinders.length * RAYS_PER_CYLINDER} were sent`);
   const firstOnBody = (list: PickHit[] | null | undefined): PickHit | undefined => (list ?? []).find((h) => h && h.body === body);
   const classified: Classified[] = cylinders.map((c, i) => {
@@ -158,8 +161,14 @@ export function holesFromPicks(body: string, cylinders: Cylinder[], hits: (PickH
     };
     const key = JSON.stringify(hole);
     const row = table.get(key);
-    if (row) row.count++;
-    else table.set(key, { ...hole, count: 1 });
+    const centre = (): V3 => {
+      const mid = add(narrow.c.origin, narrow.axis, (narrow.c.extent[0] + narrow.c.extent[1]) / 2);
+      return [round4(mid[0]), round4(mid[1]), round4(mid[2])];
+    };
+    if (row) {
+      row.count++;
+      if (opts.positions) row.positions!.push(centre());
+    } else table.set(key, { ...hole, count: 1, ...(opts.positions ? { positions: [centre()] } : {}) });
   }
   return [...table.values()].sort((p, q) => p.diameter - q.diameter || p.kind.localeCompare(q.kind) || p.depth - q.depth);
 }
@@ -168,11 +177,13 @@ export function holesFromPicks(body: string, cylinders: Cylinder[], hits: (PickH
 export function mergeHoleTables(tables: HoleRow[][]): HoleRow[] {
   const out = new Map<string, HoleRow>();
   for (const row of tables.flat()) {
-    const { count, ...rest } = row;
+    const { count, positions, ...rest } = row;
     const key = JSON.stringify(rest);
     const have = out.get(key);
-    if (have) have.count += count;
-    else out.set(key, { ...row });
+    if (have) {
+      have.count += count;
+      if (positions) have.positions = [...(have.positions ?? []), ...positions];
+    } else out.set(key, { ...row, ...(positions ? { positions: [...positions] } : {}) });
   }
   return [...out.values()].sort((p, q) => p.diameter - q.diameter || p.kind.localeCompare(q.kind) || p.depth - q.depth);
 }
@@ -193,7 +204,7 @@ export function holeSummary(rows: HoleRow[]): { diameter: number; count: number;
  * Measure one body's hole table on a live process: one `body_topology` call, then `view.pick` in
  * chunks of at most 1014 rays. Throws when SolidCraft answers an error — the gate then fails closed.
  */
-export async function holeTable(call: (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>, body: string): Promise<HoleRow[]> {
+export async function holeTable(call: (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>, body: string, opts: { positions?: boolean } = {}): Promise<HoleRow[]> {
   const topo = await call("body_topology", { body, faces: "cylinders" });
   if (topo.isError) throw new Error(`body_topology failed for ${body}: ${topo.text.slice(0, 300)}`);
   const raw: unknown = topo.json?.cylinders;
@@ -211,5 +222,5 @@ export async function holeTable(call: (tool: string, args: Record<string, unknow
     if (!Array.isArray(list) || list.length !== chunk.length) throw new Error("view.pick did not answer every ray");
     hits.push(...(list as (PickHit[] | null)[]));
   }
-  return holesFromPicks(body, cylinders, hits);
+  return holesFromPicks(body, cylinders, hits, opts);
 }

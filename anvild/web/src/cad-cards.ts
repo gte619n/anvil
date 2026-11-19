@@ -9,6 +9,13 @@
 //                      the agent's reason, Approve / Deny.
 //   ADOPT              the same event, kinds "adopt-*" — the values (or the rules diff) the owner is
 //                      asked to accept, Approve / Deny.
+//   DIMENSIONS         kind "dimensions" (Phase A4) — the agent's proposed named dimensions as EDITABLE
+//                      numbers; Submit sends the owner's typed values (checked again by the daemon).
+//   RELEASE            kind "release" (Phase A4) — expected and measured numbers, holes, advisories,
+//                      script size and who approved the numbers; Approve / Deny.
+// Phase A4 on the part card: the thumbnail (served by the preview route, never inline data), "Release"
+// while the gate passes, the "Released" badge (only for a pack whose HMAC the daemon verified), the
+// gap with "Clear gap", the script size above 5 MB, and a concept's picture score (an advisory line).
 //
 // Neither event is session-scoped or replayed from a session's log (they are current state, re-sent
 // when a socket opens), so this module keeps the latest of each and redraws them when the
@@ -23,8 +30,14 @@ export interface CadCardsDeps {
   active(): { sessionId: string; url: string } | undefined;
   /** The conversation pane. */
   container(): HTMLElement;
-  /** Send `cad.expectations.respond` to the server the card came from. */
-  respond(url: string, requestId: string, approve: boolean): void;
+  /** Send `cad.expectations.respond` to the server the card came from (`values`: a dimensions card). */
+  respond(url: string, requestId: string, approve: boolean, values?: Record<string, number>): void;
+  /** "Release" on a passing part card: send `cad.release.request` (the daemon raises the release card). */
+  release?(url: string, ev: CadDesignEvent): void;
+  /** "Clear gap": send `cad.gap.clear`. */
+  clearGap?(url: string, ev: CadDesignEvent): void;
+  /** The URL of a worktree-relative file served by the preview route (the thumbnail). */
+  fileUrl?(url: string, ev: CadDesignEvent, path: string): string;
   /** "Open" on a part card (Phase A3 points this at the live viewer). */
   open(url: string, ev: CadDesignEvent): void;
   /** "Confirm numbers" on a part card: send `cad.expectations.confirm` (the daemon raises the owner card). */
@@ -46,6 +59,8 @@ const TITLE: Record<CadExpectationsRequestEvent["kind"], string> = {
   "adopt-rules": "Adopt manufacturing rules",
   initial: "Set expectations",
   confirm: "Confirm numbers",
+  dimensions: "Dimensions",
+  release: "Release part",
 };
 const BLURB: Record<CadExpectationsRequestEvent["kind"], string> = {
   propose: "The agent asks to change what this part is checked against.",
@@ -54,7 +69,11 @@ const BLURB: Record<CadExpectationsRequestEvent["kind"], string> = {
   "adopt-rules": "cad/rules.json changed. Approve to check every part of this repo against the new rules.",
   initial: "The agent asks to set what this part is checked against.",
   confirm: "These numbers were set by the agent. Approve to make them yours.",
+  dimensions: "Type the real dimensions of this part. Your numbers become what it is built to and checked against.",
+  release: "Release this part: the daemon writes the STEP, the views, a spec sheet (not a drawing) and a signed manifest.",
 };
+/** Owner item 45: the card shows the script size once it is above this. */
+export const SCRIPT_SIZE_NOTICE_BYTES = 5 * 1024 * 1024;
 
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] => {
   const e = document.createElement(tag);
@@ -86,12 +105,35 @@ export function createCadCards(deps: CadCardsDeps) {
     card.dataset.cadRev = String(ev.rev);
     card.replaceChildren();
     const head = el("div", "cad-part-head");
-    head.append(el("span", "cad-part-thumb")); // Phase A3 puts the preview thumbnail here
-    (head.lastChild as HTMLElement).dataset.slot = "thumbnail";
-    (head.lastChild as HTMLElement).hidden = true;
+    const thumb = el("span", "cad-part-thumb");
+    thumb.dataset.slot = "thumbnail";
+    thumb.hidden = true;
+    if (ev.thumbnail && deps.fileUrl) {
+      const img = el("img");
+      img.alt = `${ev.part} preview`;
+      img.width = 80;
+      img.height = 60;
+      img.loading = "lazy";
+      img.src = deps.fileUrl(url, ev, ev.thumbnail);
+      thumb.append(img);
+      thumb.hidden = false;
+    }
+    head.append(thumb);
     head.append(el("span", "cad-part-name", ev.part), el("span", `cad-part-state cad-${gate.state}`, STATE_LABEL[gate.state] ?? gate.state));
+    if (ev.released) {
+      const badge = el("span", "cad-part-released", "Released");
+      badge.dataset.role = "released";
+      badge.title = `Release pack ${ev.released.path} (signature verified)`;
+      head.append(badge);
+    }
     if (ev.busy) head.append(el("span", "cad-part-busy", "working…"));
     card.append(head);
+    if (gate.gap) {
+      const gap = el("div", "cad-part-gap");
+      gap.dataset.role = "gap";
+      gap.append(el("b", undefined, `Blocked: ${gate.gap.feature}`), el("span", undefined, ` — ${gate.gap.detail}`));
+      card.append(gap);
+    }
 
     const failing = gate.checks.filter((c) => c.hard && !c.ok);
     if (failing.length) {
@@ -119,14 +161,38 @@ export function createCadCards(deps: CadCardsDeps) {
       by.dataset.role = "unconfirmed";
       card.append(by);
     }
+    if (typeof ev.scriptBytes === "number" && ev.scriptBytes > SCRIPT_SIZE_NOTICE_BYTES) {
+      const size = el("div", "cad-part-note", `Design script is ${Math.round((ev.scriptBytes / 1024 / 1024) * 10) / 10} MB (references are embedded in it) — large for git.`);
+      size.dataset.role = "script-size";
+      card.append(size);
+    }
     const actions = el("div", "cad-part-actions");
     const open = el("button", "cad-part-open", "Open");
     open.type = "button";
     open.onclick = () => deps.open(url, ev);
-    const release = el("span", "cad-part-release"); // Phase A4 puts "Release" here when the gate passes
+    const release = el("span", "cad-part-release");
     release.dataset.slot = "release";
     release.hidden = true;
+    if (gate.state === "pass" && deps.release) {
+      const b = el("button", "cad-part-open cad-part-release-btn", "Release");
+      b.type = "button";
+      b.onclick = () => {
+        b.disabled = true;
+        deps.release!(url, ev);
+      };
+      release.append(b);
+      release.hidden = false;
+    }
     actions.append(open);
+    if (gate.gap && deps.clearGap) {
+      const clear = el("button", "cad-part-open cad-part-clear-gap", "Clear gap");
+      clear.type = "button";
+      clear.onclick = () => {
+        clear.disabled = true;
+        deps.clearGap!(url, ev);
+      };
+      actions.append(clear);
+    }
     if (gate.approvedBy === "agent-initial" && deps.confirm) {
       const confirm = el("button", "cad-part-open cad-part-confirm", "Confirm numbers");
       confirm.type = "button";
@@ -153,6 +219,63 @@ export function createCadCards(deps: CadCardsDeps) {
     fillPartCard(card, url, ev);
   }
 
+  /** The dimensions card: one numeric input per proposed dimension, prefilled with the proposal. */
+  function drawDimensions(card: HTMLElement, url: string, ev: CadExpectationsRequestEvent): void {
+    const form = el("form", "cad-dims");
+    const inputs = new Map<string, HTMLInputElement>();
+    for (const d of ev.dimensions ?? []) {
+      const row = el("label", "cad-dim");
+      row.dataset.dim = d.name;
+      const input = el("input", "cad-dim-input");
+      input.type = "number";
+      input.step = "any";
+      input.inputMode = "decimal";
+      input.required = true;
+      input.value = String(d.value);
+      input.name = d.name;
+      input.setAttribute("aria-label", d.name);
+      inputs.set(d.name, input);
+      row.append(el("span", "cad-dim-name", d.name), input, el("span", "cad-dim-unit", d.unit ?? ""));
+      if (d.note) row.append(el("span", "cad-dim-note", d.note));
+      form.append(row);
+    }
+    const err = el("div", "cad-dim-error");
+    err.dataset.role = "error";
+    err.hidden = true;
+    const btns = el("div", "perm-btns");
+    const submit = el("button", "perm-btn allow", "Submit");
+    submit.type = "submit";
+    const deny = el("button", "perm-btn deny", "Deny");
+    deny.type = "button";
+    btns.append(submit, deny);
+    form.append(err, btns);
+    const lock = (): void => {
+      for (const x of btns.querySelectorAll("button")) (x as HTMLButtonElement).disabled = true;
+    };
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const values: Record<string, number> = {};
+      for (const [name, input] of inputs) {
+        const v = input.value.trim() === "" ? NaN : Number(input.value);
+        if (!Number.isFinite(v)) {
+          err.textContent = `${name} must be a number`;
+          err.hidden = false;
+          input.focus();
+          return;
+        }
+        values[name] = v;
+      }
+      err.hidden = true;
+      lock();
+      deps.respond(url, ev.requestId, true, values);
+    };
+    deny.onclick = () => {
+      lock();
+      deps.respond(url, ev.requestId, false);
+    };
+    card.append(form);
+  }
+
   function drawRequest(url: string, ev: CadExpectationsRequestEvent): void {
     if (!onScreen(url, [ev.sessionId])) return;
     if (requestCards.get(ev.requestId)?.isConnected) return; // already on screen (a replay)
@@ -163,16 +286,28 @@ export function createCadCards(deps: CadCardsDeps) {
     const head = el("div", "perm-head");
     head.append(el("span", undefined, `${TITLE[ev.kind] ?? "Expectations"} · `), el("b", undefined, ev.part));
     card.append(head, el("div", "cad-expect-blurb", BLURB[ev.kind] ?? ""));
-    if (ev.note) card.append(el("div", "cad-expect-note", ev.note));
+    if (ev.note) {
+      const note = el("div", ev.kind === "release" ? "cad-expect-note cad-expect-note-strong" : "cad-expect-note", ev.note);
+      note.dataset.role = "note";
+      card.append(note);
+    }
     if (ev.reason) {
       const why = el("div", "cad-expect-reason");
       why.append(el("span", "cad-expect-reason-label", "Agent's reason: "), el("span", undefined, ev.reason));
       card.append(why);
     }
+    if (ev.kind === "dimensions" && ev.dimensions?.length) {
+      drawDimensions(card, url, ev);
+      requestCards.set(ev.requestId, card);
+      deps.container().appendChild(card);
+      deps.scrollDown?.();
+      return;
+    }
     if (ev.rows.length) {
       const table = el("table", "cad-expect-rows");
       const hr = el("tr");
-      const heads = ev.kind === "propose" ? ["Now", "Proposed"] : ev.kind === "initial" ? ["Now", "Asked for"] : ev.kind === "confirm" ? ["Now", "To confirm"] : ["Approved", "In the file"];
+      const heads =
+        ev.kind === "propose" ? ["Now", "Proposed"] : ev.kind === "initial" ? ["Now", "Asked for"] : ev.kind === "confirm" ? ["Now", "To confirm"] : ev.kind === "release" ? ["Expected", "Measured"] : ["Approved", "In the file"];
       hr.append(el("th", undefined, ""), el("th", undefined, heads[0]), el("th", undefined, heads[1]));
       table.append(hr);
       for (const r of ev.rows) {
@@ -222,6 +357,7 @@ export function createCadCards(deps: CadCardsDeps) {
       if (!card) return;
       card.classList.add("resolved");
       card.querySelector(".perm-btns")?.replaceChildren(el("span", "cad-expect-outcome", ev.superseded ? "Replaced by a newer card" : ev.approved ? "Approved" : "Denied"));
+      for (const x of card.querySelectorAll("input")) (x as HTMLInputElement).disabled = true;
     },
     /** A new user message: the next `cad.design` for a part starts a new card. */
     newTurn(): void {

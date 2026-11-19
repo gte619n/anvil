@@ -1,7 +1,7 @@
 import { sameServerUrl } from "./api";
 import { createCadCards } from "./cad-cards";
 import { openCadPart } from "./cad";
-import { makeCadPartIo } from "./cad-io";
+import { cadPreviewUrl, makeCadPartIo } from "./cad-io";
 import { createCadDesignStore } from "./cad-live";
 import {
   HUB_URL,
@@ -1754,7 +1754,32 @@ const cadCards = createCadCards({
   supported: (url) => serverSupports(serverByUrl(url), "cad-work"),
   active: () => (activeId ? { sessionId: wireSessionId(activeId), url: (serverOf(activeId) ?? hub()).url } : undefined),
   container: () => conversation,
-  respond: (url, requestId, approve) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.respond", requestId, approve }),
+  respond: (url, requestId, approve, values) => {
+    const srv = serverByUrl(url) ?? hub();
+    // A dimensions card's numbers are checked again by the daemon; a refusal comes back as an error.
+    void sendAwait(srv, { type: "cad.expectations.respond", cid: newCid(), requestId, approve, ...(values ? { values } : {}) }, 30_000)
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch(() => undefined);
+  },
+  release: (url, ev) => {
+    const srv = serverByUrl(url) ?? hub();
+    void sendAwait(srv, { type: "cad.release.request", cid: newCid(), cwd: ev.cwd, part: ev.part, sessionId: activeId ? wireSessionId(activeId) : "" }, 120_000)
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch((e) => toast(`Release failed: ${e instanceof Error ? e.message : String(e)}`));
+  },
+  clearGap: (url, ev) => {
+    const srv = serverByUrl(url) ?? hub();
+    void sendAwait(srv, { type: "cad.gap.clear", cid: newCid(), cwd: ev.cwd, part: ev.part }, 60_000)
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch(() => undefined);
+  },
+  fileUrl: (url, ev, path) => cadPreviewUrl(serverByUrl(url) ?? hub(), ev.cwd, path),
   // "Open" on a part card: the live viewer listens for this (below).
   open: (url, ev) => void window.dispatchEvent(new CustomEvent("anvil:cad-open", { detail: { url, cwd: ev.cwd, part: ev.part, rev: ev.rev } })),
   confirm: (url, ev) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.confirm", cid: newCid(), cwd: ev.cwd, part: ev.part, sessionId: activeId ? wireSessionId(activeId) : "" }),

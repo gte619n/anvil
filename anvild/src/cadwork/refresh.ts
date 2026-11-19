@@ -6,24 +6,29 @@
  *   2. MEASURE   design bodies only (bodies made by a `BaseFeature` — a STEP import — are left
  *                out), the hole table, feature errors and warnings.
  *   3. GATE      evaluate (./gate.ts), write `part.json.measured`, set the part's verdict.
+ *                Phase A4 adds, for a part with references, the integrity of every `refs/` file
+ *                against the STEP text embedded in the design and the interference check with each
+ *                reference in `noInterferenceWith` (./refs.ts), and the gap (`report_gap`).
  *   4. PREVIEW   export the design bodies to `.cache/preview-<rev>.glb` (metres, Y up) and keep the
- *                newest three. An empty design has no preview. A failed export never touches the gate.
+ *                newest three, plus a small `.cache/thumb-<rev>.png` for the part card (Phase A4).
+ *                An empty design has no preview. A failed export never touches the gate.
  *   5. BROADCAST `onResult` hands the outcome to the service, which sends `cad.design`.
  *
  * FAIL CLOSED: anything that throws in here ends as an `unverified` gate result with the error
  * listed, never as `pass`, and never as an exception into the manager's queue.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import { evaluateGate, failingLines, gateError, type GateInput, type GateResult, type Measurement } from "./gate";
+import { evaluateGate, failingLines, gateError, type GateCheck, type GateInput, type GateResult, type Measurement } from "./gate";
 import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
 import { repoIdentity, type LockStore, type RepoIdentity } from "./locks";
 import type { CadParamInfo, FeatureIssue, RefreshJob, SlotContext } from "./manager";
 import type { McpToolResult } from "./mcp-client";
 import type { PartRef } from "./partfolder";
-import { readPartFile, writeMeasured, type Measured } from "./partfile";
-import { CACHE_DIR } from "./poststep";
+import { readPartFile, writeMeasured, type GapRecord, type Measured, type PartRead } from "./partfile";
+import { CACHE_DIR, DESIGN_FILE, readDesignFile } from "./poststep";
+import { embeddedReferences, interferenceCheck, interferenceRequest, referenceChecks, referenceOnDisk } from "./refs";
 import { readRules } from "./rules";
 
 export interface RefreshOutcome {
@@ -45,6 +50,15 @@ export interface RefreshOutcome {
   previewError?: string;
   /** sha256 of the preview as exported: the route serves the file only while it still matches. */
   previewSha?: string;
+  /** Worktree-relative path of the part card's thumbnail (`.cache/thumb-<rev>.png`), Phase A4. */
+  thumbnail?: string;
+  /** sha256 of the thumbnail as written (served on the same terms as the preview). */
+  thumbnailSha?: string;
+  /** Size of `design.json` in bytes (owner item 45: shown on the card above 5 MB). */
+  scriptBytes?: number;
+  /** The design's own bodies and the imported reference bodies, as read by this refresh. */
+  designBodies?: string[];
+  referenceBodies?: string[];
 }
 
 /** How many `.cache/preview-<rev>.glb` files are kept per part (§4.3 step 4). */
@@ -53,6 +67,10 @@ const PREVIEW_RE = /^preview-(\d+)\.glb$/;
 export const previewName = (rev: number): string => `preview-${rev}.glb`;
 /** A worktree-relative path that names a preview of `part` — the only shape the preview route serves. */
 export const PREVIEW_PATH_RE = /^cad\/([a-z0-9][a-z0-9-]{0,39})\/\.cache\/preview-(\d+)\.glb$/;
+/** The part card's thumbnail, served by the same route (Phase A4): nothing else is reachable. */
+export const THUMB_PATH_RE = /^cad\/([a-z0-9][a-z0-9-]{0,39})\/\.cache\/thumb-(\d+)\.png$/;
+const THUMB_RE = /^thumb-(\d+)\.png$/;
+export const thumbName = (rev: number): string => `thumb-${rev}.png`;
 
 /** The revisions that have a preview file in a part's cache folder, ascending. */
 export function previewRevs(partDir: string): number[] {
@@ -64,6 +82,35 @@ export function previewRevs(partDir: string): number[] {
       .sort((a, b) => a - b);
   } catch {
     return [];
+  }
+}
+
+/** Keep the newest `keep` thumbnails of a part. */
+export function pruneThumbs(partDir: string, keep = PREVIEWS_KEPT): void {
+  try {
+    const revs = readdirSync(join(partDir, CACHE_DIR))
+      .map((n) => THUMB_RE.exec(n)?.[1])
+      .filter((n): n is string => n !== undefined)
+      .map(Number)
+      .sort((a, b) => a - b);
+    for (const r of revs.slice(0, Math.max(0, revs.length - keep))) rmSync(join(partDir, CACHE_DIR, thumbName(r)), { force: true });
+  } catch {
+    /* no cache folder */
+  }
+}
+
+/** Step 4b (Phase A4): a small PNG of the part for its card, in the camera the process has (so the
+ *  agent's own view is not moved). Never throws. */
+export async function exportThumbnail(call: Call, ref: PartRef, rev: number): Promise<{ path: string; sha: string } | undefined> {
+  try {
+    const path = join(ref.dir, CACHE_DIR, thumbName(rev));
+    const r = await call("screenshot", { width: 160, height: 120, path });
+    if (r.isError || !existsSync(path)) return undefined;
+    const sha = createHash("sha256").update(readFileSync(path)).digest("hex");
+    pruneThumbs(ref.dir);
+    return { path: relative(ref.worktree, path), sha };
+  } catch {
+    return undefined;
   }
 }
 
@@ -114,6 +161,8 @@ export interface RefreshDeps {
   evaluateImpl?: (input: GateInput) => GateResult;
   /** Test seam: called before measuring (to prove a throwing refresh fails closed). */
   beforeMeasure?: (ref: PartRef) => void;
+  /** Phase A4: advisory checks the service holds for a part (a concept's picture score). */
+  advisoryFor?: (ref: PartRef) => GateCheck[];
 }
 
 type Call = (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>;
@@ -121,6 +170,8 @@ type Call = (tool: string, args: Record<string, unknown>) => Promise<McpToolResu
 interface DesignRead {
   version: string;
   designBodies: string[];
+  /** Bodies made by a `BaseFeature` (a STEP import): the references. */
+  referenceBodies: string[];
   featureErrors: FeatureIssue[];
   warnings: string[];
   params: CadParamInfo[];
@@ -139,11 +190,13 @@ export async function readDesign(call: Call): Promise<DesignRead> {
   const bodies: any[] = Array.isArray(d.bodies) ? d.bodies : [];
   // §4.14 #3: a body created by a BaseFeature is an imported reference, not the part.
   const designBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) !== "BaseFeature").map((b) => String(b.name));
+  const referenceBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) === "BaseFeature").map((b) => String(b.name));
   const params: any[] = Array.isArray(d.params) ? d.params : [];
   const version = need(await call("version", {}), "version").version;
   return {
     version: String(version ?? ""),
     designBodies,
+    referenceBodies,
     featureErrors: timeline.filter((f) => f?.error).map((f) => ({ id: f.id, feature: String(f.name ?? f.id), message: String(f.error) })),
     warnings: timeline.filter((f) => f?.warning).map((f) => `${String(f.name ?? f.id)}: ${String(f.warning)}`),
     params: params
@@ -187,6 +240,58 @@ export function readLocked(ref: PartRef, locks: LockStore, machine?: string): Pi
   return { repo: identity.key, identity, part: readPartFile(ref.dir), lock: locks.findPart(identity, ref.part, machine), rules: readRules(ref.worktree), rulesLock: locks.findRules(identity, machine) };
 }
 
+/**
+ * The gap a part is blocked on: the lock store's record wins (it cannot be edited away in the file);
+ * a `gap` in `part.json` with no newer record in the store counts too (a fresh clone).
+ */
+export function gapOf(part: PartRead, store: { gap?: GapRecord; at: string } | undefined): GapRecord | undefined {
+  if (store?.gap) return store.gap;
+  const fileGap = part.kind === "ok" ? part.file.gap : undefined;
+  if (!fileGap) return undefined;
+  if (store && Date.parse(store.at) >= Date.parse(fileGap.at)) return undefined; // cleared after it was reported
+  return fileGap;
+}
+
+/**
+ * Phase A4: the reference checks for a part, inside its queue slot. Nothing is asked of SolidCraft
+ * for a part that names no reference.
+ */
+export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
+  if (part.kind !== "ok") return { checks: [], unverified: false };
+  const must = part.file.expectations?.noInterferenceWith ?? [];
+  const names = [...new Set([...must, ...(part.file.refs ?? []).map((r) => r.name)])];
+  if (names.length === 0) return { checks: [], unverified: false };
+  // The embedded text is read from design.json — and only when it IS the script the process runs.
+  const disk = readDesignFile(ref.dir);
+  const embedded = disk.script && scriptSha !== undefined && disk.scriptSha === scriptSha ? embeddedReferences(disk.script) : undefined;
+  const integrity = referenceChecks(names, (n) => referenceOnDisk(ref, n), embedded);
+  const checks = [...integrity.checks];
+  for (const name of [...new Set(must)].sort()) {
+    const emb = embedded?.find((e) => e.file === name);
+    if (!emb) {
+      checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: `refs/${name} is not in the design, so nothing could be checked`, ok: false, hard: true });
+      continue;
+    }
+    const missing = emb.bodies.filter((b) => !design.referenceBodies.includes(b));
+    if (emb.bodies.length === 0 || missing.length) {
+      checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: `the reference's bodies (${missing.join(", ") || "none listed"}) are not in the design`, ok: false, hard: true });
+      continue;
+    }
+    if (design.designBodies.length === 0) {
+      checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: "no design bodies yet", ok: true, hard: true });
+      continue;
+    }
+    let reply: McpToolResult | { error: string };
+    try {
+      reply = await call("execute", interferenceRequest(design.designBodies, emb.bodies));
+    } catch (e) {
+      reply = { error: e instanceof Error ? e.message : String(e) };
+    }
+    checks.push(interferenceCheck(name, reply));
+  }
+  return { checks, unverified: integrity.unverified };
+}
+
 const paramValues = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
 
 export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
@@ -218,6 +323,9 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
       const locked = readLocked(ref, deps.locks, deps.machine?.());
       const params = paramValues(design.params);
       const state = slot.state();
+      const refs = await referenceGate(call, ref, locked.part, scriptSha, design);
+      const gap = gapOf(locked.part, deps.locks.findGap(locked.identity, ref.part, deps.machine?.()));
+      const advisory = deps.advisoryFor?.(ref) ?? [];
       const gate = evaluateGate(
         {
           ...locked,
@@ -229,7 +337,9 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
           featureErrors: design.featureErrors,
           warnings: design.warnings,
           designFailure: state.conflict ? state.reason : state.replayFailure ? `design.json failed to replay: ${state.replayFailure}` : undefined,
-          // PHASE A4 HOOK: interference with each reference body goes in `extraChecks` here.
+          ...(refs.checks.length || advisory.length ? { extraChecks: [...refs.checks, ...advisory] } : {}),
+          ...(refs.unverified ? { extraUnverified: true } : {}),
+          ...(gap ? { gap } : {}),
         },
         deps.evaluateImpl,
       );
@@ -241,7 +351,7 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
           gate.warnings.push(`part.json could not be updated with the measurement: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      outcome = { ref, gate, measurement, holes, params: design.params, scriptSha, ms: performance.now() - t0, forced: slot.forced };
+      outcome = { ref, gate, measurement, holes, params: design.params, scriptSha, ms: performance.now() - t0, forced: slot.forced, designBodies: design.designBodies, referenceBodies: design.referenceBodies };
     } catch (e) {
       outcome = { ref, gate: gateError(e instanceof Error ? e.message : String(e)), holes: [], params: slot.params(), scriptSha: slot.scriptSha(), ms: performance.now() - t0, forced: slot.forced };
     }
@@ -260,10 +370,22 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
         if (p.preview) outcome.preview = p.preview;
         if (p.sha) outcome.previewSha = p.sha;
         if (p.error) outcome.previewError = p.error;
+        if (p.preview) {
+          const thumb = await exportThumbnail(call, ref, outcome.rev);
+          if (thumb) {
+            outcome.thumbnail = thumb.path;
+            outcome.thumbnailSha = thumb.sha;
+          }
+        }
       } catch (e) {
         outcome.previewError = e instanceof Error ? e.message : String(e);
       }
       outcome.ms = performance.now() - t0;
+    }
+    try {
+      outcome.scriptBytes = statSync(join(ref.dir, DESIGN_FILE)).size;
+    } catch {
+      /* no design.json yet */
     }
 
     try {
