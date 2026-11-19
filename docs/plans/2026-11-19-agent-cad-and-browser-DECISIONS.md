@@ -31,3 +31,49 @@ would take to reverse.
 | 23 | 2026-11-19 | C0 | The browser's working folder is `<worktree>/.anvil-browser/`; real downloads are moved from there into the quarantine. | Playwright mixes downloads with its own snapshots and logs in one folder. | n/a. |
 | 24 | 2026-11-19 | C0 | Disclosure: the browser spike ran 11 short queries on the daemon's Claude subscription token (about $0.19 list-price equivalent) to test the SDK assumptions. | It was the only way to run those checks for real; the repo's own smoke test documents the same route. | n/a. |
 | 25 | 2026-11-19 | C0 | A bug found in passing is left for the browser track to fix in C4: `parseTailscalePeers` throws an unhandled rejection when `tailscale` prints non-JSON. | It only shows when the daemon starts without `ANVIL_BASE_URL`, which the test daemon avoids, but the fix is small. | n/a. |
+| 26 | 2026-11-19 | F0 | A "Foundation" phase (F0) was added ahead of the spec's phases, with its own gate entry. It passed at `94fb28c` (73 named tests; full suite 1436 pass, 0 fail). | Shared pieces had to land before the tracks forked. | n/a. |
+| 27 | 2026-11-19 | F0 | **Looser than the spec:** the phase gate's "clean tree" rule blocks any change under `anvild/` and any tracked non-doc change, but lets edited Markdown under `docs/` and untracked files outside `anvild/` through. | The orchestrator edits the spec and this log while gates run. Code and tests are still required to be committed. | Tighten `phase-gate.ts` to refuse any dirty file. |
+| 28 | 2026-11-19 | F0 | The gate records the commit at the start and fails if HEAD moves during the run. | A first run reported a commit other than the one it had tested. | n/a. |
+| 29 | 2026-11-19 | F0 | Unknown names in `ANVIL_FEATURES` log a warning and are ignored; the daemon still starts. | A machine one release behind should still boot. | Make it a startup error. |
+| 30 | 2026-11-19 | F0 | A protected permission rule that throws is treated as a denial. | A buggy rule should fail closed. | n/a. |
+| 31 | 2026-11-19 | F0 | Always-prompt cards show a custom Allow label but not the reason text. | The permission request on the wire has no field for a reason, and the foundation did not change the protocol. Later phases add one where a card needs it. | Add a `reason` field to `permission.request`. |
+| 32 | 2026-11-19 | F0 | The fail-closed backstop denies external tool calls that are not in the session's own built-in tool list, not every `mcp__` name. | Built-in tools (concierge, team, planning) could reach the same code path on a hook timeout and must keep working. | n/a. |
+| 33 | 2026-11-19 | all | Adversarial reviews for Tracks B and C run at the track-branch commit. The "Pushed" column for those phases is ticked after the track merges into `computer-use`, following one more full gate run on the merged tip. | The tracks build on separate branches for speed. | n/a. |
+| 34 | 2026-11-19 | all | The orchestrator added one small file itself before the tracks forked: `anvild/src/solidcraft/binary.ts`, the single place that decides which SolidCraft binary runs. | Tracks A and B both need it; creating it once avoids a merge conflict. | n/a. |
+
+## Owner review, 2026-11-19 (first pass)
+
+The owner was interviewed on the entries above that changed an interview answer or carried risk.
+Outcomes, now folded into the spec as §4.14 items 36 to 46:
+
+| Entry | Owner's call | Effect |
+|---|---|---|
+| 17 (part sources) | **Changed.** Add the TraceParts connector now; all keys entered in Settings like the LLM keys. | C5 builds three connectors. SnapEDA stays dropped. |
+| 19 (strip Playwright's automation-hiding flag) | **Reversed.** Leave Playwright's default. The owner also asked for "as stealthy as possible"; that was declined beyond the default (no stealth patches, fingerprint spoofing, CAPTCHA solving or proxy rotation). | C2 does not use `ignoreDefaultArgs`. |
+| 18 (logged-in rule) | Confirmed. | none |
+| 8 (CPU renderer) | Confirmed. | none |
+| Spec §10 item 12 (agent runs as the daemon's user) | Accepted for v1. | none |
+| Spec §10 item 13 (autopilot CAD needs interactive planning) | **Changed.** The nightly planner may propose numbers; the unit cannot start until the owner approves them on a card. | B3 scope grows. |
+| Spec §10 item 11 (approvals per machine) | **Changed.** Sync approvals through the hub. | A2 builds a hub-synced lock store. |
+| Spec §10 item 14 (every click asks on logged-in sites) | **Changed.** Logged-in sites can be unlocked, persistently and fleet-wide; once unlocked nothing on that site asks, including checkout and payment pages. | C3 scope changes; D28 revised. |
+| D25 (site approvals per session) | **Changed.** Site approvals persist fleet-wide until removed in Settings. | C2 scope changes. |
+| 7 (5 MB reference cap) | **Changed** to 50 MB. | A4. |
+| 27 (gate lets docs be uncommitted) | Confirmed as built. | none |
+
+## Build decisions, continued
+
+| # | Date | Phase | Decision | Why | To reverse |
+|---|---|---|---|---|---|
+| 35 | 2026-11-19 | B1 | The hub installs a new SolidCraft build on itself first; if that fails, no pin is recorded and no member is contacted. | A bad version-and-hash pair should never reach the fleet. (The Claude CLI rollout installs the hub last.) | Reorder in `fleet-solidcraft.ts`. |
+| 36 | 2026-11-19 | B1 | A corrupt pin file leaves the machine reporting CAD unavailable until a pin is set again. | Treating it as "no pin" would silently lift the fleet's version guard. | Treat corrupt as absent. |
+| 37 | 2026-11-19 | B1 | A member that was offline when the pin moved is brought up to date by a 10-minute reconcile timer on the hub, not immediately on reconnect. | Simplest reliable mechanism. Until then it believes itself on the old pin. | Trigger reconcile on member reconnect. |
+| 38 | 2026-11-19 | B1 | The installer uses its own strict zip reader, not `unzip`, and refuses symlinks, `..`, absolute paths and duplicate entries. | One parser checks and writes the names, so there is no gap between check and extraction. | n/a. |
+| 39 | 2026-11-19 | B1 | At daemon start the installed build is trusted from a marker file; signature checks are not re-run on every boot. | Keeps start-up fast and offline. Same-user risk already accepted. | Re-verify on boot. |
+| 40 | 2026-11-19 | B1 | **B1 was vetoed by its reviewer.** Reason 1: a wrong hash for the already-pinned version deleted the working install while status still said "ready". Reason 2: the "CAD unavailable when off the pin" bullet had no real test, because the event and tool refusal live in Track A. Fixes for the first (and four smaller findings) were sent to the Track B agent. The second is deferred to the merge: B1 stays "in progress" until a post-merge test shows an off-pin machine emitting `cad.status {available:false}` and an `anvil_cad` call refusing with the reason. | Spec §8.4: a bullet with no test is not done. | n/a. |
+| 41 | 2026-11-19 | B1 | `test/contract/regen-golden.ts` is broken on main (it imports a test file outside the runner), so protocol golden changes are edited by hand on each track. | Found during B1; not caused by this work. Track B was asked to fix it if quick. | n/a. |
+| 42 | 2026-11-19 | C1 | C1 passed its adversarial review. Six findings were sent to the Track C agent to fix alongside C2, the main one being that a permission card left open while an integration was edited could still be answered "always" and apply to the edited definition. | Reviewer reproduced it; only a client (the owner) can trigger it, never the model. | n/a. |
+| 43 | 2026-11-19 | C1 | When a tool server fails at session start it is held as unavailable until the owner presses Check or edits or toggles that integration. The spec said "until the next probe". | A probe runs before every turn, so the literal rule would clear the hold at once and stall each session start for about 27 s again. | Clear holds on the timer probe. |
+| 44 | 2026-11-19 | C1 | Any session that belongs to an autopilot work unit or a team is denied integrations, slightly stricter than the spec's list of roles. | Simpler and safer; re-checked live at each call. | Loosen `isOrdinarySession`. |
+| 45 | 2026-11-19 | C1 | Sessions with integrations switched on probe their health before each turn, adding up to 1 s before the prompt is delivered. | Keeps the attached set current without a background poll per session. | Drop the before-turn probe. |
+| 46 | 2026-11-19 | C1 | The iOS and Android native clients were not updated for the new events; they show the raw tool name on permission cards. The web UI (also bundled in the Android app) is updated. | Native work is outside this spec. | Add native support later. |
+| 47 | 2026-11-19 | C1 | The Custom integration form splits the typed command line in the browser (quotes and backslashes, no shell expansion). | Operators type a command line; the daemon stores command and arguments separately. | n/a. |

@@ -766,6 +766,46 @@ read those files for exact request and reply shapes.
     takes days to approve. So v1 has no confirmed API route to STEP models; those go through the
     browser and the hand-off card.
 
+**From the owner's review of the decision log (2026-11-19). These override everything above,
+including the interview table in §2.3 where noted.**
+
+36. **Part sources (revises item 35 and D33).** v1 ships DigiKey, Mouser **and TraceParts**
+    connectors. All keys are entered in Settings the way the LLM keys are, stored and synced the
+    same way. A connector with no key is skipped with a note. TraceParts is built against its
+    documented API with recorded fixtures and stays inactive until the owner enters a key; its
+    request email is a Settings field. SnapEDA stays dropped.
+37. **Automation flag (reverses item 22).** The preset leaves Playwright's defaults alone: it
+    neither strips the default `AutomationControlled` flag nor adds anything. Anvil still adds no
+    stealth patches, fingerprint spoofing, CAPTCHA solving or proxy rotation; the argument allow
+    list test asserts that nothing beyond the listed flags is passed.
+38. **Logged-in rule confirmed** as item 28 (owner list, plus sites logged into through "Open
+    agent browser").
+39. **CPU rendering confirmed** (item 1).
+40. **Same-user risk accepted for v1** (§6, §10 item 12).
+41. **Nightly planner may propose expected numbers (revises §4.11 and §10 item 13).** The nightly
+    planner writes proposed `cadExpectations` into the plan. They are not locked: the unit shows
+    a card with the numbers, and it cannot start (by "Go" or auto-start) until the owner approves
+    them. Approval locks them exactly as an interactive `save_cad_expectations` does.
+42. **Approvals sync through the hub (revises §4.1 lock store and §10 item 11).** The lock store
+    is hub-authoritative: an approval or adoption on any machine is sent to the hub, stored
+    there, and broadcast to every member, following the environments/Todoist sync pattern. Each
+    machine keeps a local copy for offline use. A part approved on the M4 needs no adopt card on
+    the M1. A member that cannot reach the hub uses its last copy and queues its own approvals.
+43. **Site approvals persist fleet-wide (revises D25).** A site the owner allows is allowed for
+    every session on every machine until removed in Settings → Integrations. The list is
+    hub-synced like item 42. The prompt options become "Allow once" / "Always allow <site>" /
+    "Deny".
+44. **Logged-in sites can be unlocked, fleet-wide and persistently (revises D28 and §4.12 hard
+    stops).** Each logged-in site has an "unlocked" switch in Settings (and an "Unlock <site>"
+    option on the hard-stop card). While a logged-in site is locked, every click, key press and
+    form action asks, as specified. Once unlocked, **nothing on that site asks**, in any session
+    on any machine, including checkout and payment pages. The owner chose this knowing it allows
+    orders to be placed unprompted; removing the unlock in Settings is the only brake. The unlock
+    list is hub-synced. Upload and script-evaluation rules (all sites) are unchanged.
+45. **Reference STEP cap is 50 MB (revises item 4).** Design scripts that embed large references
+    will be tens of MB in git; the part card shows the script size when it exceeds 5 MB.
+46. **Phase gate dirty-tree rule stays as built** (docs Markdown may be uncommitted during a run).
+
 ## 5. Deliverables & phases
 
 Status columns: **Impl** (code merged to the branch), **Tested** (the phase's listed tests pass
