@@ -44,3 +44,15 @@ test("isReadOnly", () => {
   expect(isReadOnly("Bash")).toBe(false);
   expect(isReadOnly("Write")).toBe(false);
 });
+
+test("[A2] review 3: the outside-worktree check reads `~` and `~/` as the home folder (as the CLI does), refuses `~user`, and covers MultiEdit", () => {
+  const home = require("node:os").homedir() as string;
+  const wt = `${home}/some-worktree-that-need-not-exist`;
+  // Inside the worktree only when the path really lands there.
+  expect(isDangerous("Write", { file_path: "~/some-worktree-that-need-not-exist/a.ts" }, wt).danger).toBe(false);
+  expect(isDangerous("Write", { file_path: "~/.anvil/cadwork/locks.json" }, wt)).toEqual({ danger: true, reason: "write outside the session worktree" });
+  expect(isDangerous("Write", { file_path: "~" }, wt).danger).toBe(true);
+  expect(isDangerous("MultiEdit", { file_path: "../elsewhere/x" }, wt).danger).toBe(true);
+  expect(isDangerous("Edit", { file_path: "~root/x" }, wt).danger).toBe(true);
+  expect(isDangerous("Write", { file_path: "~/SOME-WORKTREE-THAT-NEED-NOT-EXIST/b.ts" }, wt).danger).toBe(false); // case-insensitive volume
+});

@@ -74,6 +74,8 @@ export interface CadLiveDeps {
   clear?(ev: CadDesignEvent): void;
   /** Rebuild pressed. */
   rebuild(): void;
+  /** A revision is now the one on screen (shown or cleared): what the panel and gate strip follow. */
+  onShown?(ev: CadDesignEvent): void;
 }
 
 export interface CadLive {
@@ -161,6 +163,7 @@ export function createCadLive(deps: CadLiveDeps): CadLive {
       else deps.clear?.(ev);
       shown = ev.rev;
       error = "";
+      deps.onShown?.(ev);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {

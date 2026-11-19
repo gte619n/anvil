@@ -10,11 +10,16 @@
  *     the lock store, the session store, credentials — whatever the path looks like (relative, through
  *     a symlink). The only folders under it a session may write in are the ones it works in: the
  *     session worktrees root and the cloned-repos folder.
+ *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to anything under `cad/<part>/.cache/` (the
+ *     daemon's previews, thumbnails and temp files — what the viewer shows) or `cad/<part>/release/`
+ *     (release packs are daemon-written and HMAC-checked).
  *   - Bash commands that mention the daemon's own CAD and browser state (`<stateDir>/cadwork`,
  *     `<stateDir>/solidcraft`, `<stateDir>/browser-profile`) or `solidcraft-cli`, or that pass
  *     `--remote-debugging-port` or `--user-data-dir`.
+ *  Every file-tool target is resolved by ONE resolver (./tool-paths.ts): `~` / `~/` expand to the
+ *  daemon user's home as the CLI does, `~user` is refused outright, and comparisons ignore case.
  *  ALWAYS PROMPT (no "always allow"; denied when nobody is there to answer)
- *   - `Edit` / `Write` / `MultiEdit` to `cad/rules.json`.
+ *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to `cad/rules.json`.
  *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to `cad/<part>/design.json`: the script is
  *     written by the daemon; a hand edit is the owner's to allow, each time.
  *  OWNER CARD (the tool's own typed card is the prompt; denied when unattended)
@@ -25,10 +30,11 @@
  * relies on is the lock store — a `part.json` or `rules.json` written by any route the daemon did
  * not approve leaves a hash the store does not know (spec §6).
  */
-import { existsSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { join } from "node:path";
 import { gitToplevel } from "../cadwork/partfolder";
+import { isUnder, realish, relUnder, resolveToolPath, toolPathArg } from "./tool-paths";
 import { CAD_OWNER_CARD_TOOL_IDS } from "./cad-tool-ids";
 import { registerProtectedRule, type ProtectedContext, type ProtectedRule, type ProtectedVerdict } from "./protected";
 
@@ -37,26 +43,13 @@ const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 export const PROTECTED_STATE_FOLDERS = ["cadwork", "solidcraft", "browser-profile"] as const;
 const PART_JSON_RE = /^cad\/[^/]+\/part\.json$/;
 const DESIGN_JSON_RE = /^cad\/[^/]+\/design\.json$/;
+/** Daemon-written folders of a part: previews, thumbnails, temp files; release packs. */
+const DAEMON_DIR_RE = /^cad\/[^/]+\/(\.cache|release)(\/|$)/;
 
 /** State dirs of the daemons in this process (one in production; several in tests), each with the
  *  folders under it that sessions may write in. */
 const stateDirs = new Map<string, string[]>();
 const roots = new Map<string, string>();
-
-/** Resolve symlinks on the deepest existing ancestor and keep the rest (the file may not exist yet). */
-function realish(p: string): string {
-  let dir = resolve(p);
-  const rest: string[] = [];
-  while (!existsSync(dir) && dirname(dir) !== dir) {
-    rest.unshift(basename(dir));
-    dir = dirname(dir);
-  }
-  try {
-    return join(realpathSync(dir), ...rest);
-  } catch {
-    return resolve(p);
-  }
-}
 
 function worktreeRoot(cwd: string): string {
   let root = roots.get(cwd);
@@ -70,16 +63,15 @@ function worktreeRoot(cwd: string): string {
 
 /** The target of a file tool, relative to the session's worktree, lower-cased (macOS file names are
  *  case-insensitive, so `cad/plate/PART.JSON` is the same file). Undefined when outside it. */
-function targetInWorktree(ctx: ProtectedContext): string | undefined {
-  const raw = ctx.input.file_path ?? ctx.input.notebook_path ?? ctx.input.path;
-  if (typeof raw !== "string" || !raw) return undefined;
-  const abs = realish(isAbsolute(raw) ? raw : resolve(ctx.cwd, raw));
-  const rel = relative(worktreeRoot(ctx.cwd), abs);
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return undefined;
-  return rel.split("\\").join("/").toLowerCase();
+function targetInWorktree(abs: string, cwd: string): string | undefined {
+  return relUnder(worktreeRoot(cwd), abs);
 }
 
-const under = (p: string, dir: string): boolean => p === dir || p.startsWith(dir.replace(/\/+$/, "") + "/");
+/** Inside a session's own folder under a writable root — never a file in the root itself. */
+const insideWritable = (abs: string, root: string): boolean => {
+  const rel = relUnder(realish(root), abs);
+  return rel !== undefined && rel.includes("/");
+};
 
 /**
  * Why a file tool's target is off limits because it is inside a daemon's state dir, or undefined.
@@ -87,12 +79,13 @@ const under = (p: string, dir: string): boolean => p === dir || p.startsWith(dir
  * symlinks of the nearest existing ancestor followed.
  */
 export function refusedStatePath(rawPath: unknown, cwd: string, dirs: Iterable<[string, string[]]> = stateDirs): string | undefined {
-  if (typeof rawPath !== "string" || !rawPath) return undefined;
-  const abs = realish(isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath));
+  const r = resolveToolPath(rawPath, cwd);
+  if (!r) return undefined;
+  if (!r.ok) return r.reason;
   for (const [dir, writable] of dirs) {
     const root = realish(dir);
-    if (!under(abs, root)) continue;
-    if (writable.some((w) => under(abs, realish(w)) && abs !== realish(w))) continue; // inside a session worktree or a cloned repo
+    if (!isUnder(r.abs, root)) continue;
+    if (writable.some((w) => insideWritable(r.abs, w))) continue; // inside one session worktree or one cloned repo
     return "the daemon's state folder is not a session's to edit (it holds the approvals, the session store and credentials)";
   }
   return undefined;
@@ -130,16 +123,22 @@ export function refusedBash(command: string, dirs: Iterable<string> = stateDirs.
 
 export const cadProtectedRule: ProtectedRule = (ctx): ProtectedVerdict => {
   if (FILE_TOOLS.has(ctx.tool)) {
-    const state = refusedStatePath(ctx.input.file_path ?? ctx.input.notebook_path ?? ctx.input.path, ctx.cwd);
+    const target = resolveToolPath(toolPathArg(ctx.input), ctx.cwd);
+    if (!target) return undefined;
+    if (!target.ok) return { kind: "deny", reason: target.reason };
+    const state = refusedStatePath(target.abs, ctx.cwd);
     if (state) return { kind: "deny", reason: state };
-    const rel = targetInWorktree(ctx);
+    const rel = targetInWorktree(target.abs, ctx.cwd);
+    if (rel && DAEMON_DIR_RE.test(rel)) {
+      return { kind: "deny", reason: `${rel} is in a folder the daemon writes (previews, thumbnails, release packs); it is not a session's to edit` };
+    }
     if (rel && PART_JSON_RE.test(rel)) {
       return { kind: "deny", reason: `${rel} is written by the anvil_cad tools only: use record_expectations to set a part's expectations and propose_expectations to change them` };
     }
     if (rel && DESIGN_JSON_RE.test(rel)) {
       return { kind: "always-prompt", reason: `${rel} is the part's script, written by the daemon after every change: a hand edit replaces the design itself`, label: "Allow this edit", denyWhenUnattended: true };
     }
-    if (rel === "cad/rules.json" && ctx.tool !== "NotebookEdit") {
+    if (rel === "cad/rules.json") {
       return { kind: "always-prompt", reason: "cad/rules.json sets the manufacturing limits every part is checked against", label: "Allow this edit", denyWhenUnattended: true };
     }
     return undefined;

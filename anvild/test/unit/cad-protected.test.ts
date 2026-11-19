@@ -4,7 +4,7 @@
  * policy or an earlier "always allow". Driven through the REAL permission hook.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionSuggestion } from "@protocol";
@@ -254,6 +254,8 @@ describe("cad protected rules", () => {
       ["Write", { file_path: join(state, "new-folder", "x.txt"), content: "" }],
       ["NotebookEdit", { notebook_path: join(state, "solidcraft", "x.ipynb") }],
       ["Write", { file_path: join(state, "worktrees"), content: "" }], // the root itself is not a session's file
+      ["Write", { file_path: join(state, "worktrees", "x.json"), content: "" }], // nor is a file directly in it
+      ["Write", { file_path: join(state, "repos", "x.json"), content: "" }],
     ];
     for (const autonomy of ["bypass", "mostly-autonomous", "allowlist"]) {
       for (const [tool, input] of denied) {
@@ -272,5 +274,71 @@ describe("cad protected rules", () => {
     }
     // Reads are not this rule's business.
     expect(cadProtectedRule({ session: s.session, tool: "Read", input: { file_path: join(state, "cadwork", "locks.json") }, cwd: wt })).toBeUndefined();
+  });
+
+  test("[A2] review 3: `~`, `~/` and `~user` paths are resolved as the CLI resolves them — the home folder — for locks.json, part.json, design.json and rules.json; `~user` is refused", async () => {
+    resetCadProtectedForTest();
+    // A state dir and a repo under the REAL home folder (the CLI expands `~` to it), removed afterwards.
+    const base = mkdtempSync(join(homedir(), ".anvil-cad-tilde-test-"));
+    try {
+      const st = join(base, "state");
+      mkdirSync(join(st, "cadwork"), { recursive: true });
+      writeFileSync(join(st, "cadwork", "locks.json"), "{}");
+      registerCadProtectedRules(st);
+      const home = (p: string) => "~" + p.slice(homedir().length); // "~/.anvil-cad-tilde-test-…/…"
+      const r = join(base, "repo");
+      mkdirSync(join(r, "cad", "plate"), { recursive: true });
+      Bun.spawnSync(["git", "init", "-q", r]);
+      // The session's cwd is somewhere else entirely: a `~` path must NOT be read against it.
+      const s = fakeSession({ autonomy: "bypass", cwd: r });
+      const cases: [string, Record<string, unknown>, "deny" | "prompt"][] = [
+        ["Write", { file_path: home(join(st, "cadwork", "locks.json")), content: "{}" }, "deny"],
+        ["MultiEdit", { file_path: home(join(st, "cadwork", "locks.json")), edits: [] }, "deny"],
+        ["NotebookEdit", { notebook_path: home(join(st, "cadwork", "x.ipynb")) }, "deny"],
+        ["Edit", { file_path: home(join(r, "cad", "plate", "part.json")), old_string: "a", new_string: "b" }, "deny"],
+        ["Write", { file_path: home(join(r, "CAD", "Plate", "PART.JSON")), content: "{}" }, "deny"], // case-insensitive
+        ["Write", { file_path: home(join(r, "cad", "plate", "design.json")), content: "{}" }, "prompt"],
+        ["NotebookEdit", { notebook_path: home(join(r, "cad", "rules.json")) }, "prompt"], // NotebookEdit is not exempt
+        ["Write", { file_path: home(join(r, "cad", "rules.json")), content: "{}" }, "prompt"],
+      ];
+      for (const [tool, input, want] of cases) {
+        const g = await gate(s, tool, input, "deny");
+        if (want === "deny") {
+          expect([tool, input, g.decision, !!g.prompt]).toEqual([tool, input, "deny", false]);
+        } else {
+          expect([tool, input, !!g.prompt]).toEqual([tool, input, true]); // asked, even under bypass
+        }
+      }
+      // `~` alone and `~/` are the home folder, as for the CLI: outside every state dir, so no verdict.
+      expect(cadProtectedRule({ session: s.session, tool: "Write", input: { file_path: "~/" + "x.txt" }, cwd: r })).toBeUndefined();
+      // `~user` is another user's home: refused outright, whatever it points at.
+      for (const fp of ["~root/.anvil/cadwork/locks.json", "~nobody/x", "~" + require("node:os").userInfo().username + "/x"]) {
+        const g = await gate(s, "Write", { file_path: fp, content: "" });
+        expect([fp, g.decision]).toEqual([fp, "deny"]);
+        expect(g.reason).toContain("~user");
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("[A3] review: the file tools cannot write the daemon's own folders of a part — cad/<part>/.cache/ (previews, thumbnails) and cad/<part>/release/ — under any policy", async () => {
+    for (const autonomy of ["bypass", "mostly-autonomous", "allowlist"]) {
+      for (const [tool, input] of [
+        ["Write", { file_path: join(repo, "cad", "plate", ".cache", "preview-3.glb"), content: "x" }],
+        ["Write", { file_path: "cad/plate/.cache/thumb-3.png", content: "x" }],
+        ["Edit", { file_path: join(repo, "cad", "plate", "release", "plate-abcdef0", "plate.step"), old_string: "a", new_string: "b" }],
+        ["MultiEdit", { file_path: join(repo, "CAD", "plate", "Release", "x"), edits: [] }],
+        ["NotebookEdit", { notebook_path: join(repo, "cad", "plate", ".cache", "n.ipynb") }],
+      ] as [string, Record<string, unknown>][]) {
+        const s = fakeSession({ autonomy });
+        s.remembered.add(tool);
+        const g = await gate(s, tool, input);
+        expect([tool, input, g.decision]).toEqual([tool, input, "deny"]);
+        expect(s.asked).toEqual([]);
+      }
+    }
+    // The rest of the part folder is not this rule's: refs/ is written by import, and is a normal file.
+    expect((await gate(fakeSession(), "Write", { file_path: join(repo, "cad", "plate", "notes.md"), content: "" })).decision).toBe("allow");
   });
 });

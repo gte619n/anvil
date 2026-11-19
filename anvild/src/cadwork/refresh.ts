@@ -13,7 +13,8 @@
  * FAIL CLOSED: anything that throws in here ends as an `unverified` gate result with the error
  * listed, never as `pass`, and never as an exception into the manager's queue.
  */
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import { evaluateGate, failingLines, gateError, type GateInput, type GateResult, type Measurement } from "./gate";
 import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
@@ -42,6 +43,8 @@ export interface RefreshOutcome {
   preview?: string;
   /** Why no preview was written although the design has bodies. */
   previewError?: string;
+  /** sha256 of the preview as exported: the route serves the file only while it still matches. */
+  previewSha?: string;
 }
 
 /** How many `.cache/preview-<rev>.glb` files are kept per part (§4.3 step 4). */
@@ -82,7 +85,7 @@ export function newestPreview(ref: PartRef): { rev: number; path: string } | und
  * Step 4: write `.cache/preview-<rev>.glb` through the part's own process and prune. Design bodies
  * only — an imported reference is not the part. Never throws: the preview is a picture, not a check.
  */
-export async function exportPreview(call: Call, ref: PartRef, rev: number, designBodies: string[]): Promise<{ preview?: string; error?: string }> {
+export async function exportPreview(call: Call, ref: PartRef, rev: number, designBodies: string[]): Promise<{ preview?: string; sha?: string; error?: string }> {
   if (designBodies.length === 0) return {}; // nothing to show yet; not an error
   try {
     const dir = join(ref.dir, CACHE_DIR);
@@ -90,8 +93,9 @@ export async function exportPreview(call: Call, ref: PartRef, rev: number, desig
     const path = join(dir, previewName(rev));
     const r = await call("export", { path, format: "glb", bodies: designBodies });
     if (r.isError || !existsSync(path)) return { error: r.text.slice(0, 300) || "no preview file was written" };
+    const sha = createHash("sha256").update(readFileSync(path)).digest("hex");
     prunePreviews(ref.dir);
-    return { preview: relative(ref.worktree, path) };
+    return { preview: relative(ref.worktree, path), sha };
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };
   }
@@ -254,6 +258,7 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
         if (designBodies === undefined) designBodies = (await readDesign(call)).designBodies; // the gate half threw
         const p = await exportPreview(call, ref, outcome.rev, designBodies);
         if (p.preview) outcome.preview = p.preview;
+        if (p.sha) outcome.previewSha = p.sha;
         if (p.error) outcome.previewError = p.error;
       } catch (e) {
         outcome.previewError = e instanceof Error ? e.message : String(e);

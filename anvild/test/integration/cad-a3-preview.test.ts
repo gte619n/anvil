@@ -7,6 +7,7 @@
  * Phase A3 rows.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,12 +15,16 @@ import { PROTOCOL_VERSION } from "@protocol";
 import { cadTools } from "../../src/agent/cad-tools";
 import { AccountStore } from "../../src/auth/accounts";
 import { partRef } from "../../src/cadwork/partfolder";
+import { evalExpr } from "../../src/cadwork/expr";
+import { repoIdentity } from "../../src/cadwork/locks";
+import { MOVED_WITHOUT_APPROVAL } from "../../src/cadwork/gate";
+import { CadworkService } from "../../src/session/cadwork-service";
 import { DISK_CONFLICT_REASON, readDesignFile } from "../../src/cadwork/poststep";
 import { dispatch } from "../../src/server/dispatch";
 import { createServer, type ServerHandle } from "../../src/server/http";
 import { ConnectionRegistry } from "../../src/server/registry";
 import { Supervisor } from "../../src/session/supervisor";
-import { FakeClock, RULES, buildPlate, callable, modelPlate, cleanupTemp, fakeCadSession, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
+import { FakeClock, PLATE_VOLUME, RULES, buildPlate, callable, modelPlate, cleanupTemp, fakeCadSession, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 import { readGlb } from "../golden/live-glb";
 
@@ -356,7 +361,7 @@ describe("Phase A3 clients (§7, §4.8)", () => {
       });
       return { frames, send: (cmd) => ws.send(frame(cmd)) };
     };
-    return { handle, url, sup: handle.supervisor, client };
+    return { handle, url, sup: handle.supervisor, client, stateDir };
   }
   /** Wait until a socket has received the part's current state (frames trail the daemon by a tick). */
   const caughtUp = (d: Awaited<ReturnType<typeof daemon>>, c: Client, repo: string) =>
@@ -478,5 +483,85 @@ describe("Phase A3 clients (§7, §4.8)", () => {
     expect(after.gate.state).toBe("pass");
     expect(d.sup.cadwork.manager.status(x.ref)!.pid).not.toBe(pid);
     expect(existsSync(join(repo, after.preview))).toBe(true);
+  });
+
+  test("[A3] review: the preview route serves only what the daemon exported — a file written over a preview, or one it never exported, is 404 — with no-cache and the recorded sha as ETag, across a restart", async () => {
+    const d = await daemon();
+    const c = await d.client();
+    const repo = tempRepo();
+    await plateOn(d, repo, c);
+    const ev = designsOf(c.frames).at(-1);
+    const url = (p: string) => `${d.url}/api/cad/preview?cwd=${encodeURIComponent(repo)}&path=${encodeURIComponent(p)}`;
+    const ok = await fetch(url(ev.preview));
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("cache-control")).toContain("no-cache"); // revs restart after a cache wipe: a name is not a version
+    const etag = ok.headers.get("etag")!;
+    const sha = createHash("sha256").update(readFileSync(join(repo, ev.preview))).digest("hex");
+    expect(etag).toBe(`"${sha}"`);
+    expect((await fetch(url(ev.preview), { headers: { "if-none-match": etag } })).status).toBe(304);
+    // What a restarted daemon knows: the record is persisted under the state dir.
+    const again = new CadworkService({ enabled: false, getSession: () => undefined, stateDir: d.stateDir });
+    expect(again.previewEntry(repo, ev.preview)).toEqual({ abs: join(repo, ev.preview), sha });
+    // A preview the daemon never exported (a hand-made file of a valid name) is not served…
+    writeFileSync(join(repo, "cad", "plate", ".cache", "preview-999.glb"), readFileSync(join(repo, ev.preview)));
+    expect((await fetch(url("cad/plate/.cache/preview-999.glb"))).status).toBe(404);
+    // …and neither is an exported one whose bytes were replaced (the model on screen cannot be swapped).
+    writeFileSync(join(repo, ev.preview), Buffer.from("glTF not really"));
+    expect((await fetch(url(ev.preview))).status).toBe(404);
+    expect(again.previewEntry(repo, ev.preview)).toBeUndefined();
+  });
+
+  test("[A3] review: the CAD routes send no permissive CORS and refuse a foreign browser Origin with 403 (the WebSocket's origin gate); other routes are unchanged", async () => {
+    const d = await daemon();
+    const c = await d.client();
+    const repo = tempRepo();
+    await plateOn(d, repo, c);
+    const ev = designsOf(c.frames).at(-1);
+    const url = `${d.url}/api/cad/preview?cwd=${encodeURIComponent(repo)}&path=${encodeURIComponent(ev.preview)}`;
+    const foreign = await fetch(url, { headers: { origin: "https://evil.example" } });
+    expect(foreign.status).toBe(403);
+    expect(foreign.headers.get("access-control-allow-origin")).toBeNull();
+    const pre = await fetch(url, { method: "OPTIONS", headers: { origin: "https://evil.example" } });
+    expect(pre.status).toBe(403);
+    // Same origin (the PWA) and no Origin at all (native clients) are served — still with no `*`.
+    for (const headers of [{ origin: d.url }, {}] as Record<string, string>[]) {
+      const r = await fetch(url, { headers });
+      expect(r.status).toBe(200);
+      expect(r.headers.get("access-control-allow-origin")).toBeNull();
+    }
+    // Not a CAD route: the bundled native clients' permissive CORS is untouched.
+    const health = await fetch(`${d.url}/api/health`, { headers: { origin: "https://evil.example" } });
+    expect(health.headers.get("access-control-allow-origin")).toBe("*");
+  });
+});
+
+describe("Phase A3 review: owner edits", () => {
+  test("[A3] review: the agent changes L, the owner then edits T in the panel — the gate still fails on L naming its old and new values, and the accepted numbers move for T only", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    expect(x.gate.state).toBe("pass");
+    const ref = partRef(repo, "plate");
+    expect((await x.tools.set_parameter!({ name: "L", expression: "120" })).isError).toBe(false); // the agent, unapproved
+    let g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(MOVED_WITHOUT_APPROVAL);
+    const owner = await x.service.setParamAsOwner(ref, "T", "6.5"); // the owner, an unrelated parameter
+    expect(owner.ok).toBe(true);
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    const moved = g.failing.find((l: string) => l.startsWith("accepted:"))!;
+    expect(moved).toContain(MOVED_WITHOUT_APPROVAL);
+    expect(moved).toContain("bbox[2] 80 → 120");
+    expect(moved).toContain("L 80 → 120");
+    expect(moved).not.toContain("T ");
+    // The accepted numbers: T's change only. L is still the 80 that was accepted.
+    const lock = x.service.locks.findPart(repoIdentity(repo), "plate")!;
+    expect(lock.values!.bbox).toEqual([6.5, 50, 80]);
+    expect(lock.values!.volume).toBeCloseTo(evalExpr(PLATE_VOLUME, { L: 80, W: 50, T: 6.5 }), 6);
+    expect(lock.declared).toEqual({ L: 80, W: 50, T: 6.5 });
+    expect(lock.approvedBy).toBe("agent-initial"); // a panel edit is not a confirmation of the agent's numbers
+    // The owner then sets L back to what was accepted: everything agrees again.
+    expect((await x.service.setParamAsOwner(ref, "L", "80")).ok).toBe(true);
+    expect((await x.check()).state).toBe("pass");
   });
 });

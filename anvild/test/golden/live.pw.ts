@@ -176,3 +176,90 @@ test("[A3] without the cad-work capability there is no part card, no viewer and 
   await expect(page.locator(".cad-params")).toHaveCount(0);
   expect(app.errors).toEqual([]);
 });
+
+// ── A3 review, item 6 ───────────────────────────────────────────────────────────────────────────
+
+test("[A3] Paused: the parameters panel and the gate strip show the DISPLAYED revision and say a newer one exists; Reload brings both up to date", async ({ page }, info) => {
+  const app = await openPlate(page);
+  if (info.project.name === "phone") await page.locator('.cad-tools [data-act="params"]').click();
+  const panel = page.locator(".cad-params");
+  const input = panel.locator('.cad-param[data-param="L"] input');
+  await expect(input).toHaveValue("80 mm");
+  await page.locator('[data-live="follow"]').click(); // pause
+  await app.push(design({ rev: 2 }, { state: "fail", checks: [{ id: "volume", expected: 23335.167, measured: 35335.167, ok: false, hard: true }] }));
+  await expect(page.locator('[data-live="behind"]')).toHaveText("1 behind");
+  await expect(input).toHaveValue("80 mm"); // the model on screen is rev 1: so are the values
+  await expect(panel.locator('[data-role="gate"]')).toHaveAttribute("data-state", "pass");
+  await expect(panel.locator('[data-role="newer"]')).toBeVisible();
+  await page.screenshot({ path: info.outputPath(`paused-${info.project.name}.png`) });
+  await page.locator('[data-live="reload"]').click();
+  await app.model(24);
+  await expect(input).toHaveValue("120 mm");
+  await expect(panel.locator('[data-role="gate"]')).toHaveAttribute("data-state", "fail");
+  await expect(panel.locator('[data-role="newer"]')).toBeHidden();
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] desktop: the opening fit puts the whole model in the visible area beside the parameters panel", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop", "the side panel is a desktop layout");
+  const app = await openPlate(page);
+  const p = await app.settled();
+  const panel = (await page.locator(".cad-params").boundingBox())!;
+  const stage = (await page.locator(".cad-stage").boundingBox())!;
+  expect(p.screenBox).not.toBeNull();
+  const b = p.screenBox!;
+  expect(b.left).toBeGreaterThanOrEqual(panel.x + panel.width - 0.5); // nothing of the model under the panel
+  expect(b.right).toBeLessThanOrEqual(stage.x + stage.width + 0.5);
+  expect(b.top).toBeGreaterThanOrEqual(stage.y - 0.5);
+  expect(b.bottom).toBeLessThanOrEqual(stage.y + stage.height + 0.5);
+  await page.screenshot({ path: info.outputPath("desktop-fit.png") });
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] phone: with the parameters sheet open the toolbar is still on top and reachable", async ({ page }, info) => {
+  test.skip(info.project.name !== "phone", "the bottom sheet is the phone layout");
+  const app = await openPlate(page);
+  await expect(page.locator(".cad-params")).toBeHidden(); // collapsed by default
+  await page.locator('.cad-tools [data-act="params"]').click();
+  await expect(page.locator(".cad-params")).toBeVisible();
+  const tools = (await page.locator(".cad-tools").boundingBox())!;
+  const hit = await page.evaluate(([x, y]) => !!document.elementFromPoint(x!, y!)?.closest(".cad-tools"), [tools.x + tools.width / 2, tools.y + tools.height / 2]);
+  expect(hit).toBe(true);
+  await page.screenshot({ path: info.outputPath("phone-sheet.png") });
+  // The toolbar closes the sheet again.
+  await page.locator('.cad-tools [data-act="params"]').click();
+  await expect(page.locator(".cad-params")).toBeHidden();
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] the units badge is readable in both themes", async ({ page }, info) => {
+  const app = await openPlate(page);
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    const c = await page.locator('.cad-units[data-role="units"]').evaluate((e) => {
+      const parse = (s: string) => (s.match(/[\d.]+/g) ?? []).map(Number);
+      const lum = ([r, g, b]: number[]) => {
+        const f = (v: number) => ((v /= 255) <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+        return 0.2126 * f(r!) + 0.7152 * f(g!) + 0.0722 * f(b!);
+      };
+      const fg = parse(getComputedStyle(e).color);
+      const own = parse(getComputedStyle(e).backgroundColor);
+      if (!(own.length >= 3 && (own.length < 4 || own[3]! > 0.5))) return 0; // must not show through to whatever is behind
+      let bgEl: Element | null = e;
+      let bg = [255, 255, 255];
+      while (bgEl) {
+        const v = parse(getComputedStyle(bgEl).backgroundColor);
+        if (v.length >= 3 && (v.length < 4 || v[3]! > 0.5)) {
+          bg = v;
+          break;
+        }
+        bgEl = bgEl.parentElement;
+      }
+      const [a, b] = [lum(fg), lum(bg)].sort((x, y) => y - x);
+      return (a! + 0.05) / (b! + 0.05);
+    });
+    expect(c).toBeGreaterThanOrEqual(3); // WCAG large/UI text
+    await page.screenshot({ path: info.outputPath(`units-${scheme}-${info.project.name}.png`) });
+  }
+  expect(app.errors).toEqual([]);
+});

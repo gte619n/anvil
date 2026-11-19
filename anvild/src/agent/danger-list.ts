@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isUnder, realish, resolveToolPath } from "./tool-paths";
 import { CAD_READ_ONLY_TOOL_IDS } from "./cad-tool-ids";
 
 /**
@@ -53,12 +53,13 @@ export function isDangerous(toolName: string, input: Record<string, unknown>, cw
   if (SECRET_PATH.test(pathish)) return { danger: true, reason: "credential/secret path" };
 
   // writes resolving outside the session worktree
-  if (cwd && (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit")) {
-    const fp = input.file_path ?? input.notebook_path;
-    // Resolved the way the write will be: a relative path (`../../x`) is against the session's cwd.
-    const root = resolve(cwd);
-    const abs = typeof fp === "string" && fp ? resolve(root, fp) : undefined;
-    if (abs !== undefined && abs !== root && !abs.startsWith(root.replace(/\/+$/, "") + "/")) {
+  if (cwd && (toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit" || toolName === "NotebookEdit")) {
+    // Resolved the way the write will be, by the one resolver every protected rule uses: `~` / `~/`
+    // are the home folder (as the CLI expands them), `~user` is refused, a relative path is against
+    // the session's cwd, links of the nearest existing ancestor are followed, case is ignored.
+    const target = resolveToolPath(input.file_path ?? input.notebook_path, cwd);
+    if (target && !target.ok) return { danger: true, reason: target.reason };
+    if (target && !isUnder(target.abs, realish(cwd))) {
       return { danger: true, reason: "write outside the session worktree" };
     }
   }

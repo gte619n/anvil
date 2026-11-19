@@ -7,7 +7,8 @@
  * is the `cad.status` event, and the tools refuse with its reason — nothing is withdrawn from a live
  * driver.
  */
-import { existsSync, mkdtempSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -51,6 +52,7 @@ import { lineDiff } from "../cadwork/rules";
 import { newId } from "../util/ids";
 import { currentManagedSolidcraft, resolveSolidcraftCli, type ResolvedSolidcraft } from "../solidcraft/binary";
 import { now } from "../util/envelope";
+import { writeFileAtomic } from "../util/atomic";
 import type { Session } from "./session";
 
 export interface CadStatus {
@@ -122,9 +124,10 @@ export const NO_EXPECTATIONS = "has no expectations yet";
 export type ExpectationsReply = { ok: true; note?: string } | { ok: false; error: string };
 /** The caution on an `initial` card: the numbers were written after the part existed. */
 export const INITIAL_AFTER_GEOMETRY = "this part already has geometry; these numbers were written after it existed";
-/** A declared parameter value: a number, optionally followed by `mm` or `deg`. Nothing else — the
- *  declared values are what the expectations are evaluated from, so they must be plain numbers. */
-const DECLARED_RE = /^\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(mm|deg)?\s*$/;
+/** A declared parameter value: a number, optionally followed by `mm`. Nothing else — the declared
+ *  values are what the expectations (lengths, volumes) are evaluated from, so they are lengths or
+ *  plain numbers; an angle (`deg`) is not accepted. */
+const DECLARED_RE = /^\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(mm)?\s*$/;
 const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z_0-9]*$/;
 
 /** Read `record_expectations`' `parameters` argument: every value a plain number (with an optional
@@ -136,7 +139,7 @@ export function parseDeclared(raw: unknown): { ok: true; values: Record<string, 
   for (const [name, v] of Object.entries(raw as Record<string, unknown>)) {
     if (!PARAM_NAME_RE.test(name) || name === "pi") return { ok: false, error: `\`parameters\`: ${JSON.stringify(name)} is not a parameter name` };
     const m = typeof v === "number" ? (Number.isFinite(v) ? [String(v), String(v), undefined] : null) : typeof v === "string" ? DECLARED_RE.exec(v) : null;
-    if (!m) return { ok: false, error: `\`parameters.${name}\` must be a number, optionally with mm or deg (e.g. 80 or "80 mm"), not ${JSON.stringify(v)}` };
+    if (!m) return { ok: false, error: `\`parameters.${name}\` must be a number, optionally with mm (e.g. 80 or "80 mm"), not ${JSON.stringify(v)}` };
     values[name] = Number(m[1]);
     expressions[name] = typeof v === "number" ? String(v) : (v as string).trim();
   }
@@ -180,6 +183,9 @@ export class CadworkService {
   private readonly busyTimers = new Map<string, unknown>();
   /** What the owner changed in the panel that each session's agent has not been told yet. */
   private readonly ownerNotes = new Map<string, string[]>();
+  /** sha256 of every preview the daemon exported, by absolute path (`<stateDir>/cadwork/previews.json`). */
+  private readonly previewShas = new Map<string, string>();
+  private readonly previewShasFile: string;
 
   constructor(private readonly deps: CadworkServiceDeps) {
     this.resolveCli = deps.resolveCli ?? (() => resolveSolidcraftCli());
@@ -188,6 +194,13 @@ export class CadworkService {
     this.clock = deps.manager?.clock ?? realClock;
     const stateDir = deps.stateDir ?? mkdtempSync(join(tmpdir(), "anvil-cadwork-state-"));
     this.locks = new LockStore(stateDir);
+    this.previewShasFile = join(stateDir, "cadwork", "previews.json");
+    try {
+      const raw = JSON.parse(readFileSync(this.previewShasFile, "utf8"));
+      if (raw && typeof raw === "object") for (const [k, v] of Object.entries(raw)) if (typeof v === "string") this.previewShas.set(k, v);
+    } catch {
+      /* none yet */
+    }
     this.lockSync = new LockSync(this.locks, { ...deps.lockSync, onRemoteChange: () => this.recheckOpenParts() });
     if (deps.enabled) {
       // The protected rules of §4.4, once per daemon (the registry ignores a repeat registration).
@@ -552,7 +565,9 @@ export class CadworkService {
       if (!values) return { ok: false, error: `the owner approved, but the formulas no longer evaluate against the design's parameters; nothing was written` };
       const file: PartFile = { ...cur.file, expectations: proposed };
       writePartFile(ref.dir, file);
-      this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
+      // The parameter values the approved numbers were evaluated with (shown on the card) are now the accepted ones.
+      const declared = paramMap(this.manager.status(ref)?.params ?? []);
+      this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, declared, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
       this.recheck(ref);
       return { ok: true, approved: true };
     }
@@ -586,9 +601,20 @@ export class CadworkService {
         this.nextBy.set(ref.key, "panel");
         const locked = readLocked(ref, this.locks, this.machine());
         if (locked.part.kind !== "ok" || !locked.part.file.expectations || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file) || !hasValues(locked.lock.values)) return;
-        const next = this.valuesNow(ref, locked.part.file.expectations, slot.params());
+        // The OWNER changed ONE parameter. The accepted numbers are re-derived from the ACCEPTED
+        // parameter values with only that one replaced — never from the design as it is now, where
+        // the agent may have changed others without approval (those keep failing the gate).
+        const value = slot.params().find((p) => p.name === name)?.value;
+        if (value === undefined || !Number.isFinite(value)) return;
+        const base = { ...acceptedBase(locked.lock, slot.params()), [name]: value };
+        let values: EvaluatedExpectations;
+        try {
+          values = evaluateExpectations(locked.part.file.expectations, base);
+        } catch {
+          return;
+        }
         const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
-        if (next.values) this.approve(ref, { ...rest, values: next.values, at: new Date().toISOString() });
+        this.approve(ref, { ...rest, values, declared: { ...(rest.declared ?? {}), [name]: value }, at: new Date().toISOString() });
       },
     });
     if (reply.result.isError) return { ok: false, error: reply.result.text, notes: reply.notes };
@@ -676,6 +702,34 @@ export class CadworkService {
     const ref = this.refFor(worktree, part);
     if (!existsSync(ref.dir)) throw new Error(`cad/${ref.part} does not exist`);
     await this.manager.reload(ref);
+  }
+
+  /**
+   * The preview route's answer: the file behind a `cad.design.preview` path AND the sha256 the daemon
+   * recorded when it exported it — only while the file on disk still has that sha. A file anyone else
+   * wrote (or rewrote) there is never served (A3 review, item 3).
+   */
+  previewEntry(worktree: string, relPath: string): { abs: string; sha: string } | undefined {
+    const abs = this.previewFile(worktree, relPath);
+    if (!abs) return undefined;
+    const want = this.previewShas.get(abs);
+    if (!want) return undefined;
+    try {
+      return createHash("sha256").update(readFileSync(abs)).digest("hex") === want ? { abs, sha: want } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Remember what the daemon exported (persisted, so a restart keeps serving what it wrote). */
+  recordExport(abs: string, sha: string): void {
+    this.previewShas.set(abs, sha);
+    for (const k of [...this.previewShas.keys()]) if (!existsSync(k)) this.previewShas.delete(k);
+    try {
+      writeFileAtomic(this.previewShasFile, JSON.stringify(Object.fromEntries(this.previewShas)) + "\n", { mode: 0o600 });
+    } catch {
+      /* the in-memory record still serves this run */
+    }
   }
 
   /** The absolute file behind a `cad.design.preview` path, or undefined when it is not one (or is gone). */
@@ -853,6 +907,7 @@ export class CadworkService {
     const prev = this.snapshots.get(ref.key);
     const by = this.nextBy.get(ref.key) ?? "agent";
     this.nextBy.delete(ref.key);
+    if (outcome.preview && outcome.previewSha) this.recordExport(join(ref.worktree, outcome.preview), outcome.previewSha);
     const snap: PartSnapshot = { ref, rev: outcome.rev ?? (prev?.rev ?? 0) + 1, outcome, by, busy: (this.manager.status(ref)?.queued ?? 0) > 0 };
     this.snapshots.set(ref.key, snap);
     this.broadcast(this.designEvent(snap));
@@ -868,10 +923,12 @@ export class CadworkService {
       "adopt-expectations": () => {
         if (locked.part.kind !== "ok") return undefined;
         const f = locked.part.file;
-        const p = paramMap(params);
+        // Evaluated from the ACCEPTED parameter values where there are any (an agent's unapproved
+        // change does not ride in on an adoption), the design's for names never accepted.
+        const p = acceptedBase(locked.lock, params);
         // A card always shows evaluated numbers: expectations that do not evaluate cannot be adopted
         // (the gate says which formula fails), so no card is drawn for them.
-        if (f.expectations && !this.valuesNow(ref, f.expectations, params).values) return undefined;
+        if (f.expectations && !evalOrUndefined(f.expectations, p)) return undefined;
         const rows: CadExpectationsRow[] = [
           { label: "Process", new: f.process },
           { label: "Status", ...(locked.lock ? { old: locked.lock.status } : {}), new: f.status },
@@ -930,10 +987,12 @@ export class CadworkService {
     const file = locked.part.file;
     if (card.kind === "adopt-expectations") {
       if (lockedBlockSha(file) !== card.sha) return false;
-      // The accepted numbers are fixed here, at approval. Formulas that do not evaluate cannot be approved.
-      const values = file.expectations ? this.valuesNow(ref, file.expectations).values : undefined;
+      // The accepted numbers are fixed here, at approval, from the same values the card showed.
+      // Formulas that do not evaluate cannot be approved.
+      const base = acceptedBase(locked.lock, this.manager.status(ref)?.params ?? []);
+      const values = file.expectations ? evalOrUndefined(file.expectations, base) : undefined;
       if (file.expectations && !values) return false;
-      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(values ? { values } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(values ? { values, declared: base } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
       return true;
     }
     if (card.kind !== "adopt-ownerParams" || !locked.lock) return false;
@@ -1043,6 +1102,18 @@ export class CadworkService {
 
 /** What an adopt-ownerParams card stands for: the dimensions in the file when it was drawn. */
 const ownerParamsCardSha = (p: Record<string, number> | undefined): string => JSON.stringify(Object.keys(p ?? {}).sort().map((n) => [n, p![n]]));
+/** The parameter values accepted numbers are derived from: the lock's accepted (`declared`) values,
+ *  and the design's current value only for a name that was never accepted. */
+export function acceptedBase(lock: Pick<PartLock, "declared"> | undefined, params: CadParamInfo[]): Record<string, number> {
+  return { ...paramMap(params), ...(lock?.declared ?? {}) };
+}
+function evalOrUndefined(exp: Expectations, params: Record<string, number>): EvaluatedExpectations | undefined {
+  try {
+    return evaluateExpectations(exp, params);
+  } catch {
+    return undefined;
+  }
+}
 const paramMap = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
 const partRefOf = (key: string, part: string): PartRef => ({ key, part, dir: key, worktree: key.slice(0, key.length - `/cad/${part}`.length) });
 const num = (v: number): string => String(Math.round(v * 1e4) / 1e4);

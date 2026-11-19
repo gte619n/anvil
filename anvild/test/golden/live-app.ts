@@ -32,6 +32,8 @@ export interface Probe {
   sectionPos: number | null;
   gpuGeometries: number;
   canvases: number;
+  /** The model's bounding box projected to page pixels. */
+  screenBox: { left: number; top: number; right: number; bottom: number } | null;
 }
 
 const session = {

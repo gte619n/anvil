@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { MOVED_WITHOUT_APPROVAL } from "../../src/cadwork/gate";
 import { repoIdentity, repoKey } from "../../src/cadwork/locks";
 import { partRef } from "../../src/cadwork/partfolder";
-import { INITIAL_AFTER_GEOMETRY } from "../../src/session/cadwork-service";
+import { INITIAL_AFTER_GEOMETRY, parseDeclared } from "../../src/session/cadwork-service";
 import { BOX, PLATE_EXPECTATIONS, PLATE_PARAMETERS, RULES, approveCards, buildPlate, cleanupTemp, fakeCadSession, stopServices, tempRepo, until, writeDesign, writeRules } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 
@@ -291,5 +291,21 @@ describe("Phase A2 review", () => {
     editJson(y.partJson, (doc) => void (doc.expectations.volume = 1));
     y.service.respond(y.openCards().find((c: any) => c.kind === "confirm").requestId, true);
     expect(lockOf(y, repo2).approvedBy).toBe("agent-initial");
+  });
+
+  test("[A2] review 11: declared parameter values are lengths or plain numbers — `mm` is accepted, `deg` is refused", async () => {
+    expect(parseDeclared({ L: "80 mm", W: 50, T: "6" })).toEqual({ ok: true, values: { L: 80, W: 50, T: 6 }, expressions: { L: "80 mm", W: "50", T: "6" } });
+    for (const bad of [{ A: "30 deg" }, { A: "30deg" }, { A: "30 in" }, { A: "L*2" }]) {
+      const r = parseDeclared(bad);
+      expect(r.ok).toBe(false);
+    }
+    // Through the tool, nothing is recorded.
+    const repo = tempRepo();
+    writeRules(repo, RULES);
+    const x = fakeCadSession(repo, { resolveCli: () => ({ path: FAKE_SOLIDCRAFT, source: "env" }) }, "sess_cad", { expectations: "manual" });
+    await x.tools.open_part!({ part: "plate" });
+    const r = await x.tools.record_expectations!({ part: "plate", process: "fdm-0.4", parameters: { A: "30 deg" }, expectations: { ...PLATE_EXPECTATIONS, bbox: ["A", 1, 1] } });
+    expect(r.isError).toBe(true);
+    expect(existsSync(join(repo, "cad", "plate", "part.json"))).toBe(false);
   });
 });

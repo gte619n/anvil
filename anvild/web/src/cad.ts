@@ -695,7 +695,18 @@ export function openCadPart(src: CadPartSource, io: CadIo): void {
   };
 
   const params = createCadParams({ setParam: src.setParam });
-  const live = createCadLive({ part: src.part, show, clear, rebuild: src.rebuild });
+  // The panel and the gate strip describe the model ON SCREEN: while Paused behind newer revisions
+  // they keep the displayed revision's values and say a newer one exists (A3 review, item 6).
+  const live = createCadLive({
+    part: src.part,
+    show,
+    clear,
+    rebuild: src.rebuild,
+    onShown: (ev) => {
+      params.onDesign(ev);
+      params.setNewer(live.behind() > 0);
+    },
+  });
   shell.append(live.el, params.el);
   if (window.innerWidth >= 900) {
     shell.classList.add("cad-params-open"); // room for both on a wide screen; a phone opens it from the toolbar
@@ -703,8 +714,12 @@ export function openCadPart(src: CadPartSource, io: CadIo): void {
   }
 
   const feed = (ev: CadDesignEvent): void => {
-    params.onDesign(ev);
+    const shownRev = live.shownRev();
+    // The displayed revision (a busy update of it, say), or Follow on (the mesh is on its way): the
+    // panel takes the event. Paused behind: it keeps what is on screen and says a newer one exists.
+    if (live.following() || shownRev === 0 || ev.rev <= shownRev) params.onDesign(ev);
     live.onDesign(ev);
+    params.setNewer(!live.following() && live.behind() > 0);
   };
   const off = src.subscribe(feed);
   v.live = {
@@ -773,8 +788,26 @@ function publishProbe(): void {
       sectionPos: v.inspector?.sectionPos() ?? null,
       gpuGeometries: v.renderer.info.memory.geometries,
       canvases: document.querySelectorAll(".cad-stage canvas").length,
+      screenBox: screenBoxOf(v),
     };
   };
+}
+
+/** The model's bounding box projected to page pixels {left, top, right, bottom} (the probe's). */
+function screenBoxOf(v: Viewer): { left: number; top: number; right: number; bottom: number } | null {
+  const b = v.box;
+  const cam = v.camera;
+  const canvas = v.renderer?.domElement;
+  if (!b || !cam || !canvas) return null;
+  const r = canvas.getBoundingClientRect();
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const x of [b.min.x, b.max.x]) for (const y of [b.min.y, b.max.y]) for (const z of [b.min.z, b.max.z]) {
+    const p = b.min.clone().set(x, y, z).project(cam);
+    xs.push(r.left + ((p.x + 1) / 2) * r.width);
+    ys.push(r.top + ((1 - p.y) / 2) * r.height);
+  }
+  return { left: Math.min(...xs), top: Math.min(...ys), right: Math.max(...xs), bottom: Math.max(...ys) };
 }
 
 interface LoadResult {

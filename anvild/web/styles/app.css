@@ -1355,7 +1355,7 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 .cad-hud { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: linear-gradient(var(--bg), transparent); pointer-events: none; z-index: 2; }
 .cad-name { font-weight: 600; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cad-units { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+.cad-units { font-size: 11px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
 .cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: nowrap; justify-content: center; max-width: calc(100% - 24px); overflow-x: auto; scrollbar-width: none; }
 .cad-tools::-webkit-scrollbar { display: none; }
 .cad-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: none; background: transparent; color: var(--text); border-radius: 8px; cursor: pointer; }
@@ -1433,10 +1433,18 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-gate-checks li { overflow-wrap: anywhere; }
 .cad-gate-advisory { opacity: 0.8; }
 .cad-gate-note { margin-top: 6px; }
+.cad-params-newer { padding: 7px 14px; font-size: 12px; font-weight: 600; background: var(--warn); color: #1a1c20; }
+/* Phone: the sheet leaves the toolbar reachable — the toolbar floats above it, over the sheet's own
+   bottom padding (A3 review, item 6). */
+.cad-shell.cad-params-open .cad-tools { z-index: 7; }
+.cad-params { padding-bottom: calc(70px + env(safe-area-inset-bottom, 0px)); }
 @media (min-width: 900px) {
-  .cad-params { top: 0; right: auto; bottom: 0; width: 320px; max-height: none; border-top: none; border-right: 1px solid var(--border); border-radius: 0; box-shadow: none; }
+  .cad-params { top: 0; right: auto; bottom: 0; width: 320px; max-height: none; border-top: none; border-right: 1px solid var(--border); border-radius: 0; box-shadow: none; padding-bottom: 0; }
   .cad-shell.cad-params-open .cad-hud { left: 320px; }
   .cad-shell.cad-params-open .cad-readout, .cad-shell.cad-params-open .cad-slider { left: 332px; }
+  /* The canvas is the visible area beside the panel, so the opening fit centres the model in it. */
+  .cad-shell.cad-params-open .cad-stage { margin-left: 320px; }
+  .cad-shell.cad-params-open .cad-tools { left: calc(50% + 160px); max-width: calc(100% - 344px); }
 }
 
 /* ── CAD cards in the chat (agent-cad-and-browser §4.9): part card, expectation change, adopt ── */

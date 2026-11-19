@@ -20,6 +20,8 @@ export interface CadParamsDeps {
 export interface CadParams {
   el: HTMLElement;
   onDesign(ev: CadDesignEvent): void;
+  /** Paused behind the newest revision: the panel shows the DISPLAYED one and says a newer exists. */
+  setNewer(newer: boolean): void;
   dispose(): void;
 }
 
@@ -69,7 +71,10 @@ export function createCadParams(deps: CadParamsDeps): CadParams {
   const list = el("div", "cad-params-list");
   const gate = el("div", "cad-gate");
   gate.dataset.role = "gate";
-  root.append(head, list, gate);
+  const newerNote = el("div", "cad-params-newer", "Newer revision available — these are the values of the model on screen. Reload to see the newest.");
+  newerNote.dataset.role = "newer";
+  newerNote.hidden = true;
+  root.append(head, newerNote, list, gate);
 
   const rows = new Map<string, Row>();
   let disposed = false;
@@ -222,6 +227,9 @@ export function createCadParams(deps: CadParamsDeps): CadParams {
       }
       for (const p of ev.params) paint(rows.get(p.name)!, p);
       drawGate(ev.gate, ev);
+    },
+    setNewer(newer) {
+      newerNote.hidden = !newer;
     },
     dispose() {
       disposed = true;

@@ -74,6 +74,11 @@ const CSP = [
 ].join("; ");
 
 /** This host's non-internal IPv4 addresses (so the phone can be put on the same subnet). */
+/** The daemon's CAD REST routes: no permissive CORS, and the WebSocket's Origin gate applies. */
+export function isCadApiPath(pathname: string): boolean {
+  return pathname === "/api/cad" || pathname.startsWith("/api/cad/");
+}
+
 function lanIPv4(): string[] {
   const out: string[] = [];
   for (const addrs of Object.values(networkInterfaces())) {
@@ -558,6 +563,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
           async fetch(req, srv) {
             const url = new URL(req.url);
             const isApi = url.pathname.startsWith("/api/");
+            // The CAD routes (agent-cad-and-browser A3 review, item 5) get NO permissive CORS, and a
+            // request from a foreign browser Origin is refused with the WebSocket's own gate (SEC-H3,
+            // ANVIL_ALLOWED_ORIGINS): a web page must not read a part's preview by guessing a path.
+            if (isCadApiPath(url.pathname)) {
+              if (!isAllowedWsOrigin(req.headers.get("origin"), req.headers.get("host"), configuredAllowedOrigins())) return new Response("forbidden origin", { status: 403 });
+              if (req.method === "OPTIONS") return new Response(null, { status: 204 });
+              return handle(req, srv, url);
+            }
             if (isApi && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
             const res = await handle(req, srv, url);
             if (isApi && res) for (const [k, v] of Object.entries(CORS)) res.headers.set(k, v);
@@ -1439,17 +1452,22 @@ export function createServer(opts: ServerOptions): ServerHandle {
   // (a session's cwd may be a sub-folder of it, and the parts list opens parts no session touched),
   // and the file is git-excluded. `cwd` passes the same check as the cad.* commands, and `path` must
   // be exactly `cad/<part>/.cache/preview-<rev>.glb` — nothing else under the worktree is reachable.
-  route("GET", "/api/cad/preview", (_req, url) => {
+  route("GET", "/api/cad/preview", (req, url) => {
     let worktree: string;
     try {
       worktree = supervisor.cadWorktree(url.searchParams.get("cwd") ?? "");
     } catch {
       return new Response("forbidden", { status: 403 });
     }
-    const abs = supervisor.cadwork.previewFile(worktree, url.searchParams.get("path") ?? "");
-    if (!abs) return new Response("not found", { status: 404 });
-    // A revision's file never changes once written (a new revision is a new name).
-    return new Response(Bun.file(abs), { headers: { "content-type": "model/gltf-binary", "cache-control": "private, max-age=3600" } });
+    // Served only when the file is byte-for-byte what the daemon exported for that revision.
+    const hit = supervisor.cadwork.previewEntry(worktree, url.searchParams.get("path") ?? "");
+    if (!hit) return new Response("not found", { status: 404 });
+    // `no-cache` + an ETag of the recorded sha: revision numbers restart after a cache wipe and a
+    // daemon restart, so a name is not a version; the browser revalidates (a cheap 304) every time.
+    const etag = `"${hit.sha}"`;
+    const headers = { "content-type": hit.abs.endsWith(".png") ? "image/png" : "model/gltf-binary", "cache-control": "private, no-cache", etag };
+    if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
+    return new Response(Bun.file(hit.abs), { headers });
   });
 
   // Resolve a (possibly bare-basename) worktree path to one concrete file, or the candidates when it's

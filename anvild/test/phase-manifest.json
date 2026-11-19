@@ -345,7 +345,8 @@
             "cad protected rules > [A2] propose_expectations is let through with no generic prompt (its own card is the prompt) and denied when unattended",
             "cad protected rules > [A2] the rules are registered once per daemon, by the service when cad-work is on, and tests can reset the registry",
             "cad protected rules > [A2] review 2: Edit, Write, MultiEdit and NotebookEdit to cad/<part>/design.json always prompt with no always-allow, under every policy, and are denied when unattended",
-            "cad protected rules > [A2] review 3: the file tools cannot write anywhere under the daemon's state dir — absolute, relative or through a symlink — except in session worktrees and cloned repos"
+            "cad protected rules > [A2] review 3: the file tools cannot write anywhere under the daemon's state dir — absolute, relative or through a symlink — except in session worktrees and cloned repos",
+            "cad protected rules > [A2] review 3: `~`, `~/` and `~user` paths are resolved as the CLI resolves them — the home folder — for locks.json, part.json, design.json and rules.json; `~user` is refused"
           ]
         },
         {
@@ -369,13 +370,15 @@
             "Phase A2 review > [A2] review 4: a propose approval is for what the card showed — a process changed on disk while it was open is not laundered; every card shows process and status",
             "Phase A2 review > [A2] review 5: adding a remote after approval does not orphan the locks — they are found under either identity of the repo",
             "Phase A2 review > [A2] review 7: adopting ownerParams records what the card showed — a card drawn for other values approves nothing",
-            "Phase A2 review > [A2] review 10: the gate says who approved the numbers; Confirm numbers raises the owner's card (numbers, process, status) and approving it makes the owner the approver"
+            "Phase A2 review > [A2] review 10: the gate says who approved the numbers; Confirm numbers raises the owner's card (numbers, process, status) and approving it makes the owner the approver",
+            "Phase A2 review > [A2] review 11: declared parameter values are lengths or plain numbers — `mm` is accepted, `deg` is refused"
           ]
         },
         {
           "file": "test/unit/danger-list.test.ts",
           "names": [
-            "[A2] review 3: a write outside the worktree is flagged however the path is spelled — relative paths resolve against the cwd"
+            "[A2] review 3: a write outside the worktree is flagged however the path is spelled — relative paths resolve against the cwd",
+            "[A2] review 3: the outside-worktree check reads `~` and `~/` as the home folder (as the CLI does), refuses `~user`, and covers MultiEdit"
           ]
         },
         {
@@ -414,7 +417,10 @@
             "Phase A3 acceptance > [A3] acceptance 5: a change made to design.json on disk while a request is running is not overwritten: .cache/design.conflict.json exists and the part is fail with the conflict message",
             "Phase A3 clients (§7, §4.8) > [A3] two clients send cad.param.set at once: queued in arrival order, two cad.design events",
             "Phase A3 clients (§7, §4.8) > [A3] an arbitrary cwd from a client is refused by every cad command and by the preview route",
-            "Phase A3 clients (§7, §4.8) > [A3] the daemon serves the newest preview on the route the viewer uses; cad.parts.list and cad.design.refresh answer over the socket"
+            "Phase A3 clients (§7, §4.8) > [A3] the daemon serves the newest preview on the route the viewer uses; cad.parts.list and cad.design.refresh answer over the socket",
+            "Phase A3 review: owner edits > [A3] review: the agent changes L, the owner then edits T in the panel — the gate still fails on L naming its old and new values, and the accepted numbers move for T only",
+            "Phase A3 clients (§7, §4.8) > [A3] review: the preview route serves only what the daemon exported — a file written over a preview, or one it never exported, is 404 — with no-cache and the recorded sha as ETag, across a restart",
+            "Phase A3 clients (§7, §4.8) > [A3] review: the CAD routes send no permissive CORS and refuse a foreign browser Origin with 403 (the WebSocket's origin gate); other routes are unchanged"
           ]
         },
         {
@@ -454,6 +460,12 @@
             "[A3] a bad expression shows the SolidCraft error and leaves the old value; typing again clears the error",
             "[A3] an event does not write over a field the owner is typing in"
           ]
+        },
+        {
+          "file": "test/unit/cad-protected.test.ts",
+          "names": [
+            "cad protected rules > [A3] review: the file tools cannot write the daemon's own folders of a part — cad/<part>/.cache/ (previews, thumbnails) and cad/<part>/release/ — under any policy"
+          ]
         }
       ],
       "playwright": [
@@ -466,7 +478,8 @@
           "names": [
             "real SolidCraft: live preview and the owner's parameter change > [A3] real: after the plate batch a preview-<rev>.glb exists, is a valid GLB with a mesh, and is served by the daemon route the viewer uses",
             "real SolidCraft: live preview and the owner's parameter change > [A3] real: an owner cad.param.set L=120 yields a new preview whose bounding box is 120 mm long, the documented volume, and a passing gate",
-            "real SolidCraft: live preview and the owner's parameter change > [A3] real: old previews are pruned to three, and script write + refresh time for the plate is recorded"
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: old previews are pruned to three, and script write + refresh time for the plate is recorded",
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: review — the agent sets L=120, the owner edits T=6.5 in the panel: the gate still fails on L (80 → 120) and the accepted numbers move for T only"
           ]
         }
       ]

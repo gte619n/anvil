@@ -222,10 +222,13 @@ function evaluate(input: GateInput): GateResult {
       const accepted = lockOk ? lock!.values : undefined;
       if (accepted && now) {
         const moved = movedValues(accepted, now);
+        // Which parameters moved away from their ACCEPTED values (what the owner approved or typed).
+        const declared = lockOk ? lock!.declared : undefined;
+        const changedParams = declared && input.params ? Object.keys(declared).sort().filter((n) => input.params![n] !== undefined && !close(declared[n]!, input.params![n]!)).map((n) => `${n} ${fmt(declared[n]!)} → ${fmt(input.params![n]!)}`) : [];
         checks.push({
           id: "accepted",
           expected: "the expected values the owner accepted",
-          measured: moved.length ? `${MOVED_WITHOUT_APPROVAL}: ${moved.join("; ")}` : "unmoved",
+          measured: moved.length ? `${MOVED_WITHOUT_APPROVAL}: ${moved.join("; ")}${changedParams.length ? ` (parameters changed without approval: ${changedParams.join(", ")})` : ""}` : "unmoved",
           ok: moved.length === 0,
           hard: true,
         });

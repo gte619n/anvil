@@ -13,7 +13,10 @@ import { cadTools } from "../../src/agent/cad-tools";
 import { AccountStore } from "../../src/auth/accounts";
 import { partRef } from "../../src/cadwork/partfolder";
 import { createServer, type ServerHandle } from "../../src/server/http";
-import { RULES, callable, cleanupTemp, modelPlate, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
+import { PLATE_VOLUME, RULES, buildPlate, callable, cleanupTemp, modelPlate, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
+import { evalExpr } from "../../src/cadwork/expr";
+import { MOVED_WITHOUT_APPROVAL } from "../../src/cadwork/gate";
+import { repoIdentity } from "../../src/cadwork/locks";
 import { REAL, SOLIDCRAFT_CLI, hasSolidcraft } from "../helpers/real-tools";
 import { readGlb } from "../golden/live-glb";
 
@@ -167,4 +170,24 @@ describe("real SolidCraft: live preview and the owner's parameter change", () =>
     expect(Number.isFinite(mTotal)).toBe(true);
     expect(mRefresh).toBeGreaterThan(0);
   }, 300_000);
+
+  test.skipIf(!REAL)("[A3] real: review — the agent sets L=120, the owner edits T=6.5 in the panel: the gate still fails on L (80 → 120) and the accepted numbers move for T only", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    expect(x.gate.state).toBe("pass");
+    const ref = partRef(repo, "plate");
+    expect((await x.tools.set_parameter!({ name: "L", expression: "120" })).isError).toBe(false);
+    expect((await x.check()).state).toBe("fail");
+    expect((await x.service.setParamAsOwner(ref, "T", "6.5")).ok).toBe(true);
+    const g = await x.check();
+    expect(g.state).toBe("fail");
+    const moved = g.failing.find((l: string) => l.startsWith("accepted:"))!;
+    expect(moved).toContain(MOVED_WITHOUT_APPROVAL);
+    expect(moved).toContain("L 80 → 120");
+    const lock = x.service.locks.findPart(repoIdentity(repo), "plate")!;
+    expect(lock.values!.bbox.map((v) => Math.round(v * 1e6) / 1e6)).toEqual([6.5, 50, 80]);
+    expect(lock.values!.volume).toBeCloseTo(evalExpr(PLATE_VOLUME, { L: 80, W: 50, T: 6.5 }), 3);
+    expect(lock.declared).toEqual({ L: 80, W: 50, T: 6.5 });
+  }, 180_000);
 });
