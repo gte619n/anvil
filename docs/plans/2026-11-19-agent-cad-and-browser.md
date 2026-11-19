@@ -1,6 +1,6 @@
 # Agent CAD (SolidCraft) and browser for Anvil sessions
 
-- **Status:** Spec-critiqued (round 1 folded in; awaiting owner approval) · **Owner:** Evan Ruff · **Branch:** `computer-use`
+- **Status:** Building (owner said "implement everything" on 2026-11-19; decisions in the `-DECISIONS.md` file beside this one) · **Owner:** Evan Ruff · **Branch:** `computer-use`
 - **Created:** 2026-11-19
 - **Supersedes/extends:** supersedes `2026-11-19-mcp-integrations.md` as the plan of record. That
   file's registry design (its §4.1 to §4.5, §6, §7 and its critique table) stays authoritative for
@@ -630,6 +630,141 @@ The registry (store, health, lock, `buildMcpServers`, permission branch, `canUse
 | Browser | `browser/{preset,proxy,sites,hardstops,downloads}.ts` |
 | Fake SolidCraft | `anvild/test/fixtures/fake-solidcraft.ts` |
 | Phase gate runner | `anvild/test/tools/phase-gate.ts`, `anvild/test/phase-manifest.json` |
+
+### 4.14 Amendments from the spikes (these override the text above)
+
+Evidence: `2026-11-19-agent-cad-and-browser-evidence/A0-spike.md` and `B0-spike.md`. Implementers
+read those files for exact request and reply shapes.
+
+**From A0 (SolidCraft behaviour):**
+
+1. **Process start.** `solidcraft-cli mcp --headless --compact --allow-path <part dir>
+   --require-allow-path [--in <abs design.json>]`, all paths absolute, environment `PATH`,
+   `HOME`, `TMPDIR` and `SOLIDCRAFT_GPU=cpu`. Replay is `--in`, not a `batch`. `--in` starts even
+   when features fail, so the manager reads the timeline straight after start.
+2. **Failed features are a hard gate check.** A parameter change that breaks a feature returns
+   success and keeps the change, `measure` then reports partial geometry, and `eval` exits 0. The
+   refresh reads `inspect_design {timeline:"summary"}` and the gate fails if any feature has an
+   `error`. `verify` and the replay gate apply the same rule to `eval`'s `timeline[].error` and
+   `params[].error`, never the exit code alone.
+3. **Measure design bodies only.** `measure {}` includes imported reference bodies. The refresh
+   lists bodies with their creating feature, drops those created by a `BaseFeature` (an import),
+   and measures the rest with `inspect.measure {bodies:[…]}`; volume is their sum and the
+   bounding box their union.
+4. **Reference bodies travel inside the script.** `file.insert_step` embeds the whole STEP text in
+   `design.json`, with no path. `refs/*.step` is the import source and the human-readable copy.
+   A reference is capped at 5 MB. The gate reports `refs/x.step` as changed when its sha256
+   differs from the sha256 of the embedded text (state `unverified`, "reference changed; re-import").
+   Reference body names come from the insert reply's `created_bodies`.
+5. **Undo and redo revert one agent request.** A `batch` is many SolidCraft undo steps and a
+   partial undo can re-open a sketch. The manager records the undo depth before each mutating
+   request and, for the agent's `undo`, calls SolidCraft's `undo` until the depth is back to the
+   recorded value; `redo` mirrors it.
+6. **Parameter edits use `parameters.change {changes:{name:expr}}`**, for both the panel and the
+   agent's `set_parameter`. Plain `set_parameter` silently creates an unknown name; this form
+   refuses it. Creating a parameter is done with `parameters.add` through `execute` or `batch`.
+7. **Hole table.** Built from `body_topology {faces:"cylinders"}` plus `view.pick` rays, by the
+   algorithm in the A0 evidence. One row is one coaxial concave stack keyed by its smallest
+   diameter, so a counterbored hole is one row. Countersinks and slots are not holes. The
+   `holes` expectation gains an optional `kind: "through" | "blind"`.
+8. **`scriptSha` is the sha256 of the canonical `commands` array only.** `about.version` changes
+   with every SolidCraft release and must not make a design look modified. The daemon takes the
+   script from the `timeline.export_script` reply and writes the file itself, with sorted keys
+   and a stable `about` block (`design` = the part name).
+9. **The live process never calls `save`, `open` or `new_design {name}`.** `.cache/design.sc` is
+   not kept in v1; nothing needs it.
+10. **Sandbox wording.** SolidCraft can also write its own recovery folder and a per-process
+    temp folder. That is accepted; "only the part folder" means "nothing else in the repo".
+11. **Corrections to §2.2:** `body_topology` is 16 KB compact (2 KB in cylinders mode);
+    unfiltered `list_commands` is 393 KB; `describe_command` takes `id`; the plate is
+    23,335.2 mm³ at L=80 and 35,335.2 mm³ at L=120.
+12. **"Boolean retry" warnings** could not be produced on 0.44.1. That path is tested with the
+    fake server only.
+13. **S7 (M1 over SSH with no one logged in) is open**, awaiting the owner. The CPU renderer
+    removes the dependence on a GPU session.
+
+**From B0 (install and replay):**
+
+14. **Verification before first execution** is the six-step sequence in the B0 evidence. The
+    notarization step is `spctl -a -vv -t install`, requiring `source=Notarized Developer ID`.
+    `spctl -t execute` rejects a correct bare CLI and is not used. The Team ID is enforced with a
+    `codesign -R` requirement string, not by parsing text. A notarization failure is retried
+    (it needs a network lookup the first time) before the folder is deleted; if Gatekeeper
+    assessments are disabled the result is "cannot verify", which is a failure.
+15. **Zip handling.** Extract into a new empty folder, reject absolute paths, `..` and symlinks,
+    strip the one top-level folder, and run only `solidcraft-cli`.
+16. **Candidate selection.** Tag matches `^v\d+\.\d+\.\d+$`, `prerelease` and `draft` are both
+    false, sorted by `published_at` (the API order is not reliable), paged. The sha256 comes from
+    the asset's `digest` and must equal the release's `SHA256SUMS.txt` line.
+17. **Replay comparison.** Compare `body_count`, per-body `faces`, `volume_mm3` and the sorted
+    bounding box. Do not compare `edges`, `kernel.*`, `ms` or `area_mm2` (edge counts differed
+    between kernels for identical geometry). Volume tolerance is 1e-6 relative; adjacent releases
+    differed by 5e-12.
+18. **Anvil enforces the format number itself.** SolidCraft does not check `about.format` on a
+    script. The manager and `verify` refuse a `design.json` whose format number is higher than
+    the local build's ("this machine's SolidCraft is older than the design"). The local build's
+    number is read once per version by exporting an empty design.
+19. **Disk.** Each version is about 0.5 GB. Only the pinned, previous and candidate versions are
+    kept.
+
+**From C0 (SDK, browser, test daemon, part sources).** Evidence: `C0-spike.md`.
+
+20. **Pinned versions.** `@playwright/mcp@0.0.86`, run as `npx -y`, attached to installed Chrome
+    with `--browser chrome`.
+21. **Preset flags.** `--user-data-dir <stateDir>/browser-profile` (headed) or `--isolated
+    --headless` (fallback), `--proxy-server`, `--output-dir`, `--file-paths absolute`,
+    `--no-webmcp`, no `--caps`, never `--proxy-bypass`. Extra Chrome arguments go through
+    `--config` (`browser.launchOptions.args`): `--proxy-bypass-list=<-loopback>`, `--disable-quic`,
+    `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`.
+22. **No evasion, made real.** Playwright adds `--disable-blink-features=AutomationControlled`
+    by default, which hides automation from pages. The preset removes it with
+    `ignoreDefaultArgs`. The real suite asserts that `navigator.webdriver` is true in the launched
+    browser, and the unit test asserts the generated config.
+23. **The proxy is the only network control.** `--blocked-origins` is not used. Chrome sends
+    hostnames unresolved, so the proxy resolves, checks, and connects to the address it checked.
+    A refused request appears to the agent as a page with `HTTP status: 403`, not as a failed
+    load; C2's acceptance reads "the target is never contacted and the result shows 403".
+24. **Tool classification is closed.** The gate knows the 25 default tools by class (table in
+    the C0 evidence). Any other `mcp__browser__*` tool is denied. `browser_tabs` with
+    `action:"new"` and a `url` is a navigation and goes through the site gate. A `filename`
+    argument that is absolute or contains `..` is denied. `browser_run_code_unsafe` is always
+    denied; `browser_evaluate` only on the session's own test daemon.
+25. **Page URL tracking.** The daemon reads the `- Page URL:` line under `### Page` when a result
+    has one; absent means unchanged. A result with more than one `### Page` block holds the next
+    call behind a prompt, because page-controlled text sits in the same result.
+26. **Schemes.** The gate denies everything but `http:` and `https:` before the call reaches the
+    server. This matters because the server itself ran a `javascript:` URL.
+27. **Scrolling.** There is no scroll tool. On a logged-in site, `browser_press_key` with
+    `PageDown`, `PageUp`, `Home` or `End` is allowed without a prompt; every other key prompts.
+28. **Logged-in sites (replaces "has cookies").** Most sites set a cookie on first visit, so
+    cookies cannot define "logged in". A site is logged in when the owner listed it, or when the
+    profile gained cookies for it during an owner-run "Open agent browser" session (the daemon
+    compares the profile's cookie hosts before and after that session, reading the cookie
+    database read-only). Cookies gained during agent sessions do not count.
+29. **"Open agent browser"** launches Chrome with the same profile folder and the same
+    `--password-store=basic --use-mock-keychain` flags Playwright uses, so logins made there are
+    readable by the agent's browser. Those flags mean the profile's cookies are not protected by
+    the Keychain; this is part of the accepted same-user risk (§6).
+30. **Downloads.** Playwright writes downloads, snapshots, screenshots and console logs into one
+    output folder. That folder is `<worktree>/.anvil-browser/`. `downloads.ts` watches it,
+    moves real downloads (named in a `Downloaded file … to …` result line, which can arrive one
+    result late) into `<worktree>/.anvil-downloads/`, and applies the extension and size limits
+    there, deleting what fails. Both folders are git-excluded.
+31. **Startup cost.** A stdio server that hangs blocks session start for about 27 s, not 5 s, and
+    the PATH-only health probe cannot see that. The registry therefore also records a server
+    that reported `failed` at session init and marks it unavailable until the next probe.
+32. **Backstop wording.** On a hook timeout the CLI blocks the call itself; `canUseTool` is the
+    backstop for a hook that throws or returns no decision.
+33. **Test daemon environment.** The exact list is in the C0 evidence and adds `ANVIL_WEB_DIR`,
+    `ANVIL_BASE_URL` and `ANVIL_LAPO_DISABLE=1`. The web bundle is built with `ANVIL_BUILD_OUT`
+    into the temporary home, so the worktree is not written.
+34. **Desktop check.** `scutil State:/Users/ConsoleUser` names the daemon's user with
+    `kCGSSessionOnConsoleKey` true. If a headed launch still fails, fall back to headless.
+35. **Part sources (changes D33).** v1 ships DigiKey and Mouser connectors, which return
+    datasheets and product data. SnapEDA is dropped: its site terms bar automated access.
+    TraceParts is deferred: it is the only one with STEP files through an API, and its key
+    takes days to approve. So v1 has no confirmed API route to STEP models; those go through the
+    browser and the hand-off card.
 
 ## 5. Deliverables & phases
 
