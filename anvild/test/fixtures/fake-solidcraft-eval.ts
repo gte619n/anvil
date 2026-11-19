@@ -73,7 +73,9 @@ export type FakeEvalTable = Record<string, FakeEvalBehaviour>;
 export interface FakeEvalHost {
   version: string;
   volumeScale: number;
-  build: (log: readonly Cmd[]) => { params: Json[]; sketches: Json[]; timeline: Json[]; bodies: Json[] };
+  /** `strictFrom` (Track A's builder): commands from that index on are being ADDED and throw on failure;
+   *  earlier ones are history, whose failures are recorded on the timeline instead. */
+  build: (log: readonly Cmd[], strictFrom?: number) => { params: Json[]; sketches: Json[]; timeline: Json[]; bodies: Json[] };
   bboxOf: (body: any) => { min: number[]; max: number[] };
 }
 
@@ -149,7 +151,7 @@ function replay(commands: Cmd[], host: FakeEvalHost, b: FakeEvalBehaviour, fileS
         continue;
       }
       try {
-        host.build([...applied, cmd]);
+        host.build([...applied, cmd], applied.length); // this step is being added: a failure throws
         applied.push(cmd);
         results.push(outer.command === "timeline.add" ? { error: null, feature: applied.length, name, warning: null } : { name: cmd.params.name });
       } catch (e) {
