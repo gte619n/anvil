@@ -105,6 +105,7 @@ const RESULT_LABEL: Record<SolidcraftEvaluation["result"], string> = {
 const GATE_STATE_LABEL: Record<SolidcraftGateMachine["state"], string> = {
   pass: "Same on every design",
   fail: "Differs",
+  held: "Could not be decided",
   "no-designs": "Hosts no designs",
   unreachable: "Unreachable",
   unsupported: "Not switched on",
@@ -115,6 +116,7 @@ const FIELD_LABEL: Record<SolidcraftReplayDifference["field"], string> = {
   faces: "face count",
   volume_mm3: "volume (mm³)",
   bbox: "bounding box (mm, sorted)",
+  center_of_mass: "centre of mass (mm)",
 };
 const fmtNum = (v: number | number[]): string => (Array.isArray(v) ? `[${v.map((x) => String(+x.toPrecision(9))).join(", ")}]` : String(+v.toPrecision(12)));
 
@@ -142,7 +144,11 @@ function partRow(p: SolidcraftReplayPart, serverName: string): string {
         ? `<div class="cad-diff">replays under the pinned build, fails under the candidate: ${esc(p.error ?? "no detail")}</div>`
         : p.outcome === "baseline-broken"
           ? `<div class="cad-diff muted">already fails under the pinned build (ignored for the decision): ${esc(p.error ?? "no detail")}</div>`
-          : "";
+          : p.outcome === "refused"
+            ? `<div class="cad-diff">refused, not replayed: ${esc(p.error ?? "no detail")}</div>`
+            : p.outcome === "inconclusive"
+              ? `<div class="cad-diff">could not be replayed (tried again on the next check): ${esc(p.error ?? "no detail")}</div>`
+              : "";
   return `<li class="cad-part" data-part="${esc(p.part)}" data-outcome="${esc(p.outcome)}"><b>${esc(p.part)}</b> <span class="muted">· ${where}</span>${body}</li>`;
 }
 
@@ -156,6 +162,7 @@ export function gateHtml(view: CadCardView): string {
   const parts = (pick: (m: SolidcraftGateMachine) => SolidcraftReplayPart[], keep: (p: SolidcraftReplayPart) => boolean): string =>
     (ev?.machines ?? []).flatMap((m) => pick(m).filter(keep).map((p) => partRow(p, m.serverName))).join("");
   const failing = parts((m) => m.report?.parts ?? [], (p) => p.outcome === "differs" || p.outcome === "candidate-error");
+  const undecided = parts((m) => m.report?.parts ?? [], (p) => p.outcome === "refused" || p.outcome === "inconclusive");
   const broken = parts((m) => m.report?.parts ?? [], (p) => p.outcome === "baseline-broken");
   const advisory = parts((m) => m.report?.advisory ?? [], (p) => p.outcome !== "same");
   const advisoryCount = (ev?.machines ?? []).reduce((n, m) => n + (m.report?.advisory.length ?? 0), 0);
@@ -173,6 +180,7 @@ export function gateHtml(view: CadCardView): string {
         <p id="cad-gate-detail" class="small ${ev.result === "advanced" ? "muted" : "warn"}">${esc(ev.detail)}</p>
         <table class="pt-table small" id="cad-gate-machines"><thead><tr><th>Machine</th><th>Replay</th><th></th></tr></thead><tbody>${machines}</tbody></table>
         ${failing ? `<p class="small warn" style="margin-top:8px">${icon("warning")} Designs that differ under ${esc(ev.candidate.version)}:</p><ul id="cad-gate-differences" class="small">${failing}</ul>` : ""}
+        ${undecided ? `<p class="small warn" style="margin-top:8px">${icon("warning")} Designs that hold the pin without a verdict (refused as unsafe to replay, or could not be replayed):</p><ul id="cad-gate-undecided" class="small">${undecided}</ul>` : ""}
         ${broken ? `<p class="small muted" style="margin-top:8px">Designs that already fail under the pinned build:</p><ul id="cad-gate-broken" class="small">${broken}</ul>` : ""}
         ${advisoryCount ? `<p class="small muted" style="margin-top:8px">Advisory — designs in open session worktrees (${advisoryCount} replayed; these never hold the pin):</p>${advisory ? `<ul id="cad-gate-advisory" class="small">${advisory}</ul>` : `<p id="cad-gate-advisory" class="small muted">All the same under both builds.</p>`}` : ""}`
     : `<p id="cad-gate-result" class="small muted">No candidate has been evaluated yet.</p>`;
@@ -198,6 +206,7 @@ export function gateHtml(view: CadCardView): string {
       ${g.evaluating ? `<p id="cad-gate-evaluating" class="small">Evaluating SolidCraft ${esc(g.evaluating.version)}… the pinned build keeps serving sessions.</p>` : ""}
       ${g.interrupted ? `<p id="cad-gate-interrupted" class="small warn">${esc(g.interrupted)}</p>` : ""}
       ${evaluation}${lastCheck}${rejected}
+      ${g.retry ? `<p id="cad-gate-retry" class="small warn">SolidCraft ${esc(g.retry.version)} could not be installed on the hub (${esc(g.retry.reason)}). ${g.retry.attempts} attempt${g.retry.attempts === 1 ? "" : "s"} so far; the next is after ${esc(new Date(g.retry.nextAt).toLocaleString())}.</p>` : ""}
       ${g.nextAdvanceAllowedAt ? `<p id="cad-gate-limit" class="small muted">The pin moves at most once in 24 hours: the next automatic advance is possible after ${esc(new Date(g.nextAdvanceAllowedAt).toLocaleString())}.</p>` : ""}
       <div class="card-main" style="margin-top:8px;gap:8px;flex-wrap:wrap">
         <button id="cad-check-now" class="mini"${busy ? " disabled" : ""}>${icon("search")} ${view.checking ? "Checking…" : "Check now"}</button>

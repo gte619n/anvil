@@ -11,7 +11,7 @@
  * codesign / spctl, the push registries (captured), and the clock.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { rest } from "@protocol";
@@ -21,8 +21,8 @@ import type { GithubRelease } from "../../src/solidcraft/release";
 import type { ReplayWorktree } from "../../src/solidcraft/replay";
 import type { SolidcraftTestHooks } from "../../src/server/fleet-solidcraft";
 import type { PeerTrust } from "../../src/server/pairing";
-import { fakeVerifier, memoryDownloader } from "../helpers/solidcraft-release";
-import { box, commitFiles, designJson, fakeReleaseWithTable, fixtureRepo, git, githubRelease, plate, pushFromElsewhere, writeTable, type FakeEvalTable, type FixtureRepo } from "../helpers/solidcraft-replay";
+import { fakeReleaseZip, fakeVerifier, memoryDownloader } from "../helpers/solidcraft-release";
+import { asDesignSteps, box, commitFiles, designJson, fakeReleaseWithTable, fixtureRepo, git, githubRelease, plate, pushFromElsewhere, rawScript, writeTable, type FakeEvalTable, type FixtureRepo } from "../helpers/solidcraft-replay";
 
 process.env.CLAUDE_CODE_OAUTH_TOKEN ||= "sk-ant-oat-test-placeholder";
 const { createServer } = await import("../../src/server/http");
@@ -95,6 +95,8 @@ interface BootOptions {
   /** Repositories this machine hosts as environments (default branch `main`). */
   repos?: FixtureRepo[];
   worktrees?: ReplayWorktree[];
+  /** The zips THIS machine's downloads return (default: the world's good ones). */
+  zips?: Record<string, Buffer>;
   identity?: PeerTrust;
   hooks?: Partial<SolidcraftTestHooks>;
 }
@@ -103,7 +105,7 @@ async function boot(w: World, o: BootOptions = {}): Promise<Daemon> {
   if (o.members) writeFileSync(join(dir, "fleet.json"), JSON.stringify({ members: o.members.map((m) => ({ serverId: m.serverId, serverName: m.serverName, host: "127.0.0.1", url: `${m.base}/` })) }));
   // Environments go through the daemon's real store, exactly as a person's would.
   if (o.repos) writeFileSync(join(dir, "environments.json"), JSON.stringify({ environments: o.repos.map((r, i) => ({ id: `env_${i}`, name: `fixtures-${i}`, repoRoot: r.repoRoot, isRepo: true, defaultBase: "main" })) }));
-  const download = memoryDownloader(w.zips);
+  const download = memoryDownloader(o.zips ?? w.zips);
   const srv = createServer({
     host: "127.0.0.1",
     port: 0,
@@ -260,7 +262,8 @@ describe("Phase B2 acceptance", () => {
     const first = await checkNow(hub);
     expect(first.check).toMatchObject({ outcome: "advanced", version: "0.45.0" });
     expect(first.lastEvaluation!.machines.map((m) => [m.serverId, m.state, m.report!.parts.map((p) => `${p.part}:${p.outcome}`)])).toEqual(
-      [hub, ...[m1, m2].sort((a, b) => a.serverName.localeCompare(b.serverName))].map((d) => [d.serverId, "pass", d === m2 ? ["lid:same"] : ["block:same", "plate:same"]]),
+      // Hub first, then members by name and id (in this simulator every machine has the same host name).
+      [hub, ...[m1, m2].sort((a, b) => a.serverName.localeCompare(b.serverName) || a.serverId.localeCompare(b.serverId))].map((d) => [d.serverId, "pass", d === m2 ? ["lid:same"] : ["block:same", "plate:same"]]),
     );
     const st = await settled(hub);
     expect(st.pin).toMatchObject({ version: "0.45.0", previous: { version: "0.44.1" } });
@@ -503,7 +506,7 @@ describe("Phase B2 surface", () => {
   });
 
   test("[B2] the member replay route installs the candidate beside the pin, reports, and leaves the pin alone", async () => {
-    const w = world({ "0.45.0": { parts: { block: { crash: true } } } });
+    const w = world({ "0.45.0": { parts: { block: { failFeature: "Block" } } } });
     const m = await boot(w, { repos: [repoWith({ "cad/plate/design.json": designJson("plate", plate()), "cad/block/design.json": designJson("block", box()) })] });
     await pinTo(m, "0.44.1");
     const res = await post(m, "/api/solidcraft/replay", { candidate: { version: "0.45.0", sha256: w.shas["0.45.0"] }, pin: { version: "0.44.1", sha256: w.shas["0.44.1"] } });
@@ -520,6 +523,108 @@ describe("Phase B2 surface", () => {
     expect(((await bad.json()) as rest.solidcraft.ReplayResponse).error).toContain("sha256");
     expect(versionFolders(m)).toEqual(["0.44.1"]); // and the earlier candidate was pruned when the new one came in
     expect((await post(m, "/api/solidcraft/replay", { candidate: { version: "../x", sha256: "nope" } })).status).toBe(400);
+  });
+
+  test("[B2] a member that hosts designs but is not on the pin cannot pass by default: the pin holds until it has compared against the pinned build", async () => {
+    // The candidate makes the plate 50 % larger. The member's copy of the PINNED release is not the
+    // file the hub recorded, so its install of the pin failed and it has no pinned build.
+    const table: FakeEvalTable = { "0.45.0": { parts: { plate: { volumeScale: 1.5 } } } };
+    const w = world(table);
+    const wrongPinned = fakeReleaseZip("0.44.1", { extra: [{ name: "solidcraft-cli-0.44.1-macos-universal/NOTICE", data: "a different file" }] });
+    const offPin = await boot(w, { repos: [PLATE_REPO()], zips: { ...w.zips, "0.44.1": wrongPinned.zip } });
+    const hub = await boot(w, { members: [offPin] }); // the hub hosts nothing: only the member can tell
+    await pinTo(hub, "0.44.1");
+    expect((await localStatus(offPin)).local).toMatchObject({ state: "error", available: false, failure: "sha-mismatch" });
+    expect(versionFolders(offPin)).toEqual([]);
+
+    w.releases = [w.rel("0.45.0", 50)];
+    const r = await checkNow(hub);
+    expect(r.check).toMatchObject({ outcome: "held", version: "0.45.0" }); // NOT advanced
+    expect(r.check!.detail).toContain(offPin.serverName);
+    const row = machine(r, offPin);
+    expect(row).toMatchObject({ state: "error", holds: true });
+    expect(row.detail).toContain("the pinned SolidCraft 0.44.1 is not installed here and could not be");
+    expect(row.detail).toContain("nothing to compare 0.45.0 against");
+    expect((await localStatus(hub)).pin!.version).toBe("0.44.1");
+    expect(r.rejected).toEqual([]);
+
+    // Control: the same world with the member able to install the pin. Now the comparison happens,
+    // sees the 50 %, and the candidate is rejected — which is what the first run could not know.
+    const w2 = world(table);
+    const onPin = await boot(w2, { repos: [PLATE_REPO()] });
+    const hub2 = await boot(w2, { members: [onPin] });
+    await pinTo(hub2, "0.44.1");
+    w2.releases = [w2.rel("0.45.0", 50)];
+    const c = await checkNow(hub2);
+    expect(c.check!.outcome).toBe("rejected");
+    expect(machine(c, onPin).report).toMatchObject({ baseline: "0.44.1" });
+    expect(c.rejected[0]!.failures[0]!.differences![0]).toMatchObject({ field: "volume_mm3", old: expect.closeTo(PLATE_80, 6), new: expect.closeTo(PLATE_80 * 1.5, 6) });
+  });
+
+  test("[B2] a committed design that carries a file-writing command is refused on the machine that hosts it, holds the pin by name, and writes nothing", async () => {
+    const w = world();
+    const outside = tmp("anvil-sc-b2-victim-");
+    const victim = join(outside, "authorized_keys");
+    writeFileSync(victim, "the real key\n");
+    const evil = rawScript("bracket", [...asDesignSteps(box()), { command: "timeline.export_script", params: { path: victim } }, { command: "file.save", params: { path: join(outside, "saved.sc") } }]);
+    const m1 = await boot(w, { repos: [repoWith({ "cad/plate/design.json": designJson("plate", plate()), "cad/bracket/design.json": evil })] });
+    const hub = await boot(w, { members: [m1], repos: [PLATE_REPO()] });
+    await pinTo(hub, "0.44.1");
+    w.releases = [w.rel("0.45.0", 50)];
+    const r = await checkNow(hub);
+    expect(r.check!.outcome).toBe("held");
+    expect(r.check!.detail).toContain("bracket was refused and not replayed");
+    expect(r.check!.detail).toContain("timeline.export_script");
+    const row = machine(r, m1);
+    expect(row).toMatchObject({ state: "held", holds: true });
+    expect(row.report!.parts.map((p) => [p.part, p.outcome])).toEqual([["bracket", "refused"], ["plate", "same"]]);
+    expect((await localStatus(hub)).pin!.version).toBe("0.44.1");
+    expect(r.rejected).toEqual([]); // the design is at fault, not the candidate
+    expect(w.notes).toEqual([]);
+    expect(readFileSync(victim, "utf8")).toBe("the real key\n");
+    expect(readdirSync(outside)).toEqual(["authorized_keys"]);
+  });
+
+  test("[B2] a candidate the hub cannot download is retried with a growing wait; one it refuses on verification is rejected once", async () => {
+    // Four checks, four hours apart, with the download failing every time.
+    const w = world();
+    const { "0.45.0": _missing, ...withoutCandidate } = w.zips;
+    const hub = await boot(w, { repos: [PLATE_REPO()], zips: withoutCandidate });
+    await pinTo(hub, "0.44.1");
+    w.releases = [w.rel("0.45.0", 50)];
+    const outcomes: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const r = await checkNow(hub);
+      outcomes.push(r.check!.outcome);
+      if (i === 0) expect(r.retry).toMatchObject({ version: "0.45.0", attempts: 1, reason: expect.stringContaining("404") });
+      w.clock.t += 4 * HOUR;
+    }
+    expect(outcomes).toEqual(["error", "error", "backoff", "error"]); // tried at 0 h, 4 h and 12 h; not at 8 h
+    expect(hub.download.calls.filter((v) => v === "0.45.0").length).toBe(3);
+    const st = await gateStatus(hub);
+    expect(st.retry).toMatchObject({ version: "0.45.0", attempts: 3 });
+    expect(st.rejected).toEqual([]);
+    expect(w.notes).toEqual([]);
+    expect((await localStatus(hub)).pin!.version).toBe("0.44.1");
+
+    // A zip that is not the one the release records: a verification refusal. Rejected at once.
+    const w2 = world();
+    const tampered = fakeReleaseZip("0.45.0", { extra: [{ name: "solidcraft-cli-0.45.0-macos-universal/NOTICE", data: "tampered" }] });
+    const hub2 = await boot(w2, { repos: [PLATE_REPO()], zips: { ...w2.zips, "0.45.0": tampered.zip } });
+    await pinTo(hub2, "0.44.1");
+    w2.releases = [w2.rel("0.45.0", 50)];
+    const first = await checkNow(hub2);
+    expect(first.check!.outcome).toBe("rejected");
+    expect(first.rejected[0]).toMatchObject({ version: "0.45.0", failures: [] });
+    expect(first.rejected[0]!.reason).toContain("sha256");
+    for (let i = 0; i < 4; i++) {
+      w2.clock.t += 4 * HOUR;
+      expect((await checkNow(hub2)).check!.outcome).toBe("none");
+    }
+    expect(hub2.download.calls.filter((v) => v === "0.45.0").length).toBe(1); // downloaded once, ever
+    expect(w2.notes.length).toBe(1);
+    expect(w2.notes[0]!.body).toContain("the hub refused to install it");
+    expect(versionFolders(hub2)).toEqual(["0.44.1"]);
   });
 
   test("[B2] the new routes follow the managed-CLI posture, and are 404 without the solidcraft-pin feature", async () => {

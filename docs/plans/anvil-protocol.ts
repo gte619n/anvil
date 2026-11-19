@@ -653,9 +653,11 @@ export type SolidcraftReplayOutcome =
   | "same" // both builds replay it to the same geometry
   | "differs" // both replay it, to different geometry — holds the pin
   | "candidate-error" // replays under the pin, fails under the candidate — holds the pin
-  | "baseline-broken"; // already fails under the pinned build — reported, ignored for the decision
+  | "baseline-broken" // the pinned build ran it and reported feature errors — reported, ignored for the decision
+  | "refused" // the script is not a plain design script (script-screen); never replayed — holds the pin
+  | "inconclusive"; // a build could not be run, crashed or timed out on it — holds the pin, retried
 export interface SolidcraftReplayDifference {
-  field: "body_count" | "faces" | "volume_mm3" | "bbox";
+  field: "body_count" | "faces" | "volume_mm3" | "bbox" | "center_of_mass";
   body?: string; // the body it concerns (absent for body_count)
   old: number | number[]; // under the pinned build
   new: number | number[]; // under the candidate
@@ -676,21 +678,23 @@ export interface SolidcraftReplayPart {
   differences?: SolidcraftReplayDifference[]; // when `differs`
   old?: SolidcraftReplayNumbers; // under the pinned build, when it replayed
   new?: SolidcraftReplayNumbers; // under the candidate, when it replayed
-  error?: string; // the candidate's failure (`candidate-error`), or the pinned build's (`baseline-broken`)
+  error?: string; // the candidate's failure, the pinned build's (`baseline-broken`), or why it was refused / inconclusive
 }
 /** One machine's replay of everything it hosts. */
 export interface SolidcraftReplayReport {
   candidate: string; // candidate version
   baseline?: string; // the version compared against; absent ⇒ no baseline build, replayed for errors only
   hostsDesigns: boolean; // at least one cad/<part>/design.json on a default branch here
-  pass: boolean; // no `differs` and no `candidate-error` among `parts`
+  pass: boolean; // no part holds the pin and `errors` is empty
   parts: SolidcraftReplayPart[]; // from each environment's default branch — these decide
   advisory: SolidcraftReplayPart[]; // from open session worktrees — listed, never hold the pin
   notes: string[]; // environments skipped and why, fetch problems, …
+  errors: string[]; // what could NOT be read or replayed (a git failure, time ran out) — holds the pin
 }
 export type SolidcraftGateMachineState =
   | "pass"
-  | "fail" // a part differs or errors under the candidate
+  | "fail" // a part differs or errors under the candidate — rejects the candidate
+  | "held" // a part was refused or inconclusive, or the machine compared against the wrong build — retried
   | "no-designs" // reachable, hosts no designs
   | "unreachable" // could not be asked; holds the pin if it hosts (or may host) designs
   | "unsupported" // does not advertise "solidcraft-pin"; takes no part
@@ -726,7 +730,8 @@ export interface SolidcraftRejectedCandidate {
   sha256: string;
   rejectedAt: Iso8601;
   reason: string;
-  failures: (SolidcraftReplayPart & { serverName: string })[];
+  failures: (SolidcraftReplayPart & { serverName: string })[]; // at most 50
+  failuresTruncated?: boolean; // there were more than are listed
 }
 /** What the last candidate check did. */
 export interface SolidcraftCandidateCheck {
@@ -738,6 +743,7 @@ export interface SolidcraftCandidateCheck {
     | "error"
     | "none" // no release qualifies (too young, not newer, a prerelease, or already rejected)
     | "rate-limited" // the pin already advanced within the last 24 h
+    | "backoff" // the candidate could not be installed on the hub recently; waiting before the next try
     | "skipped"; // GitHub could not be read
   detail: string;
   version?: string; // the candidate it concerned, if any
@@ -2757,6 +2763,9 @@ export namespace rest {
       lastAdvanceAt?: Iso8601; // the last pin advance through the gate (at most one per 24 h)
       nextAdvanceAllowedAt?: Iso8601;
       interrupted?: string; // an evaluation was cut short by a restart; it starts again on the next check
+      /** The hub could not install this candidate (a download or network failure). It is tried again,
+       *  each time after a longer wait, at most once in 24 hours. */
+      retry?: { version: string; attempts: number; nextAt: Iso8601; reason: string };
     }
     /** POST /api/fleet/solidcraft/candidate/check {} → "Check now": list releases, evaluate, decide. */
     export interface CandidateCheckResponse extends CandidateStatusResponse {

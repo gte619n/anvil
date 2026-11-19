@@ -17,11 +17,11 @@ import type { rest, SolidcraftMachineStatus, SolidcraftPin, SolidcraftStatusEven
 import { PROTOCOL_VERSION } from "@protocol";
 import { featureEnabled } from "../config";
 import { CHECK_EVERY_MS, CandidateGate, fetchReleases, type LocalReplay, type MemberReplayClient } from "../solidcraft/candidate";
-import type { InstallDeps, Run, SolidcraftRef } from "../solidcraft/install";
+import type { InstallDeps, SolidcraftRef } from "../solidcraft/install";
 import { installedSolidcraft, isSha256, isSolidcraftVersion, pruneSolidcraft } from "../solidcraft/install";
 import { SolidcraftPinService, parsePin, pinBackWarning, type RewrittenDesignsProvider, type SetPinResult } from "../solidcraft/pin";
 import { resolveReleaseRef, type GithubRelease } from "../solidcraft/release";
-import { replayMachine, type ReplayBuild, type ReplayEnvironment, type WorktreeProvider } from "../solidcraft/replay";
+import { replayMachine, type ReplayBuild, type ReplayEnvironment, type ReplayOne, type WorktreeProvider } from "../solidcraft/replay";
 
 export const SOLIDCRAFT_PIN_CAPABILITY = "solidcraft-pin";
 
@@ -348,7 +348,7 @@ export interface SolidcraftTestHooks {
   checkEveryMs?: number;
   environments?: () => ReplayEnvironment[];
   worktrees?: WorktreeProvider;
-  replay?: { timeoutMs?: number; concurrency?: number; run?: Run };
+  replay?: { timeoutMs?: number; totalTimeoutMs?: number; concurrency?: number; replayOne?: ReplayOne; env?: Record<string, string | undefined> };
 }
 
 type Trust = { trust: string; reject?: string };
@@ -442,30 +442,40 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
   const localReplay: LocalReplay = async (candidate, pinRef) => {
     replayedCandidate = candidate.version;
     const own = service.pin();
-    pruneSolidcraft(o.stateDir, [own?.version, own?.previous?.version, pinRef?.version, candidate.version]);
+    pruneSolidcraft(o.stateDir, [own?.version, own?.previous?.version, pinRef?.version, candidate.version, gate.candidateVersion()]);
     const inst = await service.installBeside(candidate);
-    if (!inst.ok) return { ok: false, error: `SolidCraft ${candidate.version} could not be installed here: ${inst.detail}` };
-    // The baseline is the pinned build; with none installed, whatever this machine would run now.
+    if (!inst.ok) return { ok: false, error: `SolidCraft ${candidate.version} could not be installed here: ${inst.detail}`, failure: inst.reason };
+    let baseline: ReplayBuild | undefined;
     const want = pinRef ?? own;
-    const pinned = want ? installedSolidcraft(o.stateDir, want.version, want.sha256) : undefined;
-    let baseline: ReplayBuild | undefined = pinned ? { path: pinned.path, version: pinned.version } : undefined;
-    if (!baseline) {
+    if (want) {
+      // A pin exists: the comparison is against EXACTLY the pinned build. A machine that does not
+      // have it (its install of the pin failed, or it runs something else) installs it beside, and
+      // if that fails it reports an error — it never compares against another build, or none.
+      let pinned: { path: string; version: string } | undefined = installedSolidcraft(o.stateDir, want.version, want.sha256);
+      if (!pinned) {
+        const got = await service.installBeside(want);
+        if (!got.ok) {
+          return { ok: false, error: `the pinned SolidCraft ${want.version} is not installed here and could not be (${got.detail}), so there is nothing to compare ${candidate.version} against` };
+        }
+        pinned = { path: got.path, version: got.version };
+      }
+      baseline = { path: pinned.path, version: pinned.version };
+    } else {
+      // No pin anywhere: compare against whatever this machine would run now, if it is another build.
       const l = await service.local();
-      if (l.path && l.version) baseline = { path: l.path, version: l.version };
+      if (l.path && l.version && l.version !== candidate.version) baseline = { path: l.path, version: l.version };
     }
-    const selfCompare = baseline?.version === candidate.version;
-    if (selfCompare) baseline = undefined; // comparing a build with itself proves nothing
     const report = await replayMachine({
       candidate: { path: inst.path, version: inst.version },
       baseline,
       environments: (hooks.environments ?? o.environments ?? (() => []))(),
       worktrees: hooks.worktrees ?? o.worktrees,
-      run: hooks.replay?.run,
+      replayOne: hooks.replay?.replayOne,
       timeoutMs: hooks.replay?.timeoutMs,
+      totalTimeoutMs: hooks.replay?.totalTimeoutMs,
       concurrency: hooks.replay?.concurrency,
-      env: hooks.env,
+      env: hooks.replay?.env,
     });
-    if (selfCompare) report.notes.push(`this machine already runs SolidCraft ${candidate.version}, so there was no other build to compare against`);
     return { ok: true, report };
   };
 
@@ -525,8 +535,12 @@ export function mountSolidcraft(o: MountSolidcraftOptions): MountedSolidcraft | 
     if (!pin) return json({ ok: false, local: await service.status(), error: "a valid pin { version, sha256, pinnedAt } is required" } satisfies rest.solidcraft.ApplyResponse, 400);
     const keep = Array.isArray(b.keep) ? b.keep.filter((k): k is string => typeof k === "string") : [];
     const local = await service.apply(pin, keep);
-    const ok = local.state === "ready";
-    return json({ ok, pin: service.pin(), local, ...(ok ? {} : { error: local.error ?? local.reason ?? "not on the pinned version" }) } satisfies rest.solidcraft.ApplyResponse, ok ? 200 : 500);
+    // "Applied" means this machine is ready on EXACTLY the pin it was sent. A pin that was refused
+    // (and so not stored) is a failure even though the machine is still ready on the pin it had.
+    const refused = service.applyRefusal();
+    const stored = service.pin();
+    const ok = local.state === "ready" && !refused && stored?.version === pin.version && stored.sha256 === pin.sha256;
+    return json({ ok, pin: stored, local, ...(ok ? {} : { error: refused ?? local.error ?? local.reason ?? "not on the pinned version" }) } satisfies rest.solidcraft.ApplyResponse, ok ? 200 : 500);
   });
 
   o.route("POST", "/api/solidcraft/replay", async (req, _url, _m, ctx) => {

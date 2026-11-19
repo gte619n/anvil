@@ -37,13 +37,27 @@ import type {
 import { writeFileAtomic } from "../util/atomic";
 import { isSha256, isSolidcraftVersion, releaseAssetName, type SolidcraftRef } from "./install";
 import { SOLIDCRAFT_RELEASES_API, verifiedReleaseSha, type GithubRelease } from "./release";
-import { describeFailure, holdsPin } from "./replay";
+import { describeFailure, holdsPin, rejectsCandidate } from "./replay";
 
 export const CHECK_EVERY_MS = 4 * 60 * 60_000;
 export const MIN_RELEASE_AGE_MS = 48 * 60 * 60_000;
 export const ADVANCE_LIMIT_MS = 24 * 60 * 60_000;
 /** After a start, the first check waits at least this long (the daemon is still settling). */
 export const FIRST_CHECK_DELAY_MS = 2 * 60_000;
+/** A daemon that restarts in the middle of a check does not start another within this long of the last start. */
+export const RESTART_CHECK_GAP_MS = 60 * 60_000;
+/** A hub install that failed for a passing reason is tried again after 4 h, 8 h, 16 h, then every 24 h. */
+export const RETRY_BASE_MS = CHECK_EVERY_MS;
+export const RETRY_CAP_MS = 24 * 60 * 60_000;
+export const MAX_REJECTED = 50;
+export const MAX_REJECTED_FAILURES = 50;
+/**
+ * Install refusals that are about the BUILD, not the moment: the zip is not the recorded one, or
+ * it is not a build signed and notarized by the pinned team. Trying again cannot change them, so
+ * the candidate is rejected. Everything else (a failed download, Gatekeeper unavailable, a disk
+ * error) may pass, and is retried with a growing wait.
+ */
+export const VERIFICATION_REFUSALS: readonly string[] = ["sha-mismatch", "bad-zip", "unsafe-zip", "missing-binary", "signature-invalid", "wrong-team", "not-notarized", "version-mismatch"];
 export const CANDIDATE_FILE = "solidcraft-candidate.json";
 
 // ── Selection ───────────────────────────────────────────────────────────────────────────────────
@@ -126,8 +140,15 @@ interface CandidateState {
   lastEvaluation?: SolidcraftEvaluation;
   lastCheck?: SolidcraftCandidateCheck;
   lastAdvanceAt?: string;
-  /** Written when an evaluation starts and cleared when it is decided: only a restart leaves it. */
+  /**
+   * Written when an evaluation starts and cleared when a check next completes: only a restart
+   * leaves it. While it is there its build is kept on disk, so the retry does not download it again.
+   */
   inFlight?: { version: string; startedAt: string };
+  /** When the last check STARTED (it may never have finished). Bounds re-checking after restarts. */
+  lastCheckStartedAt?: string;
+  /** The hub could not install this candidate for a passing reason; when it is tried next. */
+  retry?: { version: string; attempts: number; nextAt: string; reason: string };
   /** Whether each member hosted designs the last time it answered. Unknown counts as "may host". */
   hosts: Record<string, boolean>;
 }
@@ -150,6 +171,8 @@ export class CandidateStore {
         ...(raw.lastCheck ? { lastCheck: raw.lastCheck } : {}),
         ...(typeof raw.lastAdvanceAt === "string" ? { lastAdvanceAt: raw.lastAdvanceAt } : {}),
         ...(raw.inFlight && isSolidcraftVersion(raw.inFlight.version) ? { inFlight: raw.inFlight } : {}),
+        ...(typeof raw.lastCheckStartedAt === "string" ? { lastCheckStartedAt: raw.lastCheckStartedAt } : {}),
+        ...(raw.retry && isSolidcraftVersion(raw.retry.version) && typeof raw.retry.nextAt === "string" ? { retry: raw.retry } : {}),
       };
     } catch {
       /* start empty */
@@ -179,7 +202,8 @@ export interface MemberReplayClient {
   replay(base: string, req: rest.solidcraft.ReplayRequest): Promise<rest.solidcraft.ReplayResponse>;
 }
 
-export type LocalReplay = (candidate: SolidcraftRef, pin?: SolidcraftRef) => Promise<{ ok: true; report: SolidcraftReplayReport } | { ok: false; error: string }>;
+/** `failure` is the installer's typed reason when the candidate (or the pinned build) could not be installed. */
+export type LocalReplay = (candidate: SolidcraftRef, pin?: SolidcraftRef) => Promise<{ ok: true; report: SolidcraftReplayReport } | { ok: false; error: string; failure?: string }>;
 
 export interface CandidateGateDeps {
   stateDir: string;
@@ -226,10 +250,10 @@ export class CandidateGate {
     this.store = new CandidateStore(deps.stateDir);
     const cut = this.store.state.inFlight;
     if (cut) {
-      // The process stopped in the middle of an evaluation. Nothing was decided, so nothing is kept.
+      // The process stopped in the middle of an evaluation. Nothing was decided, so no result is
+      // kept. The marker stays until the next check completes, so the build already downloaded for
+      // it is not pruned in the meantime (see `candidateVersion`).
       this.interrupted = `The evaluation of SolidCraft ${cut.version} that started ${cut.startedAt} was cut short by a restart. It starts again from scratch on the next check.`;
-      delete this.store.state.inFlight;
-      this.store.save();
       this.log(`[solidcraft] ${this.interrupted}`);
     }
   }
@@ -244,16 +268,26 @@ export class CandidateGate {
    */
   candidateVersion(): string | undefined {
     if (this.evaluating) return this.evaluating.ref.version;
-    const last = this.store.state.lastEvaluation;
+    const s = this.store.state;
+    if (s.inFlight) return s.inFlight.version; // interrupted by a restart: evaluated again next
+    const last = s.lastEvaluation;
     if (last && (last.result === "held" || last.result === "error") && !last.advancedAnyway) return last.candidate.version;
     return undefined;
   }
 
-  /** When the first check after a start is due: 4 hours after the last one, but never sooner than 2 minutes from now. */
+  /**
+   * When the first check after a start is due: 4 hours after the last one FINISHED, never sooner
+   * than 2 minutes from now — and, when a check was started and never finished (the daemon went
+   * down in the middle), not within an hour of that start. Without the last rule a daemon that
+   * restarts every few minutes would begin a full evaluation after every start.
+   */
   firstCheckDelay(everyMs: number = CHECK_EVERY_MS): number {
-    const last = Date.parse(this.store.state.lastCheck?.at ?? "");
-    const due = Number.isFinite(last) ? last + everyMs - this.now() : 0;
-    return Math.min(everyMs, Math.max(FIRST_CHECK_DELAY_MS, due));
+    const s = this.store.state;
+    const finished = Date.parse(s.lastCheck?.at ?? "");
+    const started = Date.parse(s.lastCheckStartedAt ?? "");
+    let due = Number.isFinite(finished) ? finished + everyMs : 0;
+    if (Number.isFinite(started) && !(Number.isFinite(finished) && finished >= started)) due = Math.max(due, started + RESTART_CHECK_GAP_MS);
+    return Math.min(everyMs, Math.max(FIRST_CHECK_DELAY_MS, due - this.now()));
   }
 
   /**
@@ -294,12 +328,15 @@ export class CandidateGate {
       ...(s.lastAdvanceAt ? { lastAdvanceAt: s.lastAdvanceAt } : {}),
       ...(next ? { nextAdvanceAllowedAt: next } : {}),
       ...(this.interrupted ? { interrupted: this.interrupted } : {}),
+      ...(s.retry ? { retry: s.retry } : {}),
     });
   }
 
   /** One check: list, pick, evaluate, decide. A second call while one runs joins the first. */
   check(): Promise<SolidcraftCandidateCheck> {
     if (this.running) return this.running;
+    this.store.state.lastCheckStartedAt = this.iso();
+    this.store.save();
     const p = this.doCheck()
       .catch((e): SolidcraftCandidateCheck => ({ at: this.iso(), outcome: "error", detail: `the check failed: ${errText(e)}` }))
       .then((check) => {
@@ -330,6 +367,10 @@ export class CandidateGate {
     const pin = this.deps.pin();
     const floor = pin?.version ?? (await this.deps.localVersion?.().catch(() => undefined));
     const pick = pickCandidate(releases, { now: this.now(), newerThan: floor, rejected: s.rejected.map((r) => r.version) });
+    if (s.retry && s.retry.version !== pick?.version) delete s.retry; // another candidate (or none) now
+    if (pick && s.retry && this.now() < Date.parse(s.retry.nextAt)) {
+      return { at, outcome: "backoff", version: pick.version, detail: `SolidCraft ${pick.version} could not be installed on the hub (${s.retry.reason}); attempt ${s.retry.attempts} failed. It is tried again after ${s.retry.nextAt}.` };
+    }
     if (!pick) return { at, outcome: "none", detail: `No release qualifies: it must be a full release, at least 48 hours old, newer than ${floor ?? "the current build"} and not already rejected.` };
     let sha256: string;
     try {
@@ -361,24 +402,64 @@ export class CandidateGate {
         finishedAt: this.iso(),
         result,
         detail,
-        machines: machines.sort((a, b) => Number(b.isHub) - Number(a.isHub) || a.serverName.localeCompare(b.serverName)),
+        machines: machines.sort((a, b) => Number(b.isHub) - Number(a.isHub) || a.serverName.localeCompare(b.serverName) || a.serverId.localeCompare(b.serverId)),
       };
       s.lastEvaluation = evaluation;
       return evaluation;
     };
+    /** Record the candidate as rejected for good: never evaluated again, one notification. */
+    const reject = (reason: string, failures: SolidcraftRejectedCandidate["failures"]): SolidcraftEvaluation => {
+      s.rejected.push({
+        version: ref.version,
+        sha256: ref.sha256,
+        rejectedAt: this.iso(),
+        reason,
+        failures: failures.slice(0, MAX_REJECTED_FAILURES),
+        ...(failures.length > MAX_REJECTED_FAILURES ? { failuresTruncated: true } : {}),
+      });
+      if (s.rejected.length > MAX_REJECTED) s.rejected = s.rejected.slice(-MAX_REJECTED); // the newest
+      delete s.retry;
+      this.deps.notify?.(
+        `SolidCraft ${ref.version} was not adopted`,
+        `${reason}. The fleet stays on ${pin?.version ?? "its current build"}; ${ref.version} will not be tried again.`,
+        `solidcraft-candidate-${ref.version}`,
+      );
+      this.deps.prune?.();
+      return finish("rejected", `SolidCraft ${ref.version} was rejected: ${reason}. The pin is unchanged.`);
+    };
     const fromReport = (base: Pick<SolidcraftGateMachine, "serverId" | "serverName" | "isHub">, report: SolidcraftReplayReport): SolidcraftGateMachine => {
-      const failing = report.parts.filter(holdsPin);
-      if (failing.length) return { ...base, state: "fail", holds: true, detail: describeFailure(failing[0]!), report };
+      // A replay that ran and differed (or ran and failed) rejects the candidate.
+      const rejecting = report.parts.filter(rejectsCandidate);
+      if (rejecting.length) return { ...base, state: "fail", holds: true, detail: describeFailure(rejecting[0]!), report };
+      // Anything the machine could not vouch for holds the pin without condemning the candidate.
+      if (report.errors?.length) return { ...base, state: "held", holds: true, detail: report.errors[0], report };
+      const holding = report.parts.filter(holdsPin);
+      if (holding.length) return { ...base, state: "held", holds: true, detail: describeFailure(holding[0]!), report };
+      // With a pin, a machine that hosts designs must have compared against exactly the pinned
+      // build. One that compared against something else (or nothing) has not compared at all.
+      if (pin && report.hostsDesigns && report.baseline !== pin.version) {
+        return { ...base, state: "held", holds: true, detail: `it compared against ${report.baseline ? `SolidCraft ${report.baseline}` : "no build"}, not the pinned ${pin.version}`, report };
+      }
       return { ...base, state: report.hostsDesigns ? "pass" : "no-designs", holds: false, report };
     };
 
     // The hub first: its install is the proof that the candidate is a real, verified build.
     const hubBase = { serverId: this.deps.self.serverId, serverName: this.deps.self.serverName, isHub: true };
-    const own = await this.deps.replayLocal(ref, pinRef).catch((e): { ok: false; error: string } => ({ ok: false, error: errText(e) }));
+    const own = await this.deps.replayLocal(ref, pinRef).catch((e): { ok: false; error: string; failure?: string } => ({ ok: false, error: errText(e) }));
     if (!own.ok) {
       machines.push({ ...hubBase, state: "error", holds: true, detail: own.error });
-      return finish("error", `SolidCraft ${ref.version} could not be evaluated on the hub: ${own.error}. The pin is unchanged.`);
+      if (own.failure && VERIFICATION_REFUSALS.includes(own.failure)) {
+        // Not this build, or not a build we may run: trying again cannot change that.
+        return reject(`the hub refused to install it (${own.error})`, []);
+      }
+      // A passing failure. Try again later, each time after a longer wait, so that a release whose
+      // download keeps failing is not fetched every four hours for ever.
+      const attempts = (s.retry?.version === ref.version ? s.retry.attempts : 0) + 1;
+      const wait = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (attempts - 1));
+      s.retry = { version: ref.version, attempts, nextAt: new Date(this.now() + wait).toISOString(), reason: own.error.slice(0, 300) };
+      return finish("error", `SolidCraft ${ref.version} could not be evaluated on the hub: ${own.error}. The pin is unchanged. Attempt ${attempts}; it is tried again after ${s.retry.nextAt}.`);
     }
+    delete s.retry;
     machines.push(fromReport(hubBase, own.report));
 
     await Promise.all(
@@ -400,24 +481,17 @@ export class CandidateGate {
           machines.push({ ...base, state: "error", holds: true, detail: r.error ?? "the replay did not report" });
           return;
         }
-        s.hosts[m.serverId] = r.report.hostsDesigns;
+        // Only a clean read says whether it hosts designs: a failed read must not record "none".
+        if (!r.report.errors?.length) s.hosts[m.serverId] = r.report.hostsDesigns;
         machines.push(fromReport(base, r.report));
       }),
     );
 
     const failed = machines.filter((m) => m.state === "fail");
     if (failed.length) {
-      const failures = failed.flatMap((m) => (m.report?.parts ?? []).filter(holdsPin).map((p) => ({ ...p, serverName: m.serverName })));
+      const failures = failed.flatMap((m) => (m.report?.parts ?? []).filter(rejectsCandidate).map((p) => ({ ...p, serverName: m.serverName })));
       const first = failures[0]!;
-      const reason = `${describeFailure(first)} (${first.environment}, on ${first.serverName})`;
-      s.rejected.push({ version: ref.version, sha256: ref.sha256, rejectedAt: this.iso(), reason, failures });
-      this.deps.notify?.(
-        `SolidCraft ${ref.version} was not adopted`,
-        `${reason}. The fleet stays on ${pin?.version ?? "its current build"}; ${ref.version} will not be tried again.`,
-        `solidcraft-candidate-${ref.version}`,
-      );
-      this.deps.prune?.();
-      return finish("rejected", `SolidCraft ${ref.version} was rejected: ${reason}. The pin is unchanged.`);
+      return reject(`${describeFailure(first)} (${first.environment}, on ${first.serverName})`, failures);
     }
     const holding = machines.filter((m) => m.holds);
     if (holding.length) {
@@ -455,6 +529,7 @@ export class CandidateGate {
     const moved = await this.deps.advance({ version: ref.version, sha256: ref.sha256 }).catch((e) => ({ ok: false, error: errText(e) }) as { ok: boolean; pin?: SolidcraftPin; error?: string });
     if (!moved.ok) return refuse(moved.error ?? "the pin was not changed");
     s.lastAdvanceAt = this.iso();
+    delete s.retry;
     if (s.lastEvaluation?.candidate.version === version) s.lastEvaluation.advancedAnyway = s.lastAdvanceAt;
     this.store.save();
     this.deps.onChange?.();

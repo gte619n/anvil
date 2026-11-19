@@ -15,7 +15,10 @@ import {
   CANDIDATE_FILE,
   CHECK_EVERY_MS,
   CandidateGate,
+  MAX_REJECTED,
+  MAX_REJECTED_FAILURES,
   MIN_RELEASE_AGE_MS,
+  VERIFICATION_REFUSALS,
   advanceAllowed,
   compareVersions,
   fetchReleases,
@@ -131,6 +134,7 @@ const report = (parts: SolidcraftReplayPart[], over: Partial<SolidcraftReplayRep
   parts,
   advisory: [],
   notes: [],
+  errors: [],
   ...over,
 });
 const DIFFERS = part("bracket", { outcome: "differs", differences: [{ field: "volume_mm3", body: "Body1", old: 6000, new: 6060 }], new: { body_count: 1, faces: 6, volume_mm3: 6060 } });
@@ -155,8 +159,11 @@ interface Rig {
   releases: GithubRelease[];
   release: () => void;
   deps: CandidateGateDeps;
+  /** The hub's own replay: a report, or an install error (with `hubFailure` as its typed reason). */
+  hub?: SolidcraftReplayReport | string;
+  hubFailure?: string;
 }
-function rig(o: { dir?: string; members?: string[]; plan?: Record<string, MemberPlan>; releases?: GithubRelease[]; hub?: SolidcraftReplayReport | string; pinned?: string | null; overrides?: Partial<CandidateGateDeps>; clock?: { t: number } } = {}): Rig {
+function rig(o: { dir?: string; members?: string[]; plan?: Record<string, MemberPlan>; releases?: GithubRelease[]; hub?: SolidcraftReplayReport | string; hubFailure?: string; pinned?: string | null; overrides?: Partial<CandidateGateDeps>; clock?: { t: number } } = {}): Rig {
   const clock = o.clock ?? { t: T0 };
   const members: GateTarget[] = (o.members ?? ["m1", "m2"]).map((id) => ({ serverId: id, serverName: id.toUpperCase(), url: id }));
   let unhang: () => void = () => {};
@@ -171,6 +178,8 @@ function rig(o: { dir?: string; members?: string[]; plan?: Record<string, Member
     plan: o.plan ?? {},
     releases: o.releases ?? [rel("0.45.0", 50)],
     release: () => unhang(),
+    hub: o.hub,
+    hubFailure: o.hubFailure,
   } as Rig;
   r.deps = {
     stateDir: o.dir ?? stateDir(),
@@ -186,7 +195,8 @@ function rig(o: { dir?: string; members?: string[]; plan?: Record<string, Member
         const p = r.plan[base] ?? {};
         if (p.hang) await hung;
         if (p.error) return { ok: false, error: p.error };
-        return { ok: true, report: p.report ?? report([part("plate")], { candidate: req.candidate.version }) };
+        // By default a member compares against exactly the pin it was handed.
+        return { ok: true, report: p.report ?? report([part("plate")], { candidate: req.candidate.version, baseline: req.pin?.version }) };
       },
     },
     listReleases: async () => {
@@ -196,10 +206,10 @@ function rig(o: { dir?: string; members?: string[]; plan?: Record<string, Member
     releaseSha: async (_release, version) => sha(version),
     pin: () => r.pin.current,
     localVersion: async () => "0.40.1",
-    replayLocal: async (candidate) => {
+    replayLocal: async (candidate, pin) => {
       r.replays.push(`hub:${candidate.version}`);
-      if (typeof o.hub === "string") return { ok: false, error: o.hub };
-      return { ok: true, report: o.hub ?? report([part("plate")], { candidate: candidate.version }) };
+      if (typeof r.hub === "string") return { ok: false, error: r.hub, ...(r.hubFailure ? { failure: r.hubFailure } : {}) };
+      return { ok: true, report: r.hub ?? report([part("plate")], { candidate: candidate.version, baseline: pin?.version }) };
     },
     advance: async (ref) => {
       r.advances.push(ref);
@@ -297,11 +307,96 @@ describe("the hub's replay gate", () => {
   });
 
   test("[B2] a candidate that crashes on replay on the hub holds the pin", async () => {
-    const r = rig({ hub: report([part("plate", { outcome: "candidate-error", error: "eval exited 139: simulated crash" })]) });
-    expect((await r.gate.check()).outcome).toBe("rejected");
+    // A crash gives no verdict on the design (`inconclusive`): the pin holds and the candidate is
+    // tried again, rather than being rejected for good on what may be a passing fault.
+    const r = rig({ hub: report([part("plate", { outcome: "inconclusive", error: "the candidate gave no result: SolidCraft 0.45.0 stopped (exit 139)" })]) });
+    const check = await r.gate.check();
+    expect(check.outcome).toBe("held");
+    expect(check.detail).toContain("plate could not be replayed");
     expect(r.advances).toEqual([]);
-    expect(r.notes[0]!.body).toContain("plate replays under the pinned build but fails under the candidate");
-    expect(r.gate.status().lastEvaluation!.machines[0]).toMatchObject({ isHub: true, state: "fail", holds: true });
+    expect(r.pin.current?.version).toBe("0.44.1");
+    expect(r.gate.status().lastEvaluation!.machines[0]).toMatchObject({ isHub: true, state: "held", holds: true });
+    expect(r.gate.status().rejected).toEqual([]);
+    expect(r.notes).toEqual([]);
+    // A feature error the candidate REPORTED is a verdict: that one rejects.
+    const ran = rig({ hub: report([part("plate", { outcome: "candidate-error", error: "feature Corners failed: too large" })]) });
+    expect((await ran.gate.check()).outcome).toBe("rejected");
+    expect(ran.notes[0]!.body).toContain("plate replays under the pinned build but fails under the candidate");
+  });
+
+  test("[B2] a member whose only trouble is a timed-out or refused design holds the pin by name and is not a rejection", async () => {
+    const r = rig({
+      plan: {
+        m1: { report: report([part("plate"), part("slow", { outcome: "inconclusive", error: "the candidate gave no result: SolidCraft 0.45.0 did not finish within 120 s and was stopped" })]) },
+        m2: { report: report([part("trap", { outcome: "refused", error: "step 3 (file.save): this command is not one SolidCraft writes into a design script, so it is not replayed" })]) },
+      },
+    });
+    const check = await r.gate.check();
+    expect(check.outcome).toBe("held");
+    expect(check.detail).toContain("slow could not be replayed");
+    expect(check.detail).toContain("trap was refused and not replayed");
+    expect(check.detail).toContain("file.save");
+    const machines = r.gate.status().lastEvaluation!.machines;
+    expect(machines.map((m) => [m.serverName, m.state, m.holds])).toEqual([["HUB", "pass", false], ["M1", "held", true], ["M2", "held", true]]);
+    expect(r.gate.status().rejected).toEqual([]); // not a permanent rejection
+    expect(r.notes).toEqual([]);
+    expect(r.advances).toEqual([]);
+    // Next check the slow design replays: only the refused one still holds.
+    r.plan.m1 = {};
+    r.clock.t += 4 * HOUR;
+    const again = await r.gate.check();
+    expect(again.outcome).toBe("held");
+    expect(again.detail).not.toContain("M1");
+    // A real difference elsewhere still rejects, whatever else is merely held.
+    r.plan.m1 = { report: report([DIFFERS]) };
+    r.clock.t += 4 * HOUR;
+    expect((await r.gate.check()).outcome).toBe("rejected");
+  });
+
+  test("[B2] a member that hosts designs but did not compare against the pinned build holds the pin", async () => {
+    // The reviewer's case: the member's install of the pinned 0.44.1 failed, so it replayed with no
+    // baseline (or with whatever build it had). Every part reads `same`, because nothing was compared.
+    const noBaseline = report([part("plate")], { baseline: undefined });
+    delete (noBaseline as { baseline?: string }).baseline;
+    const r = rig({ plan: { m1: { report: noBaseline } } });
+    const check = await r.gate.check();
+    expect(check.outcome).toBe("held");
+    expect(check.detail).toContain("M1");
+    expect(check.detail).toContain("it compared against no build, not the pinned 0.44.1");
+    expect(r.advances).toEqual([]);
+    expect(r.gate.status().lastEvaluation!.machines.find((m) => m.serverName === "M1")).toMatchObject({ state: "held", holds: true });
+    // Another version as the baseline (an app bundle, an env override) is no better.
+    const other = rig({ plan: { m2: { report: report([part("plate")], { baseline: "0.43.0" }) } } });
+    const c2 = await other.gate.check();
+    expect(c2.outcome).toBe("held");
+    expect(c2.detail).toContain("it compared against SolidCraft 0.43.0, not the pinned 0.44.1");
+    // The hub's own report is held to the same rule.
+    expect((await rig({ hub: report([part("plate")], { baseline: "0.44.0" }) }).gate.check()).outcome).toBe("held");
+    // Control: the same reports with the pinned baseline advance.
+    expect((await rig({ plan: { m1: { report: report([part("plate")], { baseline: "0.44.1" }) } } }).gate.check()).outcome).toBe("advanced");
+    // A machine that hosts NO designs has nothing to compare, so its baseline does not matter.
+    expect((await rig({ plan: { m1: { report: report([], { baseline: "0.43.0" }) } } }).gate.check()).outcome).toBe("advanced");
+  });
+
+  test("[B2] a member that could not read its designs holds the pin, and is not remembered as hosting none", async () => {
+    const unread = report([], { errors: ["fixtures: could not list origin/main (fatal: unable to read tree)"] });
+    const r = rig({ plan: { m2: { report: unread } } });
+    const check = await r.gate.check();
+    expect(check.outcome).toBe("held");
+    expect(check.detail).toContain("could not list origin/main");
+    expect(r.gate.status().lastEvaluation!.machines.find((m) => m.serverName === "M2")).toMatchObject({ state: "held", holds: true });
+    expect(r.advances).toEqual([]);
+    // It reported `hostsDesigns: false` only because the read failed. Unreachable next time, it
+    // must still hold: "hosts nothing" was never established.
+    r.plan.m2 = { reachable: false };
+    r.clock.t += 4 * HOUR;
+    const next = await r.gate.check();
+    expect(next.outcome).toBe("held");
+    expect(r.gate.status().lastEvaluation!.machines.find((m) => m.serverName === "M2")).toMatchObject({ state: "unreachable", holds: true });
+    expect(JSON.parse(readFileSync(join(r.deps.stateDir, CANDIDATE_FILE), "utf8")).hosts.m2).toBeUndefined();
+    // A report that ran out of time (partial results) is held the same way.
+    const partial = rig({ plan: { m1: { report: report([part("a")], { errors: ["this machine's replay ran out of time with 3 of 4 designs not replayed"] }) } } });
+    expect(await partial.gate.check()).toMatchObject({ outcome: "held", detail: expect.stringContaining("ran out of time") });
   });
 
   test("[B2] a design already broken under the pinned build is reported and ignored for the decision", async () => {
@@ -362,13 +457,109 @@ describe("the hub's replay gate", () => {
   });
 
   test("[B2] if the hub cannot install the candidate nothing is asked of the members and nothing is rejected", async () => {
-    const r = rig({ hub: "SolidCraft 0.45.0 could not be installed here: the build is signed by another team" });
+    const r = rig({ hub: "SolidCraft 0.45.0 could not be installed here: GitHub answered 503", hubFailure: "download-failed" });
     const check = await r.gate.check();
     expect(check.outcome).toBe("error");
-    expect(check.detail).toContain("another team");
+    expect(check.detail).toContain("503");
     expect(r.replays).toEqual(["hub:0.45.0"]);
     expect(r.advances).toEqual([]);
     expect(r.gate.status().rejected).toEqual([]);
+    expect(r.notes).toEqual([]);
+  });
+
+  test("[B2] a hub install that fails for a passing reason is retried with a growing wait, at most once in 24 hours, and the attempts are counted", async () => {
+    const r = rig({ hub: "SolidCraft 0.45.0 could not be installed here: GitHub answered 503", hubFailure: "download-failed" });
+    const attemptsAt: number[] = [];
+    // A check every 4 hours for a week, as the timer would run them.
+    for (let h = 0; h <= 7 * 24; h += 4) {
+      r.clock.t = T0 + h * HOUR;
+      r.releases = [rel("0.45.0", 50 + h, {}, r.clock.t)];
+      const before = r.replays.length;
+      const check = await r.gate.check();
+      if (r.replays.length > before) {
+        attemptsAt.push(h);
+        expect(check.outcome).toBe("error");
+      } else {
+        expect(check.outcome).toBe("backoff");
+        expect(check.detail).toContain("tried again after");
+      }
+    }
+    // Waits of 4, 8, 16, then 24 hours each: 9 downloads in a week instead of 43.
+    expect(attemptsAt).toEqual([0, 4, 12, 28, 52, 76, 100, 124, 148]);
+    const st = r.gate.status();
+    expect(st.retry).toMatchObject({ version: "0.45.0", attempts: 9, reason: expect.stringContaining("503") });
+    expect(Date.parse(st.retry!.nextAt) - (T0 + 148 * HOUR)).toBe(24 * HOUR); // capped
+    expect(st.rejected).toEqual([]);
+    expect(r.notes).toEqual([]);
+    expect(r.gate.candidateVersion()).toBe("0.45.0");
+    // The count survives a restart…
+    const again = rig({ dir: r.deps.stateDir, clock: r.clock, releases: r.releases, hub: "still down", hubFailure: "download-failed" });
+    expect(again.gate.status().retry?.attempts).toBe(9);
+    expect((await again.gate.check()).outcome).toBe("backoff");
+    expect(again.replays).toEqual([]);
+    // …and once the install works the evaluation goes ahead and the counter is gone.
+    r.hub = undefined;
+    r.clock.t = T0 + 172 * HOUR;
+    r.releases = [rel("0.45.0", 250, {}, r.clock.t)];
+    expect((await r.gate.check()).outcome).toBe("advanced");
+    expect(r.gate.status().retry).toBeUndefined();
+    // "Gatekeeper unavailable" and a disk error are passing reasons too.
+    for (const failure of ["cannot-verify", "install-failed", undefined]) {
+      const t = rig({ hub: "could not be installed", hubFailure: failure });
+      expect((await t.gate.check()).outcome).toBe("error");
+      expect(t.gate.status().retry?.attempts).toBe(1);
+    }
+  });
+
+  test("[B2] a candidate the hub refuses on verification is rejected with one notification and never downloaded again", async () => {
+    expect(VERIFICATION_REFUSALS).toEqual(["sha-mismatch", "bad-zip", "unsafe-zip", "missing-binary", "signature-invalid", "wrong-team", "not-notarized", "version-mismatch"]);
+    for (const failure of ["sha-mismatch", "signature-invalid", "wrong-team", "not-notarized", "version-mismatch"]) {
+      const r = rig({ hub: `SolidCraft 0.45.0 could not be installed here: refused (${failure})`, hubFailure: failure });
+      const check = await r.gate.check();
+      expect(check.outcome).toBe("rejected");
+      expect(check.detail).toContain("the hub refused to install it");
+      expect(r.replays).toEqual(["hub:0.45.0"]); // no member was asked
+      expect(r.advances).toEqual([]);
+      const st = r.gate.status();
+      expect(st.rejected.map((x) => [x.version, x.failures.length])).toEqual([["0.45.0", 0]]);
+      expect(st.rejected[0]!.reason).toContain(failure);
+      expect(st.retry).toBeUndefined();
+      expect(r.notes.length).toBe(1);
+      expect(r.notes[0]!.body).toContain("the hub refused to install it");
+      // Four more checks: no further download, no further notification.
+      for (let i = 1; i <= 4; i++) {
+        r.clock.t += 4 * HOUR;
+        expect((await r.gate.check()).outcome).toBe("none");
+      }
+      expect(r.replays).toEqual(["hub:0.45.0"]);
+      expect(r.notes.length).toBe(1);
+    }
+  });
+
+  test("[B2] the rejected list is bounded: the newest 50 versions, each with at most 50 failures and a truncated flag", async () => {
+    expect([MAX_REJECTED, MAX_REJECTED_FAILURES]).toEqual([50, 50]);
+    const many = Array.from({ length: 120 }, (_, i) => part(`p${i}`, { outcome: "differs", differences: [{ field: "faces", body: "Body1", old: 6, new: 7 }] }));
+    const r = rig({ plan: { m1: { report: report(many) } } });
+    for (let i = 0; i < 55; i++) {
+      r.clock.t = T0 + i * 4 * HOUR;
+      r.releases = [rel(`0.${45 + i}.0`, 50, {}, r.clock.t)];
+      expect((await r.gate.check()).outcome).toBe("rejected");
+    }
+    const st = r.gate.status();
+    expect(st.rejected.length).toBe(50);
+    expect(st.rejected[0]!.version).toBe("0.50.0"); // the five oldest were dropped
+    expect(st.rejected.at(-1)!.version).toBe("0.99.0");
+    for (const rej of st.rejected) {
+      expect(rej.failures.length).toBe(50);
+      expect(rej.failuresTruncated).toBe(true);
+    }
+    expect(r.notes.length).toBe(55); // one per rejected version, none repeated
+    // A short list is not flagged.
+    const few = rig({ plan: { m1: { report: report([DIFFERS]) } } });
+    await few.gate.check();
+    expect(few.gate.status().rejected[0]!.failuresTruncated).toBeUndefined();
+    // The file on disk is bounded too.
+    expect(JSON.parse(readFileSync(join(r.deps.stateDir, CANDIDATE_FILE), "utf8")).rejected.length).toBe(50);
   });
 
   test("[B2] GitHub unreachable: the check is skipped and the pin is unchanged", async () => {
@@ -432,13 +623,18 @@ describe("the hub's replay gate", () => {
     expect(st.interrupted).toContain("starts again from scratch");
     expect(second.pin.current?.version).toBe("0.44.1");
     expect(second.advances).toEqual([]);
-    expect(JSON.parse(readFileSync(join(dir, CANDIDATE_FILE), "utf8")).inFlight).toBeUndefined();
+    // The marker stays until a check completes, so the build already downloaded for the cut-short
+    // evaluation is kept on disk rather than pruned and fetched again.
+    expect(JSON.parse(readFileSync(join(dir, CANDIDATE_FILE), "utf8")).inFlight.version).toBe("0.45.0");
+    expect(second.gate.candidateVersion()).toBe("0.45.0");
 
     // The next check evaluates the whole fleet again and only then advances.
     expect(await second.gate.check()).toMatchObject({ outcome: "advanced", version: "0.45.0" });
     expect(second.replays.sort()).toEqual(["hub:0.45.0", "m1:0.45.0:0.44.1", "m2:0.45.0:0.44.1"]);
     expect(second.advances.length).toBe(1);
     expect(second.gate.status().interrupted).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(dir, CANDIDATE_FILE), "utf8")).inFlight).toBeUndefined();
+    expect(second.gate.candidateVersion()).toBeUndefined();
     first.release();
   });
 
@@ -506,6 +702,37 @@ describe("the hub's replay gate", () => {
     expect(await busy.gate.advanceAnyway("0.45.0")).toMatchObject({ ok: false, error: expect.stringContaining("check is running") });
     busy.release();
     await pending;
+  });
+
+  test("[B2] a daemon that keeps restarting mid-evaluation starts a check at most once an hour, not two minutes after every start", async () => {
+    const dir = stateDir();
+    const clock = { t: T0 };
+    const first = rig({ dir, clock, plan: { m1: { hang: true } } });
+    void first.gate.check(); // starts, and the daemon goes down before it finishes
+    for (let i = 0; i < 200 && !first.replays.includes("m1:0.45.0:0.44.1"); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(JSON.parse(readFileSync(join(dir, CANDIDATE_FILE), "utf8")).lastCheckStartedAt).toBe(new Date(T0).toISOString());
+
+    // Restarts 5, 20 and 50 minutes later: each waits out the rest of the hour.
+    for (const minutes of [5, 20, 50]) {
+      clock.t = T0 + minutes * 60_000;
+      const g = rig({ dir, clock });
+      expect(g.gate.firstCheckDelay()).toBe((60 - minutes) * 60_000);
+      const once: number[] = [];
+      g.gate.start(undefined, (() => 0) as never, ((_: () => void, ms: number) => (once.push(ms), 0)) as never);
+      expect(once).toEqual([(60 - minutes) * 60_000]);
+      g.gate.stop();
+    }
+    // 59 minutes on, the floor of two minutes applies; after the hour it is two minutes again.
+    clock.t = T0 + 59 * 60_000;
+    expect(rig({ dir, clock }).gate.firstCheckDelay()).toBe(2 * 60_000);
+    clock.t = T0 + 3 * HOUR;
+    const late = rig({ dir, clock });
+    expect(late.gate.firstCheckDelay()).toBe(2 * 60_000);
+    // Once a check does finish, the ordinary rule is back: four hours after it.
+    await late.gate.check();
+    clock.t += 30 * 60_000;
+    expect(rig({ dir, clock, pinned: "0.45.0" }).gate.firstCheckDelay()).toBe(3.5 * HOUR);
+    first.release();
   });
 
   test("[B2] the hub checks every 4 hours, and once soon after a start", async () => {

@@ -156,6 +156,28 @@ describe("member apply", () => {
     expect(changes.length).toBeGreaterThanOrEqual(2); // "installing", then the result
   });
 
+  test("[B1] a member handed the pinned version with a sha256 that is refused keeps the pin it had, and stays ready", async () => {
+    const dir = stateDir();
+    const { svc } = service(dir);
+    const good = { ...refB, pinnedAt: "2026-11-19T10:00:00.000Z" };
+    expect((await svc.apply(good)).state).toBe("ready");
+    // The same version again, with a sha256 no zip matches.
+    const st = await svc.apply({ version: "0.44.1", sha256: "0".repeat(64), pinnedAt: "2026-11-19T11:00:00.000Z" });
+    expect(svc.pin()).toEqual(good); // the stored pin still names the zip that was verified
+    expect(readLocalPin(dir)).toEqual(good);
+    expect(st).toEqual({ state: "ready", version: "0.44.1", source: "managed", pinned: "0.44.1", available: true }); // and no stale error
+    expect(svc.applyRefusal()).toContain("was refused");
+    expect(svc.applyRefusal()).toContain("0".repeat(64));
+    expect(installedVersions(dir)).toEqual(["0.44.1"]);
+    expect(Bun.spawnSync([solidcraftCliPath(dir, "0.44.1"), "--version"]).stdout.toString().trim()).toBe("solidcraft-cli 0.44.1");
+    // A later good apply clears the refusal; a different VERSION is still recorded before its install.
+    await svc.apply(good);
+    expect(svc.applyRefusal()).toBeUndefined();
+    const other = await svc.apply({ version: "0.45.0", sha256: "0".repeat(64), pinnedAt: "2026-11-19T12:00:00.000Z" });
+    expect(other.state).toBe("error");
+    expect(svc.pin()?.version).toBe("0.45.0"); // off the pin, and saying so
+  });
+
   test("[B1] a member whose install fails stays on its old version and reports CAD unavailable with the reason", async () => {
     const dir = stateDir();
     // This machine can fetch 0.43.0 but its download of 0.44.1 is a different file.

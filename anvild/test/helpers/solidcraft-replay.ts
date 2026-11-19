@@ -23,11 +23,15 @@ export function writeTable(file: string, table: FakeEvalTable): string {
   return file;
 }
 
-/** Write an executable fake `solidcraft-cli` of `version` into `dir/<version>/` and return its path. */
+/**
+ * Write an executable fake `solidcraft-cli` of `version` into `dir/<version>/` and return its path.
+ * A table path is always baked in (a file that is not there means "no special behaviour"), because
+ * that is also what switches the fake to its design-script replay server.
+ */
 export function fakeBuild(dir: string, version: string, tableFile?: string): { path: string; version: string } {
   const path = join(dir, version, "solidcraft-cli");
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, fakeCliScript(version, tableFile ? { FAKE_SC_TABLE: tableFile } : {}));
+  writeFileSync(path, fakeCliScript(version, { FAKE_SC_TABLE: tableFile ?? join(dir, "no-table.json") }));
   chmodSync(path, 0o755);
   return { path, version };
 }
@@ -65,9 +69,28 @@ export function plateWithImpossibleFillet(): Command[] {
   return REFERENCE_PLATE.map((c) => (c.command === "solid.fillet" ? { ...c, params: { ...c.params, radius: 500 } } : c));
 }
 
+/** A block with one through hole: moving the hole changes nothing but the centre of mass. */
+export function blockWithHole(): Command[] {
+  return [...box(30, 20, 10), { command: "solid.hole", params: { position: [10, 10, 10], diameter: 4, name: "Bore" } }];
+}
+
+/**
+ * Fake modelling commands as the steps of an exported design script: `parameters.add` stays, and
+ * every other command becomes a `timeline.add` step holding a fake feature (the format the fake's
+ * replay understands; the real one holds the kernel's feature objects).
+ */
+export function asDesignSteps(commands: Command[]): Command[] {
+  return commands.map((c) => (c.command === "parameters.add" ? c : { command: "timeline.add", params: { feature: { type: "fake", id: c.command, params: c.params } } }));
+}
+
 /** The text of a `design.json`. `about.design` is the part name (the behaviour table keys on it). */
 export function designJson(part: string, commands: Command[]): string {
-  return JSON.stringify({ about: { design: part, format: "solidcraft/58", replay: "solidcraft-cli eval script.json", version: "0.44.1" }, commands }, null, 1);
+  return rawScript(part, asDesignSteps(commands));
+}
+
+/** A script with exactly these steps, unconverted — for scripts that are NOT plain design scripts. */
+export function rawScript(part: string, steps: Command[]): string {
+  return JSON.stringify({ about: { design: part, format: "solidcraft/58", replay: "solidcraft-cli eval script.json", version: "0.44.1" }, commands: steps }, null, 1);
 }
 
 export function git(cwd: string, ...args: string[]): string {

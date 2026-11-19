@@ -232,6 +232,7 @@ export class SolidcraftPinService {
   private managed: ManagedSolidcraft | undefined;
   private installing: string | undefined;
   private lastError: { version: string; failure: InstallFailure; detail: string } | undefined;
+  private refusal: string | undefined;
   private readonly probed = new Map<string, string | undefined>();
   private readonly now: () => Date;
   private readonly log: (msg: string) => void;
@@ -289,6 +290,29 @@ export class SolidcraftPinService {
    * never quietly still "on" the old one.
    */
   async apply(pinIn: SolidcraftPin, keep: readonly string[] = []): Promise<SolidcraftMachineStatus> {
+    this.refusal = undefined;
+    // The one case where the pin is NOT recorded first: this machine is already on a verified
+    // build of the same version, and is now handed another sha256 for it. If that zip is refused,
+    // recording it would leave a pin naming a zip that never passed, on a machine that still
+    // reports ready. So here the install goes first, and a refusal changes nothing.
+    const cur = this.store.get();
+    const asked = parsePin(pinIn);
+    if (asked && cur && cur.version === asked.version && cur.sha256 !== asked.sha256 && installedSolidcraft(this.deps.stateDir, cur.version, cur.sha256)) {
+      this.installing = asked.version;
+      this.deps.onChange?.();
+      let trial: InstallResult;
+      try {
+        trial = await this.install(asked);
+      } finally {
+        if (this.installing === asked.version) this.installing = undefined;
+      }
+      if (!trial.ok) {
+        this.refusal = `the pin was not applied: SolidCraft ${asked.version} with sha256 ${asked.sha256} was refused (${trial.detail}); this machine stays on the build it had`;
+        this.log(`[solidcraft] ${this.refusal}`);
+        this.deps.onChange?.();
+        return this.status();
+      }
+    }
     const pin = this.store.replace(pinIn);
     this.installing = pin.version;
     this.deps.onChange?.();
@@ -310,6 +334,11 @@ export class SolidcraftPinService {
     }
     this.deps.onChange?.();
     return this.status();
+  }
+
+  /** Why the last `apply` left the pin as it was, if it did (see `apply`). */
+  applyRefusal(): string | undefined {
+    return this.refusal;
   }
 
   /**

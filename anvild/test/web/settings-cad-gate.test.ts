@@ -27,7 +27,7 @@ const rejected: SolidcraftEvaluation = {
   result: "rejected",
   detail: "SolidCraft 0.45.0 was rejected: bracket: volume (mm³) 6000 → 6006 (lapo, on Mac-Mini-M1). The pin is unchanged.",
   machines: [
-    { serverId: "hub", serverName: "Mac-Mini-M4", isHub: true, state: "pass", holds: false, report: { candidate: "0.45.0", baseline: "0.44.1", hostsDesigns: true, pass: true, parts: [part("plate")], advisory: [part("wip", { worktree: "new lid", ref: undefined, outcome: "differs", differences: [{ field: "faces", body: "Body1", old: 6, new: 8 }] }), part("ok", { worktree: "tidy" })], notes: [] } },
+    { serverId: "hub", serverName: "Mac-Mini-M4", isHub: true, state: "pass", holds: false, report: { candidate: "0.45.0", baseline: "0.44.1", hostsDesigns: true, pass: true, parts: [part("plate")], advisory: [part("wip", { worktree: "new lid", ref: undefined, outcome: "differs", differences: [{ field: "faces", body: "Body1", old: 6, new: 8 }] }), part("ok", { worktree: "tidy" })], notes: [], errors: [] } },
     {
       serverId: "m1",
       serverName: "Mac-Mini-M1",
@@ -35,7 +35,7 @@ const rejected: SolidcraftEvaluation = {
       state: "fail",
       holds: true,
       detail: "bracket: volume (mm³) 6000 → 6006",
-      report: { candidate: "0.45.0", baseline: "0.44.1", hostsDesigns: true, pass: false, parts: [BRACKET, part("lid", { outcome: "candidate-error", error: "eval exited 139" }), part("old", { outcome: "baseline-broken", error: "feature Corners failed" }), part("plate")], advisory: [], notes: [] },
+      report: { candidate: "0.45.0", baseline: "0.44.1", hostsDesigns: true, pass: false, parts: [BRACKET, part("lid", { outcome: "candidate-error", error: "eval exited 139" }), part("old", { outcome: "baseline-broken", error: "feature Corners failed" }), part("plate")], advisory: [], notes: [], errors: [] },
     },
     { serverId: "m2", serverName: "Studio", isHub: false, state: "unreachable", holds: true, detail: "unreachable — it hosts (or may host) designs, so the pin holds" },
   ],
@@ -154,6 +154,57 @@ describe("Settings → CAD card: replay gate", () => {
     expect(adv[0]!.textContent).toContain("face count of Body1: 6 → 8");
     expect(text("#cad-gate")).toContain("2 replayed; these never hold the pin");
     expect(text("#cad-gate-differences")).not.toContain("wip");
+  });
+
+  test("[B2] refused and inconclusive designs are listed by name as holding the pin without a verdict, and a failing hub install shows its retry count", () => {
+    const held: SolidcraftEvaluation = {
+      ...rejected,
+      result: "held",
+      detail: "SolidCraft 0.45.0 is held: Mac-Mini-M1 (trap was refused and not replayed (step 3 (file.save): this command is not one SolidCraft writes into a design script, so it is not replayed)). The pin is unchanged; it is evaluated again on the next check.",
+      machines: [
+        rejected.machines[0]!,
+        {
+          serverId: "m1",
+          serverName: "Mac-Mini-M1",
+          isHub: false,
+          state: "held",
+          holds: true,
+          detail: "trap was refused and not replayed",
+          report: {
+            candidate: "0.45.0",
+            baseline: "0.44.1",
+            hostsDesigns: true,
+            pass: false,
+            parts: [
+              part("trap", { outcome: "refused", error: "step 3 (file.save): this command is not one SolidCraft writes into a design script, so it is not replayed" }),
+              part("slow", { outcome: "inconclusive", error: "the pinned build gave no result: SolidCraft 0.44.1 did not finish within 120 s and was stopped" }),
+              part("plate"),
+            ],
+            advisory: [],
+            notes: [],
+            errors: [],
+          },
+        },
+      ],
+    };
+    host.innerHTML = cadCardHtml({ status: fleet(), gate: gate({ lastEvaluation: held, rejected: [], retry: { version: "0.46.0", attempts: 3, nextAt: "2026-11-20T04:00:00.000Z", reason: "GitHub answered 503" } }) });
+    const row = host.querySelector<HTMLElement>(`.cad-gate-machine[data-server-id="m1"]`)!;
+    expect(row.dataset.state).toBe("held");
+    expect(row.textContent).toContain("Could not be decided");
+    expect(row.textContent).toContain("holds the pin");
+    const undecided = [...host.querySelectorAll<HTMLElement>("#cad-gate-undecided .cad-part")];
+    expect(undecided.map((d) => [d.dataset.part, d.dataset.outcome])).toEqual([["trap", "refused"], ["slow", "inconclusive"]]);
+    expect(undecided[0]!.textContent).toContain("refused, not replayed: step 3 (file.save)");
+    expect(undecided[1]!.textContent).toContain("could not be replayed");
+    expect(undecided[1]!.textContent).toContain("did not finish within 120 s");
+    expect(host.querySelector("#cad-gate-differences")).toBeNull(); // nothing differed: these are not differences
+    expect(text("#cad-gate-retry")).toContain("SolidCraft 0.46.0 could not be installed on the hub (GitHub answered 503)");
+    expect(text("#cad-gate-retry")).toContain("3 attempts so far");
+    expect(text("#cad-gate-retry")).toContain(new Date("2026-11-20T04:00:00.000Z").toLocaleString());
+    // A centre-of-mass difference is labelled as one.
+    const moved = part("bored", { outcome: "differs", differences: [{ field: "center_of_mass", body: "Body1", old: [15, 10, 5], new: [15.4, 10, 5] }] });
+    host.innerHTML = cadCardHtml({ status: fleet(), gate: gate({ lastEvaluation: { ...rejected, machines: [{ ...rejected.machines[1]!, report: { ...rejected.machines[1]!.report!, parts: [moved] } }] } }) });
+    expect(text("#cad-gate-differences")).toContain("centre of mass (mm) of Body1: [15, 10, 5] → [15.4, 10, 5]");
   });
 
   test("[B2] 'Check now' asks the hub to check and repaints with what it did", async () => {

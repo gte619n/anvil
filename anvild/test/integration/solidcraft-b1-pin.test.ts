@@ -272,6 +272,18 @@ describe("Phase B1 surface", () => {
     expect(other.download.calls).toEqual([]);
     expect((await localStatus(other)).local.state).toBe("unpinned"); // nothing happened
     expect(versionFolders(other)).toEqual([]);
+    // A direct apply of the pinned version with a bogus sha256 is refused and changes nothing: the
+    // stored pin keeps the verified sha256 and the machine is still ready.
+    const m = await boot();
+    const goodPin = { version: "0.44.1", sha256: NEW.sha256, pinnedAt: "2026-11-19T10:00:00.000Z" };
+    expect((await post(m, "/api/solidcraft/pin/apply", { pin: goodPin })).status).toBe(200);
+    const bogus = await post(m, "/api/solidcraft/pin/apply", { pin: { ...goodPin, sha256: "0".repeat(64), pinnedAt: "2026-11-19T11:00:00.000Z" } });
+    expect(bogus.status).toBe(500);
+    const refusedBody = (await bogus.json()) as rest.solidcraft.ApplyResponse;
+    expect(refusedBody.ok).toBe(false);
+    expect(refusedBody.error).toContain("was refused");
+    expect(refusedBody.pin).toEqual(goodPin);
+    expect(await localStatus(m)).toEqual({ ok: true, pin: goodPin, local: { state: "ready", version: "0.44.1", source: "managed", pinned: "0.44.1", available: true } });
     // A malformed pin is a 400, not an install.
     const bad = await post(h, "/api/solidcraft/pin/apply", { pin: { version: "../../x", sha256: "nope", pinnedAt: "t" } });
     expect(bad.status).toBe(400);
