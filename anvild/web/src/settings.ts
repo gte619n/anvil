@@ -24,6 +24,7 @@
 // pickers; `todoistConnected`/`todoistProjectsLoaded` for the environment modal and the member
 // token-propagation check) live on `ui` in state.ts; in-place containers (`todoistProjects`,
 // `readmeLoaded`) stay `const` here.
+import { partsSectionShellHtml, refreshParts } from "./parts";
 import { apiFetch } from "./api";
 import { $, busy, byEnvName, envIcon, esc, icon } from "./dom";
 // dialogs.ts is a leaf, so the modal/toast helpers and the environment modals are direct imports —
@@ -154,6 +155,7 @@ export function openSettings(): void {
         <div class="section-head"><h3>Models</h3></div>
         <p class="small muted">The model providers Anvil drives. Set or reset the Claude subscription token and OpenRouter key here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
+        ${partsSectionShellHtml()}
       </section>
       <section class="settings-panel" data-tab="prompts">
         <div class="section-head"><h3>Prompts</h3><button id="set-add-prompt" class="primary">${icon("add")} Add prompt</button></div>
@@ -205,6 +207,7 @@ function selectSettingsTab(tab: SettingsTab): void {
   if (tab === "prompts") renderPromptsPanel();
   if (tab === "models") {
     renderModelsPanel();
+    refreshParts(); // Part sources (Phase C5) — hidden unless the hub advertises "part-sources"
     if (serverSupports(hub(), "auth")) {
       hub().sock.send({ type: "auth.status" }); // claude — refresh once per tab open
       hub().sock.send({ type: "auth.status", provider: "openrouter" });

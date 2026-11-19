@@ -624,6 +624,40 @@ export interface BrowserLoggedInEvent extends Envelope {
    *  logged-in site. Shown in Settings as an error. */
   error?: string;
 }
+/** Part sources (agent-cad-and-browser Phase C5; "part-sources" capability): the vendor APIs the
+ *  `parts_search` / `parts_fetch` tools use. */
+export type PartSourceId = "digikey" | "mouser" | "traceparts";
+/** One key field of a part source. The value itself never leaves the daemon: only whether it is set
+ *  and a masked preview, exactly like the OpenRouter key's `auth.status`. */
+export interface PartSourceField {
+  name: string; // e.g. "DIGIKEY_CLIENT_ID" — the env-file line it is stored under
+  label: string; // "Client ID"
+  set: boolean;
+  masked?: string;
+}
+export interface PartSourceStatus {
+  id: PartSourceId;
+  label: string;
+  /** Every field this source needs is set (TraceParts: tenant uid, API key AND request email). */
+  configured: boolean;
+  fields: PartSourceField[];
+  /** What the owner must do for an unconfigured source, or a limit worth knowing. */
+  note?: string;
+}
+/** The part sources on the daemon that sends it, with which are configured. Sent on connect and
+ *  after every key change. Keys are entered on the hub and pushed to members with the fleet's
+ *  credentials (the OpenRouter key's path). */
+export interface PartSourcesEvent extends Envelope {
+  type: "parts.sources";
+  sources: PartSourceStatus[];
+}
+/** Reply to `parts.test`: the outcome of one cheap authenticated call to the source. */
+export interface PartsTestResultEvent extends Envelope, Correlated {
+  type: "parts.test.result";
+  source: PartSourceId;
+  ok: boolean;
+  message: string;
+}
 /** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
  *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
 export interface BrowserSite {
@@ -1569,6 +1603,8 @@ export type ServerEvent =
   | McpIntegrationsEvent
   | BrowserSitesEvent
   | BrowserLoggedInEvent
+  | PartSourcesEvent
+  | PartsTestResultEvent
   | PromptsEvent
   | ModelLabelsEvent
   | ClaudeCliStatusEvent
@@ -1931,6 +1967,29 @@ export interface BrowserOpenAgentBrowserCmd extends Envelope, Correlated {
 export interface HumanRequestRespondCmd extends Envelope, Correlated {
   type: "human.request.respond";
   requestId: RequestId;
+}
+
+/** Part sources (Phase C5; "part-sources" capability). Client commands only; refused with a
+ *  `command.error` on a daemon without the feature. */
+export interface PartsSourcesGetCmd extends Envelope, Correlated {
+  type: "parts.sources.get"; // reply: a fresh `parts.sources`
+}
+/** Set some or all of a source's key fields (field name → value; empty values are ignored). Stored
+ *  in the daemon's env file (mode 0600) and pushed to fleet members; acked, then `parts.sources`. */
+export interface PartsKeysSetCmd extends Envelope, Correlated {
+  type: "parts.keys.set";
+  source: PartSourceId;
+  values: Record<string, string>;
+}
+/** Remove every key field of a source on this daemon. */
+export interface PartsKeysClearCmd extends Envelope, Correlated {
+  type: "parts.keys.clear";
+  source: PartSourceId;
+}
+/** Make one cheap authenticated call to the source; reply: `parts.test.result`. */
+export interface PartsTestCmd extends Envelope, Correlated {
+  type: "parts.test";
+  source: PartSourceId;
 }
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
@@ -2342,6 +2401,10 @@ export type ClientCommand =
   | BrowserLoggedInResetCmd
   | BrowserOpenAgentBrowserCmd
   | HumanRequestRespondCmd
+  | PartsSourcesGetCmd
+  | PartsKeysSetCmd
+  | PartsKeysClearCmd
+  | PartsTestCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd
@@ -2771,6 +2834,9 @@ export namespace rest {
      *  (HJ-24/HJ-27). Present keys OVERWRITE; absent keys are left alone. */
     todoistToken?: string;
     openRouterKey?: string;
+    /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
+     *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
+    partKeys?: Record<string, string>;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;
@@ -2811,6 +2877,9 @@ export namespace rest {
     hubServerId: string;
     todoistToken?: string;
     openRouterKey?: string;
+    /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
+     *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
+    partKeys?: Record<string, string>;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;

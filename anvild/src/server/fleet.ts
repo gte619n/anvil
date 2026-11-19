@@ -536,6 +536,8 @@ export async function invitePeer(opts: {
   fleetName?: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** Part-source keys (Phase C5), env-file name → value; they ride with the OpenRouter key. */
+  partKeys?: Record<string, string>;
   /** The hub's account roster (multi-account §7.3), so a joiner arrives with every account rather
    *  than waiting for the next rotation. Sent only to a joiner advertising "accounts". */
   accounts?: rest.RosterPush;
@@ -563,6 +565,7 @@ export async function invitePeer(opts: {
       ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
       ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
       ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+      ...(opts.partKeys && Object.keys(opts.partKeys).length ? { partKeys: opts.partKeys } : {}),
       ...(roster ? { accounts: roster } : {}),
     },
   });
@@ -720,6 +723,8 @@ export async function rotateToken(opts: {
   hubServerId: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** Part-source keys (Phase C5), env-file name → value; they ride with the OpenRouter key. */
+  partKeys?: Record<string, string>;
   /** The hub's account roster (multi-account §7.3). Sent ONLY to members advertising "accounts" — an
    *  older member would ignore the field, but not sending it keeps the wire honest and lets the caller
    *  tell "didn't get it" from "got it and is on this rev" via the returned `accountsRev`. */
@@ -771,6 +776,7 @@ export async function rotateToken(opts: {
           hubServerId: opts.hubServerId,
           ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
           ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+          ...(opts.partKeys && Object.keys(opts.partKeys).length ? { partKeys: opts.partKeys } : {}),
           ...(sendsRoster ? { accounts: opts.accounts } : {}),
         },
       });

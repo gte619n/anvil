@@ -826,7 +826,76 @@
     },
     "C5": {
       "title": "part sources",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/parts-connectors.test.ts",
+          "names": [
+            "DigiKey > [C5] DigiKey: client-credentials token, then keyword search with X-DIGIKEY-Client-Id + Bearer; results are normalized, with model links from product media and attribution",
+            "DigiKey > [C5] DigiKey token caching and refresh: one token for many searches until shortly before expiry, a new one after; a 401 on a search gets one fresh token and one retry",
+            "DigiKey > [C5] DigiKey errors are normalized and carry no key: a server error, an unreachable host, a timeout, and missing keys",
+            "DigiKey > [C5] DigiKey Test makes one token request and says what it proved",
+            "Mouser > [C5] Mouser: POST /api/v1/search/keyword?apiKey= with SearchByKeywordRequest; results are normalized with attribution and stock from Availability",
+            "Mouser > [C5] Mouser: an invalid key (reported in the body with HTTP 200) is an auth error; a vendor 429 is 'rate limited, retry after'; the key in the query string never appears in an error",
+            "TraceParts > [C5] TraceParts is inactive until the tenant UID, the API key AND the request email are all set",
+            "TraceParts > [C5] TraceParts: RequestToken {tenantUid, apiKey} → JWT; part-number availability per catalog; STEP formats become a cadRequest model link; normalized with attribution",
+            "TraceParts > [C5] TraceParts token caching and refresh: reused until a minute before its expiryDate, then renewed; a 401 renews once",
+            "TraceParts > [C5] TraceParts model fetch: cadRequest is sent under the configured request email, cadFileUrl is polled through 204s, and the file URL is returned"
+          ]
+        },
+        {
+          "file": "test/unit/parts-ratelimit.test.ts",
+          "names": [
+            "rate limiter > [C5] rate limiter: a per-minute and a per-day window are both enforced, refill over time, and a refused call says how long to wait",
+            "rate limiter > [C5] rate limited calls never reach the vendor and come back as 'rate limited, retry after'",
+            "rate limiter > [C5] keys are scrubbed from text, raw and URL-encoded"
+          ]
+        },
+        {
+          "file": "test/unit/parts-keys.test.ts",
+          "names": [
+            "PartKeyStore > [C5] keys: DigiKey client id + secret, Mouser key, TraceParts tenant uid + key + email are NAME=value lines in the env file (0600), read at use time, never put in process.env",
+            "PartKeyStore > [C5] keys are masked to the last four characters in the status clients see; TraceParts is configured only with all three fields",
+            "PartKeyStore > [C5] the hub's push payload carries every set key; a member adopts known names only (present keys overwrite, unknown names and bad values are ignored)"
+          ]
+        },
+        {
+          "file": "test/unit/parts-download.test.ts",
+          "names": [
+            "downloadPart > [C5] a STEP file over https is written whole, from the address that was checked (the name's resolved address, never a second lookup)",
+            "downloadPart > [C5] a redirect to a loopback address is refused, and so is one to a name that resolves to a private address, and one to http — nothing is written",
+            "downloadPart > [C5] an http URL, a loopback URL and a private name are refused before any connection",
+            "downloadPart > [C5] an oversize response is aborted and deleted — by its Content-Length before writing, and while streaming when it has none",
+            "downloadPart > [C5] the type is decided from the server's suggested name before a byte is written: destFor refusing stops the download"
+          ]
+        },
+        {
+          "file": "test/web/parts-c5.test.ts",
+          "names": [
+            "Settings → Models → Part sources > [C5] web: the Part sources section is hidden without the hub's part-sources capability; with it each source shows Configured / Not configured, its note, and only masked values",
+            "Settings → Models → Part sources > [C5] web: Save sends parts.keys.set with only the fields typed in; Test sends parts.test and shows the result; Clear asks first, then sends parts.keys.clear"
+          ]
+        },
+        {
+          "file": "test/integration/parts-c5.test.ts",
+          "names": [
+            "Acceptance: parts_search > [C5] Acceptance: a search returns normalized results from each configured source — DigiKey, Mouser and TraceParts — each with its attribution",
+            "Acceptance: parts_search > [C5] Acceptance: a source with no key is skipped with a note, not an error — and TraceParts with only some of its fields counts as no key",
+            "Acceptance: parts_search > [C5] one source failing does not fail the call: its error is a note, the others' results stand; asking for unknown sources is an error",
+            "Acceptance: parts_fetch > [C5] Acceptance: parts_fetch of a STEP link lands in the quarantine (.anvil-downloads/, 0600, git-excluded) under the download limits",
+            "Acceptance: parts_fetch > [C5] Acceptance: a non-allowed type is refused — nothing is saved",
+            "Acceptance: parts_fetch > [C5] parts_fetch refuses a URL that no parts_search in this session returned (another session's, a made-up one, http) — it is not a general fetcher",
+            "Acceptance: parts_fetch > [C5] a model link that redirects to a loopback address is refused and nothing is saved",
+            "Acceptance: parts_fetch > [C5] an oversize streamed response (no Content-Length) is aborted and the partial file deleted",
+            "tools, permissions and keys > [C5] the anvil_parts server is given to ordinary sessions only while a source is configured; parts_search is read-only and auto-allowed, parts_fetch follows the autonomy policy like a write; the system prompt says to try parts_search before the browser and to show attribution",
+            "tools, permissions and keys > [C5] keys never appear in logs, tool results, client events (masked) or error messages — through set, search, fetch, Test and failures",
+            "tools, permissions and keys > [C5] Settings: Test makes one cheap authenticated call per source and reports it; an unconfigured source says what is missing; with the feature off every command is refused",
+            "key propagation hub → member (two real daemons) > [C5] keys set in Settings on the hub reach a member with the fleet's credential push (the OpenRouter key's path): stored in the member's env file, masked in its parts.sources, used by its tools; a push from an unknown hub is refused",
+            "key propagation hub → member (two real daemons) > [C5] a key change on the hub triggers the fleet push (onRosterChanged), and a member's adoption is broadcast without pushing on",
+            "Acceptance: parts_fetch > [C5] parts_fetch never writes through a symlinked .anvil-browser"
+          ]
+        }
+      ],
+      "real": []
     }
   }
 }

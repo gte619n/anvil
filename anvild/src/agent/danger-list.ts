@@ -25,7 +25,8 @@ const BASH_PATTERNS: [RegExp, string][] = [
 
 const SECRET_PATH = /(^|\/)\.env(\.[a-z]+)?$|\/\.ssh\/|id_(rsa|ed25519)|(^|\/)credentials\b|\.pem$|\.p8$|\bsecrets?\b/i;
 
-const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead", "TodoWrite"]);
+// `mcp__anvil_parts__parts_search`: a vendor catalog lookup that writes nothing (Phase C5).
+const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead", "TodoWrite", "mcp__anvil_parts__parts_search"]);
 
 export function isReadOnly(toolName: string): boolean {
   return READ_ONLY_TOOLS.has(toolName);

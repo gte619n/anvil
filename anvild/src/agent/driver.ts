@@ -11,6 +11,7 @@ import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolv
 import { makeCanUseTool, type QuestionBroker } from "./questions";
 import { browserSessionPrompt } from "./human-tools";
 import { TEST_DAEMON_SESSION_PROMPT, TEST_MCP_SERVER_NAME } from "./testdaemon-tools";
+import { PARTS_MCP_SERVER_NAME, PARTS_SESSION_PROMPT } from "./parts-tools";
 import { inProcessKeys } from "./mcp-external";
 import { MCP_RESOURCE_TOOLS, isInProcessTool, parseMcpTool, type McpSessionGate } from "./mcp-gate";
 import type { Session } from "../session/session";
@@ -238,8 +239,9 @@ export class AgentDriver {
         "`git worktree list`, git metadata, or documentation. All work for this task must stay in this worktree so it can be reviewed as a branch.";
     }
     // A session with the agent browser has the `anvil_human` server (agent-cad-and-browser Phase C3)
-    // and the test daemon's `anvil_test` (Phase C4); each brings its own words.
-    append += browserSessionPrompt(Object.keys(this.mcpServers ?? {}), { [TEST_MCP_SERVER_NAME]: TEST_DAEMON_SESSION_PROMPT });
+    // the test daemon's `anvil_test` (Phase C4) and the part sources' `anvil_parts` (Phase C5); each
+    // brings its own words.
+    append += browserSessionPrompt(Object.keys(this.mcpServers ?? {}), { [TEST_MCP_SERVER_NAME]: TEST_DAEMON_SESSION_PROMPT, [PARTS_MCP_SERVER_NAME]: PARTS_SESSION_PROMPT });
     return { type: "preset", preset: "claude_code", append };
   }
 

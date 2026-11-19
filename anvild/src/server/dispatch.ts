@@ -392,6 +392,30 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      // Part sources (Phase C5). Refused with a command.error unless the "part-sources" feature is on.
+      // A key change is broadcast to every client as `parts.sources` (masked values only).
+      case "parts.sources.get":
+        send(deps.supervisor.partsEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.keys.set":
+        deps.supervisor.partsSetKeys(cmd.source, cmd.values);
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.keys.clear":
+        deps.supervisor.partsClearKeys(cmd.source);
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.test":
+        deps.supervisor
+          .partsTest(cmd.source, cid)
+          .then((r) => send(r))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
       case "human.request.respond":
         deps.supervisor.resolveHumanRequest(cmd.requestId);
         if (cid) send(ack(cid));

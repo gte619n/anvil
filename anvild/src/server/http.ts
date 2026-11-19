@@ -376,6 +376,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
       hubServerId: identity.serverId,
       ...(payload ? { accounts: payload } : {}),
+      // Part-source keys (Phase C5) ride the same push; a key change on the hub triggers it.
+      ...(supervisor.parts?.fleetPayload() ? { partKeys: supervisor.parts.fleetPayload()! } : {}),
       port: opts.port,
     });
     for (const r of results) {
@@ -527,6 +529,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         ws.send(JSON.stringify(supervisor.browserLoggedInEvent())); // Phase C3: logged-in sites + unlock switches
         void supervisor.mcp.browser.loggedIn.syncNow();
       }
+      if (supervisor.parts) ws.send(JSON.stringify(supervisor.partsEvent())); // Phase C5: part sources (masked)
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
@@ -637,7 +640,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
    *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; accounts?: rest.RosterPush }): string | null => {
+  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; partKeys?: Record<string, string>; accounts?: rest.RosterPush }): string | null => {
     // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
     // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
     // anything.
@@ -664,6 +667,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
         setOpenRouterKey(body.openRouterKey);
       } catch (e) {
         console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    // Part-source keys (Phase C5): present keys overwrite, like the OpenRouter key. Ignored without the feature.
+    if (body.partKeys) {
+      try {
+        supervisor.parts?.adoptFleetKeys(body.partKeys);
+      } catch (e) {
+        console.warn(`[fleet] pushed part-source keys rejected: ${e instanceof Error ? e.message : "error"}`);
       }
     }
     if (body.todoistToken) {
@@ -800,6 +811,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
         ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
         ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+        ...(supervisor.parts?.fleetPayload() ? { partKeys: supervisor.parts.fleetPayload()! } : {}),
         // The whole roster rides the first join too, so a new member arrives with every account
         // instead of only the mirrored default (§7.3).
         ...(accounts.payload() ? { accounts: accounts.payload()! } : {}),

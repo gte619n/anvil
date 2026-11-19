@@ -87,6 +87,9 @@ import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
 import { HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, buildHumanToolsServer } from "../agent/human-tools";
 import { TEST_MCP_SERVER_NAME, buildTestDaemonToolsServer } from "../agent/testdaemon-tools";
+import { PARTS_MCP_SERVER_NAME, PARTS_TOOL_IDS, buildPartsToolsServer } from "../agent/parts-tools";
+import { PartsService, type PartsServiceDeps } from "../integrations/parts/service";
+import { envFile as launcherEnvFile } from "../auth/env-file";
 import { isOrdinarySession } from "../agent/mcp-external";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
@@ -192,6 +195,8 @@ export interface SupervisorConfig {
   features?: readonly string[];
   /** Test seams for the MCP integration registry (fake prober / fake clock / no timer). */
   mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number; browser?: McpIntegrationServiceDeps["browser"] };
+  /** Test seams for the part sources (Phase C5; "part-sources" feature): fake fetch, base URLs, … */
+  parts?: Omit<Partial<PartsServiceDeps>, "envFile" | "onKeysChanged">;
 }
 
 /**
@@ -283,6 +288,8 @@ export class Supervisor {
   /** `request_human` hand-offs (agent browser Phase C3). The autopilot track assigns
    *  `human.onUnattendedHumanRequest` to mark a builder's work unit blocked. */
   readonly human: HumanRequestService;
+  /** Part sources and their keys (Phase C5). Absent unless the "part-sources" feature is on. */
+  readonly parts?: PartsService;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
   /** Team orchestration domain — plan lifecycle, member spawn/queue/drain, relay guard, integration
@@ -371,6 +378,20 @@ export class Supervisor {
       clock: cfg.mcp?.clock,
       intervalMs: cfg.mcp?.intervalMs,
     });
+    // Part sources (Phase C5): only with the "part-sources" feature. Keys live in the launcher env file
+    // (a test's own when it passes one); a change is broadcast and, on a hub, pushed to the members.
+    this.parts = featureEnabled(cfg, "part-sources")
+      ? new PartsService({
+          ...cfg.parts,
+          envFile: cfg.envFile ?? launcherEnvFile(),
+          onKeysChanged: (event, origin) => {
+            this.registry.toAll(event);
+            this.rebuildIdleDriversForParts();
+            if (origin === "local") this.onRosterChanged?.("part-source keys changed");
+          },
+        })
+      : undefined;
+    this.partsToolsOn = this.parts?.anyConfigured() ?? false;
     this.human = new HumanRequestService({ screenshot: (sessionId) => this.mcp.browser?.screenshot(sessionId) });
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
@@ -845,6 +866,44 @@ export class Supervisor {
     this.drivers.delete(id);
     await driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
     return true;
+  }
+
+  /** A part source was switched on or off: idle ordinary sessions rebuild their tools on the next
+   *  turn (a busy one keeps what it has until it is idle and its driver is rebuilt). */
+  private partsToolsOn = false;
+  private rebuildIdleDriversForParts(): void {
+    const on = this.parts?.anyConfigured() ?? false;
+    if (on === this.partsToolsOn) return;
+    this.partsToolsOn = on;
+    for (const s of this.sessions.values()) if (isOrdinarySession(s.data)) this.dropIdleDriver(s.id);
+  }
+
+  // ── Part sources (Phase C5) — delegated to PartsService ─────────────────────────────────────
+  private requireParts(): PartsService {
+    if (!this.parts) throw new BadCommand("part sources are not enabled on this server");
+    return this.parts;
+  }
+  partsEvent(cid?: string): import("@protocol").PartSourcesEvent {
+    return { ...this.requireParts().event(), ...(cid ? { cid } : {}) };
+  }
+  partsSetKeys(source: unknown, values: unknown): void {
+    const p = this.requireParts();
+    try {
+      p.setKeys(source, values);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  partsClearKeys(source: unknown): void {
+    const p = this.requireParts();
+    try {
+      p.clearKeys(source);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  partsTest(source: unknown, cid?: string): Promise<import("@protocol").PartsTestResultEvent> {
+    return this.requireParts().test(source, cid);
   }
 
   /** Synchronous sibling of {@link restartDriverForNewToken} for the MCP registry: drop an IDLE
@@ -1849,6 +1908,8 @@ export class Supervisor {
       const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
       // An ordinary session with the agent browser switched on also gets `request_human` (Phase C3).
       const hasBrowser = !!this.mcp.browser && isOrdinarySession(s.data) && this.mcp.store.list().some((i) => i.kind === "browser" && i.enabled && s.data.mcpIntegrations?.includes(i.id));
+      // …and any ordinary session gets the part-source tools while one source is configured (Phase C5).
+      const hasParts = !!this.parts && isOrdinarySession(s.data) && this.parts.anyConfigured();
       // The session's in-process servers (its role server, if any). `mcp.serversFor` passes them
       // through unchanged and adds the session's ready MCP integrations (ordinary sessions only).
       const inProcessServers: Record<string, McpSdkServerConfigWithInstance> | undefined = isDefault
@@ -1859,10 +1920,14 @@ export class Supervisor {
             ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
             : isPlanner
               ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-              : hasBrowser
-                ? // …and the throwaway test daemon's tools (Phase C4). Their ids are deliberately NOT in
-                  // `allowedTools` below: every call goes through the permission hook.
-                  { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s), [TEST_MCP_SERVER_NAME]: buildTestDaemonToolsServer(this.mcp.browser!.testDaemons, s) }
+              : hasBrowser || hasParts
+                ? {
+                    // …and the throwaway test daemon's tools (Phase C4). Their ids are deliberately NOT in
+                    // `allowedTools` below: every call goes through the permission hook.
+                    ...(hasBrowser ? { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s), [TEST_MCP_SERVER_NAME]: buildTestDaemonToolsServer(this.mcp.browser!.testDaemons, s) } : {}),
+                    // parts_search is read-only (allowed below); parts_fetch goes through the hook.
+                    ...(hasParts ? { [PARTS_MCP_SERVER_NAME]: buildPartsToolsServer(this.parts!, s) } : {}),
+                  }
                 : undefined;
       driver = new AgentDriver(
         s,
@@ -1872,7 +1937,7 @@ export class Supervisor {
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
         this.mcp.serversFor(s, inProcessServers),
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser ? HUMAN_TOOL_IDS : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser || hasParts ? [...(hasBrowser ? HUMAN_TOOL_IDS : []), ...(hasParts ? PARTS_TOOL_IDS : [])] : undefined,
         this.planReviewer(s),
         undefined, // queryFn — keep the SDK default
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
@@ -2103,6 +2168,7 @@ export class Supervisor {
     this.reflectedSessions.delete(id);
     this.prWatchers.delete(id);
     this.mcp.onSessionGone(id); // free any exclusive MCP integration lock the session held
+    this.parts?.forgetSession(id); // the URLs its parts_search returned
     this.human.cancelSession(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
@@ -2180,6 +2246,7 @@ export class Supervisor {
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
     this.cancelHumanRequests(id);
     this.mcp.onSessionReset(id); // forget "always allow <integration>" + free its exclusive locks
+    this.parts?.forgetSession(id);
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
 

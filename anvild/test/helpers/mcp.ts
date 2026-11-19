@@ -86,13 +86,13 @@ export interface McpRig {
   cleanup(): Promise<void>;
 }
 
-export function mcpRig(opts: { features?: string[]; stateDir?: string; browser?: NonNullable<ConstructorParameters<typeof Supervisor>[0]["mcp"]>["browser"]; realProber?: boolean } = {}): McpRig {
+export function mcpRig(opts: { features?: string[]; stateDir?: string; browser?: NonNullable<ConstructorParameters<typeof Supervisor>[0]["mcp"]>["browser"]; realProber?: boolean; parts?: ConstructorParameters<typeof Supervisor>[0]["parts"] } = {}): McpRig {
   const dir = opts.stateDir ?? mkdtempSync(join(tmpdir(), "anvil-mcp-"));
   const registry = new RecordingRegistry();
   const clock = fakeClock();
   const prober = fakeProber();
   const sup = new Supervisor(
-    { stateDir: dir, envFile: join(dir, "env"), features: opts.features ?? ["mcp-integrations"], mcp: { ...(opts.realProber ? {} : { prober }), clock, intervalMs: 0, browser: opts.browser } },
+    { stateDir: dir, envFile: join(dir, "env"), features: opts.features ?? ["mcp-integrations"], mcp: { ...(opts.realProber ? {} : { prober }), clock, intervalMs: 0, browser: opts.browser }, ...(opts.parts ? { parts: opts.parts } : {}) },
     registry,
   );
   return {

@@ -130,7 +130,7 @@ export const SERVER_CAPABILITIES: readonly string[] = [
 
 /**
  * The capability list this daemon advertises: the base list plus each opt-in feature capability
- * (`FEATURE_CAPABILITIES`: cad-work, solidcraft-pin, mcp-integrations, browser) that `ANVIL_FEATURES`
+ * (`FEATURE_CAPABILITIES`: cad-work, solidcraft-pin, mcp-integrations, browser, part-sources) that `ANVIL_FEATURES`
  * enabled (agent-cad-and-browser spec §4.8). EVERY place that advertises capabilities (`server.hello`,
  * `/api/health`) goes through this, so the two can never disagree. Always a fresh array. The features
  * are read at startup, so a flag changes only with a daemon restart and no live re-hello is needed.

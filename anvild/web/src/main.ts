@@ -104,6 +104,7 @@ import {
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
 // The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
 // Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
+import { initParts, onPartSources } from "./parts";
 import { browserCardImageUrl, initMcp, onBrowserLoggedIn, onBrowserSites, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
 import { initLoops, onLoopRun, onLoopRuns, onLoopsHome, onLoopsList, onLoopUpdated, openLoops, openLoopsDeepLink } from "./loops";
 import {
@@ -345,6 +346,7 @@ initLoops({
 // read. The dialog helpers + environment modals it used to receive here are imported from
 // dialogs.ts directly now.
 initMcp({ sessions, activeId: () => activeId, sendAwait });
+initParts({ sendAwait });
 initSettings({
   sessions,
   environments,
@@ -1623,6 +1625,9 @@ function onEvent(url: string, e: ServerEvent): void {
     case "browser.sites":
       // Each daemon sends its own copy of the fleet's list; Settings shows the hub's (mcp.ts).
       onBrowserSites(url, e.sites, e.pending ?? 0);
+      return;
+    case "parts.sources":
+      onPartSources(url, e.sources); // Settings → Models → Part sources (Phase C5)
       return;
     case "browser.loggedin":
       // Logged-in sites and their unlock switches (Phase C3); same hub-synced shape as the sites list.
