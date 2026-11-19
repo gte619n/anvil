@@ -581,11 +581,284 @@
     },
     "B1": {
       "title": "managed install and pin",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/solidcraft-install.test.ts",
+          "names": [
+            "verification > [B1] a zip whose sha256 differs is deleted and reported",
+            "verification > [B1] a zip signed by the wrong Team ID is deleted and reported",
+            "verification > [B1] the Team ID is the constant G5QA5U5X2S, enforced by a codesign requirement string",
+            "verification > [B1] an invalid signature is deleted and reported",
+            "verification > [B1] a build that is not notarized is retried a bounded number of times, then deleted and reported",
+            "verification > [B1] a notarization check that passes on a retry installs",
+            "verification > [B1] Gatekeeper assessments disabled is 'cannot verify', a failure, with no retry",
+            "verification > [B1] a binary that reports another version is deleted and reported",
+            "verification > [B1] --version must match exactly: extra output is a mismatch",
+            "verification > [B1] the six steps run in order, with spctl -t install and never -t execute",
+            "verification > [B1] a failed download is reported and leaves nothing behind",
+            "verification > [B1] a malformed version or sha256 is refused before anything is downloaded",
+            "zip handling > [B1] a zip entry with '..' is refused and nothing is written outside the staging folder",
+            "zip handling > [B1] a zip entry with an absolute path is refused",
+            "zip handling > [B1] a zip entry that is a symlink is refused",
+            "zip handling > [B1] a zip with no solidcraft-cli is refused as a missing binary",
+            "zip handling > [B1] solidcraft-cli as a folder is not a binary",
+            "zip handling > [B1] solvecraft-cli is never extracted, so it can never be run",
+            "zip handling > [B1] solvecraft-cli is skipped whatever its letter case",
+            "zip handling > [B1] the single top-level folder is stripped; two top folders or a loose file are refused",
+            "zip handling > [B1] the reader refuses backslashes, duplicates, file-as-folder and a wrong checksum",
+            "zip handling > [B1] extraction keeps the executable bit and file contents",
+            "install > [B1] a good zip becomes the binary resolveSolidcraftCli() returns",
+            "install > [B1] an already verified install is reused without downloading again",
+            "install > [B1] a refused re-install of an installed version leaves the working folder intact",
+            "install > [B1] a successful re-install of an installed version from a different zip replaces the folder",
+            "install > [B1] a version folder without the verification marker is not an install",
+            "install > [B1] concurrent installs of one version download once and leave one folder",
+            "install > [B1] an install that loses the race to another process accepts the winner's verified folder",
+            "install > [B1] prune keeps only the pinned, previous and candidate versions"
+          ]
+        },
+        {
+          "file": "test/unit/solidcraft-pin.test.ts",
+          "names": [
+            "pinAvailability > [B1] no pin recorded → available with no reason, so CAD works before a pin exists",
+            "pinAvailability > [B1] on the pinned version → available",
+            "pinAvailability > [B1] a machine on a different version is unavailable, with a reason naming both versions",
+            "pinAvailability > [B1] a failed install (no local build on the pin) is unavailable, and the failure is in the reason",
+            "pin store > [B1] the pin survives a reload, with pinnedAt and previous",
+            "pin store > [B1] setting the build that is already pinned keeps previous and pinnedAt",
+            "pin store > [B1] a corrupt pin file is reported, left in place, and is not treated as 'no pin'",
+            "pin store > [B1] a pin file of the wrong shape is corrupt too",
+            "pin store > [B1] a machine with a corrupt pin file reports CAD unavailable until the pin is set again",
+            "member apply > [B1] applying the hub's pin installs that exact version and reports ready",
+            "member apply > [B1] a member handed the pinned version with a sha256 that is refused keeps the pin it had, and stays ready",
+            "member apply > [B1] a member whose install fails stays on its old version and reports CAD unavailable with the reason",
+            "member apply > [B1] after an apply only the pinned, previous and candidate versions stay on disk",
+            "member apply > [B1] an env override on the pinned version is ready; on another version it is not",
+            "hub pin > [B1] the hub verifies a build before recording it: a failing install leaves the pin unchanged",
+            "hub pin > [B1] a refused re-pin of the pinned version with a wrong sha256 leaves the install intact and the machine ready",
+            "hub pin > [B1] status never says ready for a managed build that is no longer on disk",
+            "hub pin > [B1] pin back returns to previous; the build left behind becomes the new previous",
+            "hub pin > [B1] pin back with no previous is refused",
+            "hub pin > [B1] pin back after scripts were rewritten: warned, affected parts listed, no automatic rewrite",
+            "boot > [B1] at start, a recorded pin whose folder is a verified install becomes the daemon's SolidCraft",
+            "boot > [B1] at start, no pin means nothing is primed",
+            "boot > [B1] at start, a pin whose folder is missing or unverified is not used, and the install is retried",
+            "design format guard > [B1] a script written by a newer format is refused with \"this machine's SolidCraft is older than the design\"",
+            "design format guard > [B1] the local build's format number is read once per version",
+            "release lookup > [B1] the hub resolves one { version, sha256 } when the asset digest and SHA256SUMS.txt agree",
+            "release lookup > [B1] a digest that disagrees with SHA256SUMS.txt, a missing line, a draft or a missing release records nothing"
+          ]
+        },
+        {
+          "file": "test/unit/fleet-solidcraft.test.ts",
+          "names": [
+            "FleetSolidcraftCoordinator > [B1] the hub resolves ONE { version, sha256 } and every member is sent that exact pair",
+            "FleetSolidcraftCoordinator > [B1] an explicit sha256 is used as given, without a lookup",
+            "FleetSolidcraftCoordinator > [B1] the hub proves the build first: if its own install fails, no pin is recorded and no member is contacted",
+            "FleetSolidcraftCoordinator > [B1] the hub installs before the members are sent the pin",
+            "FleetSolidcraftCoordinator > [B1] a member that fails to install is reported as an error with its reason and old version",
+            "FleetSolidcraftCoordinator > [B1] an unreachable member is pending-offline and is brought to the pin by reconcile when it is back",
+            "FleetSolidcraftCoordinator > [B1] a member without the capability is reported unsupported and never sent a pin",
+            "FleetSolidcraftCoordinator > [B1] a second pin change while one is in progress is refused",
+            "FleetSolidcraftCoordinator > [B1] bad input and a failed lookup change nothing",
+            "FleetSolidcraftCoordinator > [B1] pin back fans the previous build out and returns the designs the newer build rewrote",
+            "FleetSolidcraftCoordinator > [B1] refresh re-reads every machine without changing anything",
+            "FleetSolidcraftCoordinator > [B1] with no rewritten-designs provider the pin-back list is reported unavailable; a provider that returns none is reported as none"
+          ]
+        },
+        {
+          "file": "test/web/settings-cad.test.ts",
+          "names": [
+            "Settings → CAD card > [B1] shows each machine's SolidCraft version, source and ready/error state",
+            "Settings → CAD card > [B1] shows the pin, its sha256 and the previous version; with no pin it says so and Pin back is disabled",
+            "Settings → CAD card > [B1] 'Set pin to version…' sends the typed version to the hub and repaints with the new pin",
+            "Settings → CAD card > [B1] an optional sha256 is passed through, and a non-version is refused before any request",
+            "Settings → CAD card > [B1] a refused pin shows the hub's reason and leaves the pin as it was",
+            "Settings → CAD card > [B1] 'Pin back' first shows the warning list of rewritten designs, and only pins back on confirm",
+            "Settings → CAD card > [B1] cancelling the pin-back warning changes nothing; an empty or incomplete list is stated",
+            "Settings → CAD card > [B1] the replay-gate and live-process rows are labelled placeholders until a later phase supplies them",
+            "Settings → CAD card > [B1] while a fan-out is active the controls are disabled and the card says so",
+            "Settings → CAD card > [B1] the CAD tab exists only when the hub advertises solidcraft-pin",
+            "Settings → CAD card > [B1] with no design store connected the pin-back warning says the list is not available, never that it is empty"
+          ]
+        },
+        {
+          "file": "test/integration/solidcraft-b1-pin.test.ts",
+          "names": [
+            "Phase B1 acceptance > [B1] in the fleet simulator, setting the pin on the hub brings two members to ready",
+            "Phase B1 acceptance > [B1] a member on a different version reports CAD unavailable with the reason",
+            "Phase B1 acceptance > [B1] a zip whose sha differs is deleted and reported, and the pin does not move",
+            "Phase B1 acceptance > [B1] a zip with the wrong Team ID is deleted and reported, and the pin does not move",
+            "Phase B1 acceptance > [B1] a build that is not notarized, or cannot be checked, is refused the same way",
+            "Phase B1 acceptance > [B1] pin back returns the fleet to the previous build and lists the designs the newer build rewrote",
+            "Phase B1 surface > [B1] the routes follow the managed-CLI posture: JSON content type, and a proven other tailnet user is rejected",
+            "Phase B1 surface > [B1] without the solidcraft-pin feature the capability is not advertised and every route is a 404",
+            "Phase B1 surface > [B1] a hub reports a member without the feature as unsupported and does not send it the pin",
+            "Phase B1 surface > [B1] solidcraft.status is sent on connect, on a pin change, and in reply to solidcraft.status.get",
+            "Phase B1 surface > [B1] a good zip becomes the manager's binary, and still is after the daemon restarts"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/solidcraft-b1.test.ts",
+          "names": [
+            "[B1 real] a real release zip installs into a temp state dir and passes all six verification steps",
+            "[B1 real] the installed build becomes the daemon's SolidCraft through the pin, and survives a restart",
+            "[B1 real] real refusals: a wrong sha256, a tampered binary, another team's binary, and the un-notarized 0.30.1 build"
+          ]
+        }
+      ]
     },
     "B2": {
       "title": "replay gate and auto-advance",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/solidcraft-script-screen.test.ts",
+          "names": [
+            "design-script screen > [B2] a plain design script passes: parameters, real features, an imported reference and the settings steps",
+            "design-script screen > [B2] every command that is not a design step is refused, with its index and id",
+            "design-script screen > [B2] a key that names a file or a place is refused at any depth and in any letter case, unless it holds only numbers",
+            "design-script screen > [B2] a string that is an absolute path, has a `..` segment or holds a URL is refused wherever it sits",
+            "design-script screen > [B2] the two import exceptions: `file` must be a bare name, and the embedded STEP text is not inspected",
+            "design-script screen > [B2] the envelope is shape-checked: commands is a list of { command, params } and nothing else",
+            "design-script screen > [B2] screenScriptText applies the 64 MB cap and JSON parsing before the screen, and returns the parsed script",
+            "design-script screen > [B2] a name key such as font may hold only a plain name, so a script cannot make SolidCraft open a file",
+            "design-script screen > [B2] a mesh import's vertex and triangle arrays are embedded data: any size, numbers only",
+            "design-script screen > [B2] the script is bounded: string length, key length, text in total, values and nesting",
+            "design-script screen > [B2] a refusal is short whatever the script holds: fragments are cut to 80 characters and the reason to 300",
+            "design-script screen > [B2] worst-case strings at the caps screen quickly: 1 MB of letters, of %41, of a:, of /.., and a 64 MB embedded STEP",
+            "design-script screen > [B2] screening time grows no faster than the input: doubling the size at most about doubles the time",
+            "design-script screen > [B2] the allow list is exactly what the real export was seen to write, minus the one id that opens a file"
+          ]
+        },
+        {
+          "file": "test/unit/solidcraft-candidate.test.ts",
+          "names": [
+            "candidate selection > [B2] with releases 10, 30 and 50 hours old the 50-hour one is chosen; with only 10 and 30, none is",
+            "candidate selection > [B2] the NEWEST qualifying release is taken, not the first old-enough one",
+            "candidate selection > [B2] a plain-looking tag that is a prerelease, a draft, a nightly or an rc is never a candidate",
+            "candidate selection > [B2] releases are sorted by published_at, whatever order the API returns them in",
+            "candidate selection > [B2] the candidate must be newer than the pin by version number, and not previously rejected",
+            "candidate selection > [B2] the release list is read page by page until a short page",
+            "candidate selection > [B2] at most one advance per 24 hours",
+            "the hub's replay gate > [B2] all machines pass: the pin advances once, through the coordinator, with the release's sha256",
+            "the hub's replay gate > [B2] the pin does not advance again within 24 hours, and does after",
+            "the hub's replay gate > [B2] a part that differs on one member rejects the candidate, with its old and new numbers, and sends one notification naming it",
+            "the hub's replay gate > [B2] a rejected version is never retried, across checks and across a restart",
+            "the hub's replay gate > [B2] a candidate that crashes on replay on the hub holds the pin",
+            "the hub's replay gate > [B2] a member whose only trouble is a timed-out or refused design holds the pin by name and is not a rejection",
+            "the hub's replay gate > [B2] a member that hosts designs but did not compare against the pinned build holds the pin",
+            "the hub's replay gate > [B2] a report made against the wrong baseline is never a rejection, even when it says a part differs",
+            "the hub's replay gate > [B2] a committed design that is refused is notified once per version of the file, naming the design and the command",
+            "the hub's replay gate > [B2] a member that could not read its designs holds the pin, and is not remembered as hosting none",
+            "the hub's replay gate > [B2] a design already broken under the pinned build is reported and ignored for the decision",
+            "the hub's replay gate > [B2] a member that hosts designs and is unreachable holds the pin and is named; it is not a rejection",
+            "the hub's replay gate > [B2] an unreachable member known to host no designs does not hold the pin; one that never reported does",
+            "the hub's replay gate > [B2] a member that cannot install or replay the candidate holds the pin; one without the feature takes no part",
+            "the hub's replay gate > [B2] if the hub cannot install the candidate nothing is asked of the members and nothing is rejected",
+            "the hub's replay gate > [B2] a hub install that fails for a passing reason is retried with a growing wait, at most once in 24 hours, and the attempts are counted",
+            "the hub's replay gate > [B2] a candidate the hub refuses on verification is rejected with one notification and never downloaded again",
+            "the hub's replay gate > [B2] the rejected list is bounded: the newest 50 versions, each with at most 50 failures and a truncated flag",
+            "the hub's replay gate > [B2] GitHub unreachable: the check is skipped and the pin is unchanged",
+            "the hub's replay gate > [B2] an asset digest that disagrees with SHA256SUMS.txt is never evaluated",
+            "the hub's replay gate > [B2] a hub restart mid-evaluation leaves the pin and the rejected list untouched, and the next check starts from scratch",
+            "the hub's replay gate > [B2] the pin is not advanced if it changed while the candidate was being evaluated",
+            "the hub's replay gate > [B2] two checks at once run one evaluation",
+            "the hub's replay gate > [B2] with no pin recorded the candidate must be newer than the hub's local build, and the first pin is set by a passing evaluation",
+            "the hub's replay gate > [B2] 'Advance anyway' pins a rejected candidate, only that one, and only a newer one",
+            "the hub's replay gate > [B2] 'Advance anyway' also takes a held candidate, reports a failed pin change, and waits for a running check",
+            "the hub's replay gate > [B2] a daemon that keeps restarting mid-evaluation starts a check at most once an hour, not two minutes after every start",
+            "the hub's replay gate > [B2] the hub checks every 4 hours, and once soon after a start"
+          ]
+        },
+        {
+          "file": "test/unit/solidcraft-replay.test.ts",
+          "names": [
+            "reading an eval result > [B2] a feature error with exit code 0 counts as a failed replay",
+            "reading an eval result > [B2] a parameter error with exit code 0 counts as a failed replay",
+            "reading an eval result > [B2] a non-zero exit, a crash with no output and unreadable JSON are all failures",
+            "reading an eval result > [B2] older builds lack some keys: a result without params or timeline is read leniently",
+            "the comparison rule > [B2] edges, kernel, area, vertices and timings are ignored",
+            "the comparison rule > [B2] the volume tolerance is 1e-6 relative: at the boundary it is the same, just past it differs",
+            "the comparison rule > [B2] face count and body count are compared exactly, per body",
+            "the comparison rule > [B2] the bounding box is compared sorted, so the same solid facing another way is the same",
+            "the comparison rule > [B2] the four outcomes: same, differs with old and new numbers, candidate-error, baseline-broken",
+            "the comparison rule > [B2] a build that gave no verdict is inconclusive, whichever build it was: it holds the pin and rejects nothing",
+            "the comparison rule > [B2] the centre of mass is compared, so a hole that moved without changing volume, faces or extents is seen",
+            "the fake binary's eval subcommand > [B2] the fake eval prints the real JSON shape and follows the real exit codes",
+            "the fake binary's eval subcommand > [B2] the per-version table makes two fake builds genuinely differ, one part at a time",
+            "the screen and the sandbox > [B2] a design that carries a file-writing command is refused before any build sees it, and nothing outside is touched",
+            "the screen and the sandbox > [B2] with the screen bypassed, the sandbox alone stops a write outside its folder",
+            "the screen and the sandbox > [B2] the sandboxed build runs in a fresh folder holding only the script, with a throwaway HOME and exactly four environment variables",
+            "the screen and the sandbox > [B2] a build that cannot be started, hangs, or answers nonsense gives no verdict",
+            "the screen and the sandbox > [B2] a timed-out build is killed together with everything it started",
+            "replaying a machine's designs > [B2] identical builds give `same` for every part, with the numbers both produced",
+            "replaying a machine's designs > [B2] a part whose volume differs is `differs` with the old and new numbers; the others stay `same`",
+            "replaying a machine's designs > [B2] two builds that differ only in where a hole is are told apart by the centre of mass",
+            "replaying a machine's designs > [B2] a candidate build that crashes on replay counts as a failure for that part",
+            "replaying a machine's designs > [B2] a feature that fails only under the candidate, with exit code 0, is a candidate-error",
+            "replaying a machine's designs > [B2] a design that already fails under the pinned build is reported as baseline-broken and does not hold the pin",
+            "replaying a machine's designs > [B2] a pinned build that times out on a part holds the pin; it is not written off as broken under the pin",
+            "replaying a machine's designs > [B2] designs are read from origin/<defaultBase> after a fetch, never from the working checkout",
+            "replaying a machine's designs > [B2] with no remote the local <defaultBase> branch is read, still not the checkout",
+            "replaying a machine's designs > [B2] a ref that exists but cannot be listed or read holds the pin: a git failure is an error, not an empty repository",
+            "replaying a machine's designs > [B2] only cad/<part>/design.json is read: part.json, nested folders and other files are never copied or replayed",
+            "replaying a machine's designs > [B2] a design.json that is a symbolic link is skipped with a note, and one over 64 MB is refused without being read",
+            "replaying a machine's designs > [B2] designs in open session worktrees are replayed as advisory and never decide",
+            "replaying a machine's designs > [B2] a worktree design that is a symbolic link is skipped, and no refusal ever quotes a file's content",
+            "replaying a machine's designs > [B2] a large design made of text the screen must read does not stall the machine's replay",
+            "replaying a machine's designs > [B2] a replay that outlasts the per-design timeout is stopped and counts against the candidate",
+            "replaying a machine's designs > [B2] a machine's whole replay is bounded: designs not reached in time are reported, and the machine does not pass",
+            "replaying a machine's designs > [B2] at most `concurrency` designs are replayed at once",
+            "replaying a machine's designs > [B2] with no baseline build the designs are replayed under the candidate for errors only"
+          ]
+        },
+        {
+          "file": "test/web/settings-cad-gate.test.ts",
+          "names": [
+            "Settings → CAD card: replay gate > [B2] the last evaluation shows the candidate, when, the result and each machine's status",
+            "Settings → CAD card: replay gate > [B2] a held evaluation names the unreachable member on the card",
+            "Settings → CAD card: replay gate > [B2] per-part differences show the old and new numbers; broken-under-the-pin and advisory designs are listed apart",
+            "Settings → CAD card: replay gate > [B2] refused and inconclusive designs are listed by name as holding the pin without a verdict, and a failing hub install shows its retry count",
+            "Settings → CAD card: replay gate > [B2] 'Check now' asks the hub to check and repaints with what it did",
+            "Settings → CAD card: replay gate > [B2] 'Advance anyway' shows the differences first, and only advances on confirm",
+            "Settings → CAD card: replay gate > [B2] a refused 'Advance anyway' shows the hub's reason and leaves the pin as it was",
+            "Settings → CAD card: replay gate > [B2] with nothing evaluated yet, after an advance, and against a hub without the gate, the card says what is true"
+          ]
+        },
+        {
+          "file": "test/integration/solidcraft-b2-replay.test.ts",
+          "names": [
+            "Phase B2 acceptance > [B2] with releases 10, 30 and 50 hours old the 50-hour one is chosen; with only 10 and 30, none is",
+            "Phase B2 acceptance > [B2] part.json.measured deliberately stale: the candidate still passes, because the comparison is pinned build against candidate",
+            "Phase B2 acceptance > [B2] the local checkout is on a feature branch with a different design: the replay reads origin/<defaultBase>",
+            "Phase B2 acceptance > [B2] all parts identical: the pin advances once, and not again within 24 h",
+            "Phase B2 acceptance > [B2] one part's volume differs by more than its tolerance: the pin holds, the candidate is rejected with that part's old and new numbers, one notification is sent, and the next check does not retry it",
+            "Phase B2 acceptance > [B2] a member hosting designs is unreachable: the pin holds and the card names the member",
+            "Phase B2 acceptance > [B2] during evaluation the pinned build keeps serving sessions (the candidate is installed beside it)",
+            "Phase B2 surface > [B2] 'Advance anyway' through the hub route pins a rejected candidate across the fleet",
+            "Phase B2 surface > [B2] designs in an open session worktree are listed as advisory and do not hold the pin",
+            "Phase B2 surface > [B2] GitHub unreachable: the check is skipped and the pin is unchanged",
+            "Phase B2 surface > [B2] the member replay route installs the candidate beside the pin, reports, and leaves the pin alone",
+            "Phase B2 surface > [B2] a member that hosts designs but is not on the pin cannot pass by default: the pin holds until it has compared against the pinned build",
+            "Phase B2 surface > [B2] a committed design that carries a file-writing command is refused on the machine that hosts it, holds the pin by name, and writes nothing",
+            "Phase B2 surface > [B2] a candidate the hub cannot download is retried with a growing wait; one it refuses on verification is rejected once",
+            "Phase B2 surface > [B2] the new routes follow the managed-CLI posture, and are 404 without the solidcraft-pin feature"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/solidcraft-b2.test.ts",
+          "names": [
+            "[B2 real] a real exported plate script, read from origin/main of a real repository, replays to `same` under the pinned build and the candidate",
+            "[B2 real] a script whose fillet cannot be computed is a failed replay even though the real eval exits 0",
+            "[B2 real] a design carrying file-writing commands is refused and writes nothing outside the sandbox; with the screen bypassed the sandbox alone still stops the write",
+            "[B2 real] a script whose sketch text names a font file by path or environment reference is refused; with the screen bypassed the sandboxed build does not open the file"
+          ]
+        }
+      ]
     },
     "B3": {
       "title": "autopilot CAD",

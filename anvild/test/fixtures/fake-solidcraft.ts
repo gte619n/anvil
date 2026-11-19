@@ -96,6 +96,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { fakeReplayEntry } from "./fake-solidcraft-eval";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { deflateSync } from "node:zlib";
 
@@ -1613,6 +1614,8 @@ async function main(): Promise<void> {
     console.log(`solidcraft-cli ${VERSION}`);
     return;
   }
+  const replayExit = fakeReplayEntry(argv, { version: VERSION, volumeScale: VOLUME_SCALE, build, bboxOf });
+  if (replayExit) return void process.exit(await replayExit);
   if (argv[0] !== "mcp") {
     process.stderr.write("usage: fake-solidcraft mcp [--headless] [--compact] [--allow-path DIR]... [--require-allow-path] [--in design.sc|script.json]\n");
     process.exit(2);

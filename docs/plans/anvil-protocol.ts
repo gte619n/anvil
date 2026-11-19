@@ -766,6 +766,161 @@ export interface ClaudeCliStatusEvent extends Envelope {
   info: ClaudeCliInfo;
 }
 /**
+ * SolidCraft fleet pin (docs/plans/2026-11-19-agent-cad-and-browser.md §4.10). The hub records ONE
+ * build — a version plus the sha256 of its release zip — and every machine installs exactly that
+ * build, so no design is written by a build the rest of the fleet cannot read. Gated by the
+ * "solidcraft-pin" capability.
+ */
+export type SolidcraftSource = "env" | "managed" | "app";
+/** One exact SolidCraft build. */
+export interface SolidcraftPinRef {
+  version: string; // "0.44.1"
+  sha256: string; // sha256 of the release zip, lowercase hex
+  pinnedAt?: Iso8601; // when it became the pin
+}
+/** The fleet pin, as stored on the hub and applied verbatim by each member. */
+export interface SolidcraftPin {
+  version: string;
+  sha256: string;
+  pinnedAt: Iso8601;
+  previous?: SolidcraftPinRef; // the pin this one replaced — what "Pin back" returns to
+}
+export type SolidcraftMachineState =
+  | "unpinned" // no pin recorded; whatever build is installed is used
+  | "installing" // applying the pin
+  | "ready" // running exactly the pinned version
+  | "error"; // a pin is recorded and this machine is not on it
+/** One machine's SolidCraft build and where it stands against the pin. */
+export interface SolidcraftMachineStatus {
+  state: SolidcraftMachineState;
+  version?: string; // the build this machine would run now (absent: none found, or unreadable)
+  source?: SolidcraftSource; // env override, managed install, or the app bundle a person installed
+  pinned?: string; // the pinned version this machine last applied
+  available: boolean; // may CAD run here right now (spec §4.8)
+  reason?: string; // why not, when `available` is false
+  error?: string; // the last install failure, human-readable
+  failure?: string; // …and its typed reason ("sha-mismatch", "wrong-team", "not-notarized", …)
+}
+/** A design already rewritten by the newer build — listed as the "Pin back" warning. */
+export interface SolidcraftRewrittenDesign {
+  part: string;
+  version: string; // the SolidCraft version that last wrote it (`measured.solidcraft`)
+  environment?: string;
+  path?: string;
+  serverName?: string;
+}
+/**
+ * Replay gate (spec §4.10, §4.14 item 17). Before the pin moves to a newer build, every machine
+ * replays the designs it hosts under BOTH the pinned build and the candidate and compares the two
+ * results: body count, per-body face count, volume (1e-6 relative) and the sorted bounding box.
+ */
+export type SolidcraftReplayOutcome =
+  | "same" // both builds replay it to the same geometry
+  | "differs" // both replay it, to different geometry — holds the pin
+  | "candidate-error" // replays under the pin, fails under the candidate — holds the pin
+  | "baseline-broken" // the pinned build ran it and reported feature errors — reported, ignored for the decision
+  | "refused" // the script is not a plain design script (script-screen); never replayed — holds the pin
+  | "inconclusive"; // a build could not be run, crashed or timed out on it — holds the pin, retried
+export interface SolidcraftReplayDifference {
+  field: "body_count" | "faces" | "volume_mm3" | "bbox" | "center_of_mass";
+  body?: string; // the body it concerns (absent for body_count)
+  old: number | number[]; // under the pinned build
+  new: number | number[]; // under the candidate
+}
+/** The numbers one build produced for one design. */
+export interface SolidcraftReplayNumbers {
+  body_count: number;
+  faces: number; // summed over bodies
+  volume_mm3: number; // summed over bodies
+}
+export interface SolidcraftReplayPart {
+  part: string; // the folder name under cad/
+  environment: string; // environment name
+  path: string; // "cad/<part>/design.json"
+  ref?: string; // the git ref it was read from, e.g. "origin/main" (absent for a worktree)
+  worktree?: string; // set for an advisory entry: the session worktree it was read from
+  outcome: SolidcraftReplayOutcome;
+  differences?: SolidcraftReplayDifference[]; // when `differs`
+  old?: SolidcraftReplayNumbers; // under the pinned build, when it replayed
+  new?: SolidcraftReplayNumbers; // under the candidate, when it replayed
+  error?: string; // the candidate's failure, the pinned build's (`baseline-broken`), or why it was refused / inconclusive
+  sha?: string; // sha256 of the design file as read (so a refusal is notified once per version of the file)
+}
+/** One machine's replay of everything it hosts. */
+export interface SolidcraftReplayReport {
+  candidate: string; // candidate version
+  baseline?: string; // the version compared against; absent ⇒ no baseline build, replayed for errors only
+  hostsDesigns: boolean; // at least one cad/<part>/design.json on a default branch here
+  pass: boolean; // no part holds the pin and `errors` is empty
+  parts: SolidcraftReplayPart[]; // from each environment's default branch — these decide
+  advisory: SolidcraftReplayPart[]; // from open session worktrees — listed, never hold the pin
+  notes: string[]; // environments skipped and why, fetch problems, …
+  errors: string[]; // what could NOT be read or replayed (a git failure, time ran out) — holds the pin
+}
+export type SolidcraftGateMachineState =
+  | "pass"
+  | "fail" // a part differs or errors under the candidate — rejects the candidate
+  | "held" // a part was refused or inconclusive, or the machine compared against the wrong build — retried
+  | "no-designs" // reachable, hosts no designs
+  | "unreachable" // could not be asked; holds the pin if it hosts (or may host) designs
+  | "unsupported" // does not advertise "solidcraft-pin"; takes no part
+  | "error"; // answered, but could not install the candidate or replay
+export interface SolidcraftGateMachine {
+  serverId: string;
+  serverName: string;
+  isHub: boolean;
+  state: SolidcraftGateMachineState;
+  holds: boolean; // this machine is a reason the pin did not move
+  detail?: string;
+  report?: SolidcraftReplayReport;
+}
+export type SolidcraftEvaluationResult =
+  | "advanced" // every machine that hosts designs passed; the pin moved
+  | "rejected" // a part differs or errors under the candidate; never retried
+  | "held" // could not be decided (a machine unreachable or in error); retried on the next check
+  | "error"; // the hub could not install the candidate or move the pin
+/** One evaluation of one candidate across the fleet. */
+export interface SolidcraftEvaluation {
+  candidate: SolidcraftPinRef;
+  baseline?: string; // the pinned version it was compared against
+  startedAt: Iso8601;
+  finishedAt: Iso8601;
+  result: SolidcraftEvaluationResult;
+  detail: string; // one sentence a person can read
+  machines: SolidcraftGateMachine[];
+  advancedAnyway?: Iso8601; // the owner advanced it by hand after seeing the differences
+}
+/** A candidate the gate turned down. It is never evaluated again. */
+export interface SolidcraftRejectedCandidate {
+  version: string;
+  sha256: string;
+  rejectedAt: Iso8601;
+  reason: string;
+  failures: (SolidcraftReplayPart & { serverName: string })[]; // at most 50
+  failuresTruncated?: boolean; // there were more than are listed
+}
+/** What the last candidate check did. */
+export interface SolidcraftCandidateCheck {
+  at: Iso8601;
+  outcome:
+    | "advanced"
+    | "rejected"
+    | "held"
+    | "error"
+    | "none" // no release qualifies (too young, not newer, a prerelease, or already rejected)
+    | "rate-limited" // the pin already advanced within the last 24 h
+    | "backoff" // the candidate could not be installed on the hub recently; waiting before the next try
+    | "skipped"; // GitHub could not be read
+  detail: string;
+  version?: string; // the candidate it concerned, if any
+}
+/** This daemon's pin status: sent on connect, on change, and as the reply to `solidcraft.status.get`. */
+export interface SolidcraftStatusEvent extends Envelope {
+  type: "solidcraft.status";
+  pin?: SolidcraftPin;
+  local: SolidcraftMachineStatus;
+}
+/**
  * First frame the server sends on every WS connection (before session.list/budget/
  * environments) — tells the client which server it just connected to (anvil-multi-server.md
  * §3/§6). A client federating many servers keys each socket's sessions/environments by
@@ -1618,6 +1773,7 @@ export type ServerEvent =
   | CadPartsListResultEvent
   | CadParamSetResultEvent
   | ClaudeCliStatusEvent
+  | SolidcraftStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
   | LapoStatusEvent
@@ -2259,6 +2415,13 @@ export interface ClaudeCliCheckCmd extends Envelope, Correlated {
   type: "claudecli.check";
 }
 
+// Ask this daemon for its SolidCraft pin status (Settings → CAD). Replies with a fresh
+// `solidcraft.status` on the requester's socket, then an ack. Read-only: setting the pin and pinning
+// back are REST calls on the hub. Gated by "solidcraft-pin".
+export interface SolidcraftStatusGetCmd extends Envelope, Correlated {
+  type: "solidcraft.status.get";
+}
+
 // 5d. Terminal (§7)
 
 export interface TerminalOpenCmd extends Envelope, Correlated {
@@ -2422,6 +2585,7 @@ export type ClientCommand =
   | DaemonUpdateCmd
   | ModelRefreshCmd
   | ClaudeCliCheckCmd
+  | SolidcraftStatusGetCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd
@@ -2740,6 +2904,131 @@ export namespace rest {
       ok: boolean;
       active: boolean;
       version: string; // last/current pinned target ("" if never run)
+      startedAt?: number;
+      finishedAt?: number;
+      members: Member[];
+    }
+  }
+
+  /**
+   * SolidCraft fleet pin (docs/plans/2026-11-19-agent-cad-and-browser.md §4.10). Per-daemon status
+   * and apply; hub-driven set / pin back with per-machine status. Same posture as `claudecli`:
+   * identity-gated, JSON content type on POSTs. Every route answers 404 unless the daemon runs with
+   * the "solidcraft-pin" feature.
+   */
+  export namespace solidcraft {
+    /** GET /api/solidcraft/status → this daemon's pin and build. */
+    export interface StatusResponse {
+      ok: boolean;
+      pin?: SolidcraftPin;
+      local: SolidcraftMachineStatus;
+      error?: string;
+    }
+    /** POST /api/solidcraft/pin/apply → install exactly this pin on THIS daemon (sent by the hub). */
+    export interface ApplyRequest {
+      pin: SolidcraftPin;
+      keep?: string[]; // extra versions to keep on disk (the candidate under evaluation)
+    }
+    export interface ApplyResponse {
+      ok: boolean; // true only when this machine ended up `ready` on the pin
+      pin?: SolidcraftPin;
+      local: SolidcraftMachineStatus;
+      error?: string;
+    }
+
+    // ── Hub ──────────────────────────────────────────────────────────────────────────────────
+    export type MemberState =
+      | "pending" // queued, not yet contacted
+      | "pending-offline" // unreachable — re-applied when it is back
+      | "unsupported" // reachable, but does not advertise "solidcraft-pin"
+      | "installing"
+      | "ready" // on the pinned version
+      | "unpinned" // no pin recorded there
+      | "error"; // not on the pin
+    export interface Member {
+      serverId: string;
+      serverName: string;
+      isHub: boolean;
+      state: MemberState;
+      version?: string;
+      source?: SolidcraftSource;
+      pinned?: string;
+      available?: boolean;
+      detail?: string; // error text, "offline", …
+    }
+    /** POST /api/fleet/solidcraft/pin → set the pin and fan it out. */
+    export interface SetPinRequest {
+      version: string;
+      sha256?: string; // omit ⇒ the hub reads it from the GitHub release (asset digest = SHA256SUMS line)
+    }
+    export interface SetPinResponse {
+      ok: boolean;
+      pin?: SolidcraftPin; // the pin now in force (unchanged when `ok` is false)
+      members: Member[];
+      error?: string;
+      failure?: string; // typed install failure on the hub, when that is why the pin was refused
+    }
+    /** GET /api/fleet/solidcraft/pin/back → what "Pin back" would do, and its warning list. */
+    export interface PinBackPreviewResponse {
+      ok: boolean;
+      current?: SolidcraftPinRef;
+      previous?: SolidcraftPinRef;
+      rewritten: SolidcraftRewrittenDesign[]; // designs the newer build already rewrote; may not open
+      listError?: string; // the list could not be built; treat it as incomplete
+      listUnavailable?: boolean; // no design store is connected: the list is unknown, NOT empty
+      error?: string;
+    }
+    /** POST /api/fleet/solidcraft/pin/back {} → pin back to `previous` and fan out. */
+    export interface PinBackResponse extends SetPinResponse {
+      rewritten: SolidcraftRewrittenDesign[];
+      listError?: string;
+      listUnavailable?: boolean;
+    }
+    // ── Replay gate (Phase B2) ───────────────────────────────────────────────────────────────
+    /** POST /api/solidcraft/replay → install the candidate BESIDE the pinned build on THIS daemon,
+     *  replay every hosted design under both, and report (sent by the hub). */
+    export interface ReplayRequest {
+      candidate: { version: string; sha256: string };
+      pin?: { version: string; sha256: string }; // the build to compare against (the hub's pin)
+    }
+    export interface ReplayResponse {
+      ok: boolean; // the replay ran (whatever it found); false ⇒ `error`
+      report?: SolidcraftReplayReport;
+      error?: string;
+    }
+    /** GET /api/fleet/solidcraft/candidate → the replay gate's state (Settings → CAD). */
+    export interface CandidateStatusResponse {
+      ok: boolean;
+      evaluating?: { version: string; startedAt: Iso8601 }; // an evaluation is running now
+      lastCheck?: SolidcraftCandidateCheck;
+      lastEvaluation?: SolidcraftEvaluation;
+      rejected: SolidcraftRejectedCandidate[];
+      lastAdvanceAt?: Iso8601; // the last pin advance through the gate (at most one per 24 h)
+      nextAdvanceAllowedAt?: Iso8601;
+      interrupted?: string; // an evaluation was cut short by a restart; it starts again on the next check
+      /** The hub could not install this candidate (a download or network failure). It is tried again,
+       *  each time after a longer wait, at most once in 24 hours. */
+      retry?: { version: string; attempts: number; nextAt: Iso8601; reason: string };
+    }
+    /** POST /api/fleet/solidcraft/candidate/check {} → "Check now": list releases, evaluate, decide. */
+    export interface CandidateCheckResponse extends CandidateStatusResponse {
+      check?: SolidcraftCandidateCheck; // what this check did
+      error?: string;
+    }
+    /** POST /api/fleet/solidcraft/candidate/advance → "Advance anyway": pin a held or rejected
+     *  candidate, after the owner has seen its differences. */
+    export interface AdvanceAnywayRequest {
+      version: string;
+    }
+    export interface AdvanceAnywayResponse extends CandidateStatusResponse {
+      pin?: SolidcraftPin;
+      error?: string;
+    }
+    /** GET /api/fleet/solidcraft/status[?refresh=1] → the pin and every machine's standing. */
+    export interface FleetStatusResponse {
+      ok: boolean;
+      active: boolean; // a fan-out is in progress
+      pin?: SolidcraftPin;
       startedAt?: number;
       finishedAt?: number;
       members: Member[];

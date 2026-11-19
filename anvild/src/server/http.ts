@@ -33,6 +33,7 @@ import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
 import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } from "./fleet-rollout";
 import { FleetCliRolloutCoordinator, httpMemberCliClient } from "./fleet-cli-rollout";
 import { resolveLatest as resolveLatestCli } from "../daemon/claude-cli";
+import { mountSolidcraft, type SolidcraftTestHooks } from "./fleet-solidcraft";
 import { FleetJobs } from "./fleet-jobs";
 import { resolveTargetSha } from "../daemon/selfupdate";
 import { FileExists, FileNotFound } from "../fs/session-fs";
@@ -168,6 +169,9 @@ export interface ServerOptions {
   /** Enabled opt-in features (`Config.features`, from `ANVIL_FEATURES`). Each is advertised as a
    *  capability via `serverCapabilities`; omitted (tests) ⇒ the base capability list only. */
   features?: string[];
+  /** Test-only overrides for the SolidCraft pin's downloader, verifier and release lookup. Production
+   *  omits it. Ignored unless `features` lists "solidcraft-pin". */
+  solidcraft?: SolidcraftTestHooks;
   /** [BE2-15] Test-only injection of the fleet fan-out network calls (rotate/invite jobs), so the job
    *  guard tests can simulate a slow/unreachable member deterministically. Production omits it and
    *  gets the real implementations from ./fleet. */
@@ -515,6 +519,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
         for (const ev of supervisor.cadwork.designEvents()) ws.send(JSON.stringify(ev));
         for (const ev of supervisor.cadwork.pendingCardEvents()) ws.send(JSON.stringify(ev));
       }
+      // Settings → CAD card ("solidcraft-pin" only). Async: a non-managed build is asked its version.
+      if (solidcraft) void solidcraft.statusEvent().then((e) => void ws.send(JSON.stringify(e))).catch(() => {});
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
@@ -533,7 +539,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     message(ws: ServerWebSocket<ConnState>, message: string | Buffer) {
       const raw = typeof message === "string" ? message : message.toString("utf8");
-      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist });
+      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist, solidcraftStatus: solidcraft?.statusEvent });
     },
   };
 
@@ -739,6 +745,23 @@ export function createServer(opts: ServerOptions): ServerHandle {
       const error = e instanceof Error ? e.message : String(e);
       return Response.json({ ok: false, info: supervisor.claudeCliInfo(), output: error, error } satisfies rest.claudecli.InstallResponse, { status: 500 });
     }
+  });
+
+  // ── SolidCraft fleet pin (agent-cad-and-browser spec §4.10) ───────────────────────────────────
+  // Everything lives in ./fleet-solidcraft.ts; undefined (and no routes) unless "solidcraft-pin" is on.
+  const solidcraft = mountSolidcraft({
+    stateDir: opts.stateDir,
+    features: opts.features,
+    hooks: opts.solidcraft,
+    self: { serverId: identity.serverId, serverName: identity.serverName },
+    members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName, url: m.url })),
+    // Replay gate (Phase B2): what this machine hosts, its open worktrees (advisory), and who checks.
+    environments: () => supervisor.environmentsEvent().environments.map((e) => ({ name: e.name, repoRoot: e.repoRoot, defaultBase: e.defaultBase })),
+    worktrees: () => supervisor.list().filter((s) => s.worktree && !s.archived).map((s) => ({ path: s.cwd, label: s.title || s.worktree!.branch })),
+    notify: (title, body, tag) => supervisor.pushSystemAlert(title, body, tag),
+    isHub: () => !pairedHub.get(),
+    broadcast: (event) => registry.toAll(event),
+    route,
   });
 
   // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
@@ -1630,8 +1653,12 @@ export function createServer(opts: ServerOptions): ServerHandle {
   return {
     port: server.port ?? opts.port,
     supervisor,
-    stop: () => server.stop(true),
+    stop: () => {
+      solidcraft?.stop();
+      server.stop(true);
+    },
     shutdown: async () => {
+      solidcraft?.stop();
       await supervisor.shutdown();
       server.stop(true);
     },
