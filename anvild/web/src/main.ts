@@ -1785,12 +1785,19 @@ const cadCards = createCadCards({
   container: () => conversation,
   respond: (url, requestId, approve, values) => {
     const srv = serverByUrl(url) ?? hub();
-    // A dimensions card's numbers are checked again by the daemon; a refusal comes back as an error.
-    void sendAwait(srv, { type: "cad.expectations.respond", cid: newCid(), requestId, approve, ...(values ? { values } : {}) }, 30_000)
-      .then((res) => {
-        if (res.type === "command.error") toast(res.message);
-      })
-      .catch(() => undefined);
+    // A dimensions card's numbers are checked again by the daemon; a refusal comes back as an error,
+    // which a dimensions card shows inline (re-enabling its buttons); other cards toast it.
+    return sendAwait(srv, { type: "cad.expectations.respond", cid: newCid(), requestId, approve, ...(values ? { values } : {}) }, 30_000).then(
+      (res) => {
+        if (res.type !== "command.error") return undefined;
+        if (!values) toast(res.message);
+        return res.message;
+      },
+      (e) => {
+        if (!values) return undefined;
+        throw e;
+      },
+    );
   },
   release: (url, ev) => {
     const srv = serverByUrl(url) ?? hub();

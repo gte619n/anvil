@@ -558,7 +558,8 @@
             "[A4] the part card shows the thumbnail from the preview route, Release while passing (sending cad.release.request), and the Released badge only when the event says the pack verified",
             "[A4] a gap is shown with its text and a Clear gap button (sending cad.gap.clear); the script size shows only above 5 MB; a concept's picture score is an advisory line",
             "[A4] the dimensions card has a numeric input per dimension, prefilled with the proposal; Submit sends the owner's typed numbers, a non-number is caught before sending, Deny sends a denial",
-            "[A4] the release card shows expected and measured numbers and says prominently when the numbers are the agent's; Approve / Deny only"
+            "[A4] the release card shows expected and measured numbers and says prominently when the numbers are the agent's; Approve / Deny only",
+            "[A4] a refused dimensions submission re-enables Submit and Deny and shows the daemon's message inline; a fixed resubmission is sent"
           ]
         },
         {

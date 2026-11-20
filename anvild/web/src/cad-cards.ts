@@ -30,8 +30,10 @@ export interface CadCardsDeps {
   active(): { sessionId: string; url: string } | undefined;
   /** The conversation pane. */
   container(): HTMLElement;
-  /** Send `cad.expectations.respond` to the server the card came from (`values`: a dimensions card). */
-  respond(url: string, requestId: string, approve: boolean, values?: Record<string, number>): void;
+  /** Send `cad.expectations.respond` to the server the card came from (`values`: a dimensions card).
+   *  May return a promise of the daemon's refusal message (undefined when accepted): a refused
+   *  dimensions card re-enables its buttons and shows the message inline (decision 145). */
+  respond(url: string, requestId: string, approve: boolean, values?: Record<string, number>): void | Promise<string | undefined>;
   /** "Release" on a passing part card: send `cad.release.request` (the daemon raises the release card). */
   release?(url: string, ev: CadDesignEvent): void;
   /** "Clear gap": send `cad.gap.clear`. */
@@ -249,8 +251,27 @@ export function createCadCards(deps: CadCardsDeps) {
     deny.type = "button";
     btns.append(submit, deny);
     form.append(err, btns);
-    const lock = (): void => {
-      for (const x of btns.querySelectorAll("button")) (x as HTMLButtonElement).disabled = true;
+    const lock = (on = true): void => {
+      for (const x of btns.querySelectorAll("button")) (x as HTMLButtonElement).disabled = on;
+    };
+    /** The daemon refused (bad numbers, or it could not be reached): the card stays open, so let the
+     *  owner fix it and try again — unless the card was retired meanwhile. */
+    const onRefusal = (sent: void | Promise<string | undefined>): void => {
+      if (!sent) return;
+      void sent.then(
+        (message) => {
+          if (!message || card.classList.contains("resolved")) return;
+          err.textContent = message;
+          err.hidden = false;
+          lock(false);
+        },
+        () => {
+          if (card.classList.contains("resolved")) return;
+          err.textContent = "Couldn't reach the server — try again.";
+          err.hidden = false;
+          lock(false);
+        },
+      );
     };
     form.onsubmit = (e) => {
       e.preventDefault();
@@ -267,11 +288,11 @@ export function createCadCards(deps: CadCardsDeps) {
       }
       err.hidden = true;
       lock();
-      deps.respond(url, ev.requestId, true, values);
+      onRefusal(deps.respond(url, ev.requestId, true, values));
     };
     deny.onclick = () => {
       lock();
-      deps.respond(url, ev.requestId, false);
+      onRefusal(deps.respond(url, ev.requestId, false));
     };
     card.append(form);
   }
