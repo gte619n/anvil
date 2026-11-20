@@ -145,13 +145,28 @@ export async function downloadPart(startUrl: string, maxBytes: number, destFor: 
         if (failed) return;
         failed = true;
         res.destroy();
+        const unlink = (): void => {
+          try {
+            unlinkSync(path);
+          } catch {
+            /* not created */
+          }
+        };
+        // The stream opens its file asynchronously: an abort before the open finished would unlink
+        // nothing and the open would then create the file. So delete again once it has closed, and
+        // report the failure only then (a close that never comes still fails after 2 s).
+        let settled = false;
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          unlink();
+          fail(err);
+        };
+        unlink();
+        out.once("close", finish);
+        setTimeout(finish, 2000).unref?.();
         out.destroy();
-        try {
-          unlinkSync(path);
-        } catch {
-          /* not created */
-        }
-        fail(err);
+        if (out.closed) finish();
       };
       res.on("data", (chunk: Buffer) => {
         n += chunk.length;

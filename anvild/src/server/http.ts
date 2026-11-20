@@ -243,6 +243,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adversarialProvider: opts.adversarialProvider,
       refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
       fleet: conciergeFleet,
+      fleetHosts: () => fleet.hosts(),
       features: opts.features,
     },
     registry,

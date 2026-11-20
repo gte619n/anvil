@@ -77,7 +77,12 @@ export async function vendorCall(
   throw new PartSourceError("http", `${label}: HTTP ${res.status}${snippet ? ` (${snippet})` : ""}`);
 }
 
-/** An https URL as given, `//host/…` made https; anything else (http, junk) is dropped. */
+/**
+ * A vendor-supplied link, normalized: an http or https URL is kept (as `URL.href`), a
+ * protocol-relative `//host/…` is made https, and anything else (another scheme, junk) is dropped.
+ * It does NOT drop plain http — a result may show an http datasheet link; `parts_fetch` is what
+ * refuses to fetch anything but https.
+ */
 export function httpsUrl(raw: unknown): string | undefined {
   if (typeof raw !== "string" || !raw.trim()) return undefined;
   const t = raw.trim();

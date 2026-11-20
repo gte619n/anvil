@@ -4,6 +4,7 @@
  * reports failures as a `PartSourceError` whose message never contains a key.
  */
 import type { PartSourceId } from "@protocol";
+import type { DailyCounter } from "./ratelimit";
 
 export type { PartSourceId };
 
@@ -58,6 +59,8 @@ export interface PartSource {
   search(query: string, opts: PartSearchOpts): Promise<PartResult[]>;
   /** One cheap authenticated call (Settings' "Test" button). Resolves with what it proved. */
   test(): Promise<string>;
+  /** Every credential it holds right now — its keys and any access token it was issued — for scrubbing. */
+  secrets(): string[];
 }
 
 /** What every connector is built with. `fetch` and `now` are the test seams. */
@@ -72,6 +75,8 @@ export interface ConnectorDeps {
   timeoutMs?: number;
   /** Sleep between TraceParts polls (injectable for tests). */
   sleep?: (ms: number) => Promise<void>;
+  /** The persisted calendar-day counts the daily quotas use (in memory only when absent). */
+  daily?: DailyCounter;
 }
 
 export const DEFAULT_TIMEOUT_MS = 20_000;

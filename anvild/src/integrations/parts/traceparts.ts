@@ -65,7 +65,7 @@ export class TracePartsSource implements PartSource {
     if (!tenantUid || !apiKey || !email) throw new PartSourceError("not-configured", `${LABEL} is not configured (tenant UID, API key and request email)`);
     return { tenantUid, apiKey, email };
   }
-  private secrets(): string[] {
+  secrets(): string[] {
     const k = this.deps.keys();
     return [k.TRACEPARTS_TENANT_UID, k.TRACEPARTS_API_KEY, k.TRACEPARTS_EMAIL, this.token?.value].filter((x): x is string => !!x);
   }

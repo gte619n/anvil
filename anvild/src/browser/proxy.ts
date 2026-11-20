@@ -70,6 +70,7 @@ function v4BlockReason(b: readonly number[]): string | undefined {
   if (a === 192 && c === 168) return "a private address (192.168.0.0/16)";
   if (a === 169 && c === 254) return "a link-local address";
   if (a === 100 && c >= 64 && c <= 127) return "a tailnet / carrier-NAT address (100.64.0.0/10)";
+  if (a === 198 && (c === 18 || c === 19)) return "a benchmarking address (198.18.0.0/15)";
   if (a >= 224) return "a multicast or reserved address";
   return undefined;
 }
@@ -77,8 +78,11 @@ function v4BlockReason(b: readonly number[]): string | undefined {
 /**
  * Why the browser may not connect to `ip`, or undefined when it may. Covers loopback (127/8, ::1),
  * RFC 1918, link-local (169.254/16, fe80::/10), carrier NAT / tailnet 100.64/10, unique-local
- * fc00::/7 (which contains Tailscale's fd7a:115c:a1e0::/48), the unspecified addresses, multicast,
- * and any IPv6 form that embeds one of those IPv4 addresses (v4-mapped, v4-compatible, NAT64). An
+ * fc00::/7 (which contains Tailscale's fd7a:115c:a1e0::/48), the benchmarking range 198.18/15, the
+ * unspecified addresses, multicast, and any IPv6 form that embeds one of those IPv4 addresses
+ * (v4-mapped, v4-compatible, NAT64). All of 6to4 (2002::/16) is blocked, not only the prefixes that
+ * embed a blocked IPv4: a 6to4 address with a PUBLIC embedded IPv4 is a LAN behind that address's 6to4
+ * router (this network's own, too), and 6to4 is deprecated (RFC 7526), so no real site needs it. An
  * address that cannot be parsed is blocked.
  */
 export function blockedAddressReason(ip: string): string | undefined {
@@ -92,6 +96,10 @@ export function blockedAddressReason(ip: string): string | undefined {
   if (zeros(0, 10) && b[10] === 0xff && b[11] === 0xff) return v4BlockReason(b.slice(12)); // ::ffff:a.b.c.d
   if (zeros(0, 12)) return v4BlockReason(b.slice(12)) ?? "an IPv4-compatible address"; // ::a.b.c.d (deprecated)
   if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && zeros(4, 12)) return v4BlockReason(b.slice(12)); // NAT64
+  if (b[0] === 0x20 && b[1] === 0x02) {
+    const inner = v4BlockReason(b.slice(2, 6));
+    return `a 6to4 address (2002::/16)${inner ? ` embedding ${b.slice(2, 6).join(".")}, ${inner}` : ""}`;
+  }
   if (b[0] === 0xfe && (b[1]! & 0xc0) === 0x80) return "a link-local address";
   if ((b[0]! & 0xfe) === 0xfc) return "a unique-local address (fc00::/7, which includes the tailnet)";
   if (b[0] === 0xff) return "a multicast address";

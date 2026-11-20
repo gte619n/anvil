@@ -14,6 +14,7 @@ import { downloadPart, type PartDownloadDeps } from "./download";
 import { redact } from "./http";
 import { ALL_PART_KEY_NAMES, PART_SOURCE_IDS, PART_SOURCE_LABELS, PartKeyStore, isPartSourceId } from "./keys";
 import { MouserSource } from "./mouser";
+import { DailyCounter } from "./ratelimit";
 import { TracePartsSource } from "./traceparts";
 import { PartSourceError, type ConnectorDeps, type PartResult, type PartSource } from "./types";
 
@@ -22,10 +23,15 @@ export const PARTS_MAX_LIMIT = 20;
 /** URLs remembered per session (oldest dropped first). */
 const MAX_REMEMBERED = 2000;
 const OUTPUT_DIRNAME = ".anvil-browser"; // where quarantineFile takes files from (browser/downloads.ts)
+/** The daily quotas' calendar-day counts, in the daemon's state dir (see `DailyCounter`). */
+export const PARTS_RATELIMIT_FILE = "parts-ratelimit.json";
 
 export interface PartsServiceDeps {
   /** The env file the keys are stored in (the launcher's, or a test's). */
   envFile: string;
+  /** The daemon's state dir: the daily quotas are counted in `<stateDir>/parts-ratelimit.json` so a
+   *  restart does not refill them. Absent (unit tests only), they are counted in memory. */
+  stateDir?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -65,7 +71,9 @@ export class PartsService {
 
   constructor(private readonly deps: PartsServiceDeps) {
     this.keys = new PartKeyStore(deps.envFile);
+    const daily = new DailyCounter(deps.stateDir ? join(deps.stateDir, PARTS_RATELIMIT_FILE) : undefined, deps.now ?? Date.now);
     const base = (id: PartSourceId): ConnectorDeps => ({
+      daily,
       fetch: deps.fetchImpl ?? fetch,
       now: deps.now ?? Date.now,
       sleep: deps.sleep,
@@ -87,12 +95,38 @@ export class PartsService {
     return this.sources.some((s) => s.configured());
   }
 
-  /** Every key value, for scrubbing text that leaves the daemon. */
+  /** Every key value (as stored and trimmed) and every access token a connector holds, for scrubbing
+   *  anything that leaves the daemon. */
   private secrets(): string[] {
-    return ALL_PART_KEY_NAMES.map((n) => this.keys.get(n)).filter((x): x is string => !!x);
+    const all = [...ALL_PART_KEY_NAMES.map((n) => this.keys.get(n)), ...this.sources.flatMap((s) => s.secrets())];
+    return [...new Set(all.flatMap((x) => (x ? [x, x.trim()] : [])).filter(Boolean))];
   }
   private scrub(text: string): string {
     return redact(text, this.secrets());
+  }
+
+  /**
+   * A result as the model may see it: every string field scrubbed of every secret. A link that
+   * carried one is dropped rather than rewritten — a scrubbed URL is not the vendor's URL, and a link
+   * that embeds a credential is not one `parts_fetch` should be handed.
+   */
+  private scrubResult(r: PartResult, secrets: readonly string[]): PartResult {
+    const s = (t: string): string => redact(t, secrets);
+    const link = (u: string | undefined): string | undefined => (u !== undefined && s(u) === u ? u : undefined);
+    const datasheetUrl = link(r.datasheetUrl);
+    const productUrl = link(r.productUrl);
+    const modelUrls = r.modelUrls?.flatMap((m) => (link(m.url) ? [{ format: s(m.format), url: m.url }] : []));
+    return {
+      source: r.source,
+      manufacturer: s(r.manufacturer),
+      mpn: s(r.mpn),
+      description: s(r.description),
+      ...(datasheetUrl ? { datasheetUrl } : {}),
+      ...(modelUrls?.length ? { modelUrls } : {}),
+      ...(productUrl ? { productUrl } : {}),
+      ...(typeof r.stock === "number" ? { stock: r.stock } : {}),
+      attribution: s(r.attribution),
+    };
   }
 
   // ── Settings ────────────────────────────────────────────────────────────────────────────────
@@ -180,8 +214,11 @@ export class PartsService {
       else await run(this.traceparts, { candidates });
       results.push(...(bySource.get("traceparts") ?? []));
     }
-    this.remember(sessionId, results);
-    return { results, notes };
+    // Scrubbed after every source has answered, so the tokens they were issued on the way are known.
+    const secrets = this.secrets();
+    const clean = results.map((r) => this.scrubResult(r, secrets));
+    this.remember(sessionId, clean);
+    return { results: clean, notes: notes.map((n) => redact(n, secrets)) };
   }
 
   private remember(sessionId: string, results: readonly PartResult[]): void {

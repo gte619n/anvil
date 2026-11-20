@@ -23,6 +23,20 @@ export class FleetStore {
     return [...this.members];
   }
 
+  /** Every member's host and URL hostname (what network vetting refuses: the proxy, parts_fetch). */
+  hosts(): string[] {
+    const out = new Set<string>();
+    for (const m of this.members) {
+      if (m.host) out.add(m.host);
+      try {
+        if (m.url) out.add(new URL(m.url).hostname);
+      } catch {
+        /* not a URL */
+      }
+    }
+    return [...out].filter(Boolean);
+  }
+
   /** Add or update a member (keyed by serverId; also dedups by host). */
   upsert(m: rest.FleetMember): void {
     this.members = this.members.filter((x) => x.serverId !== m.serverId && x.host !== m.host);

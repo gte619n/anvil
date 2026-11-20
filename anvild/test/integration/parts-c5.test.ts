@@ -15,9 +15,13 @@ import { PARTS_FETCH_TOOL_ID, PARTS_MCP_SERVER_NAME, PARTS_SEARCH_TOOL_ID, PARTS
 import { rotateToken } from "../../src/server/fleet";
 import { createServer } from "../../src/server/http";
 import { PartKeyStore } from "../../src/integrations/parts/keys";
+import { PARTS_RATELIMIT_FILE } from "../../src/integrations/parts/service";
+import { isReadOnly } from "../../src/agent/danger-list";
+import { FleetStore } from "../../src/fleet/store";
+import { Supervisor } from "../../src/session/supervisor";
 import { loadServerIdentity } from "../../src/server/identity";
 import type { Session } from "../../src/session/session";
-import { callHook, isPending, mcpRig, parked, type McpRig } from "../helpers/mcp";
+import { RecordingRegistry, callHook, isPending, mcpRig, parked, type McpRig } from "../helpers/mcp";
 import { KEYS, SECRET_VALUES, STEP_BYTES, baseUrls, fixtureResolver, startFileFixture, startVendorFixture, type FileFixture, type VendorFixture } from "../helpers/parts";
 
 let fx: VendorFixture;
@@ -234,7 +238,8 @@ describe("tools, permissions and keys", () => {
     const s = await rig.session({ cwd: worktree });
     const d = driverOf(s);
     expect(Object.keys(d.mcpServers ?? {})).toEqual([PARTS_MCP_SERVER_NAME]);
-    expect(d.extraAllowedTools).toEqual([PARTS_SEARCH_TOOL_ID]);
+    expect(d.extraAllowedTools ?? []).not.toContain(PARTS_SEARCH_TOOL_ID); // spec §6: no allowedTools entry for integration tools
+    expect(d.extraAllowedTools ?? []).not.toContain(PARTS_FETCH_TOOL_ID);
     expect(d.systemPrompt().append).toContain(PARTS_SESSION_PROMPT.trimStart());
     expect(PARTS_SESSION_PROMPT).toMatch(/before using the browser/);
     expect(PARTS_SESSION_PROMPT).toMatch(/show each one's attribution/);
@@ -398,5 +403,111 @@ describe("key propagation hub → member (two real daemons)", () => {
     } finally {
       await sup.shutdown();
     }
+  });
+});
+
+describe("review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry", () => {
+  test("[C5] a vendor that echoes the keys and the Authorization header into result fields: the tool text carries none of them (raw or URL-encoded), and a link that carried one is dropped and cannot be fetched", async () => {
+    for (const x of ["digikey", "mouser", "traceparts"] as const) setKeys(x);
+    fx.opts.echo = true;
+    const s = await rig.session({ cwd: worktree });
+    const out = await search(s, { query: "LM317" });
+    expect(out.isError).toBe(false);
+    const tokens = [`dk-bearer-${fx.tokensIssued.digikey}-xyzxyzxyz`, `tp-jwt-${fx.tokensIssued.traceparts}-eyJhbGciOi`];
+    expect(fx.tokensIssued.digikey).toBeGreaterThan(0);
+    expect(fx.tokensIssued.traceparts).toBeGreaterThan(0);
+    for (const v of [...SECRET_VALUES, ...tokens]) {
+      expect(out.text).not.toContain(v);
+      expect(out.text).not.toContain(encodeURIComponent(v));
+      expect(out.text).not.toContain(encodeURIComponent(`Bearer ${v}`));
+    }
+    const echo = out.results.find((r) => r.mpn === "ECHO-1");
+    expect(echo.description).toBe("sent Bearer ••• as ••• with •••");
+    expect(echo.manufacturer).toBe("Echo •••");
+    expect(echo.datasheetUrl).toBeUndefined(); // carried the bearer token
+    expect(echo.productUrl).toBeUndefined(); // carried the client id
+    const mouser = out.results.find((r) => r.source === "mouser");
+    expect([mouser.mpn, mouser.description, mouser.datasheetUrl, mouser.productUrl]).toEqual(["LM317T-•••", "key ••• / •••", undefined, undefined]);
+    const tp = out.results.find((r) => r.source === "traceparts");
+    expect(tp.description).toBe("CAD model on TraceParts (STEP Bearer ••• •••)");
+    expect(tp.modelUrls[0].url).toContain("/v3/Product/cadRequest?");
+    // The clean result keeps its links; the dropped one is not fetchable.
+    expect(out.results.find((r) => r.source === "digikey" && r.mpn === "LM317T").datasheetUrl).toBe("https://files.parts.test/ds/lm317.pdf");
+    const dropped = `https://files.parts.test/ds/echo.pdf?t=${encodeURIComponent(`Bearer ${tokens[0]}`)}`;
+    expect((await fetchPart(s, dropped)).text).toMatch(/was not returned by parts_search in this session/);
+  });
+
+  test("[C5] the daily quota is counted in the daemon's state dir, so a restarted daemon (a new service over the same dir) does not get a fresh day", async () => {
+    setKeys("mouser");
+    const s = await rig.session({ cwd: worktree });
+    await search(s, { query: "LM317", sources: ["mouser"] });
+    await search(s, { query: "LM317", sources: ["mouser"] });
+    const file = join(rig.dir, PARTS_RATELIMIT_FILE);
+    const today = new Date().toISOString().slice(0, 10);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ mouser: { day: today, count: 2 } });
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    // Today is used up (as if 998 more calls had been made), then the daemon restarts over the same dir.
+    writeFileSync(file, JSON.stringify({ mouser: { day: today, count: 1000 } }));
+    const dir = rig.dir;
+    await (rig.sup as unknown as { shutdown(): Promise<void> }).shutdown();
+    const sup = new Supervisor({ stateDir: dir, envFile: join(dir, "env"), features: ["part-sources"], parts: { baseUrls: baseUrls(fx), resolver: fixtureResolver, selfHosts: () => [], fleetHosts: () => [] } }, new RecordingRegistry());
+    try {
+      const before = fx.calls.length;
+      const again = await sup.parts!.search("sess_x", "LM317", { sources: ["mouser"] });
+      expect(again.results).toEqual([]);
+      expect(again.notes).toEqual([expect.stringMatching(/^Mouser: rate limited by Anvil's own limit for this source, retry after \d+ (s|min|h)$/)]);
+      expect(fx.calls.length).toBe(before); // never reached the vendor
+    } finally {
+      await sup.shutdown();
+    }
+  });
+
+  test("[C5] parts_fetch refuses a URL whose host is a fleet member (the FleetStore roster http.ts hands the supervisor), whatever it resolves to; nothing is fetched", async () => {
+    const d = realpathSync(mkdtempSync(join(tmpdir(), "anvil-c5-fleethost-")));
+    const fleet = new FleetStore(d);
+    fleet.upsert({ serverId: "srv_member1", serverName: "member", host: "files.parts.test", url: "https://files.parts.test:7790" } as never);
+    expect(fleet.hosts()).toEqual(["files.parts.test"]);
+    const sup = new Supervisor(
+      { stateDir: d, envFile: join(d, "env"), features: ["part-sources"], fleetHosts: () => fleet.hosts(), parts: { baseUrls: baseUrls(fx), resolver: fixtureResolver, selfHosts: () => [], ca: files.ca, dial: () => ({ address: "127.0.0.1", port: files.port }), sleep: async () => {} } },
+      new RecordingRegistry(),
+    );
+    try {
+      sup.partsSetKeys("digikey", { DIGIKEY_CLIENT_ID: KEYS.DIGIKEY_CLIENT_ID, DIGIKEY_CLIENT_SECRET: KEYS.DIGIKEY_CLIENT_SECRET });
+      const s = await sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: worktree } as never);
+      const t = partsTools(sup.parts!, s);
+      const call = async (name: string, args: Record<string, unknown>) => ((await t.find((x) => x.name === name)!.handler(args as never, {} as never)) as { content: { text: string }[]; isError?: boolean });
+      expect((await call("parts_search", { query: "LM317", sources: ["digikey"] })).isError).toBeUndefined();
+      const before = files.requests.length;
+      const out = await call("parts_fetch", { url: "https://files.parts.test/models/lm317.step" });
+      expect(out.isError).toBe(true);
+      expect(out.content[0]!.text).toMatch(/files\.parts\.test is a machine in the fleet/);
+      expect(files.requests.length).toBe(before);
+      expect(existsSync(join(worktree, ".anvil-downloads"))).toBe(false);
+    } finally {
+      await sup.shutdown();
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  test("[C5] neither parts tool is in allowedTools; the autonomy policy classifies parts_search as read-only (allowed by the hook without a prompt under the default policy) and parts_fetch as a write", async () => {
+    expect(isReadOnly(PARTS_SEARCH_TOOL_ID)).toBe(true);
+    expect(isReadOnly(PARTS_FETCH_TOOL_ID)).toBe(false);
+    expect(Object.keys(await import("../../src/agent/parts-tools"))).not.toContain("PARTS_TOOL_IDS");
+    setKeys("mouser");
+    const s = await rig.session({ cwd: worktree });
+    (rig.sup as unknown as { agentEnv: () => Record<string, string> }).agentEnv = () => ({});
+    const d = (rig.sup as unknown as { ensureDriver(id: string): { extraAllowedTools?: string[] } }).ensureDriver(s.id);
+    expect(d.extraAllowedTools).toBeUndefined();
+    // The default policy (a new session's autonomy).
+    const fresh = await rig.sup.create({ v: PROTOCOL_VERSION, ts: "t", type: "session.create", source: "existing-dir", cwd: worktree } as never);
+    expect(fresh.data.autonomy).toBe("mostly-autonomous");
+    const v = callHook(fresh, rig.broker, PARTS_SEARCH_TOOL_ID, IN_PROCESS, { query: "a" });
+    expect(await isPending(v)).toBe(false);
+    expect((await v).decision).toBe("allow");
+    const p = await rig.session({ cwd: worktree, autonomy: "allowlist" });
+    const f = callHook(p, rig.broker, PARTS_FETCH_TOOL_ID, IN_PROCESS, { url: "https://x.test/a.pdf" });
+    expect(await isPending(f)).toBe(true); // a write: asks under allowlist
+    rig.sup.resolvePermission(parked(p).requestId, "deny");
+    expect((await f).decision).toBe("deny");
   });
 });

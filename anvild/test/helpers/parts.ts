@@ -35,6 +35,8 @@ export interface VendorFixture {
     datasheetUrl: string;
     modelUrl: string;
     hang?: boolean;
+    /** A hostile or buggy vendor: echo the credentials it was sent into result fields. */
+    echo?: boolean;
   };
   tokensIssued: { digikey: number; traceparts: number };
   stop(): void;
@@ -76,6 +78,16 @@ export function startVendorFixture(): VendorFixture {
         }
         if (f.opts.dkSearchStatus) return Response.json({ title: "Server error", status: f.opts.dkSearchStatus }, { status: f.opts.dkSearchStatus });
         if (u.pathname === "/dk/products/v4/search/keyword") {
+          if (f.opts.echo) {
+            const auth = req.headers.get("authorization") ?? "";
+            const id = req.headers.get("x-digikey-client-id") ?? "";
+            return Response.json({
+              Products: [
+                { Manufacturer: { Name: `Echo ${id}` }, ManufacturerProductNumber: "ECHO-1", Description: { DetailedDescription: `sent ${auth} as ${id} with ${KEYS.DIGIKEY_CLIENT_SECRET}` }, DatasheetUrl: `https://files.parts.test/ds/echo.pdf?t=${encodeURIComponent(auth)}`, ProductUrl: `https://www.digikey.com/p/ECHO-1?cid=${id}`, QuantityAvailable: 1 },
+                { Manufacturer: { Name: "Texas Instruments" }, ManufacturerProductNumber: "LM317T", Description: { DetailedDescription: "clean" }, DatasheetUrl: f.opts.datasheetUrl, ProductUrl: "https://www.digikey.com/en/products/detail/LM317T" },
+              ],
+            });
+          }
           return Response.json({
             ProductsCount: 2,
             Products: [
@@ -94,6 +106,10 @@ export function startVendorFixture(): VendorFixture {
         if (f.opts.mouserStatus) return new Response("busy", { status: f.opts.mouserStatus, headers: f.opts.mouserStatus === 429 ? { "retry-after": "42" } : {} });
         if (f.opts.mouserBadKey || u.searchParams.get("apiKey") !== KEYS.MOUSER_API_KEY) return Response.json({ Errors: [{ Id: 0, Code: "Invalid", Message: "Invalid unique identifier.", PropertyName: "API Key" }], SearchResults: null });
         const kw = JSON.parse(body ?? "{}").SearchByKeywordRequest?.keyword;
+        if (f.opts.echo) {
+          const k = u.searchParams.get("apiKey") ?? "";
+          return Response.json({ Errors: [], SearchResults: { Parts: [{ Manufacturer: "Texas Instruments", ManufacturerPartNumber: `LM317T-${k}`, Description: `key ${k} / ${encodeURIComponent(k)}`, DataSheetUrl: `https://www.mouser.com/ds.pdf?apiKey=${encodeURIComponent(k)}`, ProductDetailUrl: `https://www.mouser.com/p/${k}` }] } });
+        }
         return Response.json({
           Errors: [],
           SearchResults: {
@@ -117,6 +133,7 @@ export function startVendorFixture(): VendorFixture {
           return new Response(null, { status: 404 });
         }
         if (u.pathname === "/tp/v3/Product/CadDataAvailability") {
+          if (f.opts.echo) return Response.json({ cadFormatList: [{ cadFormatId: 96, cadFormatName: `STEP ${req.headers.get("authorization")} ${KEYS.TRACEPARTS_EMAIL}`, deliveryMethod: 1 }] });
           return Response.json({ partNumberAvailability: { partNumber: "LM317T", availability: true }, viewerAvailability: true, cadFormatList: [{ cadFormatId: 96, cadFormatName: "STEP AP214", deliveryMethod: 1 }, { cadFormatId: 12, cadFormatName: "AutoCAD DWG", deliveryMethod: 1 }, { cadFormatId: 200, cadFormatName: "STEP (web page)", deliveryMethod: 2 }] });
         }
         if (u.pathname === "/tp/v3/Product/cadRequest") {
