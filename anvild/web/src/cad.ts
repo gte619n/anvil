@@ -1053,19 +1053,70 @@ function fitToView(): void {
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 1;
     const fov = (v.camera!.fov * Math.PI) / 180;
-    const dist = (maxDim / 2 / Math.tan(fov / 2)) * 1.6;
+    let dist = (maxDim / 2 / Math.tan(fov / 2)) * 1.6;
 
     v.controls!.target.copy(center);
     // Keep the current view direction; just back the camera off to the fit distance.
     const dirv = new THREE.Vector3().subVectors(v.camera!.position, v.controls!.target);
     if (dirv.lengthSq() === 0) dirv.set(1, 1, 1);
-    dirv.normalize().multiplyScalar(dist);
-    v.camera!.position.copy(center).add(dirv);
-    v.camera!.near = dist / 100;
-    v.camera!.far = dist * 100;
-    v.camera!.updateProjectionMatrix();
+    dirv.normalize();
+    const place = (): void => {
+      v.camera!.position.copy(center).addScaledVector(dirv, dist);
+      v.camera!.near = dist / 100;
+      v.camera!.far = dist * 100;
+      v.camera!.updateProjectionMatrix();
+      v.camera!.lookAt(center);
+      v.camera!.updateMatrixWorld();
+    };
+    place();
+    // Then refine the distance so the projected box fits the VISIBLE part of the canvas, both ways
+    // (a phone's narrow canvas is width-bound) and clear of the toolbar, HUD, live bar and sheet.
+    const room = visibleRoom(v);
+    if (room) {
+      const corner = new THREE.Vector3();
+      for (let i = 0; i < 6; i++) {
+        let ex = 0;
+        let ey = 0;
+        for (const x of [box.min.x, box.max.x]) for (const y of [box.min.y, box.max.y]) for (const z of [box.min.z, box.max.z]) {
+          corner.set(x, y, z).project(v.camera!);
+          ex = Math.max(ex, Math.abs(corner.x));
+          ey = Math.max(ey, Math.abs(corner.y));
+        }
+        const k = Math.max(ex / room.x, ey / room.y);
+        if (!Number.isFinite(k) || k <= 0 || Math.abs(k - 1) < 0.01) break;
+        dist *= k > 1 ? k * 1.02 : k; // projected size goes ~1/dist; overshoot a hair when growing
+        place();
+      }
+    }
     v.controls!.update();
   })();
+}
+
+/**
+ * How much of the canvas, as NDC half-extents around its centre, the model may fill: the canvas less
+ * the chrome floating over it (toolbar at the bottom, HUD and live bar at the top, the phone's sheet
+ * when open), kept symmetric so the orbit target stays the canvas centre, less a small margin.
+ */
+function visibleRoom(v: Viewer): { x: number; y: number } | null {
+  const canvas = v.renderer?.domElement;
+  const shell = v.chrome?.wrap.querySelector<HTMLElement>(".cad-shell");
+  if (!canvas || !shell) return null;
+  const c = canvas.getBoundingClientRect();
+  if (c.width < 2 || c.height < 2) return null;
+  let top = 0;
+  let bottom = 0;
+  for (const el of shell.querySelectorAll<HTMLElement>(":scope > .cad-tools, :scope > .cad-hud, :scope > .cad-live, :scope > .cad-params")) {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue; // hidden
+    if (r.right <= c.left || r.left >= c.right || r.bottom <= c.top || r.top >= c.bottom) continue; // beside the canvas
+    if (r.top + r.height / 2 < c.top + c.height / 2) top = Math.max(top, r.bottom - c.top);
+    else bottom = Math.max(bottom, c.bottom - r.top);
+  }
+  const margin = 12;
+  const halfH = c.height / 2 - Math.max(top, bottom) - margin;
+  const halfW = c.width / 2 - margin;
+  if (halfH < 20 || halfW < 20) return null; // nothing sensible left: fall back to the plain fit
+  return { x: halfW / (c.width / 2), y: halfH / (c.height / 2) };
 }
 
 function setPresetView(view: "front" | "top" | "iso"): void {

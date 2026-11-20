@@ -1356,7 +1356,7 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-hud { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: linear-gradient(var(--bg), transparent); pointer-events: none; z-index: 2; }
 .cad-name { font-weight: 600; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cad-units { font-size: 11px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
-.cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: nowrap; justify-content: center; max-width: calc(100% - 24px); overflow-x: auto; scrollbar-width: none; }
+.cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: nowrap; justify-content: safe center; max-width: calc(100% - 24px); overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
 .cad-tools::-webkit-scrollbar { display: none; }
 .cad-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: none; background: transparent; color: var(--text); border-radius: 8px; cursor: pointer; }
 .cad-btn:hover { background: var(--tool-bg); }
@@ -1483,10 +1483,18 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-part-open, .cad-part-action { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; padding: 5px 12px; cursor: pointer; }
 .cad-expect-blurb, .cad-expect-reason { margin: 6px 0; font-size: 13px; }
 .cad-expect-reason-label { font-weight: 600; }
-.cad-expect-rows { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
-.cad-expect-rows th, .cad-expect-rows td { text-align: left; vertical-align: top; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+/* Numbers never break mid-digit: cells wrap only at spaces (between "80 × 50 × 6"'s parts, before a
+   unit), never inside a word or number (keep-all, no overflow-wrap); a table still too wide for a
+   phone scrolls inside the card instead of widening the page. */
+.cad-expect-rows { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.cad-expect-rows th, .cad-expect-rows td { text-align: left; vertical-align: top; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--border); overflow-wrap: normal; word-break: keep-all; }
+.cad-expect-rows .cad-row-old, .cad-expect-rows .cad-row-new { font-variant-numeric: tabular-nums; }
+.cad-expect-rows th { white-space: nowrap; }
 .cad-expect-rows .cad-row-changed .cad-row-new { font-weight: 600; }
 .cad-expect-rows .cad-row-changed .cad-row-old { opacity: 0.7; }
+/* Something approving this card approves that was never approved (a parameter the agent moved, a replaced reference). */
+.cad-expect-rows .cad-row-unapproved td { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.cad-expect-rows .cad-row-unapproved .cad-row-new { color: var(--danger); font-weight: 600; }
 .cad-expect-diff { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--code-bg); padding: 8px 10px; border-radius: 8px; margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
 .cad-diff-add { color: var(--ok, #2e9d57); }
 .cad-diff-del { color: var(--danger, #d04545); }

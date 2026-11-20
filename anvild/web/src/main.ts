@@ -1757,11 +1757,10 @@ const cadCards = createCadCards({
   respond: (url, requestId, approve, values) => {
     const srv = serverByUrl(url) ?? hub();
     // A dimensions card's numbers are checked again by the daemon; a refusal comes back as an error.
-    void sendAwait(srv, { type: "cad.expectations.respond", cid: newCid(), requestId, approve, ...(values ? { values } : {}) }, 30_000)
-      .then((res) => {
-        if (res.type === "command.error") toast(res.message);
-      })
-      .catch(() => undefined);
+    // The card shows a refusal inline and gives its buttons back.
+    return sendAwait(srv, { type: "cad.expectations.respond", cid: newCid(), requestId, approve, ...(values ? { values } : {}) }, 30_000)
+      .then((res) => (res.type === "command.error" ? res.message : undefined))
+      .catch((e) => `not sent: ${e instanceof Error ? e.message : String(e)}`);
   },
   release: (url, ev) => {
     const srv = serverByUrl(url) ?? hub();
