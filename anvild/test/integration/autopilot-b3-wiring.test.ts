@@ -87,6 +87,9 @@ test("[B3] wiring: Go through the Supervisor stamps the builder, applies the pla
   }) as any;
   const sup = new Supervisor({ stateDir, accounts, envFile: join(stateDir, "env"), features: ["cad-work"], sessionQueryFn: queryFn }, new ConnectionRegistry());
   sups.push(sup);
+  // The first turn's fire-and-forget branch-kind classification would try a model (20 s timeout) and
+  // persist into this test's removed state dir long after it ends, failing whichever test runs then.
+  (sup as any).ensureRemoteBranch = async () => {};
   // The owner adopted the rules once.
   const { readRules } = await import("../../src/cadwork/rules");
   const { repoIdentity } = await import("../../src/cadwork/locks");
@@ -153,6 +156,10 @@ async function supervisorRig(registry = new ConnectionRegistry()) {
   })) as any;
   const sup = new Supervisor({ stateDir, accounts, envFile: join(stateDir, "env"), features: ["cad-work"], sessionQueryFn: queryFn }, registry);
   sups.push(sup);
+  // The first turn's fire-and-forget model helpers (branch-kind and icon classification) are not what
+  // these tests are about: stubbed, so nothing tries a model and nothing outlives the test.
+  (sup as any).ensureRemoteBranch = async () => {};
+  (sup as any).assignIcon = async () => {};
   const { readRules } = await import("../../src/cadwork/rules");
   const { repoIdentity } = await import("../../src/cadwork/locks");
   const rules = readRules(repo) as any;
@@ -200,6 +207,8 @@ test("[B3] review 6: a builder's session.created is broadcast only AFTER prepare
   });
   expect(during).toEqual([{ refused: expect.stringContaining("still being prepared"), announced: 1 }]);
   expect(seen.length).toBe(2); // announced once prepare finished
+  // Let the builder's first turn and its verify hook finish before the rig is torn down.
+  await until(() => (sup as any).autopilot.workUnits.get(uid).status === "blocked", "the verify hook to block the unit", 15_000);
 }, 60_000);
 
 test("[B3] review 1: a loop's pipeline body refuses a CAD unit (CAD units build with Go)", async () => {
