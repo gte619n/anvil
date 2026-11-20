@@ -62,7 +62,7 @@ import {
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import type { CadParamSetResultEvent, CadPartsListResultEvent, CadStatusEvent } from "@protocol";
+import type { CadExpectationsRequestEvent, CadParamSetResultEvent, CadPartsListResultEvent, CadStatusEvent } from "@protocol";
 import { featureEnabled } from "../config";
 import { STATE_FEATURES, registerStateDirProtection } from "../agent/state-protected";
 import type { CadManagerOptions } from "../cadwork/manager";
@@ -370,7 +370,14 @@ export class Supervisor {
     this.cadwork = new CadworkService({
       enabled: featureEnabled({ features: cfg.features }, "cad-work"),
       getSession: (id) => this.sessions.get(id),
-      registry: this.registry,
+      // Every owner card also reaches the owner's devices, as a notification that only OPENS the card
+      // (decision 128): it is never answered from the shade.
+      registry: {
+        toAll: (ev) => {
+          this.registry.toAll(ev);
+          if (ev.type === "cad.expectations.request" && !ev.replay) this.notifyOwnerCard(ev);
+        },
+      },
       manager: cfg.cadManager,
       stateDir: cfg.stateDir, // the lock store: <stateDir>/cadwork/locks.json
       writableStateRoots: [this.store.worktreeRoot(), this.clonesDir], // the only folders under the state dir a session may edit
@@ -2112,6 +2119,20 @@ export class Supervisor {
   }
 
   /** Answer a parked permission prompt (arch §6.6) — may come from any device. */
+  /**
+   * Answer from a notification's action button (`POST /api/permission/respond`). A card the owner has
+   * to see (a hard stop, anything with a screenshot or a reason) can be DENIED from there but never
+   * allowed: its push carries no buttons, and this is the second lock (decision 128).
+   */
+  resolvePermissionFromNotification(requestId: string, decision: PermissionDecision, updatedInput?: unknown): void {
+    if (decision !== "deny") {
+      const sessionId = this.broker.sessionFor(requestId);
+      const pending = sessionId ? this.sessions.get(sessionId)?.pendingPermissions.get(requestId) : undefined;
+      if (pending && mustSeeCard(pending)) throw new BadCommand("this card has to be seen to be approved: open it in Anvil");
+    }
+    this.resolvePermission(requestId, decision, updatedInput);
+  }
+
   resolvePermission(requestId: string, decision: PermissionDecision, updatedInput?: unknown): void {
     const sessionId = this.broker.sessionFor(requestId);
     if (!this.broker.resolve(requestId, decision, updatedInput)) {
@@ -2627,13 +2648,35 @@ export class Supervisor {
   }
 
   /** Push a notification on the events that mean "your turn" (arch §6.7). */
+  /** An owner card (CAD expectations, dimensions, release…) as a push that only opens its session. */
+  private notifyOwnerCard(ev: CadExpectationsRequestEvent): void {
+    const data = this.sessions.get(ev.sessionId)?.data;
+    const payload: PushPayload = {
+      title: data?.title ?? "Anvil",
+      body: `${ev.part}: ${OWNER_CARD_ASK[ev.kind] ?? "needs your answer"}. Open to see the card.`,
+      dir: data?.cwd ? basename(data.cwd) : undefined,
+      sessionId: ev.sessionId,
+      tag: `cad-${ev.sessionId}`,
+      kind: "question",
+    };
+    this.notified.add(ev.sessionId);
+    void this.webpush.notify(payload);
+    void this.fcm.notify(payload);
+    void this.apns.notify(payload);
+  }
+
   private maybeNotify(sessionId: string, event: ServerEvent): void {
     const data = this.sessions.get(sessionId)?.data;
     const title = data?.title ?? "Anvil";
     // Which project — the cwd basename — so a reminder says *which* session it's for at a glance.
     const dir = data?.cwd ? basename(data.cwd) : undefined;
     let payload: PushPayload | undefined;
-    if (event.type === "permission.request") {
+    if (event.type === "permission.request" && mustSeeCard(event)) {
+      // A hard stop (or any card carrying a screenshot or a reason): the owner has to SEE it, so the
+      // push only opens the session — no requestId, no Allow/Deny in the shade (decision 128).
+      const ask = summarizeRequest(event.tool, event.input);
+      payload = { title, body: `Needs your approval — ${ask}. Open to see what it is.`, dir, sessionId, tag: `perm-${sessionId}`, kind: "question" };
+    } else if (event.type === "permission.request") {
       const ask = summarizeRequest(event.tool, event.input);
       payload = { title, body: `Needs your approval — ${ask}`, dir, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool, ask };
     } else if (event.type === "question.request") {
@@ -3003,3 +3046,20 @@ function summarizeRequest(tool: string, input: unknown): string {
       return `Approve ${tool}`;
   }
 }
+
+/** A permission card that must be seen before it can be approved: it carries a screenshot (a hard
+ *  stop always does) or a reason of its own. Never answerable from a notification (decision 128). */
+export function mustSeeCard(card: { image?: unknown; reason?: string }): boolean {
+  return !!card.image || !!card.reason;
+}
+
+const OWNER_CARD_ASK: Record<string, string> = {
+  propose: "a change to its locked expectations needs your approval",
+  initial: "its expectations need your approval",
+  confirm: "its expectations need your confirmation",
+  dimensions: "its dimensions need typing in",
+  release: "a release needs your approval",
+  "adopt-expectations": "an edit to its expectations needs your approval",
+  "adopt-ownerParams": "an edit to its owner parameters needs your approval",
+  "adopt-rules": "an edit to cad/rules.json needs your approval",
+};

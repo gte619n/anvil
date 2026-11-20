@@ -1462,7 +1462,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (!requestId || (decision !== "allow" && decision !== "deny" && decision !== "allow_always")) {
         return new Response("bad request", { status: 400 });
       }
-      supervisor.resolvePermission(requestId, decision, updatedInput);
+      // A notification button: a card that has to be seen cannot be approved from here (decision 128).
+      supervisor.resolvePermissionFromNotification(requestId, decision, updatedInput);
       return Response.json({ ok: true });
     } catch (e) {
       // BadCommand → the request was already answered or expired; treat as gone, not a server error.
