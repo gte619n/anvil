@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { cadProtectedRule } from "../../src/agent/cad-protected";
 import { planningTools } from "../../src/agent/planning-tools";
 import { OPENROUTER_KEY } from "../../src/auth/openrouter";
-import { replaceNote } from "../../src/cadwork/plan-expectations";
+import { repoIdentity } from "../../src/cadwork/locks";
+import { checkPlanPart, replaceNote } from "../../src/cadwork/plan-expectations";
 import { CAD_BUILDS_WITH_GO } from "../../src/integrations/autopilot-cad";
 import type { AgentFn } from "../../src/pipeline/phases";
 import { builderBlockedNotice } from "../../src/session/autopilot-service";
@@ -253,18 +254,165 @@ describe("review item 3: one approval per repo and part, made visible and not cl
     expect(x.unit(b).status).toBe("building");
   });
 
-  test("[B3] review 3c: a unit cannot start while another unit's LIVE builder holds the same part; once that builder is gone it can", async () => {
+  test("[B3] review 3c: a unit cannot start while another unit's LIVE builder holds the same part; once that builder is archived it can (after re-approval over the approval that builder wrote)", async () => {
     const x = await b3Rig({ cli: FAKE_SOLIDCRAFT });
     const a = create(x, "first plate", approvedFields());
     const ev = await x.svc.startPlan(a);
     const b = create(x, "second plate", approvedFields());
-    await expect(x.svc.startPlan(b)).rejects.toThrow("cad/plate is being built by “first plate”");
+    await expect(x.svc.startPlan(b)).rejects.toThrow("cad/plate is being built by “first plate” — finish, dismiss or archive that session first");
     expect(x.unit(b).status).toBe("planned");
     // A unit on other parts is not held by it.
     const other = create(x, "bracket", { needsCad: true, cadExpectations: { bracket: approved() }, cadExpectationsStatus: "approved" });
     await x.svc.startPlan(other);
-    // The first builder's process exits: the part is free.
+    // The first builder's process exiting does NOT free the part: the session can still take turns.
     (x.sessions.get(ev.sessionId)!.data as any).status = "exited";
+    await expect(x.svc.startPlan(b)).rejects.toThrow("is being built by “first plate”");
+    // Archived: the part is free. b was approved over no approval; the first builder has written one since,
+    // so b must be re-approved over it (re-review 5) — then it starts.
+    (x.sessions.get(ev.sessionId)!.data as any).archived = true;
+    await expect(x.svc.startPlan(b)).rejects.toThrow("changed after this plan was approved");
+    x.svc.respondCad(b, true, x.plan(b).cad!.sha);
+    await x.svc.startPlan(b);
+    expect(x.unit(b).status).toBe("building");
+  });
+});
+
+describe("B3 re-review: approvals keep only identical blocks; parts are reserved before start", () => {
+  async function mainAt80(x: Rig) {
+    const a = create(x, "plate at 80", approvedFields());
+    const ev = await x.svc.startPlan(a);
+    const cwd = x.firstTurns.at(-1)!.cwd;
+    await builderBuildsPlate(x.tools(ev.sessionId));
+    expect((await x.svc.verifyBuilder(ev.sessionId, "turn"))!.ok).toBe(true);
+    git(cwd, "add", "-A");
+    git(cwd, "commit", "-q", "-m", "plate");
+    git(x.repo, "merge", "-q", "--ff-only", `b3-${x.handoffs.length}`);
+    (x.sessions.get(ev.sessionId)!.data as any).archived = true;
+    expect((await x.cad.verifyParts(x.repo, { parts: ["plate"] })).parts[0]!.state).toBe("pass");
+  }
+  const row = (rows: any[], label: string) => rows.find((r) => r.label === label);
+  const refusal = async (p: Promise<unknown>) => {
+    try {
+      await p;
+      return "";
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  };
+
+  test("[B3] re-review 1: the reviewer's repro — the same numbers plus 'Must not touch: housing.step': the card shows the replace note, the start writes part.json with the reference, and the verify checks the interference", async () => {
+    const x = await b3Rig({ cli: FAKE_SOLIDCRAFT });
+    await mainAt80(x);
+    const lockBefore = x.cad.approvalOf(x.repo, "plate")!;
+    const strict = { ...PLATE_PLAN, expectations: { ...PLATE_PLAN.expectations, noInterferenceWith: ["housing.step"] } };
+    const c = create(x, "plate clear of the housing", { needsCad: true, cadExpectations: { plate: strict }, cadExpectationsStatus: "proposed" });
+    const card = x.plan(c).cad!;
+    expect(card.parts[0]!.note).toBe(replaceNote("plate", "main"));
+    expect(row(card.parts[0]!.rows, "Must not touch")).toMatchObject({ old: "none", new: "housing.step" });
+    expect(row(card.parts[0]!.rows, "Parameters")).toMatchObject({ old: "L = 80, T = 6, W = 50" }); // the numbers are the same
+    x.svc.respondCad(c, true, card.sha);
+    const ev = await x.svc.startPlan(c);
+    const first = x.firstTurns.at(-1)!;
+    expect(first.partJson.expectations.noInterferenceWith).toEqual(["housing.step"]);
+    expect(first.partJson.expectations.lockedBy).toBe("planner");
+    const after = x.cad.approvalOf(x.repo, "plate")!;
+    expect(after.sha).not.toBe(lockBefore.sha); // the approval was replaced, as the card said
+    expect(after.approvedBy).toBe("planner");
+    const j = (await x.svc.verifyBuilder(ev.sessionId, "turn"))!;
+    expect(j.ok).toBe(false);
+    expect(j.reason).toContain("interference housing.step"); // the reference is checked
+    expect(x.unit(c).status).toBe("blocked");
+  });
+
+  test("[B3] re-review 2: two concurrent Go clicks for two units on cad/plate — exactly one starts, the other is refused naming the first; the lock holds only the winner's numbers", async () => {
+    const x = await b3Rig({ cli: FAKE_SOLIDCRAFT });
+    const a = create(x, "plate at 80", approvedFields());
+    const b = create(x, "plate at 120", approvedFields(L120));
+    const [ra, rb] = await Promise.allSettled([x.svc.startPlan(a), x.svc.startPlan(b)]);
+    const won = [ra, rb].filter((r) => r.status === "fulfilled");
+    const lost = [ra, rb].filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+    expect(won.length).toBe(1);
+    expect(lost.length).toBe(1);
+    const winner = ra.status === "fulfilled" ? a : b;
+    const loser = winner === a ? b : a;
+    expect(String(lost[0]!.reason?.message ?? lost[0]!.reason)).toContain(`cad/plate is being built by “${x.unit(winner).title}” — finish, dismiss or archive that session first`);
+    expect(x.handoffs.filter((h) => h.workUnitRole === "builder").length).toBe(1);
+    expect(x.unit(winner).status).toBe("building");
+    expect(x.unit(loser).status).toBe("planned");
+    expect(x.unit(loser).sessionId).toBeUndefined();
+    expect(x.cad.approvalOf(x.repo, "plate")!.declared!.L).toBe(winner === a ? 80 : 120);
+    // The reservation is released when a start fails: a refused/failed start leaves nothing held.
+    expect((x.svc as any).starting.size).toBe(0);
+  });
+
+  test("[B3] re-review 3: a double Go on the same unit starts one builder; the second is refused 'this plan is already starting'", async () => {
+    const x = await b3Rig({ cli: FAKE_SOLIDCRAFT });
+    const a = create(x, "plate", approvedFields());
+    const plain = create(x, "readme", {});
+    const results = await Promise.allSettled([x.svc.startPlan(a), x.svc.startPlan(a), x.svc.startPlan(plain), x.svc.startPlan(plain)]);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected", "fulfilled", "rejected"]);
+    for (const r of [results[1], results[3]] as PromiseRejectedResult[]) expect(String(r.reason?.message)).toBe("this plan is already starting");
+    expect(x.handoffs.filter((h) => h.workUnitId === a).length).toBe(1);
+    expect(x.handoffs.filter((h) => h.workUnitId === plain).length).toBe(1);
+    // A start whose prepare fails releases the reservation: the unit can be started again.
+    const bad = create(x, "bad", { needsCad: true, cadExpectations: { gear: approved({ ...PLATE_PLAN, process: "fdm-0.4" }) }, cadExpectationsStatus: "approved" });
+    const orig = x.cad.applyPlanExpectations.bind(x.cad);
+    (x.cad as any).applyPlanExpectations = async () => ({ ok: false, error: "boom" });
+    await expect(x.svc.startPlan(bad)).rejects.toThrow("boom");
+    (x.cad as any).applyPlanExpectations = orig;
+    expect((x.svc as any).starting.size).toBe(0);
+    await x.svc.startPlan(bad);
+    expect(x.unit(bad).status).toBe("building");
+  });
+
+  test("[B3] re-review 4: a builder holds its part only while its unit is building/blocked with that session, not archived; every other path releases it", async () => {
+    const paths: [string, boolean, (x: Rig, a: string, sid: string) => void][] = [
+      ["blocked (still its builder)", true, (x, a) => (x.svc as any).workUnits.update(a, { status: "blocked" })],
+      ["process exited (not archived)", true, (x, _a, sid) => void ((x.sessions.get(sid)!.data as any).status = "exited")],
+      ["session archived", false, (x, _a, sid) => void ((x.sessions.get(sid)!.data as any).archived = true)],
+      ["session gone", false, (x, _a, sid) => void x.sessions.delete(sid)],
+      ["unit completed", false, (x, a) => (x.svc as any).workUnits.update(a, { status: "completed" })],
+      ["unit dismissed", false, (x, a) => (x.svc as any).workUnits.update(a, { status: "dismissed" })],
+      ["unit expired", false, (x, a) => (x.svc as any).workUnits.update(a, { status: "expired" })],
+      ["unit in review", false, (x, a) => (x.svc as any).workUnits.update(a, { status: "review" })],
+      ["unit moved on to another session", false, (x, a) => (x.svc as any).workUnits.update(a, { sessionId: "sess_other" })],
+    ];
+    for (const [what, holds, release] of paths) {
+      const x = await b3Rig({ cli: FAKE_SOLIDCRAFT });
+      const a = create(x, "first plate", approvedFields());
+      const ev = await x.svc.startPlan(a);
+      const b = create(x, "second plate", approvedFields());
+      release(x, a, ev.sessionId);
+      const why = await refusal(x.svc.startPlan(b));
+      expect([what, why.includes("cad/plate is being built by “first plate” — finish, dismiss or archive that session first")]).toEqual([what, holds]);
+      if (!holds) {
+        // Free: only the approval the first builder wrote stands in the way; re-approved over it, b starts.
+        expect([what, why]).toEqual([what, "this plan cannot start: the approved numbers for cad/plate changed after this plan was approved; re-approve the plan"]);
+        x.svc.respondCad(b, true, x.plan(b).cad!.sha);
+        await x.svc.startPlan(b);
+        expect([what, x.unit(b).status]).toEqual([what, "building"]);
+      }
+      await stopServices();
+      cleanupTemp();
+    }
+  }, 120_000);
+
+  test("[B3] re-review 5: an approval synced from another machine whose clock is EARLIER than the plan's approval still refuses the start (identity, not time); re-approval over it lets it start", async () => {
+    const x = await b3Rig({ cli: FAKE_SOLIDCRAFT });
+    const b = create(x, "plate at 120", { needsCad: true, cadExpectations: { plate: L120 }, cadExpectationsStatus: "proposed" });
+    x.svc.respondCad(b, true, x.plan(b).cad!.sha); // approved now, over no approval
+    const planAt = Date.parse(x.unit(b).cadExpectations!.plate!.approvedAt!);
+    const c = checkPlanPart("plate", PLATE_PLAN);
+    if (!c.ok) throw new Error(c.error);
+    const id = repoIdentity(x.repo);
+    // The owner approved L=80 on another machine whose clock runs an hour behind; it arrives via the fleet.
+    x.cad.lockSync.acceptFromMember({ serverId: "m1", parts: [{ repo: id.key, ...(id.remote ? { remote: id.remote } : {}), path: id.path, part: "plate", sha: "sha-from-m1", approvedBy: "owner", status: "dimensioned", values: c.values, declared: c.declared, at: new Date(planAt - 3_600_000).toISOString(), machine: "m1" }], rules: [] } as any);
+    expect(x.cad.approvalOf(x.repo, "plate")!.sha).toBe("sha-from-m1");
+    await expect(x.svc.startPlan(b)).rejects.toThrow("the approved numbers for cad/plate changed after this plan was approved; re-approve the plan");
+    const card = x.plan(b).cad!;
+    expect(card.reapprove).toContain("re-approve the plan");
+    expect(card.parts[0]!.note).toBe(replaceNote("plate", "main"));
+    x.svc.respondCad(b, true, card.sha);
     await x.svc.startPlan(b);
     expect(x.unit(b).status).toBe("building");
   });

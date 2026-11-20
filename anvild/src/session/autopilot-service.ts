@@ -61,7 +61,8 @@ import { buildPlanningToolsServer } from "../agent/planning-tools";
 import type { AgentFn, ChecksFn, OpenPrFn } from "../pipeline/phases";
 import { gitToplevel } from "../cadwork/partfolder";
 import { changedParts, type VerifyResult } from "../cadwork/verify";
-import { approvedFingerprint, checkPlanPart, planExpectationRows, replaceNote, replacesApproval, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { approvalPrint, approvedFingerprint, checkPlanPart, planExpectationRows, replaceNote, replacesApproval, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { repoKey } from "../cadwork/locks";
 import type { CadExpectationsRow } from "@protocol";
 import { approvalChangedRefusal, CAD_BUILDS_WITH_GO, cadCardSha, cadStartRefusal, cadStatusOf, coveredParts, judgeCadVerify, needsCad, NEEDS_APPROVED_DIMENSIONS, processProblem, type CadCardContext, type CadJudgement } from "../integrations/autopilot-cad";
 import type { PushPayload } from "../push/webpush";
@@ -488,6 +489,7 @@ export class AutopilotService {
   async startPlanningSession(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (this.starting.has(u.id)) throw new BadCommand("this plan is already starting");
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a live session");
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
@@ -603,7 +605,8 @@ export class AutopilotService {
       const latest = this.workUnits.get(u.id);
       if (!latest) throw new BadCommand("the work unit is gone");
       const at = new Date().toISOString();
-      const record = { ...(latest.cadExpectations ?? {}), [part]: { ...c.entry, approvedAt: at } };
+      // The approval the card's "old" side showed (unchanged since it was drawn): a start is refused once it changes.
+      const record = { ...(latest.cadExpectations ?? {}), [part]: { ...c.entry, approvedAt: at, approvedOver: approvalPrint(approvedNow()) } };
       const status = cadStatusOf(record);
       this.workUnits.update(u.id, {
         cadExpectations: record,
@@ -649,12 +652,13 @@ export class AutopilotService {
         const bad = processProblem(c.entry.process, ctx?.processes);
         if (bad) throw new BadCommand(`cannot approve: cad/${p}: ${bad}`);
       }
-      const record = Object.fromEntries(parts.map((p) => [p, { ...u.cadExpectations![p]!, approvedAt: at }]));
+      // Each part's approval the card was drawn over (its sha matched above): a start is refused once it changes.
+      const record = Object.fromEntries(parts.map((p) => [p, { ...u.cadExpectations![p]!, approvedAt: at, approvedOver: approvalPrint(ctx?.approved(p)) }]));
       this.workUnits.update(u.id, { cadExpectations: record, cadExpectationsStatus: "approved", cadExpectationsApprovedAt: at, ...clearCadHold(u.hold) });
     } else {
       const record = Object.fromEntries(
         parts.map((p) => {
-          const { approvedAt: _a, ...rest } = u.cadExpectations![p]!;
+          const { approvedAt: _a, approvedOver: _o, ...rest } = u.cadExpectations![p]!;
           return [p, rest];
         }),
       );
@@ -690,26 +694,68 @@ export class AutopilotService {
     return (u.status === "building" || u.status === "blocked") && this.liveSession(u.sessionId);
   }
 
-  /** A session that can still take turns: it exists, is not archived, and its process has not exited. */
+  /** A session that can still take turns: it exists and is not archived. (A session's process exiting does
+   *  not end it — the next prompt respawns it — so only archival does.) */
   private liveSession(id: string | undefined): boolean {
     const s = id ? this.deps.getSession(id) : undefined;
-    return !!s && !s.data.archived && s.data.status !== "exited";
+    return !!s && !s.data.archived;
   }
 
   /**
-   * Decision 183 (c): another unit's LIVE builder holds one of these parts of the same repo. Two builders
-   * on one part would each replace the other's approval (it is one per repo and part).
+   * Starts in flight (decision 183 (c)): taken synchronously BEFORE `startPlan`'s first await and dropped
+   * in its `finally` — by then a successful start has set the unit's `sessionId` and status, so the live
+   * builder's hold (`holdsParts`) takes over with no gap. Keyed by unit id; carries the repo identity and
+   * parts it reserves. Two Go clicks (on one unit, or on two units over the same part) cannot both pass.
+   */
+  private readonly starting = new Map<string, { title: string; repo: string; parts: string[] }>();
+
+  /** The repo identity approvals are stored under (`repoKey`) for an environment, memoized per call site. */
+  private repoKeyOf(environmentId: string | undefined, memo?: Map<string, string | undefined>): string | undefined {
+    const root = (environmentId ? this.deps.envStore.get(environmentId) : undefined)?.repoRoot;
+    if (!root) return undefined;
+    if (memo?.has(root)) return memo.get(root);
+    let key: string | undefined;
+    try {
+      key = repoKey(root);
+    } catch {
+      key = root;
+    }
+    memo?.set(root, key);
+    return key;
+  }
+
+  /**
+   * A unit's builder HOLDS its planned parts while: the unit is `building` or `blocked`, its `sessionId`
+   * names a session that exists, is not archived, and is that unit's builder. A unit that is completed,
+   * dismissed, expired or in review releases its parts; so does one whose session moved on (another
+   * session, archived, gone).
+   */
+  private holdsParts(other: WorkUnit): boolean {
+    if (!other.sessionId || (other.status !== "building" && other.status !== "blocked")) return false;
+    const s = this.deps.getSession(other.sessionId);
+    return !!s && !s.data.archived && s.data.workUnitRole === "builder" && s.data.workUnitId === other.id;
+  }
+
+  /**
+   * Decision 183 (c): another unit's builder — live (`holdsParts`) or starting (`starting`) — holds one of
+   * these parts of the same repo. Two builders on one part would each replace the other's approval (it is
+   * one per repo and part).
    */
   private partHeldBy(u: WorkUnit, parts: string[]): string | undefined {
     if (!parts.length) return undefined;
-    const repo = this.deps.envStore.get(u.environmentId)?.repoRoot;
+    const memo = new Map<string, string | undefined>();
+    const repo = this.repoKeyOf(u.environmentId, memo);
+    if (!repo) return undefined;
+    const held = (part: string, title: string) => `cad/${part} is being built by “${title}” — finish, dismiss or archive that session first`;
+    for (const [id, r] of this.starting) {
+      if (id === u.id || r.repo !== repo) continue;
+      const p = r.parts.find((x) => parts.includes(x));
+      if (p) return held(p, r.title);
+    }
     for (const other of this.workUnits.list()) {
-      if (other.id === u.id || !other.sessionId || other.status === "completed" || other.status === "dismissed" || other.status === "expired") continue;
-      if (this.deps.envStore.get(other.environmentId)?.repoRoot !== repo) continue;
-      const s = this.deps.getSession(other.sessionId);
-      if (!s || s.data.workUnitRole !== "builder" || !this.liveSession(other.sessionId)) continue;
-      const held = coveredParts(other).find((p) => parts.includes(p));
-      if (held) return `cad/${held} is being built by “${other.title}”`;
+      if (other.id === u.id || !this.holdsParts(other)) continue;
+      const p = coveredParts(other).find((x) => parts.includes(x));
+      if (p && this.repoKeyOf(other.environmentId, memo) === repo) return held(p, other.title);
     }
     return undefined;
   }
@@ -725,10 +771,10 @@ export class AutopilotService {
       const bad = processProblem(u.cadExpectations![p]!.process, ctx.processes);
       if (bad) return `this plan cannot start: cad/${p}: ${bad}`;
     }
-    const changed = approvalChangedRefusal(u, ctx.approved);
-    if (changed) return `this plan cannot start: ${changed}`;
     const held = this.partHeldBy(u, parts);
     if (held) return `this plan cannot start: ${held}`;
+    const changed = approvalChangedRefusal(u, ctx.approved);
+    if (changed) return `this plan cannot start: ${changed}`;
     return undefined;
   }
 
@@ -1414,6 +1460,7 @@ export class AutopilotService {
   async startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (this.starting.has(u.id)) throw new BadCommand("this plan is already starting");
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a running session");
     // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
     // the reviewer to answer them first, in a "Plan with Claude" session, before it can start.
@@ -1436,46 +1483,53 @@ export class AutopilotService {
     // Stop hook keeps it going until a judge agrees the plan is actually built + the checks pass, rather
     // than stopping the instant the model claims it's done (loop-engineering: run-until-done).
     const goalCondition = buildAutopilotGoal(u);
-    let cadBase: string | undefined;
-    const { id } = await this.deps.handoffCreate({
-      environmentId: env.id,
-      source: "fresh-worktree",
-      title: u.title,
-      model: model ?? "opus",
-      autonomy: autonomy ?? "bypass",
-      brief,
-      // The Go session is the unit's BUILDER (§4.11): unattended, owner cards denied, CAD verified.
-      workUnitId: u.id,
-      workUnitRole: "builder",
-      // Before the builder's first turn: record its base and write the plan's approved numbers into its
-      // NEW worktree (part.json + the declared parameters + the lock store, approvedBy "planner").
-      prepare: async ({ id: sid, cwd }) => {
-        const root = gitToplevel(cwd) ?? cwd;
-        cadBase = gitHead(root);
-        if (!planned.length) return;
-        if (!cadBase) throw new BadCommand("the build worktree has no commit, so its CAD parts could not be verified; nothing was started");
-        for (const part of planned) {
-          const r = await cad!.applyPlanExpectations(root, part, u.cadExpectations![part]!, sid);
-          if (!r.ok) throw new BadCommand(`could not apply the plan's numbers for cad/${part}: ${r.error}`);
-        }
-      },
-    });
-    // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
-    this.workUnits.update(u.id, {
-      sessionId: id,
-      status: "building",
-      hold: undefined,
-      ...(goalCondition ? { goalCondition } : {}),
-      ...(cadBase ? { cadBase } : {}),
-      cadVerified: undefined,
-      cadBlocked: undefined,
-      ...(u.blockedReason?.startsWith("CAD: ") ? { blockedReason: undefined } : {}),
-    });
-    this.clearVerificationOnBuild(u.id); // real work is starting → a stale "Likely complete" must not linger
-    if (goalCondition) this.deps.armGoal(id, goalCondition);
-    void this.tagTasks(u, "building");
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
+    // Reserved synchronously, before the first await (everything above is synchronous): a second Go on
+    // this unit, or on another unit over the same part, is refused until this start settles.
+    this.starting.set(u.id, { title: u.title, repo: this.repoKeyOf(u.environmentId) ?? env.repoRoot, parts: planned });
+    try {
+      let cadBase: string | undefined;
+      const { id } = await this.deps.handoffCreate({
+        environmentId: env.id,
+        source: "fresh-worktree",
+        title: u.title,
+        model: model ?? "opus",
+        autonomy: autonomy ?? "bypass",
+        brief,
+        // The Go session is the unit's BUILDER (§4.11): unattended, owner cards denied, CAD verified.
+        workUnitId: u.id,
+        workUnitRole: "builder",
+        // Before the builder's first turn: record its base and write the plan's approved numbers into its
+        // NEW worktree (part.json + the declared parameters + the lock store, approvedBy "planner").
+        prepare: async ({ id: sid, cwd }) => {
+          const root = gitToplevel(cwd) ?? cwd;
+          cadBase = gitHead(root);
+          if (!planned.length) return;
+          if (!cadBase) throw new BadCommand("the build worktree has no commit, so its CAD parts could not be verified; nothing was started");
+          for (const part of planned) {
+            const r = await cad!.applyPlanExpectations(root, part, u.cadExpectations![part]!, sid);
+            if (!r.ok) throw new BadCommand(`could not apply the plan's numbers for cad/${part}: ${r.error}`);
+          }
+        },
+      });
+      // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
+      this.workUnits.update(u.id, {
+        sessionId: id,
+        status: "building",
+        hold: undefined,
+        ...(goalCondition ? { goalCondition } : {}),
+        ...(cadBase ? { cadBase } : {}),
+        cadVerified: undefined,
+        cadBlocked: undefined,
+        ...(u.blockedReason?.startsWith("CAD: ") ? { blockedReason: undefined } : {}),
+      });
+      this.clearVerificationOnBuild(u.id); // real work is starting → a stale "Likely complete" must not linger
+      if (goalCondition) this.deps.armGoal(id, goalCondition);
+      void this.tagTasks(u, "building");
+      this.broadcastAutopilotPlans();
+      return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
+    } finally {
+      this.starting.delete(u.id);
+    }
   }
 
   /** Link a plan to an existing session that's already doing the work, instead of spawning a new one
@@ -1484,6 +1538,7 @@ export class AutopilotService {
   linkPlan(workUnitId: string, sessionId: string, cid?: string): AutopilotStartedEvent {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (this.starting.has(u.id)) throw new BadCommand("this plan is already starting");
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a running session");
     if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
     // Phase B3: the same start gate as Go (numbers approved), and then some: a CAD unit is built ONLY by

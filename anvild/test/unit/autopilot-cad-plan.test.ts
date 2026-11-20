@@ -6,7 +6,7 @@
  * verify result is judged for a builder or the dev pipeline.
  */
 import { describe, expect, test } from "bun:test";
-import { checkPlanExpectations, checkPlanPart, parseDeclared, planExpectationRows, planExpectationsSha } from "../../src/cadwork/plan-expectations";
+import { approvalPrint, canonicalBlock, checkPlanExpectations, checkPlanPart, keepsApproval, parseDeclared, planExpectationRows, planExpectationsSha, planWrite, replaceNote } from "../../src/cadwork/plan-expectations";
 import { parseDeclared as serviceParseDeclared } from "../../src/session/cadwork-service";
 import { CAD_META_INSTRUCTION, extractPlanMeta } from "../../src/integrations/plan-meta";
 import { autoStartDecision } from "../../src/integrations/autostart-gate";
@@ -167,6 +167,7 @@ describe("judging a verify run", () => {
 });
 
 describe("B3 review fixes: the pure parts", () => {
+  /** The approval a part has when its block on disk is exactly PLAN's (as a plan or the owner wrote it). */
   const approvedAt80 = (over: Record<string, unknown> = {}) => ({
     approvedBy: "planner",
     at: "2026-11-20T01:00:00.000Z",
@@ -176,24 +177,39 @@ describe("B3 review fixes: the pure parts", () => {
     matchesFile: true,
     process: "fdm-0.4",
     tolerance: { length: 0.01, volumeRel: 0.001 }, // the defaults (PLAN sets none)
-    refs: [],
+    refs: [] as string[],
+    block: planWrite(PLAN as any)!.block,
+    existingRefs: [] as string[],
     ...over,
   });
 
-  test("[B3] review 3: 'same as approved' compares the evaluated numbers and declared values (and the process when known); only the same, owner- or plan-approved numbers with their block on disk keep the approval", async () => {
-    const { replacesApproval, sameAsApproved, planExpectationRows: rowsOf } = await import("../../src/cadwork/plan-expectations");
+  test("[B3] review 3 (re-review 1): an approval is kept only when the WHOLE block the plan would write is byte-identical to the approved block, the block is known, and the owner or a plan approved it", async () => {
+    const { keepsApproval, replacesApproval, planExpectationRows: rowsOf } = await import("../../src/cadwork/plan-expectations");
     const p80 = checkPlanPart("plate", PLAN);
     if (!p80.ok) throw new Error(p80.error);
-    expect(sameAsApproved(p80.entry, approvedAt80())).toBe(true);
+    expect(keepsApproval(p80.entry, approvedAt80())).toBe(true);
     expect(replacesApproval(p80.entry, approvedAt80())).toBe(false);
     const p120 = checkPlanPart("plate", { ...PLAN, parameters: { ...PLAN.parameters, L: "120 mm" } });
     if (!p120.ok) throw new Error(p120.error);
-    expect(sameAsApproved(p120.entry, approvedAt80())).toBe(false);
     expect(replacesApproval(p120.entry, approvedAt80())).toBe(true);
-    expect(sameAsApproved(p80.entry, approvedAt80({ process: "cnc-3axis" }))).toBe(false);
-    expect(sameAsApproved(p80.entry, approvedAt80({ tolerance: { length: 0.1, volumeRel: 0.01 } }))).toBe(false);
-    expect(sameAsApproved(p80.entry, approvedAt80({ process: undefined, tolerance: undefined, matchesFile: false }))).toBe(true); // unknown fields not compared…
-    expect(replacesApproval(p80.entry, approvedAt80({ matchesFile: false }))).toBe(true); // …but the block on disk is not the approved one
+    // The reviewer's repro: the same numbers plus "Must not touch: housing.step" — a stricter block, so it REPLACES.
+    const touch = checkPlanPart("plate", { ...PLAN, expectations: { ...PLAN.expectations, noInterferenceWith: ["housing.step"] } });
+    if (!touch.ok) throw new Error(touch.error);
+    expect(replacesApproval(touch.entry, approvedAt80())).toBe(true);
+    // A reference the part already has is in what the plan writes: an approved block without it is replaced…
+    expect(replacesApproval(p80.entry, approvedAt80({ existingRefs: ["housing.step"] }))).toBe(true);
+    // …and one with it (in any order) is kept: noInterferenceWith is compared as a sorted set.
+    const two = (order: string[]) => canonicalBlock({ process: "fdm-0.4", status: "dimensioned", expectations: { ...planWrite(PLAN as any)!.expectations, noInterferenceWith: order }, declared: { L: 80, W: 50, T: 6 } });
+    const twoRefs = checkPlanPart("plate", { ...PLAN, expectations: { ...PLAN.expectations, noInterferenceWith: ["b.step", "a.step"] } });
+    if (!twoRefs.ok) throw new Error(twoRefs.error);
+    expect(keepsApproval(twoRefs.entry, approvedAt80({ block: two(["a.step", "b.step"]) }))).toBe(true);
+    expect(keepsApproval(twoRefs.entry, approvedAt80({ block: two(["a.step"]) }))).toBe(false);
+    // An approved block with a field this Anvil does not write (added later) is not identical: replaced.
+    const later = canonicalBlock({ process: "fdm-0.4", status: "dimensioned", expectations: { ...planWrite(PLAN as any)!.expectations, flatness: 0.05 }, declared: { L: 80, W: 50, T: 6 } });
+    expect(replacesApproval(p80.entry, approvedAt80({ block: later }))).toBe(true);
+    // Unknown approved block (the lock without the block on disk): replaced.
+    expect(replacesApproval(p80.entry, approvedAt80({ matchesFile: false, block: undefined }))).toBe(true);
+    expect(replacesApproval(p80.entry, approvedAt80({ block: undefined }))).toBe(true);
     expect(replacesApproval(p80.entry, approvedAt80({ approvedBy: "agent-initial" }))).toBe(true);
     expect(replacesApproval(p80.entry, undefined)).toBe(true);
     // The rows' old side is the approval, the new side the plan.
@@ -203,24 +219,71 @@ describe("B3 review fixes: the pure parts", () => {
     expect(rowsOf(p120.entry).every((r) => r.old === undefined)).toBe(true);
   });
 
+  test("[B3] re-review 1: property — any single-field change to the plan's block flips keep → replace (the card's note and the start's write use the same comparison)", () => {
+    const base = { process: "fdm-0.4", parameters: { L: "80 mm", W: 50, T: "6 mm" }, expectations: { bbox: ["L", "W", "T"], volume: "L*W*T", bodies: 1, holes: [{ diameter: 3.4, count: 4, kind: "through" }], tolerance: { length: 0.05, volumeRel: 0.005 }, noInterferenceWith: ["housing.step"] } };
+    const approval = (b: any) => approvedAt80({ block: planWrite(b)!.block, declared: checkPlanPart("x", b).ok ? (checkPlanPart("x", b) as any).declared : {} });
+    const ctx = (b: any) => ({ approved: () => approval(b), processes: ["fdm-0.4", "cnc-3axis"], defaultBranch: "main" });
+    const card = (entry: any, b: any) => toCadInfo(unit({ needsCad: true, cadExpectations: { plate: entry }, cadExpectationsStatus: "proposed" }), ctx(b))!.parts[0]!.note;
+    expect(keepsApproval(base as any, approval(base))).toBe(true);
+    expect(card(base, base)).toBeUndefined();
+    const clone = () => JSON.parse(JSON.stringify(base));
+    const mutations: [string, (b: any) => void][] = [
+      ["process", (b) => (b.process = "cnc-3axis")],
+      ["parameter L", (b) => (b.parameters.L = "81 mm")],
+      ["parameter W", (b) => (b.parameters.W = 51)],
+      ["parameter T", (b) => (b.parameters.T = "7 mm")],
+      ["an added parameter", (b) => (b.parameters.H = 3)],
+      ["bbox[0] formula", (b) => (b.expectations.bbox[0] = "L+0")],
+      ["bbox[2]", (b) => (b.expectations.bbox[2] = 6.5)],
+      ["volume", (b) => (b.expectations.volume = "L*W*T-1")],
+      ["bodies", (b) => (b.expectations.bodies = 2)],
+      ["hole diameter", (b) => (b.expectations.holes[0].diameter = 3.5)],
+      ["hole count", (b) => (b.expectations.holes[0].count = 3)],
+      ["hole kind", (b) => (b.expectations.holes[0].kind = "blind")],
+      ["an added hole", (b) => b.expectations.holes.push({ diameter: 5, count: 1 })],
+      ["no holes", (b) => (b.expectations.holes = [])],
+      ["tolerance length", (b) => (b.expectations.tolerance.length = 0.04)],
+      ["tolerance volumeRel", (b) => (b.expectations.tolerance.volumeRel = 0.004)],
+      ["tolerance defaulted", (b) => delete b.expectations.tolerance],
+      ["an added reference", (b) => b.expectations.noInterferenceWith.push("lid.step")],
+      ["a dropped reference", (b) => (b.expectations.noInterferenceWith = [])],
+      ["a renamed reference", (b) => (b.expectations.noInterferenceWith = ["case.step"])],
+    ];
+    for (const [what, mutate] of mutations) {
+      const changed = clone();
+      mutate(changed);
+      expect([what, checkPlanPart("plate", changed).ok]).toEqual([what, true]);
+      // The plan changes, the approval is the base's — and the reverse.
+      expect([what, keepsApproval(changed, approval(base))]).toEqual([what, false]);
+      expect([what, keepsApproval(base as any, approval(changed))]).toEqual([what, false]);
+      expect([what, card(changed, base)]).toEqual([what, replaceNote("plate", "main")]);
+    }
+  });
+
   test("[B3] review 3: the card carries old values, the replace note and a re-approve state from the approval; its sha changes when the approval does", async () => {
     const { cadCardSha, approvalChangedRefusal } = await import("../../src/integrations/autopilot-cad");
     const p120 = checkPlanPart("plate", { ...PLAN, parameters: { ...PLAN.parameters, L: "120 mm" } });
     if (!p120.ok) throw new Error(p120.error);
-    const u = unit({ needsCad: true, cadExpectations: { plate: { ...p120.entry, approvedAt: "2026-11-20T00:00:00.000Z" } }, cadExpectationsStatus: "approved" });
+    const u = unit({ needsCad: true, cadExpectations: { plate: { ...p120.entry, approvedAt: "2026-11-20T00:00:00.000Z", approvedOver: "none" } }, cadExpectationsStatus: "approved" });
     let approval: ReturnType<typeof approvedAt80> | undefined = approvedAt80();
     const ctx = { approved: () => approval, processes: ["fdm-0.4"], defaultBranch: "main" };
     const info = toCadInfo(u, ctx)!;
     expect(info.parts[0]!.note).toContain("Approving replaces the approved numbers for cad/plate for the whole repo");
     expect(info.parts[0]!.note).toContain("the part on main will show as unverified");
-    expect(info.reapprove).toContain("changed after this plan was approved"); // the approval (01:00) is newer than the plan's (00:00)
+    expect(info.reapprove).toContain("changed after this plan was approved"); // approved over "none"; there is an approval now
     expect(info.needsApproval).toBe(true);
-    expect(approvalChangedRefusal(u, () => approvedAt80({ at: "2026-11-19T00:00:00.000Z" }))).toBeUndefined(); // older: no conflict
+    // Re-review 5: identity, not clocks — approved over THIS approval: no conflict, whatever its time says.
+    const over = { ...u, cadExpectations: { plate: { ...u.cadExpectations!.plate!, approvedOver: approvalPrint(approvedAt80()) } } };
+    expect(approvalChangedRefusal(over, () => approvedAt80())).toBeUndefined();
+    expect(approvalChangedRefusal(over, () => approvedAt80({ at: "2026-11-19T00:00:00.000Z" }))).toBeUndefined(); // the clock is not part of it
+    expect(approvalChangedRefusal(over, () => approvedAt80({ sha: "s2", at: "2026-11-19T00:00:00.000Z" }))).toContain("re-approve the plan"); // older clock, different approval
+    expect(approvalChangedRefusal(over, () => undefined)).toContain("re-approve the plan"); // the approval was removed
     const shaWith = cadCardSha(u.cadExpectations, ctx);
     approval = approvedAt80({ at: "2026-11-20T02:00:00.000Z" });
     expect(cadCardSha(u.cadExpectations, ctx)).not.toBe(shaWith);
     approval = undefined;
     expect(cadCardSha(u.cadExpectations, ctx)).toBe(planExpectationsSha(u.cadExpectations));
+    expect(planExpectationsSha(u.cadExpectations)).toBe(planExpectationsSha({ plate: p120.entry })); // approval stamps are not what the card shows
     expect(toCadInfo(u, ctx)!.parts[0]!.note).toBeUndefined(); // nothing approved: nothing replaced
     // An unknown process is invalid with a note.
     const bad = toCadInfo(u, { ...ctx, processes: ["cnc-3axis"] })!;

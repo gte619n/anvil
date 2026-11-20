@@ -54,7 +54,7 @@ import {
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
 import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
-import { checkPlanPart, parseDeclared, replacesApproval, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { canonicalBlock, checkPlanPart, keepsApproval, parseDeclared, planWrite, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
 import { holeTable, mergeHoleTables } from "../cadwork/holes";
 import { readRules } from "../cadwork/rules";
@@ -2027,9 +2027,24 @@ export class CadworkService {
       ...(lock.values ? { values: lock.values } : {}),
       ...(lock.declared ? { declared: { ...lock.declared } } : {}),
       matchesFile: !!file,
-      ...(file ? { process: file.process } : {}),
+      ...(file ? { process: file.process, block: canonicalBlock({ process: file.process, status: file.status, expectations: file.expectations ?? null, declared: lock.declared ?? {} }) } : {}),
       ...(file?.expectations ? { tolerance: { ...file.expectations.tolerance }, refs: [...(file.expectations.noInterferenceWith ?? [])] } : {}),
+      existingRefs: this.existingRefs(ref, pf.kind === "ok" ? pf.file : undefined).map((r) => r.name),
     };
+  }
+
+  /** The references a part already has — part.json's records and the design's embedded references whose
+   *  file is in `refs/` — each of which a plan's write adds to `noInterferenceWith`. */
+  private existingRefs(ref: PartRef, file: PartFile | undefined): PartReference[] {
+    const records: PartReference[] = [...(file?.refs ?? [])];
+    let embedded: ReturnType<typeof embeddedReferences> = [];
+    try {
+      embedded = embeddedReferences(readDesignFile(ref.dir).script).filter((e) => existsSync(join(ref.dir, REFS_DIR, e.file)));
+    } catch {
+      embedded = [];
+    }
+    for (const e of embedded) if (!records.some((r) => r.name === e.file)) records.push({ name: e.file, source: `${REFS_DIR}/${e.file}`, sha256: e.sha256, bodies: e.bodies, at: new Date().toISOString() });
+    return records;
   }
 
   /** The process ids in a worktree's cad/rules.json (`null`: missing or unreadable). */
@@ -2083,20 +2098,18 @@ export class CadworkService {
     }
     await this.manager.open(ref);
     // Every reference the part already has is something it must not touch (as record_expectations does).
-    const embedded = embeddedReferences(readDesignFile(ref.dir).script).filter((e) => existsSync(join(ref.dir, REFS_DIR, e.file)));
-    const refRecords: PartReference[] = [...(keep?.refs ?? [])];
-    for (const e of embedded) if (!refRecords.some((r) => r.name === e.file)) refRecords.push({ name: e.file, source: `${REFS_DIR}/${e.file}`, sha256: e.sha256, bodies: e.bodies, at: new Date().toISOString() });
-    const asked = c.entry.expectations.noInterferenceWith ?? [];
-    const names = [...new Set([...asked, ...refRecords.map((r) => r.name)])];
-    const exp = stampExpectations({ ...c.entry.expectations, ...(names.length ? { noInterferenceWith: names } : {}) }, "planner", new Date().toISOString());
+    const refRecords = this.existingRefs(ref, keep);
+    const exp = planWrite(c.entry, refRecords.map((r) => r.name), new Date().toISOString())!.expectations;
     const have = new Map((this.manager.status(ref)?.params ?? []).map((p) => [p.name, p.value]));
     const change = Object.keys(c.declared).filter((n) => have.has(n) && !closeTo(have.get(n)!, c.declared[n]!));
     const add = Object.keys(c.declared).filter((n) => !have.has(n));
     let failure: string | undefined;
-    // Decision 183: the plan's numbers ARE the part's current approval (by the owner or a plan) and this
-    // worktree's part.json carries exactly that block → keep both untouched (only the parameters are set),
-    // so starting the builder does not make the part unverified on the default branch.
-    const keepApproval = !replacesApproval(c.entry, this.approvedNumbers(worktree, part));
+    // Decision 183: the WHOLE block this plan writes (process, every expectation field, tolerances, holes,
+    // references, declared values) is byte-identical to the part's current approval (by the owner or a
+    // plan), which this worktree's part.json carries → keep both untouched (only the parameters are set),
+    // so starting the builder does not make the part unverified on the default branch. Anything else —
+    // even one added reference — replaces it. The same `keepsApproval` the card's note is drawn from.
+    const keepApproval = keepsApproval(c.entry, this.approvedNumbers(worktree, part));
     const write = (params: CadParamInfo[]): void => {
       for (const n of Object.keys(c.declared)) {
         const got = params.find((p) => p.name === n)?.value;

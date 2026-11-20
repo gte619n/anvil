@@ -8,7 +8,7 @@
  */
 import type { AutopilotCadInfo } from "@protocol";
 import { createHash } from "node:crypto";
-import { approvedFingerprint, planExpectationRows, planExpectationsSha, replaceNote, replacesApproval, sameAsApproved, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { approvalPrint, approvedFingerprint, keepsApproval, planExpectationRows, planExpectationsSha, replaceNote, replacesApproval, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import type { PlanCadMeta } from "./plan-meta";
 import type { WorkUnit } from "./workunit";
 
@@ -96,15 +96,19 @@ export function cadCardSha(record: Record<string, PlanPartExpectations> | undefi
 }
 
 /**
- * Decision 183 (b): a part whose approved numbers were changed by someone AFTER this plan's numbers for
- * it were approved — a start would silently overwrite that newer approval. Undefined when none.
+ * Decision 183 (b): a part whose approval is no longer the one this plan's numbers were approved over
+ * (`approvedOver`, stamped at plan approval; absent = "none") — a start would silently overwrite an
+ * approval the owner never saw on this plan's card. Compared by the approval's identity, never by clocks
+ * (the approval may have been made on another machine). A plan whose whole block IS the current approval
+ * (`keepsApproval`) overwrites nothing. Undefined when none.
  */
 export function approvalChangedRefusal(u: Pick<WorkUnit, "cadExpectations">, approved: (part: string) => ApprovedNumbers | undefined): string | undefined {
   for (const p of coveredParts(u)) {
     const e = u.cadExpectations![p]!;
+    if (!e.approvedAt) continue;
     const a = approved(p);
-    if (!a || !e.approvedAt || sameAsApproved(e, a)) continue;
-    if (Date.parse(a.at) > Date.parse(e.approvedAt)) return `the approved numbers for cad/${p} changed after this plan was approved; re-approve the plan`;
+    if (keepsApproval(e, a)) continue;
+    if (approvalPrint(a) !== (e.approvedOver ?? "none")) return `the approved numbers for cad/${p} changed after this plan was approved; re-approve the plan`;
   }
   return undefined;
 }

@@ -63,8 +63,12 @@ describe("real SolidCraft: autopilot CAD", () => {
     expect(await goal(x, ev.sessionId)).toEqual([{ met: true }]); // the verify passes; the judge decides
 
     // Run 2 cannot start while run 1's builder is live on the same part (decision 183); once it is done, it can.
-    await expect(x.svc.startPlan(uid2)).rejects.toThrow("cad/plate is being built by “plate”");
+    await expect(x.svc.startPlan(uid2)).rejects.toThrow("cad/plate is being built by “plate” — finish, dismiss or archive that session first");
     (x.sessions.get(ev.sessionId)!.data as any).archived = true;
+    // Run 1's builder wrote the part's approval after run 2's numbers were approved: run 2 is re-approved
+    // over it on its card first (an approval is compared by identity, never by clock).
+    await expect(x.svc.startPlan(uid2)).rejects.toThrow("changed after this plan was approved");
+    x.svc.respondCad(uid2, true, x.plan(uid2).cad!.sha);
     // Run 2: a builder that moves L.
     const ev2 = await x.svc.startPlan(uid2);
     const t = x.tools(ev2.sessionId);

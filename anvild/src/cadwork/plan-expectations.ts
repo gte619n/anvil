@@ -24,6 +24,7 @@ import {
   stampExpectations,
   toleranceCapErrors,
   type EvaluatedExpectations,
+  type Expectations,
   type ExpectationsInput,
 } from "./partfile";
 import { sortKeys } from "./poststep";
@@ -36,6 +37,10 @@ export interface PlanPartExpectations {
   expectations: ExpectationsInput;
   /** When the OWNER approved this part's numbers (a planner card or the autopilot card). */
   approvedAt?: string;
+  /** The approval that was current for the part when the owner approved these numbers
+   *  (`approvalPrint`: the lock entry's identity, or "none"). A start is refused when it has changed
+   *  since — compared by identity, never by clocks from different machines. Absent (older units): "none". */
+  approvedOver?: string;
 }
 
 /** At most this many parts in one plan (a bound on what a model can make the card show). */
@@ -134,7 +139,7 @@ export function planExpectationsSha(record: Record<string, PlanPartExpectations>
     Object.keys(record ?? {})
       .sort()
       .map((p) => {
-        const { approvedAt: _a, ...rest } = record![p]!;
+        const { approvedAt: _a, approvedOver: _o, ...rest } = record![p]!;
         return [p, rest];
       }),
   );
@@ -146,13 +151,13 @@ const withValue = (written: string, value: string): string => (written === value
 
 /**
  * What is APPROVED for a part right now: the repo's single lock-store entry (per repo and part, shared by
- * every worktree and fleet-synced — decision 183). `process`, `tolerance` and `refs` are only known when
- * the part.json read alongside it still carries exactly the approved block (`matchesFile`); the numbers
- * (`values`, `declared`) are the lock's own.
+ * every worktree and fleet-synced — decision 183). `process`, `tolerance`, `refs` and `block` are only
+ * known when the part.json read alongside it still carries exactly the approved block (`matchesFile`);
+ * the numbers (`values`, `declared`) are the lock's own.
  */
 export interface ApprovedNumbers {
   approvedBy: string;
-  /** ISO time of the approval (the lock entry's clock). */
+  /** ISO time of the approval (the lock entry's clock — shown, never compared across machines). */
   at: string;
   /** The lock entry's `lockedBlockSha`. */
   sha: string;
@@ -163,45 +168,68 @@ export interface ApprovedNumbers {
   process?: string;
   tolerance?: { length: number; volumeRel: number };
   refs?: string[];
+  /** `canonicalBlock` of the approved block with the lock's declared values (only when `matchesFile`). */
+  block?: string;
+  /** The reference names the part already has (part.json `refs` and the design's embedded references):
+   *  a plan's write adds them to `noInterferenceWith`, as `record_expectations` does. */
+  existingRefs?: string[];
 }
 
-const near = (a: number, b: number): boolean => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
-const sameHoles = (a: EvaluatedExpectations["holes"], b: EvaluatedExpectations["holes"]): boolean =>
-  a.length === b.length && a.every((h, i) => near(h.diameter, b[i]!.diameter) && h.count === b[i]!.count && (h.kind ?? "") === (b[i]!.kind ?? ""));
-
 /**
- * The plan's numbers for a part are the approved ones: the same evaluated expectations and declared
- * parameter values (and, where the approved block is known, the same process and tolerance). Fields the
- * approval does not record are not compared.
+ * The canonical text of an expectations BLOCK: process, status, the WHOLE expectations object (every
+ * field, including any added later, without the `lockedAt` / `lockedBy` stamps; `noInterferenceWith` as a
+ * sorted set) and the declared parameter values. Two blocks are the same approval only when these are
+ * byte-identical — never a field-by-field comparison that a new field could slip past.
  */
-export function sameAsApproved(entry: PlanPartExpectations, approved: ApprovedNumbers | undefined): boolean {
-  if (!approved?.values) return false;
-  const c = checkPlanPart("x", entry);
-  if (!c.ok) return false;
-  const v = c.values;
-  const a = approved.values;
-  if (!(v.bbox.every((x, i) => near(x, a.bbox[i]!)) && near(v.volume, a.volume) && v.bodies === a.bodies && sameHoles(v.holes, a.holes))) return false;
-  const d = approved.declared ?? {};
-  const names = new Set([...Object.keys(c.declared), ...Object.keys(d)]);
-  for (const n of names) if (c.declared[n] === undefined || d[n] === undefined || !near(c.declared[n]!, d[n]!)) return false;
-  if (approved.process !== undefined && approved.process !== entry.process) return false;
-  if (approved.tolerance) {
-    const t = { length: entry.expectations.tolerance?.length ?? DEFAULT_TOLERANCE.length, volumeRel: entry.expectations.tolerance?.volumeRel ?? DEFAULT_TOLERANCE.volumeRel };
-    if (!near(t.length, approved.tolerance.length) || !near(t.volumeRel, approved.tolerance.volumeRel)) return false;
+export function canonicalBlock(b: { process: string; status: string; expectations?: object | null; declared?: Record<string, number> }): string {
+  let ex: Record<string, unknown> | null = null;
+  if (b.expectations) {
+    const { lockedAt: _a, lockedBy: _b, ...rest } = b.expectations as Record<string, unknown>;
+    ex = rest;
+    const refs = [...new Set(Array.isArray(rest.noInterferenceWith) ? (rest.noInterferenceWith as string[]) : [])].sort();
+    if (refs.length) ex.noInterferenceWith = refs;
+    else delete ex.noInterferenceWith;
   }
-  return true;
+  return JSON.stringify(sortKeys({ process: b.process, status: b.status, expectations: ex, declared: b.declared ?? {} }));
 }
 
 /**
- * Starting a builder with this plan REPLACES the part's approval (and so, until the work is merged, the
- * part on the default branch shows as unverified): anything but "the same numbers, already approved by
- * the owner or a plan, with the approved block on disk". When it does not, the builder keeps the
- * existing approval and part.json block untouched (`applyPlanExpectations`).
+ * The expectations a plan WRITES for a part (`applyPlanExpectations`): the plan's block, stamped, with
+ * every reference the part already has added to `noInterferenceWith`. Undefined for an invalid entry.
  */
+export function planWrite(entry: PlanPartExpectations, existingRefs: readonly string[] = [], lockedAt = "1970-01-01T00:00:00.000Z"): { expectations: Expectations; declared: Record<string, number>; block: string } | undefined {
+  const c = checkPlanPart("x", entry);
+  if (!c.ok) return undefined;
+  const names = [...new Set([...(c.entry.expectations.noInterferenceWith ?? []), ...existingRefs])];
+  const expectations = stampExpectations({ ...c.entry.expectations, ...(names.length ? { noInterferenceWith: names } : {}) }, "planner", lockedAt);
+  return { expectations, declared: c.declared, block: canonicalBlock({ process: c.entry.process, status: "dimensioned", expectations, declared: c.declared }) };
+}
+
+/**
+ * Starting a builder with this plan KEEPS the part's approval only when the whole block the plan would
+ * write is byte-identical (`canonicalBlock`) to the approved block, that block is known (on disk with the
+ * approval) and it was approved by the owner or a plan. Anything else REPLACES it. One comparison, used
+ * by the card's note, the start's refusal and `applyPlanExpectations`.
+ */
+export function keepsApproval(entry: PlanPartExpectations, approved: ApprovedNumbers | undefined): boolean {
+  if (!approved?.matchesFile || !approved.block) return false;
+  if (approved.approvedBy !== "owner" && approved.approvedBy !== "planner") return false;
+  return planWrite(entry, approved.existingRefs)?.block === approved.block;
+}
+
+/** Starting a builder with this plan replaces the part's approval (`!keepsApproval`): until the work is
+ *  merged, the part on the default branch shows as unverified. */
 export function replacesApproval(entry: PlanPartExpectations, approved: ApprovedNumbers | undefined): boolean {
-  if (!approved || !approved.matchesFile) return true;
-  if (approved.approvedBy !== "owner" && approved.approvedBy !== "planner") return true;
-  return !sameAsApproved(entry, approved);
+  return !keepsApproval(entry, approved);
+}
+
+/** The identity of a part's approval for "has it changed since the plan was approved?": the lock entry's
+ *  block sha, approver and accepted values; "none" when nothing is approved. No clock is part of it. */
+export function approvalPrint(approved: ApprovedNumbers | undefined): string {
+  if (!approved) return "none";
+  return createHash("sha256")
+    .update(JSON.stringify(sortKeys({ sha: approved.sha, by: approved.approvedBy, values: approved.values ?? null, declared: approved.declared ?? null })))
+    .digest("hex");
 }
 
 /** The warning a plan card carries when approving and starting it replaces the repo-wide approval. */
@@ -212,7 +240,7 @@ export function replaceNote(part: string, defaultBranch: string): string {
 /** What a card's "old" side is drawn from, for the card's identity (decision 153: a card whose old side
  *  changed while it was open is refused and redrawn). */
 export function approvedFingerprint(approved: ApprovedNumbers | undefined): string | null {
-  return approved ? `${approved.sha}@${approved.at}@${approved.approvedBy}@${approved.matchesFile ? 1 : 0}` : null;
+  return approved ? `${approved.sha}@${approved.at}@${approved.approvedBy}@${approved.matchesFile ? 1 : 0}@${(approved.existingRefs ?? []).join(",")}` : null;
 }
 
 /** The rows an owner card shows for one planned part: the process, each declared parameter, and each
