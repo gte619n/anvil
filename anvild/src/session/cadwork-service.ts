@@ -54,6 +54,7 @@ import {
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
 import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
+import { checkPlanPart, parseDeclared, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
 import { holeTable, mergeHoleTables } from "../cadwork/holes";
 import { readRules } from "../cadwork/rules";
@@ -129,7 +130,7 @@ export const CWD_REFUSED = "is not the worktree of a session or a registered env
 type CardKind = CadExpectationsRequestEvent["kind"];
 /** How an owner card was answered. `stale`: approved, but something the card showed changed while it
  *  was open — nothing is approved and a fresh card is drawn (decision 153). */
-type CardAnswer = "approved" | "denied" | "stale";
+export type CardAnswer = "approved" | "denied" | "stale";
 /**
  * What an owner card was drawn from (decision 153), stored with the card. Every kind follows one rule:
  * "old" is the ACCEPTED values; each parameter whose current value differs from its accepted value is
@@ -181,27 +182,10 @@ export const DIMENSIONS_CARD_OPEN = "a dimensions card is already open";
 export type ExpectationsReply = { ok: true; note?: string } | { ok: false; error: string };
 /** The caution on an `initial` card: the numbers were written after the part existed. */
 export const INITIAL_AFTER_GEOMETRY = "this part already has geometry; these numbers were written after it existed";
-/** A declared parameter value: a number, optionally followed by `mm`. Nothing else — the declared
- *  values are what the expectations (lengths, volumes) are evaluated from, so they are lengths or
- *  plain numbers; an angle (`deg`) is not accepted. */
-const DECLARED_RE = /^\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(mm)?\s*$/;
 const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z_0-9]*$/;
 
-/** Read `record_expectations`' `parameters` argument: every value a plain number (with an optional
- *  `mm` / `deg`). Returns the numbers and the expressions to create the parameters with. */
-export function parseDeclared(raw: unknown): { ok: true; values: Record<string, number>; expressions: Record<string, string> } | { ok: false; error: string } {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "`parameters` must be an object mapping every parameter name the expectations use to its value (use {} when every expectation is a plain number)" };
-  const values: Record<string, number> = {};
-  const expressions: Record<string, string> = {};
-  for (const [name, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (!PARAM_NAME_RE.test(name) || name === "pi") return { ok: false, error: `\`parameters\`: ${JSON.stringify(name)} is not a parameter name` };
-    const m = typeof v === "number" ? (Number.isFinite(v) ? [String(v), String(v), undefined] : null) : typeof v === "string" ? DECLARED_RE.exec(v) : null;
-    if (!m) return { ok: false, error: `\`parameters.${name}\` must be a number, optionally with mm (e.g. 80 or "80 mm"), not ${JSON.stringify(v)}` };
-    values[name] = Number(m[1]);
-    expressions[name] = typeof v === "number" ? String(v) : (v as string).trim();
-  }
-  return { ok: true, values, expressions };
-}
+/** `record_expectations`' `parameters` reader — shared with the autopilot plan's expectations (Phase B3). */
+export { parseDeclared } from "../cadwork/plan-expectations";
 
 /** Why a part that was not refreshed since the daemon started is `unverified`. */
 export const NOT_MEASURED = "not measured in this session";
@@ -394,6 +378,7 @@ export class CadworkService {
       unavailable: () => this.unavailableReason(),
       offerFile: (absPath) => this.offerFile(sessionId, absPath),
       touch: (ref) => this.touch(sessionId, ref),
+      partRefusal: (ref) => this.partRefusal(sessionId, ref),
       modelingRefusal: (ref) => this.modelingRefusal(ref),
       recordExpectations: (ref, process, parameters, expectations) => this.recordExpectations(sessionId, ref, process, parameters, expectations),
       proposeExpectations: (ref, expectations, reason) => this.proposeExpectations(sessionId, ref, expectations, reason),
@@ -520,6 +505,10 @@ export class CadworkService {
    */
   async recordExpectations(sessionId: string, ref: PartRef, process: unknown, parameters: unknown, input: unknown): Promise<ExpectationsReply & { approved?: boolean; by?: "agent-initial" | "owner" }> {
     this.touch(sessionId, ref);
+    // Phase B3: an autopilot builder never sets the numbers of a part its plan covers — those come
+    // from the plan, approved by the owner, and were written before its first turn.
+    const scope = this.builderPartsOf(sessionId);
+    if (scope?.includes(ref.part)) return { ok: false, error: `record_expectations was denied: cad/${ref.part}'s expectations come from this work unit's approved plan (they were applied before you started); build the part to meet them, or call report_gap` };
     if (typeof process !== "string" || !process.trim()) return { ok: false, error: "record_expectations: `process` must name a process in cad/rules.json (for example \"fdm-0.4\")" };
     const part = readPartFile(ref.dir);
     if (part.kind === "invalid") return { ok: false, error: `cad/${ref.part}/part.json cannot be read (${part.error}); it was not touched` };
@@ -1646,7 +1635,7 @@ export class CadworkService {
     }
     this.cards.delete(requestId);
     // The waiting tool call does the writing for these.
-    const toolCard = card.kind === "propose" || card.kind === "initial" || card.kind === "dimensions" || card.kind === "release";
+    const toolCard = card.kind === "propose" || card.kind === "initial" || card.kind === "dimensions" || card.kind === "release" || card.kind === "plan";
     // Decision 153: an approval is for exactly what the card showed. If anything on it changed while
     // it was open, nothing is approved and a fresh card is drawn (by the waiting call, or the recheck).
     const stale = approve && !!card.stale?.();
@@ -1977,6 +1966,158 @@ export class CadworkService {
     }
     s.emit({ type: "file.offer", file: offer });
     return true;
+  }
+
+  // ── Phase B3: autopilot builders and plans (spec §4.11, §4.14 item 41) ──────────────────────────
+
+  /** Which parts an autopilot builder session's plan covers (set by the Supervisor from the work unit).
+   *  `undefined` for a session that is not a builder (or when no autopilot is wired, e.g. a unit test). */
+  private builderScope?: (sessionId: string) => string[] | undefined;
+  setBuilderScope(fn: ((sessionId: string) => string[] | undefined) | undefined): void {
+    this.builderScope = fn;
+  }
+  private builderPartsOf(sessionId: string): string[] | undefined {
+    const s = this.deps.getSession(sessionId);
+    if (!s || !isUnattended(s)) return undefined;
+    return this.builderScope?.(sessionId);
+  }
+
+  /**
+   * Why a session may not address this part at all, or undefined. An autopilot builder works only on
+   * the parts its plan has approved dimensions for: it may not open (and so create) any other part.
+   */
+  partRefusal(sessionId: string, ref: PartRef): string | undefined {
+    const covered = this.builderPartsOf(sessionId);
+    if (!covered || covered.includes(ref.part)) return undefined;
+    return `cad/${ref.part} is not covered by this work unit's plan: an autopilot builder works only on the parts the plan has approved dimensions for (${covered.length ? covered.map((p) => `cad/${p}`).join(", ") : "none"}). If the change needs another part, stop and say so — the owner adds it in a planning session.`;
+  }
+
+  /** The approval on record for a part of a worktree (who approved its numbers), if any. */
+  approvalOf(worktree: string, part: string): PartLock | undefined {
+    try {
+      return this.findLock(partRef(worktree, part));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Refresh (measure and record) the named parts of a worktree now, starting their processes if
+   *  needed — so `part.json.measured` is the daemon's own measurement of the design on disk before a
+   *  verify reads it (what `check_part` does). Parts whose folder is gone are skipped. */
+  async settleParts(worktree: string, parts: string[]): Promise<void> {
+    for (const p of parts) {
+      let ref: PartRef;
+      try {
+        ref = partRef(worktree, p);
+      } catch {
+        continue;
+      }
+      if (!existsSync(ref.dir)) continue;
+      await this.manager.refreshNow(ref).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Apply a plan's APPROVED numbers for one part to a worktree, before an autopilot builder's first
+   * turn (Phase B3): the declared parameters are set in the design (`parameters.change` for names it
+   * has, `parameters.add` for the rest), then `part.json` gets the process and expectations
+   * (`lockedBy: "planner"`) and the lock store the approval (`approvedBy: "planner"`, fleet-synced),
+   * with the evaluated numbers fixed from the declared values — the same record `record_expectations`
+   * writes, in one queued job, so nothing slips in between. The caller has the owner's approval.
+   */
+  async applyPlanExpectations(worktree: string, part: string, entry: PlanPartExpectations, sessionId?: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const why = this.unavailableReason();
+    if (why) return { ok: false, error: `CAD is not available on this machine: ${why}` };
+    const c = checkPlanPart(part, entry);
+    if (!c.ok) return c;
+    let ref: PartRef;
+    try {
+      ref = partRef(worktree, part);
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    if (sessionId) this.touch(sessionId, ref);
+    const pf = readPartFile(ref.dir);
+    if (pf.kind === "invalid") return { ok: false, error: `cad/${part}/part.json cannot be read (${pf.error}); nothing was applied` };
+    const keep = pf.kind === "ok" ? pf.file : undefined;
+    if (keep?.ownerParams) {
+      const differ = Object.keys(keep.ownerParams).filter((n) => c.declared[n] === undefined || !closeTo(c.declared[n]!, keep.ownerParams![n]!));
+      if (differ.length) return { ok: false, error: `cad/${part}: the plan's parameters differ from the dimensions the owner typed (${differ.map((n) => `${n} = ${num(keep.ownerParams![n]!)}`).join(", ")})` };
+    }
+    await this.manager.open(ref);
+    // Every reference the part already has is something it must not touch (as record_expectations does).
+    const embedded = embeddedReferences(readDesignFile(ref.dir).script).filter((e) => existsSync(join(ref.dir, REFS_DIR, e.file)));
+    const refRecords: PartReference[] = [...(keep?.refs ?? [])];
+    for (const e of embedded) if (!refRecords.some((r) => r.name === e.file)) refRecords.push({ name: e.file, source: `${REFS_DIR}/${e.file}`, sha256: e.sha256, bodies: e.bodies, at: new Date().toISOString() });
+    const asked = c.entry.expectations.noInterferenceWith ?? [];
+    const names = [...new Set([...asked, ...refRecords.map((r) => r.name)])];
+    const exp = stampExpectations({ ...c.entry.expectations, ...(names.length ? { noInterferenceWith: names } : {}) }, "planner", new Date().toISOString());
+    const have = new Map((this.manager.status(ref)?.params ?? []).map((p) => [p.name, p.value]));
+    const change = Object.keys(c.declared).filter((n) => have.has(n) && !closeTo(have.get(n)!, c.declared[n]!));
+    const add = Object.keys(c.declared).filter((n) => !have.has(n));
+    let failure: string | undefined;
+    const write = (params: CadParamInfo[]): void => {
+      for (const n of Object.keys(c.declared)) {
+        const got = params.find((p) => p.name === n)?.value;
+        if (got === undefined || !closeTo(got, c.declared[n]!)) return void (failure = `SolidCraft made ${n} = ${got === undefined ? "nothing" : num(got)}, not the planned ${num(c.declared[n]!)}`);
+      }
+      const f: PartFile = {
+        schema: 1,
+        process: c.entry.process,
+        ...(keep?.material ? { material: keep.material } : {}),
+        status: "dimensioned",
+        ...(keep?.ownerParams ? { ownerParams: keep.ownerParams } : {}),
+        expectations: exp,
+        ...(refRecords.length ? { refs: refRecords } : {}),
+      };
+      writePartFile(ref.dir, f);
+      this.approve(ref, { sha: lockedBlockSha(f), approvedBy: "planner", status: "dimensioned", values: c.values, declared: { ...c.declared }, ...(f.ownerParams ? { ownerParams: f.ownerParams } : {}), at: exp.lockedAt });
+      this.clearGapRecord(ref); // owner-approved numbers are an approved expectation change
+    };
+    const commands = [
+      ...(change.length ? [{ command: "parameters.change", params: { changes: Object.fromEntries(change.map((n) => [n, c.expressions[n]])) } }] : []),
+      ...add.map((n) => ({ command: "parameters.add", params: { name: n, expression: c.expressions[n] } })),
+    ];
+    if (commands.length) {
+      const reply = await this.manager.request(ref, {
+        tool: "batch",
+        args: { commands, verbose: false },
+        kind: "mutate",
+        afterWrite: (slot, done) => {
+          if (done.result.isError) failure = `the planned parameters could not be set: ${done.result.text.slice(0, 300)}`;
+          else if (slot.state().conflict) failure = DISK_CONFLICT_REASON;
+          else write(slot.params());
+        },
+      });
+      if (failure && !reply.result.isError) await this.manager.request(ref, { tool: "undo", kind: "undo" }).catch(() => undefined);
+    } else {
+      await this.manager.run(ref, async (slot) => write(slot.params()));
+    }
+    if (failure) return { ok: false, error: `cad/${part}: ${failure}; nothing was applied` };
+    this.recheck(ref);
+    return { ok: true };
+  }
+
+  /**
+   * A typed owner card for an autopilot plan's numbers (`kind: "plan"`, Phase B3): shown in the
+   * planning session's chat, Approve / Deny, no "always allow". `stale()` says whether what the card
+   * shows has changed since it was drawn; an approval then comes back `stale` and the caller redraws
+   * (decision 153). Resolves with the answer; a reset or kill of the session denies it.
+   */
+  askPlanCard(sessionId: string, cwd: string, part: string, rows: CadExpectationsRow[], opts: { note?: string; stale: () => boolean }): Promise<CardAnswer> {
+    const requestId = newId("cadx");
+    const ref: PartRef = { key: `plan:${sessionId}:${part}`, worktree: cwd, part, dir: cwd };
+    return new Promise<CardAnswer>((resolve) => {
+      this.park({
+        requestId,
+        sessionId,
+        ref,
+        kind: "plan",
+        settle: resolve,
+        stale: opts.stale,
+        body: { type: "cad.expectations.request", requestId, sessionId, cwd, part, kind: "plan", ...(opts.note ? { note: opts.note } : {}), rows },
+      });
+    });
   }
 
   /**

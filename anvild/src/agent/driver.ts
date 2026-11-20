@@ -8,7 +8,7 @@ import { askUserQuestionToolIds, asyncLaunchedToolIds, extractResultUsage, signa
 import { CAD_MCP_SERVER_NAME, CAD_SYSTEM_PROMPT } from "./cad-tool-ids";
 import { buildFileOffer, deliverablePath, maybeTaildrop } from "./file-offer";
 import { makePreToolUseHook, type PermissionBroker, type PlanProposedHook } from "./permissions";
-import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalProgress, type GoalResolved } from "./goal";
+import { GOAL_TRANSCRIPT_LINES, makeStopHook, type GoalPrecheck, type GoalProgress, type GoalResolved } from "./goal";
 import { makeCanUseTool, type QuestionBroker } from "./questions";
 import { browserSessionPrompt } from "./human-tools";
 import { TEST_DAEMON_SESSION_PROMPT, TEST_MCP_SERVER_NAME } from "./testdaemon-tools";
@@ -125,6 +125,9 @@ export class AgentDriver {
     /** The MCP integration registry's hooks for this daemon (permission lookups, the exclusive lock,
      *  init-time failure reports). Absent (unit tests): every integration tool call is denied. */
     private readonly mcpGate?: McpSessionGate,
+    /** Phase B3: a deterministic check that runs before the goal judge and overrides it (an autopilot
+     *  builder's CAD verify). Absent for every other session. */
+    private readonly goalPrecheck?: GoalPrecheck,
   ) {}
 
   prompt(text: string, attachments: InlineAttachment[] = []): void {
@@ -292,12 +295,14 @@ export class AgentDriver {
                 makeStopHook(
                   s,
                   () => this.env,
-                  (met, goal) => this.onGoalResolved?.(met, goal),
+                  (met, goal, unmet) => this.onGoalResolved?.(met, goal, unmet),
                   undefined,
                   (goal) => this.onGoalProgress?.(goal),
+                  this.goalPrecheck,
                 ),
               ],
-              timeout: 60,
+              // 60s covered the judge alone; a builder's CAD verify (fresh SolidCraft replays) runs first.
+              timeout: this.goalPrecheck ? 600 : 60,
             },
           ],
         },

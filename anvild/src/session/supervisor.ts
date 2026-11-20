@@ -523,7 +523,10 @@ export class Supervisor {
         this.persist();
         this.broadcastUpdated(built.data);
       },
+      cadwork: this.cadwork, // Phase B3: plan numbers into builder worktrees, the verify hook, planner cards
     });
+    // An autopilot builder works only on the parts its plan covers (Phase B3, §4.11).
+    this.cadwork.setBuilderScope((sessionId) => this.autopilot.builderParts(sessionId));
     // A builder that hits a bot check or a CAPTCHA cannot wait for a person: its work unit is marked
     // blocked with the reason (agent browser §4.12 "Hand-off"; C3 review, item 3).
     this.human.onUnattendedHumanRequest = (sessionId, reason) => {
@@ -1217,6 +1220,11 @@ export class Supervisor {
   approveProposed(workUnitId: string, start: boolean, cid?: string): Promise<AutopilotStartedEvent | AutopilotPlanResultEvent> {
     return this.autopilot.approveProposed(workUnitId, start, cid);
   }
+
+  /** `autopilot.cad.respond` (Phase B3, item 41): approve/reject the CAD numbers on a plan's card. */
+  respondAutopilotCad(workUnitId: string, approve: boolean, sha: unknown, cid?: string): AutopilotPlanResultEvent {
+    return this.autopilot.respondCad(workUnitId, approve, sha, cid);
+  }
   reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
     return this.autopilot.reassignPlan(workUnitId, environmentId, cid);
   }
@@ -1523,9 +1531,12 @@ export class Supervisor {
     teamRole?: "lead" | "member";
     memberTask?: string;
     repoRoot?: string; // #7: spawn a fresh-worktree member off this repo when there's no environment
-    // ── Autopilot: mark a "Plan with Claude" planning session and link it to its work unit ──
+    // ── Autopilot: mark a "Plan with Claude" planning session (or a Go builder) and link it to its work unit ──
     workUnitId?: string;
-    workUnitRole?: "planner";
+    workUnitRole?: "planner" | "builder";
+    /** Phase B3: runs after the session exists and BEFORE its first turn (a builder's worktree gets the
+     *  plan's approved CAD numbers). A throw removes the session and is rethrown. */
+    prepare?: (s: { id: string; cwd: string }) => Promise<void> | void;
   }): Promise<{ id: string; title: string; cwd: string }> {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
@@ -1579,6 +1590,14 @@ export class Supervisor {
     }
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
     this.teams.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
+    if (a.prepare) {
+      try {
+        await a.prepare({ id: session.id, cwd: session.data.cwd });
+      } catch (e) {
+        await this.kill(session.id).catch(() => undefined); // nothing half-prepared is left running
+        throw e;
+      }
+    }
     this.prompt(session.id, a.brief); // lazily starts the driver and runs the first turn
     return { id: session.id, title: session.data.title, cwd: session.data.cwd };
   }
@@ -1991,7 +2010,7 @@ export class Supervisor {
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
         (commands) => this.onSessionCommands(id, commands),
         (err) => this.onTurnError(err),
-        (met, goal) => this.onGoalResolved(id, met, goal),
+        (met, goal, unmet) => this.onGoalResolved(id, met, goal, unmet),
         () => {
           this.persist();
           this.broadcastUpdated(s.data);
@@ -2004,6 +2023,8 @@ export class Supervisor {
         // the opus/sonnet/haiku aliases itself; fable has no alias, so this is how it keeps current).
         () => this.modelLabels.catalog(),
         this.mcp.gate,
+        // Phase B3: an autopilot builder's CAD verify runs before the goal judge and overrides it.
+        s.data.workUnitRole === "builder" ? () => this.autopilot.builderGoalCheck(id) : undefined,
       );
       this.drivers.set(id, driver);
     }
@@ -2546,13 +2567,15 @@ export class Supervisor {
 
   /** A goal finished — met, or abandoned at the ceiling. Marks the transcript, persists, and sends
    *  the ONE push the whole goal is allowed (design D3/D4). */
-  private onGoalResolved(id: string, met: boolean, goal: SessionGoal): void {
+  private onGoalResolved(id: string, met: boolean, goal: SessionGoal, unmet?: string): void {
     const s = this.sessions.get(id);
     if (!s) return;
-    const label = met ? "Goal met" : `Goal abandoned after ${GOAL_MAX_ITERATIONS} turns`;
+    const label = met ? "Goal met" : unmet ? "Goal unmet" : `Goal abandoned after ${GOAL_MAX_ITERATIONS} turns`;
     const note = met
       ? `“${goal.condition}” — reached in ${goal.iterations} attempt${goal.iterations === 1 ? "" : "s"}.`
-      : `“${goal.condition}” — last blocker: ${goal.lastReason ?? "unknown"}`;
+      : unmet
+        ? `“${goal.condition}” — ${unmet}`
+        : `“${goal.condition}” — last blocker: ${goal.lastReason ?? "unknown"}`;
     this.goalDivider(s, label, note);
     this.persist();
     this.broadcastUpdated(s.data);
@@ -2748,6 +2771,11 @@ export class Supervisor {
     // window instead of 4-5 sync spawns blocking the event loop after every turn.
     const s = this.sessions.get(sessionId);
     if (s) this.gitProjection.scheduleRefreshGit(sessionId);
+    // Phase B3: an autopilot builder's turn ended → verify the CAD parts its worktree touches (blocks the
+    // unit, or stamps cadVerified). Background: it replays designs in fresh SolidCraft processes.
+    if (s?.data.workUnitRole === "builder") {
+      void this.autopilot.verifyBuilder(sessionId, "turn").catch((e) => console.error(`[autopilot] CAD verify after a builder turn failed: ${e instanceof Error ? e.message : e}`));
+    }
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
     if (s?.data.parentId) void this.teams.drainQueuedMembers(s.data.parentId, sessionId);

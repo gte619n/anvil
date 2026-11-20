@@ -969,7 +969,72 @@
     },
     "B3": {
       "title": "autopilot CAD",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/autopilot-cad-plan.test.ts",
+          "names": [
+            "a plan's expectations: the record_expectations schema and caps > [B3] a valid part is normalized and its numbers fixed from the declared literal values",
+            "a plan's expectations: the record_expectations schema and caps > [B3] a bad name, a missing process, a non-literal parameter, a bad shape, a loose tolerance, or an undeclared formula name is refused",
+            "a plan's expectations: the record_expectations schema and caps > [B3] a record keeps the valid parts and lists one error per invalid one; the sha ignores approval stamps and key order",
+            "the nightly planner's channel: the metadata block > [B3] needsCad and cadExpectations in the metadata block become PROPOSED numbers on the unit, never approved",
+            "the nightly planner's channel: the metadata block > [B3] malformed proposals are ignored with a note; the unit still needs CAD",
+            "the start gate: an overlay, not a new status > [B3] a CAD unit starts only when every part is approved; a non-CAD unit is unaffected; auto-start holds with the same reason",
+            "the start gate: an overlay, not a new status > [B3] the card shows the numbers, the needs-approval state, the verified badge and the blocked reason; CAD builds stay on the grid",
+            "judging a verify run > [B3] all pass with plan-approved numbers → OK; every failure kind gives its own reason"
+          ]
+        },
+        {
+          "file": "test/unit/autopilot-cad-goal.test.ts",
+          "names": [
+            "[B3] a failing precheck ends the goal unmet with its reason, and the judge is never asked",
+            "[B3] a passing precheck lets the judge decide; a throwing precheck fails closed (unmet)"
+          ]
+        },
+        {
+          "file": "test/integration/autopilot-b3-cad.test.ts",
+          "names": [
+            "Phase B3 acceptance > [B3] acceptance 1: startPlan on a unit with cadExpectations.plate — the new session carries workUnitRole builder, and the worktree's cad/plate/part.json and the lock store hold the plan's expectations (approvedBy planner) before the first turn",
+            "Phase B3 acceptance > [B3] acceptance 2: the builder builds a passing part — at turn end the unit has cadVerified and is not blocked",
+            "Phase B3 acceptance > [B3] acceptance 3a: the builder's part fails the gate — the unit is blocked with the failing checks and the goal reports unmet (overriding the judge)",
+            "Phase B3 acceptance > [B3] acceptance 3b: the builder calls report_gap — the unit is blocked on the gap and the goal reports unmet",
+            "Phase B3 acceptance > [B3] acceptance 3c: the builder touches a part the plan did not cover — open_part refuses it, and a part made another way blocks the unit and the goal reports unmet",
+            "Phase B3 acceptance > [B3] acceptance 4: in a builder session, propose_expectations, request_dimensions and an Edit to cad/rules.json are denied and no card is emitted",
+            "Phase B3 acceptance > [B3] acceptance 5: the dev pipeline with a diff touching cad/ and a failing design maps to blocked, and removing the repo's EnvironmentValidation does not change that",
+            "item 41: the nightly planner proposes, the owner approves > [B3] item 41: nightly-proposed numbers block start (Go and auto-start) until approved",
+            "item 41: the nightly planner proposes, the owner approves > [B3] item 41: Reject keeps the unit unable to start",
+            "item 41: the nightly planner proposes, the owner approves > [B3] item 41: approval on the card locks the numbers (approvedBy planner in the builder's worktree) and start then succeeds",
+            "item 41: the nightly planner proposes, the owner approves > [B3] item 41: malformed proposals are ignored with a note, and the unit still cannot start",
+            "item 41: the nightly planner proposes, the owner approves > [B3] item 41: the approval card approves exactly what it showed — a proposal changed while the card is open is refused and the card redrawn",
+            "the planner's save_cad_expectations (interactive planning session) > [B3] save_cad_expectations always prompts with a typed card showing the numbers; approval sets the unit's cadExpectations approved, deny saves nothing",
+            "the planner's save_cad_expectations (interactive planning session) > [B3] the planner's card approves exactly what it showed: the unit's numbers changing while it is open refuses the approval and redraws the card",
+            "builder restrictions and the moved-number rule > [B3] a builder that changes a planned parameter is blocked on 'moved without owner approval'",
+            "builder restrictions and the moved-number rule > [B3] a unit whose plan touches CAD cannot start on a machine without cad-work, and a failed apply leaves no session"
+          ]
+        },
+        {
+          "file": "test/integration/autopilot-b3-wiring.test.ts",
+          "names": [
+            "[B3] wiring: Go through the Supervisor stamps the builder, applies the plan's numbers before the first turn reaches the model, and the turn's result runs the verify hook"
+          ]
+        },
+        {
+          "file": "test/web/autopilot-cad.test.ts",
+          "names": [
+            "[B3] web: proposed numbers render with Approve / Reject and the needs-approved-dimensions state; the buttons send exactly the card's sha",
+            "[B3] web: approved numbers are locked (no buttons); missing numbers say to plan with Claude; a note is shown",
+            "[B3] web: the CAD-verified badge, and the blocking reason on a blocked unit",
+            "[B3] web: the planner's `plan` card renders its rows with Approve / Deny and no always-allow"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/autopilot-b3.test.ts",
+          "names": [
+            "real SolidCraft: autopilot CAD > [B3] real: an approved plan → startPlan → the builder builds the reference plate → turn end → cadVerified; a second run where the builder changes L is blocked 'moved'; wall times recorded"
+          ]
+        }
+      ]
     },
     "C0": {
       "title": "spike",

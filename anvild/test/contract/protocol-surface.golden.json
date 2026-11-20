@@ -15,6 +15,7 @@
     "auth.set",
     "auth.status",
     "autopilot.approve",
+    "autopilot.cad.respond",
     "autopilot.clear",
     "autopilot.dismiss",
     "autopilot.link",

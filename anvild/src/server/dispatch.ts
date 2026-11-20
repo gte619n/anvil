@@ -658,6 +658,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .catch((e) => send(cmdError(errMsg(e), cid)));
         return;
 
+      case "autopilot.cad.respond":
+        // Phase B3 / item 41: the owner approves (locks) or rejects the CAD numbers shown on a plan's card.
+        send(deps.supervisor.respondAutopilotCad(cmd.workUnitId, cmd.approve === true, cmd.sha, cid));
+        return;
+
       // ── Completion verification (completion-verification spec §4.5) ──
       case "autopilot.verify":
         // Fleet-wide sweep: progress + plan-grid updates broadcast from inside the supervisor; only the

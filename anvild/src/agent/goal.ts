@@ -98,8 +98,12 @@ export async function judgeGoal(
   }
 }
 
-/** Called when a goal resolves — met (true) or abandoned at the ceiling (false). */
-export type GoalResolved = (met: boolean, goal: SessionGoal) => void;
+/** Called when a goal resolves — met (true), or not (false): abandoned at the ceiling, or (`unmet` set)
+ *  reported unmet by a deterministic precheck that overrides the judge. */
+export type GoalResolved = (met: boolean, goal: SessionGoal, unmet?: string) => void;
+/** A deterministic check run BEFORE the judge (Phase B3: an autopilot builder's CAD verify). A result
+ *  ends the goal as UNMET with that reason, whatever the judge would have said; undefined lets the judge decide. */
+export type GoalPrecheck = () => Promise<{ met: false; reason: string } | undefined>;
 /** Called after an unmet attempt so the supervisor can persist + broadcast the new count. */
 export type GoalProgress = (goal: SessionGoal) => void;
 
@@ -119,6 +123,7 @@ export function makeStopHook(
   onResolved: GoalResolved,
   judge: (c: string, t: string, e: Record<string, string>) => Promise<GoalVerdict> = judgeGoal,
   onProgress: GoalProgress = () => {},
+  precheck?: GoalPrecheck,
 ): HookCallback {
   return async () => {
     const goal = session.data.goal;
@@ -129,6 +134,23 @@ export function makeStopHook(
       session.data.goal = undefined;
       onResolved(false, goal);
       return { continue: true };
+    }
+
+    // The deterministic precheck overrides the judge: a CAD verify that does not pass is UNMET, and the
+    // goal ends there — the unit is blocked and no number of further attempts can approve a design.
+    if (precheck) {
+      let pre: { met: false; reason: string } | undefined;
+      try {
+        pre = await precheck();
+      } catch (e) {
+        pre = { met: false, reason: `the precheck failed: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      if (pre) {
+        goal.lastReason = pre.reason;
+        session.data.goal = undefined;
+        onResolved(false, goal, pre.reason);
+        return { continue: true };
+      }
     }
 
     let verdict: GoalVerdict;

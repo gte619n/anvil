@@ -63,6 +63,7 @@ const TITLE: Record<CadExpectationsRequestEvent["kind"], string> = {
   confirm: "Confirm numbers",
   dimensions: "Dimensions",
   release: "Release part",
+  plan: "Plan's CAD numbers",
 };
 const BLURB: Record<CadExpectationsRequestEvent["kind"], string> = {
   propose: "The agent asks to change what this part is checked against.",
@@ -73,6 +74,7 @@ const BLURB: Record<CadExpectationsRequestEvent["kind"], string> = {
   confirm: "These numbers were set by the agent. Approve to make them yours.",
   dimensions: "Type the real dimensions of this part. Your numbers become what it is built to and checked against.",
   release: "Release this part: the daemon writes the STEP, the views, a spec sheet (not a drawing) and a signed manifest.",
+  plan: "The planning session asks to lock these numbers onto the autopilot plan. The builder will be held to exactly them and cannot change them.",
 };
 /** Owner item 45: the card shows the script size once it is above this. */
 export const SCRIPT_SIZE_NOTICE_BYTES = 5 * 1024 * 1024;
@@ -333,7 +335,7 @@ export function createCadCards(deps: CadCardsDeps) {
       const table = el("table", "cad-expect-rows");
       const hr = el("tr");
       const heads =
-        ev.kind === "propose" ? ["Now", "Proposed"] : ev.kind === "initial" ? ["Now", "Asked for"] : ev.kind === "confirm" ? ["Now", "To confirm"] : ev.kind === "release" ? ["Expected", "Measured"] : ["Approved", "In the file"];
+        ev.kind === "propose" ? ["Now", "Proposed"] : ev.kind === "initial" ? ["Now", "Asked for"] : ev.kind === "confirm" ? ["Now", "To confirm"] : ev.kind === "release" ? ["Expected", "Measured"] : ev.kind === "plan" ? ["On the plan now", "To lock"] : ["Approved", "In the file"];
       hr.append(el("th", undefined, ""), el("th", undefined, heads[0]), el("th", undefined, heads[1]));
       table.append(hr);
       for (const r of ev.rows) {

@@ -52,6 +52,9 @@ export interface CadToolDeps {
   offerFile(absPath: string): boolean | Promise<boolean>;
   /** This session works on the part (its chat gets the part card and the adopt cards). */
   touch(ref: PartRef): void;
+  /** Why this session may not address the part at all (Phase B3: an autopilot builder outside its
+   *  plan's parts), else undefined. Checked by every tool that names a part, before anything runs. */
+  partRefusal?(ref: PartRef): string | undefined;
   /** Why modeling is refused on the part right now (no expectations recorded), else undefined. */
   modelingRefusal(ref: PartRef): string | undefined;
   /** Fixes the expected numbers from the declared parameter values and creates those parameters. For
@@ -154,6 +157,13 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
     if (!current) throw new Error("no part is open: call open_part { part } first");
     return current;
   };
+  /** The part a call names: a plain name (never a path), and one this session may address. */
+  const named = (part: unknown): PartRef => {
+    const ref = partRef(deps.worktree, part); // throws on anything that is not a plain name
+    const refused = deps.partRefusal?.(ref);
+    if (refused) throw new Error(refused);
+    return ref;
+  };
   const read = (name: string, args: Record<string, unknown>) =>
     guarded(async () => {
       const ref = selected();
@@ -188,7 +198,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       },
       async ({ part, concept, process }) =>
         guarded(async () => {
-          const ref = partRef(deps.worktree, part); // throws on anything that is not a plain name
+          const ref = named(part);
           const created = !existsSync(ref.dir);
           const opened = await deps.manager.open(ref);
           current = ref;
@@ -398,7 +408,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       },
       async ({ part, process, parameters, expectations }) =>
         guarded(async () => {
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           const r = await deps.recordExpectations(ref, process, parameters, expectations);
           if (!r.ok) return fail(r.error);
           if (r.approved === false) return ok(JSON.stringify({ part: ref.part, recorded: false, note: "The owner DENIED recording these expectations. Nothing was written." }));
@@ -422,7 +432,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       { part: z.string().describe("The part name (not a path)."), expectations: expectationsSchema, reason: z.string().describe("Why the expectations should change, for the owner to judge.") },
       async ({ part, expectations, reason }) =>
         guarded(async () => {
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           const r = await deps.proposeExpectations(ref, expectations, reason);
           if (!r.ok) return fail(r.error);
           if (!r.approved) return ok(JSON.stringify({ part: ref.part, approved: false, note: "The owner DENIED the change. The expectations are exactly as they were; nothing was written." }));
@@ -437,7 +447,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       { part: z.string().describe("The part name (not a path).") },
       async ({ part }) =>
         guarded(async () => {
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           if (!existsSync(join(ref.dir, DESIGN_FILE)) && !deps.manager.status(ref)?.live) return fail(`cad/${ref.part} has no design yet: open_part it and build something first`);
           const gate = await deps.checkPart(ref);
           const out = ok(JSON.stringify({ part: ref.part, ...gate, failing: failingLines(gate), advisory: advisoryLines(gate) }));
@@ -457,7 +467,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       },
       async ({ part, formats }) =>
         guarded(async () => {
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           if (!existsSync(join(ref.dir, DESIGN_FILE)) && !deps.manager.status(ref)?.live) {
             return fail(`cad/${ref.part} has no design yet: open_part it and build something first`);
           }
@@ -510,7 +520,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async ({ part, file }) =>
         guarded(async () => {
           if (!deps.importReference) return fail("import_reference is not available here");
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           const r = await deps.importReference(ref, file);
           if (!r.ok) return fail(r.error);
           if (r.approved === false) return ok(JSON.stringify({ part: ref.part, imported: false, note: "The owner DENIED adding this reference. Nothing was imported or written." }));
@@ -530,7 +540,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async ({ part, proposed }) =>
         guarded(async () => {
           if (!deps.requestDimensions) return fail("request_dimensions is not available here");
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           const r = await deps.requestDimensions(ref, proposed);
           if (!r.ok) return fail(r.error);
           if (!r.approved) return ok(JSON.stringify({ part: ref.part, confirmed: false, note: "The owner declined to give dimensions. Nothing was changed." }));
@@ -545,7 +555,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async ({ part, feature, detail }) =>
         guarded(async () => {
           if (!deps.reportGap) return fail("report_gap is not available here");
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           const r = await deps.reportGap(ref, feature, detail);
           if (!r.ok) return fail(r.error);
           return ok(JSON.stringify({ part: ref.part, state: r.gate?.state ?? "gap", gap: { feature, detail }, note: "The owner sees this on the part card. Stop working on this feature." }));
@@ -560,7 +570,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async ({ part }) =>
         guarded(async () => {
           if (!deps.releasePart) return fail("release_part is not available here");
-          const ref = partRef(deps.worktree, part);
+          const ref = named(part);
           const r = await deps.releasePart(ref);
           if (!r.ok) return fail(r.error);
           if (!r.approved) return ok(JSON.stringify({ part: ref.part, released: false, note: "The owner DENIED the release. Nothing was written." }));

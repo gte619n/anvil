@@ -856,6 +856,10 @@ export interface CadDimensionRow {
  *  - `release`            Phase A4: release the part (§4.7). `rows` hold expected and measured
  *                         numbers, holes, advisories, script size and who approved the numbers;
  *                         `note` says so when the agent set them (approving then also confirms them).
+ *  - `plan`               Phase B3: an autopilot PLANNING session's `save_cad_expectations` — the numbers
+ *                         an autopilot builder will be held to (`cwd` is the planning session's worktree,
+ *                         `part` the planned part). Approving locks exactly the rows shown onto the work
+ *                         unit; the builder's worktree gets them (approvedBy "planner") when it starts.
  * Every card shows the evaluated numbers together with the process and status they are approved under.
  * Answered with `cad.expectations.respond`; retired by `cad.expectations.resolved`. Broadcast to all
  * clients (it names its session) and re-sent, with `replay`, when a socket opens.
@@ -866,7 +870,7 @@ export interface CadExpectationsRequestEvent extends Envelope {
   sessionId: SessionId;
   cwd: string;
   part: string;
-  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "initial" | "confirm" | "dimensions" | "release";
+  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "initial" | "confirm" | "dimensions" | "release" | "plan";
   reason?: string;
   /** `dimensions` cards only: the rows the owner edits. */
   dimensions?: CadDimensionRow[];
@@ -1238,8 +1242,29 @@ export interface AutopilotPlanInfo {
   // judgment surfaced as a "Likely complete" badge (verdict done) or a mismatch warning. Additive, so an
   // old client simply ignores it. Only present when the verifier has run and the overlay is live.
   verification?: AutopilotVerificationInfo;
+  // Phase B3 (agent-cad-and-browser §4.11, §4.14 item 41): the CAD numbers the plan carries, the
+  // "needs approved dimensions" state, and the builder's last verify. Additive; an old client ignores it.
+  cad?: AutopilotCadInfo;
+  blockedReason?: string; // why a `blocked` unit is blocked (e.g. the CAD verify's reason)
   createdAt: Iso8601;
   updatedAt: Iso8601;
+}
+/**
+ * A work unit's CAD state on its card (Phase B3). `needsApproval`: the unit's plan touches CAD and its
+ * numbers are not approved, so neither Go nor auto-start will start it ("needs approved dimensions").
+ * A `proposed` card shows Approve / Reject; Approve sends `autopilot.cad.respond` with `sha`, and the
+ * daemon approves only if the numbers are still exactly the ones this card shows.
+ */
+export interface AutopilotCadInfo {
+  status: "proposed" | "approved" | "rejected" | "missing"; // missing: CAD needed but no valid numbers yet
+  needsApproval: boolean;
+  sha?: string; // identity of exactly the numbers shown (planExpectationsSha)
+  parts: { part: string; process: string; approved: boolean; rows: CadExpectationsRow[] }[];
+  source?: "planner" | "nightly";
+  approvedAt?: Iso8601;
+  note?: string; // e.g. proposed numbers that were ignored as malformed
+  verified?: { at: Iso8601; parts: string[] }; // the builder's last verify passed for these parts
+  blocked?: { at: Iso8601; reason: string }; // the last verify blocked the unit
 }
 /** Provenance of an event-triggered work unit (structurally matches integrations/event-trigger TriggerInfo). */
 export interface AutopilotTriggerInfo {
@@ -2555,6 +2580,16 @@ export interface AutopilotApproveCmd extends Envelope, Correlated {
   workUnitId: string;
   start?: boolean; // also start a build session immediately (else it lands on the grid as `planned`)
 }
+/** Approve or reject the CAD numbers on an autopilot card (Phase B3, §4.14 item 41). `sha` is the
+ *  card's `AutopilotCadInfo.sha`: an Approve whose numbers changed since the card was drawn is refused
+ *  (command.error) and the grid is redrawn. Approval locks them exactly as an interactive
+ *  `save_cad_expectations` does. → autopilot.plan (and an autopilot.plans broadcast). */
+export interface AutopilotCadRespondCmd extends Envelope, Correlated {
+  type: "autopilot.cad.respond";
+  workUnitId: string;
+  approve: boolean;
+  sha: string;
+}
 // ── Completion verification (completion-verification spec). Gated by the "autopilot-verify" capability:
 // a client sends these only to a daemon that advertises it, and the daemon additionally rejects them when
 // the `verifyEnabled` flag is off. All five settle → autopilot.plans (the overlay rides AutopilotPlanInfo).
@@ -2847,6 +2882,7 @@ export type ClientCommand =
   | AutopilotRunCmd
   | AutopilotTriggerCmd
   | AutopilotApproveCmd
+  | AutopilotCadRespondCmd
   | AutopilotVerifyCmd
   | AutopilotVerifyConfirmCmd
   | AutopilotVerifyDismissCmd

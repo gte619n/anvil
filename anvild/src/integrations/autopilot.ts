@@ -7,7 +7,10 @@ import { makePipelineGuardHook } from "../agent/pipeline-guard";
 import type { QueryLike } from "../agent/query";
 import type { TodoistClient, TodoistTask, TodoistSection, TodoistComment } from "./todoist";
 import { readStatus, withStatus, type AnvilStatus } from "./status";
-import { extractPlanMeta, PLAN_META_INSTRUCTION, type PlanClarification } from "./plan-meta";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { CAD_META_INSTRUCTION, extractPlanMeta, PLAN_META_INSTRUCTION, type PlanCadMeta, type PlanClarification } from "./plan-meta";
+import { cadFieldsFromMeta } from "./autopilot-cad";
 import { extractJson } from "./json";
 import { parseIntakeVerdict, type IntakeVerdict } from "./autostart-gate";
 import { parseVerdict, type Verdict } from "./autopilot-plans";
@@ -36,6 +39,7 @@ export interface PlannedUnit extends ProposedUnit {
   effort?: AutopilotEffort; // rough size + files-touched estimate (from the plan's metadata block)
   adversarial?: AdversarialReview; // competing-model critiques of the plan (undefined when the panel is disabled)
   clarification?: PlanClarification; // set when the planner judged the task too underspecified to build (Fix B escape hatch)
+  cad?: PlanCadMeta; // Phase B3 / item 41: the planner's PROPOSED CAD numbers (never locked until the owner approves)
 }
 
 /** Optional adversarial-panel wiring threaded through the planner. Omitting it disables the panel
@@ -129,7 +133,7 @@ async function runQuery(
  * falls back to the wrap-up text. The model is told to append a ```json metadata block "after the
  * plan"; it may land in either the plan or the wrap-up, so we look in both for summary/effort.
  */
-function resolvePlan(out: { text: string; plan?: string }): { plan: string; summary?: string; effort?: AutopilotEffort; clarification?: PlanClarification } {
+function resolvePlan(out: { text: string; plan?: string }): { plan: string; summary?: string; effort?: AutopilotEffort; clarification?: PlanClarification; cad?: PlanCadMeta } {
   const primary = extractPlanMeta(out.plan ?? out.text);
   if (primary.summary || !out.plan) return primary; // metadata found, or nothing else to look at
   const fromText = extractPlanMeta(out.text); // plan had no block — try the wrap-up for summary/effort/clarification
@@ -138,6 +142,7 @@ function resolvePlan(out: { text: string; plan?: string }): { plan: string; summ
     ...(fromText.summary ? { summary: fromText.summary } : {}),
     ...(fromText.effort ? { effort: fromText.effort } : {}),
     ...(fromText.clarification ? { clarification: fromText.clarification } : {}),
+    ...(fromText.cad ? { cad: fromText.cad } : {}),
   };
 }
 
@@ -264,7 +269,7 @@ Write a focused implementation plan in markdown: the approach, the specific file
 
 ${VALIDATION_INSTRUCTION}
 
-${PLAN_META_INSTRUCTION}`;
+${PLAN_META_INSTRUCTION}${existsSync(join(opts.repoRoot, "cad")) ? `\n\n${CAD_META_INSTRUCTION}` : ""}`;
 
   const out = await runQuery(prompt, {
     model: opts.model ?? "opus",
@@ -275,7 +280,7 @@ ${PLAN_META_INSTRUCTION}`;
     accountId: opts.accountId,
   });
   const resolved = resolvePlan(out);
-  const { summary, effort, clarification } = resolved;
+  const { summary, effort, clarification, cad } = resolved;
   let plan = resolved.plan;
 
   // Adversarial panel: competing OpenRouter models critique Claude's plan. Advisory only — never fail
@@ -296,7 +301,7 @@ ${PLAN_META_INSTRUCTION}`;
       adversarial = undefined;
     }
   }
-  return { ...unit, tasks: members, plan, summary, effort, adversarial, ...(clarification ? { clarification } : {}) };
+  return { ...unit, tasks: members, plan, summary, effort, adversarial, ...(clarification ? { clarification } : {}), ...(cad ? { cad } : {}) };
 }
 
 /**
@@ -559,6 +564,8 @@ async function processUnit(
           adversarial: planned!.adversarial,
           status,
           ...(opts.source ? { source: opts.source } : {}),
+          // Item 41: the planner's CAD numbers are stored PROPOSED; the card asks the owner to approve them.
+          ...cadFieldsFromMeta(planned!.cad),
         },
   );
 
