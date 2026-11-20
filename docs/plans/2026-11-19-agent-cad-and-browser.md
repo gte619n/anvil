@@ -1,6 +1,6 @@
 # Agent CAD (SolidCraft) and browser for Anvil sessions
 
-- **Status:** Building (owner said "implement everything" on 2026-11-19; decisions in the `-DECISIONS.md` file beside this one) · **Owner:** Evan Ruff · **Branch:** `computer-use`
+- **Status:** Built and reviewed (owner-witnessed checks pending) · decisions in the `-DECISIONS.md` file beside this one, verification in §11 · **Owner:** Evan Ruff · **Branch:** `computer-use`
 - **Created:** 2026-11-19
 - **Supersedes/extends:** supersedes `2026-11-19-mcp-integrations.md` as the plan of record. That
   file's registry design (its §4.1 to §4.5, §6, §7 and its critique table) stays authoritative for
@@ -818,11 +818,11 @@ ticked only by the rule in §8.4. Symbols: ☐ not started, ◐ in progress, ☑
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| Script round trip: build, export script, replay in a new process, compare numbers (S2) | ☐ | ☐ | ☐ |
-| Reference STEP import, script export, replay with a relative path (S3) | ☐ | ☐ | ☐ |
-| Hole extraction from `body_topology` on the plate and on a part with a blind hole and a boss (S4) | ☐ | ☐ | ☐ |
-| Headless over SSH on the M1 with no one logged in, including `screenshot` (S7) | ☐ | ☐ | ☐ |
-| Two interleaved callers on one process: confirm strict request/response ordering (S1) | ☐ | ☐ | ☐ |
+| Script round trip: build, export script, replay in a new process, compare numbers (S2) | ☑ | ☑ | ☑ |
+| Reference STEP import, script export, replay with a relative path (S3) (see §4.14 item 4 / decision 7: the STEP is embedded, no path) | ☑ | ☑ | ☑ |
+| Hole extraction from `body_topology` on the plate and on a part with a blind hole and a boss (S4) | ☑ | ☑ | ☑ |
+| Headless over SSH on the M1 with no one logged in, including `screenshot` (S7) (see §4.14 item 13 / decision 5) | ◐ | ◐ awaiting owner | ◐ |
+| Two interleaved callers on one process: confirm strict request/response ordering (S1) | ☑ | ☑ | ☑ |
 
 **Acceptance:** §11 holds the commands and output for each row, each assumption is marked
 confirmed or refuted, and every refuted one has a spec change merged before A1 starts.
@@ -831,11 +831,11 @@ confirmed or refuted, and every refuted one has a spec change merged before A1 s
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `mcp-client.ts` + `fake-solidcraft.ts` | ☐ | ☐ | ☐ |
-| Manager: keying, queue, idle exit, cap, crash restart, disk-change reload | ☐ | ☐ | ☐ |
-| Post-step step 1 (script write) | ☐ | ☐ | ☐ |
-| `anvil_cad` server: `open_part`, pass-through tools, `export_part` | ☐ | ☐ | ☐ |
-| Permission classes; capability `cad-work` behind `ANVIL_FEATURES` | ☐ | ☐ | ☐ |
+| `mcp-client.ts` + `fake-solidcraft.ts` | ☑ | ☑ | ☑ |
+| Manager: keying, queue, idle exit, cap, crash restart, disk-change reload (see §4.14 item 1 / decisions 88, 164: designs load screened, by batch, not `--in`) | ☑ | ☑ | ☑ |
+| Post-step step 1 (script write) | ☑ | ☑ | ☑ |
+| `anvil_cad` server: `open_part`, pass-through tools, `export_part` (see decision 49: default-deny allow list) | ☑ | ☑ | ☑ |
+| Permission classes; capability `cad-work` behind `ANVIL_FEATURES` | ☑ | ☑ | ☑ |
 
 **Acceptance:**
 
@@ -852,12 +852,12 @@ confirmed or refuted, and every refuted one has a spec change merged before A1 s
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `expr.ts` evaluator | ☐ | ☐ | ☐ |
-| `partfile.ts`, `locks.ts`, `record_expectations`, `propose_expectations` + card, adopt card | ☐ | ☐ | ☐ |
-| Protected check in `decide()` (always-prompt and always-deny lists) | ☐ | ☐ | ☐ |
-| `holes.ts`, `gate.ts`, refresh steps 2 and 3, `check_part` | ☐ | ☐ | ☐ |
-| `rules.ts` hard and advisory checks | ☐ | ☐ | ☐ |
-| Part card in chat | ☐ | ☐ | ☐ |
+| `expr.ts` evaluator | ☑ | ☑ | ☑ |
+| `partfile.ts`, `locks.ts`, `record_expectations`, `propose_expectations` + card, adopt card (see §4.14 item 42 / decisions 93, 94, 153: hub-synced lock store, numbers fixed at record time, cards drawn from snapshots) | ☑ | ☑ | ☑ |
+| Protected check in `decide()` (always-prompt and always-deny lists) | ☑ | ☑ | ☑ |
+| `holes.ts`, `gate.ts`, refresh steps 2 and 3, `check_part` | ☑ | ☑ | ☑ |
+| `rules.ts` hard and advisory checks | ☑ | ☑ | ☑ |
+| Part card in chat | ☑ | ☑ | ☑ |
 
 **Acceptance:**
 
@@ -884,12 +884,12 @@ confirmed or refuted, and every refuted one has a spec change merged before A1 s
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| Post-step steps 4 and 5, debounce, preview pruning | ☐ | ☐ | ☐ |
-| `cad.design`, `cad.parts.list`, `cad.param.set`, `cad.design.refresh` | ☐ | ☐ | ☐ |
-| `replaceModel` in `cad.ts`; live mode: Follow, Paused + badge, Reload, Rebuild | ☐ | ☐ | ☐ |
-| Playwright spec that loads the real web bundle (not the standalone golden harness page) | ☐ | ☐ | ☐ |
-| Parameters panel, gate strip, error display | ☐ | ☐ | ☐ |
-| Owner-change note on the agent's next tool result | ☐ | ☐ | ☐ |
+| Post-step steps 4 and 5, debounce, preview pruning | ☑ | ☑ | ☑ |
+| `cad.design`, `cad.parts.list`, `cad.param.set`, `cad.design.refresh` | ☑ | ☑ | ☑ |
+| `replaceModel` in `cad.ts`; live mode: Follow, Paused + badge, Reload, Rebuild | ☑ | ☑ | ☑ |
+| Playwright spec that loads the real web bundle (not the standalone golden harness page) | ☑ | ☑ | ☑ |
+| Parameters panel, gate strip, error display | ☑ | ☑ | ☑ |
+| Owner-change note on the agent's next tool result | ☑ | ☑ | ☑ |
 
 **Acceptance:**
 
@@ -911,10 +911,10 @@ confirmed or refuted, and every refuted one has a spec change merged before A1 s
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `import_reference` + interference check in the gate | ☐ | ☐ | ☐ |
-| `concept` parts: picture compare advisory, `request_dimensions` typed card, promotion to `dimensioned` | ☐ | ☐ | ☐ |
-| `report_gap` + card | ☐ | ☐ | ☐ |
-| `release.ts` + `release_part` + cards | ☐ | ☐ | ☐ |
+| `import_reference` + interference check in the gate (see §4.14 item 45 / decision 140: 50 MB cap) | ☑ | ☑ | ☑ |
+| `concept` parts: picture compare advisory, `request_dimensions` typed card, promotion to `dimensioned` | ☑ | ☑ | ☑ |
+| `report_gap` + card | ☑ | ☑ | ☑ |
+| `release.ts` + `release_part` + cards | ☑ | ☑ | ☑ |
 
 **Acceptance:**
 
@@ -929,12 +929,14 @@ confirmed or refuted, and every refuted one has a spec change merged before A1 s
   one hole-table row per distinct diameter; one `file.offer` is emitted per file. On a failing
   part it writes nothing. A copied folder with an edited STEP does not get the "Released" badge.
 
+**Owner-witnessed check (Track A, §8.3): ◐ awaiting owner.** A part built from a phone prompt, a parameter changed in the panel on the phone, and the release pack opened.
+
 #### Phase A5: merge guard
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `verify.ts` + `verify-cli.ts` | ☐ | ☐ | ☐ |
-| System-prompt rule for merges touching `cad/` | ☐ | ☐ | ☐ |
+| `verify.ts` + `verify-cli.ts` | ☑ | ☑ | ☑ |
+| System-prompt rule for merges touching `cad/` | ☑ | ☑ | ☑ |
 
 **Acceptance:** in a fixture repo, two branches each change a different parameter of one part.
 After a clean text merge, `verify-cli` exits non-zero because `measured` no longer matches the
@@ -947,8 +949,8 @@ replay. After the refresh runs on the merged script and the result passes, it ex
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| Standalone zip runs from `<stateDir>`, passes `codesign` and `spctl` (S6) | ☐ | ☐ | ☐ |
-| A script from the previous release replays under the current one (S5) | ☐ | ☐ | ☐ |
+| Standalone zip runs from `<stateDir>`, passes `codesign` and `spctl` (S6) (see §4.14 item 14 / decision 13: `spctl -t install`) | ☑ | ☑ | ☑ |
+| A script from the previous release replays under the current one (S5) | ☑ | ☑ | ☑ |
 
 **Acceptance:** as A0.
 
@@ -956,9 +958,9 @@ replay. After the refresh runs on the merged script and the result passes, it ex
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `install.ts` with the four verifications | ☐ | ☐ | ☐ |
-| `pin.ts`, hub broadcast, member apply, `cad-work` withdrawn off-pin | ☐ | ☐ | ☐ |
-| Settings → CAD card; "Pin back" | ☐ | ☐ | ☐ |
+| `install.ts` with the four verifications (see §4.14 item 14: now six steps) | ☑ | ☑ | ☑ |
+| `pin.ts`, hub broadcast, member apply, `cad-work` withdrawn off-pin | ☑ | ☑ | ☑ |
+| Settings → CAD card; "Pin back" | ☑ | ☑ | ☑ |
 
 **Acceptance:** with a fake downloader: a zip whose sha differs is deleted and reported; one with
 the wrong Team ID is deleted and reported; a good one becomes the manager's binary. A member on a
@@ -970,9 +972,9 @@ the hub brings two members to `ready`.
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `candidate.ts` (age, release type, rate limit) | ☐ | ☐ | ☐ |
-| `replay.ts` on each machine, hub aggregation | ☐ | ☐ | ☐ |
-| Hold, reject, notify; "Advance anyway" | ☐ | ☐ | ☐ |
+| `candidate.ts` (age, release type, rate limit) | ☑ | ☑ | ☑ |
+| `replay.ts` on each machine, hub aggregation (see §4.14 item 17 / decisions 62, 65, 88: screened, sandboxed, centre-of-mass compared) | ☑ | ☑ | ☑ |
+| Hold, reject, notify; "Advance anyway" (see decisions 53, 63, 64) | ☑ | ☑ | ☑ |
 
 **Acceptance (fake clock, fake SolidCraft with a per-version behaviour table):**
 
@@ -988,16 +990,18 @@ the hub brings two members to `ready`.
 - A member hosting designs is unreachable: the pin holds and the card names the member.
 - During evaluation the pinned build keeps serving sessions (the candidate is installed beside it).
 
+**Owner-witnessed check (Track B, §8.3): ◐ awaiting owner.** A real pin advance across two machines.
+
 #### Phase B3: autopilot CAD
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `workUnitRole: "builder"` + `workUnitId` on handoff; `WorkUnit.cadExpectations`, `cadVerified` | ☐ | ☐ | ☐ |
-| `save_cad_expectations` on the planner server (always prompts) | ☐ | ☐ | ☐ |
-| `startPlan` applies plan expectations to files and lock store | ☐ | ☐ | ☐ |
-| Builder restrictions in the protected check and `cad-tools` | ☐ | ☐ | ☐ |
-| Verify hook at builder turn end and goal resolution | ☐ | ☐ | ☐ |
-| Verify prepended to dev-pipeline `checks` when the diff touches `cad/` | ☐ | ☐ | ☐ |
+| `workUnitRole: "builder"` + `workUnitId` on handoff; `WorkUnit.cadExpectations`, `cadVerified` | ☑ | ☑ | ☑ |
+| `save_cad_expectations` on the planner server (always prompts) (see §4.14 item 41 / decision 177: nightly planner proposes, owner approves) | ☑ | ☑ | ☑ |
+| `startPlan` applies plan expectations to files and lock store | ☑ | ☑ | ☑ |
+| Builder restrictions in the protected check and `cad-tools` | ☑ | ☑ | ☑ |
+| Verify hook at builder turn end and goal resolution | ☑ | ☑ | ☑ |
+| Verify prepended to dev-pipeline `checks` when the diff touches `cad/` (see decisions 182, 186: the pipeline now refuses CAD units; Go builds them) | ☑ | ☑ | ☑ |
 
 **Acceptance (autopilot service with fake handoff and fake SolidCraft):**
 
@@ -1018,10 +1022,10 @@ the hub brings two members to `ready`.
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| Superseded spec's Phase 0 rows, minus Fusion and SolidCraft | ☐ | ☐ | ☐ |
-| Playwright MCP: attach to Chrome with a profile, proxy, page URL in results (S9) | ☐ | ☐ | ☐ |
-| Daemon from a worktree on a random port, empty state, no credentials (S10) | ☐ | ☐ | ☐ |
-| Part-source APIs and terms (S11) | ☐ | ☐ | ☐ |
+| Superseded spec's Phase 0 rows, minus Fusion and SolidCraft | ☑ | ☑ | ☑ |
+| Playwright MCP: attach to Chrome with a profile, proxy, page URL in results (S9) | ☑ | ☑ | ☑ |
+| Daemon from a worktree on a random port, empty state, no credentials (S10) | ☑ | ☑ | ☑ |
+| Part-source APIs and terms (S11) (see §4.14 items 35, 36 / decision 17) | ☑ | ☑ | ☑ |
 
 **Acceptance:** as A0. If S9's proxy or URL reporting fails, C2 does not start until §4.12 is
 redesigned and re-critiqued.
@@ -1033,18 +1037,18 @@ fixture. Tasks and status are tracked here:
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| Protocol, store, service, `buildMcpServers`, `strictMcpConfig`, resource tools disallowed | ☐ | ☐ | ☐ |
-| Permission branch, `mcpAllowed`, unknown-key deny, `canUseTool` backstop | ☐ | ☐ | ☐ |
-| Health, idle-driver drop on flip, exclusive lock | ☐ | ☐ | ☐ |
-| Settings → Integrations, session Tools control | ☐ | ☐ | ☐ |
+| Protocol, store, service, `buildMcpServers`, `strictMcpConfig`, resource tools disallowed | ☑ | ☑ | ☑ |
+| Permission branch, `mcpAllowed`, unknown-key deny, `canUseTool` backstop | ☑ | ☑ | ☑ |
+| Health, idle-driver drop on flip, exclusive lock (see decision 43: failed-at-start holds until Check) | ☑ | ☑ | ☑ |
+| Settings → Integrations, session Tools control | ☑ | ☑ | ☑ |
 
 #### Phase C2: browser preset, network block, per-site approval
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `preset.ts`: headed with profile; desktop check; headless fallback; argument allow list | ☐ | ☐ | ☐ |
-| `proxy.ts` block list by resolved address | ☐ | ☐ | ☐ |
-| `sites.ts`: navigation gate, post-result URL check, hold and `about:blank` | ☐ | ☐ | ☐ |
+| `preset.ts`: headed with profile; desktop check; headless fallback; argument allow list (see §4.14 item 37 / decisions 72, 83: Playwright defaults kept, pinned install not `npx`; headed path not exercised) | ☑ | ☑ | ☑ |
+| `proxy.ts` block list by resolved address | ☑ | ☑ | ☑ |
+| `sites.ts`: navigation gate, post-result URL check, hold and `about:blank` (see §4.14 item 43 / decisions 85, 86: fleet-wide site approvals; Deny leaves only blank-page or close) | ☑ | ☑ | ☑ |
 
 **Acceptance:**
 
@@ -1065,10 +1069,10 @@ fixture. Tasks and status are tracked here:
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| Logged-in sites list + "Open agent browser" | ☐ | ☐ | ☐ |
-| `hardstops.ts` | ☐ | ☐ | ☐ |
-| `downloads.ts` quarantine and limits | ☐ | ☐ | ☐ |
-| `request_human` + card | ☐ | ☐ | ☐ |
+| Logged-in sites list + "Open agent browser" (see §4.14 items 28, 44 / decision 110: unlockable logged-in sites) | ☑ | ☑ | ☑ |
+| `hardstops.ts` | ☑ | ☑ | ☑ |
+| `downloads.ts` quarantine and limits | ☑ | ☑ | ☑ |
+| `request_human` + card (see decisions 132, 166: no builder can reach the hand-off in v1) | ☑ | ☑ | ☑ |
 
 **Acceptance:**
 
@@ -1083,11 +1087,13 @@ fixture. Tasks and status are tracked here:
   and reported; a file over the limit is deleted and reported.
 - `request_human` parks until `I've cleared it`; in an autopilot unit it blocks the unit.
 
+**Owner-witnessed check (Track C, §8.3): ◐ awaiting owner.** A logged-in site action stopped by a hard-stop card on the phone; plus the two live-model behaviours of decision 114 (the network-policy note reaches the model; a hand-off card survives a long wait) and the part-source key Test, search and fetch of decision 134.
+
 #### Phase C4: throwaway test daemon
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| `start_test_daemon`, lifetime, proxy exemption | ☐ | ☐ | ☐ |
+| `start_test_daemon`, lifetime, proxy exemption | ☑ | ☑ | ☑ |
 
 **Acceptance:** the started process's environment is exactly the listed variables plus PATH and
 TMPDIR, with `ANVIL_HOST=127.0.0.1` and `HOME` a new temporary folder; it listens on loopback
@@ -1099,9 +1105,9 @@ The live daemon's port stays refused for both. The process and its temporary hom
 
 | Task | Impl | Tested | Pushed |
 |---|---|---|---|
-| DigiKey and Mouser connectors, keys in Settings | ☐ | ☐ | ☐ |
-| SnapEDA / TraceParts connector (whichever passed S11) | ☐ | ☐ | ☐ |
-| `parts_search`, `parts_fetch` into quarantine | ☐ | ☐ | ☐ |
+| DigiKey and Mouser connectors, keys in Settings | ☑ | ☑ | ☑ |
+| SnapEDA / TraceParts connector (whichever passed S11) (see §4.14 item 36: TraceParts built, SnapEDA dropped) | ☑ | ☑ | ☑ |
+| `parts_search`, `parts_fetch` into quarantine | ☑ | ☑ | ☑ |
 
 **Acceptance (recorded HTTP fixtures):** a search returns normalized results from each configured
 source; a source with no key is skipped with a note, not an error; `parts_fetch` of a STEP link
@@ -1323,5 +1329,452 @@ Defaults assumed unless you object:
 
 ## 11. Evidence log
 
-_One subsection per phase: the `phase-gate` summary block, the pushed sha, spike output, reviewer
-verdict, and owner-witnessed screenshots. Empty until Phase A0._
+Final verification on 2026-11-20 at code sha `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (branch `computer-use`, equal to `origin/computer-use`), on the M4 with SolidCraft 0.44.1 and bun 1.3.14, after `bun install --frozen-lockfile` and `bun run build:web`. Every gate was run serially with `--require-real` on a clean tree; spikes with `--spike-evidence`. All 17 passed on the first run; no flakes and no re-runs. During the runs only this spec file was uncommitted (allowed by §4.14 item 46; the gate listed it as not blocking). Full suite in every run: 2496 passed, 0 failed, 72 skipped, 17959 assertions.
+
+Review history uses decision-log numbers in parentheses and fix commit shas. Owner-witnessed checks (§8.3) and A0 S7 are not yet recorded; see §5 and §12.
+
+### F0
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built at `3eb8990`; HEAD-move check added in `94fb28c` (decision 28); gate passed at `94fb28c` (decision 26). No dedicated adversarial review entry; the gate tool was re-run by every later phase reviewer (§8.4). Decisions 26 to 32.
+
+```
+================ PHASE GATE F0: Foundation: capability flags, protected permission check, phase gate, fake SolidCraft ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  341.3s
+  clean tree     PASS     clean
+  manifest       PASS     73 named test(s) in 5 file(s)
+  named tests    PASS     73/73 named tests ok; 82 passed, 0 failed, 0 skipped, 395 assertions in 5 file(s) (0.9s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (339.5s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     NOT RUN  none listed (--require-real had nothing to run)
+PHASE F0: PASS
+```
+
+### A0
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Evidence:** `docs/plans/2026-11-19-agent-cad-and-browser-evidence/A0-spike.md`.
+- **Reviews:** Spike; verdicts S1 to S4 confirmed or met, S7 stand-in only (decision 5). Spec changes merged as §4.14 items 1 to 13 (`a6cd5c5`) before A1. Decisions 5 to 12.
+
+```
+================ PHASE GATE A0: spike (no product code) ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  0.0s
+  clean tree      PASS     clean
+  spike evidence  PASS     ../docs/plans/2026-11-19-agent-cad-and-browser-evidence/A0-spike.md
+PHASE A0: PASS
+```
+
+### A1
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `0f3d2b1` → vetoed (48) → fixed `0def91e` (decisions 49 to 52, 74, 75) → A1 fixes passed in the A2 review (92). Merge wiring `703b3a7` (screened batch load, decision 164), `966d8f8` (off-pin refusal).
+- **Named tests:** Changed named test (`[A1] a process starts with the amended flags …`, in `703b3a7`) is merge wiring; reviewed in the A5 review (173), which ran on the merged code.
+
+```
+================ PHASE GATE A1: process manager, part files, agent tools ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  355.2s
+  clean tree     PASS     clean
+  manifest       PASS     74 named test(s) in 5 file(s)
+  named tests    PASS     74/74 named tests ok; 75 passed, 0 failed, 0 skipped, 1388 assertions in 5 file(s) (10.0s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (338.6s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     8/8 named tests ok; 8 passed, 0 failed, 0 skipped, 834 assertions in 1 file(s) (5.8s)
+PHASE A1: PASS
+```
+
+### A2
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `f24204f` (74) → vetoed (92) → fixed `1f01837`, `6dbb3a4` (93 to 97) → the A2 fixes were vetoed in the A3 review (117, `~` path reason) → fixed `d1e8aeb` (118, 119) → the A4 review (152) found a Unicode look-alike route past the path rules for new files → fixed `0ffc108` (161); merged `b8dadd0` (163).
+- **Named tests:** Changed named test (`[A2] gateFromDisk …`, in `1f01837`) signed off by the reviewer of A3 (117).
+
+```
+================ PHASE GATE A2: expectations, gate, rules ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  386.2s
+  clean tree     PASS     clean
+  manifest       PASS     100 named test(s) in 12 file(s)
+  named tests    PASS     100/100 named tests ok; 128 passed, 0 failed, 0 skipped, 2548 assertions in 12 file(s) (32.6s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.3s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     8/8 named tests ok; 8 passed, 0 failed, 0 skipped, 223 assertions in 1 file(s) (12.5s)
+PHASE A2: PASS
+```
+
+### A3
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `f051a66` → vetoed (117) → fixed `d1e8aeb` (118 to 121) → the A3 fixes were vetoed again in the A4 review (152: same approval hole in other cards) → fixed `0ffc108`, `bb87e88` (153, 159 to 161), merged `b8dadd0` (163). No separate re-review entry for these fixes; the A5 review (173) ran on the merged code and decision 195 records every phase as having passed review.
+
+```
+================ PHASE GATE A3: live preview and parameters panel ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  425.8s
+  clean tree     PASS     clean
+  manifest       PASS     37 named test(s) in 6 file(s)
+  named tests    PASS     37/37 named tests ok; 56 passed, 0 failed, 0 skipped, 948 assertions in 6 file(s) (24.8s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (339.5s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     PASS     1 spec(s), config test/golden/live.playwright.config.ts (50.0s)
+  real tools     PASS     5/5 named tests ok; 5 passed, 0 failed, 0 skipped, 68 assertions in 1 file(s) (10.7s)
+PHASE A3: PASS
+```
+
+### A4
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `54e2507`, `b5986c9` (138) → vetoed (152) → fixed `0ffc108`, `bb87e88`, `73c9cd7` (153 to 162, 145) → merged `b8dadd0` (163). Same re-review note as A3 (173, 195).
+- **Named tests:** Changed named tests (`[A4] re-releasing the same script …` and the dimensions-card test, in `0ffc108` and `b8dadd0`) reviewed in the A5 review (173), which ran on the merged code.
+
+```
+================ PHASE GATE A4: inputs, gaps, release ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  377.5s
+  clean tree     PASS     clean
+  manifest       PASS     57 named test(s) in 9 file(s)
+  named tests    PASS     57/57 named tests ok; 70 passed, 0 failed, 0 skipped, 1205 assertions in 9 file(s) (26.1s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (339.2s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     5/5 named tests ok; 5 passed, 0 failed, 0 skipped, 81 assertions in 1 file(s) (11.5s)
+PHASE A4: PASS
+```
+
+### A5
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `71661eb`, fixture cache `1048fe5` (169) → passed its review (173); four small findings fixed in `7084c25`, which passed in the B3 review (181).
+
+```
+================ PHASE GATE A5: merge guard ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  360.2s
+  clean tree     PASS     clean
+  manifest       PASS     34 named test(s) in 3 file(s)
+  named tests    PASS     34/34 named tests ok; 34 passed, 0 failed, 0 skipped, 273 assertions in 3 file(s) (14.6s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.1s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     1/1 named tests ok; 1 passed, 0 failed, 0 skipped, 24 assertions in 1 file(s) (4.6s)
+PHASE A5: PASS
+```
+
+### B0
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Evidence:** `docs/plans/2026-11-19-agent-cad-and-browser-evidence/B0-spike.md`.
+- **Reviews:** Spike; S5 and S6 confirmed with the changes in §4.14 items 14 to 19 (`a6cd5c5`). Decisions 13 to 16.
+
+```
+================ PHASE GATE B0: spike ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  0.0s
+  clean tree      PASS     clean
+  spike evidence  PASS     ../docs/plans/2026-11-19-agent-cad-and-browser-evidence/B0-spike.md
+PHASE B0: PASS
+```
+
+### B1
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `b1e6c92` → vetoed (40) → fixed `afef7d7` → B1 fixes passed in the B2 review (61); the deferred off-pin bullet was closed at the merge by `966d8f8` (164).
+- **Named tests:** Changed named test (`[B1] a folder verified against a different zip …`, in `afef7d7`) signed off by the reviewer of B2 (61).
+
+```
+================ PHASE GATE B1: managed install and pin ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  361.9s
+  clean tree     PASS     clean
+  manifest       PASS     93 named test(s) in 6 file(s)
+  named tests    PASS     93/93 named tests ok; 93 passed, 0 failed, 0 skipped, 549 assertions in 6 file(s) (7.8s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.2s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     3/3 named tests ok; 3 passed, 0 failed, 0 skipped, 38 assertions in 1 file(s) (13.1s)
+PHASE B1: PASS
+```
+
+### B2
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `801b92c` → vetoed (61) → fixed `d290415` (62 to 65, 87, 88) → re-review vetoed (98) → fixed `3bc7e52` (99 to 104) → passed its third review (115). Merged `f3ee78f`.
+
+```
+================ PHASE GATE B2: replay gate and auto-advance ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  391.0s
+  clean tree     PASS     clean
+  manifest       PASS     110 named test(s) in 5 file(s)
+  named tests    PASS     110/110 named tests ok; 110 passed, 0 failed, 0 skipped, 2228 assertions in 5 file(s) (38.3s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.5s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     4/4 named tests ok; 4 passed, 0 failed, 0 skipped, 101 assertions in 1 file(s) (11.4s)
+PHASE B2: PASS
+```
+
+### B3
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `493910f` (175) → vetoed (181) → fixed `5f2b2a6`, `9ea3a95` (182 to 189) → re-review vetoed (190) → fixed `22b2fc2` (191 to 194) → passed its third review (195).
+- **Named tests:** Changed named tests (two `[B3] review 3…` names, in `22b2fc2`) signed off by the reviewer of B3's third review (195).
+
+```
+================ PHASE GATE B3: autopilot CAD ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  379.1s
+  clean tree     PASS     clean
+  manifest       PASS     63 named test(s) in 8 file(s)
+  named tests    PASS     63/63 named tests ok; 87 passed, 0 failed, 0 skipped, 874 assertions in 8 file(s) (33.3s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (339.8s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.2s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     1/1 named tests ok; 1 passed, 0 failed, 0 skipped, 19 assertions in 1 file(s) (5.1s)
+PHASE B3: PASS
+```
+
+### C0
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Evidence:** `docs/plans/2026-11-19-agent-cad-and-browser-evidence/C0-spike.md`.
+- **Reviews:** Spike; S9 and S10 confirmed, S11 changed D33 (decision 17, revised by the owner in §4.14 item 36). Spec changes in §4.14 items 20 to 35. Decisions 17 to 25.
+
+```
+================ PHASE GATE C0: spike ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  0.0s
+  clean tree      PASS     clean
+  spike evidence  PASS     ../docs/plans/2026-11-19-agent-cad-and-browser-evidence/C0-spike.md
+PHASE C0: PASS
+```
+
+### C1
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `cab22e5` → passed its review with six findings (42) → fixed `ee5f649` (43 to 47, 73) → C1 fixes passed in the C2 review (82).
+
+```
+================ PHASE GATE C1: registry core ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  344.3s
+  clean tree     PASS     clean
+  manifest       PASS     137 named test(s) in 10 file(s)
+  named tests    PASS     137/137 named tests ok; 137 passed, 0 failed, 0 skipped, 759 assertions in 10 file(s) (2.3s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (341.0s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     1/1 named tests ok; 1 passed, 0 failed, 0 skipped, 11 assertions in 1 file(s) (0.1s)
+PHASE C1: PASS
+```
+
+### C2
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `07bf00d` → vetoed (82) → fixed `001f236` (83 to 86) → C2 fixes passed in the C3 review (122).
+- **Named tests:** Ten changed named tests (`npx` launch, HOLD and about:blank, health, real-Chrome hold, in `001f236`, following decisions 83 and 85) signed off by the reviewer of C3 (122).
+
+```
+================ PHASE GATE C2: browser preset, network block, per-site approval ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  352.0s
+  clean tree     PASS     clean
+  manifest       PASS     152 named test(s) in 10 file(s)
+  named tests    PASS     152/152 named tests ok; 154 passed, 0 failed, 0 skipped, 1710 assertions in 10 file(s) (2.4s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.0s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     16/16 named tests ok; 16 passed, 0 failed, 0 skipped, 175 assertions in 1 file(s) (8.8s)
+PHASE C2: PASS
+```
+
+### C3
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `6b1cb56` (106) → vetoed (122) → fixed `4ec9eb7` (123 to 127, 132, 133) → the C3 fixes were vetoed in the C4/C5 review (147) → fixed `f46d421` (148, 149, 157), merged `c9d7d97` (156, 163). No separate re-review entry for that round; decision 195 records every phase as having passed review.
+
+```
+================ PHASE GATE C3: logged-in sites, hard stops, downloads, hand-off ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  371.4s
+  clean tree     PASS     clean
+  manifest       PASS     112 named test(s) in 11 file(s)
+  named tests    PASS     112/112 named tests ok; 116 passed, 0 failed, 0 skipped, 1337 assertions in 11 file(s) (3.2s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.9s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     11/11 named tests ok; 14 passed, 0 failed, 0 skipped, 171 assertions in 3 file(s) (26.5s)
+PHASE C3: PASS
+```
+
+### C4
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `89a200c` (129) → vetoed (147) → fixed `f46d421` (156, 157), merged `c9d7d97`. Same re-review note as C3.
+
+```
+================ PHASE GATE C4: throwaway test daemon ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  360.8s
+  clean tree     PASS     clean
+  manifest       PASS     45 named test(s) in 7 file(s)
+  named tests    PASS     45/45 named tests ok; 49 passed, 0 failed, 0 skipped, 435 assertions in 7 file(s) (2.1s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (340.5s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     PASS     7/7 named tests ok; 9 passed, 0 failed, 0 skipped, 106 assertions in 2 file(s) (17.4s)
+PHASE C4: PASS
+```
+
+### C5
+
+- **Verified sha:** `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (pushed).
+- **Reviews:** Built `66f6c20` (129) → passed its review (147) with findings fixed in `a0a0815` (150, 158). The manifest lists no real-tool tests for C5: no vendor API is called in tests (decision 134).
+
+```
+================ PHASE GATE C5: part sources ================
+git sha:     4b71da002dcf78df7953b902c27b60b6a5bb7c36
+branch:      computer-use
+dirty:       no (1 non-blocking path(s) outside anvild/, listed above)
+bun:         1.3.14
+solidcraft:  solidcraft-cli 0.44.1
+real tools:  required
+total time:  347.4s
+  clean tree     PASS     clean
+  manifest       PASS     48 named test(s) in 7 file(s)
+  named tests    PASS     48/48 named tests ok; 48 passed, 0 failed, 0 skipped, 1479 assertions in 7 file(s) (6.6s)
+  full suite     PASS     2496 passed, 0 failed, 72 skipped, 17959 assertions (339.9s)
+  typecheck      PASS     bun run typecheck (0.5s)
+  typecheck:web  PASS     bun run typecheck:web (0.2s)
+  build:web      PASS     bun run build:web (0.1s)
+  playwright     NOT RUN  none listed
+  real tools     NOT RUN  none listed (--require-real had nothing to run)
+PHASE C5: PASS
+```
+
+## 12. Known limitations and follow-ups
+
+- **Agent sets the first numbers (decision 96).** An agent can measure a throwaway part and then record matching "expected" numbers for the real one. Mitigation: each part shows who set its numbers, with a one-tap "Confirm numbers"; release and autopilot need owner or planner approval. Closing it fully means owner approval of every first set.
+- **Approving a card approves the agent parameter changes it lists (decision 160).** Shown as a highlighted line, never hidden.
+- **Every autopilot "Go" session is an unattended builder (decisions 176, 184).** It gets no browser, no tool-server integrations, no CLAUDE.md reflection prompt and cannot add integrations; owner cards are denied rather than shown. Part-source lookups are allowed.
+- **No "Unblock" control for autopilot tasks (decision 188).** A CAD-blocked builder is resumed by fixing the design and replying in its session.
+- **Two machines hosting the same repo can start builders on the same part (decision 196)** in the seconds before the approval syncs. The second is caught afterwards and blocked, not prevented.
+- **Plan card can say "keeps the approval" while the start rewrites it (decision 197)** when the main checkout has uncommitted CAD changes. Numbers are identical; the main checkout's part shows unverified.
+- **Two browser behaviours unverified without a live model (decision 114):** that the network-policy note reaches the model, and that a hand-off card survives a long wait. Part of the Track C owner-witnessed check.
+- **Part sources unverified against real vendors (decision 134).** No DigiKey, Mouser or TraceParts API was called; Mouser shapes come from secondary research. The owner enables `part-sources`, enters keys, presses Test, and runs one search and one fetch.
+- **The throwaway test daemon has ordinary network access (decision 151)** and agent-modified code in it can read files by absolute path; only the browser is fenced.
+- **Same-user risk (§6, §10 item 12, §4.14 item 40).** The agent runs as the daemon's user; guards stop easy routes, not a determined one. A separate OS user for agent shells is a separate project.
+- **Large design parse cost (decision 115).** A 64 MB design file of tiny values takes about 2 s and several GB of memory to parse before the screen refuses it (linear, bounded).
+- **Owner-witnessed checks pending (§8.3)** for Tracks A, B and C, and A0 S7 (M1 over SSH with no one logged in).
+- **Gate flakes:** none in the final verification run. Earlier in the build the B1/B2 real tests depended on SolidCraft zips under `/tmp` (decision 168), fixed by the persistent cache (`1048fe5`).
