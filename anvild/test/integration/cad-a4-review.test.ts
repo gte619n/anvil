@@ -14,7 +14,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION } from "@protocol";
@@ -27,6 +27,8 @@ import { MANIFEST, releaseKey } from "../../src/cadwork/release";
 import { dispatch } from "../../src/server/dispatch";
 import { ConnectionRegistry } from "../../src/server/registry";
 import { DIMENSIONS_CARD_OPEN, UNAPPROVED_PARAMETER } from "../../src/session/cadwork-service";
+import { REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
+import { importFeatureName } from "../../src/cadwork/refs";
 import { Supervisor } from "../../src/session/supervisor";
 import { PLATE_EXPECTATIONS, RULES, buildPlate, callable, cleanupTemp, fakeCadSession, modelPlate, stopServices, tempRepo, until, writeRules, type ToolReply } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
@@ -83,6 +85,11 @@ function stepFile(repo: string, rel: string, min: number[], max: number[], name 
   return abs;
 }
 const TIGHTER = { ...PLATE_EXPECTATIONS, tolerance: { length: 0.05 } };
+const editJsonFile = (p: string, f: (doc: any) => void) => {
+  const doc = JSON.parse(readFileSync(p, "utf8"));
+  f(doc);
+  writeFileSync(p, JSON.stringify(doc, null, 2) + "\n");
+};
 
 describe("A4 review: owner cards approve exactly what they show (decision 153)", () => {
   test("[A4] review: the agent sets L=120, then proposes only a tighter tolerance — the card's old numbers are the accepted ones, L is its own row; denied the gate still fails on L, approved it passes with L accepted by the owner", async () => {
@@ -238,6 +245,191 @@ describe("A4 review: owner cards approve exactly what they show (decision 153)",
     expect(row(card, "Reference")).toEqual({ label: "Reference", old: "refs/block.step", new: `Replaces refs/block.step: old sha ${oldSha.slice(0, 12)} → new sha ${newSha.slice(0, 12)}`, unapproved: true });
     expect(row(card, "Reference bodies")).toEqual({ label: "Reference bodies", old: "1 (block)", new: "1 (solids declared in the new file)" });
     expect(card.reason).toContain(`REPLACING the existing refs/block.step (sha256 ${oldSha.slice(0, 12)})`);
+  });
+});
+
+describe("A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204)", () => {
+  const designJson = (repo: string) => json(join(repo, "cad", "plate", "design.json"));
+  const imports = (repo: string) => designJson(repo).commands.filter((c: any) => c.command === "timeline.add" && c.params?.feature?.type === "import");
+  /** The plate, with a hook that runs once inside the NEXT script write after `arm()` (i.e. inside a
+   *  queued change — import_reference's import, while it holds the part's queue). */
+  async function plateWithHook(repo: string) {
+    let armed: (() => void) | undefined;
+    const x = await buildPlate(repo, {
+      cli: FAKE_SOLIDCRAFT,
+      deps: {
+        manager: {
+          beforeScriptRename: () => {
+            const f = armed;
+            armed = undefined;
+            f?.();
+          },
+        },
+      },
+    });
+    return { ...x, arm: (f: () => void) => void (armed = f) };
+  }
+
+  test("[A4] re-review: the card shows Process fdm-0.4; part.json is rewritten to cnc-3axis while the approved import runs — nothing is recorded, the import is rolled back in full (feature, refs/, part.json), redo cannot bring it back, and the redrawn card shows cnc-3axis", async () => {
+    const repo = tempRepo();
+    const x = await plateWithHook(repo);
+    expect(x.gate.state).toBe("pass");
+    const lockBefore = x.service.locks.findPart(repoIdentity(repo), "plate")!;
+    const scriptBefore = readFileSync(join(repo, "cad", "plate", "design.json"), "utf8");
+    stepFile(repo, ".anvil-downloads/block.step", [200, 0, 0], [210, 10, 10]);
+    // Inside the import (the part's queue held), something rewrites part.json — what Bash can do.
+    x.arm(() => editJsonFile(x.partJson, (doc) => void (doc.process = "cnc-3axis")));
+    let n = 0;
+    const r = await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" }), () => n++ === 0); // approve the first card only
+    expect(r.shown).toHaveLength(2);
+    expect(row(r.shown[0], "Process")).toMatchObject({ old: "fdm-0.4", new: "fdm-0.4" });
+    // Redrawn from what is there now: the process the owner would be approving is said.
+    expect(row(r.shown[1], "Process")).toMatchObject({ old: "cnc-3axis", new: "cnc-3axis" });
+    expect(row(r.shown[1], "Reference").new).toMatch(/^adds refs\/block\.step/); // rolled back: still an add, not a replace
+    expect(r.reply.json).toMatchObject({ imported: false });
+    // Nothing was recorded and nothing of the import is left.
+    expect(x.service.locks.findPart(repoIdentity(repo), "plate")).toEqual(lockBefore);
+    const pj = json(x.partJson);
+    expect(pj.process).toBe("cnc-3axis"); // the edit itself is the editor's, not approved
+    expect(pj.refs ?? []).toEqual([]);
+    expect(pj.expectations.noInterferenceWith ?? []).toEqual([]);
+    expect(existsSync(join(repo, "cad", "plate", "refs", "block.step"))).toBe(false);
+    expect(imports(repo)).toEqual([]);
+    expect(readFileSync(join(repo, "cad", "plate", "design.json"), "utf8")).toBe(scriptBefore);
+    const redo = await x.tools.redo!({});
+    expect(redo.isError).toBe(true);
+    expect(redo.text).toContain("nothing to redo");
+    expect(imports(repo)).toEqual([]);
+    // The gate does not pass on the unapproved process.
+    const g = await x.check();
+    expect(g.state).not.toBe("pass");
+    expect(g.failing.join("\n")).not.toContain("interference");
+  });
+
+  test("[A4] re-review: a parameter change queued ahead of the approved import refuses the approval BEFORE anything is imported; the card is redrawn with the move, and denied nothing is left in the design", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    stepFile(repo, ".anvil-downloads/block.step", [200, 0, 0], [210, 10, 10]);
+    const ref = partRef(repo, "plate");
+    const call = x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" });
+    await until(() => x.openCards().length === 1, "the import card");
+    const first = x.openCards()[0];
+    // The agent's change is already in the part's queue when the owner taps Approve.
+    const change = x.manager.request(ref, { tool: "execute", args: { command: "parameters.change", params: { changes: { L: "130 mm" } } }, kind: "mutate" });
+    expect(x.service.respond(first.requestId, true)).toBe(true);
+    await change;
+    await until(() => x.openCards().some((c) => c.requestId !== first.requestId), "the redrawn card");
+    const second = x.openCards()[0];
+    expect(row(second, "Parameter L")).toMatchObject({ old: "80", new: `130 (${UNAPPROVED_PARAMETER})`, unapproved: true });
+    expect(row(second, "Reference").new).toMatch(/^adds refs\/block\.step/);
+    // While the redrawn card is open, nothing was imported.
+    expect(existsSync(join(repo, "cad", "plate", "refs", "block.step"))).toBe(false);
+    expect(imports(repo)).toEqual([]);
+    x.service.respond(second.requestId, false);
+    expect((await call).json).toMatchObject({ imported: false });
+    expect(imports(repo)).toEqual([]);
+    expect(json(x.partJson).refs ?? []).toEqual([]);
+    const g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain("L 80 → 130");
+    expect(g.failing.join("\n")).not.toContain(REFERENCE_NOT_COVERED);
+  });
+
+  test("[A4] re-review: an import that fails after it began (SolidCraft reports no bodies) is rolled back and the tool says so truthfully", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    const lockBefore = x.service.locks.findPart(repoIdentity(repo), "plate")!;
+    // A STEP the fake imports with no solids in it.
+    const abs = join(repo, ".anvil-downloads", "empty.step");
+    mkdirSync(join(abs, ".."), { recursive: true });
+    writeFileSync(abs, `ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n/* fake-solidcraft ${JSON.stringify({ bodies: [] })} */\nENDSEC;\nEND-ISO-10303-21;\n`);
+    const r = await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/empty.step" }));
+    expect(r.reply.isError).toBe(true);
+    expect(r.reply.text).toContain("reported no bodies");
+    expect(r.reply.text).toContain("Nothing was imported: the design, refs/ and part.json are as they were.");
+    expect(existsSync(join(repo, "cad", "plate", "refs", "empty.step"))).toBe(false);
+    expect(imports(repo)).toEqual([]);
+    expect(json(x.partJson).refs ?? []).toEqual([]);
+    expect(x.service.locks.findPart(repoIdentity(repo), "plate")).toEqual(lockBefore);
+    expect((await x.check()).state).toBe("pass");
+  });
+
+  test("[A4] re-review: the replace rows are worked out on every round — a refs/ file that appears while the card is open makes the redrawn card say Replaces", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    stepFile(repo, ".anvil-downloads/block.step", [200, 0, 0], [210, 10, 10]);
+    const call = x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" });
+    await until(() => x.openCards().length === 1, "the import card");
+    const first = x.openCards()[0];
+    expect(row(first, "Reference").new).toMatch(/^adds /);
+    expect(first.reason).not.toContain("REPLACING");
+    const planted = stepFile(repo, "cad/plate/refs/block.step", [300, 0, 0], [310, 10, 10]);
+    const plantedSha = createHash("sha256").update(readFileSync(planted)).digest("hex");
+    x.service.respond(first.requestId, true);
+    await until(() => x.openCards().some((c) => c.requestId !== first.requestId), "the redrawn card");
+    const second = x.openCards()[0];
+    expect(row(second, "Reference").new).toContain(`Replaces refs/block.step: old sha ${plantedSha.slice(0, 12)}`);
+    expect(second.reason).toContain(`REPLACING the existing refs/block.step (sha256 ${plantedSha.slice(0, 12)})`);
+    x.service.respond(second.requestId, false);
+    expect((await call).json).toMatchObject({ imported: false });
+  });
+
+  test("[A4] re-review: the gate fails closed — a reference in the design that no must-not-touch rule names (an import feature, a refs record in part.json) fails with 'reference <name> is not covered'", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    const ref = partRef(repo, "plate");
+    const step = stepFile(repo, "cad/plate/refs/motor.step", [200, 0, 0], [210, 10, 10], "motor");
+    // The daemon's import route, used past import_reference (what the vetoed bug left behind).
+    const ins = await x.manager.request(ref, { tool: "execute", args: { command: "file.insert_step", params: { path: step, name: importFeatureName("motor.step") } }, kind: "mutate" });
+    expect(ins.result.isError).toBe(false);
+    let g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`reference motor.step ${REFERENCE_NOT_COVERED}`);
+    // A refs record in part.json with no rule fails the same way (refs are outside the locked block).
+    await x.tools.undo!({});
+    const pj = json(x.partJson);
+    pj.refs = [{ name: "pump.step", source: "refs/pump.step", sha256: "0".repeat(64), bodies: ["pump"], at: new Date().toISOString() }];
+    writeFileSync(x.partJson, JSON.stringify(pj, null, 2) + "\n");
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`reference pump.step ${REFERENCE_NOT_COVERED}`);
+  });
+
+  test("[A4] re-review: an adopt-ownerParams card that also approves a parameter the agent moved shows the numbers it leads to (accepted → new); approving records exactly those", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    expect((await x.tools.set_parameter!({ name: "L", expression: "120" })).isError).toBe(false);
+    const pj = json(x.partJson);
+    pj.ownerParams = { L: 120 };
+    writeFileSync(x.partJson, JSON.stringify(pj, null, 2) + "\n");
+    await x.check();
+    await until(() => x.openCards().some((c) => c.kind === "adopt-ownerParams"), "the dimensions card");
+    const card = x.openCards().find((c) => c.kind === "adopt-ownerParams")!;
+    expect(row(card, "Parameter L")).toMatchObject({ old: "80", new: `120 (${UNAPPROVED_PARAMETER})`, unapproved: true });
+    expect(row(card, "Bounding box (mm)")).toEqual({ label: "Bounding box (mm)", old: "L × W × T  (= 6 × 50 × 80)", new: "L × W × T  (= 6 × 50 × 120)" });
+    expect(row(card, "Volume (mm³)").old).toContain("(= 23335.167)");
+    expect(row(card, "Volume (mm³)").new).toContain("(= 35335.167)");
+    expect(row(card, "L")).toEqual({ label: "L", new: "120" });
+    x.service.respond(card.requestId, true);
+    await until(() => x.broadcasts.some((e) => e.type === "cad.expectations.resolved" && e.requestId === card.requestId), "the answer");
+    const lock = x.service.locks.findPart(repoIdentity(repo), "plate")!;
+    expect(lock).toMatchObject({ ownerParams: { L: 120 }, declared: { L: 120, W: 50, T: 6 } });
+    expect(lock.values!.bbox).toEqual([6, 50, 120]);
+    expect((await x.check()).state).toBe("pass");
+  });
+
+  test("[A4] re-review: a parameter nobody approved and no expected number uses is never approved silently — it stays out of `declared`", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    const ref = partRef(repo, "plate");
+    const add = await x.manager.request(ref, { tool: "execute", args: { command: "parameters.add", params: { name: "Z", expression: "7 mm" } }, kind: "mutate" });
+    expect(add.result.isError).toBe(false);
+    const r = await asOwner(x, x.tools.propose_expectations!({ part: "plate", expectations: TIGHTER, reason: "tighter length tolerance" }));
+    expect(r.reply.isError).toBe(false);
+    expect(r.shown[0].rows.some((x: any) => String(x.label).includes("Z"))).toBe(false); // not a row: it is not approved
+    const lock = x.service.locks.findPart(repoIdentity(repo), "plate")!;
+    expect(lock.declared).toEqual({ L: 80, W: 50, T: 6 });
+    expect((await x.check()).state).toBe("pass");
   });
 });
 

@@ -258,14 +258,17 @@ export function gapOf(part: PartRead, store: { gap?: GapRecord; at: string } | u
  */
 export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
   if (part.kind !== "ok") return { checks: [], unverified: false };
-  const must = part.file.expectations?.noInterferenceWith ?? [];
-  const names = [...new Set([...must, ...(part.file.refs ?? []).map((r) => r.name)])];
-  if (names.length === 0) return { checks: [], unverified: false };
+  const exp = part.file.expectations;
+  const must = exp?.noInterferenceWith ?? [];
+  const recorded = (part.file.refs ?? []).map((r) => r.name);
+  const names = [...new Set([...must, ...recorded])];
+  if (names.length === 0 && (!exp || design.referenceBodies.length === 0)) return { checks: [], unverified: false };
   // The embedded text is read from design.json — and only when it IS the script the process runs.
   const disk = readDesignFile(ref.dir);
   const embedded = disk.script && scriptSha !== undefined && disk.scriptSha === scriptSha ? embeddedReferences(disk.script) : undefined;
   const integrity = referenceChecks(names, (n) => referenceOnDisk(ref, n), embedded);
   const checks = [...integrity.checks];
+  if (exp) checks.push(...coverageChecks(must, recorded, embedded, design.referenceBodies));
   for (const name of [...new Set(must)].sort()) {
     const emb = embedded?.find((e) => e.file === name);
     if (!emb) {
@@ -290,6 +293,29 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
     checks.push(interferenceCheck(name, reply));
   }
   return { checks, unverified: integrity.unverified };
+}
+
+/** Why a reference in the design fails the gate when no must-not-touch rule names it (decision 204). */
+export const REFERENCE_NOT_COVERED = "is not covered by a must-not-touch rule";
+
+/**
+ * Fail closed (decision 204): once a part has expectations, every reference in the design — a
+ * `refs` record in part.json, a STEP import embedded in the script, or any imported (BaseFeature)
+ * body — must be named in `noInterferenceWith`, so no reference is ever in the part unchecked.
+ */
+export function coverageChecks(must: string[], recorded: string[], embedded: { file: string; bodies: string[] }[] | undefined, referenceBodies: string[]): GateCheck[] {
+  const checks: GateCheck[] = [];
+  const covered = new Set(must);
+  const named = [...new Set([...recorded, ...(embedded ?? []).map((e) => e.file)])].sort();
+  for (const n of named) {
+    if (covered.has(n)) continue;
+    checks.push({ id: `covered ${n}`, expected: `refs/${n} is in noInterferenceWith`, measured: `reference ${n} ${REFERENCE_NOT_COVERED}`, ok: false, hard: true });
+  }
+  // Imported bodies no embedded reference accounts for (or the script could not be read for them).
+  const known = new Set((embedded ?? []).flatMap((e) => e.bodies));
+  const stray = referenceBodies.filter((b) => !known.has(b));
+  if (stray.length) checks.push({ id: "covered reference bodies", expected: "every imported body belongs to a reference in noInterferenceWith", measured: `reference ${stray.join(", ")} ${REFERENCE_NOT_COVERED}`, ok: false, hard: true });
+  return checks;
 }
 
 const paramValues = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));

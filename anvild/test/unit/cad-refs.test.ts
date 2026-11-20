@@ -19,6 +19,7 @@ import {
   REFERENCE_MAX_BYTES,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
+import { coverageChecks, REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
 import { cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempRepo } from "../helpers/cad-work";
 
 afterEach(async () => {
@@ -89,6 +90,22 @@ describe("reference sources", () => {
 });
 
 describe("reference integrity and interference", () => {
+  test("[A4] re-review: coverage fails closed — every recorded, embedded or imported reference body must be under a must-not-touch rule", () => {
+    const emb = [{ file: "a.step", bodies: ["a1"] }, { file: "b.step", bodies: ["b1", "b2"] }];
+    // Everything covered: no check at all.
+    expect(coverageChecks(["a.step", "b.step"], ["a.step"], emb, ["a1", "b1", "b2"])).toEqual([]);
+    // An embedded import and a part.json record that no rule names, and an imported body nothing accounts for.
+    const c = coverageChecks(["a.step"], ["a.step", "c.step"], emb, ["a1", "b1", "b2", "stray"]);
+    expect(c.map((x) => [x.id, x.measured, x.ok, x.hard])).toEqual([
+      ["covered b.step", `reference b.step ${REFERENCE_NOT_COVERED}`, false, true],
+      ["covered c.step", `reference c.step ${REFERENCE_NOT_COVERED}`, false, true],
+      ["covered reference bodies", `reference stray ${REFERENCE_NOT_COVERED}`, false, true],
+    ]);
+    // The script could not be read: every imported body is unaccounted for.
+    expect(coverageChecks([], [], undefined, ["a1"]).map((x) => x.ok)).toEqual([false]);
+  });
+
+
   test("[A4] embedded imports are read from the script's timeline.add import features; refs/x.step must have the embedded text's sha256, else 'reference changed; re-import' (unverified)", () => {
     const script = {
       about: {},

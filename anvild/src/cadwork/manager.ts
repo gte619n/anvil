@@ -195,6 +195,17 @@ export interface SlotContext {
   params(): CadParamInfo[];
   /** Record the gate's verdict for the script the process holds now (the refresh calls this). */
   setVerdict(verdict: PartVerdict): void;
+  /**
+   * A change made INSIDE this slot, with the same post-step as a `mutate` request (design.json written,
+   * undo recorded). A composite job (import_reference's import + owner write) uses it so the change and
+   * what follows it are one job that nothing else can slip into.
+   */
+  mutate(tool: string, args?: Record<string, unknown>, timeoutMs?: number): Promise<{ result: McpToolResult; wrote: boolean }>;
+  /**
+   * Undo the last change made in this slot (as the agent's `undo` would, post-step included) and make
+   * it impossible to redo: a rolled-back change must not come back with one `redo`.
+   */
+  revert(): Promise<McpToolResult>;
 }
 
 /** The refresh a later phase installs: measure, gate, preview, broadcast (§4.3 steps 2–5). */
@@ -240,7 +251,8 @@ interface Job {
   body: (rec: PartRec, slot: SlotContext) => Promise<unknown>;
   resolve: (v: any) => void;
   reject: (e: Error) => void;
-  refreshFirst: boolean;
+  /** "force": refresh even if an earlier queued refresh already consumed the dirty flag (`refreshNow`). */
+  refreshFirst: boolean | "force";
   /** Restart the process from `design.json` on disk before this job, even if the file is unchanged. */
   reload: boolean;
 }
@@ -280,6 +292,8 @@ interface PartRec {
   refused?: { sha: string; reason: string };
   /** Undo depth right after the script was loaded: the agent's `undo` never goes below it. */
   loadDepth: number;
+  /** The last thing undone was a daemon rollback (`slot.revert`): `redo` is refused until the next change. */
+  noRedo?: boolean;
 }
 
 export function maxProcsFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -420,7 +434,7 @@ export class CadManager {
   async refreshNow(ref: PartRef): Promise<void> {
     if (!this.refreshJob) return;
     this.rec(ref).refreshDirty = true;
-    await this.enqueue(ref, async () => undefined, true);
+    await this.enqueue(ref, async () => undefined, "force");
   }
 
   /**
@@ -477,7 +491,7 @@ export class CadManager {
     return rec;
   }
 
-  private enqueue<T>(ref: PartRef, body: (rec: PartRec, slot: SlotContext) => Promise<T>, refreshFirst = false, reload = false): Promise<T> {
+  private enqueue<T>(ref: PartRef, body: (rec: PartRec, slot: SlotContext) => Promise<T>, refreshFirst: boolean | "force" = false, reload = false): Promise<T> {
     if (this.closed) return Promise.reject(new CadError("shutdown", "the CAD manager is shutting down"));
     const rec = this.rec(ref);
     const p = new Promise<T>((resolve, reject) => rec.queue.push({ body, resolve, reject, refreshFirst, reload }));
@@ -496,6 +510,7 @@ export class CadManager {
         const job = rec.queue.shift()!;
         try {
           const slot = await this.prepare(rec, job.reload);
+          if (job.refreshFirst === "force") rec.refreshDirty = true; // whatever ran in between, this caller asked for a measurement NOW
           if (job.refreshFirst) await this.runRefresh(rec, slot, true);
           job.resolve(await job.body(rec, slot));
         } catch (e) {
@@ -543,6 +558,18 @@ export class CadManager {
       params: () => rec.params,
       setVerdict: (verdict) => {
         rec.verdict = { ...verdict, scriptSha: rec.scriptSha };
+      },
+      mutate: async (tool, args = {}, timeoutMs) => {
+        const result = await this.call(rec, tool, args, timeoutMs ?? (tool === "batch" ? this.batchTimeoutMs : this.requestTimeoutMs));
+        const wrote = await this.afterMutation(rec, result, "mutate", info.notes);
+        return { result, wrote };
+      },
+      revert: async () => {
+        const result = await this.undoRedo(rec, "undo", this.requestTimeoutMs, info.notes);
+        await this.afterMutation(rec, result, "undo", info.notes);
+        rec.redoStack = [];
+        rec.noRedo = true;
+        return result;
       },
     };
   }
@@ -782,6 +809,7 @@ export class CadManager {
     rec.scriptSha = disk.scriptSha;
     rec.undoStack = [];
     rec.redoStack = [];
+    rec.noRedo = false;
     rec.conflict = false;
     rec.replayFailure = replayFailure;
     void client.exited.then(() => this.onExit(rec, client));
@@ -898,6 +926,9 @@ export class CadManager {
     const stack = dir === "undo" ? rec.undoStack : rec.redoStack;
     const other = dir === "undo" ? rec.redoStack : rec.undoStack;
     const start = rec.depth;
+    if (dir === "redo" && rec.noRedo) {
+      return { isError: true, content: [{ type: "text", text: "nothing to redo" }], texts: ["nothing to redo"], text: "nothing to redo", images: [] } as unknown as McpToolResult;
+    }
     // The design was loaded as a batch of undo steps (no `--in`): those are not the agent's to undo.
     if (dir === "undo" && rec.undoStack.length === 0 && (await this.depthNow(rec)) <= rec.loadDepth) {
       return { isError: true, content: [{ type: "text", text: "nothing to undo" }], texts: ["nothing to undo"], text: "nothing to undo", images: [] } as unknown as McpToolResult;
@@ -934,6 +965,7 @@ export class CadManager {
     const changed = !result.isError || rec.depth !== before.depth || rec.revision !== before.revision;
     if (!changed) return false;
     if (kind === "mutate") {
+      rec.noRedo = false;
       if (rec.depth > before.depth) rec.undoStack.push(before.depth);
       if (rec.redoDepth === 0) rec.redoStack = [];
     }

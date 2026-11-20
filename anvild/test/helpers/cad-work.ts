@@ -326,10 +326,14 @@ export const BOX = (name = "Box", size = 10) => ({ command: "solid.box", params:
 /** Approve every expectations card that is waiting (what the owner's taps do), until none is left. */
 export function approveCards(x: { service: CadworkService; openCards: () => any[] }): string[] {
   const kinds: string[] = [];
+  // A part's card is written in the part's queue (decision 204), so it shows as open until its
+  // `resolved` goes out: a card already answered is not answered (or counted) twice.
+  const answered = new Set<string>();
   for (let i = 0; i < 10; i++) {
-    const open = x.openCards();
+    const open = x.openCards().filter((c) => !answered.has(c.requestId));
     if (open.length === 0) break;
     for (const c of open) {
+      answered.add(c.requestId);
       kinds.push(c.kind);
       x.service.respond(c.requestId, true);
     }

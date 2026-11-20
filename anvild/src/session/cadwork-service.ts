@@ -50,7 +50,9 @@ import {
   type GapRecord,
   type PartFile,
   type PartReference,
+  type PartRead,
 } from "../cadwork/partfile";
+import { exprNames } from "../cadwork/expr";
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
 import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
@@ -150,6 +152,13 @@ export interface CardSnapshot {
   noDeclared: boolean;
   /** Everything else the card showed (part.json's locked block and refs, the lock, extras). */
   fingerprint: string;
+  /** The part.json + lock half of `fingerprint` (what an owner write re-checks inside the queue). */
+  core: string;
+  /** The card's extra state (a reference file's sha, a script sha) as JSON. */
+  extra: string;
+  /** part.json as the card was drawn (undefined: there was none). An owner write builds the file it
+   *  writes from THIS — its process, status, expectations, refs — never from a re-read. */
+  file?: PartFile;
 }
 interface Card {
   requestId: string;
@@ -456,19 +465,19 @@ export class CadworkService {
     return paramMap(this.manager.status(ref)?.params ?? []);
   }
 
-  /** Everything an owner card shows about a part besides its parameter values: part.json's locked
-   *  block, its references and dimensions, and the approval on record. */
-  private cardFingerprint(ref: PartRef, extra?: () => unknown): string {
+  /** Everything an owner card shows about a part besides its parameter values and extras: part.json's
+   *  locked block, references, dimensions and material, and the approval on record — from ONE read. */
+  private cardCore(ref: PartRef): { core: string; file?: PartFile } {
     const part = readPartFile(ref.dir);
     const lock = this.findLock(ref);
-    return JSON.stringify({
-      part:
-        part.kind === "ok"
-          ? { sha: lockedBlockSha(part.file), refs: (part.file.refs ?? []).map((r) => [r.name, r.sha256, r.bodies]), ownerParams: sortedEntries(part.file.ownerParams) }
-          : part.kind,
+    const core = JSON.stringify({
+      part: partKeyOf(part),
       lock: lock ? { sha: lock.sha, by: lock.approvedBy, status: lock.status, values: lock.values ?? null, declared: sortedEntries(lock.declared), ownerParams: sortedEntries(lock.ownerParams) } : null,
-      extra: extra ? extra() : null,
     });
+    return { core, ...(part.kind === "ok" ? { file: part.file } : {}) };
+  }
+  private cardFingerprint(ref: PartRef, extra?: () => unknown): string {
+    return JSON.stringify([this.cardCore(ref).core, JSON.stringify(extra ? extra() : null)]);
   }
 
   /**
@@ -483,12 +492,59 @@ export class CadworkService {
     const changed = Object.keys(accepted)
       .sort()
       .filter((n) => current[n] === undefined || !closeTo(current[n]!, accepted[n]!));
-    return { accepted, current, changed, noDeclared: !!lock && hasValues(lock.values) && !lock.declared, fingerprint: this.cardFingerprint(ref, opts.extra) };
+    const { core, file } = this.cardCore(ref);
+    const extra = JSON.stringify(opts.extra ? opts.extra() : null);
+    return { accepted, current, changed, noDeclared: !!lock && hasValues(lock.values) && !lock.declared, fingerprint: JSON.stringify([core, extra]), core, extra, ...(file ? { file } : {}) };
   }
 
   /** Does the part still show exactly what the card was drawn from (parameters and everything else)? */
   private stillShows(ref: PartRef, snap: CardSnapshot, extra?: () => unknown): boolean {
     return sameValues(this.paramsNow(ref), snap.current) && this.cardFingerprint(ref, extra) === snap.fingerprint;
+  }
+
+  /**
+   * The check every owner card's write makes FIRST, inside the part's queue slot and with nothing
+   * awaited between it and the write (decisions 153, 204): the design's parameters (`params`, the
+   * slot's), part.json's locked block, references and dimensions, the approval on record and the
+   * card's extra state are all still what the card showed — except what this card's own action
+   * changed: `ownParams` (names it created or set) and `extraExpected` (the extra state its action
+   * leaves, e.g. the new reference file's sha).
+   */
+  private shownNow(ref: PartRef, snap: CardSnapshot, params: CadParamInfo[], opts: { extraNow?: () => unknown; extraExpected?: string; ownParams?: string[] } = {}): boolean {
+    const now_ = paramMap(params);
+    const want = { ...snap.current };
+    for (const n of opts.ownParams ?? []) {
+      delete now_[n];
+      delete want[n];
+    }
+    if (!sameValues(now_, want)) return false;
+    if (this.cardCore(ref).core !== snap.core) return false;
+    return JSON.stringify(opts.extraNow ? opts.extraNow() : null) === (opts.extraExpected ?? snap.extra);
+  }
+
+  /**
+   * The part.json an owner card writes: the SNAPSHOT's process, material, status, dimensions,
+   * expectations and references, with the card's own change on top. Only what the card never
+   * showed and the gate never trusts (the last measurement, a reported gap) is taken from disk.
+   */
+  private fileFromSnapshot(ref: PartRef, snap: CardSnapshot, change: { expectations?: Expectations; refs?: PartReference[]; ownerParams?: Record<string, number> }): PartFile {
+    const base = snap.file!;
+    const disk = readPartFile(ref.dir);
+    const fresh = disk.kind === "ok" ? disk.file : undefined;
+    const expectations = "expectations" in change ? change.expectations : base.expectations;
+    const refs = "refs" in change ? change.refs : base.refs;
+    const ownerParams = "ownerParams" in change ? change.ownerParams : base.ownerParams;
+    return {
+      schema: 1,
+      process: base.process,
+      ...(base.material ? { material: base.material } : {}),
+      status: base.status,
+      ...(ownerParams ? { ownerParams: { ...ownerParams } } : {}),
+      ...(expectations ? { expectations } : {}),
+      ...(refs?.length ? { refs } : {}),
+      ...(fresh?.gap ? { gap: fresh.gap } : {}),
+      ...(fresh?.measured ? { measured: fresh.measured } : {}),
+    };
   }
 
   /**
@@ -607,6 +663,9 @@ export class CadworkService {
       let answer: CardAnswer = "stale";
       for (let round = 0; round < 3 && answer === "stale"; round++) {
         const snap = this.cardSnapshot(ref);
+        // The card shows what this call read at its start (part.json's process, refs, dimensions): if
+        // part.json moved since, the call starts over rather than show (and write) a mix.
+        if (JSON.stringify(JSON.parse(snap.core).part) !== JSON.stringify(partKeyOf(part))) return { ok: false, error: `record_expectations refused: cad/${ref.part}/part.json changed while the call ran. Nothing was recorded; call it again.` };
         for (const [n, want] of Object.entries(declared.values)) {
           if (snap.current[n] !== undefined && !closeTo(snap.current[n]!, want)) return { ok: false, error: `record_expectations refused: the design has ${n} = ${num(snap.current[n]!)}, not the declared ${num(want)}. Nothing was recorded.` };
         }
@@ -660,14 +719,11 @@ export class CadworkService {
           return;
         }
       }
-      if (shown) {
-        // Every other parameter is still what the owner's card was drawn with.
-        const nowValues = paramMap(params);
-        const moved = Object.keys(shown.current).filter((n) => nowValues[n] === undefined || !closeTo(nowValues[n]!, shown!.current[n]!));
-        if (moved.length) {
-          failure = `the design's ${moved.join(", ")} changed while the owner's card was open`;
-          return;
-        }
+      // Decision 204: everything the owner's card showed still holds — every other parameter, part.json,
+      // the approval on record — checked here, in the queue slot, with nothing awaited before the write.
+      if (shown && !this.shownNow(ref, shown, params, { ownParams: toAdd })) {
+        failure = `cad/${ref.part} changed while the owner's card was open (its parameters, part.json or the approval on record)`;
+        return;
       }
       const f = file(exp);
       writePartFile(ref.dir, f);
@@ -675,20 +731,19 @@ export class CadworkService {
       if (by === "owner") this.clearGapRecord(ref);
     };
     if (toAdd.length) {
-      const reply = await this.manager.request(ref, {
+      await this.manager.request(ref, {
         tool: "batch",
         args: { commands: toAdd.map((name) => ({ command: "parameters.add", params: { name, expression: declared.expressions[name] } })), verbose: false },
         kind: "mutate",
-        afterWrite: (slot, done) => {
+        afterWrite: async (slot, done) => {
           if (done.result.isError) failure = `the declared parameters could not be created: ${done.result.text}`;
           else if (slot.state().conflict) failure = DISK_CONFLICT_REASON;
           else write(slot.params());
+          // Leave the design as it was, in the same slot (and not redoable).
+          if (failure && !done.result.isError) await slot.revert().catch(() => undefined);
         },
       });
-      if (failure) {
-        if (!reply.result.isError) await this.manager.request(ref, { tool: "undo", kind: "undo" }).catch(() => undefined); // leave the design as it was
-        return { ok: false, error: `record_expectations refused: ${failure}. Nothing was recorded.` };
-      }
+      if (failure) return { ok: false, error: `record_expectations refused: ${failure}. Nothing was recorded.` };
     } else {
       await this.manager.run(ref, async (slot) => write(slot.params()));
       if (failure) return { ok: false, error: `record_expectations refused: ${failure}. Nothing was recorded.` };
@@ -712,9 +767,14 @@ export class CadworkService {
     ref: PartRef,
     input: unknown,
     reason: unknown,
-    /** Runs after the owner approved and before anything is written; an error string writes nothing
-     *  (import_reference imports the reference here, so a failed import changes no expectation). */
-    opts: { beforeWrite?: () => Promise<string | undefined>; extraRows?: () => CadExpectationsRow[]; extraState?: () => unknown } = {},
+    /**
+     * `inSlot`: the card's own action (import_reference imports the reference here). It runs after the
+     * owner approved, INSIDE the same queue job as the write and only after the card's snapshot was
+     * re-checked; a failure (or a snapshot that no longer holds after it) rolls it back and writes
+     * nothing. `extraRows` / `reasonFor` are re-drawn on every round; `extraState` is part of what the
+     * card shows.
+     */
+    opts: { inSlot?: (slot: SlotContext) => Promise<CardAction>; extraRows?: () => CadExpectationsRow[]; extraState?: () => unknown; reasonFor?: () => string } = {},
   ): Promise<ExpectationsReply & { approved?: boolean }> {
     this.touch(sessionId, ref);
     const session = this.deps.getSession(sessionId);
@@ -727,14 +787,17 @@ export class CadworkService {
     for (let round = 0; round < 3; round++) {
       const part = readPartFile(ref.dir);
       if (part.kind !== "ok" || !part.file.expectations) return { ok: false, error: `cad/${ref.part} has no expectations to change: call record_expectations first` };
-      const before = part.file.expectations;
+      // Decision 153: "old" is the ACCEPTED numbers; "new" is the proposal at the values the card
+      // approves — the design's, with every parameter that differs from its accepted value shown.
+      // Everything on the card is drawn from this ONE snapshot (its part.json included).
+      const snap = this.cardSnapshot(ref, { extra: opts.extraState });
+      const shownFile = snap.file;
+      if (!shownFile?.expectations) continue;
+      const before = shownFile.expectations;
       // A proposal that says nothing about tolerance keeps the current one.
       const proposed = stampExpectations({ ...(input as ExpectationsInput), tolerance: { ...before.tolerance, ...((input as ExpectationsInput).tolerance ?? {}) } }, "owner", new Date().toISOString());
       const caps = toleranceCapErrors(proposed.tolerance);
       if (caps.length) return { ok: false, error: `propose_expectations refused: ${caps.join("; ")}` };
-      // Decision 153: "old" is the ACCEPTED numbers; "new" is the proposal at the values the card
-      // approves — the design's, with every parameter that differs from its accepted value shown.
-      const snap = this.cardSnapshot(ref, { extra: opts.extraState });
       let values: EvaluatedExpectations;
       try {
         values = evaluateExpectations(proposed, snap.current);
@@ -760,10 +823,10 @@ export class CadworkService {
             cwd: ref.worktree,
             part: ref.part,
             kind: "propose",
-            reason: reason.trim(),
+            reason: opts.reasonFor ? opts.reasonFor() : reason.trim(),
             rows: [
-              { label: "Process", old: part.file.process, new: part.file.process },
-              { label: "Status", old: part.file.status, new: part.file.status },
+              { label: "Process", old: shownFile.process, new: shownFile.process },
+              { label: "Status", old: shownFile.status, new: shownFile.status },
               ...parameterRows(snap),
               ...expectationRows(before, proposed, oldValues, values),
               ...(opts.extraRows?.() ?? []),
@@ -772,25 +835,43 @@ export class CadworkService {
         });
       });
       if (answer === "denied") return { ok: true, approved: false };
-      // Written only now, and only if the part still shows exactly what the card showed.
       if (answer === "stale" || !this.stillShows(ref, snap, opts.extraState)) continue; // ask again, showing what is there now
-      const cur = readPartFile(ref.dir);
-      if (cur.kind !== "ok") return { ok: false, error: `the owner approved, but cad/${ref.part}/part.json can no longer be read; nothing was written` };
-      if (opts.beforeWrite) {
-        const err = await opts.beforeWrite();
-        if (err) return { ok: false, error: err };
+      // ONE queued job: re-check the snapshot, run the card's own action, re-check again (only what
+      // that action changed may differ), then write part.json and the approval from the SNAPSHOT.
+      let outcome: { kind: "ok" } | { kind: "stale" } | { kind: "error"; error: string };
+      try {
+        outcome = await this.manager.run(ref, async (slot) => {
+          if (!this.shownNow(ref, snap, slot.params(), { extraNow: opts.extraState })) return { kind: "stale" as const };
+          let action: Extract<CardAction, { ok: true }> | undefined;
+          if (opts.inSlot) {
+            const a = await opts.inSlot(slot);
+            if (!a.ok) return { kind: "error" as const, error: a.error };
+            action = a;
+          }
+          const undo = async (why: string): Promise<{ kind: "stale" } | { kind: "error"; error: string }> => {
+            const err = action ? await action.rollback() : undefined;
+            return err ? { kind: "error", error: `the owner approved, but ${why}; the import could not be undone (${err}) — ${action!.leftBehind}` } : { kind: "stale" };
+          };
+          if (!this.shownNow(ref, snap, slot.params(), { extraNow: opts.extraState, ...(action ? { extraExpected: JSON.stringify(action.extraAfter) } : {}) })) {
+            return undo(`cad/${ref.part} changed while the card's action ran`);
+          }
+          const prevText = readPartFile(ref.dir);
+          try {
+            const file = this.fileFromSnapshot(ref, snap, { expectations: proposed, ...(action ? { refs: action.refs(shownFile.refs ?? []) } : {}) });
+            writePartFile(ref.dir, file);
+            this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, declared: declaredFor(snap.current, lock, proposed), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
+          } catch (e) {
+            if (prevText.kind !== "missing") restorePartText(ref.dir, prevText.text);
+            const r = await undo(`part.json could not be written (${e instanceof Error ? e.message : String(e)})`);
+            return r.kind === "error" ? r : { kind: "error" as const, error: `the owner approved, but cad/${ref.part}/part.json could not be written (${e instanceof Error ? e.message : String(e)}); nothing was changed` };
+          }
+          return { kind: "ok" as const };
+        });
+      } catch (e) {
+        return { ok: false, error: `the owner approved, but the change could not be made (${e instanceof Error ? e.message : String(e)}); nothing was written` };
       }
-      // The write and the approval sit in the part's queue, after a last look at the parameters: the
-      // lock gets the values the card showed (snap.current), never the design's at this moment.
-      const wrote = await this.manager.run(ref, async (slot) => {
-        if (!sameValues(paramMap(slot.params()), snap.current)) return false;
-        const now2 = readPartFile(ref.dir);
-        const file: PartFile = { ...(now2.kind === "ok" ? now2.file : cur.file), expectations: proposed };
-        writePartFile(ref.dir, file);
-        this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, declared: { ...snap.current }, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
-        return true;
-      });
-      if (!wrote) continue;
+      if (outcome.kind === "stale") continue;
+      if (outcome.kind === "error") return { ok: false, error: outcome.error };
       this.clearGapRecord(ref); // an approved expectation change clears a reported gap
       this.recheck(ref);
       return { ok: true, approved: true };
@@ -826,8 +907,13 @@ export class CadworkService {
    * `import_reference {part, file}`: check the source (./refs.ts), then — free while the part has no
    * expectations, else only after the owner approves the standard `propose` card that adds the file to
    * `noInterferenceWith` (denied when unattended) — copy it to `cad/<part>/refs/` and import it as a
-   * fixed body with `file.insert_step` in the part's queue. A re-import of the same name replaces the
-   * old import feature. A failed import puts the old `refs/` file back and records nothing.
+   * fixed body with `file.insert_step`. A re-import of the same name replaces the old import feature.
+   *
+   * With expectations, the import, the re-check of everything the card showed and the write of
+   * part.json and the approval are ONE job in the part's queue (decision 204): the snapshot is checked
+   * BEFORE anything is imported, and if anything fails after the import began it is rolled back in
+   * full — the feature undone (and not redoable), the old `refs/` file put back or the new one
+   * removed, part.json untouched — and the tool says so.
    */
   async importReference(sessionId: string, ref: PartRef, file: unknown): Promise<{ ok: true; approved?: boolean; name?: string; bodies?: string[]; sha256?: string; replaced?: boolean } | { ok: false; error: string }> {
     this.touch(sessionId, ref);
@@ -837,42 +923,95 @@ export class CadworkService {
     const part = readPartFile(ref.dir);
     if (part.kind === "invalid") return { ok: false, error: `cad/${ref.part}/part.json cannot be read (${part.error}); nothing was imported` };
 
-    let outcome: { ok: true; name: string; bodies: string[]; sha256: string; replaced: boolean } | { ok: false; error: string } = { ok: false, error: "not imported" };
-    const doImport = async (): Promise<string | undefined> => {
-      outcome = await this.insertReference(ref, name, src.rel, src.bytes, src.sha256);
-      return outcome.ok ? undefined : outcome.error;
-    };
     const exp = part.kind === "ok" ? part.file.expectations : undefined;
     if (!exp) {
-      await doImport();
-      return outcome;
+      // Free: nothing is locked yet. Checked again inside the job — expectations recorded meanwhile
+      // make this the owner's call.
+      try {
+        return await this.manager.run(ref, async (slot) => {
+          const now_ = readPartFile(ref.dir);
+          if (now_.kind === "invalid") return { ok: false as const, error: `cad/${ref.part}/part.json cannot be read (${now_.error}); nothing was imported` };
+          if (now_.kind === "ok" && now_.file.expectations) return { ok: false as const, error: `cad/${ref.part} got expectations while import_reference waited; nothing was imported. Call import_reference again: it now asks the owner.` };
+          const r = await this.insertInSlot(slot, ref, name, src.rel, src.bytes, src.sha256);
+          if (!r.ok) return r;
+          if (now_.kind === "ok") {
+            try {
+              writePartFile(ref.dir, { ...now_.file, refs: r.refs(now_.file.refs ?? []) });
+            } catch (e) {
+              const err = await r.rollback();
+              return { ok: false as const, error: `import_reference: cad/${ref.part}/part.json could not be written (${e instanceof Error ? e.message : String(e)}); ${err ? `the import could not be undone (${err}) — ${r.leftBehind}` : "nothing was imported"}` };
+            }
+          }
+          return { ok: true as const, name, bodies: r.bodies, sha256: src.sha256, replaced: r.replaced };
+        });
+      } catch (e) {
+        return { ok: false, error: `import_reference: ${e instanceof Error ? e.message : String(e)}` };
+      }
     }
     // Expectations are locked: adding what the part must not touch is the owner's call, on the card.
     const input: ExpectationsInput = { bbox: exp.bbox, volume: exp.volume, bodies: exp.bodies, holes: exp.holes, tolerance: exp.tolerance, noInterferenceWith: [...new Set([...(exp.noInterferenceWith ?? []), name])] };
-    // Replacing a reference is said as such: which file, its old and new sha, and the body counts.
     const onDisk = (): string | null => {
       const d = referenceOnDisk(ref, name);
       return "sha256" in d ? d.sha256 : existsSync(join(ref.dir, REFS_DIR, name)) ? "unreadable" : null;
     };
-    const record = (part.kind === "ok" ? part.file.refs ?? [] : []).find((x) => x.name === name);
-    const oldSha = record?.sha256 ?? onDisk() ?? undefined;
-    const replacing = !!record || oldSha !== undefined;
+    // Replacing a reference is said as such — worked out again for EVERY card drawn, from what is
+    // there at that moment: which file, its old and new sha, and the body counts.
+    const replacing = () => {
+      const cur = readPartFile(ref.dir);
+      const record = (cur.kind === "ok" ? (cur.file.refs ?? []) : []).find((x) => x.name === name);
+      const oldSha = record?.sha256 ?? onDisk() ?? undefined;
+      return { record, oldSha, replacing: !!record || oldSha !== undefined };
+    };
     const solids = stepSolidCount(src.bytes);
-    const replaceRows = (): CadExpectationsRow[] =>
-      replacing
+    const replaceRows = (): CadExpectationsRow[] => {
+      const r = replacing();
+      return r.replacing
         ? [
-            { label: "Reference", old: `refs/${name}`, new: `Replaces refs/${name}: old sha ${String(oldSha ?? "unknown").slice(0, 12)} → new sha ${src.sha256.slice(0, 12)}`, unapproved: true },
-            { label: "Reference bodies", old: record ? `${record.bodies.length} (${record.bodies.join(", ")})` : "unknown", new: solids ? `${solids} (solids declared in the new file)` : "counted when it is imported" },
+            { label: "Reference", old: `refs/${name}`, new: `Replaces refs/${name}: old sha ${String(r.oldSha ?? "unknown").slice(0, 12)} → new sha ${src.sha256.slice(0, 12)}`, unapproved: true },
+            { label: "Reference bodies", old: r.record ? `${r.record.bodies.length} (${r.record.bodies.join(", ")})` : "unknown", new: solids ? `${solids} (solids declared in the new file)` : "counted when it is imported" },
           ]
         : [{ label: "Reference", new: `adds refs/${name} (sha ${src.sha256.slice(0, 12)}${solids ? `, ${solids} bod${solids === 1 ? "y" : "ies"}` : ""})` }];
-    const reason = `import_reference: ${src.rel} as refs/${name} (sha256 ${src.sha256.slice(0, 12)}, ${src.bytes.length} bytes)${replacing ? `, REPLACING the existing refs/${name} (sha256 ${String(oldSha ?? "unknown").slice(0, 12)})` : ""} — the part must not touch it.`;
-    const r = await this.proposeExpectations(sessionId, ref, input, reason, { beforeWrite: doImport, extraRows: replaceRows, extraState: onDisk });
+    };
+    const reasonFor = (): string => {
+      const r = replacing();
+      return `import_reference: ${src.rel} as refs/${name} (sha256 ${src.sha256.slice(0, 12)}, ${src.bytes.length} bytes)${r.replacing ? `, REPLACING the existing refs/${name} (sha256 ${String(r.oldSha ?? "unknown").slice(0, 12)})` : ""} — the part must not touch it.`;
+    };
+    let imported: { bodies: string[]; replaced: boolean } | undefined;
+    const r = await this.proposeExpectations(sessionId, ref, input, reasonFor(), {
+      extraRows: replaceRows,
+      extraState: onDisk,
+      reasonFor,
+      inSlot: async (slot) => {
+        imported = undefined;
+        const ins = await this.insertInSlot(slot, ref, name, src.rel, src.bytes, src.sha256);
+        if (!ins.ok) return ins;
+        imported = { bodies: ins.bodies, replaced: ins.replaced };
+        return {
+          ok: true,
+          refs: ins.refs,
+          extraAfter: src.sha256,
+          leftBehind: ins.leftBehind,
+          rollback: async () => {
+            imported = undefined;
+            return ins.rollback();
+          },
+        };
+      },
+    });
     if (!r.ok) return r;
     if (!r.approved) return { ok: true, approved: false };
-    return outcome;
+    if (!imported) return { ok: false, error: `import_reference: the owner approved, but nothing was imported` };
+    const done: { bodies: string[]; replaced: boolean } = imported;
+    return { ok: true, name, bodies: done.bodies, sha256: src.sha256, replaced: done.replaced };
   }
 
-  private async insertReference(ref: PartRef, name: string, source: string, bytes: Buffer, sha256: string): Promise<{ ok: true; name: string; bodies: string[]; sha256: string; replaced: boolean } | { ok: false; error: string }> {
+  /**
+   * Import a reference INSIDE a queue slot: copy it to `refs/`, import it (replacing an earlier import
+   * of the same name in the same batch), and check what SolidCraft embedded. part.json is NOT written
+   * here — the caller does that, in the same job. On failure everything is rolled back; on success the
+   * caller gets `rollback` to undo it all if what follows fails.
+   */
+  private async insertInSlot(slot: SlotContext, ref: PartRef, name: string, source: string, bytes: Buffer, sha256: string): Promise<{ ok: true; bodies: string[]; replaced: boolean; refs: (refs: PartReference[]) => PartReference[]; rollback: () => Promise<string | undefined>; leftBehind: string } | { ok: false; error: string }> {
     const dest = join(ref.dir, REFS_DIR, name);
     let previous: Buffer | undefined;
     try {
@@ -883,52 +1022,53 @@ export class CadworkService {
     try {
       storeReference(ref, name, bytes);
     } catch (e) {
-      return { ok: false, error: `import_reference: ${e instanceof Error ? e.message : String(e)}` };
+      return { ok: false, error: `import_reference: ${e instanceof Error ? e.message : String(e)}; nothing was imported` };
     }
-    const restore = (): void => {
+    const leftBehind = `the design may still hold refs/${name}; the gate fails the part until it is removed (undo) or approved`;
+    let changed = false;
+    const rollback = async (): Promise<string | undefined> => {
+      let err: string | undefined;
+      if (changed) {
+        try {
+          const u = await slot.revert();
+          if (u.isError) err = u.text.slice(0, 300) || "undo failed";
+        } catch (e) {
+          err = e instanceof Error ? e.message : String(e);
+        }
+        changed = false;
+      }
       try {
         if (previous) storeReference(ref, name, previous);
         else rmSync(dest, { force: true });
-      } catch {
-        /* best effort */
+      } catch (e) {
+        err = `${err ? `${err}; ` : ""}refs/${name} could not be restored (${e instanceof Error ? e.message : String(e)})`;
       }
+      return err;
+    };
+    const fail = async (why: string): Promise<{ ok: false; error: string }> => {
+      const err = await rollback();
+      return { ok: false, error: err ? `${why}; the import could not be undone (${err}) — ${leftBehind}` : `${why}. Nothing was imported: the design, refs/ and part.json are as they were.` };
     };
     try {
       // An earlier import of the same file is replaced (its feature deleted in the same batch).
-      const old = await this.manager.request(ref, { tool: "inspect_design", args: { measure: false, sketches: false, timeline: "summary", bodies: false }, kind: "read" });
-      const timeline: any[] = Array.isArray(old.result.json?.timeline) ? old.result.json.timeline : [];
+      const old = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: false });
+      const timeline: any[] = Array.isArray(old.json?.timeline) ? old.json.timeline : [];
       const prior = timeline.find((f) => f?.type === "BaseFeature" && f?.name === importFeatureName(name));
       const insert = { command: "file.insert_step", params: { path: dest, name: importFeatureName(name) } };
-      const reply = prior
-        ? await this.manager.request(ref, { tool: "batch", args: { commands: [{ command: "timeline.delete", params: { feature: prior.id } }, insert], verbose: true }, kind: "mutate" })
-        : await this.manager.request(ref, { tool: "execute", args: { ...insert, verbose: true }, kind: "mutate" });
-      if (reply.result.isError) {
-        restore();
-        return { ok: false, error: `import_reference: SolidCraft could not import refs/${name}: ${reply.result.text.slice(0, 500)}` };
-      }
-      if (reply.state.conflict) {
-        restore();
-        return { ok: false, error: `import_reference: ${DISK_CONFLICT_REASON}; nothing was recorded` };
-      }
-      const j = prior ? reply.result.json?.results?.at?.(-1) : reply.result.json;
+      const done = prior
+        ? await slot.mutate("batch", { commands: [{ command: "timeline.delete", params: { feature: prior.id } }, insert], verbose: true })
+        : await slot.mutate("execute", { ...insert, verbose: true });
+      changed = !done.result.isError || done.wrote || slot.state().conflict;
+      if (done.result.isError) return fail(`import_reference: SolidCraft could not import refs/${name}: ${done.result.text.slice(0, 500)}`);
+      if (slot.state().conflict) return fail(`import_reference: ${DISK_CONFLICT_REASON}`);
+      const j = prior ? done.result.json?.results?.at?.(-1) : done.result.json;
       const bodies: string[] = Array.isArray(j?.created_bodies) ? j.created_bodies.map(String) : [];
-      if (bodies.length === 0) {
-        restore();
-        return { ok: false, error: `import_reference: SolidCraft imported refs/${name} but reported no bodies` };
-      }
-      if (typeof j?.content_sha256 === "string" && j.content_sha256 !== sha256) {
-        restore();
-        return { ok: false, error: `import_reference: SolidCraft embedded different bytes than refs/${name} holds (${String(j.content_sha256).slice(0, 12)} ≠ ${sha256.slice(0, 12)})` };
-      }
-      const cur = readPartFile(ref.dir);
-      if (cur.kind === "ok") {
-        const record: PartReference = { name, source, sha256, bodies, at: new Date().toISOString() };
-        writePartFile(ref.dir, { ...cur.file, refs: [...(cur.file.refs ?? []).filter((x) => x.name !== name), record] });
-      }
-      return { ok: true, name, bodies, sha256, replaced: !!prior };
+      if (bodies.length === 0) return fail(`import_reference: SolidCraft imported refs/${name} but reported no bodies`);
+      if (typeof j?.content_sha256 === "string" && j.content_sha256 !== sha256) return fail(`import_reference: SolidCraft embedded different bytes than refs/${name} holds (${String(j.content_sha256).slice(0, 12)} ≠ ${sha256.slice(0, 12)})`);
+      const record: PartReference = { name, source, sha256, bodies, at: new Date().toISOString() };
+      return { ok: true, bodies, replaced: !!prior, refs: (refs) => [...refs.filter((x) => x.name !== name), record], rollback, leftBehind };
     } catch (e) {
-      restore();
-      return { ok: false, error: `import_reference: ${e instanceof Error ? e.message : String(e)}` };
+      return fail(`import_reference: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -1027,25 +1167,27 @@ export class CadworkService {
       tool: "batch",
       args: { commands, verbose: false },
       kind: "mutate",
-      afterWrite: (slot, done) => {
+      afterWrite: async (slot, done) => {
         if (done.result.isError) return void (failure = `the dimensions could not be applied: ${done.result.text.slice(0, 300)}`);
-        if (slot.state().conflict) return void (failure = DISK_CONFLICT_REASON);
-        // Every parameter the owner did not type is still what the card was drawn with.
-        const nowValues = paramMap(slot.params());
-        const moved = Object.keys(drawnWith.current).filter((n) => !(n in values) && (nowValues[n] === undefined || !closeTo(nowValues[n]!, drawnWith.current[n]!)));
-        if (moved.length) return void (failure = `the design's ${moved.join(", ")} changed after the card was drawn`);
-        for (const n of Object.keys(values)) {
-          const got = slot.params().find((p) => p.name === n)?.value;
-          if (got === undefined || Math.abs(got - values[n]!) > 1e-9 * Math.max(1, Math.abs(values[n]!))) return void (failure = `SolidCraft made ${n} = ${got ?? "nothing"}, not ${values[n]}`);
-        }
-        this.nextBy.set(ref.key, "panel");
-        const cur = readPartFile(ref.dir);
-        if (cur.kind !== "ok") return void (failure = "part.json can no longer be read");
-        writePartFile(ref.dir, { ...cur.file, ownerParams: { ...values } });
-        const l = this.findLock(ref);
-        if (!l) return void (failure = "the concept's approval is gone");
-        const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = l;
-        this.approve(ref, { ...rest, ownerParams: { ...values }, at: new Date().toISOString() });
+        const apply = (): string | undefined => {
+          if (slot.state().conflict) return DISK_CONFLICT_REASON;
+          // Decision 204: everything else the card showed still holds — every parameter the owner did
+          // not type, part.json, the concept's approval — checked here, in the slot, before the write.
+          if (!this.shownNow(ref, drawnWith, slot.params(), { ownParams: Object.keys(values) })) return `cad/${ref.part} changed after the card was drawn (its parameters, part.json or the approval on record)`;
+          for (const n of Object.keys(values)) {
+            const got = slot.params().find((p) => p.name === n)?.value;
+            if (got === undefined || Math.abs(got - values[n]!) > 1e-9 * Math.max(1, Math.abs(values[n]!))) return `SolidCraft made ${n} = ${got ?? "nothing"}, not ${values[n]}`;
+          }
+          const l = this.findLock(ref);
+          if (!l || !drawnWith.file) return "the concept's approval is gone";
+          this.nextBy.set(ref.key, "panel");
+          writePartFile(ref.dir, this.fileFromSnapshot(ref, drawnWith, { ownerParams: { ...values } }));
+          const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = l;
+          this.approve(ref, { ...rest, ownerParams: { ...values }, at: new Date().toISOString() });
+          return undefined;
+        };
+        failure = apply();
+        if (failure) await slot.revert().catch(() => undefined); // the owner's numbers are not left half-applied
       },
     });
     if (failure || reply.result.isError) return { ok: false, error: `request_dimensions: ${failure ?? reply.result.text}` };
@@ -1173,14 +1315,6 @@ export class CadworkService {
     if (answer === "stale") return refuse(`cad/${ref.part} kept changing while the owner was being asked`);
     if (answer !== "approved") return { ok: true, approved: false };
 
-    // The owner saw these numbers on the release card: release is never on numbers nobody approved.
-    // The confirmation is written from the approval the card was drawn with (unchanged: checked above).
-    if (agentNumbers) {
-      const locked = readLocked(ref, this.locks, this.machine());
-      if (locked.part.kind !== "ok" || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file) || !this.stillShows(ref, snapCard, () => this.manager.status(ref)?.scriptSha ?? null)) return refuse("part.json changed while the card was open");
-      const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
-      this.approve(ref, { ...rest, approvedBy: "owner", at: new Date().toISOString() });
-    }
     await this.manager.refreshNow(ref);
     const after = this.snapshots.get(ref.key);
     if (!after || after.outcome.scriptSha !== shownSha) return refuse("the design changed while the card was open");
@@ -1190,29 +1324,25 @@ export class CadworkService {
     try {
       written = await this.manager.run(ref, async (slot) => {
         if (slot.scriptSha() !== shownSha) throw new Error("the design changed while the card was open");
-        const call = (tool: string, args: Record<string, unknown>) => slot.call(tool, args);
-        const design = await readDesign(call);
-        const tables = [];
-        for (const b of design.designBodies) tables.push(await holeTable(call, b, { positions: true }));
-        const g = after.outcome.gate;
-        const data: ReleaseData = {
-          part: ref.part,
-          scriptSha: shownSha,
-          solidcraft: design.version,
-          process: { id: proc.id, kind: proc.kind, ...(proc.generalTolerance ? { generalTolerance: proc.generalTolerance } : {}) },
-          ...(part.file.material ?? proc.material ? { material: part.file.material ?? proc.material } : {}),
-          bbox: m.bbox,
-          volume: m.volume,
-          bodies: m.bodies,
-          params: design.params,
-          holes: mergeHoleTables(tables),
-          checks: g.checks,
-          advisories: [...advisoryLines(g), ...g.warnings],
-          references: (part.file.refs ?? []).map((r) => ({ name: r.name, sha256: r.sha256 })),
-          approvedBy: agentNumbers ? "owner (confirmed with this release)" : String(g.approvedBy ?? "owner"),
-          createdAt: new Date().toISOString(),
-        };
-        return writeReleasePack(call, ref, data, design.designBodies, key);
+        // Decision 204: everything the card showed (parameters, part.json, the approval on record, the
+        // script) still holds — checked here, in the slot, before anything is written.
+        if (!this.shownNow(ref, snapCard, slot.params(), { extraNow: () => slot.scriptSha() ?? null })) throw new Error("part.json, the parameters or the approval changed while the card was open");
+        // The owner saw these numbers on the release card: release is never on numbers nobody approved.
+        // The confirmation is the approval the card was drawn with (unchanged: just checked), by the owner.
+        let unconfirm: (() => void) | undefined;
+        if (agentNumbers) {
+          const l = this.findLock(ref);
+          if (!l || !snapCard.file || l.sha !== lockedBlockSha(snapCard.file)) throw new Error("part.json changed while the card was open");
+          const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = l;
+          this.approve(ref, { ...rest, approvedBy: "owner", at: new Date().toISOString() });
+          unconfirm = () => this.approve(ref, { ...rest, at: new Date().toISOString() });
+        }
+        try {
+          return await this.writePack(slot, ref, { shownSha, proc, file: snapCard.file!, m, gate: after.outcome.gate, agentNumbers, key });
+        } catch (e) {
+          unconfirm?.(); // nothing was released, so nothing was confirmed
+          throw e;
+        }
       });
     } catch (e) {
       return { ok: false, error: `release_part failed, nothing was written: ${e instanceof Error ? e.message : String(e)}` };
@@ -1225,6 +1355,33 @@ export class CadworkService {
       this.emitDesign(cur, true);
     }
     return { ok: true, approved: true, dir: written.dir, files: written.files, offered };
+  }
+
+  /** The release pack, inside the release's queue slot (the card's snapshot was checked by the caller). */
+  private async writePack(slot: SlotContext, ref: PartRef, d: { shownSha: string; proc: { id: string; kind: "fdm" | "cnc"; generalTolerance?: string; material?: string }; file: PartFile; m: NonNullable<RefreshOutcome["measurement"]>; gate: GateResult; agentNumbers: boolean; key: Buffer }): Promise<{ dir: string; files: string[] }> {
+    const call = (tool: string, args: Record<string, unknown>) => slot.call(tool, args);
+    const design = await readDesign(call);
+    const tables = [];
+    for (const b of design.designBodies) tables.push(await holeTable(call, b, { positions: true }));
+    const { proc, file, m, gate: g } = d;
+    const data: ReleaseData = {
+      part: ref.part,
+      scriptSha: d.shownSha,
+      solidcraft: design.version,
+      process: { id: proc.id, kind: proc.kind, ...(proc.generalTolerance ? { generalTolerance: proc.generalTolerance } : {}) },
+      ...(file.material ?? proc.material ? { material: file.material ?? proc.material } : {}),
+      bbox: m.bbox,
+      volume: m.volume,
+      bodies: m.bodies,
+      params: design.params,
+      holes: mergeHoleTables(tables),
+      checks: g.checks,
+      advisories: [...advisoryLines(g), ...g.warnings],
+      references: (file.refs ?? []).map((r) => ({ name: r.name, sha256: r.sha256 })),
+      approvedBy: d.agentNumbers ? "owner (confirmed with this release)" : String(g.approvedBy ?? "owner"),
+      createdAt: new Date().toISOString(),
+    };
+    return writeReleasePack(call, ref, data, design.designBodies, d.key);
   }
 
   /** `cad.release.request`: raise the release card with no model turn. Resolves once the card is up
@@ -1642,20 +1799,34 @@ export class CadworkService {
     // Decision 153: an approval is for exactly what the card showed. If anything on it changed while
     // it was open, nothing is approved and a fresh card is drawn (by the waiting call, or the recheck).
     const stale = approve && !!card.stale?.();
-    let approved = approve && !stale;
-    let superseded = stale;
-    if (!toolCard && approved) {
-      approved = card.kind === "confirm" ? this.confirm(card) : this.adopt(card);
-      superseded = !approved;
+    const approved = approve && !stale;
+    if (!toolCard && approved && card.kind !== "adopt-rules") {
+      // Decision 204: a part's card is written inside the part's queue slot, after its snapshot is
+      // checked again there; the answer is broadcast once that has run.
+      void this.manager
+        .run(card.ref, async (slot) => (card.kind === "confirm" ? this.confirm(card, slot.params()) : this.adopt(card, slot.params())))
+        .catch(() => false)
+        .then((ok) => this.finishCard(card, toolCard, ok, !ok, typed));
+      return true;
     }
-    this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId, approved, ...(superseded ? { superseded: true } : {}) } satisfies CadExpectationsResolvedEvent);
+    if (!toolCard && approved) {
+      const ok = this.adopt(card);
+      this.finishCard(card, toolCard, ok, !ok, typed);
+      return true;
+    }
+    this.finishCard(card, toolCard, approved, stale, typed);
+    return true;
+  }
+
+  /** Tell every client how a card ended, give the session its status back, and wake its waiter. */
+  private finishCard(card: Card, toolCard: boolean, approved: boolean, superseded: boolean, typed?: Record<string, number>): void {
+    this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId: card.requestId, approved, ...(superseded ? { superseded: true } : {}) } satisfies CadExpectationsResolvedEvent);
     this.releaseStatus(card);
     card.settle?.(approved ? "approved" : superseded ? "stale" : "denied", typed);
     if (!toolCard) {
       if (superseded && card.kind === "confirm") this.confirmNumbers(card.sessionId, card.ref); // redraw it, showing what is there now
       this.recheck(card.ref, card.kind === "adopt-rules");
     }
-    return true;
   }
 
   /** Deny every card parked for a session (reset, kill): a waiting tool call is released. */
@@ -1797,12 +1968,20 @@ export class CadworkService {
         const now_ = locked.part.file.ownerParams ?? {};
         const old = locked.lock?.ownerParams ?? {};
         const names = [...new Set([...Object.keys(old), ...Object.keys(now_)])].sort();
-        const exp = locked.part.file.expectations;
-        const values = exp ? evalOrUndefined(exp, snap.current) : undefined;
+        const f = locked.part.file;
+        const exp = f.expectations;
+        const l = locked.lock;
+        // Moved parameters ride on this card only when the approval on record is of this very block and
+        // the numbers they lead to can be shown — and then those numbers are rows too, accepted → new,
+        // because approving the card approves them.
+        const ride = !!exp && snap.changed.length > 0 && !!l && l.sha === lockedBlockSha(f) && hasValues(l.values);
+        const values = ride ? evalOrUndefined(exp!, snap.current) : undefined;
         return {
-          sha: ownerParamsCardSha(locked.part.file.ownerParams),
-          // Moved parameters ride on this card only when the numbers they lead to can be shown.
-          rows: [...(values ? parameterRows(snap) : []), ...names.map((n) => ({ label: n, ...(old[n] !== undefined ? { old: String(old[n]) } : {}), ...(now_[n] !== undefined ? { new: String(now_[n]) } : {}) }))],
+          sha: ownerParamsCardSha(f.ownerParams),
+          rows: [
+            ...(values ? [...parameterRows(snap), ...expectationRows(exp, exp!, l!.values, values)] : []),
+            ...names.map((n) => ({ label: n, ...(old[n] !== undefined ? { old: String(old[n]) } : {}), ...(now_[n] !== undefined ? { new: String(now_[n]) } : {}) })),
+          ],
           ...(values ? { values } : {}),
         };
       },
@@ -1846,31 +2025,34 @@ export class CadworkService {
   }
 
   /** The owner tapped Approve on an adopt card: record exactly what the card showed, and nothing
-   *  else — every kind compares the card's hash with what is on disk now, and the parameter values
-   *  recorded are the snapshot's (decision 153), never the design's at approval time. */
-  private adopt(card: Card): boolean {
+   *  else. A part's card runs INSIDE the part's queue slot (`params` are the slot's) and first checks
+   *  the card's whole snapshot again (decision 204); the record is built from the snapshot — its
+   *  part.json and the parameter values it was drawn with — never from the design at approval time. */
+  private adopt(card: Card, params?: CadParamInfo[]): boolean {
     const { ref } = card;
-    const locked = readLocked(ref, this.locks, this.machine());
     const at = new Date().toISOString();
     if (card.kind === "adopt-rules") {
+      const locked = readLocked(ref, this.locks, this.machine());
       if (locked.rules.kind === "missing" || locked.rules.sha !== card.sha) return false; // changed since the card was drawn
       this.approveRules(ref.worktree, { sha: locked.rules.sha, text: locked.rules.text, at });
       return true;
     }
-    if (locked.part.kind !== "ok" || !card.snap) return false;
-    const file = locked.part.file;
     const snap = card.snap;
+    if (!snap?.file || !params || !this.shownNow(ref, snap, params)) return false;
+    const file = snap.file;
+    const lock = this.findLock(ref);
     if (card.kind === "adopt-expectations") {
       if (lockedBlockSha(file) !== card.sha) return false;
       if (file.expectations && !card.values) return false; // formulas that do not evaluate cannot be approved
-      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(card.values ? { values: card.values, declared: { ...snap.current } } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(card.values ? { values: card.values, declared: declaredFor(snap.current, lock, file.expectations) } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
       return true;
     }
-    if (card.kind !== "adopt-ownerParams" || !locked.lock) return false;
+    if (card.kind !== "adopt-ownerParams" || !lock) return false;
     if (ownerParamsCardSha(file.ownerParams) !== card.sha) return false; // not the dimensions the card showed
-    const { ownerParams: _old, repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
-    // Moved parameters were rows on the card (only when their numbers could be shown): approved with it.
-    const moved = card.values && snap.changed.length && rest.sha === lockedBlockSha(file) ? { values: card.values, declared: { ...snap.current } } : {};
+    const { ownerParams: _old, repo: _r, part: _p, remote: _m, path: _a, ...rest } = lock;
+    // Moved parameters and the numbers they lead to were rows on the card (only when they could be
+    // shown): approved with it.
+    const moved = card.values && snap.changed.length && rest.sha === lockedBlockSha(file) ? { values: card.values, declared: declaredFor(snap.current, lock, file.expectations) } : {};
     this.approve(ref, { ...rest, ...moved, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
     return true;
   }
@@ -1920,11 +2102,14 @@ export class CadworkService {
     return { ok: true };
   }
 
-  private confirm(card: Card): boolean {
-    const locked = readLocked(card.ref, this.locks, this.machine());
-    if (locked.part.kind !== "ok" || !locked.lock || lockedBlockSha(locked.part.file) !== card.sha || locked.lock.sha !== card.sha || !hasValues(locked.lock.values) || !card.snap || !card.values) return false;
-    const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
-    const moved = card.snap.changed.length ? { values: card.values, declared: { ...card.snap.current } } : {};
+  /** Approve a "Confirm numbers" card: inside the part's queue slot, after the snapshot check (decision 204). */
+  private confirm(card: Card, params: CadParamInfo[]): boolean {
+    const snap = card.snap;
+    if (!snap?.file || !card.values || !this.shownNow(card.ref, snap, params)) return false;
+    const lock = this.findLock(card.ref);
+    if (!lock || lockedBlockSha(snap.file) !== card.sha || lock.sha !== card.sha || !hasValues(lock.values)) return false;
+    const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = lock;
+    const moved = snap.changed.length ? { values: card.values, declared: declaredFor(snap.current, lock, snap.file.expectations) } : {};
     this.approve(card.ref, { ...rest, ...moved, approvedBy: "owner", at: new Date().toISOString() });
     return true;
   }
@@ -2203,6 +2388,49 @@ export class CadworkService {
     await this.manager.shutdown();
     await this.lockSync.settled();
   }
+}
+
+/** What an owner card's own action did inside the write's queue job (import_reference's import). */
+type CardAction =
+  | {
+      ok: true;
+      /** part.json's `refs` after the action, from the snapshot's. */
+      refs: (refs: PartReference[]) => PartReference[];
+      /** The card's extra state the action leaves behind (the new reference file's sha). */
+      extraAfter: unknown;
+      /** Undo the action in full; an error string when it could not be. */
+      rollback: () => Promise<string | undefined>;
+      /** What is left in the design when the rollback fails (said to the agent, truthfully). */
+      leftBehind: string;
+    }
+  | { ok: false; error: string };
+
+/** The part.json half of an owner card's fingerprint. */
+function partKeyOf(part: PartRead): unknown {
+  return part.kind === "ok"
+    ? { sha: lockedBlockSha(part.file), refs: (part.file.refs ?? []).map((r) => [r.name, r.sha256, r.bodies]), ownerParams: sortedEntries(part.file.ownerParams), material: part.file.material ?? null }
+    : part.kind;
+}
+/** Put part.json's previous bytes back (an owner write that failed half way). */
+function restorePartText(dir: string, text: string): void {
+  try {
+    writeFileAtomic(join(dir, "part.json"), text);
+  } catch {
+    /* best effort: the gate fails a part.json the lock store does not match */
+  }
+}
+/** The parameter names an expectations block's formulas use. */
+function expectationNames(exp: Expectations): Set<string> {
+  return new Set([...exp.bbox, exp.volume, ...exp.holes.map((h) => h.diameter)].flatMap((e) => exprNames(e)));
+}
+/**
+ * The parameter values an approval records as accepted (`declared`, A4 re-review): the names the
+ * approved expectations use, and the names already accepted. A parameter nothing uses and nobody
+ * approved stays out — it is never approved silently.
+ */
+export function declaredFor(current: Record<string, number>, lock: Pick<PartLock, "declared"> | undefined, exp: Expectations | undefined): Record<string, number> {
+  const names = new Set([...Object.keys(lock?.declared ?? {}), ...(exp ? expectationNames(exp) : [])]);
+  return Object.fromEntries(Object.entries(current).filter(([n]) => names.has(n)));
 }
 
 /** What an adopt-ownerParams card stands for: the dimensions in the file when it was drawn. */

@@ -13,6 +13,7 @@ import { evaluateExpectations, lockedBlockSha, stampExpectations, type PartFile 
 import { validateRules, type RulesRead } from "../../src/cadwork/rules";
 import { PLATE_EXPECTATIONS, RULES, approveCards, buildPlate, cleanupTemp, fakeCadSession, stopServices, tempDir, tempRepo, writeRules } from "../helpers/cad-work";
 import { NOT_MEASURED } from "../../src/session/cadwork-service";
+import { REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 
 afterEach(async () => {
@@ -342,7 +343,10 @@ describe("cad gate (the refresh, against the fake)", () => {
     const all = (await x.tools.measure!({ summary: true })).json;
     expect(all.body_count).toBe(2); // SolidCraft's own measure counts the reference
     const g = await x.check();
-    expect(g.state).toBe("pass");
+    // Decision 204: an imported body that no must-not-touch rule covers fails the gate — and it is the
+    // ONLY thing that fails: the body is still left out of the measurement.
+    expect(g.state).toBe("fail");
+    expect(g.failing).toEqual([expect.stringContaining(`${REFERENCE_NOT_COVERED}`)]);
     const measured = JSON.parse(readFileSync(x.partJson, "utf8")).measured;
     expect(measured.bodies).toBe(1);
     expect(measured.bbox).toEqual([6, 50, 80]);

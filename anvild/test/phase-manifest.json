@@ -529,7 +529,8 @@
             "reference sources > [A4] a reference's name in refs/ is the file name reduced to safe characters, never a path or hidden",
             "reference integrity and interference > [A4] embedded imports are read from the script's timeline.add import features; refs/x.step must have the embedded text's sha256, else 'reference changed; re-import' (unverified)",
             "reference integrity and interference > [A4] interference: only count 0 with nothing unchecked, not truncated and within budget passes — an overlap names the pair and volume; unchecked, truncated or budget_exceeded fail",
-            "the manager's working folder > [A4] SolidCraft is spawned with its working folder set to the part folder (absolute), so a plain name it resolves stays inside the part (decision 115)"
+            "the manager's working folder > [A4] SolidCraft is spawned with its working folder set to the part folder (absolute), so a plain name it resolves stays inside the part (decision 115)",
+            "reference integrity and interference > [A4] re-review: coverage fails closed — every recorded, embedded or imported reference body must be under a must-not-touch rule"
           ]
         },
         {
@@ -590,7 +591,14 @@
             "A4 review: the Release button and session status > [A4] review: a tool's owner card shows awaiting_permission only while the session's turn is running, and gives it back after",
             "A4 review: the Released badge > [A4] review: a verifying pack whose manifest names a different script with the same 7-character prefix does not get the Released badge; file-browser litter in the pack does not remove it",
             "A4 review: dimensions > [A4] review: non-positive, non-finite and over-1e6 mm dimensions are refused by the daemon and the card stays open; a second request_dimensions for the part is refused while one is open",
-            "A4 review: per-part timer state > [A4] review: when a part's process stops, its busy notice and cad.design coalescer state are dropped (a pending trailing emit goes out first)"
+            "A4 review: per-part timer state > [A4] review: when a part's process stops, its busy notice and cad.design coalescer state are dropped (a pending trailing emit goes out first)",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: the card shows Process fdm-0.4; part.json is rewritten to cnc-3axis while the approved import runs — nothing is recorded, the import is rolled back in full (feature, refs/, part.json), redo cannot bring it back, and the redrawn card shows cnc-3axis",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: a parameter change queued ahead of the approved import refuses the approval BEFORE anything is imported; the card is redrawn with the move, and denied nothing is left in the design",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: an import that fails after it began (SolidCraft reports no bodies) is rolled back and the tool says so truthfully",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: the replace rows are worked out on every round — a refs/ file that appears while the card is open makes the redrawn card say Replaces",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: the gate fails closed — a reference in the design that no must-not-touch rule names (an import feature, a refs record in part.json) fails with 'reference <name> is not covered'",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: an adopt-ownerParams card that also approves a parameter the agent moved shows the numbers it leads to (accepted → new); approving records exactly those",
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: a parameter nobody approved and no expected number uses is never approved silently — it stays out of `declared`"
           ]
         },
         {
@@ -601,6 +609,10 @@
           ]
         }
       ],
+      "playwright": [
+        "test/golden/live.pw.ts"
+      ],
+      "playwrightConfig": "test/golden/live.playwright.config.ts",
       "real": [
         {
           "file": "test/real/cad-a4.test.ts",
@@ -609,7 +621,10 @@
             "real SolidCraft: references and the release pack > [A4] real: editing refs/x.step makes the part unverified ('reference changed; re-import') — the sha of refs/ against the embedded text",
             "real SolidCraft: references and the release pack > [A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded",
             "real SolidCraft: references and the release pack > [A4] real: review — the agent sets L=120, then proposes only a tighter tolerance: the card shows the accepted numbers and L as its own row; denied the gate still fails on L, approved it passes with L accepted by the owner",
-            "real SolidCraft: references and the release pack > [A4] real: review — the agent sets L=120, then imports a clear reference: the card shows the accepted numbers and L as its own row; denied nothing is imported and the gate fails on L, approved it passes with L accepted"
+            "real SolidCraft: references and the release pack > [A4] real: review — the agent sets L=120, then imports a clear reference: the card shows the accepted numbers and L as its own row; denied nothing is imported and the gate fails on L, approved it passes with L accepted",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — the card shows Process fdm-0.4; part.json is rewritten to cnc-3axis while the approved import runs: nothing is recorded, the import is rolled back in full and cannot be redone, the redrawn card shows cnc-3axis, the gate does not pass",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — a parameter change queued ahead of the approved import refuses the approval before anything is imported; redrawn with the move, denied, nothing is left and no reference goes unchecked",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — a real STEP imported past import_reference (no must-not-touch rule) fails the gate: 'reference <name> is not covered by a must-not-touch rule'"
           ]
         }
       ]

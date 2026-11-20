@@ -405,3 +405,54 @@ test("[A3] review: a card that would also approve a parameter the agent moved sh
   await page.screenshot({ path: info.outputPath(`propose-moved-${info.project.name}.png`) });
   expect(app.errors).toEqual([]);
 });
+
+test("[A4] re-review: a long formula with no spaces wraps at its operators — on a phone the red new value stays on screen and no number is split", async ({ page }, info) => {
+  const app = await bootApp(page);
+  const longOld = "L*W*T-(4-pi)*5^2*T-2*pi*(D/2)^2*T+Lslot*Wslot*T-12.5*W*T  (= 23335.1673)";
+  const longNew = "L*W*T-(4-pi)*5^2*T-2*pi*(D/2)^2*T+Lslot*Wslot*T-12.5*W*T+0.0001*Lchamfer^2  (= 35335.1673)";
+  const rows = [
+    { label: "Process", old: "fdm-0.4", new: "fdm-0.4" },
+    { label: "Parameter Lchamfer", old: "1.5e-3", new: "2.25e-3*Lscale+(-5) (changed by the agent, not approved)", unapproved: true },
+    { label: "Volume (mm³)", old: longOld, new: longNew },
+  ];
+  await app.push({ type: "cad.expectations.request", requestId: "req_long", sessionId: "sess_live", cwd: CWD, part: "plate", kind: "propose", reason: "a longer formula", rows });
+  const card = page.locator('.cad-expect[data-cad-kind="propose"]');
+  await expect(card).toBeVisible();
+  await card.scrollIntoViewIfNeeded();
+  // Every cell's text, across the wrap points: no number is ever on two lines.
+  const split = await card.locator(".cad-row-old, .cad-row-new").evaluateAll((els) =>
+    els.flatMap((e) => {
+      const nodes: Text[] = [];
+      const walker = document.createTreeWalker(e, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n as Text);
+      const at: [Text, number][] = [];
+      for (const n of nodes) for (let i = 0; i < n.length; i++) at.push([n, i]);
+      const text = nodes.map((n) => n.data).join("");
+      const out: string[] = [];
+      for (const m of text.matchAll(/[-+]?\d[\d.,]*(?:e[-+]?\d+)?/gi)) {
+        const range = document.createRange();
+        const [sn, so] = at[m.index!]!;
+        const [en, eo] = at[m.index! + m[0].length - 1]!;
+        range.setStart(sn, so);
+        range.setEnd(en, eo + 1);
+        if (new Set([...range.getClientRects()].map((r) => Math.round(r.top))).size !== 1) out.push(m[0]);
+      }
+      return out;
+    }),
+  );
+  expect(split).toEqual([]);
+  // The long values wrap instead of widening the table: every new value is fully on screen.
+  const width = page.viewportSize()!.width;
+  for (const cell of await card.locator(".cad-row-new").all()) {
+    const box = (await cell.boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(width + 0.5);
+  }
+  const volNew = card.locator("tr", { hasText: "Volume (mm³)" }).locator(".cad-row-new");
+  if (info.project.name === "phone") expect(((await volNew.boundingBox())!.height)).toBeGreaterThan(30); // it really wrapped
+  const moved = card.locator('tr[data-role="unapproved"] .cad-row-new');
+  expect(await moved.evaluate((e) => getComputedStyle(e).color)).not.toBe(await card.locator(".cad-row-label").first().evaluate((e) => getComputedStyle(e).color));
+  expect(await card.locator(".cad-expect-rows").evaluate((t) => t.scrollWidth <= t.clientWidth + 1)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath(`long-formula-${info.project.name}.png`) });
+  expect(app.errors).toEqual([]);
+});

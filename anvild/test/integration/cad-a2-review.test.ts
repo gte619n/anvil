@@ -251,7 +251,11 @@ describe("Phase A2 review", () => {
     expect(g.needsAdoption).toBe("ownerParams");
     // The card for what is actually there can be approved.
     await until(() => x.openCards().some((c: any) => c.kind === "adopt-ownerParams" && c.rows[0].new === "999"), "the fresh card");
-    x.service.respond(x.openCards().find((c: any) => c.kind === "adopt-ownerParams").requestId, true);
+    const fresh = x.openCards().find((c: any) => c.kind === "adopt-ownerParams");
+    x.service.respond(fresh.requestId, true);
+    // The approval is written in the part's queue (decision 204): it lands with the card's answer.
+    await until(() => x.broadcasts.some((e: any) => e.type === "cad.expectations.resolved" && e.requestId === fresh.requestId), "the answer");
+    expect(x.broadcasts.find((e: any) => e.type === "cad.expectations.resolved" && e.requestId === fresh.requestId)).toMatchObject({ approved: true });
     expect(lockOf(x, repo).ownerParams).toEqual({ L: 999 });
   });
 
@@ -278,7 +282,10 @@ describe("Phase A2 review", () => {
     // Approve: the owner is the approver of exactly that block; the part still passes.
     x.service.confirmNumbers("sess_cad", ref);
     const sha = lockOf(x, repo).sha;
-    x.service.respond(x.openCards()[0].requestId, true);
+    const confirmCard = x.openCards()[0];
+    x.service.respond(confirmCard.requestId, true);
+    // Written in the part's queue (decision 204): it lands with the card's answer.
+    await until(() => x.broadcasts.some((e: any) => e.type === "cad.expectations.resolved" && e.requestId === confirmCard.requestId), "the answer");
     expect(lockOf(x, repo)).toMatchObject({ approvedBy: "owner", sha, values: { bbox: [6, 50, 80] } });
     const g = await x.check();
     expect(g).toMatchObject({ state: "pass", approvedBy: "owner" });
@@ -289,7 +296,10 @@ describe("Phase A2 review", () => {
     const y = await buildPlate(repo2, { cli: CLI, sessionId: "sess_two" });
     y.service.confirmNumbers("sess_two", partRef(repo2, "plate"));
     editJson(y.partJson, (doc) => void (doc.expectations.volume = 1));
-    y.service.respond(y.openCards().find((c: any) => c.kind === "confirm").requestId, true);
+    const yCard = y.openCards().find((c: any) => c.kind === "confirm");
+    y.service.respond(yCard.requestId, true);
+    await until(() => y.broadcasts.some((e: any) => e.type === "cad.expectations.resolved" && e.requestId === yCard.requestId), "the answer");
+    expect(y.broadcasts.find((e: any) => e.type === "cad.expectations.resolved" && e.requestId === yCard.requestId)).toMatchObject({ approved: false });
     expect(lockOf(y, repo2).approvedBy).toBe("agent-initial");
   });
 

@@ -21,6 +21,7 @@
 // when a socket opens), so this module keeps the latest of each and redraws them when the
 // conversation is rebuilt (`restore`). Everything is built with DOM nodes and textContent: the
 // agent's reason and file contents are untrusted text and are never parsed as HTML.
+import { appendFormula } from "./formula-breaks";
 import { CAD_DIMENSION_MAX_MM, type CadDesignEvent, type CadExpectationsRequestEvent, type CadExpectationsResolvedEvent, type CadGateResult } from "../../protocol";
 
 export interface CadCardsDeps {
@@ -341,7 +342,9 @@ export function createCadCards(deps: CadCardsDeps) {
       for (const r of ev.rows) {
         const tr = el("tr", [r.old !== r.new ? "cad-row-changed" : "", r.unapproved ? "cad-row-unapproved" : ""].filter(Boolean).join(" ") || undefined);
         if (r.unapproved) tr.dataset.role = "unapproved";
-        tr.append(el("td", "cad-row-label", r.label), el("td", "cad-row-old", r.old ?? "—"), el("td", "cad-row-new", r.new ?? "—"));
+        // A long formula with no spaces may wrap at its operators (never inside a number), so the
+        // "new" value stays on a phone's screen.
+        tr.append(el("td", "cad-row-label", r.label), appendFormula(el("td", "cad-row-old"), r.old ?? "—"), appendFormula(el("td", "cad-row-new"), r.new ?? "—"));
         table.append(tr);
       }
       card.append(table);

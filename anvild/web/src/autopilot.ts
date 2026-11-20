@@ -21,6 +21,7 @@
 // fires. Cross-module state that main still reaches (`serverSchedule` in onStatus; the plan routing
 // maps live in fleet.ts) is an in-place container, so it stays an exported `const` here.
 import { $, busy, esc, icon } from "./dom";
+import { formulaHtml } from "./formula-breaks";
 // dialogs.ts is a leaf, so the modal/dialog/toast helpers are direct imports — they used to arrive
 // via initAutopilot(deps).
 import { closeModal, confirmDialog, confirmDialogWithOption, pickListDialog, showModal, toast } from "./dialogs";
@@ -411,7 +412,7 @@ export function cadSectionHtml(p: AutopilotPlanInfo): string {
           .map((r) => {
             const hasOld = part.rows.some((x) => x.old !== undefined);
             const changed = r.old !== undefined && r.old !== r.new;
-            return `<tr${changed ? ` class="cad-row-changed"` : ""}><td class="cad-row-label">${esc(r.label)}</td>${hasOld ? `<td class="cad-row-old">${esc(r.old ?? "—")}</td>` : ""}<td class="cad-row-new">${esc(r.new ?? "—")}</td></tr>`;
+            return `<tr${changed ? ` class="cad-row-changed"` : ""}><td class="cad-row-label">${esc(r.label)}</td>${hasOld ? `<td class="cad-row-old">${formulaHtml(r.old ?? "—", esc)}</td>` : ""}<td class="cad-row-new">${formulaHtml(r.new ?? "—", esc)}</td></tr>`;
           })
           .join("")}</table>
       </div>`,
