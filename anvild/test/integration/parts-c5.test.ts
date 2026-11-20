@@ -268,6 +268,31 @@ describe("tools, permissions and keys", () => {
     expect(RESERVED_MCP_KEYS).toContain(PARTS_MCP_SERVER_NAME);
   });
 
+  test("[C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not", async () => {
+    const driverOf = (s: Session) => {
+      (rig.sup as unknown as { agentEnv: () => Record<string, string> }).agentEnv = () => ({});
+      return (rig.sup as unknown as { ensureDriver(id: string): { mcpServers?: Record<string, unknown>; systemPrompt(): { append?: string } } }).ensureDriver(s.id);
+    };
+    const noKeys = await rig.session({ cwd: worktree, workUnitRole: "builder", workUnitId: "wu_b0" } as never);
+    expect(Object.keys(driverOf(noKeys).mcpServers ?? {})).not.toContain(PARTS_MCP_SERVER_NAME); // no source configured: none
+    setKeys("mouser");
+    // A builder that even carries an integration id (hand-edited) gets only the in-process part tools.
+    const b = await rig.session({ cwd: worktree, workUnitRole: "builder", workUnitId: "wu_b1", mcpIntegrations: ["mcp_any"], autonomy: "bypass" } as never);
+    const d = driverOf(b);
+    expect(Object.keys(d.mcpServers ?? {})).toEqual([PARTS_MCP_SERVER_NAME]);
+    expect(d.systemPrompt().append).toContain(PARTS_SESSION_PROMPT.trimStart());
+    // The permission hook lets an unattended builder use both (no owner card is ever needed)…
+    expect((await callHook(b, rig.broker, PARTS_SEARCH_TOOL_ID, IN_PROCESS, { query: "a" })).decision).toBe("allow");
+    expect((await callHook(b, rig.broker, PARTS_FETCH_TOOL_ID, IN_PROCESS, { url: "https://x.test/a.pdf" })).decision).toBe("allow");
+    expect(b.pendingPermissions.size).toBe(0);
+    // …and the lookup works for it, read-only, through the same tool.
+    const r = await search(b, { query: "LM317" });
+    expect(r.isError).toBe(false);
+    expect(r.results.length).toBeGreaterThan(0);
+    const planner = await rig.session({ cwd: worktree, workUnitRole: "planner", workUnitId: "wu_p" } as never);
+    expect(Object.keys(driverOf(planner).mcpServers ?? {})).not.toContain(PARTS_MCP_SERVER_NAME);
+  });
+
   test("[C5] keys never appear in logs, tool results, client events (masked) or error messages — through set, search, fetch, Test and failures", async () => {
     for (const x of ["digikey", "mouser", "traceparts"] as const) setKeys(x);
     const s = await rig.session({ cwd: worktree });

@@ -144,28 +144,114 @@ export function planExpectationsSha(record: Record<string, PlanPartExpectations>
 const num = (v: number): string => String(Math.round(v * 1e4) / 1e4);
 const withValue = (written: string, value: string): string => (written === value ? written : `${written}  (= ${value})`);
 
+/**
+ * What is APPROVED for a part right now: the repo's single lock-store entry (per repo and part, shared by
+ * every worktree and fleet-synced — decision 183). `process`, `tolerance` and `refs` are only known when
+ * the part.json read alongside it still carries exactly the approved block (`matchesFile`); the numbers
+ * (`values`, `declared`) are the lock's own.
+ */
+export interface ApprovedNumbers {
+  approvedBy: string;
+  /** ISO time of the approval (the lock entry's clock). */
+  at: string;
+  /** The lock entry's `lockedBlockSha`. */
+  sha: string;
+  values?: EvaluatedExpectations;
+  declared?: Record<string, number>;
+  /** The part.json read with it holds exactly the approved block (so the fields below are known). */
+  matchesFile: boolean;
+  process?: string;
+  tolerance?: { length: number; volumeRel: number };
+  refs?: string[];
+}
+
+const near = (a: number, b: number): boolean => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+const sameHoles = (a: EvaluatedExpectations["holes"], b: EvaluatedExpectations["holes"]): boolean =>
+  a.length === b.length && a.every((h, i) => near(h.diameter, b[i]!.diameter) && h.count === b[i]!.count && (h.kind ?? "") === (b[i]!.kind ?? ""));
+
+/**
+ * The plan's numbers for a part are the approved ones: the same evaluated expectations and declared
+ * parameter values (and, where the approved block is known, the same process and tolerance). Fields the
+ * approval does not record are not compared.
+ */
+export function sameAsApproved(entry: PlanPartExpectations, approved: ApprovedNumbers | undefined): boolean {
+  if (!approved?.values) return false;
+  const c = checkPlanPart("x", entry);
+  if (!c.ok) return false;
+  const v = c.values;
+  const a = approved.values;
+  if (!(v.bbox.every((x, i) => near(x, a.bbox[i]!)) && near(v.volume, a.volume) && v.bodies === a.bodies && sameHoles(v.holes, a.holes))) return false;
+  const d = approved.declared ?? {};
+  const names = new Set([...Object.keys(c.declared), ...Object.keys(d)]);
+  for (const n of names) if (c.declared[n] === undefined || d[n] === undefined || !near(c.declared[n]!, d[n]!)) return false;
+  if (approved.process !== undefined && approved.process !== entry.process) return false;
+  if (approved.tolerance) {
+    const t = { length: entry.expectations.tolerance?.length ?? DEFAULT_TOLERANCE.length, volumeRel: entry.expectations.tolerance?.volumeRel ?? DEFAULT_TOLERANCE.volumeRel };
+    if (!near(t.length, approved.tolerance.length) || !near(t.volumeRel, approved.tolerance.volumeRel)) return false;
+  }
+  return true;
+}
+
+/**
+ * Starting a builder with this plan REPLACES the part's approval (and so, until the work is merged, the
+ * part on the default branch shows as unverified): anything but "the same numbers, already approved by
+ * the owner or a plan, with the approved block on disk". When it does not, the builder keeps the
+ * existing approval and part.json block untouched (`applyPlanExpectations`).
+ */
+export function replacesApproval(entry: PlanPartExpectations, approved: ApprovedNumbers | undefined): boolean {
+  if (!approved || !approved.matchesFile) return true;
+  if (approved.approvedBy !== "owner" && approved.approvedBy !== "planner") return true;
+  return !sameAsApproved(entry, approved);
+}
+
+/** The warning a plan card carries when approving and starting it replaces the repo-wide approval. */
+export function replaceNote(part: string, defaultBranch: string): string {
+  return `Approving replaces the approved numbers for cad/${part} for the whole repo. Until this work is merged, the part on ${defaultBranch} will show as unverified.`;
+}
+
+/** What a card's "old" side is drawn from, for the card's identity (decision 153: a card whose old side
+ *  changed while it was open is refused and redrawn). */
+export function approvedFingerprint(approved: ApprovedNumbers | undefined): string | null {
+  return approved ? `${approved.sha}@${approved.at}@${approved.approvedBy}@${approved.matchesFile ? 1 : 0}` : null;
+}
+
 /** The rows an owner card shows for one planned part: the process, each declared parameter, and each
- *  expected number as written with what it evaluates to. `old` is what is approved for the unit now. */
-export function planExpectationRows(entry: PlanPartExpectations, before?: PlanPartExpectations): CadExpectationsRow[] {
-  const side = (e: PlanPartExpectations | undefined) => {
-    if (!e) return undefined;
-    const c = checkPlanPart("x", e);
-    const v = c.ok ? c.values : undefined;
-    const ex = e.expectations;
-    const tol = { length: ex.tolerance?.length ?? DEFAULT_TOLERANCE.length, volumeRel: ex.tolerance?.volumeRel ?? DEFAULT_TOLERANCE.volumeRel };
-    return {
-      process: e.process,
-      params: Object.keys(e.parameters).sort().map((n) => `${n} = ${String(e.parameters[n])}`).join(", ") || "none",
-      bbox: withValue(ex.bbox.join(" × "), v ? v.bbox.map(num).join(" × ") : "?"),
-      volume: withValue(String(ex.volume), v ? num(v.volume) : "?"),
-      bodies: String(ex.bodies),
-      holes: ex.holes.map((h) => `⌀${h.diameter} ×${h.count}${h.kind ? ` ${h.kind}` : ""}`).join(", ") || "none",
-      tolerance: `${tol.length} mm, ${tol.volumeRel * 100}% volume`,
-      refs: (ex.noInterferenceWith ?? []).join(", ") || "none",
-    };
+ *  expected number as written with what it evaluates to. `old` is what is APPROVED for the part now (the
+ *  repo's lock-store entry, decisions 153 and 183) — absent for a part nobody has approved numbers for. */
+export function planExpectationRows(entry: PlanPartExpectations, approved?: ApprovedNumbers): CadExpectationsRow[] {
+  const c = checkPlanPart("x", entry);
+  const v = c.ok ? c.values : undefined;
+  const ex = entry.expectations;
+  const tol = { length: ex.tolerance?.length ?? DEFAULT_TOLERANCE.length, volumeRel: ex.tolerance?.volumeRel ?? DEFAULT_TOLERANCE.volumeRel };
+  const n = {
+    process: entry.process,
+    params: Object.keys(entry.parameters).sort().map((k) => `${k} = ${String(entry.parameters[k])}`).join(", ") || "none",
+    bbox: withValue(ex.bbox.join(" × "), v ? v.bbox.map(num).join(" × ") : "?"),
+    volume: withValue(String(ex.volume), v ? num(v.volume) : "?"),
+    bodies: String(ex.bodies),
+    holes: ex.holes.map((h) => `⌀${h.diameter} ×${h.count}${h.kind ? ` ${h.kind}` : ""}`).join(", ") || "none",
+    tolerance: `${tol.length} mm, ${tol.volumeRel * 100}% volume`,
+    refs: (ex.noInterferenceWith ?? []).join(", ") || "none",
   };
-  const [o, n] = [side(before), side(entry)!];
-  const row = (label: string, k: keyof typeof n): CadExpectationsRow => ({ label, ...(o ? { old: o[k] } : {}), new: n[k] });
+  const a = approved;
+  const av = a?.values;
+  const o: Partial<Record<keyof typeof n, string>> = a
+    ? {
+        ...(a.process !== undefined ? { process: a.process } : {}),
+        ...(a.declared ? { params: Object.keys(a.declared).sort().map((k) => `${k} = ${num(a.declared![k]!)}`).join(", ") || "none" } : {}),
+        ...(av
+          ? {
+              bbox: av.bbox.map(num).join(" × "),
+              volume: num(av.volume),
+              bodies: String(av.bodies),
+              holes: av.holes.map((h) => `⌀${num(h.diameter)} ×${h.count}${h.kind ? ` ${h.kind}` : ""}`).join(", ") || "none",
+            }
+          : {}),
+        ...(a.tolerance ? { tolerance: `${a.tolerance.length} mm, ${a.tolerance.volumeRel * 100}% volume` } : {}),
+        ...(a.refs ? { refs: a.refs.join(", ") || "none" } : {}),
+      }
+    : {};
+  const row = (label: string, k: keyof typeof n): CadExpectationsRow => ({ label, ...(o[k] !== undefined ? { old: o[k] } : {}), new: n[k] });
   return [
     row("Process", "process"),
     row("Parameters", "params"),

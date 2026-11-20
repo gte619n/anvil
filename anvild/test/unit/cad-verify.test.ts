@@ -72,13 +72,14 @@ describe("changedParts: what --changed-since selects", () => {
     git(repo, "add", "-A");
     git(repo, "commit", "-q", "-m", "init");
     const base = git(repo, "rev-parse", "HEAD");
-    expect(changedParts(repo, base)).toEqual({ parts: [], rulesChanged: false });
+    expect(changedParts(repo, base)).toEqual({ parts: [], rulesChanged: false, unexpected: [] });
     writeFileSync(join(repo, "cad", "two", "part.json"), "{}\n"); // untracked
     mkdirSync(join(repo, "cad", "one", "release"), { recursive: true });
     writeFileSync(join(repo, "cad", "one", "release", "x"), "x"); // daemon-written (and normally git-excluded)
     mkdirSync(join(repo, "cad", "Not-A-Part"), { recursive: true });
     writeFileSync(join(repo, "cad", "Not-A-Part", "x"), "x");
-    expect(changedParts(repo, base)).toEqual({ parts: ["two"], rulesChanged: false });
+    // A folder no part can have is not a part (the merge guard skips it) but is reported as unexpected.
+    expect(changedParts(repo, base)).toEqual({ parts: ["two"], rulesChanged: false, unexpected: ["cad/Not-A-Part/x"] });
     writeFileSync(join(repo, "cad", "rules.json"), '{"changed":true}\n');
     expect(changedParts(repo, base).rulesChanged).toBe(true);
     // A diverged ref: only what changed on this side since the fork point (merge base) counts.
@@ -88,7 +89,7 @@ describe("changedParts: what --changed-since selects", () => {
     writeFileSync(join(repo, "cad", "one", "design.json"), '{"theirs":1}\n');
     git(repo, "commit", "-q", "-am", "theirs");
     git(repo, "checkout", "-q", "main");
-    expect(changedParts(repo, "theirs")).toEqual({ parts: ["two"], rulesChanged: true });
+    expect(changedParts(repo, "theirs")).toEqual({ parts: ["two"], rulesChanged: true, unexpected: ["cad/Not-A-Part/x"] });
     expect(() => changedParts(repo, "no-such-ref")).toThrow(VerifyCannotRun);
     expect(() => changedParts(repo, "--output=/tmp/x")).toThrow(VerifyCannotRun); // never an option to git
   });

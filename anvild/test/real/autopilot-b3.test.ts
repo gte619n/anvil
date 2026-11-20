@@ -62,6 +62,9 @@ describe("real SolidCraft: autopilot CAD", () => {
     expect(x.unit(uid).cadVerified!.parts).toEqual(["plate"]);
     expect(await goal(x, ev.sessionId)).toEqual([{ met: true }]); // the verify passes; the judge decides
 
+    // Run 2 cannot start while run 1's builder is live on the same part (decision 183); once it is done, it can.
+    await expect(x.svc.startPlan(uid2)).rejects.toThrow("cad/plate is being built by “plate”");
+    (x.sessions.get(ev.sessionId)!.data as any).archived = true;
     // Run 2: a builder that moves L.
     const ev2 = await x.svc.startPlan(uid2);
     const t = x.tools(ev2.sessionId);

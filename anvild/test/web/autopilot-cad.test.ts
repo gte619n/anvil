@@ -105,3 +105,27 @@ test("[B3] web: the planner's `plan` card renders its rows with Approve / Deny a
   card.querySelector<HTMLButtonElement>("button.allow")!.click();
   expect(sent).toEqual([{ url: "http://hub", requestId: "cadx_p", approve: true }]);
 });
+
+test("[B3] web: review 3 — the card shows the approved values beside the plan's, the replace note prominently, a re-approve state with the buttons back, and an invalid process with no Approve", () => {
+  const withOld = [
+    { label: "Parameters", old: "L = 80, T = 6, W = 50", new: "L = 120 mm, T = 6 mm, W = 50 mm" },
+    { label: "Bodies", old: "1", new: "1" },
+  ];
+  const note = "Approving replaces the approved numbers for cad/plate for the whole repo. Until this work is merged, the part on main will show as unverified.";
+  const el = render(ap.cadSectionHtml(plan({ parts: [{ part: "plate", process: "fdm-0.4", approved: false, rows: withOld, note }] })));
+  expect(el.querySelector(".cad-row-head")?.textContent).toContain("Approved now");
+  expect(el.querySelector(".cad-row-changed .cad-row-old")?.textContent).toBe("L = 80, T = 6, W = 50");
+  expect(el.querySelector(".cad-row-changed .cad-row-new")?.textContent).toBe("L = 120 mm, T = 6 mm, W = 50 mm");
+  expect(el.querySelector(".cad-replace-note")?.textContent).toContain(note);
+  expect(el.querySelector('[data-cad-act="approve"]')).not.toBeNull();
+  // Approved, but the repo's approval moved on since: re-approve, with the buttons back.
+  const re = render(ap.cadSectionHtml(plan({ status: "approved", needsApproval: true, reapprove: "the approved numbers for cad/plate changed after this plan was approved; re-approve the plan", parts: [{ part: "plate", process: "fdm-0.4", approved: true, rows: withOld, note }] })));
+  expect(re.querySelector(".cad-reapprove")?.textContent).toContain("re-approve the plan");
+  expect(re.querySelector('[data-cad-act="approve"]')).not.toBeNull();
+  // A process the repo's rules do not define: shown, and nothing to approve.
+  const bad = render(ap.cadSectionHtml(plan({ parts: [{ part: "plate", process: "sla-0.05", approved: false, rows, invalid: "process sla-0.05 is not in the repo's cad/rules.json (it has: fdm-0.4)" }] })));
+  expect(bad.querySelector(".cad-invalid")?.textContent).toContain("sla-0.05");
+  expect(bad.querySelector('[data-cad-act="approve"]')).toBeNull();
+  // No approval on record: no old column.
+  expect(render(ap.cadSectionHtml(plan())).querySelector(".cad-row-head")).toBeNull();
+});

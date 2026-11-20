@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { CAD_META_INSTRUCTION, extractPlanMeta, PLAN_META_INSTRUCTION, type PlanCadMeta, type PlanClarification } from "./plan-meta";
 import { cadFieldsFromMeta } from "./autopilot-cad";
+import { readRules } from "../cadwork/rules";
 import { extractJson } from "./json";
 import { parseIntakeVerdict, type IntakeVerdict } from "./autostart-gate";
 import { parseVerdict, type Verdict } from "./autopilot-plans";
@@ -479,6 +480,25 @@ function clarificationComment(unit: { title: string }, c: { reason: string; ques
 }
 
 /**
+ * The stored record for a unit that went through intake and planning: `planned`, or `needs-clarification`
+ * when either gate held it. Item 41: the planner's CAD numbers are stored PROPOSED (the card asks the owner
+ * to approve them) on BOTH kinds, so answering the questions does not lose them (B3 review, item 6). A part
+ * whose process is not in the repo's cad/rules.json is dropped with a note, like a malformed one.
+ */
+export function processedUnitFields(
+  unit: ProposedUnit,
+  opts: { environmentId: string; projectId: string; repoRoot: string; source?: "label" },
+  clarification: { reason: string; questions: string[] } | undefined,
+  planned: PlannedUnit | undefined,
+): Parameters<WorkUnitStore["create"]>[0] {
+  const cadFields = planned?.cad ? cadFieldsFromMeta(planned.cad, repoProcesses(opts.repoRoot)) : {};
+  const base = { environmentId: opts.environmentId, todoistProjectId: opts.projectId, taskIds: unit.taskIds, title: unit.title, rationale: unit.rationale, ...(opts.source ? { source: opts.source } : {}) };
+  return clarification
+    ? { ...base, plan: clarificationDoc(clarification, planned?.plan), summary: clarification.reason, status: "needs-clarification", ...cadFields }
+    : { ...base, plan: planned!.plan, summary: planned!.summary, effort: planned!.effort, adversarial: planned!.adversarial, status: "planned", ...cadFields };
+}
+
+/**
  * Run one bundled unit through intake → plan → persist, applying both underspecification gates:
  *  - intake (Fix C) short-circuits before planning when the ask itself is too vague;
  *  - the planner's own escape hatch (Fix B) catches a task that only reveals its ambiguity mid-plan.
@@ -538,36 +558,9 @@ async function processUnit(
   }
 
   const projectId = opts.projectId ?? members[0]?.project_id ?? "";
-  const status: AnvilStatus = clarification ? "needs-clarification" : "planned";
-  const wu = deps.workUnits.create(
-    clarification
-      ? {
-          environmentId: opts.environmentId,
-          todoistProjectId: projectId,
-          taskIds: unit.taskIds,
-          title: unit.title,
-          rationale: unit.rationale,
-          plan: clarificationDoc(clarification, planned?.plan),
-          summary: clarification.reason,
-          status,
-          ...(opts.source ? { source: opts.source } : {}),
-        }
-      : {
-          environmentId: opts.environmentId,
-          todoistProjectId: projectId,
-          taskIds: unit.taskIds,
-          title: unit.title,
-          rationale: unit.rationale,
-          plan: planned!.plan,
-          summary: planned!.summary,
-          effort: planned!.effort,
-          adversarial: planned!.adversarial,
-          status,
-          ...(opts.source ? { source: opts.source } : {}),
-          // Item 41: the planner's CAD numbers are stored PROPOSED; the card asks the owner to approve them.
-          ...cadFieldsFromMeta(planned!.cad),
-        },
-  );
+  const fields = processedUnitFields(unit, { environmentId: opts.environmentId, projectId, repoRoot: opts.repoRoot, ...(opts.source ? { source: opts.source } : {}) }, clarification, planned);
+  const status = fields.status as AnvilStatus;
+  const wu = deps.workUnits.create(fields);
 
   // Tag every member; post the actionable comment once (on the first member), pointers on the rest.
   for (const [j, t] of members.entries()) {
@@ -579,6 +572,12 @@ async function processUnit(
     }
   }
   return wu;
+}
+
+/** The process ids in a repo's cad/rules.json (`null`: none readable). */
+function repoProcesses(repoRoot: string): string[] | null {
+  const r = readRules(repoRoot);
+  return r.kind === "ok" ? r.file.processes.map((p) => p.id) : null;
 }
 
 /**

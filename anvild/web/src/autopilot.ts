@@ -403,11 +403,21 @@ export function cadSectionHtml(p: AutopilotPlanInfo): string {
     .map(
       (part) => `<div class="cad-plan-part" data-part="${esc(part.part)}">
         <div class="cad-plan-part-head"><b>cad/${esc(part.part)}</b> <span class="small muted">${esc(part.process)}</span>${part.approved ? ` <span class="ap-chip cad-part-approved">${icon("lock")} approved</span>` : ""}</div>
-        <table class="cad-expect-rows">${part.rows.map((r) => `<tr><td class="cad-row-label">${esc(r.label)}</td><td class="cad-row-new">${esc(r.new ?? "—")}</td></tr>`).join("")}</table>
+        ${part.note ? `<div class="reader-hold cad-replace-note">${icon("warning")} <b>${esc(part.note)}</b></div>` : ""}
+        ${part.invalid ? `<div class="reader-hold cad-invalid">${icon("block")} <b>Cannot be approved:</b> ${esc(part.invalid)}</div>` : ""}
+        <table class="cad-expect-rows">${
+          part.rows.some((r) => r.old !== undefined) ? `<tr class="cad-row-head"><th></th><th>Approved now</th><th>This plan</th></tr>` : ""
+        }${part.rows
+          .map((r) => {
+            const hasOld = part.rows.some((x) => x.old !== undefined);
+            const changed = r.old !== undefined && r.old !== r.new;
+            return `<tr${changed ? ` class="cad-row-changed"` : ""}><td class="cad-row-label">${esc(r.label)}</td>${hasOld ? `<td class="cad-row-old">${esc(r.old ?? "—")}</td>` : ""}<td class="cad-row-new">${esc(r.new ?? "—")}</td></tr>`;
+          })
+          .join("")}</table>
       </div>`,
     )
     .join("");
-  const canAnswer = (c.status === "proposed" || c.status === "rejected") && !!c.sha && p.status !== "building";
+  const canAnswer = (c.status === "proposed" || c.status === "rejected" || !!c.reapprove) && !!c.sha && p.status !== "building" && !c.parts.some((x) => x.invalid);
   const buttons = canAnswer
     ? `<div class="cad-plan-actions"><button class="mini danger" data-cad-act="reject" data-id="${esc(p.id)}">${icon("close")} Reject</button><button class="primary" data-cad-act="approve" data-id="${esc(p.id)}">${icon("lock")} Approve these numbers</button></div>`
     : "";
@@ -418,7 +428,7 @@ export function cadSectionHtml(p: AutopilotPlanInfo): string {
   const blocked = c.blocked && p.status === "blocked" ? `<div class="reader-hold cad-blocked">${icon("block")} <b>Blocked by the CAD verify:</b> ${esc(c.blocked.reason)}</div>` : "";
   return `<section class="card cad-plan" data-cad-status="${esc(c.status)}">
     <div class="pt-head">${icon("view_in_ar")} <b>CAD numbers</b> <span class="small muted">${esc(status)}</span></div>
-    ${needs}${blocked}${verified}
+    ${needs}${c.reapprove ? `<div class="reader-hold cad-reapprove">${icon("history")} <b>Re-approve:</b> ${esc(c.reapprove)}.</div>` : ""}${blocked}${verified}
     ${c.note ? `<p class="small cad-note">${icon("info")} ${esc(c.note)}</p>` : ""}
     ${tables}
     ${buttons}

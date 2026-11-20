@@ -28,7 +28,7 @@
  * first for a job queued with `refreshFirst` (what `forceRefresh()` does). With no job installed —
  * this phase — all of that is a no-op.
  */
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveSolidcraftCli } from "../solidcraft/binary";
@@ -228,7 +228,8 @@ export interface CadManagerOptions {
   refresh?: RefreshJob;
   /** Where each SolidCraft child gets its OWN `TMPDIR` (a folder the manager deletes when that process
    *  exits, so SolidCraft's `solidcraft-mcp-<pid>-*` folders never pile up). Default: a daemon-owned
-   *  `anvil-sc-*` folder under the system temp folder, made on first spawn. */
+   *  `anvil-sc-<pid>-*` folder under the system temp folder, made on first spawn and removed at
+   *  shutdown; one a dead daemon left behind is swept by `sweepOrphanedTmpRoots` at the next start. */
   tmpRoot?: string;
   /** Test seams for the script write. */
   poststepFs?: PoststepFs;
@@ -646,7 +647,7 @@ export class CadManager {
       if (this.opts.tmpRoot) {
         mkdirSync(this.opts.tmpRoot, { recursive: true });
         this.tmpRootDir = this.opts.tmpRoot;
-      } else this.tmpRootDir = mkdtempSync(join(tmpdir(), "anvil-sc-"));
+      } else this.tmpRootDir = mkdtempSync(join(tmpdir(), `${SC_TMP_PREFIX}${process.pid}-`)); // the pid: a later start can tell it is orphaned
     }
     return mkdtempSync(join(this.tmpRootDir, "p-"));
   }
@@ -1000,4 +1001,53 @@ export class CadManager {
       }
     }
   }
+}
+
+/** The default per-manager temp root's name: `anvil-sc-<pid of the daemon>-XXXXXX`. */
+export const SC_TMP_PREFIX = "anvil-sc-";
+const OWNED_TMP_RE = /^anvil-sc-(\d+)-/;
+/** An orphaned temp root is swept only once it is this old (a live daemon's is never touched anyway). */
+export const ORPHAN_TMP_MIN_AGE_MS = 60 * 60 * 1000;
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM"; // exists, owned by someone else
+  }
+}
+
+/**
+ * At daemon start: remove the `anvil-sc-<pid>-*` temp roots under `dir` that a daemon (or a test run)
+ * which is no longer running left behind, once they are older than an hour. A folder whose pid is alive
+ * (this daemon, another daemon, a concurrent test run) is never touched, and neither is any name without
+ * a pid (an older build's folder: it cannot be told apart from a live one). Returns what was removed.
+ */
+export function sweepOrphanedTmpRoots(dir: string = tmpdir(), opts: { now?: number; alive?: (pid: number) => boolean } = {}): string[] {
+  const now = opts.now ?? Date.now();
+  const alive = opts.alive ?? pidAlive;
+  const removed: string[] = [];
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return removed;
+  }
+  for (const name of names) {
+    const m = OWNED_TMP_RE.exec(name);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (pid === process.pid || alive(pid)) continue;
+    const path = join(dir, name);
+    try {
+      const st = statSync(path);
+      if (!st.isDirectory() || now - st.mtimeMs < ORPHAN_TMP_MIN_AGE_MS) continue;
+      rmSync(path, { recursive: true, force: true });
+      removed.push(path);
+    } catch {
+      /* gone already, or not ours to remove */
+    }
+  }
+  return removed;
 }

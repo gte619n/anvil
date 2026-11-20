@@ -524,6 +524,9 @@ export class Supervisor {
         this.broadcastUpdated(built.data);
       },
       cadwork: this.cadwork, // Phase B3: plan numbers into builder worktrees, the verify hook, planner cards
+      notice: (id, markdown) => {
+        this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
+      },
     });
     // An autopilot builder works only on the parts its plan covers (Phase B3, §4.11).
     this.cadwork.setBuilderScope((sessionId) => this.autopilot.builderParts(sessionId));
@@ -1588,16 +1591,21 @@ export class Supervisor {
       session.data.workUnitRole = a.workUnitRole;
       this.persist();
     }
-    this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
-    this.teams.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
+    // Phase B3: `prepare` (a builder's plan numbers) runs BEFORE the session is announced, and while it
+    // runs no prompt is accepted for it — so nothing can reach the model before the numbers are applied.
     if (a.prepare) {
+      this.preparing.add(session.id);
       try {
         await a.prepare({ id: session.id, cwd: session.data.cwd });
       } catch (e) {
+        this.preparing.delete(session.id);
         await this.kill(session.id).catch(() => undefined); // nothing half-prepared is left running
         throw e;
       }
+      this.preparing.delete(session.id);
     }
+    this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
+    this.teams.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
     this.prompt(session.id, a.brief); // lazily starts the driver and runs the first turn
     return { id: session.id, title: session.data.title, cwd: session.data.cwd };
   }
@@ -1866,9 +1874,13 @@ export class Supervisor {
     return this.attachStore.bytes(sessionId, id);
   }
 
+  /** Sessions whose handoff `prepare` is still running (Phase B3): not announced, and refuse prompts. */
+  private readonly preparing = new Set<string>();
+
   /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
   prompt(id: string, text: string, attachmentIds: string[] = [], cid?: string): void {
     const s = this.require(id);
+    if (this.preparing.has(id)) throw new BadCommand("this session is still being prepared (its plan's CAD numbers are being applied); try again in a moment");
     // Exactly-once (v4, spec A5): a re-flushed offline send carries the same cid. If we've already
     // applied it, record nothing new and don't run the turn again — the dispatcher re-acks it.
     if (cid && s.isPromptApplied(cid)) return;
@@ -1982,7 +1994,11 @@ export class Supervisor {
       // An ordinary session with the agent browser switched on also gets `request_human` (Phase C3).
       const hasBrowser = !!this.mcp.browser && isOrdinarySession(s.data) && this.mcp.store.list().some((i) => i.kind === "browser" && i.enabled && s.data.mcpIntegrations?.includes(i.id));
       // …and any ordinary session gets the part-source tools while one source is configured (Phase C5).
-      const hasParts = !!this.parts && isOrdinarySession(s.data) && this.parts.anyConfigured();
+      // So does an autopilot BUILDER (decision 184): a lookup is read-only (a fetch lands in quarantine)
+      // and needs no owner card. Builders still get no MCP integrations and no browser (hasBrowser and
+      // mcp.serversFor are ordinary-session only), and no CLAUDE.md reflection (maybeReflectOnClaudeMd).
+      const isBuilder = s.data.workUnitRole === "builder" && !!s.data.workUnitId;
+      const hasParts = !!this.parts && (isOrdinarySession(s.data) || isBuilder) && this.parts.anyConfigured();
       // The session's in-process servers: its role server, or for an ordinary session the capability-
       // gated ones (anvil_cad, anvil_human/anvil_test, anvil_parts). `mcp.serversFor` passes them
       // through unchanged (any `type: "sdk"` entry counts as in-process for the permission gate) and

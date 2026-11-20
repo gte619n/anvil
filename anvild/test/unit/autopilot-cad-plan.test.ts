@@ -165,3 +165,91 @@ describe("judging a verify run", () => {
     expect(reason(run([verdict("bracket", "pass")], ["bracket"]), undefined, () => ({ approvedBy: "agent-initial" }))).toContain("set by the agent");
   });
 });
+
+describe("B3 review fixes: the pure parts", () => {
+  const approvedAt80 = (over: Record<string, unknown> = {}) => ({
+    approvedBy: "planner",
+    at: "2026-11-20T01:00:00.000Z",
+    sha: "s1",
+    values: { bbox: [6, 50, 80] as [number, number, number], volume: 24000, bodies: 1, holes: [{ diameter: 3.4, count: 4 }] },
+    declared: { L: 80, W: 50, T: 6 },
+    matchesFile: true,
+    process: "fdm-0.4",
+    tolerance: { length: 0.01, volumeRel: 0.001 }, // the defaults (PLAN sets none)
+    refs: [],
+    ...over,
+  });
+
+  test("[B3] review 3: 'same as approved' compares the evaluated numbers and declared values (and the process when known); only the same, owner- or plan-approved numbers with their block on disk keep the approval", async () => {
+    const { replacesApproval, sameAsApproved, planExpectationRows: rowsOf } = await import("../../src/cadwork/plan-expectations");
+    const p80 = checkPlanPart("plate", PLAN);
+    if (!p80.ok) throw new Error(p80.error);
+    expect(sameAsApproved(p80.entry, approvedAt80())).toBe(true);
+    expect(replacesApproval(p80.entry, approvedAt80())).toBe(false);
+    const p120 = checkPlanPart("plate", { ...PLAN, parameters: { ...PLAN.parameters, L: "120 mm" } });
+    if (!p120.ok) throw new Error(p120.error);
+    expect(sameAsApproved(p120.entry, approvedAt80())).toBe(false);
+    expect(replacesApproval(p120.entry, approvedAt80())).toBe(true);
+    expect(sameAsApproved(p80.entry, approvedAt80({ process: "cnc-3axis" }))).toBe(false);
+    expect(sameAsApproved(p80.entry, approvedAt80({ tolerance: { length: 0.1, volumeRel: 0.01 } }))).toBe(false);
+    expect(sameAsApproved(p80.entry, approvedAt80({ process: undefined, tolerance: undefined, matchesFile: false }))).toBe(true); // unknown fields not compared…
+    expect(replacesApproval(p80.entry, approvedAt80({ matchesFile: false }))).toBe(true); // …but the block on disk is not the approved one
+    expect(replacesApproval(p80.entry, approvedAt80({ approvedBy: "agent-initial" }))).toBe(true);
+    expect(replacesApproval(p80.entry, undefined)).toBe(true);
+    // The rows' old side is the approval, the new side the plan.
+    const rows = rowsOf(p120.entry, approvedAt80());
+    expect(rows.find((r) => r.label === "Parameters")).toMatchObject({ old: "L = 80, T = 6, W = 50", new: "L = 120 mm, T = 6 mm, W = 50" });
+    expect(rows.find((r) => r.label === "Process")).toMatchObject({ old: "fdm-0.4", new: "fdm-0.4" });
+    expect(rowsOf(p120.entry).every((r) => r.old === undefined)).toBe(true);
+  });
+
+  test("[B3] review 3: the card carries old values, the replace note and a re-approve state from the approval; its sha changes when the approval does", async () => {
+    const { cadCardSha, approvalChangedRefusal } = await import("../../src/integrations/autopilot-cad");
+    const p120 = checkPlanPart("plate", { ...PLAN, parameters: { ...PLAN.parameters, L: "120 mm" } });
+    if (!p120.ok) throw new Error(p120.error);
+    const u = unit({ needsCad: true, cadExpectations: { plate: { ...p120.entry, approvedAt: "2026-11-20T00:00:00.000Z" } }, cadExpectationsStatus: "approved" });
+    let approval: ReturnType<typeof approvedAt80> | undefined = approvedAt80();
+    const ctx = { approved: () => approval, processes: ["fdm-0.4"], defaultBranch: "main" };
+    const info = toCadInfo(u, ctx)!;
+    expect(info.parts[0]!.note).toContain("Approving replaces the approved numbers for cad/plate for the whole repo");
+    expect(info.parts[0]!.note).toContain("the part on main will show as unverified");
+    expect(info.reapprove).toContain("changed after this plan was approved"); // the approval (01:00) is newer than the plan's (00:00)
+    expect(info.needsApproval).toBe(true);
+    expect(approvalChangedRefusal(u, () => approvedAt80({ at: "2026-11-19T00:00:00.000Z" }))).toBeUndefined(); // older: no conflict
+    const shaWith = cadCardSha(u.cadExpectations, ctx);
+    approval = approvedAt80({ at: "2026-11-20T02:00:00.000Z" });
+    expect(cadCardSha(u.cadExpectations, ctx)).not.toBe(shaWith);
+    approval = undefined;
+    expect(cadCardSha(u.cadExpectations, ctx)).toBe(planExpectationsSha(u.cadExpectations));
+    expect(toCadInfo(u, ctx)!.parts[0]!.note).toBeUndefined(); // nothing approved: nothing replaced
+    // An unknown process is invalid with a note.
+    const bad = toCadInfo(u, { ...ctx, processes: ["cnc-3axis"] })!;
+    expect(bad.parts[0]!.invalid).toBe("process fdm-0.4 is not in the repo's cad/rules.json (it has: cnc-3axis)");
+    expect(bad.needsApproval).toBe(true);
+    expect(toCadInfo(u, { ...ctx, processes: null })!.parts[0]!.invalid).toContain("no readable cad/rules.json");
+  });
+
+  test("[B3] review 6: a unit held for clarification keeps the planner's CAD fields; a proposed part whose process is not in cad/rules.json is dropped with a note", async () => {
+    const { processedUnitFields } = await import("../../src/integrations/autopilot");
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const repo = mkdtempSync(join(tmpdir(), "anvil-b3-fields-"));
+    try {
+      mkdirSync(join(repo, "cad"));
+      writeFileSync(join(repo, "cad", "rules.json"), JSON.stringify({ schema: 1, processes: [{ id: "fdm-0.4", kind: "fdm", envelope: [250, 210, 220] }] }));
+      const meta = extractPlanMeta(`# Plan\n\n\`\`\`json\n${JSON.stringify({ summary: "s", size: "s", needsCad: true, cadExpectations: { plate: PLAN, cup: { ...PLAN, process: "sla-0.05" } } })}\n\`\`\``);
+      const planned = { title: "plate", rationale: "r", taskIds: ["t1"], tasks: [], plan: meta.plan, cad: meta.cad } as any;
+      const held = processedUnitFields({ title: "plate", rationale: "r", taskIds: ["t1"] }, { environmentId: "e", projectId: "p", repoRoot: repo }, { reason: "which plate?", questions: ["Which?"] }, planned);
+      expect(held).toMatchObject({ status: "needs-clarification", needsCad: true, cadExpectationsStatus: "proposed", cadExpectationsSource: "nightly" });
+      expect(Object.keys((held as any).cadExpectations)).toEqual(["plate"]);
+      expect((held as any).cadNote).toContain("cad/cup: process sla-0.05 is not in the repo's cad/rules.json (it has: fdm-0.4)");
+      const ok = processedUnitFields({ title: "plate", rationale: "r", taskIds: ["t1"] }, { environmentId: "e", projectId: "p", repoRoot: repo }, undefined, planned);
+      expect(ok).toMatchObject({ status: "planned", needsCad: true, cadExpectationsStatus: "proposed" });
+      // Intake held it before any planning: there is nothing about CAD to keep.
+      expect((processedUnitFields({ title: "x", rationale: "r", taskIds: [] }, { environmentId: "e", projectId: "p", repoRoot: repo }, { reason: "vague", questions: [] }, undefined) as any).needsCad).toBeUndefined();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});

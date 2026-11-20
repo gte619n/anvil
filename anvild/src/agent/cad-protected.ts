@@ -10,6 +10,8 @@
  *     the lock store, the session store, credentials — whatever the path looks like (relative, through
  *     a symlink). The only folders under it a session may write in are the ones it works in: the
  *     session worktrees root and the cloned-repos folder.
+ *   - For an autopilot builder (unattended), `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to a file
+ *     directly under `cad/` other than `cad/rules.json` (which always prompts, so is denied unattended).
  *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to anything under `cad/<part>/.cache/` (the
  *     daemon's previews, thumbnails and temp files — what the viewer shows) or `cad/<part>/release/`
  *     (release packs are daemon-written and HMAC-checked).
@@ -37,7 +39,7 @@ import { join } from "node:path";
 import { gitToplevel } from "../cadwork/partfolder";
 import { isUnder, newComponentsSafe, realish, relUnder, resolveToolPath, toolPathArg } from "./tool-paths";
 import { CAD_OWNER_CARD_TOOL_IDS, cadToolId } from "./cad-tool-ids";
-import { registerProtectedRule, type ProtectedContext, type ProtectedRule, type ProtectedVerdict } from "./protected";
+import { isUnattended, registerProtectedRule, type ProtectedContext, type ProtectedRule, type ProtectedVerdict } from "./protected";
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 /** Folders under the daemon's state dir that an agent's shell must stay out of. */
@@ -48,6 +50,8 @@ const PART_JSON_RE = /^cad\/[^/]+\/part\.json$/;
 const DESIGN_JSON_RE = /^cad\/[^/]+\/design\.json$/;
 /** Daemon-written folders of a part: previews, thumbnails, temp files; release packs. */
 const DAEMON_DIR_RE = /^cad\/[^/]+\/(\.cache|release)(\/|$)/;
+/** A file directly under cad/ (not in a part folder). cad/rules.json has its own rule above. */
+const LOOSE_CAD_FILE_RE = /^cad\/[^/]+$/;
 
 /** State dirs of the daemons in this process (one in production; several in tests), each with the
  *  folders under it that sessions may write in. */
@@ -155,6 +159,11 @@ export const cadProtectedRule: ProtectedRule = (ctx): ProtectedVerdict => {
     }
     if (rel === "cad/rules.json") {
       return { kind: "always-prompt", reason: "cad/rules.json sets the manufacturing limits every part is checked against", label: "Allow this edit", denyWhenUnattended: true };
+    }
+    // An autopilot builder works only inside its plan's part folders: a file directly under cad/ (a loose
+    // `cad/bracket.step`) is no part's file, and its verify would fail on it anyway (B3 review, item 4).
+    if (rel && LOOSE_CAD_FILE_RE.test(rel) && isUnattended(ctx.session)) {
+      return { kind: "deny", reason: `${rel} is directly under cad/, outside every part folder; an autopilot builder may only write inside its plan's parts (cad/<part>/…)` };
     }
     return undefined;
   }

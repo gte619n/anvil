@@ -1259,7 +1259,12 @@ export interface AutopilotCadInfo {
   status: "proposed" | "approved" | "rejected" | "missing"; // missing: CAD needed but no valid numbers yet
   needsApproval: boolean;
   sha?: string; // identity of exactly the numbers shown (planExpectationsSha)
-  parts: { part: string; process: string; approved: boolean; rows: CadExpectationsRow[] }[];
+  /** `rows[].old` is what is APPROVED for the part now (the repo-wide approval, decision 183). `note`: approving
+   *  replaces that approval for the whole repo (the default branch's part shows unverified until merged).
+   *  `invalid`: the part's process is not in the repo's cad/rules.json (the plan cannot be approved). */
+  parts: { part: string; process: string; approved: boolean; rows: CadExpectationsRow[]; note?: string; invalid?: string }[];
+  /** The approved numbers of a part changed after this plan was approved: it must be re-approved to start. */
+  reapprove?: string;
   source?: "planner" | "nightly";
   approvedAt?: Iso8601;
   note?: string; // e.g. proposed numbers that were ignored as malformed

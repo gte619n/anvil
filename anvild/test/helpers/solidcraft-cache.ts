@@ -19,7 +19,7 @@
  * (never skips).
  */
 import { createHash } from "node:crypto";
-import { copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { httpDownloader, releaseAssetName, releaseAssetUrl, type Download } from "../../src/solidcraft/install";
@@ -35,6 +35,8 @@ export const SOLIDCRAFT_TEST_RELEASES: Readonly<Record<string, string>> = {
 /** Where the B0 spike left its files; read when present, never written. */
 export const LEGACY_SPIKE_DIR = "/tmp/sc-b0";
 const MARKER = ".zip-sha256";
+/** A staging folder is another run's in-progress unpack until it is this old. */
+export const STAGING_STALE_MS = 10 * 60 * 1000;
 
 export function solidcraftTestCache(env: Record<string, string | undefined> = process.env): string {
   // Absolute, whatever the test's working folder: a relative ANVIL_TEST_CACHE is resolved once, here.
@@ -150,8 +152,17 @@ export async function solidcraftReleaseBuild(version: string, opts: CacheOptions
     throw e;
   }
   mkdirSync(x, { recursive: true });
-  // Staging folders an interrupted run left behind (`.<version>-XXXX`) are removed first.
-  for (const name of readdirSync(x)) if (name.startsWith(`.${version}-`)) rmSync(join(x, name), { recursive: true, force: true });
+  // Staging folders an interrupted run left behind (`.<version>-XXXX`) are removed first — only ones
+  // older than STAGING_STALE_MS, so a concurrent run's folder that is being unpacked right now is kept.
+  const cutoff = Date.now() - STAGING_STALE_MS;
+  for (const name of readdirSync(x)) {
+    if (!name.startsWith(`.${version}-`)) continue;
+    try {
+      if (statSync(join(x, name)).mtimeMs < cutoff) rmSync(join(x, name), { recursive: true, force: true });
+    } catch {
+      /* already gone (its run finished) */
+    }
+  }
   const staged = mkdtempSync(join(x, `.${version}-`)); // a new, empty folder for the untrusted archive
   try {
     await extractZip(zip, join(staged, buildFolder(version)));

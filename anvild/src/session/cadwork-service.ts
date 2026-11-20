@@ -31,7 +31,7 @@ import { buildFileOffer, maybeTaildrop } from "../agent/file-offer";
 import { isUnattended } from "../agent/protected";
 import { evaluateGate, hasValues, pendingAdoptions, type GateInput, type GateResult } from "../cadwork/gate";
 import { LockStore, LockSync, repoIdentity, type LockSyncOptions, type PartLock, type RulesLock } from "../cadwork/locks";
-import { CadManager, type CadManagerOptions, type CadParamInfo, type SlotContext } from "../cadwork/manager";
+import { CadManager, sweepOrphanedTmpRoots, type CadManagerOptions, type CadParamInfo, type SlotContext } from "../cadwork/manager";
 import { realClock, solidcraftEnv, type CadClock } from "../cadwork/mcp-client";
 import { gitToplevel, listParts, partRef, type PartRef } from "../cadwork/partfolder";
 import { CACHE_DIR, DESIGN_FILE, DISK_CONFLICT_REASON, readDesignFile } from "../cadwork/poststep";
@@ -54,7 +54,7 @@ import {
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
 import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
-import { checkPlanPart, parseDeclared, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { checkPlanPart, parseDeclared, replacesApproval, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
 import { holeTable, mergeHoleTables } from "../cadwork/holes";
 import { readRules } from "../cadwork/rules";
@@ -238,6 +238,9 @@ export class CadworkService {
     this.resolveCli = deps.resolveCli ?? (() => resolveSolidcraftCli());
     this.readVersion = deps.readVersion ?? readSolidcraftVersion;
     this.manager = new CadManager({ resolveCli: this.resolveCli, ...deps.manager });
+    // Daemon start: the SolidCraft temp roots a daemon that is gone left behind (killed, crashed, a test
+    // run that never shut down) are removed — only `anvil-sc-<dead pid>-*`, only when over an hour old.
+    if (!deps.manager?.tmpRoot) sweepOrphanedTmpRoots();
     this.clock = deps.manager?.clock ?? realClock;
     const stateDir = deps.stateDir ?? mkdtempSync(join(tmpdir(), "anvil-cadwork-state-"));
     this.stateDir = stateDir;
@@ -2001,6 +2004,40 @@ export class CadworkService {
     }
   }
 
+  /**
+   * What is approved for a part right now (decision 183): the repo's single lock entry (shared by every
+   * worktree, fleet-synced), with the process / tolerance / references of the block when the part.json
+   * in `worktree` still carries exactly that block. Undefined when nothing is approved.
+   */
+  approvedNumbers(worktree: string, part: string): ApprovedNumbers | undefined {
+    let ref: PartRef;
+    try {
+      ref = partRef(worktree, part);
+    } catch {
+      return undefined;
+    }
+    const lock = this.findLock(ref);
+    if (!lock) return undefined;
+    const pf = readPartFile(ref.dir);
+    const file = pf.kind === "ok" && lockedBlockSha(pf.file) === lock.sha ? pf.file : undefined;
+    return {
+      approvedBy: lock.approvedBy,
+      at: lock.at,
+      sha: lock.sha,
+      ...(lock.values ? { values: lock.values } : {}),
+      ...(lock.declared ? { declared: { ...lock.declared } } : {}),
+      matchesFile: !!file,
+      ...(file ? { process: file.process } : {}),
+      ...(file?.expectations ? { tolerance: { ...file.expectations.tolerance }, refs: [...(file.expectations.noInterferenceWith ?? [])] } : {}),
+    };
+  }
+
+  /** The process ids in a worktree's cad/rules.json (`null`: missing or unreadable). */
+  processIds(worktree: string): string[] | null {
+    const r = readRules(worktree);
+    return r.kind === "ok" ? r.file.processes.map((p) => p.id) : null;
+  }
+
   /** Refresh (measure and record) the named parts of a worktree now, starting their processes if
    *  needed — so `part.json.measured` is the daemon's own measurement of the design on disk before a
    *  verify reads it (what `check_part` does). Parts whose folder is gone are skipped. */
@@ -2056,11 +2093,16 @@ export class CadworkService {
     const change = Object.keys(c.declared).filter((n) => have.has(n) && !closeTo(have.get(n)!, c.declared[n]!));
     const add = Object.keys(c.declared).filter((n) => !have.has(n));
     let failure: string | undefined;
+    // Decision 183: the plan's numbers ARE the part's current approval (by the owner or a plan) and this
+    // worktree's part.json carries exactly that block → keep both untouched (only the parameters are set),
+    // so starting the builder does not make the part unverified on the default branch.
+    const keepApproval = !replacesApproval(c.entry, this.approvedNumbers(worktree, part));
     const write = (params: CadParamInfo[]): void => {
       for (const n of Object.keys(c.declared)) {
         const got = params.find((p) => p.name === n)?.value;
         if (got === undefined || !closeTo(got, c.declared[n]!)) return void (failure = `SolidCraft made ${n} = ${got === undefined ? "nothing" : num(got)}, not the planned ${num(c.declared[n]!)}`);
       }
+      if (keepApproval) return;
       const f: PartFile = {
         schema: 1,
         process: c.entry.process,

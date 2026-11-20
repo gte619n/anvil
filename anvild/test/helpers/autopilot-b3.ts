@@ -105,6 +105,7 @@ export async function b3Rig(opts: { cli: string; units?: (seed: WorkUnitStore, e
   const handoffs: any[] = [];
   const firstTurns: FirstTurn[] = [];
   const goals = new Map<string, string>();
+  const notices: { sessionId: string; markdown: string }[] = [];
   let n = 0;
   const deps: AutopilotDeps = {
     registry,
@@ -165,6 +166,7 @@ export async function b3Rig(opts: { cli: string; units?: (seed: WorkUnitStore, e
     notifyAll: () => {},
     broadcastLoops: () => {},
     armGoal: (sid, condition) => void goals.set(sid, condition),
+    notice: (sessionId, markdown) => void notices.push({ sessionId, markdown }),
     cadwork: cad,
   };
   const svc = new AutopilotService(deps);
@@ -188,7 +190,7 @@ export async function b3Rig(opts: { cli: string; units?: (seed: WorkUnitStore, e
   const unit = (uid: string): WorkUnit => (svc as any).workUnits.get(uid);
   /** The unit as its card shows it (whether or not it is on the pending grid right now). */
   const plan = (uid: string) => (svc as any).autopilotPlanInfo(unit(uid)) as import("@protocol").AutopilotPlanInfo;
-  return { repo, stateDir, cad, svc, env, envStore, sessions, builders, broadcasts, events, handoffs, firstTurns, goals, tools, gate, openCards, unit, plan };
+  return { repo, stateDir, cad, svc, env, envStore, sessions, builders, broadcasts, events, handoffs, firstTurns, goals, notices, tools, gate, openCards, unit, plan, builderSession };
 }
 
 /** The builder's half of the reference plate when the plan already applied L, W, T: open, then model

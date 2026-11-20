@@ -7,12 +7,15 @@
  * (usually `planned`) and `cadStartRefusal` holds it, the same way `hold` and the completion overlay do.
  */
 import type { AutopilotCadInfo } from "@protocol";
-import { planExpectationRows, planExpectationsSha, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { createHash } from "node:crypto";
+import { approvedFingerprint, planExpectationRows, planExpectationsSha, replaceNote, replacesApproval, sameAsApproved, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import type { PlanCadMeta } from "./plan-meta";
 import type { WorkUnit } from "./workunit";
 
 /** What startPlan / auto-start / the dev pipeline say for a unit whose CAD numbers are not approved. */
 export const NEEDS_APPROVED_DIMENSIONS = "needs approved dimensions";
+/** Why the dev pipeline and "Link to session" refuse a CAD unit (decision 182): only Go builds CAD. */
+export const CAD_BUILDS_WITH_GO = "CAD units build with Go (the pipeline cannot model)";
 
 type CadFields = Pick<WorkUnit, "cadExpectations" | "cadExpectationsStatus" | "needsCad">;
 
@@ -41,31 +44,96 @@ export function cadStatusOf(record: Record<string, PlanPartExpectations>): "prop
   return parts.length > 0 && parts.every((p) => !!p.approvedAt) ? "approved" : "proposed";
 }
 
-/** The WorkUnit fields for the nightly planner's CAD metadata (item 41): numbers PROPOSED, never approved. */
-export function cadFieldsFromMeta(cad: PlanCadMeta | undefined): Partial<WorkUnit> {
+/** The WorkUnit fields for the nightly planner's CAD metadata (item 41): numbers PROPOSED, never approved.
+ *  With `processes` (the repo's cad/rules.json ids; `null` when it has none), a part whose process is not
+ *  there is dropped with a note, like a malformed one — the unit still needs CAD. */
+export function cadFieldsFromMeta(cad: PlanCadMeta | undefined, processes?: readonly string[] | null): Partial<WorkUnit> {
   if (!cad) return {};
-  const parts = Object.keys(cad.expectations);
+  const expectations: Record<string, PlanPartExpectations> = {};
+  const dropped: string[] = [];
+  for (const [part, e] of Object.entries(cad.expectations)) {
+    const why = processProblem(e.process, processes);
+    if (why) dropped.push(`cad/${part}: ${why}`);
+    else expectations[part] = e;
+  }
+  const parts = Object.keys(expectations);
+  const note = [cad.note, dropped.length ? `Ignored: ${dropped.join("; ")}` : undefined].filter(Boolean).join(" ");
   return {
     needsCad: true,
-    ...(parts.length ? { cadExpectations: cad.expectations, cadExpectationsStatus: "proposed" as const, cadExpectationsSource: "nightly" as const } : {}),
-    ...(cad.note ? { cadNote: cad.note } : {}),
+    ...(parts.length ? { cadExpectations: expectations, cadExpectationsStatus: "proposed" as const, cadExpectationsSource: "nightly" as const } : {}),
+    ...(note ? { cadNote: note } : {}),
   };
 }
 
+/** What the card needs to know about the repo besides the unit (decision 183): the CURRENT approval of
+ *  each part (the repo-wide lock entry), the processes `cad/rules.json` defines, and the default branch's
+ *  name. Absent: drawn from the unit alone (no "old" side, no process check). */
+export interface CadCardContext {
+  approved: (part: string) => ApprovedNumbers | undefined;
+  /** The process ids in the repo's `cad/rules.json`; `null` when it is missing or unreadable. */
+  processes: readonly string[] | null;
+  defaultBranch: string;
+}
+
+/** Why a part's process cannot be used, or undefined. */
+export function processProblem(process: string, processes: readonly string[] | null | undefined): string | undefined {
+  if (processes === undefined) return undefined;
+  if (processes === null) return `process ${process} cannot be checked: the repo has no readable cad/rules.json`;
+  return processes.includes(process) ? undefined : `process ${process} is not in the repo's cad/rules.json (it has: ${processes.join(", ") || "none"})`;
+}
+
+/**
+ * The identity of exactly what a unit's card shows: the plan's numbers and, per part, the approval its
+ * "old" side was drawn from. With no approval on record for any part it is `planExpectationsSha`.
+ */
+export function cadCardSha(record: Record<string, PlanPartExpectations> | undefined, ctx?: Pick<CadCardContext, "approved">): string {
+  const plan = planExpectationsSha(record);
+  const prints = Object.keys(record ?? {})
+    .sort()
+    .map((p) => [p, approvedFingerprint(ctx?.approved(p))] as const);
+  if (prints.every(([, f]) => f === null)) return plan;
+  return createHash("sha256").update(JSON.stringify([plan, prints])).digest("hex");
+}
+
+/**
+ * Decision 183 (b): a part whose approved numbers were changed by someone AFTER this plan's numbers for
+ * it were approved — a start would silently overwrite that newer approval. Undefined when none.
+ */
+export function approvalChangedRefusal(u: Pick<WorkUnit, "cadExpectations">, approved: (part: string) => ApprovedNumbers | undefined): string | undefined {
+  for (const p of coveredParts(u)) {
+    const e = u.cadExpectations![p]!;
+    const a = approved(p);
+    if (!a || !e.approvedAt || sameAsApproved(e, a)) continue;
+    if (Date.parse(a.at) > Date.parse(e.approvedAt)) return `the approved numbers for cad/${p} changed after this plan was approved; re-approve the plan`;
+  }
+  return undefined;
+}
+
 /** The card's CAD section, or undefined for a unit that has nothing to do with CAD. */
-export function toCadInfo(u: WorkUnit): AutopilotCadInfo | undefined {
+export function toCadInfo(u: WorkUnit, ctx?: CadCardContext): AutopilotCadInfo | undefined {
   if (!needsCad(u) && !u.cadVerified && !u.cadBlocked) return undefined;
   const record = u.cadExpectations ?? {};
   const parts = coveredParts(u).map((part) => {
     const e = record[part]!;
-    return { part, process: e.process, approved: !!e.approvedAt, rows: planExpectationRows(e) };
+    const approved = ctx?.approved(part);
+    const invalid = processProblem(e.process, ctx?.processes);
+    return {
+      part,
+      process: e.process,
+      approved: !!e.approvedAt,
+      rows: planExpectationRows(e, approved),
+      ...(ctx && replacesApproval(e, approved) && approved ? { note: replaceNote(part, ctx.defaultBranch) } : {}),
+      ...(invalid ? { invalid } : {}),
+    };
   });
   const status: AutopilotCadInfo["status"] = parts.length === 0 ? "missing" : (u.cadExpectationsStatus ?? "proposed");
+  const reapprove = ctx ? approvalChangedRefusal(u, ctx.approved) : undefined;
   return {
     status,
-    needsApproval: !!cadStartRefusal(u),
-    ...(parts.length ? { sha: planExpectationsSha(record) } : {}),
+    needsApproval: !!cadStartRefusal(u) || !!reapprove || parts.some((p) => !!p.invalid),
+    ...(parts.length ? { sha: cadCardSha(record, ctx) } : {}),
     parts,
+    ...(reapprove ? { reapprove } : {}),
     ...(u.cadExpectationsSource ? { source: u.cadExpectationsSource } : {}),
     ...(u.cadExpectationsApprovedAt ? { approvedAt: u.cadExpectationsApprovedAt } : {}),
     ...(u.cadNote ? { note: u.cadNote } : {}),
@@ -93,14 +161,20 @@ export interface CadJudgement {
 /**
  * Judge a verify run for an autopilot builder (`covered` = the plan's parts) or the dev pipeline
  * (`covered` undefined: no plan coverage required, only an approved, passing design). Not OK when:
- * the run could not be carried out; `cad/rules.json` changed; a touched part is not covered by the
+ * the run could not be carried out; a changed path under cad/ is not a valid part's file nor
+ * cad/rules.json (`unexpected`); `cad/rules.json` changed; a touched part is not covered by the
  * plan; a part is not `pass` (fail, gap, unverified — an adoption pending — or concept); or a part's
  * numbers were set by the agent (`agent-initial`) or are not approved at all.
  */
-export function judgeCadVerify(r: VerifyLike, opts: { covered?: readonly string[]; approvalOf: (part: string) => { approvedBy: string } | undefined }): CadJudgement {
+export function judgeCadVerify(
+  r: VerifyLike,
+  opts: { covered?: readonly string[]; approvalOf: (part: string) => { approvedBy: string } | undefined; unexpected?: readonly string[] },
+): CadJudgement {
   const problems: string[] = [];
   const parts = [...new Set([...r.selection.changed, ...r.parts.map((p) => p.part)])].sort();
   if (r.error) problems.push(`the CAD check could not run: ${r.error}`);
+  // Changed paths under cad/ outside every valid part folder (and not cad/rules.json): never shipped unseen.
+  for (const p of opts.unexpected ?? []) problems.push(`unexpected path ${p}`);
   if (r.selection.rulesChanged) problems.push("cad/rules.json changed in this worktree; only the owner may change the manufacturing rules");
   if (opts.covered) {
     for (const p of r.selection.changed) if (!opts.covered.includes(p)) problems.push(`cad/${p} was touched but the plan has no approved dimensions for it`);

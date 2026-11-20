@@ -660,7 +660,10 @@
             "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] a format refusal kills the child it started, and its TMPDIR goes with it",
             "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] the merge guard's replay child runs with a TMPDIR inside its throwaway folder, which is gone when verify returns",
             "the test cache of real SolidCraft builds > [A5] the marker holds the zip's AND the unpacked binary's sha256; a cached binary that no longer matches is unpacked again; stale staging folders are removed",
-            "the test cache of real SolidCraft builds > [A5] a relative ANVIL_TEST_CACHE is resolved to an absolute path"
+            "the test cache of real SolidCraft builds > [A5] a relative ANVIL_TEST_CACHE is resolved to an absolute path",
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] the default temp root is named for the daemon's pid and is removed at shutdown even when it is empty",
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] a daemon start sweeps anvil-sc-<pid>-* roots older than an hour whose pid is dead — never a live pid's, a young one, or a name without a pid",
+            "the test cache of real SolidCraft builds > [A5] the staging cleanup keeps a concurrent run's in-progress folder (under 10 minutes old) and removes only older ones"
           ]
         }
       ],
@@ -980,7 +983,10 @@
             "the nightly planner's channel: the metadata block > [B3] malformed proposals are ignored with a note; the unit still needs CAD",
             "the start gate: an overlay, not a new status > [B3] a CAD unit starts only when every part is approved; a non-CAD unit is unaffected; auto-start holds with the same reason",
             "the start gate: an overlay, not a new status > [B3] the card shows the numbers, the needs-approval state, the verified badge and the blocked reason; CAD builds stay on the grid",
-            "judging a verify run > [B3] all pass with plan-approved numbers → OK; every failure kind gives its own reason"
+            "judging a verify run > [B3] all pass with plan-approved numbers → OK; every failure kind gives its own reason",
+            "B3 review fixes: the pure parts > [B3] review 3: 'same as approved' compares the evaluated numbers and declared values (and the process when known); only the same, owner- or plan-approved numbers with their block on disk keep the approval",
+            "B3 review fixes: the pure parts > [B3] review 3: the card carries old values, the replace note and a re-approve state from the approval; its sha changes when the approval does",
+            "B3 review fixes: the pure parts > [B3] review 6: a unit held for clarification keeps the planner's CAD fields; a proposed part whose process is not in cad/rules.json is dropped with a note"
           ]
         },
         {
@@ -1014,7 +1020,9 @@
         {
           "file": "test/integration/autopilot-b3-wiring.test.ts",
           "names": [
-            "[B3] wiring: Go through the Supervisor stamps the builder, applies the plan's numbers before the first turn reaches the model, and the turn's result runs the verify hook"
+            "[B3] wiring: Go through the Supervisor stamps the builder, applies the plan's numbers before the first turn reaches the model, and the turn's result runs the verify hook",
+            "[B3] review 6: a builder's session.created is broadcast only AFTER prepare applied the plan's numbers, and no prompt is accepted for it while prepare runs",
+            "[B3] review 1: a loop's pipeline body refuses a CAD unit (CAD units build with Go)"
           ]
         },
         {
@@ -1023,7 +1031,43 @@
             "[B3] web: proposed numbers render with Approve / Reject and the needs-approved-dimensions state; the buttons send exactly the card's sha",
             "[B3] web: approved numbers are locked (no buttons); missing numbers say to plan with Claude; a note is shown",
             "[B3] web: the CAD-verified badge, and the blocking reason on a blocked unit",
-            "[B3] web: the planner's `plan` card renders its rows with Approve / Deny and no always-allow"
+            "[B3] web: the planner's `plan` card renders its rows with Approve / Deny and no always-allow",
+            "[B3] web: review 3 — the card shows the approved values beside the plan's, the replace note prominently, a re-approve state with the buttons back, and an invalid process with no Approve"
+          ]
+        },
+        {
+          "file": "test/integration/autopilot-b3-review.test.ts",
+          "names": [
+            "review item 1: a CAD unit never goes through the dev pipeline > [B3] review 1: the reviewer's repro — approved numbers for cad/plate, an implementer that edits only README.md — the Run pipeline entry point refuses it: nothing built, nothing shipped, no PR, the unit untouched",
+            "review item 1: a CAD unit never goes through the dev pipeline > [B3] review 1: the planner's run_pipeline tool refuses a CAD unit with the reason (and starts nothing)",
+            "review item 1: a CAD unit never goes through the dev pipeline > [B3] review 1: auto-start with the pipeline selected falls back to Go for a CAD unit (its start gate still applies) and keeps the pipeline for a non-CAD unit",
+            "review item 1: a CAD unit never goes through the dev pipeline > [B3] review 1: a non-CAD unit whose pipeline diff touches cad/ is still verified (unchanged), and a loose file under cad/ blocks it as an unexpected path",
+            "review item 2: Link to session cannot start a CAD unit > [B3] review 2: linking applies the start gate (unapproved numbers refused) and refuses a CAD unit outright, since a linked session is never its builder; a non-CAD unit still links",
+            "review item 3: one approval per repo and part, made visible and not clobbered > [B3] review 3a: the reviewer's repro — main verifies at L=80; a second unit plans L=120: its card shows old 80 with the replace note; approving and starting makes main unverified BY DESIGN, as the card said",
+            "review item 3: one approval per repo and part, made visible and not clobbered > [B3] review 3a: a plan whose numbers ARE the approved ones has no note, and starting it keeps the approval — main stays verified",
+            "review item 3: one approval per repo and part, made visible and not clobbered > [B3] review 3a: the planner's save_cad_expectations card also shows old from the approved entry, with the replace note",
+            "review item 3: one approval per repo and part, made visible and not clobbered > [B3] review 3b: approved numbers that changed after the plan was approved refuse the start; the redrawn card shows the new old values and a re-approval lets it start",
+            "review item 3: one approval per repo and part, made visible and not clobbered > [B3] review 3c: a unit cannot start while another unit's LIVE builder holds the same part; once that builder is gone it can",
+            "review item 4: no change under cad/ is skipped > [B3] review 4: a builder's loose file directly under cad/ or a folder with an invalid part name fails its verify as an unexpected path",
+            "review item 4: no change under cad/ is skipped > [B3] review 4: a builder's Write/Edit to a file directly under cad/ (other than rules.json) is denied; an ordinary session is not stopped by that rule",
+            "review item 5: the unit follows the latest verify > [B3] review 5: blocked → fixed → building: a passing verify clears cadBlocked and returns the unit to building; a failing one clears cadVerified; never both; one notice per new reason says how to resume",
+            "review item 5: the unit follows the latest verify > [B3] review 5: a goal-time block says the goal ended unmet (the first failing goal check ends it), and a passing verify of a builder whose session is gone does not revive the unit",
+            "review item 6: smaller holes > [B3] review 6: save_cad_expectations refuses a unit that is building (as the card's respond does)",
+            "review item 6: smaller holes > [B3] review 6: a process the repo's cad/rules.json does not define — refused by save_cad_expectations, marked invalid on the card (no approve, no start)"
+          ]
+        },
+        {
+          "file": "test/integration/parts-c5.test.ts",
+          "names": [
+            "tools, permissions and keys > [C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not"
+          ]
+        },
+        {
+          "file": "test/unit/cad-a5-followups.test.ts",
+          "names": [
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] the default temp root is named for the daemon's pid and is removed at shutdown even when it is empty",
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] a daemon start sweeps anvil-sc-<pid>-* roots older than an hour whose pid is dead — never a live pid's, a young one, or a name without a pid",
+            "the test cache of real SolidCraft builds > [A5] the staging cleanup keeps a concurrent run's in-progress folder (under 10 minutes old) and removes only older ones"
           ]
         }
       ],
@@ -1849,7 +1893,8 @@
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] a vendor that echoes the keys and the Authorization header into result fields: the tool text carries none of them (raw or URL-encoded), and a link that carried one is dropped and cannot be fetched",
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] the daily quota is counted in the daemon's state dir, so a restarted daemon (a new service over the same dir) does not get a fresh day",
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] parts_fetch refuses a URL whose host is a fleet member (the FleetStore roster http.ts hands the supervisor), whatever it resolves to; nothing is fetched",
-            "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] neither parts tool is in allowedTools; the autonomy policy classifies parts_search as read-only (allowed by the hook without a prompt under the default policy) and parts_fetch as a write"
+            "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] neither parts tool is in allowedTools; the autonomy policy classifies parts_search as read-only (allowed by the hook without a prompt under the default policy) and parts_fetch as a write",
+            "tools, permissions and keys > [C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not"
           ]
         },
         {

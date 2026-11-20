@@ -9,7 +9,7 @@ import type { AutopilotPlanInfo } from "@protocol";
 import type { WorkUnit, WorkUnitVerification } from "./workunit";
 import type { MarkdownRenderer } from "../render/markdown";
 import { toPipelineTraceInfo } from "../pipeline/daemon-adapters";
-import { coveredParts, toCadInfo } from "./autopilot-cad";
+import { coveredParts, toCadInfo, type CadCardContext } from "./autopilot-cad";
 
 /** Pending plans = what the Autopilot card grid shows. `liveIds` lets a unit carrying a verification
  *  overlay (likely-complete or mismatch) surface even when its base status wouldn't otherwise render it
@@ -74,7 +74,7 @@ export function selectCompletedUnits(
 }
 
 /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
-export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, renderer: Pick<MarkdownRenderer, "render">): AutopilotPlanInfo {
+export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, renderer: Pick<MarkdownRenderer, "render">, cadCtx?: CadCardContext): AutopilotPlanInfo {
   const verification = toVerificationInfo(u.verification, renderer);
   return {
     id: u.id,
@@ -97,7 +97,7 @@ export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, ren
     ...(u.goalCondition ? { goalCondition: u.goalCondition } : {}),
     ...(verification ? { verification } : {}),
     ...(() => {
-      const cad = toCadInfo(u);
+      const cad = toCadInfo(u, cadCtx);
       return cad ? { cad } : {};
     })(),
     ...(u.status === "blocked" && u.blockedReason ? { blockedReason: u.blockedReason } : {}),

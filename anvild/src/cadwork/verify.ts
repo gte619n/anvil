@@ -114,7 +114,7 @@ function git(cwd: string, args: string[]): { ok: boolean; out: string; err: stri
  * of `ref` and HEAD and the working tree, plus untracked files there; `rulesChanged` when
  * `cad/rules.json` is among them. Throws `VerifyCannotRun` for a ref git does not know.
  */
-export function changedParts(worktree: string, ref: string): { parts: string[]; rulesChanged: boolean } {
+export function changedParts(worktree: string, ref: string): { parts: string[]; rulesChanged: boolean; unexpected: string[] } {
   if (!ref || ref.startsWith("-")) throw new VerifyCannotRun(`--changed-since needs a git ref, not ${JSON.stringify(ref)}`);
   const commit = git(worktree, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`]);
   if (!commit.ok) throw new VerifyCannotRun(`--changed-since: ${JSON.stringify(ref)} is not a commit in this repository`);
@@ -126,15 +126,25 @@ export function changedParts(worktree: string, ref: string): { parts: string[]; 
   if (!untracked.ok) throw new VerifyCannotRun(`git ls-files failed: ${untracked.err}`);
   const paths = [...diff.out.split("\0"), ...untracked.out.split("\0")].filter(Boolean);
   const parts = new Set<string>();
+  const unexpected = new Set<string>();
   let rulesChanged = false;
   for (const p of paths) {
-    if (p === `${CAD_DIR}/rules.json`) rulesChanged = true;
+    if (p === `${CAD_DIR}/rules.json`) {
+      rulesChanged = true;
+      continue;
+    }
     const m = /^cad\/([^/]+)\/(.+)$/.exec(p);
-    if (!m || !isValidPartName(m[1])) continue;
+    // Anything else under cad/ that is not inside a validly named part folder: a file directly under
+    // cad/ (`cad/bracket.step`) or a folder no part can have (`cad/Widget_X/…`). The merge guard skips
+    // these; an autopilot builder and the dev pipeline are failed on them (B3 review, item 4).
+    if (!m || !isValidPartName(m[1])) {
+      unexpected.add(p);
+      continue;
+    }
     if (/^(\.cache|release)(\/|$)/.test(m[2]!)) continue; // daemon-written, git-excluded
     parts.add(m[1]!);
   }
-  return { parts: [...parts].sort(), rulesChanged };
+  return { parts: [...parts].sort(), rulesChanged, unexpected: [...unexpected].sort() };
 }
 
 const close = (a: number, b: number, tol: number): boolean => Math.abs(a - b) <= tol;

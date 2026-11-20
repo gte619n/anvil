@@ -265,8 +265,8 @@ describe("item 41: the nightly planner proposes, the owner approves", () => {
     expect(card).toMatchObject({ status: "proposed", needsApproval: true, source: "nightly" });
     expect(card.parts[0]!.part).toBe("plate");
     expect(card.parts[0]!.rows.find((r) => r.label === "Volume (mm³)")!.new).toContain("23335.167");
-    // The pipeline path is held as well.
-    await expect(x.svc.runDevPipeline(x.uid)).rejects.toThrow("needs approved dimensions");
+    // The pipeline path is refused outright: a CAD unit builds with Go only (decision 182).
+    await expect(x.svc.runDevPipeline(x.uid)).rejects.toThrow("CAD units build with Go (the pipeline cannot model)");
   });
 
   test("[B3] item 41: Reject keeps the unit unable to start", async () => {
@@ -391,7 +391,9 @@ describe("the planner's save_cad_expectations (interactive planning session)", (
     expect(x.unit(x.uid).cadExpectations!.plate!.approvedAt).toBeUndefined(); // nothing approved
     const second = x.openCards()[0];
     expect(second.requestId).not.toBe(first.requestId);
-    expect(second.rows.find((r: any) => r.label === "Parameters").old).toContain("L = 90 mm"); // redrawn against what is there now
+    // Redrawn: "old" is what is APPROVED for cad/plate in the repo (decision 183) — nothing yet — never the
+    // unit's earlier, unapproved proposal.
+    expect(second.rows.find((r: any) => r.label === "Parameters").old).toBeUndefined();
     x.cad.respond(second.requestId, true);
     await pending;
     expect(x.unit(x.uid).cadExpectations!.plate!.parameters).toEqual(PLATE_PLAN.parameters);

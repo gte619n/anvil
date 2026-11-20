@@ -113,3 +113,98 @@ test("[B3] wiring: Go through the Supervisor stamps the builder, applies the pla
   expect(unit().blockedReason).toContain("CAD: cad/plate");
   expect(unit().cadBlocked.reason).toContain("cad/plate");
 }, 60_000);
+
+/** A real Supervisor (cad-work on, fake query) over a repo with adopted rules, plus one approved CAD unit. */
+async function supervisorRig(registry = new ConnectionRegistry()) {
+  const repo = tempRepo("anvil-b3-wire-");
+  git(repo, "checkout", "-q", "-b", "main");
+  writeRules(repo);
+  writeFileSync(join(repo, "README.md"), "# b3\n");
+  git(repo, "add", "-A");
+  git(repo, "commit", "-q", "-m", "base");
+  const stateDir = realpathSync(mkdtempSync(join(tmpdir(), "anvil-b3-wire-state-")));
+  dirs.push(stateDir);
+  const accounts = new AccountStore(stateDir);
+  if (accounts.list().length === 0) accounts.add("test", "sk-ant-oat01-testtesttest-0000");
+  const env = new EnvironmentStore(stateDir).add("proj", repo);
+  const uid = new WorkUnitStore(stateDir).create({
+    environmentId: env.id,
+    todoistProjectId: "p",
+    taskIds: [],
+    title: "plate",
+    plan: "Build the plate.",
+    needsCad: true,
+    cadExpectations: { plate: { ...PLATE_PLAN, approvedAt: "2026-11-20T00:00:00.000Z" } },
+    cadExpectationsStatus: "approved",
+  } as any).id;
+  const queryFn = ((args: { prompt: AsyncIterable<any> }) => ({
+    async *[Symbol.asyncIterator]() {
+      for await (const _m of args.prompt) {
+        yield { type: "result", subtype: "success", result: "done", total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, num_turns: 1 };
+        return;
+      }
+    },
+    interrupt: async () => {},
+    setModel: async () => {},
+    close: () => {},
+    getContextUsage: async () => undefined,
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({}),
+    supportedCommands: async () => [],
+  })) as any;
+  const sup = new Supervisor({ stateDir, accounts, envFile: join(stateDir, "env"), features: ["cad-work"], sessionQueryFn: queryFn }, registry);
+  sups.push(sup);
+  const { readRules } = await import("../../src/cadwork/rules");
+  const { repoIdentity } = await import("../../src/cadwork/locks");
+  const rules = readRules(repo) as any;
+  const id = repoIdentity(repo);
+  sup.cadwork.lockSync.approveRules({ repo: id.key, path: id.path, sha: rules.sha, text: rules.text, at: new Date().toISOString() } as any);
+  return { repo, env, uid, sup };
+}
+
+test("[B3] review 6: a builder's session.created is broadcast only AFTER prepare applied the plan's numbers, and no prompt is accepted for it while prepare runs", async () => {
+  const seen: { partJson?: any }[] = [];
+  let cwdOf: (id: string) => string = () => "";
+  class Spy extends ConnectionRegistry {
+    override toAll(ev: any): void {
+      if (ev.type === "session.created" && ev.session.workUnitRole === "builder") {
+        const pj = join(cwdOf(ev.session.id), "cad", "plate", "part.json");
+        seen.push(existsSync(pj) ? { partJson: JSON.parse(readFileSync(pj, "utf8")) } : {});
+      }
+      super.toAll(ev);
+    }
+  }
+  const { uid, sup, env } = await supervisorRig(new Spy());
+  cwdOf = (id) => (sup as any).sessions.get(id).data.cwd;
+  await sup.startPlan(uid);
+  expect(seen.length).toBe(1);
+  expect(seen[0]!.partJson?.expectations?.lockedBy).toBe("planner"); // applied before anyone was told the session exists
+  // While prepare runs: not announced, and a prompt for it is refused.
+  const during: { refused?: string; announced: number }[] = [];
+  const created = () => seen.length;
+  await (sup as any).handoffCreate({
+    environmentId: env.id,
+    source: "fresh-worktree",
+    title: "probe",
+    brief: "go",
+    workUnitId: "wu_probe",
+    workUnitRole: "builder",
+    prepare: async ({ id }: { id: string }) => {
+      let refused: string | undefined;
+      try {
+        sup.prompt(id, "hello");
+      } catch (e) {
+        refused = e instanceof Error ? e.message : String(e);
+      }
+      during.push({ ...(refused ? { refused } : {}), announced: created() });
+    },
+  });
+  expect(during).toEqual([{ refused: expect.stringContaining("still being prepared"), announced: 1 }]);
+  expect(seen.length).toBe(2); // announced once prepare finished
+}, 60_000);
+
+test("[B3] review 1: a loop's pipeline body refuses a CAD unit (CAD units build with Go)", async () => {
+  const { uid, sup } = await supervisorRig();
+  const runPipeline = (sup as any).loops.deps.runPipeline as (loop: any, cwd: string) => Promise<string>;
+  await expect(runPipeline({ id: "loop_x", workUnitId: uid }, "/tmp")).rejects.toThrow("CAD units build with Go (the pipeline cannot model)");
+  expect((sup as any).autopilot.workUnits.get(uid).status).toBe("planned");
+}, 60_000);

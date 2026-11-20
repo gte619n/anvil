@@ -6,17 +6,17 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CAD_SYSTEM_PROMPT, VERIFY_CLI_COMMAND, VERIFY_CLI_PATH, shellQuote } from "../../src/agent/cad-tool-ids";
-import { CadError } from "../../src/cadwork/manager";
+import { CadError, ORPHAN_TMP_MIN_AGE_MS, sweepOrphanedTmpRoots } from "../../src/cadwork/manager";
 import { LockStore } from "../../src/cadwork/locks";
 import { partRef } from "../../src/cadwork/partfolder";
 import { verifyParts } from "../../src/cadwork/verify";
 import { BOX, cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempDir, tempRepo, writeDesign } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
-import { SOLIDCRAFT_TEST_RELEASES, solidcraftReleaseBuild, solidcraftTestCache } from "../helpers/solidcraft-cache";
+import { STAGING_STALE_MS, SOLIDCRAFT_TEST_RELEASES, solidcraftReleaseBuild, solidcraftTestCache } from "../helpers/solidcraft-cache";
 
 afterEach(async () => {
   await stopManagers();
@@ -71,6 +71,48 @@ describe("each SolidCraft child gets its own TMPDIR, removed with the process", 
     expect(own.split("/").at(-1)).toStartWith("anvil-sc-");
     await m2.shutdown();
     await until(() => !existsSync(own), "the manager's temp folder to go");
+  });
+
+  test("[A5] the default temp root is named for the daemon's pid and is removed at shutdown even when it is empty", async () => {
+    const repo = tempRepo();
+    const log = recordingSpawn();
+    const m = fakeManager({ spawn: log.spawn, idleMs: 30 });
+    await m.open(partRef(repo, "plate"));
+    const child = log.envs[0]!.TMPDIR!;
+    const own = dirname(child);
+    expect(own.split("/").at(-1)).toStartWith(`anvil-sc-${process.pid}-`);
+    await until(() => !existsSync(child), "the idle child's TMPDIR to go");
+    expect(readdirSync(own)).toEqual([]); // empty: every child is gone
+    await m.shutdown();
+    expect(existsSync(own)).toBe(false);
+  });
+
+  test("[A5] a daemon start sweeps anvil-sc-<pid>-* roots older than an hour whose pid is dead — never a live pid's, a young one, or a name without a pid", async () => {
+    const dir = tempDir("anvil-sweep-");
+    const mk = (name: string, ageMs: number) => {
+      const p = join(dir, name);
+      mkdirSync(join(p, "p-x"), { recursive: true });
+      const t = (Date.now() - ageMs) / 1000;
+      utimesSync(p, t, t);
+      return p;
+    };
+    const hour = ORPHAN_TMP_MIN_AGE_MS;
+    const deadOld = mk("anvil-sc-999991-aaaaaa", hour + 60_000);
+    const deadYoung = mk("anvil-sc-999992-bbbbbb", hour - 60_000);
+    const liveOld = mk("anvil-sc-999993-cccccc", hour * 3);
+    const mineOld = mk(`anvil-sc-${process.pid}-dddddd`, hour * 3);
+    const legacy = mk("anvil-sc-Q1w2E3", hour * 3); // an older build's name: no pid, cannot be told from a live one
+    const replay = mk("anvil-sc-replay-zzzzzz", hour * 3);
+    const removed = sweepOrphanedTmpRoots(dir, { alive: (pid) => pid === 999993 });
+    expect(removed).toEqual([deadOld]);
+    expect(existsSync(deadOld)).toBe(false);
+    for (const kept of [deadYoung, liveOld, mineOld, legacy, replay]) expect(existsSync(kept)).toBe(true);
+    // The real liveness check: this process is alive; pids far above the system's range are not (so the
+    // one the fake called live goes too).
+    const real = mk("anvil-sc-4194999-eeeeee", hour * 2);
+    expect(sweepOrphanedTmpRoots(dir).sort()).toEqual([liveOld, real].sort());
+    expect(existsSync(mineOld)).toBe(true);
+    expect(existsSync(deadYoung)).toBe(true);
   });
 
   test("[A5] a format refusal kills the child it started, and its TMPDIR goes with it", async () => {
@@ -133,6 +175,8 @@ describe("the test cache of real SolidCraft builds", () => {
     const leftover = join(cache, "x", ".9.0.0-abc123");
     mkdirSync(leftover, { recursive: true });
     writeFileSync(join(leftover, "junk"), "x");
+    const old = (Date.now() - 11 * 60 * 1000) / 1000;
+    utimesSync(leftover, old, old); // left by an interrupted run 11 minutes ago
     const quiet = () => undefined;
     const cli = await solidcraftReleaseBuild("9.0.0", { cache, log: quiet, legacyDir: "/nonexistent" });
     const original = readFileSync(cli, "utf8");
@@ -141,6 +185,7 @@ describe("the test cache of real SolidCraft builds", () => {
     expect(cliSha).toBe(createHash("sha256").update(readFileSync(cli)).digest("hex"));
     expect(existsSync(leftover)).toBe(false);
     expect(readdirSync(join(cache, "x")).filter((n) => n.startsWith("."))).toEqual([]);
+    expect(existsSync(join(cache, "x", "9.0.0", "solidcraft-cli-9.0.0-macos-universal", "solidcraft-cli"))).toBe(true);
     // Someone swaps the cached binary: the marker alone no longer vouches for it.
     writeFileSync(cli, "#!/bin/sh\necho evil\n");
     const logs: string[] = [];
@@ -148,6 +193,24 @@ describe("the test cache of real SolidCraft builds", () => {
     expect(again).toBe(cli);
     expect(readFileSync(again, "utf8")).toBe(original);
     expect(logs.join("\n")).toContain("does not match its marker");
+  });
+
+  test("[A5] the staging cleanup keeps a concurrent run's in-progress folder (under 10 minutes old) and removes only older ones", async () => {
+    const cache = mkdtempSync(join(tmpdir(), "anvil-sc-cache-"));
+    dirs.push(cache);
+    fakeRelease(cache);
+    const x = join(cache, "x");
+    const busy = join(x, ".9.0.0-busy01");
+    const stale = join(x, ".9.0.0-stale1");
+    mkdirSync(join(busy, "solidcraft-cli-9.0.0-macos-universal"), { recursive: true });
+    mkdirSync(stale, { recursive: true });
+    const t = (Date.now() - STAGING_STALE_MS - 60_000) / 1000;
+    utimesSync(stale, t, t);
+    const young = (Date.now() - STAGING_STALE_MS + 60_000) / 1000;
+    utimesSync(busy, young, young); // 9 minutes in: still another run's
+    await solidcraftReleaseBuild("9.0.0", { cache, log: () => undefined, legacyDir: "/nonexistent" });
+    expect(existsSync(busy)).toBe(true);
+    expect(existsSync(stale)).toBe(false);
   });
 
   test("[A5] a relative ANVIL_TEST_CACHE is resolved to an absolute path", () => {
