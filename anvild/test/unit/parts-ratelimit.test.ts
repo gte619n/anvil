@@ -54,6 +54,15 @@ describe("rate limiter", () => {
     expect(redact("GET /x?apiKey=ab%2Bcd%3D&y=ab+cd= failed", ["ab+cd="])).toBe("GET /x?apiKey=•••&y=••• failed");
     expect(redact("short ab", ["ab"])).toBe("short ab"); // too short to be a key; left alone
   });
+
+  test("[C5] fix-c-final: a key is scrubbed whatever case its percent-escapes are in, and however much of it is encoded", () => {
+    const email = "me+parts@corp.example";
+    for (const form of ["me%2bparts%40corp.example", "me%2Bparts%40corp.example", "me%2bparts@corp.example", "me+parts%40corp%2eexample", "%6De%2Bparts%40corp.example"]) {
+      expect([form, redact(`GET /x?email=${form}&q=1 failed`, [email])]).toEqual([form, "GET /x?email=•••&q=1 failed"]);
+    }
+    expect(redact("token=a%20b%2fc and a+b/c", ["a b/c"])).toBe("token=••• and •••");
+    expect(redact("nothing here: me-parts@corp.example", [email])).toBe("nothing here: me-parts@corp.example");
+  });
 });
 
 describe("daily quota (UTC calendar day, persisted)", () => {

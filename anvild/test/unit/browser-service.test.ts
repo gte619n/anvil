@@ -77,7 +77,7 @@ describe("the preset", () => {
     expect(rig.sup.mcp.store.get(added.id)).toMatchObject({ label: "Agent browser", exclusive: true, transport: { command: "node" } });
   });
 
-  test("[C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener", async () => {
+  test("[C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments (headed: plus a new --disk-cache-dir per launch, outside the profile, deleted when the browser is replaced or the session forgotten); the proxy port is the session's own listener", async () => {
     rig = browserRig();
     const integration = await addBrowser(rig);
     const s = await browserSession(rig, integration);
@@ -95,17 +95,33 @@ describe("the preset", () => {
     expect(args[0]).toBe(cli);
     expect(cli.startsWith(join(rig.dir, "browser", "runtime-"))).toBe(true);
     expect(cli.startsWith(s.data.cwd + "/.")).toBe(false);
-    expect(presetArgProblems({ command: TEST_NODE, args, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } } }, cli)).toEqual([]);
+    const configPath = args[args.indexOf("--config") + 1]!;
+    const written = JSON.parse(readFileSync(configPath, "utf8"));
+    expect(presetArgProblems({ command: TEST_NODE, args, configJson: written }, cli)).toEqual([]);
     const port = browserOf(rig).proxies.get(s.id)!.port;
     expect(args[args.indexOf("--proxy-server") + 1]).toBe(`http://127.0.0.1:${port}`);
     expect(args[args.indexOf("--output-dir") + 1]).toBe(join(s.data.cwd, ".anvil-browser"));
     expect(args[args.indexOf("--user-data-dir") + 1]).toBe(join(rig.dir, "browser-profile")); // headed: the desktop probe says yes
     expect(args).not.toContain("--headless");
 
-    const configPath = args[args.indexOf("--config") + 1]!;
     expect(configPath.startsWith(join(rig.dir, "browser", s.id))).toBe(true);
-    expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual({ browser: { launchOptions: { args: ["--proxy-bypass-list=<-loopback>", "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"] } } });
+    const chromeArgs: string[] = written.browser.launchOptions.args;
+    expect(chromeArgs.slice(0, 3)).toEqual(["--proxy-bypass-list=<-loopback>", "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]);
+    expect(chromeArgs).toHaveLength(4);
+    const cacheDir = chromeArgs[3]!.replace(/^--disk-cache-dir=/, "");
+    expect(cacheDir.startsWith(join(rig.dir, "browser", s.id, "disk-cache-"))).toBe(true);
+    expect(cacheDir.startsWith(join(rig.dir, "browser-profile"))).toBe(false);
+    expect(existsSync(cacheDir)).toBe(true);
     expect(existsSync(join(s.data.cwd, ".anvil-browser"))).toBe(true);
+    // A new launch gets a new cache folder; the old one goes with the browser it served.
+    const again = startBrowser(rig, s)!;
+    const againCfg = JSON.parse(readFileSync(again.args[again.args.indexOf("--config") + 1]!, "utf8"));
+    const cacheDir2 = (againCfg.browser.launchOptions.args as string[])[3]!.replace(/^--disk-cache-dir=/, "");
+    expect(cacheDir2).not.toBe(cacheDir);
+    expect(existsSync(cacheDir2)).toBe(true);
+    expect(existsSync(cacheDir)).toBe(false);
+    browserOf(rig).forgetSession(s.id);
+    expect(existsSync(cacheDir2)).toBe(false);
   });
 
   test("[C2] a hand-edited store cannot add a flag: the stored transport is ignored when the launch line is built", async () => {

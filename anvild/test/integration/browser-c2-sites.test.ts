@@ -13,7 +13,7 @@
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
 import { connect } from "node:net";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_VERSION, type McpIntegration } from "@protocol";
@@ -322,7 +322,10 @@ describe("Phase C2 acceptance: sites", () => {
       const flags = args.slice(1).filter((a) => a.startsWith("--"));
       expect(flags.length).toBeGreaterThanOrEqual(7);
       for (const f of flags) expect(Object.keys(PRESET_FLAG_ALLOW_LIST)).toContain(f);
-      expect(presetArgProblems({ command: TEST_NODE, args, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } } }, browserRuntimeCli(rig.dir))).toEqual([]);
+      const written = JSON.parse(readFileSync(args[args.indexOf("--config") + 1]!, "utf8"));
+      expect(written.browser.launchOptions.args.slice(0, 3)).toEqual([...BROWSER_CHROME_ARGS]);
+      expect(written.browser.launchOptions.args.length).toBe(desktop ? 4 : 3); // headed: + its own --disk-cache-dir
+      expect(presetArgProblems({ command: TEST_NODE, args, configJson: written }, browserRuntimeCli(rig.dir))).toEqual([]);
       expect(cfg.args.some((a) => /^(npx|npm|bunx|pnpm|yarn)$/.test(a))).toBe(false);
       for (const never of ["--proxy-bypass", "--caps", "--blocked-origins", "--allowed-origins"]) expect(args).not.toContain(never);
     }

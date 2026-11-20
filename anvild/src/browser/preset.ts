@@ -39,8 +39,23 @@ export const BROWSER_CONFIG_FILENAME = "playwright-mcp.json";
  *  - `--proxy-bypass-list=<-loopback>`: Chrome otherwise skips the proxy for loopback addresses;
  *  - `--disable-quic`: QUIC is UDP and would not go through an HTTP proxy;
  *  - `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`: no WebRTC UDP around the proxy.
+ * Headed mode adds one more, `--disk-cache-dir=<folder>` (`BROWSER_DISK_CACHE_FLAG`), below.
  */
 export const BROWSER_CHROME_ARGS: readonly string[] = ["--proxy-bypass-list=<-loopback>", "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"];
+
+/**
+ * Headed mode only: Chrome's HTTP cache goes to a NEW folder for every launch of the session's browser
+ * server, outside the persistent agent profile (`<stateDir>/browser/<session>/disk-cache-<launch id>`;
+ * the service deletes it when that browser is replaced or the session ends). Without it the profile's
+ * own cache outlives the browser, and a fresh process shows a cached page or frame of a logged-in site
+ * without one connection through the proxy, so the gate's traffic log could not see it (verified with
+ * real Chrome on a reused profile: launch two loaded the cached frame with zero proxy traffic; with this
+ * flag it fetched it again, and the profile had no `Default/Cache` at all). `--media-cache-dir` is not
+ * passed: Chrome ignores it (it created no folder in the same run). The headless fallback needs neither:
+ * its whole profile, cache included, is Playwright's throwaway folder.
+ */
+export const BROWSER_DISK_CACHE_FLAG = "--disk-cache-dir";
+export const BROWSER_DISK_CACHE_PREFIX = "disk-cache-";
 
 export type BrowserMode = "headed" | "headless";
 
@@ -57,6 +72,9 @@ export interface BrowserLaunchInput {
   nodePath: string;
   /** Absolute path of the pinned runtime's `cli.js` (`runtime.ts`). */
   cliPath: string;
+  /** Headed mode: a new id for every launch (letters, digits, `-`): names the launch's own HTTP cache
+   *  folder (`BROWSER_DISK_CACHE_FLAG`). Required for headed, ignored for headless. */
+  launchId?: string;
 }
 
 export interface BrowserLaunch {
@@ -68,6 +86,8 @@ export interface BrowserLaunch {
   outputDir: string;
   /** The profile folder — headed mode only. Headless uses Playwright's own throwaway profile. */
   profileDir?: string;
+  /** This launch's HTTP cache folder, outside the profile — headed mode only. */
+  diskCacheDir?: string;
 }
 
 export function browserOutputDir(worktree: string): string {
@@ -76,8 +96,16 @@ export function browserOutputDir(worktree: string): string {
 export function browserProfileDir(stateDir: string): string {
   return join(stateDir, BROWSER_PROFILE_DIRNAME);
 }
+/** The session's own folder for generated launch files: `<stateDir>/browser/<session>/`. */
+export function browserSessionDir(stateDir: string, sessionId: string): string {
+  return join(stateDir, BROWSER_STATE_DIRNAME, sessionId.replace(/[^A-Za-z0-9_-]/g, "_"));
+}
 export function browserConfigPath(stateDir: string, sessionId: string): string {
-  return join(stateDir, BROWSER_STATE_DIRNAME, sessionId.replace(/[^A-Za-z0-9_-]/g, "_"), BROWSER_CONFIG_FILENAME);
+  return join(browserSessionDir(stateDir, sessionId), BROWSER_CONFIG_FILENAME);
+}
+/** One headed launch's HTTP cache folder (see `BROWSER_DISK_CACHE_FLAG`). */
+export function browserDiskCacheDir(stateDir: string, sessionId: string, launchId: string): string {
+  return join(browserSessionDir(stateDir, sessionId), `${BROWSER_DISK_CACHE_PREFIX}${launchId}`);
 }
 
 /** The complete command line and config for one session's browser server. Pure. */
@@ -87,6 +115,8 @@ export function buildBrowserLaunch(input: BrowserLaunchInput): BrowserLaunch {
   const configPath = browserConfigPath(input.stateDir, input.sessionId);
   const profileDir = input.mode === "headed" ? browserProfileDir(input.stateDir) : undefined;
   if (!isAbsolute(input.nodePath) || !isAbsolute(input.cliPath)) throw new Error("the browser is started by absolute paths only");
+  if (profileDir && !/^[A-Za-z0-9-]{1,64}$/.test(input.launchId ?? "")) throw new Error("a headed launch needs its own launch id (for its HTTP cache folder outside the profile)");
+  const diskCacheDir = profileDir ? browserDiskCacheDir(input.stateDir, input.sessionId, input.launchId!) : undefined;
   const args = [
     input.cliPath,
     "--browser",
@@ -102,7 +132,8 @@ export function buildBrowserLaunch(input: BrowserLaunchInput): BrowserLaunch {
     configPath,
     ...(profileDir ? ["--user-data-dir", profileDir] : ["--isolated", "--headless"]),
   ];
-  return { command: input.nodePath, args, configPath, configJson: { browser: { launchOptions: { args: [...BROWSER_CHROME_ARGS] } } }, outputDir, ...(profileDir ? { profileDir } : {}) };
+  const chromeArgs = [...BROWSER_CHROME_ARGS, ...(diskCacheDir ? [`${BROWSER_DISK_CACHE_FLAG}=${diskCacheDir}`] : [])];
+  return { command: input.nodePath, args, configPath, configJson: { browser: { launchOptions: { args: chromeArgs } } }, outputDir, ...(profileDir ? { profileDir, diskCacheDir } : {}) };
 }
 
 // ── The argument allow list ─────────────────────────────────────────────────────────────────────
@@ -157,7 +188,9 @@ export function presetArgProblems(launch: Pick<BrowserLaunch, "command" | "args"
   if (headed && fallback) problems.push("--user-data-dir cannot be combined with --isolated or --headless");
   if (!headed && !(seen.has("--isolated") && seen.has("--headless"))) problems.push("without a profile the browser must be --isolated and --headless");
 
-  // The config file: `browser.launchOptions.args` with exactly the three Chrome arguments, no other key.
+  // The config file: `browser.launchOptions.args` with exactly the three Chrome arguments — plus, in
+  // headed mode, exactly one `--disk-cache-dir=` naming an absolute folder outside the profile — and
+  // no other key.
   const cfg = launch.configJson as unknown;
   const only = (o: unknown, key: string): unknown => {
     if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
@@ -168,9 +201,18 @@ export function presetArgProblems(launch: Pick<BrowserLaunch, "command" | "args"
   const chromeArgs = only(only(only(cfg, "browser"), "launchOptions"), "args");
   if (!Array.isArray(chromeArgs)) problems.push("the config must be exactly { browser: { launchOptions: { args: [...] } } }");
   else {
-    for (const a of chromeArgs) if (!BROWSER_CHROME_ARGS.includes(a as string)) problems.push(`Chrome argument not on the allow list: ${String(a)}`);
+    const cacheFlag = `${BROWSER_DISK_CACHE_FLAG}=`;
+    const caches = chromeArgs.filter((a): a is string => typeof a === "string" && a.startsWith(cacheFlag));
+    for (const a of chromeArgs) if (!BROWSER_CHROME_ARGS.includes(a as string) && !caches.includes(a as string)) problems.push(`Chrome argument not on the allow list: ${String(a)}`);
     for (const a of BROWSER_CHROME_ARGS) if (!chromeArgs.includes(a)) problems.push(`missing Chrome argument ${a}`);
-    if (chromeArgs.length !== BROWSER_CHROME_ARGS.length) problems.push("Chrome arguments must be listed exactly once each");
+    if (chromeArgs.length !== BROWSER_CHROME_ARGS.length + caches.length || new Set(chromeArgs).size !== chromeArgs.length) problems.push("Chrome arguments must be listed exactly once each");
+    if (headed) {
+      const profile = String(seen.get("--user-data-dir") ?? "");
+      const dir = caches[0]?.slice(cacheFlag.length) ?? "";
+      if (caches.length !== 1) problems.push(`headed mode needs exactly one ${BROWSER_DISK_CACHE_FLAG} (the launch's HTTP cache, outside the profile)`);
+      else if (!isAbsolute(dir) || dir.split("/").includes("..") || !basename(dir).startsWith(BROWSER_DISK_CACHE_PREFIX)) problems.push(`${BROWSER_DISK_CACHE_FLAG} must be an absolute ${BROWSER_DISK_CACHE_PREFIX}… folder`);
+      else if (dir === profile || dir.startsWith(`${profile.replace(/\/+$/, "")}/`)) problems.push(`${BROWSER_DISK_CACHE_FLAG} must be outside the profile`);
+    } else if (caches.length) problems.push(`${BROWSER_DISK_CACHE_FLAG} is for the headed profile only`);
   }
   return problems;
 }

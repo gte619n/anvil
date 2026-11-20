@@ -11,6 +11,7 @@ import { join } from "node:path";
 import type { McpIntegration } from "@protocol";
 import { buildFileOffer } from "../../src/agent/file-offer";
 import { BROWSER_LOGGEDIN_FILE, LoggedInSitesService, defaultLauncherRefusal, runOwnerBrowser } from "../../src/browser/loggedin";
+import { PROFILE_UNKNOWN_SITE } from "../../src/browser/gate";
 import { browserProfileDir } from "../../src/browser/preset";
 import { resolveRealNode } from "../../src/browser/service";
 import { WorkUnitStore } from "../../src/integrations/workunit";
@@ -41,6 +42,13 @@ afterEach(async () => {
 });
 
 /** The proxy saw the session's browser connect to `host` (allowed or refused). */
+/** The headless fallback (a throwaway profile), where the sticky set is exactly the traffic the proxy
+ *  saw; in headed mode every locked logged-in site counts from the start (fix-c-final, below). */
+async function headless(): Promise<void> {
+  await rig.cleanup();
+  rig = browserRig({ desktop: false });
+  integration = await addBrowser(rig);
+}
 const contact = (s: Session, host: string, port = 443, allowed = true): void => browserOf(rig).proxies.onSessionDecision!(s.id, { kind: "connect", host, port, allowed });
 /** A navigation that lands on `url`, with the traffic its page load made (as a real one would). */
 async function land(s: Session, url: string, loads: string[] = []): Promise<void> {
@@ -100,7 +108,8 @@ describe("item 1: a page that moves by itself", () => {
     expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
   });
 
-  test("[C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page does not clear it, about:blank does", async () => {
+  test("[C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page does not clear it, nor does about:blank; a browser_close that ended the (headless) browser does", async () => {
+    await headless();
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
     allow(s, "shop.test", "bank.test", "news.test");
     browserOf(rig).loggedIn.add("bank.test", "owner");
@@ -119,9 +128,14 @@ describe("item 1: a page that moves by itself", () => {
     contact(s, "news.test");
     feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });
     expect(await browserHook(rig, s, "browser_click", { target: "e1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/has loaded bank\.test/) });
-    // …only about:blank does.
+    // …nor does about:blank (fix-c-final: a fresh load of the framing page can show the frame again
+    // from Chrome's cache or over a tunnel it holds, with no traffic)…
     expect((await browserHook(rig, s, "browser_navigate", { url: "about:blank" })).decision).toBe("allow");
     feedResult(rig, s, "browser_navigate", pageResult("about:blank"), { url: "about:blank" });
+    await land(s, "https://news.test/");
+    expect(await browserHook(rig, s, "browser_click", { target: "e1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/has loaded bank\.test/) });
+    // …only a browser_close after which no process of the browser is left.
+    feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
     await land(s, "https://news.test/");
     expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
   });
@@ -154,7 +168,8 @@ describe("fix-round re-review: the embedded locked-site set is sticky", () => {
     expect(v.reason).toMatch(/has loaded bank\.test/);
   };
 
-  test("[C3] re-review: pushState, a #fragment navigation, a new tab then select back, and going back all keep the locked frame's site — input stays a hard stop and browser_evaluate is refused; an unlocked site does not stop; about:blank clears it until the page arrives other than by a fresh navigate (going back restores it), browser_close for good", async () => {
+  test("[C3] re-review: pushState, a #fragment navigation, a new tab then select back, and going back all keep the locked frame's site — input stays a hard stop and browser_evaluate is refused; an unlocked site does not stop; about:blank does not clear it (in one tab or all), a browser_close that ended the (headless) browser does", async () => {
+    await headless();
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
     allow(s, "shop.test", "bank.test");
     browserOf(rig).loggedIn.add("bank.test", "owner");
@@ -193,22 +208,132 @@ describe("fix-round re-review: the embedded locked-site set is sticky", () => {
     expect((await browserHook(rig, s, "browser_navigate", { url: "about:blank" })).decision).toBe("allow");
     feedResult(rig, s, "browser_navigate", `### Open tabs\n- 0: (current) [B](about:blank)\n- 1: [T](https://shop.test/plain)\n### Page\n- Page URL: about:blank\n- Page Title: `, { url: "about:blank" });
     expect(browserOf(rig).gate.state(s.id).contacted?.has("bank.test")).toBe(true);
-    // …about:blank with every tab blank does.
+    // …nor does about:blank with every tab blank (fix-c-final: the same Chrome process can show the frame
+    // again from its HTTP cache or over a tunnel it already holds, with no traffic at all)…
     feedResult(rig, s, "browser_tabs", `### Result\n- 0: (current) [B](about:blank)\n- 1: [B](about:blank)\n### Page\n- Page URL: about:blank\n- Page Title: `, { action: "list" });
+    expect(browserOf(rig).gate.state(s.id).contacted?.has("bank.test")).toBe(true);
+    await land(s, "https://shop.test/embed"); // a fresh navigate, no traffic to the bank (served from cache)
+    await stopped(s);
+    expect((await browserHook(rig, s, "browser_navigate_back")).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate_back", pageResult("https://shop.test/plain"));
+    await stopped(s);
+    // …only browser_close, once the service has confirmed no process of that browser is left.
+    feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
     expect(browserOf(rig).gate.state(s.id).contacted?.size ?? 0).toBe(0);
     await land(s, "https://shop.test/plain");
     expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
-    // …but the history still holds the framed page: arriving any way but a fresh browser_navigate
-    // (here, going back into the back/forward cache, which loads nothing) puts the stop back.
-    expect((await browserHook(rig, s, "browser_navigate_back")).decision).toBe("allow");
-    feedResult(rig, s, "browser_navigate_back", pageResult("https://shop.test/embed#x"));
-    await stopped(s);
-    // browser_close clears it for good.
-    await land(s, "https://shop.test/embed", ["bank.test"]);
-    await stopped(s);
+  });
+
+  test("[C3] fix-c-final: browser_close clears the set only when no process of the browser is left — a process still holding the session's proxy, or a process list that cannot be read, keeps it; and only in headless mode", async () => {
+    await rig.cleanup();
+    let ps: string | undefined = "";
+    rig = browserRig({ desktop: false, browser: { processList: () => ps } });
+    integration = await addBrowser(rig);
+    const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
+    allow(s, "shop.test", "bank.test");
+    browserOf(rig).loggedIn.add("bank.test", "owner");
+    const port = browserOf(rig).proxies.get(s.id)!.port;
+    const chrome = (p: number) => `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless --proxy-server=http://127.0.0.1:${p} --user-data-dir=/tmp/x\n`;
+    // Still running (or a list that cannot be read): the set stays.
+    for (const still of [chrome(port), undefined]) {
+      await land(s, "https://shop.test/embed", ["bank.test"]);
+      ps = still;
+      const t = Date.now();
+      feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
+      expect(Date.now() - t).toBeLessThan(3000); // it asks a few times, then gives up (fail closed)
+      expect([still === undefined ? "unreadable" : "running", browserOf(rig).gate.state(s.id).contacted?.has("bank.test")]).toEqual([still === undefined ? "unreadable" : "running", true]);
+      await land(s, "https://shop.test/plain");
+      await stopped(s);
+    }
+    // Another session's browser (another proxy port — even one whose number starts with this one) is not this one.
+    ps = `${chrome(Number(`${port}9`))}${chrome(port + 1)}`;
     feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
+    expect(browserOf(rig).gate.state(s.id).contacted?.size ?? 0).toBe(0);
     await land(s, "https://shop.test/plain");
     expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
+  });
+
+  test("[C3] fix-c-final (headed): every locked logged-in site counts as loaded from the first call of every launch, with no traffic — a click on a page that never touched it is a hard stop saying the profile holds it, and browser_evaluate is refused; about:blank, browser_close and a rebuilt browser do not end it; unlocking does", async () => {
+    const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
+    allow(s, "shop.test");
+    browserOf(rig).loggedIn.add("bank.test", "owner");
+    const fresh = async () => {
+      await land(s, "https://shop.test/plain"); // no traffic to bank.test at all
+      expect(browserOf(rig).gate.state(s.id).contacted?.has("bank.test") ?? false).toBe(false);
+      const v = await browserHook(rig, s, "browser_click", { target: "e1" });
+      expect(v).toMatchObject({ decision: "deny", reason: expect.stringMatching(/^click on shop\.test in the headed agent browser, whose profile holds bank\.test, a logged-in site: a frame of it can load from the profile with no network traffic.*browser_take_screenshot/) });
+      expect(await browserHook(rig, s, "browser_evaluate", { function: "() => 1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/not allowed on the agent profile, which holds bank\.test/) });
+    };
+    await fresh();
+    shotResult(s);
+    const gated = browserHook(rig, s, "browser_type", { target: "e1", text: "x" });
+    expect(await isPending(gated)).toBe(true);
+    expect(parked(s).suggestions.map((x) => x.label)).toEqual(["Allow once", "Unlock bank.test", "Deny"]);
+    rig.sup.resolvePermission(parked(s).requestId, "deny");
+    await gated;
+    // Uploads name it too (an upload is always its own once-prompt).
+    writeFileSync(join(worktree, "a.txt"), "x");
+    await land(s, "https://shop.test/plain");
+    const upload = { session: s, integration, tool: "browser_file_upload", fullTool: "mcp__browser__browser_file_upload", input: { paths: [join(worktree, "a.txt")] }, cwd: s.data.cwd };
+    expect(browserOf(rig).gate.gate(upload)).toMatchObject({ kind: "prompt", reason: expect.stringMatching(/^upload .*a\.txt to shop\.test; this is the agent profile, which holds bank\.test .*so a frame from it may receive the file$/), suggestions: [{ label: "Allow once" }, { label: "Deny" }] });
+    // Not ended by about:blank, by browser_close (the persistent profile stays), or by a new launch.
+    feedResult(rig, s, "browser_navigate", pageResult("about:blank"), { url: "about:blank" });
+    await fresh();
+    feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
+    await fresh();
+    startBrowser(rig, s);
+    await fresh();
+    // A site logged in later counts at once (looked up live); unlocking every one ends it.
+    browserOf(rig).loggedIn.add("mail.test", "owner");
+    await land(s, "https://shop.test/plain");
+    expect((await browserHook(rig, s, "browser_click", { target: "e1" })).reason).toMatch(/profile holds bank\.test.*its profile also holds mail\.test/);
+    browserOf(rig).loggedIn.setUnlocked("bank.test", true);
+    browserOf(rig).loggedIn.setUnlocked("mail.test", true);
+    await land(s, "https://shop.test/plain");
+    expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
+    expect((await browserHook(rig, s, "browser_evaluate", { function: "() => 1" })).reason).toMatch(/only allowed on this session's own throwaway test daemon/);
+  });
+
+  test("[C3] fix-c-final: the locked sites the headed browser starts with — the list's locked sites; with a damaged list every site the profile has cookies for, or (cookies unreadable) an unknown-sites marker, named by the gate", async () => {
+    const dir = tmp("anvil-c3r-ls-");
+    const svc = new LoggedInSitesService({ stateDir: dir, broadcast: () => {}, intervalMs: 0 });
+    svc.add("bank.test", "owner");
+    svc.add("mail.test", "owner");
+    svc.setUnlocked("mail.test", true);
+    expect(svc.lockedSites()).toEqual(["bank.test"]);
+    svc.stop();
+    writeFileSync(join(dir, BROWSER_LOGGEDIN_FILE), "{ damaged");
+    const damaged = new LoggedInSitesService({ stateDir: dir, broadcast: () => {}, intervalMs: 0 });
+    expect(damaged.lockedSites()).toEqual([]); // a profile with no cookie database holds no logins
+    damaged.stop();
+    mkdirSync(join(browserProfileDir(dir), "Default"), { recursive: true });
+    writeFileSync(join(browserProfileDir(dir), "Default", "Cookies"), "not a database");
+    const unreadable = new LoggedInSitesService({ stateDir: dir, broadcast: () => {}, intervalMs: 0 });
+    expect(unreadable.lockedSites()).toEqual([PROFILE_UNKNOWN_SITE]);
+    unreadable.stop();
+    rmSync(join(browserProfileDir(dir), "Default", "Cookies"));
+    addCookies(browserProfileDir(dir), [[".bank.test", "sid"], ["shop.test", "c"]]);
+    const withCookies = new LoggedInSitesService({ stateDir: dir, broadcast: () => {}, intervalMs: 0 });
+    expect(withCookies.lockedSites().sort()).toEqual(["bank.test", "shop.test"]);
+    withCookies.stop();
+    // Through the gate: every site counts as locked then (the page's own too), and the marker is named.
+    await rig.cleanup();
+    const stateDir = tmp("anvil-c3r-state-");
+    writeFileSync(join(stateDir, BROWSER_LOGGEDIN_FILE), "not json");
+    mkdirSync(join(browserProfileDir(stateDir), "Default"), { recursive: true });
+    writeFileSync(join(browserProfileDir(stateDir), "Default", "Cookies"), "not a database");
+    rig = browserRig({ stateDir });
+    integration = await addBrowser(rig);
+    const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
+    allow(s, "shop.test");
+    await land(s, "https://shop.test/plain");
+    shotResult(s);
+    const gated = browserHook(rig, s, "browser_click", { target: "e1" });
+    expect(await isPending(gated)).toBe(true);
+    expect((parked(s) as { reason?: string }).reason).toBe("click on shop.test, a logged-in site");
+    rig.sup.resolvePermission(parked(s).requestId, "deny");
+    await gated;
+    expect(await browserHook(rig, s, "browser_evaluate", { function: "() => 1" })).toMatchObject({ decision: "deny", reason: expect.stringContaining(`the agent profile, which holds ${PROFILE_UNKNOWN_SITE}`) });
   });
 });
 

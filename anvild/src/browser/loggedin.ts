@@ -26,6 +26,7 @@ import { join, resolve } from "node:path";
 import { PROTOCOL_VERSION, type BrowserLoggedInEvent, type BrowserLoggedInSite, type ServerEvent } from "@protocol";
 import { memberBases } from "../server/fleet";
 import { now } from "../util/envelope";
+import { PROFILE_UNKNOWN_SITE } from "./gate";
 import { browserProfileDir } from "./preset";
 import { normalizeSite, registrableDomain } from "./sites";
 import type { BrowserFleetLink } from "./sites-sync";
@@ -376,6 +377,18 @@ export class LoggedInSitesService {
   }
   isUnlocked(site: string): boolean {
     return !this.store.corrupt() && this.store.get(site)?.unlocked === true;
+  }
+  /** Every site that is locked right now: the list's locked sites, and while the list is damaged every
+   *  site the agent profile has cookies for — or, when those cannot be read, `PROFILE_UNKNOWN_SITE`
+   *  (every site counts). The headed browser counts these as contacted from every launch (gate.ts). */
+  lockedSites(): string[] {
+    const out = new Set(this.store.list().filter((s) => this.isLocked(s.site)).map((s) => s.site));
+    if (this.store.corrupt()) {
+      const sites = this.profileSites();
+      if (!sites) out.add(PROFILE_UNKNOWN_SITE);
+      else for (const s of sites) out.add(s);
+    }
+    return [...out];
   }
   /** Logged in and not unlocked: the state in which actions ask. */
   isLocked(site: string): boolean {

@@ -73,7 +73,7 @@ describe("the session's own test daemon is an allowed page", () => {
     expect(gate.state("s2").hold).toMatchObject({ kind: "site", site: "127.0.0.1" });
   });
 
-  test("[C4] the test daemon is never a logged-in site: with 127.0.0.1 on the logged-in list and locked, a click on the test daemon does not prompt and headless mode does not refuse it; a real logged-in site still stops", () => {
+  test("[C4] the test daemon is never a logged-in site: with 127.0.0.1 on the logged-in list and locked, a click on the test daemon does not prompt (headless; headed, it asks only because the agent profile holds the locked 127.0.0.1 — fix-c-final) and headless mode does not refuse it; a real logged-in site still stops", () => {
     const locked = new Set(["127.0.0.1", "bank.test"]);
     allowed.add("bank.test");
     hooks.loggedInSites = () => [...locked];
@@ -83,8 +83,18 @@ describe("the session's own test daemon is an allowed page", () => {
 
     expect(call("browser_navigate", { url: `${OWN}/` }).kind).toBe("allow");
     result("browser_navigate", pageResult(`${OWN}/`));
+    // Headed: the page is not taken for 127.0.0.1, but the agent profile holds that locked site, whose
+    // frames can load from it with no traffic (fix-c-final), so input asks — naming the profile.
+    for (const [tool, input] of [["browser_click", { target: "e1" }], ["browser_type", { target: "e1", text: "x" }]] as const) {
+      expect(call(tool, input)).toMatchObject({ kind: "prompt", reason: expect.stringMatching(/^\w+ on \(this session's test daemon\) in the headed agent browser, whose profile holds 127\.0\.0\.1, a logged-in site/) });
+    }
+    // Headless (a throwaway profile): nothing asks on it.
+    mode = "headless";
+    gate.pageGone("s1", "headless");
+    result("browser_navigate", pageResult(`${OWN}/`));
     expect(call("browser_click", { target: "e1" }).kind).toBe("allow");
     expect(call("browser_type", { target: "e1", text: "x" }).kind).toBe("allow");
+    mode = "headed";
     // The policy was shown a name that is not a hostname, so no list can contain it.
     expect(new Set(seen.filter(Boolean))).toEqual(new Set([OWN_TEST_DAEMON_SITE]));
     expect(OWN_TEST_DAEMON_SITE).toMatch(/[ ()]/);

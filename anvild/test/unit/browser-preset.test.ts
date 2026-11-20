@@ -23,7 +23,7 @@ import { ensureGitExcluded } from "../../src/browser/service";
 
 const CLI = "/state/browser/runtime-0123456789abcdef/node_modules/@playwright/mcp/cli.js";
 const IN = { proxyPort: 51234, worktree: "/work/tree", stateDir: "/state", sessionId: "sess_1", nodePath: "/opt/homebrew/bin/node", cliPath: CLI };
-const headed = () => buildBrowserLaunch({ ...IN, mode: "headed" });
+const headed = () => buildBrowserLaunch({ ...IN, mode: "headed", launchId: "launch-1" });
 const headless = () => buildBrowserLaunch({ ...IN, mode: "headless" });
 
 describe("buildBrowserLaunch", () => {
@@ -77,6 +77,10 @@ describe("buildBrowserLaunch", () => {
       "/state/browser-profile",
     ]);
     expect(headed().profileDir).toBe("/state/browser-profile");
+    expect(headed().diskCacheDir).toBe("/state/browser/sess_1/disk-cache-launch-1");
+    // A headed launch without its own launch id (so without its own cache folder) is not built.
+    expect(() => buildBrowserLaunch({ ...IN, mode: "headed" })).toThrow(/launch id/);
+    expect(() => buildBrowserLaunch({ ...IN, mode: "headed", launchId: "../x" })).toThrow(/launch id/);
   });
 
   test("[C2] no desktop session: the built config is headless with a temporary profile (--isolated --headless, no --user-data-dir)", () => {
@@ -103,11 +107,11 @@ describe("buildBrowserLaunch", () => {
     expect(chooseBrowserMode({ desktop: false, reason: "nobody is logged in at this machine's screen" }).mode).toBe("headless");
   });
 
-  test("[C2] the generated config carries the three Chrome arguments and nothing else — no ignoreDefaultArgs", () => {
+  test("[C2] the generated config carries the three Chrome arguments and nothing else — no ignoreDefaultArgs (headed: plus the launch's own --disk-cache-dir)", () => {
+    const three = ["--proxy-bypass-list=<-loopback>", "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"];
+    expect(headless().configJson).toEqual({ browser: { launchOptions: { args: three } } });
+    expect(headed().configJson).toEqual({ browser: { launchOptions: { args: [...three, "--disk-cache-dir=/state/browser/sess_1/disk-cache-launch-1"] } } });
     for (const l of [headed(), headless()]) {
-      expect(l.configJson).toEqual({
-        browser: { launchOptions: { args: ["--proxy-bypass-list=<-loopback>", "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"] } },
-      });
       expect(JSON.stringify(l.configJson)).not.toContain("ignoreDefaultArgs");
       expect(Object.keys(l.configJson.browser.launchOptions)).toEqual(["args"]);
     }
@@ -132,6 +136,27 @@ describe("buildBrowserLaunch", () => {
 
   test("[C2] there is no launch line without a proxy port", () => {
     for (const proxyPort of [0, -1, 70000, NaN, 1.5]) expect(() => buildBrowserLaunch({ ...IN, mode: "headless", proxyPort })).toThrow(/proxy/);
+  });
+});
+
+describe("the headed HTTP cache folder (fix-c-final)", () => {
+  test("[C3] fix-c-final: a headed launch puts Chrome's HTTP cache in a new folder per launch outside the profile; the check refuses a headed config without it, with two, with one inside the profile or not absolute, and a headless config with one", () => {
+    const a = buildBrowserLaunch({ ...IN, mode: "headed", launchId: "a" });
+    const b = buildBrowserLaunch({ ...IN, mode: "headed", launchId: "b" });
+    expect(a.diskCacheDir).not.toBe(b.diskCacheDir);
+    expect(a.diskCacheDir!.startsWith(`${a.profileDir!}/`)).toBe(false);
+    expect(presetArgProblems(a)).toEqual([]);
+    const cfg = (args: string[]) => ({ browser: { launchOptions: { args } } });
+    const bad = (base: BrowserLaunch, args: string[]) => presetArgProblems({ ...base, configJson: cfg(args) }).join();
+    expect(bad(a, [...BROWSER_CHROME_ARGS])).toMatch(/exactly one --disk-cache-dir/);
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser/sess_1/disk-cache-a", "--disk-cache-dir=/state/browser/sess_1/disk-cache-b"])).toMatch(/exactly one --disk-cache-dir/);
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser-profile/disk-cache-a"])).toMatch(/outside the profile/);
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser-profile"])).not.toBe("");
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=disk-cache-a"])).toMatch(/absolute/);
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser/sess_1/../../browser-profile/disk-cache-a"])).toMatch(/absolute/);
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser/sess_1/disk-cache-a", "--disk-cache-dir=/state/browser/sess_1/disk-cache-a"])).not.toBe("");
+    expect(bad(headless(), [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser/sess_1/disk-cache-a"])).toMatch(/headed profile only/);
+    expect(bad(a, [...BROWSER_CHROME_ARGS, "--disk-cache-dir=/state/browser/sess_1/disk-cache-a", "--media-cache-dir=/tmp/m"])).toMatch(/not on the allow list/);
   });
 });
 

@@ -29,7 +29,7 @@
 import type { PermissionSuggestion, ToolResultImage } from "@protocol";
 import type { McpKindVerdict } from "../agent/mcp-gate";
 import { isUnattended } from "../agent/protected";
-import { TRAFFIC_LOST_SITE, type BrowserActionInfo } from "./gate";
+import { PROFILE_UNKNOWN_SITE, TRAFFIC_LOST_SITE, isMarkerSite, type BrowserActionInfo } from "./gate";
 
 /** The keys that count as scrolling (item 27). Compared exactly: `pagedown`, `Shift+End`, ` End` ask. */
 export const SCROLL_KEYS: readonly string[] = ["PageDown", "PageUp", "Home", "End"];
@@ -43,7 +43,7 @@ export const HARD_STOP_LABELS = (site: string): [string, string, string] => ["Al
 const suggestions = (site: string): PermissionSuggestion[] => {
   const [once, unlock, no] = HARD_STOP_LABELS(site);
   // Unknown embedded content (C4 review, item 2) is not a site: there is nothing to unlock.
-  if (site === TRAFFIC_LOST_SITE) return [{ decision: "allow", label: once }, { decision: "deny", label: no }];
+  if (isMarkerSite(site)) return [{ decision: "allow", label: once }, { decision: "deny", label: no }];
   return [
     { decision: "allow", label: once },
     // `allow_always` on the wire (no new decision value, so every client can send it); on THIS card
@@ -84,6 +84,8 @@ export function runsWithoutPrompt(info: BrowserActionInfo, site: string): boolea
 function describe(info: BrowserActionInfo, site: string): string {
   const tool = info.ctx.tool.replace(/^browser_/, "").replace(/_/g, " ");
   if (site === TRAFFIC_LOST_SITE) return `${tool} on ${info.currentSite ?? "a page"} whose embedded content is unknown: the page made more connections than Anvil keeps track of, so Anvil lost track of what it loaded (a frame from a logged-in site may be on it)`;
+  if (site === PROFILE_UNKNOWN_SITE) return `${tool} on ${info.currentSite ?? "a page"} in the headed agent browser: the logged-in sites list is damaged and the agent profile could not be read, so any site may be logged in (a page or frame of one can load from the profile with no network traffic)`;
+  if (info.profileSites?.includes(site) && site !== info.currentSite && site !== info.target?.site) return `${tool} on ${info.currentSite ?? "a page"} in the headed agent browser, whose profile holds ${site}, a logged-in site: a frame of it can load from the profile with no network traffic, so Anvil cannot tell whether it is on the page`;
   if (site !== info.currentSite && site !== info.target?.site) return `${tool} on ${info.currentSite ?? "a page"} that has loaded ${site}, a logged-in site (a frame or widget from it may be on the page)`;
   if (info.target && info.target.site !== site) return `leave ${site} for ${info.target.site} (${tool})`;
   if (info.target) return `open ${info.target.url.slice(0, 160)} on ${site} without https (${tool})`;
@@ -97,7 +99,7 @@ export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo
     // from one of them is acted on as if the page were on it.
     const touched = [info.currentSite, info.target?.site, ...(info.embeddedSites ?? [])].filter((s, i, all): s is string => !!s && all.indexOf(s) === i);
     // Unknown embedded content counts as a locked logged-in site (fail closed).
-    const site = touched.find((s) => (s === TRAFFIC_LOST_SITE || deps.isLocked(s)) && !runsWithoutPrompt(info, s));
+    const site = touched.find((s) => (isMarkerSite(s) || deps.isLocked(s)) && !runsWithoutPrompt(info, s));
     // The daemon does not know which page the current tab shows: assume the worst — a locked
     // logged-in site — never "not logged in". Only a read runs; anything else is refused until a
     // snapshot says where the page is (the gate refuses such calls too; this is the second lock).
@@ -107,8 +109,9 @@ export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo
     if (!site) return undefined;
 
     // Name every locked site the browser has loaded, not only the one the card is about.
-    const others = (info.embeddedSites ?? []).filter((s) => s !== site && s !== TRAFFIC_LOST_SITE && deps.isLocked(s));
-    const reason = describe(info, site) + (others.length ? ` (the browser has also loaded ${others.slice(0, 3).join(", ")}, locked logged-in site${others.length > 1 ? "s" : ""})` : "");
+    const others = (info.embeddedSites ?? []).filter((s) => s !== site && !isMarkerSite(s) && deps.isLocked(s));
+    const verb = others.every((s) => info.profileSites?.includes(s)) ? "its profile also holds" : "the browser has also loaded";
+    const reason = describe(info, site) + (others.length ? ` (${verb} ${others.slice(0, 3).join(", ")}, locked logged-in site${others.length > 1 ? "s" : ""})` : "");
     const session = info.ctx.session;
     if (isUnattended(session)) return { kind: "deny", reason: `${reason} needs the owner's approval (denied: this session is unattended)` };
 
@@ -128,7 +131,7 @@ export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo
       card: { reason, image },
       timeoutMs: deps.timeoutMs ?? HARD_STOP_TIMEOUT_MS,
       onAnswer: (decision) => {
-        if (decision === "allow_always" && site !== TRAFFIC_LOST_SITE) deps.unlock(site, session.id);
+        if (decision === "allow_always" && !isMarkerSite(site)) deps.unlock(site, session.id);
       },
     };
   };

@@ -77,12 +77,13 @@ async function payRef(): Promise<string> {
  * then the call. A card is answered Deny; an allow (the bug) is RUN on the real server. Returns what
  * the owner was shown, or the denial. B must record zero presses either way.
  */
-async function actOnFrame(tool: string, input: (ref: string) => Record<string, unknown>): Promise<string> {
+async function actOnFrame(tool: string, input: (ref: string) => Record<string, unknown>, ref0?: string): Promise<string> {
   const before = presses;
   let reason = "";
   for (let i = 0; i < 4; i++) {
     expect((await attempt("browser_take_screenshot")).decision).toBe("allow");
-    const ref = await payRef();
+    const ref = ref0 ?? (await payRef());
+    if (ref0) await snapshot();
     const gated = hook(tool, input(ref));
     if (await isPending(gated)) {
       const card = parked(session) as ReturnType<typeof parked> & { reason?: string };
@@ -256,25 +257,23 @@ describe("real Chrome: a locked site's frame stays a hard stop", () => {
     expect((await attempt("browser_navigate", { url: A("/frame") })).decision).toBe("allow");
     await payRef();
     expect((await attempt("browser_navigate", { url: "about:blank" })).decision).toBe("allow");
-    expect(browser().gate.state(session.id).contacted?.has("localhost") ?? false).toBe(false);
+    expect(browser().gate.state(session.id).contacted?.has("localhost")).toBe(true); // fix-c-final: about:blank keeps it
     expect((await attempt("browser_navigate_back")).decision).toBe("allow");
     expect(await snapshot()).toContain(`Page URL: ${A("/frame")}`);
     expect(await actOnFrame("browser_click", click)).toMatch(/has loaded localhost/);
     expect((await attempt("browser_close")).decision).toBe("allow");
   }, 180_000);
 
-  test.skipIf(!REAL)("[C3] real re-review (clear): about:blank and browser_close empty the set — after either, a click on A's own button on a page with no frame runs without a prompt", async () => {
+  test.skipIf(!REAL)("[C3] real fix-c-final (headed: nothing clears): after about:blank and after browser_close the set still holds locked B — the headed agent profile is persistent — and a click on A's own button on a page with no frame is still a hard stop naming B", async () => {
     for (const out of ["about:blank", "close"] as const) {
       expect((await attempt("browser_navigate", { url: A("/frame") })).decision).toBe("allow");
       await payRef();
       expect(browser().gate.state(session.id).contacted?.has("localhost")).toBe(true);
       if (out === "close") expect((await attempt("browser_close")).decision).toBe("allow");
       else expect((await attempt("browser_navigate", { url: "about:blank" })).decision).toBe("allow");
-      expect(browser().gate.state(session.id).contacted?.has("localhost") ?? false).toBe(false);
+      expect([out, browser().gate.state(session.id).contacted?.has("localhost")]).toEqual([out, true]);
       expect((await attempt("browser_navigate", { url: A("/plain") })).decision).toBe("allow");
-      await snapshot();
-      const v = await attempt("browser_click", { target: "#mine", element: "Mine" });
-      expect([out, v.decision]).toEqual([out, "allow"]);
+      expect(await actOnFrame("browser_click", () => ({ target: "#mine", element: "Mine" }), "#mine")).toMatch(/localhost/);
     }
     expect((await attempt("browser_close")).decision).toBe("allow");
   }, 180_000);

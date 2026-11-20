@@ -122,13 +122,24 @@ describe("Phase C3 acceptance: hard stops on a logged-in site", () => {
     expect(rig.sup.browserLoggedInEvent().sites).toEqual([expect.objectContaining({ site: "bank.test", unlocked: false })]);
   });
 
-  test("[C3] on an allowed site that is not logged-in, a click, an Enter key press and a form fill do not prompt — in a bypass session and in an ordinary one", async () => {
+  test("[C3] on an allowed site that is not logged-in, a click, an Enter key press and a form fill do not prompt — in a bypass session and in an ordinary one (headed: only once no logged-in site is locked, fix-c-final)", async () => {
     for (const autonomy of ["bypass", "mostly-autonomous"] as const) {
       const s = await browserSession(rig, integration, { autonomy });
+      onPage(rig, s, "https://plain.test/checkout");
+      // Headed (fix-c-final): the agent profile holds the locked bank.test, and a frame of it can load
+      // from the profile with no traffic — so even here the click is a hard stop naming it…
+      const { out, card } = await hardStop(rig, s, "browser_click", { element: "Buy", target: "e1" }, "bank.test", "deny");
+      expect(out.decision).toBe("deny");
+      expect((card as { reason?: string }).reason).toMatch(/^click on plain\.test in the headed agent browser, whose profile holds bank\.test, a logged-in site/);
+      // …until the owner unlocks it: then nothing on the page asks.
+      rig.clock.advance(1000); // (the list orders its changes by time)
+      rig.sup.browserLoggedInSetUnlocked("bank.test", true);
       onPage(rig, s, "https://plain.test/checkout");
       expect((await direct(rig, s, "browser_click", { element: "Buy", target: "e1" })).decision).toBe("allow");
       expect((await direct(rig, s, "browser_press_key", { key: "Enter" })).decision).toBe("allow");
       expect((await direct(rig, s, "browser_fill_form", { fields: [] })).decision).toBe("allow");
+      rig.clock.advance(1000);
+      rig.sup.browserLoggedInSetUnlocked("bank.test", false);
       rig.sup.mcp.gate.onTurnEnd(s);
     }
   });
@@ -170,7 +181,15 @@ describe("Phase C3 acceptance: hard stops on a logged-in site", () => {
     }
     // The other way round: a read described as a purchase is still a read.
     expect((await direct(rig, s, "browser_snapshot", { element: "Confirm purchase", target: "pay-now" })).decision).toBe("allow");
-    // And the same click on a page the daemon tracked on a site that is NOT logged in does not ask, whatever it claims.
+    // And the same click on a page the daemon tracked on a site that is NOT logged in is decided on the
+    // daemon's facts only, whatever it claims: in headed mode the profile holds the locked bank.test
+    // (fix-c-final), so it asks in the daemon's words…
+    onPage(rig, s, "https://plain.test/");
+    const { card } = await hardStop(rig, s, "browser_click", { element: "Pay now on bank.test", target: "e1" }, "bank.test", "deny");
+    expect((card as { reason?: string }).reason).toMatch(/^click on plain\.test in the headed agent browser, whose profile holds bank\.test/);
+    expect((card as { reason?: string }).reason).not.toMatch(/Pay now/);
+    // …and with bank.test unlocked it does not ask.
+    rig.sup.browserLoggedInSetUnlocked("bank.test", true);
     onPage(rig, s, "https://plain.test/");
     expect((await direct(rig, s, "browser_click", { element: "Pay now on bank.test", target: "e1" })).decision).toBe("allow");
   });
@@ -275,12 +294,14 @@ describe("Phase C3 acceptance: what makes a site logged-in (item 28)", () => {
     expect(loggedIn().some((x) => x.site === "news.test")).toBe(false);
     expect(rig.registry.ofType("browser.loggedin").at(-1)!.sites.map((x) => x.site)).toEqual(["bank.co.uk", "shop.test"]);
 
-    // From now on a click on shop.test is a hard stop; on news.test it is not.
+    // From now on a click on shop.test is a hard stop naming it. On news.test it is one too, in headed
+    // mode, but because the profile holds the locked logged-in sites (fix-c-final), not as news.test.
     startAgain(rig, s);
     onPage(rig, s, "https://www.shop.test/cart");
     expect((await hardStop(rig, s, "browser_click", { element: "Buy", target: "e1" }, "shop.test", "deny")).out.decision).toBe("deny");
     onPage(rig, s, "https://news.test/");
-    expect((await direct(rig, s, "browser_click", { element: "Read more", target: "e1" })).decision).toBe("allow");
+    const news = await hardStop(rig, s, "browser_click", { element: "Read more", target: "e1" }, "bank.co.uk", "deny");
+    expect((news.card as { reason?: string }).reason).toMatch(/^click on news\.test in the headed agent browser, whose profile holds bank\.co\.uk, a logged-in site.*its profile also holds shop\.test/);
     rig.sup.mcp.gate.onTurnEnd(s);
     s.setStatus("idle"); // the session's turn is over
 
