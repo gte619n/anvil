@@ -51,10 +51,31 @@
  * a logged-in site's widget) forces a snapshot before most inputs. Residual: a connection Chrome
  * already holds open (HTTP/2 reuse of a socket opened before the last result) is not seen again.
  *
- * Embedded logged-in sites (C3 review, item 4): while any locked logged-in site has been contacted
- * since the navigation that led to the current page (a frame or widget from it on this page), input,
- * upload, script and housekeeping calls on that page are hard-stopped as if they were on that site,
- * naming it (`BrowserActionInfo.embeddedSites`). Reads and navigations are not.
+ * Embedded logged-in sites (C3 review, item 4; made STICKY by the C3/C4 fix-round re-review). Every
+ * site the browser contacts is added to one set per session (`BrowserSessionState.contacted`), across
+ * all tabs. While that set holds a locked logged-in site (looked up live, so an unlocked one — decision
+ * 44 — does not count), every input, upload and housekeeping call is hard-stopped naming it
+ * (`BrowserActionInfo.embeddedSites`) and `browser_evaluate` is refused outright. Reads and navigations
+ * are not. The set is cleared ONLY by a result that reports `about:blank` (with no other tab open on a
+ * page), by `browser_close`, or by a rebuilt browser (`pageGone`) — never by a URL change, a tab select,
+ * going back, or a same-document navigation: a frame survives `history.pushState`, a `#fragment`
+ * navigation, a tab switch and the back/forward cache without the proxy seeing a single new connection,
+ * so no page address can say the frame is gone. (The earlier rule tied the set to the navigation that
+ * led to the current page; each of those moved the page forward and dropped a frame that was still
+ * there.) The page's own site counts too: a frame from B on A can reuse the tunnel Chrome opened while
+ * the tab was on B, so leaving B proves nothing either. After about:blank the sites are still kept as
+ * the browser's `history` and put back as soon as the page arrives anywhere other than by a fresh
+ * `browser_navigate` to the address it reports (going back, a tab, a page's own `history.back()`):
+ * the history still holds the framed pages, and the back/forward cache restores them with no traffic.
+ *
+ * Accepted cost (over-prompting): any browser that has EVER loaded anything from a locked logged-in
+ * site since its last about:blank / close — a frame, a widget, a script, or the site itself as the
+ * page — prompts on every click, key press, form fill and upload, on every page and in every tab, and
+ * cannot run scripts, until the agent navigates to about:blank (or closes the browser) or the owner
+ * unlocks the site. Unlocking the site, or "Allow once" per call, are the owner's ways through. And
+ * about:blank is only a partial reset: it holds for pages the agent then opens with `browser_navigate`,
+ * but the first time the page arrives some other way (a link click, going back, a page moving itself)
+ * the stop comes back; only `browser_close` resets it for good.
  *
  * The session's own test daemon (C4 review, item 1) gets NO exemption from either rule: the agent
  * wrote that page itself, so it is the least trusted page there is. The only differences are that its
@@ -62,12 +83,12 @@
  * everything else it contacts — another site it moves itself to, a frame it embeds — counts exactly as
  * on any other page (it has no "own site" whose traffic is ignored).
  *
- * A traffic log that overflowed (C4 review, item 2). The log is bounded; when entries since the
- * navigation to the current page were dropped, Anvil no longer knows what that page loaded. Then the
- * page is UNKNOWN for input (snapshot first, like any traffic since the last result), and after the
- * snapshot every input-like call on it is hard-stopped as "unknown embedded content"
- * (`TRAFFIC_LOST_SITE` in `embeddedSites`), naming that Anvil lost track, until a navigation to a page
- * whose log is complete.
+ * A traffic log that overflowed (C4 review, item 2). The log is bounded; when entries the sticky set had
+ * not absorbed yet were dropped (or the set grew past `MAX_CONTACTED_SITES`), Anvil no longer knows what
+ * the browser loaded. Then the page is UNKNOWN for input (snapshot first, like any traffic since the
+ * last result), and after the snapshot every input-like call is hard-stopped as "unknown embedded
+ * content" (`TRAFFIC_LOST_SITE` in the sticky set and in `embeddedSites`), naming that Anvil lost track,
+ * until the set is cleared (about:blank, close, rebuilt browser) like any other entry.
  *
  * Time (C4 review, item 4). Chrome can reuse an HTTPS tunnel it already holds, so a page can move
  * itself to another page on a site it is already connected to without the proxy seeing anything new.
@@ -104,6 +125,8 @@ export const FRESH_PAGE_MS = 2000;
 /** What `trafficSince` reports when the bounded log no longer reaches back that far — and the name a
  *  hard stop shows for what the page may have embedded then. Not a hostname: never on any list. */
 export const TRAFFIC_LOST_SITE = "(unknown embedded content: more connections than Anvil keeps track of)";
+/** More distinct contacted sites than this and the sticky set becomes "lost track" (fail closed). */
+export const MAX_CONTACTED_SITES = 5000;
 
 export interface BrowserSessionState {
   /** Sites answered "Allow once" (or allowed by `bypass`) in this session. */
@@ -120,10 +143,19 @@ export interface BrowserSessionState {
   establishedAt?: number;
   /** The proxy's traffic sequence when the last result established the page. */
   resultSeq?: number;
-  /** The traffic sequence when the navigation that led to the current page began. */
-  pageSeq?: number;
-  /** The traffic sequence when the last navigation-class call was allowed. */
-  navCallSeq?: number;
+  /** Every site (registrable domain, or `TRAFFIC_LOST_SITE`) this browser contacted since it last
+   *  showed about:blank, was closed or was rebuilt — all tabs together. STICKY: see the file comment. */
+  contacted?: Set<string>;
+  /** The traffic sequence `contacted` has absorbed up to. */
+  contactedSeq?: number;
+  /** Everything `contacted` ever held since the browser was closed or rebuilt — NOT emptied by
+   *  about:blank, because the history still holds those pages: when the page then changes in any way
+   *  other than a fresh `browser_navigate` to the address it reports (going back, a tab, a page's own
+   *  `history.back()`), this is put back into `contacted` (a back/forward-cache page loads nothing). */
+  history?: Set<string>;
+  /** A result listed more than one tab (or a tab was opened) since the browser last had one tab: an
+   *  about:blank in one tab then does not clear `contacted` unless every listed tab is blank. */
+  multiTab?: boolean;
   /** The tabs as last listed by the server (only entries whose URL could be read with certainty). */
   tabs?: TabEntry[];
   /** The owner refused a page that this browser's history still holds: no going back. */
@@ -144,8 +176,8 @@ export interface BrowserActionInfo {
   currentUnknown?: boolean;
   /** For a navigation with a target: where it goes. */
   target?: { site: string; url: string };
-  /** Locked logged-in sites the browser contacted since the navigation to the current page (a frame
-   *  or widget from them on it). Input-like calls are hard-stopped as if on them. */
+  /** Locked logged-in sites this browser has contacted since it last showed about:blank, was closed or
+   *  rebuilt (sticky; all tabs). Input-like calls are hard-stopped as if on them. */
   embeddedSites?: string[];
   mode: BrowserMode;
 }
@@ -201,6 +233,14 @@ export interface BrowserGateDeps {
   clock?: () => number;
 }
 
+function sameAddress(asked: unknown, got: string): boolean {
+  try {
+    return typeof asked === "string" && new URL(asked).href === new URL(got).href;
+  } catch {
+    return false;
+  }
+}
+
 const SITE_SUGGESTIONS = (site: string): PermissionSuggestion[] => [
   { decision: "allow", label: "Allow once" },
   { decision: "allow_always", label: `Always allow ${site}` },
@@ -234,14 +274,43 @@ export class BrowserGate {
   pageGone(sessionId: string): void {
     const st = this.states.get(sessionId);
     if (!st) return;
-    this.resetPage(st);
+    this.resetPage(st, sessionId);
   }
 
-  private resetPage(st: BrowserSessionState): void {
+  /** Add everything the browser contacted since the last look to the sticky set. */
+  private absorbTraffic(sessionId: string, st: BrowserSessionState): void {
+    if (!this.deps.hooks.trafficSince || !this.deps.hooks.trafficSeq) return;
+    const seq = this.deps.hooks.trafficSeq(sessionId);
+    const set = (st.contacted ??= new Set());
+    const history = (st.history ??= new Set());
+    for (const s of this.deps.hooks.trafficSince(sessionId, st.contactedSeq ?? 0)) {
+      set.add(s);
+      history.add(s);
+    }
+    if (history.size > MAX_CONTACTED_SITES) st.history = new Set([TRAFFIC_LOST_SITE]);
+    // Bounded: past the cap Anvil no longer claims to know what was loaded (fail closed).
+    if (set.size > MAX_CONTACTED_SITES) st.contacted = new Set([TRAFFIC_LOST_SITE]);
+    st.contactedSeq = seq;
+  }
+
+  /** The browser shows nothing any more: forget what it contacted (from the current sequence on). */
+  private clearContacted(st: BrowserSessionState, sessionId: string): void {
+    st.contacted = undefined;
+    st.contactedSeq = this.deps.hooks.trafficSeq?.(sessionId);
+  }
+
+  /** The locked logged-in sites in the sticky set, lost-track first (it is the widest claim). */
+  private embeddedLocked(st: BrowserSessionState): string[] {
+    const out = [...(st.contacted ?? [])].filter((s) => s === TRAFFIC_LOST_SITE || this.isLocked(s));
+    return out.sort((x, y) => (x === TRAFFIC_LOST_SITE ? -1 : y === TRAFFIC_LOST_SITE ? 1 : 0));
+  }
+
+  private resetPage(st: BrowserSessionState, sessionId: string): void {
     st.currentUrl = undefined;
     st.resultSeq = undefined;
-    st.pageSeq = undefined;
-    st.navCallSeq = undefined;
+    this.clearContacted(st, sessionId);
+    st.history = undefined; // closed or rebuilt: no history either
+    st.multiTab = undefined;
     st.establishedAt = undefined;
     st.hold = undefined;
     st.closing = undefined;
@@ -297,6 +366,7 @@ export class BrowserGate {
     if (ctx.tool === "browser_close") return { kind: "allow", reason: "browser_close is always allowed" };
 
     const st = this.state(ctx.session.id);
+    this.absorbTraffic(ctx.session.id, st);
     // CLOSING comes first: only the way out is open.
     if (st.closing) return this.closingVerdict(ctx, st);
 
@@ -335,7 +405,7 @@ export class BrowserGate {
     }
 
     if (plan.recordOnce) st.once.add(plan.recordOnce);
-    this.noteNavigationCall(ctx, st, plan.verdict);
+    if (plan.verdict.kind === "allow" && ctx.tool === "browser_tabs" && ctx.input.action === "new") st.multiTab = true;
     return plan.verdict;
   };
 
@@ -394,13 +464,6 @@ export class BrowserGate {
     return `the last result that said where the page is is ${ago === undefined ? "missing" : `${ago} s old`} (an action needs one from the last ${FRESH_PAGE_MS / 1000} s)`;
   }
 
-  /** An allowed navigation-class call: the traffic from here on belongs to the page it leads to. */
-  private noteNavigationCall(ctx: McpKindGateContext, st: BrowserSessionState, verdict: McpKindVerdict): void {
-    if (verdict?.kind !== "allow" || !this.deps.hooks.trafficSeq) return;
-    const cls = classifyBrowserTool(ctx.tool, ctx.input);
-    if ("cls" in cls && cls.cls === "navigation") st.navCallSeq = this.deps.hooks.trafficSeq(ctx.session.id);
-  }
-
   /** Whether this call is one that may run while the page's address is unknown: the calls whose
    *  result establishes it, the way out, and — after an input-class call only — any read. */
   private establishesPage(ctx: McpKindGateContext, unknown: NonNullable<BrowserSessionState["unknown"]>): boolean {
@@ -431,11 +494,11 @@ export class BrowserGate {
     // that is not a hostname in place of its site.
     const onOwn = this.isOwn(ctx.session.id, st.currentUrl);
     const shownSite = onOwn ? OWN_TEST_DAEMON_SITE : currentSite;
-    // Locked logged-in sites this page has loaded something from (a frame, a widget): input-like calls
-    // are hard-stopped as if on them — on the session's own test daemon too (C4 review, item 1). When
-    // the log lost entries since the navigation here, what the page loaded is unknown (item 2).
-    const here = onOwn ? undefined : currentSite;
-    const embedded = cls.cls === "read" || cls.cls === "navigation" ? [] : this.trafficSince(ctx.session.id, st.pageSeq).filter((s) => s === TRAFFIC_LOST_SITE || (s !== here && this.isLocked(s)));
+    // Locked logged-in sites this browser has loaded something from since about:blank / close (a frame,
+    // a widget, the page itself — sticky, all tabs): input-like calls are hard-stopped as if on them —
+    // on the session's own test daemon too (C4 review, item 1). When the log lost entries, what was
+    // loaded is unknown (item 2), and that is sticky too.
+    const embedded = cls.cls === "read" || cls.cls === "navigation" ? [] : this.embeddedLocked(st);
     const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(shownSite ? { currentSite: shownSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}), ...(embedded.length ? { embeddedSites: embedded } : {}) };
     const session = ctx.session;
 
@@ -454,10 +517,11 @@ export class BrowserGate {
         if (bad) return deny(`${ctx.tool}: ${bad}`);
       }
       const where = currentSite ?? "the page";
+      const framed = embedded.length ? `; the browser has loaded ${embedded.slice(0, 3).join(", ")}${embedded.includes(TRAFFIC_LOST_SITE) ? "" : " (a locked logged-in site)"}, so a frame from it may receive the file` : "";
       return {
         verdict: {
           kind: "prompt",
-          reason: `upload ${paths.length === 1 ? paths[0] : `${paths.length} files`} to ${where}`,
+          reason: `upload ${paths.length === 1 ? paths[0] : `${paths.length} files`} to ${where}${framed}`,
           suggestions: ONCE_SUGGESTIONS, // an upload is asked every time: there is no "always"
           always: true,
           denyWhenUnattended: true,
@@ -583,9 +647,10 @@ export class BrowserGate {
   onResult(sessionId: string, result: McpToolResult, mode: BrowserMode = "headed"): { purge: boolean } {
     const st = this.state(sessionId);
     if (result.tool === "browser_close" && !result.isError) {
-      this.resetPage(st);
+      this.resetPage(st, sessionId);
       return { purge: false };
     }
+    this.absorbTraffic(sessionId, st);
     const reading = readPage(result.tool, toolResultText(result.content), result.isError);
     const cls = classifyBrowserTool(result.tool, result.input);
     const changesPage = result.tool === "browser_navigate" || result.tool === "browser_navigate_back" || (result.tool === "browser_tabs" && result.input.action !== "list");
@@ -595,6 +660,8 @@ export class BrowserGate {
     }
     if (reading.tabs) st.tabs = reading.tabs;
     else if (changesPage) st.tabs = undefined; // the list we had may no longer be true
+    if (reading.tabs && reading.tabs.length > 1) st.multiTab = true;
+    else if (reading.tabs?.length === 1) st.multiTab = undefined;
     if (reading.kind === "none") {
       if (changesPage) st.unknown = "navigation";
       else if ("cls" in cls && (cls.cls === "input" || cls.cls === "upload" || cls.cls === "script")) st.unknown ??= "input";
@@ -604,18 +671,24 @@ export class BrowserGate {
 
     st.unknown = undefined;
     st.establishedAt = (this.deps.clock ?? Date.now)();
-    // The traffic so far is accounted for by this result; traffic before the navigation that led here
-    // belongs to an earlier page.
+    // The traffic so far is accounted for by this result (for the "moved by itself" rule; what was
+    // embedded stays in the sticky set whatever the address says).
     const seq = this.deps.hooks.trafficSeq?.(sessionId);
-    if (seq !== undefined) {
-      if (st.currentUrl !== reading.url || st.pageSeq === undefined) st.pageSeq = changesPage ? (st.navCallSeq ?? st.resultSeq ?? 0) : (st.resultSeq ?? 0);
-      st.resultSeq = seq;
-    }
+    if (seq !== undefined) st.resultSeq = seq;
+    // After about:blank emptied the set, the history still holds the pages it covered: any arrival
+    // other than a fresh load of the address asked for may be one of them, restored with no traffic.
+    const fresh = result.tool === "browser_navigate" && sameAddress(result.input.url, reading.url);
+    if (!fresh && reading.url !== st.currentUrl && st.history?.size) for (const s of st.history) (st.contacted ??= new Set()).add(s);
     st.currentUrl = reading.url;
     const where: UrlVerdict = reading.url === CHROME_ERROR_URL ? { ok: true, blank: true } : checkUrl(reading.url);
     if (where.ok && "blank" in where) {
       st.hold = undefined;
-      if (reading.url !== CHROME_ERROR_URL) st.closing = undefined; // only about:blank ends CLOSING
+      if (reading.url !== CHROME_ERROR_URL) {
+        st.closing = undefined; // only about:blank ends CLOSING
+        // …and only about:blank empties the sticky set — when no other tab still shows a page.
+        const othersBlank = reading.tabs?.every((t) => t.current || t.url === BLANK_URL) ?? false;
+        if (!st.multiTab || othersBlank) this.clearContacted(st, sessionId);
+      }
       return { purge: false };
     }
     if (st.closing) return { purge: true }; // still has to leave

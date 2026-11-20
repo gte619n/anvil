@@ -143,7 +143,7 @@ export function startVendorFixture(): VendorFixture {
         if (u.pathname === "/tp/v2/Product/cadFileUrl") {
           if (u.searchParams.get("cadRequestId") !== "4711") return new Response(null, { status: 404 });
           if (pending-- > 0) return new Response(null, { status: 204 });
-          return Response.json(f.opts.fileUrl);
+          return Response.json(f.opts.fileUrl.replaceAll("{TOKEN}", tpToken)); // `{TOKEN}`: the JWT this fixture issued
         }
       }
       return new Response("not found", { status: 404 });
@@ -187,6 +187,8 @@ export function startFileFixture(): FileFixture {
       if (u.pathname === "/tool.exe") return new Response("MZ", { headers: { "content-type": "application/octet-stream" } });
       if (u.pathname === "/named") return new Response("not a step", { headers: { "content-disposition": 'attachment; filename="installer.dmg"' } });
       if (u.pathname === "/big.step") return new Response("x".repeat(100));
+      // A vendor that names the file after whatever it was asked with (`name`): its Content-Disposition can carry keys.
+      if (u.pathname.startsWith("/cad/named/")) return new Response(STEP_BYTES, { headers: { "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(u.searchParams.get("name") ?? "x.step")}` } });
       if (u.pathname === "/huge-stream.step") {
         // No Content-Length: the cap must be enforced while streaming.
         let n = 0;

@@ -106,7 +106,9 @@ export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo
     }
     if (!site) return undefined;
 
-    const reason = describe(info, site);
+    // Name every locked site the browser has loaded, not only the one the card is about.
+    const others = (info.embeddedSites ?? []).filter((s) => s !== site && s !== TRAFFIC_LOST_SITE && deps.isLocked(s));
+    const reason = describe(info, site) + (others.length ? ` (the browser has also loaded ${others.slice(0, 3).join(", ")}, locked logged-in site${others.length > 1 ? "s" : ""})` : "");
     const session = info.ctx.session;
     if (isUnattended(session)) return { kind: "deny", reason: `${reason} needs the owner's approval (denied: this session is unattended)` };
 

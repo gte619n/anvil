@@ -100,7 +100,7 @@ describe("item 1: a page that moves by itself", () => {
     expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
   });
 
-  test("[C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page clears it", async () => {
+  test("[C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page does not clear it, about:blank does", async () => {
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
     allow(s, "shop.test", "bank.test", "news.test");
     browserOf(rig).loggedIn.add("bank.test", "owner");
@@ -114,9 +114,15 @@ describe("item 1: a page that moves by itself", () => {
     expect(parked(s).suggestions.map((x) => x.label)).toEqual(["Allow once", "Unlock bank.test", "Deny"]);
     rig.sup.resolvePermission(parked(s).requestId, "deny");
     await gated;
+    // Sticky (fix-round re-review): a new page does NOT clear it — the frame may still be there…
     expect((await browserHook(rig, s, "browser_navigate", { url: "https://news.test/" })).decision).toBe("allow");
     contact(s, "news.test");
     feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });
+    expect(await browserHook(rig, s, "browser_click", { target: "e1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/has loaded bank\.test/) });
+    // …only about:blank does.
+    expect((await browserHook(rig, s, "browser_navigate", { url: "about:blank" })).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate", pageResult("about:blank"), { url: "about:blank" });
+    await land(s, "https://news.test/");
     expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
   });
 
@@ -137,6 +143,72 @@ describe("item 1: a page that moves by itself", () => {
     feedResult(rig, s, "browser_snapshot", pageResult("https://bank.test/"));
     expect(await close()).toBe("allow");
     expect(s.pendingPermissions.size).toBe(0);
+  });
+});
+
+describe("fix-round re-review: the embedded locked-site set is sticky", () => {
+  const tabsText = (cur: number, urls: string[]) => `### Result\n${urls.map((u, i) => `- ${i}: ${i === cur ? "(current) " : ""}[T](${u})`).join("\n")}\n### Page\n- Page URL: ${urls[cur]}\n- Page Title: T`;
+  const stopped = async (s: Session, tool = "browser_click", input: Record<string, unknown> = { target: "f1e2" }) => {
+    const v = await browserHook(rig, s, tool, input);
+    expect([tool, v.decision]).toEqual([tool, "deny"]);
+    expect(v.reason).toMatch(/has loaded bank\.test/);
+  };
+
+  test("[C3] re-review: pushState, a #fragment navigation, a new tab then select back, and going back all keep the locked frame's site — input stays a hard stop and browser_evaluate is refused; an unlocked site does not stop; about:blank clears it until the page arrives other than by a fresh navigate (going back restores it), browser_close for good", async () => {
+    const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
+    allow(s, "shop.test", "bank.test");
+    browserOf(rig).loggedIn.add("bank.test", "owner");
+    await land(s, "https://shop.test/embed", ["bank.test"]);
+    await stopped(s);
+    // The page moves its own address (history.pushState): no navigation, no traffic.
+    feedResult(rig, s, "browser_snapshot", pageResult("https://shop.test/embed/moved"));
+    await stopped(s);
+    await stopped(s, "browser_type", { target: "f1e2", text: "x" });
+    expect(await browserHook(rig, s, "browser_evaluate", { function: "(el) => el.click()", target: "f1e2" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/not allowed on a page that has loaded bank\.test/) });
+    // A same-document navigation the agent makes.
+    expect((await browserHook(rig, s, "browser_navigate", { url: "https://shop.test/embed#x" })).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate", pageResult("https://shop.test/embed#x"), { url: "https://shop.test/embed#x" });
+    await stopped(s);
+    // A new tab (about:blank while the first tab still shows the page), then back to the first tab.
+    expect((await browserHook(rig, s, "browser_tabs", { action: "new" })).decision).toBe("allow");
+    feedResult(rig, s, "browser_tabs", tabsText(1, ["https://shop.test/embed#x", "about:blank"]), { action: "new" });
+    expect(browserOf(rig).gate.state(s.id).contacted?.has("bank.test")).toBe(true);
+    feedResult(rig, s, "browser_tabs", tabsText(1, ["https://shop.test/embed#x", "about:blank"]), { action: "list" });
+    expect((await browserHook(rig, s, "browser_tabs", { action: "select", index: 0 })).decision).toBe("allow");
+    feedResult(rig, s, "browser_tabs", tabsText(0, ["https://shop.test/embed#x", "about:blank"]), { action: "select", index: 0 });
+    await stopped(s);
+    // Away and back (the back/forward cache: no traffic at all).
+    await land(s, "https://shop.test/plain");
+    expect((await browserHook(rig, s, "browser_navigate_back")).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate_back", pageResult("https://shop.test/embed#x"));
+    await stopped(s);
+    // Unlocked (decision 44): no hard stop for it.
+    browserOf(rig).loggedIn.setUnlocked("bank.test", true);
+    feedResult(rig, s, "browser_snapshot", pageResult("https://shop.test/embed#x"));
+    expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
+    browserOf(rig).loggedIn.setUnlocked("bank.test", false);
+    feedResult(rig, s, "browser_snapshot", pageResult("https://shop.test/embed#x"));
+    await stopped(s);
+    // about:blank in one tab while the other still shows a page does not clear it…
+    expect((await browserHook(rig, s, "browser_navigate", { url: "about:blank" })).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate", `### Open tabs\n- 0: (current) [B](about:blank)\n- 1: [T](https://shop.test/plain)\n### Page\n- Page URL: about:blank\n- Page Title: `, { url: "about:blank" });
+    expect(browserOf(rig).gate.state(s.id).contacted?.has("bank.test")).toBe(true);
+    // …about:blank with every tab blank does.
+    feedResult(rig, s, "browser_tabs", `### Result\n- 0: (current) [B](about:blank)\n- 1: [B](about:blank)\n### Page\n- Page URL: about:blank\n- Page Title: `, { action: "list" });
+    expect(browserOf(rig).gate.state(s.id).contacted?.size ?? 0).toBe(0);
+    await land(s, "https://shop.test/plain");
+    expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
+    // …but the history still holds the framed page: arriving any way but a fresh browser_navigate
+    // (here, going back into the back/forward cache, which loads nothing) puts the stop back.
+    expect((await browserHook(rig, s, "browser_navigate_back")).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate_back", pageResult("https://shop.test/embed#x"));
+    await stopped(s);
+    // browser_close clears it for good.
+    await land(s, "https://shop.test/embed", ["bank.test"]);
+    await stopped(s);
+    feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
+    await land(s, "https://shop.test/plain");
+    expect((await browserHook(rig, s, "browser_click", { target: "e1" })).decision).toBe("allow");
   });
 });
 

@@ -104,7 +104,7 @@ describe("item 1: the session's own test daemon has no exemption from the traffi
 });
 
 describe("item 2: an overflowing traffic log", () => {
-  test("[C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to a page with a complete log clears it", async () => {
+  test("[C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to another page does not clear it, about:blank does", async () => {
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
     allow(s, "shop.test", "news.test");
     browserOf(rig).loggedIn.add("bank.test", "owner");
@@ -128,7 +128,14 @@ describe("item 2: an overflowing traffic log", () => {
     rig.sup.resolvePermission(card.requestId, "deny");
     expect((await gated).decision).toBe("deny");
     expect(browserOf(rig).loggedIn.isLocked(TRAFFIC_LOST_SITE)).toBe(false);
-    // A new page whose log is complete: the click runs.
+    // Sticky (fix-round re-review): a new page does NOT clear it — the frame may still be there…
+    expect((await browserHook(rig, s, "browser_navigate", { url: "https://news.test/" })).decision).toBe("allow");
+    contact(s, "news.test");
+    feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });
+    expect(await browserHook(rig, s, "browser_click", { target: "e1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/embedded content is unknown/) });
+    // …only about:blank does.
+    expect((await browserHook(rig, s, "browser_navigate", { url: "about:blank" })).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate", pageResult("about:blank"), { url: "about:blank" });
     expect((await browserHook(rig, s, "browser_navigate", { url: "https://news.test/" })).decision).toBe("allow");
     contact(s, "news.test");
     feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });

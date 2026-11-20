@@ -431,6 +431,41 @@ describe("key propagation hub → member (two real daemons)", () => {
   });
 });
 
+describe("fix-round re-review: parts_fetch output is scrubbed", () => {
+  test("[C5] re-review: a TraceParts cadFileUrl whose path, query and Content-Disposition file name carry every key and the issued token — the tool text, the saved file's name and the logs carry none of them (raw or URL-encoded), and the source URL is shown without its query", async () => {
+    setKeys("traceparts");
+    const k = KEYS;
+    const nameParam = `${encodeURIComponent(`m-${k.TRACEPARTS_TENANT_UID}-${k.TRACEPARTS_API_KEY}-${k.TRACEPARTS_EMAIL}-`)}{TOKEN}.step`;
+    fx.opts.fileUrl = `https://files.parts.test/cad/named/${k.TRACEPARTS_API_KEY}/${k.TRACEPARTS_TENANT_UID}/model.step?apiKey=${k.TRACEPARTS_API_KEY}&tenantUid=${k.TRACEPARTS_TENANT_UID}&email=${encodeURIComponent(k.TRACEPARTS_EMAIL)}&token={TOKEN}&name=${nameParam}`;
+    const s = await rig.session({ cwd: worktree });
+    const tp = await search(s, { query: "LM317T", manufacturer: "Texas Instruments", sources: ["traceparts"] });
+    const token = `tp-jwt-${fx.tokensIssued.traceparts}-eyJhbGciOi`;
+    expect(fx.tokensIssued.traceparts).toBeGreaterThan(0);
+    const out = await fetchPart(s, tp.results[0].modelUrls[0].url);
+    expect(out.isError).toBe(false);
+    // The vendor really was asked with the secrets, and really named the file after them.
+    const asked = files.requests.find((r) => r.startsWith("/cad/named/"))!;
+    expect(decodeURIComponent(asked)).toContain(token);
+    expect(decodeURIComponent(asked)).toContain(k.TRACEPARTS_API_KEY);
+    const saved = readdirSync(join(worktree, ".anvil-downloads"));
+    expect(saved.length).toBe(1);
+    expect(readFileSync(join(worktree, ".anvil-downloads", saved[0]!), "utf8")).toBe(STEP_BYTES);
+    for (const v of [...SECRET_VALUES, token]) {
+      for (const form of [v, encodeURIComponent(v), v.replace(/[^A-Za-z0-9._ -]+/g, "_")]) {
+        expect(out.text).not.toContain(form);
+        expect(saved[0]).not.toContain(form);
+        for (const line of logs) expect(line).not.toContain(form);
+      }
+    }
+    expect(out.text).toMatch(/^Saved \.anvil-downloads\/m-\S*\.step \(\d+ bytes\) from https:\/\/files\.parts\.test\/cad\/named\/\S+\/model\.step\. It is in quarantine/);
+    expect(out.text).not.toContain("?");
+    // An error on the way out is scrubbed and loses its URL queries the same way.
+    const parts2 = partsTools({ ...parts(), search: parts().search.bind(parts()), fetch: async () => ({ ok: false as const, error: `fetch of https://x.test/f.step?key=${k.TRACEPARTS_API_KEY}&t=${token} failed (${k.TRACEPARTS_TENANT_UID})` }), forModel: parts().forModel.bind(parts()) }, s);
+    const err = (await parts2.find((t) => t.name === "parts_fetch")!.handler({ url: "x" } as never, {} as never)) as { content: { text: string }[] };
+    expect(err.content[0]!.text).toBe("parts_fetch refused or failed: fetch of https://x.test/f.step failed (•••)");
+  });
+});
+
 describe("review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry", () => {
   test("[C5] a vendor that echoes the keys and the Authorization header into result fields: the tool text carries none of them (raw or URL-encoded), and a link that carried one is dropped and cannot be fetched", async () => {
     for (const x of ["digikey", "mouser", "traceparts"] as const) setKeys(x);

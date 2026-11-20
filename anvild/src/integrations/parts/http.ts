@@ -16,6 +16,22 @@ export function redact(text: string, secrets: readonly (string | undefined)[]): 
   return out;
 }
 
+/** Every http(s) URL in `text` without its query string and fragment (where vendors put keys, tenant
+ *  ids and tokens). A URL that does not parse is cut at its first `?` or `#`. */
+export function stripUrlQueries(text: string): string {
+  return text.replace(/\bhttps?:\/\/[^\s"'<>`]+/gi, (u) => {
+    try {
+      const x = new URL(u);
+      if (!x.search && !x.hash) return u;
+      x.search = "";
+      x.hash = "";
+      return x.href;
+    } catch {
+      return u.split(/[?#]/)[0]!;
+    }
+  });
+}
+
 export interface VendorReply {
   status: number;
   /** Parsed JSON, or the raw text when the body is not JSON; undefined for an empty body. */

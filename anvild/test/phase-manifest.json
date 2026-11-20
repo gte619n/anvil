@@ -1645,7 +1645,7 @@
           "names": [
             "item 1: a page that moves by itself > [C3] review 1: after the result, traffic to a locked logged-in site makes the page unknown — a key press or a click is refused with 'take a snapshot first', under bypass; the snapshot then applies the hard stop on that site",
             "item 1: a page that moves by itself > [C3] review 1: traffic to a site not allowed in this session also makes the page unknown; traffic only to the page's own site does not, nor does traffic that came before the result",
-            "item 1: a page that moves by itself > [C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page clears it",
+            "item 1: a page that moves by itself > [C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page does not clear it, about:blank does",
             "item 1: a page that moves by itself > [C3] review 6: browser_close is allowed in every state — unknown, held, closing, and on a locked logged-in site",
             "item 2: the card's picture > [C3] review 2: a PNG planted in .anvil-browser and named in browser_find's text never becomes the card image; neither does a file a take_screenshot result links that was there before the call",
             "item 2: the card's picture > [C3] review 2: the screenshot goes stale after an input call and when the browser contacts another site after it was taken",
@@ -1657,7 +1657,8 @@
             "item 6: small gaps > [C3] review 6: an updatedInput sent with the answer to a browser prompt is ignored — the call that runs is the one the card showed",
             "item 6: small gaps > [C3] review 6: the runtime's node is what `node -p process.execPath` prints from a neutral daemon folder, so a .tool-versions planted in the worktree cannot change it",
             "item 6: small gaps > [C3] review 6: the file-offer quarantine check compares real paths — a link inside the worktree that points into .anvil-downloads gets no download card",
-            "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused"
+            "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused",
+            "fix-round re-review: the embedded locked-site set is sticky > [C3] re-review: pushState, a #fragment navigation, a new tab then select back, and going back all keep the locked frame's site — input stays a hard stop and browser_evaluate is refused; an unlocked site does not stop; about:blank clears it until the page arrives other than by a fresh navigate (going back restores it), browser_close for good"
           ]
         },
         {
@@ -1677,7 +1678,7 @@
         {
           "file": "test/integration/browser-c4-review.test.ts",
           "names": [
-            "item 2: an overflowing traffic log > [C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to a page with a complete log clears it",
+            "item 2: an overflowing traffic log > [C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to another page does not clear it, about:blank does",
             "item 3: the card's picture cannot be chosen by the agent > [C3] review C4-3: browser_take_screenshot with any filename is denied, without one it is allowed; a file it links — even one written during the call — never becomes the card image, only its inline image does",
             "item 3: the card's picture cannot be chosen by the agent > [C3] review C4-3: the agent's Write, Edit, MultiEdit and NotebookEdit are denied inside .anvil-browser/ (also through a link into it); Read there and writes elsewhere are not",
             "item 4: time passing with the page live > [C3] review C4-4: after browser_wait_for whose result has no page block the next click needs a snapshot; a wait whose result carries the page block does not"
@@ -1717,6 +1718,18 @@
           "names": [
             "real Chrome: the C4 review's bypasses > [C3] real review C4-2: allowed A frames locked B, then makes 2100 same-site fetches — after a snapshot the click is still a hard stop naming that Anvil lost track, and B records zero presses",
             "real Chrome: the C4 review's bypasses > [C3] real review C4-3: while a background loop keeps replacing every PNG in .anvil-browser/ with a planted one, browser_take_screenshot with a filename is refused and the hard-stop card shows the real server's inline image, byte for byte — never the planted file"
+          ]
+        },
+        {
+          "file": "test/real/browser-sticky-frames.test.ts",
+          "names": [
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review: setup — the real server starts headless through the real proxy; A (127.0.0.1) is allowed, B (localhost) is a locked logged-in site, and the session's test daemon (stand-in) is running",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (pushState): A frames locked B, then moves its own address with history.pushState — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (fragment): the agent navigates A/frame to A/frame#x (same document) — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (tabs): A frames locked B; a new tab, a tab list, then selecting the first tab again — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (back): A frames locked B; the agent opens A/plain, then browser_navigate_back restores A/frame (back/forward cache) — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (back after about:blank): A frames locked B; the agent sends the page to about:blank, then browser_navigate_back restores A/frame — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (clear): about:blank and browser_close empty the set — after either, a click on A's own button on a page with no frame runs without a prompt"
           ]
         }
       ]
@@ -1822,6 +1835,13 @@
             "real Chrome: the C4 review's bypasses > [C4] real review 1 (timer): after the own-origin page's own timer sends it to locked B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
             "real Chrome: the C4 review's bypasses > [C4] real review 1 (frame): an own-origin page that frames locked B — a key press and a click are hard stops naming B (screenshot first, then a card), browser_evaluate is refused, and B records zero presses"
           ]
+        },
+        {
+          "file": "test/real/browser-sticky-frames.test.ts",
+          "names": [
+            "real Chrome: a locked site's frame stays a hard stop > [C4] real re-review (own pushState): the session's own test daemon frames locked B and pushes its address — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C4] real re-review (evaluate): on the session's own test daemon after it framed locked B and pushed its address, browser_evaluate with the frame's ref as target is refused naming B, and B records zero presses"
+          ]
         }
       ]
     },
@@ -1851,7 +1871,8 @@
             "rate limiter > [C5] keys are scrubbed from text, raw and URL-encoded",
             "daily quota (UTC calendar day, persisted) > [C5] daily quota: N calls use up the UTC day, a new limiter over the same file (a restart) still refuses, the refusal waits until UTC midnight, and the next UTC day allows again",
             "daily quota (UTC calendar day, persisted) > [C5] daily quota: a refused short window does not count against the day, and the vendor's pause leaves the day alone",
-            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a corrupt or wrong-shaped file fails closed for the rest of that UTC day, then the next day rewrites it; a missing file is a fresh day"
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a corrupt or wrong-shaped file fails closed for the rest of that UTC day, then the next day rewrites it; a missing file is a fresh day",
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a row dated in the future (the clock stepped back) counts as today with its count — a restart on the earlier day is still refused, another source's future row survives a write, and a corrupt read on a later day stays closed after the step back"
           ]
         },
         {
@@ -1900,7 +1921,8 @@
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] the daily quota is counted in the daemon's state dir, so a restarted daemon (a new service over the same dir) does not get a fresh day",
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] parts_fetch refuses a URL whose host is a fleet member (the FleetStore roster http.ts hands the supervisor), whatever it resolves to; nothing is fetched",
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] neither parts tool is in allowedTools; the autonomy policy classifies parts_search as read-only (allowed by the hook without a prompt under the default policy) and parts_fetch as a write",
-            "tools, permissions and keys > [C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not"
+            "tools, permissions and keys > [C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not",
+            "fix-round re-review: parts_fetch output is scrubbed > [C5] re-review: a TraceParts cadFileUrl whose path, query and Content-Disposition file name carry every key and the issued token — the tool text, the saved file's name and the logs carry none of them (raw or URL-encoded), and the source URL is shown without its query"
           ]
         },
         {
