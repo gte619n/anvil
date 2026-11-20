@@ -1278,6 +1278,12 @@
             "allowed sites > [C2] web: typing a site and pressing Allow site sends browser.site.add; a refusal is shown and nothing is invented locally",
             "allowed sites > [C2] web: changes a member has not yet delivered to the hub are counted"
           ]
+        },
+        {
+          "file": "test/unit/state-protected.test.ts",
+          "names": [
+            "state-dir protection for Track B and C state > [C2] a daemon with only mcp-integrations on (no cad-work) registers the rule, and withdraws it on shutdown"
+          ]
         }
       ],
       "real": [
@@ -1441,6 +1447,13 @@
             "item 6: small gaps > [C3] review 6: the runtime's node is what `node -p process.execPath` prints from a neutral daemon folder, so a .tool-versions planted in the worktree cannot change it",
             "item 6: small gaps > [C3] review 6: the file-offer quarantine check compares real paths — a link inside the worktree that points into .anvil-downloads gets no download card",
             "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused"
+          ]
+        },
+        {
+          "file": "test/unit/state-protected.test.ts",
+          "names": [
+            "state-dir protection for Track B and C state > [C3] Write via `~/…` to browser-loggedin.json, the browser runtime folder and testdaemons.json is denied (and the other browser, registry and SolidCraft state); a session worktree under the state dir is not",
+            "state-dir protection for Track B and C state > [C3] Write into a worktree's .anvil-browser/ (or the .anvil-downloads/ quarantine) is denied, whatever the case or route"
           ]
         }
       ],

@@ -64,6 +64,7 @@ import { now } from "../util/envelope";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { CadParamSetResultEvent, CadPartsListResultEvent, CadStatusEvent } from "@protocol";
 import { featureEnabled } from "../config";
+import { STATE_FEATURES, registerStateDirProtection } from "../agent/state-protected";
 import type { CadManagerOptions } from "../cadwork/manager";
 import { CadworkService, CWD_REFUSED } from "./cadwork-service";
 import { gitToplevel, partRef } from "../cadwork/partfolder";
@@ -300,6 +301,8 @@ export class Supervisor {
   readonly human: HumanRequestService;
   /** Part sources and their keys (Phase C5). Absent unless the "part-sources" feature is on. */
   readonly parts?: PartsService;
+  /** Withdraws the state-dir file-tool protection (see STATE_FEATURES). */
+  private offStateProtection?: () => void;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
   /** CAD domain — SolidCraft process manager + the `anvil_cad` tool server (agent-cad-and-browser spec). */
@@ -415,6 +418,11 @@ export class Supervisor {
       : undefined;
     this.partsToolsOn = this.parts?.anyConfigured() ?? false;
     this.human = new HumanRequestService({ screenshot: (sessionId) => this.mcp.browser?.screenshot(sessionId) });
+    // The state folder's file-tool protection (merge item (c)): with ANY feature that keeps state
+    // there, not only cad-work. The only folders under it a session may edit: worktrees, clones.
+    if (STATE_FEATURES.some((f) => featureEnabled(cfg, f))) {
+      this.offStateProtection = registerStateDirProtection(cfg.stateDir, [this.store.worktreeRoot(), this.clonesDir]);
+    }
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
       getSession: (id) => this.sessions.get(id),
@@ -2356,6 +2364,7 @@ export class Supervisor {
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
     this.mcp.stop();
+    this.offStateProtection?.();
     this.terminalMgr.killAll();
     await this.cadwork.shutdown().catch(() => undefined); // stop every SolidCraft process
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit

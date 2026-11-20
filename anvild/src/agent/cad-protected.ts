@@ -40,7 +40,9 @@ import { registerProtectedRule, type ProtectedContext, type ProtectedRule, type 
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 /** Folders under the daemon's state dir that an agent's shell must stay out of. */
-export const PROTECTED_STATE_FOLDERS = ["cadwork", "solidcraft", "browser-profile"] as const;
+// "browser" also covers browser-profile, browser-sites.json and browser-loggedin.json (a prefix
+// match); "solidcraft" covers solidcraft-pin.json and the other solidcraft* files (merge item (c)).
+export const PROTECTED_STATE_FOLDERS = ["cadwork", "solidcraft", "browser", "testdaemons.json", "mcp-integrations.json"] as const;
 const PART_JSON_RE = /^cad\/[^/]+\/part\.json$/;
 const DESIGN_JSON_RE = /^cad\/[^/]+\/design\.json$/;
 /** Daemon-written folders of a part: previews, thumbnails, temp files; release packs. */

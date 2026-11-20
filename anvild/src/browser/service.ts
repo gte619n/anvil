@@ -14,6 +14,7 @@ import type { BrowserIntegrationInfo, McpHealth, McpIntegration, McpTransport, S
 import type { McpChildEnv } from "../agent/mcp-external";
 import { registerMcpKindGate, registerMcpKindResultHook, type McpKindGateContext, type McpKindVerdict } from "../agent/mcp-gate";
 import { registerProtectedRule, type ProtectedRule } from "../agent/protected";
+import { isUnder, realish, resolveToolPath } from "../agent/tool-paths";
 import { resolveOnPath } from "../mcp/health";
 import { registerMcpPreset, type McpPreset, type McpPresetContext } from "../mcp/presets";
 import { DOWNLOADS_DIRNAME, downloadContext, downloadNotice, downloadsProtectedRule, outputDirProblem, parseDownloadLines, quarantineFile, requestedOutputFiles, sweepOutputDir, type DownloadOutcome } from "./downloads";
@@ -913,11 +914,13 @@ export class BrowserService {
       if (guarded.some((p) => cmd.includes(p)) || /\bbrowser-profile\b|\bbrowser-sites\.json\b|\bbrowser-loggedin\.json\b/.test(cmd)) return { kind: "deny", reason };
       return undefined;
     }
+    // Every tool that names a path, resolved by Track A's shared resolver (`~` as the CLI expands it,
+    // symlinks followed, case-insensitive): the same file the tool would touch.
     for (const key of ["file_path", "path", "notebook_path"]) {
-      const v = ctx.input[key];
-      if (typeof v !== "string" || !v) continue;
-      const abs = resolve(ctx.cwd, v);
-      if (guarded.some((p) => abs === p || abs.startsWith(p + sep))) return { kind: "deny", reason };
+      const r = resolveToolPath(ctx.input[key], ctx.cwd);
+      if (!r) continue;
+      if (!r.ok) return { kind: "deny", reason: r.reason };
+      if (guarded.some((p) => isUnder(r.abs, realish(p)))) return { kind: "deny", reason };
     }
     return undefined;
   };
