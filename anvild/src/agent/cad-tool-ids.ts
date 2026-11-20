@@ -68,7 +68,12 @@ export const CAD_OWNER_CARD_TOOL_IDS: readonly string[] = CAD_OWNER_CARD_TOOLS.m
  */
 export const VERIFY_CLI_PATH = join(import.meta.dir, "..", "cadwork", "verify-cli.ts");
 /** The command the prompt tells the agent to run after a merge or rebase that touches `cad/`. */
-export const VERIFY_CLI_COMMAND = `bun ${VERIFY_CLI_PATH} --changed-since <base>`;
+/** The path is quoted (a checkout path with a space or a quote must not split the agent's command). */
+export const VERIFY_CLI_COMMAND = `bun ${shellQuote(VERIFY_CLI_PATH)} --changed-since <base>`;
+/** POSIX single-quote a word unless it is plainly safe. */
+export function shellQuote(word: string): string {
+  return /^[A-Za-z0-9_./@%+=:,-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+}
 
 /** The paragraph a session with the `anvil_cad` server gets in its system prompt (spec §4.4, §4.11). */
 export const CAD_SYSTEM_PROMPT =

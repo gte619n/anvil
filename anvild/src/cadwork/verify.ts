@@ -236,7 +236,8 @@ async function verifyOne(ref: PartRef, locks: LockReader, opts: VerifyOptions): 
   const root = realpathSync(mkdtempSync(join(opts.tmpRoot ?? tmpdir(), "anvil-verify-")));
   // A fresh manager per part, with NO refresh job: nothing it runs can write part.json, and its one
   // process is gone before the folder is.
-  const manager = new CadManager({ ...opts.manager, maxProcs: 1, resolveCli: () => opts.binary, refresh: undefined });
+  // Its child's TMPDIR is inside the same throwaway folder, so nothing it leaves outlives the run.
+  const manager = new CadManager({ ...opts.manager, maxProcs: 1, resolveCli: () => opts.binary, refresh: undefined, tmpRoot: join(root, "tmp") });
   try {
     const dir = join(root, CAD_DIR, ref.part);
     mkdirSync(dir, { recursive: true });

@@ -28,7 +28,8 @@
  * first for a job queued with `refreshFirst` (what `forceRefresh()` does). With no job installed —
  * this phase — all of that is a no-op.
  */
-import { copyFileSync, mkdirSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveSolidcraftCli } from "../solidcraft/binary";
 import {
@@ -225,6 +226,10 @@ export interface CadManagerOptions {
   extraEnv?: Record<string, string> | (() => Record<string, string>);
   onEvent?: (e: CadManagerEvent) => void;
   refresh?: RefreshJob;
+  /** Where each SolidCraft child gets its OWN `TMPDIR` (a folder the manager deletes when that process
+   *  exits, so SolidCraft's `solidcraft-mcp-<pid>-*` folders never pile up). Default: a daemon-owned
+   *  `anvil-sc-*` folder under the system temp folder, made on first spawn. */
+  tmpRoot?: string;
   /** Test seams for the script write. */
   poststepFs?: PoststepFs;
   beforeScriptRename?: (ref: PartRef) => void | Promise<void>;
@@ -436,6 +441,8 @@ export class CadManager {
     }
     this.wake();
     await Promise.all(stops);
+    // The manager's own temp folder (each child's TMPDIR is already gone with its process).
+    if (this.tmpRootDir && !this.opts.tmpRoot) rmSync(this.tmpRootDir, { recursive: true, force: true });
   }
 
   // ── queue ─────────────────────────────────────────────────────────────────────────────────────
@@ -632,6 +639,18 @@ export class CadManager {
     for (const r of w) r();
   }
 
+  private tmpRootDir?: string;
+  /** A fresh, empty TMPDIR for one SolidCraft child, inside the manager's own temp folder. */
+  private childTmpDir(): string {
+    if (!this.tmpRootDir) {
+      if (this.opts.tmpRoot) {
+        mkdirSync(this.opts.tmpRoot, { recursive: true });
+        this.tmpRootDir = this.opts.tmpRoot;
+      } else this.tmpRootDir = mkdtempSync(join(tmpdir(), "anvil-sc-"));
+    }
+    return mkdtempSync(join(this.tmpRootDir, "p-"));
+  }
+
   private spawnEnv(): Record<string, string> {
     const x = this.opts.extraEnv;
     return typeof x === "function" ? x() : (x ?? {});
@@ -692,8 +711,20 @@ export class CadManager {
     // NO `--in` (decision 88): SolidCraft's file sandbox does not apply to a script loaded at start,
     // only to tool calls on a running server. The process starts EMPTY and the script is sent as a
     // `batch`, the way the replay gate does it (solidcraft/replay-client.ts).
-    const common = { extraEnv: this.spawnEnv(), spawn: this.opts.spawn, clock: this.clock, cwd: ref.dir };
-    const client: McpClient = await McpClient.start({ cmd: this.baseCmd(cli.path, ref.dir), ...common });
+    // Each child gets its own TMPDIR, deleted when that process exits (however it exits).
+    const childTmp = this.childTmpDir();
+    const common = { extraEnv: { ...this.spawnEnv(), TMPDIR: childTmp }, spawn: this.opts.spawn, clock: this.clock, cwd: ref.dir };
+    let client: McpClient;
+    try {
+      client = await McpClient.start({ cmd: this.baseCmd(cli.path, ref.dir), ...common });
+    } catch (e) {
+      rmSync(childTmp, { recursive: true, force: true });
+      throw e;
+    }
+    void client.exited.then(
+      () => rmSync(childTmp, { recursive: true, force: true }),
+      () => rmSync(childTmp, { recursive: true, force: true }),
+    );
     // The build's own format number comes from THIS process's script export (of the empty design) —
     // no second process, and no way to skip the check: if the number cannot be learned, the design is
     // not opened.

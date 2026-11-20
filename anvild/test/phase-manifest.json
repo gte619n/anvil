@@ -651,6 +651,17 @@
             "Phase A5 edge cases and gaming (§7) > [A5] verify never writes: the lock store, part.json, design.json, rules.json and the worktree are byte-identical after failing and passing runs; a state dir with no lock store gets no folder",
             "Phase A5 edge cases and gaming (§7) > [A5] the service's verifyParts (what Phase B3's hook calls) gives the CLI's verdicts in process, and refuses with the reason when CAD is unavailable here"
           ]
+        },
+        {
+          "file": "test/unit/cad-a5-followups.test.ts",
+          "names": [
+            "the merge guard command in the system prompt > [A5] a path with a space or a quote is single-quoted so the agent's shell runs exactly that file; a plain path is left as it is",
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] the live manager: a fresh TMPDIR per process inside the manager's temp folder; gone when the process stops, and the folder itself at shutdown",
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] a format refusal kills the child it started, and its TMPDIR goes with it",
+            "each SolidCraft child gets its own TMPDIR, removed with the process > [A5] the merge guard's replay child runs with a TMPDIR inside its throwaway folder, which is gone when verify returns",
+            "the test cache of real SolidCraft builds > [A5] the marker holds the zip's AND the unpacked binary's sha256; a cached binary that no longer matches is unpacked again; stale staging folders are removed",
+            "the test cache of real SolidCraft builds > [A5] a relative ANVIL_TEST_CACHE is resolved to an absolute path"
+          ]
         }
       ],
       "real": [

@@ -19,9 +19,9 @@
  * (never skips).
  */
 import { createHash } from "node:crypto";
-import { copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { httpDownloader, releaseAssetName, releaseAssetUrl, type Download } from "../../src/solidcraft/install";
 import { extractZip } from "../../src/solidcraft/zip";
 
@@ -37,7 +37,8 @@ export const LEGACY_SPIKE_DIR = "/tmp/sc-b0";
 const MARKER = ".zip-sha256";
 
 export function solidcraftTestCache(env: Record<string, string | undefined> = process.env): string {
-  return env.ANVIL_TEST_CACHE ? join(env.ANVIL_TEST_CACHE, "solidcraft") : join(homedir(), "Library", "Caches", "anvil-test", "solidcraft");
+  // Absolute, whatever the test's working folder: a relative ANVIL_TEST_CACHE is resolved once, here.
+  return env.ANVIL_TEST_CACHE ? join(resolve(env.ANVIL_TEST_CACHE), "solidcraft") : join(homedir(), "Library", "Caches", "anvil-test", "solidcraft");
 }
 
 const buildFolder = (v: string) => `solidcraft-cli-${v}-macos-universal`;
@@ -126,8 +127,14 @@ export async function solidcraftReleaseBuild(version: string, opts: CacheOptions
   const x = join(opts.cache ?? solidcraftTestCache(), "x");
   const dir = join(x, version);
   const cli = join(dir, buildFolder(version), "solidcraft-cli");
+  // The marker holds the zip's sha256 AND the sha256 of the solidcraft-cli unpacked from it; a cached
+  // build is used only when the binary on disk still hashes to what was unpacked.
   try {
-    if (existsSync(cli) && readFileSync(join(dir, MARKER), "utf8").trim() === sha) return cli;
+    if (existsSync(cli)) {
+      const [zipSha, cliSha] = readFileSync(join(dir, MARKER), "utf8").trim().split(/\s+/);
+      if (zipSha === sha && cliSha && (await sha256File(cli)) === cliSha) return cli;
+      (opts.log ?? console.log)(`[solidcraft cache] the cached ${cli} does not match its marker; unpacking it again`);
+    }
   } catch {
     /* no marker: unpack again */
   }
@@ -143,10 +150,14 @@ export async function solidcraftReleaseBuild(version: string, opts: CacheOptions
     throw e;
   }
   mkdirSync(x, { recursive: true });
+  // Staging folders an interrupted run left behind (`.<version>-XXXX`) are removed first.
+  for (const name of readdirSync(x)) if (name.startsWith(`.${version}-`)) rmSync(join(x, name), { recursive: true, force: true });
   const staged = mkdtempSync(join(x, `.${version}-`)); // a new, empty folder for the untrusted archive
   try {
     await extractZip(zip, join(staged, buildFolder(version)));
-    writeFileSync(join(staged, MARKER), `${sha}\n`);
+    const unpacked = join(staged, buildFolder(version), "solidcraft-cli");
+    if (!existsSync(unpacked)) throw new Error(`[solidcraft cache] ${zip} unpacked without a solidcraft-cli`);
+    writeFileSync(join(staged, MARKER), `${sha} ${await sha256File(unpacked)}\n`);
     rmSync(dir, { recursive: true, force: true });
     renameSync(staged, dir);
   } finally {
