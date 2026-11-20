@@ -5,8 +5,10 @@
  *
  * Skipped unless ANVIL_REAL_TOOLS is set (`phase-gate B1 --require-real` sets it and fails on a skip).
  *
- * The zips are the ones the B0 spike downloaded into /tmp/sc-b0/dl when they are still there (no
- * network needed); otherwise the pinned release is downloaded from GitHub.
+ * The zips come from the persistent test cache (../helpers/solidcraft-cache.ts:
+ * `~/Library/Caches/anvil-test/solidcraft/dl`, or `$ANVIL_TEST_CACHE/solidcraft/dl`). A zip missing
+ * there is taken from the B0 spike's /tmp/sc-b0/dl if that still exists, else downloaded from the
+ * pinned GitHub release; every one is checked against its recorded sha256 before use.
  */
 import { afterAll, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdtempSync, openSync, closeSync, readdirSync, rmSync, statSync, writeSync, constants } from "node:fs";
@@ -17,7 +19,6 @@ import { resolveSolidcraftCli, setManagedSolidcraftCli } from "../../src/solidcr
 import {
   SOLIDCRAFT_TEAM_ID,
   fileDownloader,
-  httpDownloader,
   installSolidcraft,
   installedSolidcraft,
   solidcraftCliPath,
@@ -29,11 +30,12 @@ import {
   type Run,
 } from "../../src/solidcraft/install";
 import { SolidcraftPinService, pinAvailability } from "../../src/solidcraft/pin";
+import { SOLIDCRAFT_TEST_RELEASES, solidcraftReleaseZip } from "../helpers/solidcraft-cache";
 
-const SPIKE_DL = "/tmp/sc-b0/dl";
 const GOOD = { version: "0.44.1", sha256: "f324ec49fd50b30d6dc18928d84749b8a72a132e4233daf844e422b3c38bc251" };
 const UNNOTARIZED = { version: "0.30.1", sha256: "1effd9b38bc7f8a67ef7a7c8bec49df6453b307e9f1476b638e2c4f70208dc2f" };
-const localZip = (version: string): string => join(SPIKE_DL, `solidcraft-cli-${version}-macos-universal.zip`);
+// The cache helper verifies each zip against the same recorded sha256 the installer is given here.
+if (SOLIDCRAFT_TEST_RELEASES[GOOD.version] !== GOOD.sha256 || SOLIDCRAFT_TEST_RELEASES[UNNOTARIZED.version] !== UNNOTARIZED.sha256) throw new Error("[B1 real] the release sha256 values here and in test/helpers/solidcraft-cache.ts differ");
 
 const dirs: string[] = [];
 function tmp(prefix: string): string {
@@ -46,10 +48,10 @@ afterAll(() => {
   dirs.forEach((d) => rmSync(d, { recursive: true, force: true }));
 });
 
-/** The spike's zip from disk when present, else the real download. */
-function downloader(version: string): { download: Download; from: string } {
-  if (existsSync(localZip(version))) return { download: fileDownloader(localZip), from: localZip(version) };
-  return { download: httpDownloader(), from: "GitHub" };
+/** The release zip from the persistent cache (fetched into it, and its sha256 checked, when missing). */
+async function downloader(version: string): Promise<{ download: Download; from: string }> {
+  const zip = await solidcraftReleaseZip(version); // throws with a clear message when it cannot be had
+  return { download: fileDownloader((v) => (v === version ? zip : undefined)), from: zip };
 }
 
 /** The real runner, recording each command and its exit code. */
@@ -72,7 +74,7 @@ async function installGood() {
   if (shared) return shared;
   const dir = tmp("anvil-sc-real-");
   const run = recordingRun();
-  const { download, from } = downloader(GOOD.version);
+  const { download, from } = await downloader(GOOD.version);
   const result = await installSolidcraft(dir, GOOD, { download, run, log: (m) => console.log(m) });
   shared = { dir, run, from, result };
   return shared;
@@ -148,7 +150,7 @@ test.skipIf(!REAL)(
     const quick = { run: spawnRun, notarizeAttempts: 2, notarizeRetryMs: 1_000, sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms)) };
 
     // 1. The real zip against a sha256 that is not its own: refused at step 1, nothing left on disk.
-    const { download } = downloader(GOOD.version);
+    const { download } = await downloader(GOOD.version);
     const wrongDir = tmp("anvil-sc-real-wrong-");
     const wrong = await installSolidcraft(wrongDir, { version: GOOD.version, sha256: UNNOTARIZED.sha256 }, { download, run: spawnRun, log: () => {} });
     expect(wrong).toMatchObject({ ok: false, reason: "sha-mismatch" });
@@ -172,13 +174,12 @@ test.skipIf(!REAL)(
     if (!ls.ok) expect(ls.detail).toContain(SOLIDCRAFT_TEAM_ID);
 
     // 4. SolidCraft 0.30.1 is signed by the right team but was never notarized: refused at step 5.
-    // The zip is REQUIRED: a real-tool run that cannot exercise this refusal must fail, not pass quietly.
-    if (!existsSync(localZip(UNNOTARIZED.version))) {
-      throw new Error(`[B1 real] required file missing: ${localZip(UNNOTARIZED.version)} (the SolidCraft 0.30.1 release zip, sha256 ${UNNOTARIZED.sha256}). Download it from the v0.30.1 release into ${SPIKE_DL} and run again.`);
-    }
+    // The zip is REQUIRED: a real-tool run that cannot exercise this refusal must fail, not pass quietly
+    // (the cache helper throws, naming what it tried, when the zip cannot be had).
+    const { download: oldZip } = await downloader(UNNOTARIZED.version);
     const oldDir = tmp("anvil-sc-real-old-");
     const run = recordingRun();
-    const old = await installSolidcraft(oldDir, UNNOTARIZED, { ...quick, download: fileDownloader(localZip), run, log: () => {} });
+    const old = await installSolidcraft(oldDir, UNNOTARIZED, { ...quick, download: oldZip, run, log: () => {} });
     expect(old).toMatchObject({ ok: false, reason: "not-notarized" });
     if (!old.ok) expect(old.detail).toContain("Unnotarized Developer ID");
     // It got as far as step 5 (signature and team passed) and was never executed.

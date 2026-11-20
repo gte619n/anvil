@@ -5,9 +5,10 @@
  *
  * Skipped unless ANVIL_REAL_TOOLS is set (`phase-gate B2 --require-real` sets it and fails on a skip).
  *
- * It needs TWO real builds, the ones the B0 spike extracted: 0.43.0 as the pinned build and 0.44.1
- * as the candidate. Without both, every test here FAILS with the paths it wants: a real run that
- * compares a build with itself, or compares nothing, must not pass.
+ * It needs TWO real builds: 0.43.0 as the pinned build and 0.44.1 as the candidate, unpacked from
+ * their sha256-checked release zips into the persistent test cache (../helpers/solidcraft-cache.ts;
+ * fetched when missing). If either cannot be had, every test here FAILS with what was tried: a real
+ * run that compares a build with itself, or compares nothing, must not pass.
  */
 import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -20,9 +21,10 @@ import { classify, replayInSandbox, replayMachine, type ReplayBuild } from "../.
 import { sandboxedReplay } from "../../src/solidcraft/replay-client";
 import { screenScriptText } from "../../src/solidcraft/script-screen";
 import { commitFiles, fixtureRepo, git } from "../helpers/solidcraft-replay";
+import { LEGACY_SPIKE_DIR, solidcraftReleaseBuild } from "../helpers/solidcraft-cache";
 
-const SPIKE = "/tmp/sc-b0";
-const spikeBuild = (v: string): string => join(SPIKE, "x", v, `solidcraft-cli-${v}-macos-universal`, "solidcraft-cli");
+/** Optional extras the B0 spike left behind (read when still there; otherwise generated). */
+const SPIKE = LEGACY_SPIKE_DIR;
 const SPIKE_PLATE = join(SPIKE, "out", "0.43.0", "plate.script.json");
 const SPIKE_GEOMFAIL = join(SPIKE, "cases", "geomfail.json");
 /** The reference plate at L = 80, as the real kernel measures it (A0/B0 evidence). */
@@ -44,18 +46,10 @@ function versionOf(path: string): string {
 }
 
 /** The pinned build and the candidate: two different real builds, or a thrown explanation. */
-function realBuilds(): { pinned: ReplayBuild; candidate: ReplayBuild } {
-  const missing = ["0.43.0", "0.44.1"].map(spikeBuild).filter((p) => !existsSync(p));
-  if (missing.length) {
-    throw new Error(
-      `[B2 real] required SolidCraft builds are missing: ${missing.join(", ")}. ` +
-        `This suite compares two real builds and does not fall back to one. To recreate them, for each of 0.43.0 and 0.44.1 run ` +
-        `\`mkdir -p ${SPIKE}/x/<version> && unzip ${SPIKE}/dl/solidcraft-cli-<version>-macos-universal.zip -d ${SPIKE}/x/<version>\`; ` +
-        `if the zips under ${SPIKE}/dl are gone too, download solidcraft-cli-<version>-macos-universal.zip from the v0.43.0 and v0.44.1 releases of github.com/tangency-labs/solidcraft first.`,
-    );
-  }
-  const pinned = { path: spikeBuild("0.43.0"), version: versionOf(spikeBuild("0.43.0")) };
-  const candidate = { path: spikeBuild("0.44.1"), version: versionOf(spikeBuild("0.44.1")) };
+async function realBuilds(): Promise<{ pinned: ReplayBuild; candidate: ReplayBuild }> {
+  const [pinnedPath, candidatePath] = [await solidcraftReleaseBuild("0.43.0"), await solidcraftReleaseBuild("0.44.1")];
+  const pinned = { path: pinnedPath, version: versionOf(pinnedPath) };
+  const candidate = { path: candidatePath, version: versionOf(candidatePath) };
   expect(pinned.version).toBe("0.43.0");
   expect(candidate.version).toBe("0.44.1"); // two builds, not one twice
   return { pinned, candidate };
@@ -97,7 +91,7 @@ const sandbox = (build: ReplayBuild, text: string) => replayInSandbox(build, tex
 test.skipIf(!REAL)(
   "[B2 real] a real exported plate script, read from origin/main of a real repository, replays to `same` under the pinned build and the candidate",
   async () => {
-    const { pinned, candidate } = realBuilds();
+    const { pinned, candidate } = await realBuilds();
     const script = await plateScript(pinned.path);
     expect(screenScriptText(script).ok).toBe(true); // a real export is a plain design script
     const root = tmp("anvil-sc-real-b2-");
@@ -132,7 +126,7 @@ test.skipIf(!REAL)(
 test.skipIf(!REAL)(
   "[B2 real] a script whose fillet cannot be computed is a failed replay even though the real eval exits 0",
   async () => {
-    const { pinned, candidate } = realBuilds();
+    const { pinned, candidate } = await realBuilds();
     const good = await plateScript(pinned.path);
     const bad = withImpossibleFillet(good);
     const dir = tmp("anvil-sc-real-b2-bad-");
@@ -172,7 +166,7 @@ test.skipIf(!REAL)(
 test.skipIf(!REAL)(
   "[B2 real] a design carrying file-writing commands is refused and writes nothing outside the sandbox; with the screen bypassed the sandbox alone still stops the write",
   async () => {
-    const { pinned, candidate } = realBuilds();
+    const { pinned, candidate } = await realBuilds();
     const good = await plateScript(pinned.path);
     const outside = tmp("anvil-sc-real-b2-victim-");
     const victim = join(outside, "authorized_keys");
@@ -251,7 +245,7 @@ async function textScript(cli: string): Promise<Script> {
 test.skipIf(!REAL)(
   "[B2 real] a script whose sketch text names a font file by path or environment reference is refused; with the screen bypassed the sandboxed build does not open the file",
   async () => {
-    const { pinned, candidate } = realBuilds();
+    const { pinned, candidate } = await realBuilds();
     const base = await textScript(candidate.path);
     const withFont = (font: string): string => {
       const s = structuredClone(base);
