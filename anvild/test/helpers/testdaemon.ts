@@ -36,9 +36,10 @@ export interface FakeRunner extends TestDaemonRunner {
 
 /**
  * A runner that starts nothing. `spawn` serves `/api/health` and a page on 127.0.0.1:<ANVIL_PORT> from
- * inside the test process — the stand-in for the daemon — until its group is "killed".
+ * inside the test process — the stand-in for the daemon — until its group is "killed". `page` may
+ * answer other paths itself (the pages an agent-modified daemon could serve).
  */
-export function fakeRunner(): FakeRunner {
+export function fakeRunner(page?: (req: Request) => Response | undefined): FakeRunner {
   const r: FakeRunner = {
     builds: [],
     starts: [],
@@ -61,6 +62,8 @@ export function fakeRunner(): FakeRunner {
               const u = new URL(req.url);
               requests.push(u.pathname);
               if (u.pathname === "/api/health") return Response.json({ ok: true, subscriptionAuthOk: false });
+              const own = page?.(req);
+              if (own) return own;
               return new Response("<!doctype html><title>Anvil (test daemon)</title><body>hello from the stand-in</body>", { headers: { "content-type": "text/html" } });
             },
           })

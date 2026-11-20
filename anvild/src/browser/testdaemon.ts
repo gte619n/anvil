@@ -17,7 +17,10 @@
  * 15-minute timer; the proxy exemption is revoked — open connections dropped — at the same moment.
  *
  * A daemon that dies without stopping (a crash) cannot run any of that, so every started test daemon
- * is also written to `<stateDir>/testdaemons.json`, and the next start reaps what is listed there.
+ * is also written to `<stateDir>/testdaemons.json` with what identifies its process — its start time
+ * (`ps -o lstart=`), its exact command line and its environment's `HOME` (the temp home) — and the next
+ * start reaps what is listed there. A pid is signalled only when all three still match (C4 review,
+ * item 6): a pid the system has since given to another program is left alone and its row dropped.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -185,8 +188,20 @@ export interface TestDaemonPorts {
   revokeLoopbackPort(sessionId: string, port?: number): void;
 }
 
+/** What identifies a running process across a restart of this daemon (pids are reused). */
+export interface ProcessIdentity {
+  /** `ps -o lstart=`: when it started, to the second. */
+  started: string;
+  /** `ps -o command=`: its exact command line. */
+  command: string;
+  /** Its environment's HOME (`ps eww`), when it could be read. */
+  home?: string;
+}
+
 export interface TestDaemonSeams {
   runner: TestDaemonRunner;
+  /** What `ps` says about a live pid, or undefined when it is not running (default: `ps`). */
+  identify: (pid: number) => ProcessIdentity | undefined;
   /** Absolute path of `bun` (default: the binary this daemon runs under). */
   bunPath: () => string;
   /** Create the new temporary home and return its real path. */
@@ -212,6 +227,8 @@ export interface TestDaemonServiceDeps extends Partial<TestDaemonSeams> {
 
 interface Running {
   home: string;
+  /** The process as `ps` saw it right after it started (for the crash ledger). */
+  identity?: ProcessIdentity;
   port: number;
   url: string;
   proc?: TestDaemonProcess;
@@ -235,6 +252,7 @@ export class TestDaemonService {
   constructor(private readonly deps: TestDaemonServiceDeps) {
     this.seams = {
       runner: deps.runner ?? defaultTestDaemonRunner,
+      identify: deps.identify ?? psIdentity,
       bunPath: deps.bunPath ?? (() => process.execPath),
       makeHome: deps.makeHome ?? defaultMakeHome,
       pickPort: deps.pickPort ?? pickLoopbackPort,
@@ -317,6 +335,7 @@ export class TestDaemonService {
     if (!reg.ok) return fail(`the test daemon's port could not be used (${reg.reason})`);
 
     rec.proc = this.seams.runner.spawn(bun, ["run", "src/main.ts"], { cwd: checkout.anvild, env: testDaemonEnv({ bunDir, home, port: rec.port }) });
+    if (rec.proc.pid > 1) rec.identity = this.seams.identify(rec.proc.pid);
     this.writeLedger();
     let exited = false;
     void rec.proc.exited.then(() => {
@@ -406,7 +425,7 @@ export class TestDaemonService {
   }
 
   private writeLedger(): void {
-    const rows = [...this.bySession.values()].filter((r) => r.proc?.pid).map((r) => ({ pid: r.proc!.pid, home: r.home }));
+    const rows = [...this.bySession.values()].filter((r) => r.proc?.pid).map((r) => ({ pid: r.proc!.pid, home: r.home, ...(r.identity ? { started: r.identity.started, command: r.identity.command } : {}) }));
     try {
       if (rows.length) writeFileSync(this.ledgerPath(), `${JSON.stringify(rows)}\n`, { mode: 0o600 });
       else rmSync(this.ledgerPath(), { force: true });
@@ -418,10 +437,12 @@ export class TestDaemonService {
   /**
    * Kill and delete the test daemons a previous run of THIS daemon left behind (it crashed before it
    * could stop them). A row is believed only as far as: the home is a folder this code created (its
-   * name and its marker file), and the process, if still alive, is a daemon (`src/main.ts`).
+   * name and its marker file). Its pid is signalled only when the process running under it now is the
+   * one that was started — the same start time, the same command line, and HOME the row's temp home;
+   * otherwise (the pid is gone or was reused) only the row and the home go.
    */
-  reapOrphans(commandOf: (pid: number) => string = psCommand): number {
-    let rows: { pid?: unknown; home?: unknown }[];
+  reapOrphans(identify: (pid: number) => ProcessIdentity | undefined = this.seams.identify): number {
+    let rows: { pid?: unknown; home?: unknown; started?: unknown; command?: unknown }[];
     try {
       rows = JSON.parse(readFileSync(this.ledgerPath(), "utf8"));
       if (!Array.isArray(rows)) rows = [];
@@ -432,7 +453,10 @@ export class TestDaemonService {
     for (const row of rows) {
       if (typeof row?.home !== "string" || typeof row.pid !== "number" || !Number.isInteger(row.pid) || row.pid < 2) continue;
       if (!basename(row.home).startsWith(TEST_DAEMON_HOME_PREFIX) || !existsSync(join(row.home, HOME_MARKER))) continue;
-      if (commandOf(row.pid).includes("src/main.ts")) killGroupOf(row.pid);
+      if (typeof row.started === "string" && row.started && typeof row.command === "string" && row.command) {
+        const now = identify(row.pid);
+        if (now && now.started === row.started && now.command === row.command && now.home === row.home) killGroupOf(row.pid);
+      }
       try {
         rmSync(row.home, { recursive: true, force: true });
         reaped++;
@@ -449,10 +473,23 @@ export class TestDaemonService {
   }
 }
 
-function psCommand(pid: number): string {
+const psOut = (args: string[]): string => {
   try {
-    return Bun.spawnSync(["/bin/ps", "-o", "command=", "-p", String(pid)]).stdout.toString();
+    const r = Bun.spawnSync(["/bin/ps", ...args], { stdout: "pipe", stderr: "ignore" });
+    return r.exitCode === 0 ? r.stdout.toString().trim() : "";
   } catch {
     return "";
   }
+};
+
+/** What `ps` says about `pid`: start time, command line, and the HOME in its environment. */
+export function psIdentity(pid: number): ProcessIdentity | undefined {
+  if (!Number.isInteger(pid) || pid < 2) return undefined;
+  const started = psOut(["-o", "lstart=", "-p", String(pid)]);
+  const command = psOut(["-o", "command=", "-p", String(pid)]);
+  if (!started || !command) return undefined;
+  // `ps eww` appends the environment to the command line (own-user processes only).
+  const withEnv = psOut(["eww", "-o", "command=", "-p", String(pid)]);
+  const home = withEnv.startsWith(command) ? / HOME=(\S+)/.exec(withEnv.slice(command.length))?.[1] : undefined;
+  return { started, command, ...(home ? { home } : {}) };
 }

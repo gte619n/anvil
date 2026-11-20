@@ -58,7 +58,8 @@ describe("classification at the gate", () => {
     expect(call("browser_take_screenshot", { filename: "/etc/x.png" })).toMatchObject({ kind: "deny" });
     expect(call("browser_snapshot", { filename: "../x.yml" })).toMatchObject({ kind: "deny" });
     expect(call("browser_console_messages", { filename: "a/../../x.log" })).toMatchObject({ kind: "deny" });
-    expect(call("browser_take_screenshot", { filename: "shot.png" })).toMatchObject({ kind: "allow" });
+    expect(call("browser_snapshot", { filename: "page.yml" })).toMatchObject({ kind: "allow" });
+    // (browser_take_screenshot takes no filename at all since the C4 review: see browser-c4-review.test.ts)
   });
 
   test("[C2] the C4 hook can exempt browser_evaluate (the session's own test daemon); run_code_unsafe stays denied whatever the hook says", () => {

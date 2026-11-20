@@ -159,14 +159,16 @@ describe("item 2: the card's picture", () => {
     expect((await browserHook(rig, s, "browser_take_screenshot")).decision).toBe("allow");
     rig.sup.mcp.gate.onToolResult(s, "browser", { tool: "browser_take_screenshot", input: {}, content: [{ type: "text", text: `### Result\n- [Screenshot of viewport](${planted})` }], isError: false });
     expect(browserOf(rig).screenshot(s.id, true)).toBeUndefined();
-    // The file the server writes during the call is used.
+    // Since the C4 review not even a file the server writes during the call is used: only an inline image.
     const fresh = join(worktree, ".anvil-browser", "page-2026-11-19T10-00-00-000Z.png");
     expect((await browserHook(rig, s, "browser_take_screenshot")).decision).toBe("allow");
     writeFileSync(fresh, "\x89PNG\r\n\x1a\nfresh");
     rig.sup.mcp.gate.onToolResult(s, "browser", { tool: "browser_take_screenshot", input: {}, content: [{ type: "text", text: `### Result\n- [Screenshot of viewport](${fresh})` }], isError: false });
+    expect(browserOf(rig).screenshot(s.id, true)).toBeUndefined();
+    shotResult(s);
     const img = browserOf(rig).screenshot(s.id, true)!;
     expect(img).toBeDefined();
-    expect(readFileSync(rig.sup.attachmentBytes(s.id, img.attachmentId)!.path, "latin1")).toContain("fresh");
+    expect(readFileSync(rig.sup.attachmentBytes(s.id, img.attachmentId)!.path, "latin1")).toContain("real");
   });
 
   test("[C3] review 2: the screenshot goes stale after an input call and when the browser contacts another site after it was taken", async () => {
