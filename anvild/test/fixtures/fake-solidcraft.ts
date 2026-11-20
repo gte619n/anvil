@@ -27,7 +27,7 @@
  * through or blind; from a sketch's points or a position; drilled along -Z),
  * solid.pattern.rectangular (of hole / cylinder features), file.insert_step (a fixed reference
  * body; its timeline type is `BaseFeature`, as the real import's is), inspect.interference
- * (axis-aligned bounding-box overlap), inspect.measure {bodies} (the measure reply for the named
+ * (axis-aligned bounding-box overlap), inspect.measure {bodies, names_only} (the measure reply for the named
  * bodies; null or [] means all), view.pick {rays, all} (rays against the closed-form solids: enough to
  * tell a hole from a boss from a fillet on Z-axis cylinders, and a blind hole's floor),
  * timeline.export_script.
@@ -819,6 +819,8 @@ function measure(m: Model, a: Json): Json {
       return b;
     });
   }
+  // `names_only`: each placed body's world name and its definition's (the fake places every body once).
+  if (a.names_only === true) return { bodies: bodies.map((b) => ({ definition: b.name, name: b.name })), body_count: bodies.length };
   const summary = a.summary === true;
   const volume = bodies.reduce((s, b) => s + b.volume, 0) * VOLUME_SCALE;
   return {

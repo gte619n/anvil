@@ -376,6 +376,39 @@ describe("anvil_cad tools", () => {
     expect(readFileSync(join(repo, "cad", "plate", "design.json"), "utf8")).toBe(before);
   });
 
+  test("[A4] re-review: execute and batch refuse placing a reference again — occurrence.copy or a component pattern of a ref- component, or of one named by id or path; the agent's own components still copy", async () => {
+    const refused: [string, Record<string, unknown>][] = [
+      ["occurrence.copy", { occurrence: "ref-far.step:1", translate: [-100, 0, 0] }],
+      ["occurrence.copy", { component: "ref-far.step" }],
+      ["occurrence.copy", { component: " REF-far.step " }],
+      ["occurrence.copy", { occurrence: 3 }],
+      ["occurrence.copy", { occurrence: "Bracket:1", path: [3] }],
+      ["occurrence.copy", {}],
+      ["solid.pattern.rectangular", { components: ["ref-far.step"], dir1: [-1, 0, 0], count1: 2, spacing1: 100 }],
+      ["solid.pattern.circular", { components: [2], axis: "Z", count: 3 }],
+      ["sketch.draw.dimensioned", { command: "occurrence.copy", params: { occurrence: "ref-far.step:1" } }], // nested
+    ];
+    for (const [command, params] of refused) expect(refusedStep(command, params)).toContain("a reference may be placed once");
+    for (const [command, params] of [
+      ["occurrence.copy", { occurrence: "Bracket:1", translate: [10, 0, 0] }],
+      ["occurrence.copy", { component: "Bracket" }],
+      ["solid.pattern.rectangular", { components: ["Bracket"], dir1: [1, 0, 0], count1: 2, spacing1: 10 }],
+      ["solid.pattern.rectangular", { features: ["Hole"], dir1: [-1, 0, 0], count1: 2, spacing1: 10 }],
+      ["occurrence.move", { occurrence: "ref-far.step:1", translate: [1, 0, 0] }], // a move keeps one placement (checked where it is)
+    ] as [string, Record<string, unknown>][])
+      expect(refusedStep(command, params)).toBeUndefined();
+    const { manager, requests } = recordingManager();
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
+    await tools.open_part!({ part: "plate" });
+    const one = await tools.execute!({ command: "occurrence.copy", params: { occurrence: "ref-far.step:1", translate: [-100, 0, 0] } });
+    expect(one.isError).toBe(true);
+    expect(one.text).toContain("a reference may be placed once");
+    const many = await tools.batch!({ commands: [BOX(), { command: "occurrence.copy", params: { component: "ref-far.step" } }] });
+    expect(many.isError).toBe(true);
+    expect(many.text).toContain("step 2");
+    expect(requests).toEqual([]);
+  });
+
   test("[A1] execute and batch are default-deny: only allow-listed command ids run, and a new unknown id is refused", async () => {
     // Everything the reference plate and the fake's command table use is allowed…
     for (const step of REFERENCE_PLATE) expect(refusedStep(step.command, step.params)).toBeUndefined();

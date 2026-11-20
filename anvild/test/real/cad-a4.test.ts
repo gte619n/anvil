@@ -9,7 +9,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFi
 import { join } from "node:path";
 import { partRef } from "../../src/cadwork/partfolder";
 import { DUPLICATE_REFERENCE, REFERENCE_CHANGED, importFeatureName } from "../../src/cadwork/refs";
-import { REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
+import { REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { expectedReleaseFiles, MANIFEST } from "../../src/cadwork/release";
 import { PLATE_EXPECTATIONS, buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
 import { repoIdentity } from "../../src/cadwork/locks";
@@ -313,6 +313,105 @@ describe("real SolidCraft: references and the release pack", () => {
     expect(p.state).toBe("fail");
     expect(p.failing.join("\n")).toContain(`${DUPLICATE_REFERENCE} far.step`);
     expect(p.failing.join("\n")).toMatch(/overlaps far_b by 600 mm³/);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: re-review — the approved far.step reference copied onto the plate (occurrence.copy of ref-far.step:1, translate -100) fails the gate: 'reference far.step is placed 2 times' and Body1 overlaps far (ref-far.step:2) by 600 mm³; the agent's execute refuses the copy; release_part writes nothing and verify-cli exits 1", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const far = await blockStep(x, repo, "far", [100, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(far, join(repo, ".anvil-downloads", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }))).json.imported).toBe(true);
+    let g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    const copy = { command: "occurrence.copy", params: { occurrence: "ref-far.step:1", translate: [-100, 0, 0] } };
+    // The agent's own tools refuse it before it reaches SolidCraft…
+    const refused = await x.tools.execute!(copy);
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain(REFERENCE_PLACED_ONCE);
+    // …so it arrives the other way: a step in design.json (what a Bash write can add), here run as one.
+    const ref = partRef(repo, "plate");
+    const ran = await x.manager.request(ref, { tool: "execute", args: copy, kind: "mutate" });
+    expect(ran.result.isError).toBe(false);
+    expect(readFileSync(join(repo, "cad", "plate", "design.json"), "utf8")).toContain('"occurrence.copy"');
+    // SolidCraft's own all-bodies check sees the copy on the plate.
+    const all = (await x.tools.execute!({ command: "inspect.interference", params: {} })).json;
+    expect(all.interferences.map((i: any) => `${i.a}|${i.b}|${Math.round(i.volume_mm3)}`)).toEqual(["Body1|far (ref-far.step:2)|600"]);
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    const lines = g.failing.join("\n");
+    expect(lines).toContain(`reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE}`);
+    expect(g.checks.find((c: any) => c.id === "interference far.step").measured).toMatch(/Body1 overlaps far \(ref-far\.step:2\) by 600 mm³/);
+    const rel = await asOwner(x, x.tools.release_part!({ part: "plate" }));
+    expect(rel.isError).toBe(true);
+    expect(rel.text).toContain("the gate is fail");
+    expect(existsSync(join(repo, "cad", "plate", "release"))).toBe(false);
+    const stateDir = x.service.locks.file.replace(/\/cadwork\/locks\.json$/, "");
+    const v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    const p = v.json.parts.find((q: any) => q.part === "plate");
+    expect(p.state).toBe("fail");
+    expect(p.failing.join("\n")).toContain(`reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE}`);
+    expect(p.failing.join("\n")).toMatch(/Body1 overlaps far \(ref-far\.step:2\) by 600 mm³/);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: re-review — a copy of the far.step reference left in place, then moved onto the plate by the agent's occurrence.move of ref-far.step:2: placed twice fails at once, and after the move the overlap is found at the copy's final position", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const far = await blockStep(x, repo, "far", [100, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(far, join(repo, ".anvil-downloads", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }))).json.imported).toBe(true);
+    const ref = partRef(repo, "plate");
+    expect((await x.manager.request(ref, { tool: "execute", args: { command: "occurrence.copy", params: { occurrence: "ref-far.step:1" } }, kind: "mutate" })).result.isError).toBe(false);
+    let g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE}`);
+    expect(g.checks.find((c: any) => c.id === "interference far.step")).toMatchObject({ ok: true, measured: "no overlap" }); // both placements are clear at x=100
+    await must(x.tools.execute!({ command: "occurrence.move", params: { occurrence: "ref-far.step:2", translate: [-100, 0, 0] } }));
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE}`);
+    expect(g.checks.find((c: any) => c.id === "interference far.step").measured).toMatch(/Body1 overlaps far \(ref-far\.step:2\) by 600 mm³/);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: re-review — after a refused import is rolled back, a read through execute (inspect.measure) does not lift the redo ceiling: redo is refused, design.json is unchanged and no BaseFeature comes back", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    let armed: (() => void) | undefined;
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI, deps: { manager: { beforeScriptRename: () => { const f = armed; armed = undefined; f?.(); } } } });
+    const far = await blockStep(x, repo, "far", [200, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(far, join(repo, ".anvil-downloads", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    const designPath = join(repo, "cad", "plate", "design.json");
+    const scriptBefore = readFileSync(designPath, "utf8");
+    armed = () => {
+      const pj = JSON.parse(readFileSync(x.partJson, "utf8"));
+      pj.process = "cnc-3axis";
+      writeFileSync(x.partJson, JSON.stringify(pj, null, 2) + "\n");
+    };
+    const r = await asOwnerEach(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }), (i) => i === 0);
+    expect(r.json.imported).toBe(false);
+    expect(readFileSync(designPath, "utf8")).toBe(scriptBefore);
+    // SolidCraft still holds the rolled-back import in its redo history…
+    const depth = (await x.tools.inspect_design!({ measure: false, sketches: false, timeline: "summary", bodies: true })).json;
+    expect(depth.redo).toBeGreaterThan(0);
+    // …and a read the agent sends through execute keeps it there.
+    const m = await x.tools.execute!({ command: "inspect.measure", params: {} });
+    expect(m.isError).toBe(false);
+    expect((await x.tools.inspect_design!({ measure: false, sketches: false, timeline: "summary", bodies: true })).json.redo).toBeGreaterThan(0);
+    const redo = await x.tools.redo!({});
+    expect(redo.isError).toBe(true);
+    expect(redo.text).toContain("nothing to redo");
+    expect(readFileSync(designPath, "utf8")).toBe(scriptBefore);
+    const insp = (await x.tools.inspect_design!({ measure: false, sketches: false, timeline: "summary", bodies: true })).json;
+    expect(insp.timeline.filter((f: any) => f.type === "BaseFeature")).toEqual([]);
   }, 300_000);
 
   test.skipIf(!REAL)("[A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded", async () => {

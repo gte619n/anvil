@@ -20,7 +20,7 @@ import {
   REFERENCE_MAX_BYTES,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
-import { coverageChecks, referenceGate, REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
+import { coverageChecks, placementChecks, readPlacements, referenceGate, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { readDesignFile } from "../../src/cadwork/poststep";
 import { cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempRepo } from "../helpers/cad-work";
 
@@ -177,6 +177,8 @@ function interferenceStub(hot: string[]) {
   };
   return { call, asked };
 }
+/** The design's bodies, each placed once (its world name is its own name). */
+const once = (designBodies: string[], referenceBodies: string[]) => ({ designBodies, referenceBodies, placements: Object.fromEntries([...designBodies, ...referenceBodies].map((b) => [b, [b]])) });
 const ruled = (must: string[]) => ({ kind: "ok", file: { expectations: { noInterferenceWith: must }, refs: [] } }) as any;
 const failing = (checks: { id: string; ok: boolean; hard: boolean; measured: unknown }[]) => checks.filter((c) => !c.ok && c.hard).map((c) => `${c.id}: ${String(c.measured)}`);
 
@@ -184,7 +186,7 @@ describe("every embedded import is checked (the second import of a file name)", 
   test("[A4] re-review: two imports carrying the same file name fail closed ('duplicate reference import far.step'); the interference check covers the bodies of BOTH and finds the second one's overlap", async () => {
     const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }, { file: "far.step", step: "FAR", bodies: ["far_b"] }], { "far.step": "FAR" });
     const s = interferenceStub(["far_b"]);
-    const g = await referenceGate(s.call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a", "far_b"] });
+    const g = await referenceGate(s.call as any, ref, ruled(["far.step"]), scriptSha, once(["Body1"], ["far_a", "far_b"]));
     const bad = failing(g.checks);
     expect(bad.find((l) => l.startsWith("ref far.step:"))).toContain(`${DUPLICATE_REFERENCE} far.step: 2 imports`);
     expect(s.asked).toEqual([["Body1", "far_a", "far_b"]]);
@@ -195,7 +197,7 @@ describe("every embedded import is checked (the second import of a file name)", 
 
   test("[A4] re-review: the SECOND import's bytes differ from refs/ — named on the duplicate line, and its body is not a known reference", async () => {
     const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }, { file: "far.step", step: "BLOCK AT ORIGIN", bodies: ["far_b"] }], { "far.step": "FAR" });
-    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a", "far_b"] });
+    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, once(["Body1"], ["far_a", "far_b"]));
     const dup = failing(g.checks).find((l) => l.startsWith("ref far.step:"))!;
     expect(dup).toContain(DUPLICATE_REFERENCE);
     expect(dup).toContain("import 1 (ref-far.step-0, bodies far_a) matches");
@@ -203,17 +205,47 @@ describe("every embedded import is checked (the second import of a file name)", 
     expect(failing(g.checks).find((l) => l.startsWith("covered reference bodies:"))).toContain("far_b");
     // The same import alone, with the bytes of refs/: everything passes.
     const one = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }], { "far.step": "FAR" });
-    const ok = await referenceGate(interferenceStub([]).call as any, one.ref, ruled(["far.step"]), one.scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a"] });
+    const ok = await referenceGate(interferenceStub([]).call as any, one.ref, ruled(["far.step"]), one.scriptSha, once(["Body1"], ["far_a"]));
     expect(failing(ok.checks)).toEqual([]);
   });
 
   test("[A4] re-review: a reference body no checked import accounts for fails naming it — a stray BaseFeature body; an uncovered import whose bytes match refs/ fails on its own line", async () => {
     const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }, { file: "other.step", step: "OTHER", bodies: ["other_a"] }], { "far.step": "FAR", "other.step": "OTHER" });
-    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a", "other_a", "ghost"] });
+    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, once(["Body1"], ["far_a", "other_a", "ghost"]));
     const bad = failing(g.checks);
     expect(bad).toContain(`covered other.step: reference other.step ${REFERENCE_NOT_COVERED}`);
     expect(bad).toContain(`covered reference bodies: reference ghost ${REFERENCE_NOT_COVERED}`);
     expect(bad.some((l) => l.includes("far_a"))).toBe(false);
+  });
+});
+
+describe("a reference may be placed once; interference checks every placement", () => {
+  test("[A4] re-review: placements are read from inspect.measure names_only (world name per placement, by definition); a reply without that shape throws", () => {
+    expect(readPlacements({ bodies: [{ definition: "Body1", name: "Body1" }, { definition: "far", name: "far" }, { definition: "far", name: "far (ref-far.step:2)" }], body_count: 3 })).toEqual({ Body1: ["Body1"], far: ["far", "far (ref-far.step:2)"] });
+    expect(() => readPlacements({})).toThrow("no body list");
+    expect(() => readPlacements({ bodies: [{ name: "far" }] })).toThrow("without a name and definition");
+  });
+
+  test("[A4] re-review: a reference placed twice (occurrence.copy of ref-far.step:1) is a hard fail 'reference far.step is placed 2 times; a reference may be placed once'; an imported body no import accounts for is named too; placed once passes", () => {
+    const emb = [{ file: "far.step", bodies: ["far"] }];
+    const twice = placementChecks(emb, ["far"], { Body1: ["Body1"], far: ["far", "far (ref-far.step:2)"] });
+    expect(twice).toEqual([{ id: "placed far.step", expected: "the reference is placed once", measured: `reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE} (far, far (ref-far.step:2))`, ok: false, hard: true }]);
+    expect(placementChecks(emb, ["far", "ghost"], { far: ["far"], ghost: ["ghost", "ghost (x:2)", "ghost (x:3)"] })[0]!.measured).toContain("reference body ghost is placed 3 times");
+    expect(placementChecks(emb, ["far"], { far: ["far"] })).toEqual([]);
+    expect(placementChecks(undefined, ["far"], { far: ["far", "far (ref-far.step:2)"] })[0]!.measured).toContain("is placed 2 times");
+  });
+
+  test("[A4] re-review: the gate sends every placement by world name — the copy moved onto the plate is found, and the part fails on both the placement and the overlap", async () => {
+    const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far"] }], { "far.step": "FAR" });
+    const s = interferenceStub(["far (ref-far.step:2)"]);
+    const g = await referenceGate(s.call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far"], placements: { Body1: ["Body1"], far: ["far", "far (ref-far.step:2)"] } });
+    expect(s.asked).toEqual([["Body1", "far", "far (ref-far.step:2)"]]);
+    const bad = failing(g.checks);
+    expect(bad).toContain(`placed far.step: reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE} (far, far (ref-far.step:2))`);
+    expect(bad.find((l) => l.startsWith("interference far.step:"))).toContain("Body1 overlaps far (ref-far.step:2) by 600 mm³");
+    // Placed once, the same reference passes.
+    const ok = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, once(["Body1"], ["far"]));
+    expect(failing(ok.checks)).toEqual([]);
   });
 });
 

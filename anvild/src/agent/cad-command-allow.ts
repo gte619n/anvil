@@ -138,6 +138,34 @@ export function refusedCommand(id: unknown): string | undefined {
   return `\`${c}\` is not on the list of SolidCraft commands the anvil_cad tools may run (modeling and inspection commands only). If a part needs it, say so instead of working around it`;
 }
 
+/** The name prefix of an import's component and its placements (`ref-far.step`, `ref-far.step:1`):
+ *  `import_reference` names the import `importFeatureName(file)`. */
+const REFERENCE_PREFIX = "ref-";
+
+/**
+ * Commands that place a component again: `occurrence.copy` (its `occurrence`, `component` or `path`)
+ * and the solid patterns' `components`. A reference may be placed once (the gate fails a second
+ * placement), so a copy of a `ref-` component is refused here too — and so is one named by id or path,
+ * which cannot be told apart from a reference without the design.
+ */
+export function refusedReferenceCopy(cmd: string, params: unknown): string | undefined {
+  const p = (params && typeof params === "object" && !Array.isArray(params) ? params : {}) as Record<string, unknown>;
+  const sources: unknown[] =
+    cmd === "occurrence.copy"
+      ? [p.occurrence ?? p.component, ...(p.path !== undefined && p.path !== null ? [p.path] : [])]
+      : /^solid\.pattern\./.test(cmd) && p.components !== undefined && p.components !== null
+        ? Array.isArray(p.components)
+          ? p.components
+          : [p.components]
+        : [];
+  for (const src of sources) {
+    if (typeof src === "string" && !src.trim().toLowerCase().startsWith(REFERENCE_PREFIX)) continue;
+    const what = typeof src === "string" ? `the reference ${JSON.stringify(src.slice(0, 80))}` : "a component or placement named by id or path";
+    return `\`${cmd}\` may not place ${what} again: a reference may be placed once (import it with import_reference), and a copy is named by the component's own name, not an id`;
+  }
+  return undefined;
+}
+
 /**
  * Why one step may not be sent, or undefined. Checks the command id, every command nested inside its
  * params at any depth (`sketch.draw.dimensioned` carries one), and the params themselves:
@@ -150,6 +178,8 @@ export function refusedStep(command: unknown, params: unknown, nesting = 0): str
   if (bad) return bad;
   if (nesting > 6) return "commands are nested too deeply";
   const cmd = norm(command);
+  const copy = refusedReferenceCopy(cmd, params);
+  if (copy) return copy;
   const exempt = GEOMETRY_KEYS[cmd] ?? [];
   const walk = (v: unknown, where: string, depth: number): string | undefined => {
     if (typeof v === "string") {

@@ -8,7 +8,10 @@
  *   3. GATE      evaluate (./gate.ts), write `part.json.measured`, set the part's verdict.
  *                Phase A4 adds, for a part with references, the integrity of every `refs/` file
  *                against the STEP text embedded in the design and the interference check with each
- *                reference in `noInterferenceWith` (./refs.ts), and the gap (`report_gap`).
+ *                reference in `noInterferenceWith` (./refs.ts), and the gap (`report_gap`). A
+ *                reference is placed once (a copy or pattern of its component fails), and the
+ *                interference check names every placement by its world name, so each is checked
+ *                where it sits.
  *   4. PREVIEW   export the design bodies to `.cache/preview-<rev>.glb` (metres, Y up) and keep the
  *                newest three, plus a small `.cache/thumb-<rev>.png` for the part card (Phase A4).
  *                An empty design has no preview. A failed export never touches the gate.
@@ -172,6 +175,13 @@ export interface DesignRead {
   designBodies: string[];
   /** Bodies made by a `BaseFeature` (a STEP import): the references. */
   referenceBodies: string[];
+  /**
+   * Every placement of every body, by its definition's name: `{far: ["far", "far (ref-far.step:2)"]}`
+   * after `occurrence.copy` of the component holding `far`. From `inspect.measure {names_only: true}`,
+   * which lists each placed body once with its WORLD name — the name `inspect.interference` takes to
+   * check that placement where it sits (real 0.44.1; a bare body name means its first placement only).
+   */
+  placements: Record<string, string[]>;
   featureErrors: FeatureIssue[];
   warnings: string[];
   params: CadParamInfo[];
@@ -192,11 +202,13 @@ export async function readDesign(call: Call): Promise<DesignRead> {
   const designBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) !== "BaseFeature").map((b) => String(b.name));
   const referenceBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) === "BaseFeature").map((b) => String(b.name));
   const params: any[] = Array.isArray(d.params) ? d.params : [];
+  const placements = readPlacements(need(await call("execute", { command: "inspect.measure", params: { names_only: true } }), "inspect.measure names_only"));
   const version = need(await call("version", {}), "version").version;
   return {
     version: String(version ?? ""),
     designBodies,
     referenceBodies,
+    placements,
     featureErrors: timeline.filter((f) => f?.error).map((f) => ({ id: f.id, feature: String(f.name ?? f.id), message: String(f.error) })),
     warnings: timeline.filter((f) => f?.warning).map((f) => `${String(f.name ?? f.id)}: ${String(f.warning)}`),
     params: params
@@ -204,6 +216,53 @@ export async function readDesign(call: Call): Promise<DesignRead> {
       .map((p) => ({ name: String(p.name), expression: String(p.expression ?? ""), value: Number(p.value), unit: String(p.unit ?? ""), ...(p.error ? { error: String(p.error) } : {}) })),
   };
 }
+
+/** `inspect.measure {names_only: true}` → definition name → the world names of its placements. A reply
+ *  that is not that shape throws (the refresh fails closed). */
+export function readPlacements(j: any): Record<string, string[]> {
+  if (!Array.isArray(j?.bodies)) throw new Error("inspect.measure names_only answered no body list");
+  const out: Record<string, string[]> = Object.create(null);
+  for (const b of j.bodies) {
+    if (typeof b?.name !== "string" || typeof b?.definition !== "string") throw new Error(`inspect.measure names_only answered a body without a name and definition: ${JSON.stringify(b).slice(0, 120)}`);
+    (out[b.definition] ??= []).push(b.name);
+  }
+  return out;
+}
+
+/** Why a reference placed more than once fails the gate (each placement is another copy of the
+ *  thing the part must fit; only one can be the approved one). */
+export const REFERENCE_PLACED_ONCE = "a reference may be placed once";
+
+/**
+ * Every reference — each STEP import in the script, and any imported (BaseFeature) body no import
+ * accounts for — must be placed exactly once: `occurrence.copy` or a component pattern of its
+ * component adds a placement the approval never saw. Hard fail "reference <name> is placed N times".
+ */
+export function placementChecks(embedded: { file: string; bodies: string[] }[] | undefined, referenceBodies: string[], placements: Record<string, string[]>): GateCheck[] {
+  const groups = new Map<string, Set<string>>();
+  const seen = new Set<string>();
+  for (const e of embedded ?? []) {
+    const g = groups.get(e.file) ?? new Set<string>();
+    for (const b of e.bodies) {
+      g.add(b);
+      seen.add(b);
+    }
+    groups.set(e.file, g);
+  }
+  for (const b of referenceBodies) if (!seen.has(b)) groups.set(`body ${b}`, new Set([b]));
+  const checks: GateCheck[] = [];
+  for (const [name, bodies] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+    const world = [...bodies].flatMap((b) => placements[b] ?? []);
+    const n = Math.max(0, ...[...bodies].map((b) => (placements[b] ?? []).length));
+    if (n <= 1) continue;
+    checks.push({ id: `placed ${name}`, expected: "the reference is placed once", measured: `reference ${name} is placed ${n} times; ${REFERENCE_PLACED_ONCE} (${world.join(", ").slice(0, 200)})`, ok: false, hard: true });
+  }
+  return checks;
+}
+
+/** A body's placements by world name; a body the list does not have is sent by its own name, so
+ *  SolidCraft answers for it (and refuses a name that is no body: a hard fail). */
+const worldNames = (bodies: string[], placements: Record<string, string[]>): string[] => [...new Set(bodies.flatMap((b) => (placements[b]?.length ? placements[b]! : [b])))];
 
 /** Measure the design bodies: volume is their sum, the bounding box their union (then sorted). */
 export async function measureDesign(call: Call, designBodies: string[]): Promise<{ bbox: [number, number, number]; volume: number; faces: number; bodies: number; holes: HoleRow[] }> {
@@ -256,7 +315,7 @@ export function gapOf(part: PartRead, store: { gap?: GapRecord; at: string } | u
  * Phase A4: the reference checks for a part, inside its queue slot. Nothing is asked of SolidCraft
  * for a part that names no reference.
  */
-export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
+export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies" | "placements">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
   if (part.kind !== "ok") return { checks: [], unverified: false };
   const exp = part.file.expectations;
   const must = exp?.noInterferenceWith ?? [];
@@ -267,7 +326,7 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
   const disk = readDesignFile(ref.dir);
   const embedded = disk.script && scriptSha !== undefined && disk.scriptSha === scriptSha ? embeddedReferences(disk.script) : undefined;
   const integrity = referenceChecks(names, (n) => referenceOnDisk(ref, n), embedded);
-  const checks = [...integrity.checks];
+  const checks = [...integrity.checks, ...placementChecks(embedded, design.referenceBodies, design.placements)];
   if (exp) checks.push(...coverageChecks(must, recorded, embedded, design.referenceBodies, integrity.clean));
   for (const name of [...new Set(must)].sort()) {
     // EVERY import carrying this file name is checked (a second one is also a duplicate, failed above).
@@ -288,7 +347,8 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
     }
     let reply: McpToolResult | { error: string };
     try {
-      reply = await call("execute", interferenceRequest(design.designBodies, emb.bodies));
+      // EVERY placement on both sides, by world name: a copy or a moved placement is checked where it is.
+      reply = await call("execute", interferenceRequest(worldNames(design.designBodies, design.placements), worldNames(emb.bodies, design.placements)));
     } catch (e) {
       reply = { error: e instanceof Error ? e.message : String(e) };
     }

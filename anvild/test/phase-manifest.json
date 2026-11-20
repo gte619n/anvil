@@ -533,7 +533,10 @@
             "reference integrity and interference > [A4] re-review: coverage fails closed — every recorded, embedded or imported reference body must be under a must-not-touch rule",
             "every embedded import is checked (the second import of a file name) > [A4] re-review: two imports carrying the same file name fail closed ('duplicate reference import far.step'); the interference check covers the bodies of BOTH and finds the second one's overlap",
             "every embedded import is checked (the second import of a file name) > [A4] re-review: the SECOND import's bytes differ from refs/ — named on the duplicate line, and its body is not a known reference",
-            "every embedded import is checked (the second import of a file name) > [A4] re-review: a reference body no checked import accounts for fails naming it — a stray BaseFeature body; an uncovered import whose bytes match refs/ fails on its own line"
+            "every embedded import is checked (the second import of a file name) > [A4] re-review: a reference body no checked import accounts for fails naming it — a stray BaseFeature body; an uncovered import whose bytes match refs/ fails on its own line",
+            "a reference may be placed once; interference checks every placement > [A4] re-review: placements are read from inspect.measure names_only (world name per placement, by definition); a reply without that shape throws",
+            "a reference may be placed once; interference checks every placement > [A4] re-review: a reference placed twice (occurrence.copy of ref-far.step:1) is a hard fail 'reference far.step is placed 2 times; a reference may be placed once'; an imported body no import accounts for is named too; placed once passes",
+            "a reference may be placed once; interference checks every placement > [A4] re-review: the gate sends every placement by world name — the copy moved onto the plate is found, and the part fails on both the placement and the overlap"
           ]
         },
         {
@@ -615,7 +618,14 @@
         {
           "file": "test/unit/cad-manager.test.ts",
           "names": [
-            "cad manager > [A4] re-review: after a daemon rollback (slot.revert) the agent can undo its own request and redo it back, but redo never brings back the rolled-back change"
+            "cad manager > [A4] re-review: after a daemon rollback (slot.revert) the agent can undo its own request and redo it back, but redo never brings back the rolled-back change",
+            "cad manager > [A4] re-review: a read sent through execute after a rollback (inspect.measure, inspect.interference) keeps SolidCraft's redo history, so the ceiling stays: redo is 'nothing to redo' and design.json is unchanged; a real change clears both"
+          ]
+        },
+        {
+          "file": "test/unit/cad-tools.test.ts",
+          "names": [
+            "anvil_cad tools > [A4] re-review: execute and batch refuse placing a reference again — occurrence.copy or a component pattern of a ref- component, or of one named by id or path; the agent's own components still copy"
           ]
         }
       ],
@@ -635,7 +645,10 @@
             "real SolidCraft: references and the release pack > [A4] real: re-review — the card shows Process fdm-0.4; part.json is rewritten to cnc-3axis while the approved import runs: nothing is recorded, the import is rolled back in full and cannot be redone, the redrawn card shows cnc-3axis, the gate does not pass",
             "real SolidCraft: references and the release pack > [A4] real: re-review — a parameter change queued ahead of the approved import refuses the approval before anything is imported; redrawn with the move, denied, nothing is left and no reference goes unchecked",
             "real SolidCraft: references and the release pack > [A4] real: re-review — a real STEP imported past import_reference (no must-not-touch rule) fails the gate: 'reference <name> is not covered by a must-not-touch rule'",
-            "real SolidCraft: references and the release pack > [A4] real: re-review — a SECOND import carrying the approved reference's file name (other STEP text: a 10 mm block at the origin, body far_b) added to design.json fails the gate ('duplicate reference import far.step', the overlap with far_b found); release_part writes nothing and verify-cli exits 1"
+            "real SolidCraft: references and the release pack > [A4] real: re-review — a SECOND import carrying the approved reference's file name (other STEP text: a 10 mm block at the origin, body far_b) added to design.json fails the gate ('duplicate reference import far.step', the overlap with far_b found); release_part writes nothing and verify-cli exits 1",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — the approved far.step reference copied onto the plate (occurrence.copy of ref-far.step:1, translate -100) fails the gate: 'reference far.step is placed 2 times' and Body1 overlaps far (ref-far.step:2) by 600 mm³; the agent's execute refuses the copy; release_part writes nothing and verify-cli exits 1",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — a copy of the far.step reference left in place, then moved onto the plate by the agent's occurrence.move of ref-far.step:2: placed twice fails at once, and after the move the overlap is found at the copy's final position",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — after a refused import is rolled back, a read through execute (inspect.measure) does not lift the redo ceiling: redo is refused, design.json is unchanged and no BaseFeature comes back"
           ]
         }
       ]

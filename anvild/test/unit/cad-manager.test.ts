@@ -725,6 +725,35 @@ describe("cad manager", () => {
     expect(design(ref).commands.some((c: any) => JSON.stringify(c).includes('"W":"60"'))).toBe(false);
   });
 
+  test("[A4] re-review: a read sent through execute after a rollback (inspect.measure, inspect.interference) keeps SolidCraft's redo history, so the ceiling stays: redo is 'nothing to redo' and design.json is unchanged; a real change clears both", async () => {
+    const repo = tempRepo();
+    const m = fakeManager();
+    const ref = partRef(repo, "plate");
+    const redo = () => m.request(ref, { tool: "redo", kind: "redo" });
+    const param = (n: string) => m.status(ref)!.params.find((p) => p.name === n)!.value;
+    await m.request(ref, { tool: "batch", args: { commands: REFERENCE_PLATE, verbose: false }, kind: "mutate" });
+    await m.run(ref, async (slot) => {
+      await slot.mutate("execute", { command: "parameters.change", params: { changes: { W: "60" } } });
+      await slot.revert();
+    });
+    const script = readFileSync(join(ref.dir, "design.json"), "utf8");
+    // The agent's execute tool sends every command as a mutation, reads included.
+    for (const command of ["inspect.measure", "inspect.interference"]) {
+      const r = await m.request(ref, { tool: "execute", args: { command, params: {} }, kind: "mutate" });
+      expect(r.result.isError).toBe(false);
+    }
+    const none = await redo();
+    expect(none.result.isError).toBe(true);
+    expect(none.result.text).toBe("nothing to redo");
+    expect(param("W")).toBe(50);
+    expect(readFileSync(join(ref.dir, "design.json"), "utf8")).toBe(script);
+    // A real change empties SolidCraft's redo history: the ceiling goes with it, and redo has nothing.
+    await exec(m, ref, "parameters.change", { changes: { L: "120" } });
+    expect((await redo()).result.isError).toBe(true);
+    expect(param("W")).toBe(50);
+    expect(param("L")).toBe(120);
+  });
+
   test("[A1] the refresh hook runs after a change, is debounced in a burst, can be forced, and is a no-op when absent", async () => {
     const repo = tempRepo();
     const clock = new FakeClock();

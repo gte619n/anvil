@@ -250,7 +250,8 @@ export function referenceChecks(names: string[], onDisk: (name: string) => { sha
 
 /** The `inspect.interference` request for the design bodies against ONE reference's bodies: every
  *  design–design and reference–reference pair is excluded, so `count` is exactly the overlaps that
- *  matter. */
+ *  matter. Pass WORLD names (`far (ref-far.step:2)`, from `inspect.measure {names_only}`): a bare body
+ *  name means that body's first placement only. */
 export function interferenceRequest(designBodies: string[], refBodies: string[]): Record<string, unknown> {
   const pairs: [string, string][] = [];
   for (const list of [designBodies, refBodies]) for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++) pairs.push([list[i]!, list[j]!]);

@@ -294,7 +294,10 @@ interface PartRec {
   loadDepth: number;
   /** A daemon rollback (`slot.revert`) left the design at this undo depth: the rolled-back change sits
    *  just above it, so `redo` never steps to or past it. The agent may still undo its own requests
-   *  below it and redo them back up to it. Cleared by the next change (or a restart). */
+   *  below it and redo them back up to it. Cleared only once SolidCraft's own redo history is empty
+   *  (`inspect_design.redo` 0 after a request: a real change discards it) or on a restart — NOT by
+   *  any successful request, since a read sent through `execute` (`inspect.measure`) keeps the redo
+   *  history, and with it the rolled-back change. */
   noRedoAt?: number;
 }
 
@@ -969,9 +972,12 @@ export class CadManager {
     const changed = !result.isError || rec.depth !== before.depth || rec.revision !== before.revision;
     if (!changed) return false;
     if (kind === "mutate") {
-      rec.noRedoAt = undefined;
       if (rec.depth > before.depth) rec.undoStack.push(before.depth);
-      if (rec.redoDepth === 0) rec.redoStack = [];
+      if (rec.redoDepth === 0) {
+        // SolidCraft discarded its redo history: the rolled-back change can no longer come back.
+        rec.redoStack = [];
+        rec.noRedoAt = undefined;
+      }
     }
     let out: Awaited<ReturnType<typeof writeScript>>;
     try {
