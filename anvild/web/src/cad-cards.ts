@@ -21,7 +21,7 @@
 // when a socket opens), so this module keeps the latest of each and redraws them when the
 // conversation is rebuilt (`restore`). Everything is built with DOM nodes and textContent: the
 // agent's reason and file contents are untrusted text and are never parsed as HTML.
-import type { CadDesignEvent, CadExpectationsRequestEvent, CadExpectationsResolvedEvent, CadGateResult } from "../../protocol";
+import { CAD_DIMENSION_MAX_MM, type CadDesignEvent, type CadExpectationsRequestEvent, type CadExpectationsResolvedEvent, type CadGateResult } from "../../protocol";
 
 export interface CadCardsDeps {
   /** Does the server at `url` advertise "cad-work"? */
@@ -31,8 +31,8 @@ export interface CadCardsDeps {
   /** The conversation pane. */
   container(): HTMLElement;
   /** Send `cad.expectations.respond` to the server the card came from (`values`: a dimensions card).
-   *  May return a promise of the daemon's refusal message (undefined when accepted): a refused
-   *  dimensions card re-enables its buttons and shows the message inline (decision 145). */
+   *  May return the daemon's answer: a promise of its error message when it REFUSED the answer (the
+   *  card then stays open — its buttons come back and the message is shown on it), else undefined. */
   respond(url: string, requestId: string, approve: boolean, values?: Record<string, number>): void | Promise<string | undefined>;
   /** "Release" on a passing part card: send `cad.release.request` (the daemon raises the release card). */
   release?(url: string, ev: CadDesignEvent): void;
@@ -84,6 +84,30 @@ const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: 
   return e;
 };
 const show = (v: number | string): string => (typeof v === "number" ? String(Math.round(v * 1e4) / 1e4) : v);
+
+/** Why a typed dimension is refused (the daemon checks the same, decision 154), or undefined. */
+export function dimensionProblem(v: number): string | undefined {
+  if (!Number.isFinite(v)) return "must be a number";
+  if (v <= 0) return "must be above 0 mm";
+  if (v > CAD_DIMENSION_MAX_MM) return `must be at most ${CAD_DIMENSION_MAX_MM} mm`;
+  return undefined;
+}
+const lockButtons = (btns: HTMLElement, disabled: boolean): void => {
+  for (const x of btns.querySelectorAll("button")) (x as HTMLButtonElement).disabled = disabled;
+};
+/** The daemon refused the answer (bad numbers, a card already gone): show why and give the buttons back. */
+function answer(btns: HTMLElement, err: HTMLElement, reply: void | Promise<string | undefined>): void {
+  if (!reply) return;
+  void reply.then(
+    (msg) => {
+      if (!msg || !btns.isConnected || btns.closest(".resolved")) return;
+      err.textContent = msg;
+      err.hidden = false;
+      lockButtons(btns, false);
+    },
+    () => undefined,
+  );
+}
 
 export function createCadCards(deps: CadCardsDeps) {
   /** Latest `cad.design` per server + worktree + part. */
@@ -196,7 +220,7 @@ export function createCadCards(deps: CadCardsDeps) {
       actions.append(clear);
     }
     if (gate.approvedBy === "agent-initial" && deps.confirm) {
-      const confirm = el("button", "cad-part-open cad-part-confirm", "Confirm numbers");
+      const confirm = el("button", "cad-part-action cad-part-confirm", "Confirm numbers");
       confirm.type = "button";
       confirm.onclick = () => {
         confirm.disabled = true;
@@ -231,6 +255,8 @@ export function createCadCards(deps: CadCardsDeps) {
       const input = el("input", "cad-dim-input");
       input.type = "number";
       input.step = "any";
+      input.min = "0";
+      input.max = String(CAD_DIMENSION_MAX_MM);
       input.inputMode = "decimal";
       input.required = true;
       input.value = String(d.value);
@@ -251,35 +277,18 @@ export function createCadCards(deps: CadCardsDeps) {
     deny.type = "button";
     btns.append(submit, deny);
     form.append(err, btns);
-    const lock = (on = true): void => {
-      for (const x of btns.querySelectorAll("button")) (x as HTMLButtonElement).disabled = on;
-    };
-    /** The daemon refused (bad numbers, or it could not be reached): the card stays open, so let the
-     *  owner fix it and try again — unless the card was retired meanwhile. */
-    const onRefusal = (sent: void | Promise<string | undefined>): void => {
-      if (!sent) return;
-      void sent.then(
-        (message) => {
-          if (!message || card.classList.contains("resolved")) return;
-          err.textContent = message;
-          err.hidden = false;
-          lock(false);
-        },
-        () => {
-          if (card.classList.contains("resolved")) return;
-          err.textContent = "Couldn't reach the server — try again.";
-          err.hidden = false;
-          lock(false);
-        },
-      );
+    const send = (approve: boolean, values?: Record<string, number>): void => {
+      lockButtons(btns, true);
+      answer(btns, err, deps.respond(url, ev.requestId, approve, values));
     };
     form.onsubmit = (e) => {
       e.preventDefault();
       const values: Record<string, number> = {};
       for (const [name, input] of inputs) {
         const v = input.value.trim() === "" ? NaN : Number(input.value);
-        if (!Number.isFinite(v)) {
-          err.textContent = `${name} must be a number`;
+        const bad = dimensionProblem(v);
+        if (bad) {
+          err.textContent = `${name} ${bad}`;
           err.hidden = false;
           input.focus();
           return;
@@ -287,13 +296,9 @@ export function createCadCards(deps: CadCardsDeps) {
         values[name] = v;
       }
       err.hidden = true;
-      lock();
-      onRefusal(deps.respond(url, ev.requestId, true, values));
+      send(true, values);
     };
-    deny.onclick = () => {
-      lock();
-      onRefusal(deps.respond(url, ev.requestId, false));
-    };
+    deny.onclick = () => send(false);
     card.append(form);
   }
 
@@ -332,7 +337,8 @@ export function createCadCards(deps: CadCardsDeps) {
       hr.append(el("th", undefined, ""), el("th", undefined, heads[0]), el("th", undefined, heads[1]));
       table.append(hr);
       for (const r of ev.rows) {
-        const tr = el("tr", r.old !== r.new ? "cad-row-changed" : undefined);
+        const tr = el("tr", [r.old !== r.new ? "cad-row-changed" : "", r.unapproved ? "cad-row-unapproved" : ""].filter(Boolean).join(" ") || undefined);
+        if (r.unapproved) tr.dataset.role = "unapproved";
         tr.append(el("td", "cad-row-label", r.label), el("td", "cad-row-old", r.old ?? "—"), el("td", "cad-row-new", r.new ?? "—"));
         table.append(tr);
       }
@@ -345,16 +351,19 @@ export function createCadCards(deps: CadCardsDeps) {
     }
     // Approve / Deny only: this card is asked every time, so it never offers "always allow".
     const btns = el("div", "perm-btns");
+    const err = el("div", "cad-dim-error");
+    err.dataset.role = "error";
+    err.hidden = true;
     for (const [label, approve] of [["Approve", true], ["Deny", false]] as const) {
       const b = el("button", `perm-btn ${approve ? "allow" : "deny"}`, label);
       b.type = "button";
       b.onclick = () => {
-        for (const x of btns.querySelectorAll("button")) (x as HTMLButtonElement).disabled = true;
-        deps.respond(url, ev.requestId, approve);
+        lockButtons(btns, true);
+        answer(btns, err, deps.respond(url, ev.requestId, approve));
       };
       btns.append(b);
     }
-    card.append(btns);
+    card.append(err, btns);
     requestCards.set(ev.requestId, card);
     deps.container().appendChild(card);
     deps.scrollDown?.();

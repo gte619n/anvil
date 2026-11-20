@@ -10,7 +10,9 @@ import { join } from "node:path";
 import { partRef } from "../../src/cadwork/partfolder";
 import { REFERENCE_CHANGED } from "../../src/cadwork/refs";
 import { expectedReleaseFiles, MANIFEST } from "../../src/cadwork/release";
-import { buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
+import { PLATE_EXPECTATIONS, buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
+import { repoIdentity } from "../../src/cadwork/locks";
+import { UNAPPROVED_PARAMETER } from "../../src/session/cadwork-service";
 import { REAL, SOLIDCRAFT_CLI, hasSolidcraft } from "../helpers/real-tools";
 
 afterEach(async () => {
@@ -19,7 +21,7 @@ afterEach(async () => {
 });
 
 type X = Awaited<ReturnType<typeof buildPlate>>;
-async function asOwner(x: X, call: Promise<ToolReply>): Promise<ToolReply> {
+async function asOwner(x: X, call: Promise<ToolReply>, approve = true, shown: any[] = []): Promise<ToolReply> {
   let settled = false;
   void call.finally(() => (settled = true));
   const seen = new Set<string>();
@@ -27,12 +29,14 @@ async function asOwner(x: X, call: Promise<ToolReply>): Promise<ToolReply> {
     for (const c of x.openCards()) {
       if (seen.has(c.requestId)) continue;
       seen.add(c.requestId);
-      x.service.respond(c.requestId, true);
+      shown.push(c);
+      x.service.respond(c.requestId, approve);
     }
     await new Promise((r) => setTimeout(r, 5));
   }
   return call;
 }
+const row = (card: any, label: string) => card.rows.find((r: any) => r.label === label);
 const must = async (p: Promise<ToolReply>): Promise<ToolReply> => {
   const r = await p;
   if (r.isError) throw new Error(r.text);
@@ -104,6 +108,55 @@ describe("real SolidCraft: references and the release pack", () => {
     expect(g.failing.join("\n")).toContain(REFERENCE_CHANGED);
     writeFileSync(p, orig);
     expect((await x.check()).state).toBe("pass");
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: review — the agent sets L=120, then proposes only a tighter tolerance: the card shows the accepted numbers and L as its own row; denied the gate still fails on L, approved it passes with L accepted by the owner", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    expect(x.gate.state).toBe("pass");
+    await must(x.tools.set_parameter!({ name: "L", expression: "120" }));
+    expect((await x.check()).failing.join("\n")).toContain("L 80 → 120");
+    const tighter = { ...PLATE_EXPECTATIONS, tolerance: { length: 0.05 } };
+    const shown: any[] = [];
+    await asOwner(x, x.tools.propose_expectations!({ part: "plate", expectations: tighter, reason: "tighter length tolerance" }), false, shown);
+    expect(row(shown[0], "Bounding box (mm)").old).toBe("L × W × T  (= 6 × 50 × 80)");
+    expect(row(shown[0], "Parameter L")).toMatchObject({ old: "80", new: `120 (${UNAPPROVED_PARAMETER})`, unapproved: true });
+    let g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain("L 80 → 120");
+    const r = await asOwner(x, x.tools.propose_expectations!({ part: "plate", expectations: tighter, reason: "tighter length tolerance" }));
+    expect(r.isError).toBe(false);
+    g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    expect(g.approvedBy).toBe("owner");
+    expect(x.service.locks.findPart(repoIdentity(repo), "plate")!.declared).toMatchObject({ L: 120, W: 50, T: 6 });
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: review — the agent sets L=120, then imports a clear reference: the card shows the accepted numbers and L as its own row; denied nothing is imported and the gate fails on L, approved it passes with L accepted", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const far = await blockStep(x, repo, "far", [200, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(far, join(repo, ".anvil-downloads", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    await must(x.tools.set_parameter!({ name: "L", expression: "120" }));
+    const shown: any[] = [];
+    const no = await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }), false, shown);
+    expect(no.json.imported).toBe(false);
+    expect(row(shown[0], "Bounding box (mm)").old).toBe("L × W × T  (= 6 × 50 × 80)");
+    expect(row(shown[0], "Parameter L")).toMatchObject({ old: "80", new: `120 (${UNAPPROVED_PARAMETER})`, unapproved: true });
+    expect(row(shown[0], "Reference").new).toMatch(/^adds refs\/far\.step \(sha [0-9a-f]{12}, 1 body\)$/); // the real STEP declares its one solid
+    expect((await x.check()).failing.join("\n")).toContain("L 80 → 120");
+    const yes = await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }));
+    expect(yes.json.imported).toBe(true);
+    const g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    expect(g.approvedBy).toBe("owner");
+    expect(x.service.locks.findPart(repoIdentity(repo), "plate")!.declared).toMatchObject({ L: 120, W: 50, T: 6 });
   }, 300_000);
 
   test.skipIf(!REAL)("[A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded", async () => {

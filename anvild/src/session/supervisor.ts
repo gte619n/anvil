@@ -219,6 +219,15 @@ export interface SupervisorConfig {
  * cleanup). Broadcasts global `session.*` events; session-scoped events flow through each
  * `Session`'s `emit` to attached connections.
  */
+/** A path with its symlinks resolved, or the path itself when it cannot be resolved. */
+function realpathOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 export class Supervisor {
   private readonly store: SessionStore;
   private readonly sessions = new Map<string, Session>();
@@ -2034,7 +2043,12 @@ export class Supervisor {
   /** `cad.release.request` (Phase A4): raise the release card for a part, with no model turn. */
   async requestCadRelease(cwd: unknown, part: unknown, sessionId: unknown): Promise<void> {
     const worktree = this.cadWorktree(cwd);
-    if (typeof sessionId !== "string" || !this.sessions.has(sessionId)) throw new BadCommand(`no such session: ${String(sessionId)}`);
+    const session = typeof sessionId === "string" ? this.sessions.get(sessionId) : undefined;
+    if (!session || typeof sessionId !== "string") throw new BadCommand(`no such session: ${String(sessionId)}`);
+    // The card is raised in that session's chat and its pack offered there: it must be a session of
+    // THIS worktree, never an unrelated one that happens to exist.
+    const own = this.cadwork.worktreeOf(session.data);
+    if (!own || realpathOr(own) !== realpathOr(worktree)) throw new BadCommand(`session ${sessionId} does not work in ${worktree}; a release is raised in a session of the part's own worktree`);
     try {
       await this.cadwork.requestRelease(sessionId, partRef(worktree, part));
     } catch (e) {

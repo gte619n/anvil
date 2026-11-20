@@ -105,38 +105,6 @@ test("[A4] the dimensions card has a numeric input per dimension, prefilled with
   expect(sent.at(-1)).toEqual({ type: "respond", url: HUB, requestId: "cadx_e", approve: false, values: undefined });
 });
 
-test("[A4] a refused dimensions submission re-enables Submit and Deny and shows the daemon's message inline; a fixed resubmission is sent", async () => {
-  const replies: (string | undefined)[] = ["W must be a positive number", undefined];
-  const got: any[] = [];
-  const c = mod.createCadCards({
-    supported: () => true,
-    active: () => ({ sessionId: "s1", url: HUB }),
-    container: pane,
-    respond: (_url, requestId, approve, values) => {
-      got.push({ requestId, approve, values });
-      return Promise.resolve(replies.shift());
-    },
-    open: () => undefined,
-  });
-  c.onRequest(HUB, { v: 4, ts: "t", type: "cad.expectations.request", requestId: "cadx_f", sessionId: "s1", cwd: "/repo", part: "bracket", kind: "dimensions", rows: [], dimensions: [{ name: "W", value: 20, unit: "mm" }] } as any);
-  const el = pane().querySelector<HTMLElement>('[data-req="cadx_f"]')!;
-  const buttons = () => [...el.querySelectorAll<HTMLButtonElement>(".perm-btn")];
-  const error = () => el.querySelector<HTMLElement>('[data-role="error"]')!;
-  el.querySelector<HTMLInputElement>("input.cad-dim-input")!.value = "-3";
-  el.querySelector("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
-  expect(buttons().every((b) => b.disabled)).toBe(true); // in flight
-  await new Promise((r) => setTimeout(r, 0));
-  expect(buttons().every((b) => !b.disabled)).toBe(true); // refused: usable again, no refresh needed
-  expect(error().hidden).toBe(false);
-  expect(error().textContent).toBe("W must be a positive number");
-  el.querySelector<HTMLInputElement>("input.cad-dim-input")!.value = "25";
-  el.querySelector("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
-  expect(got).toEqual([{ requestId: "cadx_f", approve: true, values: { W: -3 } }, { requestId: "cadx_f", approve: true, values: { W: 25 } }]);
-  expect(error().hidden).toBe(true);
-  await new Promise((r) => setTimeout(r, 0));
-  expect(buttons().every((b) => b.disabled)).toBe(true); // accepted: stays locked until the card is retired
-});
-
 test("[A4] the release card shows expected and measured numbers and says prominently when the numbers are the agent's; Approve / Deny only", () => {
   const c = cards();
   c.onRequest(HUB, {
@@ -151,4 +119,69 @@ test("[A4] the release card shows expected and measured numbers and says promine
   expect([...el.querySelectorAll(".perm-btns button")].map((b) => b.textContent)).toEqual(["Approve", "Deny"]);
   el.querySelector<HTMLButtonElement>(".perm-btn.allow")!.click();
   expect(sent).toEqual([{ type: "respond", url: HUB, requestId: "cadx_r", approve: true, values: undefined }]);
+});
+
+test("[A4] review: the dimensions card refuses 0, negative and over-1e6 mm numbers before sending; when the daemon refuses an answer the buttons come back and its error is shown on the card", async () => {
+  let reply: (msg: string | undefined) => void = () => undefined;
+  const c = mod.createCadCards({
+    supported: () => true,
+    active: () => ({ sessionId: "s1", url: HUB }),
+    container: pane,
+    respond: (url, requestId, approve, values) => {
+      sent.push({ type: "respond", url, requestId, approve, values });
+      return new Promise<string | undefined>((r) => (reply = r));
+    },
+    open: () => undefined,
+  });
+  const req = { v: 4, ts: "t", type: "cad.expectations.request", requestId: "cadx_b", sessionId: "s1", cwd: "/repo", part: "bracket", kind: "dimensions", rows: [], dimensions: [{ name: "L", value: 60, unit: "mm" }] } as any;
+  c.onRequest(HUB, req);
+  const el = pane().querySelector<HTMLElement>('[data-req="cadx_b"]')!;
+  const input = el.querySelector<HTMLInputElement>("input.cad-dim-input")!;
+  expect(input.min).toBe("0");
+  expect(input.max).toBe("1000000");
+  const err = el.querySelector<HTMLElement>('[data-role="error"]')!;
+  const submit = () => el.querySelector("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+  const buttons = () => [...el.querySelectorAll<HTMLButtonElement>(".perm-btns button")];
+  for (const [v, why] of [["0", "above 0"], ["-5", "above 0"], ["1000001", "at most 1000000"], ["1e308", "at most"]] as const) {
+    input.value = v;
+    submit();
+    expect(sent).toEqual([]);
+    expect(err.hidden).toBe(false);
+    expect(err.textContent).toContain(why);
+  }
+  expect(mod.dimensionProblem(1e6)).toBeUndefined();
+  // Accepted here; the daemon refuses it anyway (say the part changed): the card stays usable.
+  input.value = "95";
+  submit();
+  expect(sent).toHaveLength(1);
+  expect(buttons().every((b) => b.disabled)).toBe(true);
+  reply("L must be at most 1000000 mm");
+  await new Promise((r) => setTimeout(r, 0));
+  expect(err.hidden).toBe(false);
+  expect(err.textContent).toBe("L must be at most 1000000 mm");
+  expect(buttons().every((b) => !b.disabled)).toBe(true);
+  // A second, accepted answer: buttons stay locked until the card is resolved.
+  input.value = "96";
+  submit();
+  reply(undefined);
+  await new Promise((r) => setTimeout(r, 0));
+  expect(buttons().every((b) => b.disabled)).toBe(true);
+  expect(sent.at(-1)).toMatchObject({ approve: true, values: { L: 96 } });
+});
+
+test("[A4] review: Confirm numbers is its own action button, never a second .cad-part-open", () => {
+  const c = mod.createCadCards({
+    supported: () => true,
+    active: () => ({ sessionId: "s1", url: HUB }),
+    container: pane,
+    respond: () => undefined,
+    open: () => undefined,
+    confirm: () => undefined,
+  });
+  c.onDesign(HUB, design({}, { approvedBy: "agent-initial" }));
+  expect(card().querySelectorAll(".cad-part-open")).toHaveLength(1);
+  const confirm = card().querySelector<HTMLButtonElement>(".cad-part-confirm")!;
+  expect(confirm.textContent).toBe("Confirm numbers");
+  expect(confirm.classList.contains("cad-part-action")).toBe(true);
+  expect(confirm.classList.contains("cad-part-open")).toBe(false);
 });

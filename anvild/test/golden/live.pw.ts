@@ -263,3 +263,145 @@ test("[A3] the units badge is readable in both themes", async ({ page }, info) =
   }
   expect(app.errors).toEqual([]);
 });
+
+// ── A3 review, phone/desktop layout ─────────────────────────────────────────────────────────────
+
+/** What the chrome floating over the canvas leaves visible: the stage less the toolbar, HUD and live bar. */
+async function visibleArea(page: Page) {
+  return page.evaluate(() => {
+    const c = document.querySelector(".cad-stage canvas")!.getBoundingClientRect();
+    let top = c.top;
+    let bottom = c.bottom;
+    for (const sel of [".cad-tools", ".cad-hud", ".cad-live", ".cad-params"]) {
+      const el = document.querySelector(`.cad-shell > ${sel}`);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0 || r.right <= c.left || r.left >= c.right || r.bottom <= c.top || r.top >= c.bottom) continue;
+      if (r.top + r.height / 2 < c.top + c.height / 2) top = Math.max(top, r.bottom);
+      else bottom = Math.min(bottom, r.top);
+    }
+    return { left: Math.max(c.left, 0), right: Math.min(c.right, window.innerWidth), top, bottom };
+  });
+}
+
+test("[A3] phone: the opening fit puts the whole model in the visible area clear of the toolbar and the top bars", async ({ page }, info) => {
+  test.skip(info.project.name !== "phone", "the phone layout");
+  const app = await openPlate(page);
+  const p = await app.settled();
+  expect(p.screenBox).not.toBeNull();
+  const b = p.screenBox!;
+  const vis = await visibleArea(page);
+  expect(b.left).toBeGreaterThanOrEqual(vis.left - 0.5);
+  expect(b.right).toBeLessThanOrEqual(vis.right + 0.5);
+  expect(b.top).toBeGreaterThanOrEqual(vis.top - 0.5);
+  expect(b.bottom).toBeLessThanOrEqual(vis.bottom + 0.5);
+  // …and it is a fit, not a speck: the model spans a fair part of the visible width.
+  expect(b.right - b.left).toBeGreaterThan((vis.right - vis.left) * 0.5);
+  await page.screenshot({ path: info.outputPath("phone-fit.png") });
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] every toolbar button can be reached: scrolled into view, its centre is on screen and hits the button", async ({ page }, info) => {
+  const app = await openPlate(page);
+  await app.settled();
+  const acts = await page.locator(".cad-tools .cad-btn:visible").evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.act!));
+  expect(acts.length).toBeGreaterThan(8);
+  const vw = page.viewportSize()!;
+  for (const act of acts) {
+    const r = await page.evaluate((a) => {
+      const btn = document.querySelector<HTMLElement>(`.cad-tools [data-act="${a}"]`)!;
+      btn.scrollIntoView({ block: "nearest", inline: "nearest" }); // only the toolbar scrolls
+      const b = btn.getBoundingClientRect();
+      const x = b.left + b.width / 2;
+      const y = b.top + b.height / 2;
+      const hit = document.elementFromPoint(x, y);
+      return { x, y, hit: !!hit && (hit === btn || btn.contains(hit)) };
+    }, act);
+    expect(r.x, act).toBeGreaterThanOrEqual(0);
+    expect(r.x, act).toBeLessThanOrEqual(vw.width);
+    expect(r.y, act).toBeGreaterThanOrEqual(0);
+    expect(r.y, act).toBeLessThanOrEqual(vw.height);
+    expect(r.hit, act).toBe(true);
+  }
+  await page.locator(".cad-tools").evaluate((e) => (e.scrollLeft = 0));
+  await page.screenshot({ path: info.outputPath(`toolbar-${info.project.name}.png`) });
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] a part card whose numbers are the agent's has exactly one Open (Confirm numbers is not a second .cad-part-open)", async ({ page }) => {
+  const app = await bootApp(page);
+  await app.push(design({ rev: 1 }, { approvedBy: "agent-initial" }));
+  const cards = page.locator("#conversation .cad-part");
+  await expect(cards.first()).toBeVisible();
+  await expect(cards.first().locator('[data-role="unconfirmed"]')).toBeVisible();
+  await expect(cards.first().getByRole("button", { name: "Confirm numbers" })).toBeVisible();
+  const n = await cards.count();
+  expect(n).toBeGreaterThan(0);
+  for (let i = 0; i < n; i++) await expect(cards.nth(i).locator(".cad-part-open")).toHaveCount(1);
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] the release card never breaks a number mid-digit", async ({ page }, info) => {
+  const app = await bootApp(page);
+  const rows = [
+    { label: "Volume", old: "23335.1673 mm³", new: "23335.1673 mm³" },
+    { label: "Bounding box", old: "80 × 50 × 6", new: "80.0002 × 50.0001 × 6.0000 mm" },
+    { label: "Surface area", old: "9123456.789012 mm²", new: "9123456.789013 mm²" },
+    { label: "Mass at the stated density", old: "62.9049 g", new: "62.9050 g" },
+  ];
+  await app.push({ type: "cad.expectations.request", requestId: "req_release", sessionId: "sess_live", cwd: CWD, part: "plate", kind: "release", rows, note: "Every hard check passes." });
+  const card = page.locator('.cad-expect[data-cad-kind="release"]');
+  await expect(card).toBeVisible();
+  await card.scrollIntoViewIfNeeded();
+  // No number is ever split across lines: every number in every cell lies on ONE line box (a cell
+  // may wrap between the parts of "80 × 50 × 6", never inside one of them).
+  const split = await card.locator(".cad-row-old, .cad-row-new, th").evaluateAll((els) =>
+    els.flatMap((e) => {
+      const node = e.firstChild;
+      if (!node || node.nodeType !== Node.TEXT_NODE) return [];
+      const out: string[] = [];
+      for (const m of node.textContent!.matchAll(/[-+]?\d[\d.,]*(?:e[-+]?\d+)?/gi)) {
+        const range = document.createRange();
+        range.setStart(node, m.index!);
+        range.setEnd(node, m.index! + m[0].length);
+        if (new Set([...range.getClientRects()].map((r) => Math.round(r.top))).size !== 1) out.push(m[0]);
+      }
+      return out;
+    }),
+  );
+  expect(split).toEqual([]);
+  // …and on this card every value is fully visible: the table fits the card without scrolling.
+  expect(await card.locator(".cad-expect-rows").evaluate((t) => t.scrollWidth <= t.clientWidth + 1)).toBe(true);
+  // The card stays inside the screen: a wide table scrolls inside it rather than widening the page.
+  const cardBox = (await card.boundingBox())!;
+  expect(cardBox.x + cardBox.width).toBeLessThanOrEqual(page.viewportSize()!.width + 0.5);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath(`release-card-${info.project.name}.png`) });
+  expect(app.errors).toEqual([]);
+});
+
+test("[A3] review: a card that would also approve a parameter the agent moved shows it as its own highlighted row, and its numbers stay whole", async ({ page }, info) => {
+  const app = await bootApp(page);
+  const rows = [
+    { label: "Process", old: "fdm-0.4", new: "fdm-0.4" },
+    { label: "Parameter L", old: "80", new: "120 (changed by the agent, not approved)", unapproved: true },
+    { label: "Bounding box (mm)", old: "L × W × T  (= 6 × 50 × 80)", new: "L × W × T  (= 6 × 50 × 120)" },
+    { label: "Volume (mm³)", old: "L*W*T - (4 - pi)*5^2*T  (= 23335.167)", new: "L*W*T - (4 - pi)*5^2*T  (= 35335.167)" },
+    { label: "Tolerance", old: "0.1 mm, 1% volume", new: "0.05 mm, 1% volume" },
+  ];
+  await app.push({ type: "cad.expectations.request", requestId: "req_propose", sessionId: "sess_live", cwd: CWD, part: "plate", kind: "propose", reason: "tighter length tolerance", rows });
+  const card = page.locator('.cad-expect[data-cad-kind="propose"]');
+  await expect(card).toBeVisible();
+  await card.scrollIntoViewIfNeeded();
+  const moved = card.locator('tr[data-role="unapproved"]');
+  await expect(moved).toHaveCount(1);
+  await expect(moved.locator(".cad-row-label")).toHaveText("Parameter L");
+  await expect(moved.locator(".cad-row-old")).toHaveText("80");
+  await expect(moved.locator(".cad-row-new")).toHaveText("120 (changed by the agent, not approved)");
+  const bg = await moved.locator("td").first().evaluate((e) => getComputedStyle(e).backgroundColor);
+  expect(bg).not.toBe("rgba(0, 0, 0, 0)"); // highlighted, not a plain row
+  expect(await card.locator(".cad-expect-rows").evaluate((t) => t.scrollWidth <= t.clientWidth + 1)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: info.outputPath(`propose-moved-${info.project.name}.png`) });
+  expect(app.errors).toEqual([]);
+});

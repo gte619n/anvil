@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
+  CAD_DIMENSION_MAX_MM,
   PROTOCOL_VERSION,
   type CadDesignEvent,
   type CadPartInfo,
@@ -51,7 +52,7 @@ import {
   type PartReference,
 } from "../cadwork/partfile";
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
-import { embeddedReferences, importFeatureName, referenceName, resolveReferenceSource, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
+import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
 import { holeTable, mergeHoleTables } from "../cadwork/holes";
 import { readRules } from "../cadwork/rules";
@@ -125,6 +126,29 @@ export const BUSY_NOTICE_MS = 250;
 export const CWD_REFUSED = "is not the worktree of a session or a registered environment on this machine";
 
 type CardKind = CadExpectationsRequestEvent["kind"];
+/** How an owner card was answered. `stale`: approved, but something the card showed changed while it
+ *  was open — nothing is approved and a fresh card is drawn (decision 153). */
+type CardAnswer = "approved" | "denied" | "stale";
+/**
+ * What an owner card was drawn from (decision 153), stored with the card. Every kind follows one rule:
+ * "old" is the ACCEPTED values; each parameter whose current value differs from its accepted value is
+ * its own row ("changed by the agent, not approved"); approving approves exactly the rows shown —
+ * those parameter rows included — and the lock is written from THESE values, never from the design
+ * as it is at approval time. On approval the state is read again and any difference refuses.
+ */
+export interface CardSnapshot {
+  /** The approved parameter values: the lock's `declared`, and for a name never accepted the value
+   *  the card was drawn with. */
+  accepted: Record<string, number>;
+  /** The design's parameter values when the card was drawn. */
+  current: Record<string, number>;
+  /** Names whose current value differs from (or has no) accepted value: shown as their own rows. */
+  changed: string[];
+  /** The approval on record had numbers but no parameter values (made before `declared` existed). */
+  noDeclared: boolean;
+  /** Everything else the card showed (part.json's locked block and refs, the lock, extras). */
+  fingerprint: string;
+}
 interface Card {
   requestId: string;
   sessionId: string;
@@ -133,14 +157,26 @@ interface Card {
   body: Omit<CadExpectationsRequestEvent, "v" | "ts" | "replay">;
   /** propose / initial / dimensions / release: settles the tool call that is waiting on the owner.
    *  A `dimensions` card also hands over the owner's typed numbers. */
-  settle?: (approved: boolean, values?: Record<string, number>) => void;
+  settle?: (answer: CardAnswer, values?: Record<string, number>) => void;
   /** adopt: the hash of exactly what the card showed. Approval records THIS and nothing else. */
   sha?: string;
+  /** adopt / confirm: the identity of the whole card (hash, rows, snapshot). Approval needs it unchanged. */
+  key?: string;
+  /** What the card was drawn from (decision 153). */
+  snap?: CardSnapshot;
+  /** adopt-expectations / confirm: the accepted numbers approval writes (evaluated from `snap.current`). */
+  values?: EvaluatedExpectations;
+  /** True when something the card showed has changed since it was drawn: an approval is refused. */
+  stale?: () => boolean;
   /** dimensions: the names the owner must give a number for. */
   dims?: string[];
+  /** The session's status before this card held it at `awaiting_permission` (only while a turn ran). */
+  prevStatus?: string;
 }
 
 export const NO_EXPECTATIONS = "has no expectations yet";
+/** `request_dimensions` while this session already has a dimensions card open for the part. */
+export const DIMENSIONS_CARD_OPEN = "a dimensions card is already open";
 export type ExpectationsReply = { ok: true; note?: string } | { ok: false; error: string };
 /** The caution on an `initial` card: the numbers were written after the part existed. */
 export const INITIAL_AFTER_GEOMETRY = "this part already has geometry; these numbers were written after it existed";
@@ -248,6 +284,7 @@ export class CadworkService {
         else if (e.type === "busy") this.onBusy(e.key, e.part, e.busy);
         else if (e.type === "waiting") this.onWaiting(e.key, e.part, e.waiting);
         else if (e.type === "conflict") this.onConflict(e.key, e.part);
+        else if (e.type === "stopped" && e.reason !== "reload") this.onStopped(e.key); // a reload restarts at once, mid-request
       });
     }
   }
@@ -423,6 +460,48 @@ export class CadworkService {
     this.lockSync.approveRules({ ...lock, repo: id.key, ...(id.remote ? { remote: id.remote } : {}), path: id.path });
   }
 
+  // ── owner cards: one rule for every kind (decision 153) ─────────────────────────────────────────
+
+  /** The design's parameter values now (the manager's record of the live process). */
+  private paramsNow(ref: PartRef): Record<string, number> {
+    return paramMap(this.manager.status(ref)?.params ?? []);
+  }
+
+  /** Everything an owner card shows about a part besides its parameter values: part.json's locked
+   *  block, its references and dimensions, and the approval on record. */
+  private cardFingerprint(ref: PartRef, extra?: () => unknown): string {
+    const part = readPartFile(ref.dir);
+    const lock = this.findLock(ref);
+    return JSON.stringify({
+      part:
+        part.kind === "ok"
+          ? { sha: lockedBlockSha(part.file), refs: (part.file.refs ?? []).map((r) => [r.name, r.sha256, r.bodies]), ownerParams: sortedEntries(part.file.ownerParams) }
+          : part.kind,
+      lock: lock ? { sha: lock.sha, by: lock.approvedBy, status: lock.status, values: lock.values ?? null, declared: sortedEntries(lock.declared), ownerParams: sortedEntries(lock.ownerParams) } : null,
+      extra: extra ? extra() : null,
+    });
+  }
+
+  /**
+   * What an owner card is drawn from: the accepted parameter values (the lock's `declared`; where a
+   * name has none, the value the card is drawn with), the current ones, the names that differ, and a
+   * fingerprint of everything else the card shows. `current` defaults to the design's values now.
+   */
+  cardSnapshot(ref: PartRef, opts: { current?: Record<string, number>; extra?: () => unknown } = {}): CardSnapshot {
+    const current = { ...(opts.current ?? this.paramsNow(ref)) };
+    const lock = this.findLock(ref);
+    const accepted = { ...current, ...(lock?.declared ?? {}) };
+    const changed = Object.keys(accepted)
+      .sort()
+      .filter((n) => current[n] === undefined || !closeTo(current[n]!, accepted[n]!));
+    return { accepted, current, changed, noDeclared: !!lock && hasValues(lock.values) && !lock.declared, fingerprint: this.cardFingerprint(ref, opts.extra) };
+  }
+
+  /** Does the part still show exactly what the card was drawn from (parameters and everything else)? */
+  private stillShows(ref: PartRef, snap: CardSnapshot, extra?: () => unknown): boolean {
+    return sameValues(this.paramsNow(ref), snap.current) && this.cardFingerprint(ref, extra) === snap.fingerprint;
+  }
+
   /**
    * `record_expectations { part, process, parameters, expectations }`.
    *
@@ -522,6 +601,8 @@ export class CadworkService {
     });
     let exp = draft;
     let by: "agent-initial" | "owner" = "agent-initial";
+    /** The owner card's snapshot (decision 153): the write checks the design still has these values. */
+    let shown: CardSnapshot | undefined;
 
     if (!pristine) {
       // The part exists already: only the owner can say what it must be.
@@ -530,29 +611,45 @@ export class CadworkService {
       if (isUnattended(session)) return { ok: false, error: `record_expectations was denied: cad/${ref.part} already has geometry (or an earlier approval), so its expectations need the owner's approval, and this session is unattended` };
       exp = { ...draft, lockedBy: "owner" };
       by = "owner";
-      const requestId = newId("cadx");
-      const approved = await new Promise<boolean>((resolve) => {
-        this.park({
-          requestId,
-          sessionId,
-          ref,
-          kind: "initial",
-          settle: resolve,
-          body: {
-            type: "cad.expectations.request",
+      let answer: CardAnswer = "stale";
+      for (let round = 0; round < 3 && answer === "stale"; round++) {
+        const snap = this.cardSnapshot(ref);
+        for (const [n, want] of Object.entries(declared.values)) {
+          if (snap.current[n] !== undefined && !closeTo(snap.current[n]!, want)) return { ok: false, error: `record_expectations refused: the design has ${n} = ${num(snap.current[n]!)}, not the declared ${num(want)}. Nothing was recorded.` };
+        }
+        const requestId = newId("cadx");
+        answer = await new Promise<CardAnswer>((resolve) => {
+          this.park({
             requestId,
             sessionId,
-            cwd: ref.worktree,
-            part: ref.part,
+            ref,
             kind: "initial",
-            note: INITIAL_AFTER_GEOMETRY,
-            rows: [{ label: "Process", new: process.trim() }, { label: "Status", ...(keep?.status === "concept" ? { old: "concept" } : {}), new: "dimensioned" }, ...expectationRows(undefined, exp, declared.values), ...(ownerParams ? [{ label: "Dimensions you typed", new: Object.keys(ownerParams).sort().map((n) => `${n} = ${num(ownerParams[n]!)}`).join(", ") }] : [])],
-          },
+            snap,
+            settle: resolve,
+            stale: () => !this.stillShows(ref, snap),
+            body: {
+              type: "cad.expectations.request",
+              requestId,
+              sessionId,
+              cwd: ref.worktree,
+              part: ref.part,
+              kind: "initial",
+              note: INITIAL_AFTER_GEOMETRY,
+              rows: [
+                { label: "Process", new: process.trim() },
+                { label: "Status", ...(keep?.status === "concept" ? { old: "concept" } : {}), new: "dimensioned" },
+                ...parameterRows(snap),
+                ...expectationRows(undefined, exp, undefined, values),
+                ...(ownerParams ? [{ label: "Dimensions you typed", new: Object.keys(ownerParams).sort().map((n) => `${n} = ${num(ownerParams[n]!)}`).join(", ") }] : []),
+              ],
+            },
+          });
         });
-        setStatus(session, "awaiting_permission");
-      });
-      setStatus(session, "running_tool");
-      if (!approved) return { ok: true, approved: false };
+        if (answer === "approved" && !this.stillShows(ref, snap)) answer = "stale";
+        if (answer === "approved") shown = snap;
+      }
+      if (answer === "denied") return { ok: true, approved: false };
+      if (answer === "stale") return { ok: false, error: `cad/${ref.part} kept changing while the owner was being asked; nothing was written` };
       const now_ = readPartFile(ref.dir);
       if (now_.kind === "invalid" || (now_.kind === "ok" && now_.file.expectations)) return { ok: false, error: `the owner approved, but cad/${ref.part}/part.json changed while the card was open; nothing was written` };
     }
@@ -567,6 +664,15 @@ export class CadworkService {
         const got = params.find((p) => p.name === n)?.value;
         if (got === undefined || Math.abs(got - declared.values[n]!) > 1e-9 * Math.max(1, Math.abs(declared.values[n]!))) {
           failure = `SolidCraft made ${n} = ${got === undefined ? "nothing" : num(got)}, not the declared ${num(declared.values[n]!)}`;
+          return;
+        }
+      }
+      if (shown) {
+        // Every other parameter is still what the owner's card was drawn with.
+        const nowValues = paramMap(params);
+        const moved = Object.keys(shown.current).filter((n) => nowValues[n] === undefined || !closeTo(nowValues[n]!, shown!.current[n]!));
+        if (moved.length) {
+          failure = `the design's ${moved.join(", ")} changed while the owner's card was open`;
           return;
         }
       }
@@ -598,15 +704,6 @@ export class CadworkService {
     return { ok: true, approved: true, by };
   }
 
-  /** `{ values }` when every formula evaluates with the part's current parameters, else `{}`. */
-  private valuesNow(ref: PartRef, exp: Expectations, params?: CadParamInfo[]): { values?: EvaluatedExpectations } {
-    try {
-      return { values: evaluateExpectations(exp, paramMap(params ?? this.manager.status(ref)?.params ?? [])) };
-    } catch {
-      return {};
-    }
-  }
-
   /**
    * `propose_expectations`: park a card showing each old and new value (evaluated), the process and
    * status they are approved under, and the agent's reason, and wait for the owner. Deny changes
@@ -624,7 +721,7 @@ export class CadworkService {
     reason: unknown,
     /** Runs after the owner approved and before anything is written; an error string writes nothing
      *  (import_reference imports the reference here, so a failed import changes no expectation). */
-    opts: { beforeWrite?: () => Promise<string | undefined> } = {},
+    opts: { beforeWrite?: () => Promise<string | undefined>; extraRows?: () => CadExpectationsRow[]; extraState?: () => unknown } = {},
   ): Promise<ExpectationsReply & { approved?: boolean }> {
     this.touch(sessionId, ref);
     const session = this.deps.getSession(sessionId);
@@ -633,7 +730,7 @@ export class CadworkService {
     if (typeof reason !== "string" || !reason.trim()) return { ok: false, error: "propose_expectations: give a `reason` the owner can judge the change by" };
     const why = expectationsShapeError(input, { stamped: false });
     if (why) return { ok: false, error: `propose_expectations: ${why}` };
-    const opened = await this.manager.open(ref); // the parameters the formulas are evaluated with
+    await this.manager.open(ref); // the parameters the formulas are evaluated with
     for (let round = 0; round < 3; round++) {
       const part = readPartFile(ref.dir);
       if (part.kind !== "ok" || !part.file.expectations) return { ok: false, error: `cad/${ref.part} has no expectations to change: call record_expectations first` };
@@ -642,21 +739,27 @@ export class CadworkService {
       const proposed = stampExpectations({ ...(input as ExpectationsInput), tolerance: { ...before.tolerance, ...((input as ExpectationsInput).tolerance ?? {}) } }, "owner", new Date().toISOString());
       const caps = toleranceCapErrors(proposed.tolerance);
       if (caps.length) return { ok: false, error: `propose_expectations refused: ${caps.join("; ")}` };
-      const params = paramMap(this.manager.status(ref)?.params ?? opened.params);
+      // Decision 153: "old" is the ACCEPTED numbers; "new" is the proposal at the values the card
+      // approves — the design's, with every parameter that differs from its accepted value shown.
+      const snap = this.cardSnapshot(ref, { extra: opts.extraState });
+      let values: EvaluatedExpectations;
       try {
-        evaluateExpectations(proposed, params);
+        values = evaluateExpectations(proposed, snap.current);
       } catch (e) {
         return { ok: false, error: `propose_expectations refused: ${e instanceof Error ? e.message : String(e)}. Every formula must evaluate against the design's parameters before the owner is asked, so the card can show numbers.` };
       }
-      const shown = lockedBlockSha(part.file);
+      const lock = this.findLock(ref);
+      const oldValues = hasValues(lock?.values) ? lock.values : evalOrUndefined(before, snap.accepted);
       const requestId = newId("cadx");
-      const approved = await new Promise<boolean>((resolve) => {
+      const answer = await new Promise<CardAnswer>((resolve) => {
         this.park({
           requestId,
           sessionId,
           ref,
           kind: "propose",
+          snap,
           settle: resolve,
+          stale: () => !this.stillShows(ref, snap, opts.extraState),
           body: {
             type: "cad.expectations.request",
             requestId,
@@ -665,34 +768,41 @@ export class CadworkService {
             part: ref.part,
             kind: "propose",
             reason: reason.trim(),
-            rows: [{ label: "Process", old: part.file.process, new: part.file.process }, { label: "Status", old: part.file.status, new: part.file.status }, ...expectationRows(before, proposed, params, this.findLock(ref)?.values)],
+            rows: [
+              { label: "Process", old: part.file.process, new: part.file.process },
+              { label: "Status", old: part.file.status, new: part.file.status },
+              ...parameterRows(snap),
+              ...expectationRows(before, proposed, oldValues, values),
+              ...(opts.extraRows?.() ?? []),
+            ],
           },
         });
-        setStatus(session, "awaiting_permission");
       });
-      setStatus(session, "running_tool");
-      if (!approved) return { ok: true, approved: false };
-      // Written only now, and only if the file is still what the card showed.
+      if (answer === "denied") return { ok: true, approved: false };
+      // Written only now, and only if the part still shows exactly what the card showed.
+      if (answer === "stale" || !this.stillShows(ref, snap, opts.extraState)) continue; // ask again, showing what is there now
       const cur = readPartFile(ref.dir);
       if (cur.kind !== "ok") return { ok: false, error: `the owner approved, but cad/${ref.part}/part.json can no longer be read; nothing was written` };
-      if (lockedBlockSha(cur.file) !== shown) continue; // process, status or the expectations changed meanwhile: ask again, showing what is there now
-      const values = this.valuesNow(ref, proposed).values;
-      if (!values) return { ok: false, error: `the owner approved, but the formulas no longer evaluate against the design's parameters; nothing was written` };
       if (opts.beforeWrite) {
         const err = await opts.beforeWrite();
         if (err) return { ok: false, error: err };
       }
-      const now2 = readPartFile(ref.dir);
-      const file: PartFile = { ...(now2.kind === "ok" ? now2.file : cur.file), expectations: proposed };
-      writePartFile(ref.dir, file);
-      // The parameter values the approved numbers were evaluated with (shown on the card) are now the accepted ones.
-      const declared = paramMap(this.manager.status(ref)?.params ?? []);
-      this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, declared, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
+      // The write and the approval sit in the part's queue, after a last look at the parameters: the
+      // lock gets the values the card showed (snap.current), never the design's at this moment.
+      const wrote = await this.manager.run(ref, async (slot) => {
+        if (!sameValues(paramMap(slot.params()), snap.current)) return false;
+        const now2 = readPartFile(ref.dir);
+        const file: PartFile = { ...(now2.kind === "ok" ? now2.file : cur.file), expectations: proposed };
+        writePartFile(ref.dir, file);
+        this.approve(ref, { sha: lockedBlockSha(file), approvedBy: "owner", status: file.status, values, declared: { ...snap.current }, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at: proposed.lockedAt });
+        return true;
+      });
+      if (!wrote) continue;
       this.clearGapRecord(ref); // an approved expectation change clears a reported gap
       this.recheck(ref);
       return { ok: true, approved: true };
     }
-    return { ok: false, error: `cad/${ref.part}/part.json kept changing while the owner was being asked; nothing was written` };
+    return { ok: false, error: `cad/${ref.part} kept changing while the owner was being asked; nothing was written` };
   }
 
   // ── Phase A4: references, concepts and dimensions, gaps, release ───────────────────────────────
@@ -746,8 +856,24 @@ export class CadworkService {
     }
     // Expectations are locked: adding what the part must not touch is the owner's call, on the card.
     const input: ExpectationsInput = { bbox: exp.bbox, volume: exp.volume, bodies: exp.bodies, holes: exp.holes, tolerance: exp.tolerance, noInterferenceWith: [...new Set([...(exp.noInterferenceWith ?? []), name])] };
-    const reason = `import_reference: ${src.rel} as refs/${name} (sha256 ${src.sha256.slice(0, 12)}, ${src.bytes.length} bytes) — the part must not touch it.`;
-    const r = await this.proposeExpectations(sessionId, ref, input, reason, { beforeWrite: doImport });
+    // Replacing a reference is said as such: which file, its old and new sha, and the body counts.
+    const onDisk = (): string | null => {
+      const d = referenceOnDisk(ref, name);
+      return "sha256" in d ? d.sha256 : existsSync(join(ref.dir, REFS_DIR, name)) ? "unreadable" : null;
+    };
+    const record = (part.kind === "ok" ? part.file.refs ?? [] : []).find((x) => x.name === name);
+    const oldSha = record?.sha256 ?? onDisk() ?? undefined;
+    const replacing = !!record || oldSha !== undefined;
+    const solids = stepSolidCount(src.bytes);
+    const replaceRows = (): CadExpectationsRow[] =>
+      replacing
+        ? [
+            { label: "Reference", old: `refs/${name}`, new: `Replaces refs/${name}: old sha ${String(oldSha ?? "unknown").slice(0, 12)} → new sha ${src.sha256.slice(0, 12)}`, unapproved: true },
+            { label: "Reference bodies", old: record ? `${record.bodies.length} (${record.bodies.join(", ")})` : "unknown", new: solids ? `${solids} (solids declared in the new file)` : "counted when it is imported" },
+          ]
+        : [{ label: "Reference", new: `adds refs/${name} (sha ${src.sha256.slice(0, 12)}${solids ? `, ${solids} bod${solids === 1 ? "y" : "ies"}` : ""})` }];
+    const reason = `import_reference: ${src.rel} as refs/${name} (sha256 ${src.sha256.slice(0, 12)}, ${src.bytes.length} bytes)${replacing ? `, REPLACING the existing refs/${name} (sha256 ${String(oldSha ?? "unknown").slice(0, 12)})` : ""} — the part must not touch it.`;
+    const r = await this.proposeExpectations(sessionId, ref, input, reason, { beforeWrite: doImport, extraRows: replaceRows, extraState: onDisk });
     if (!r.ok) return r;
     if (!r.approved) return { ok: true, approved: false };
     return outcome;
@@ -856,32 +982,43 @@ export class CadworkService {
     }
     const rows = parseDimensionRows(proposed);
     if (!rows.ok) return { ok: false, error: `request_dimensions: ${rows.error}` };
-    const requestId = newId("cadx");
-    const answer = await new Promise<{ approved: boolean; values?: Record<string, number> }>((resolve) => {
-      this.park({
-        requestId,
-        sessionId,
-        ref,
-        kind: "dimensions",
-        dims: rows.rows.map((r) => r.name),
-        settle: (approved, values) => resolve({ approved, values }),
-        body: {
-          type: "cad.expectations.request",
+    // One open dimensions card per part per session: a second request does not pile up cards.
+    if ([...this.cards.values()].some((c) => c.kind === "dimensions" && c.sessionId === sessionId && c.ref.key === ref.key)) return { ok: false, error: DIMENSIONS_CARD_OPEN };
+    let answer: { answer: CardAnswer; values?: Record<string, number> } = { answer: "stale" };
+    let shown: CardSnapshot | undefined;
+    for (let round = 0; round < 3 && answer.answer === "stale"; round++) {
+      const snap = this.cardSnapshot(ref);
+      const requestId = newId("cadx");
+      answer = await new Promise<{ answer: CardAnswer; values?: Record<string, number> }>((resolve) => {
+        this.park({
           requestId,
           sessionId,
-          cwd: ref.worktree,
-          part: ref.part,
+          ref,
           kind: "dimensions",
-          note: "The agent built this part from a picture. Type the real dimensions: your numbers are what the part will be checked against.",
-          dimensions: rows.rows,
-          rows: rows.rows.map((r) => ({ label: r.name, new: `${num(r.value)}${r.unit ? ` ${r.unit}` : ""}` })),
-        },
+          snap,
+          dims: rows.rows.map((r) => r.name),
+          settle: (a, values) => resolve({ answer: a, values }),
+          stale: () => !this.stillShows(ref, snap),
+          body: {
+            type: "cad.expectations.request",
+            requestId,
+            sessionId,
+            cwd: ref.worktree,
+            part: ref.part,
+            kind: "dimensions",
+            note: "The agent built this part from a picture. Type the real dimensions: your numbers are what the part will be checked against.",
+            dimensions: rows.rows,
+            rows: [...parameterRows(snap), ...rows.rows.map((r) => ({ label: r.name, new: `${num(r.value)}${r.unit ? ` ${r.unit}` : ""}` }))],
+          },
+        });
       });
-      setStatus(session, "awaiting_permission");
-    });
-    setStatus(session, "running_tool");
-    if (!answer.approved || !answer.values) return { ok: true, approved: false };
+      if (answer.answer === "approved" && !this.stillShows(ref, snap)) answer = { answer: "stale" };
+      if (answer.answer === "approved") shown = snap;
+    }
+    if (answer.answer === "stale") return { ok: false, error: `cad/${ref.part} kept changing while the owner was being asked; nothing was written` };
+    if (answer.answer !== "approved" || !answer.values || !shown) return { ok: true, approved: false };
     const values = answer.values;
+    const drawnWith = shown;
     // Apply exactly the owner's numbers to the design, in one queued change, then record them.
     const have = new Set((this.manager.status(ref)?.params ?? []).map((p) => p.name));
     const unit = new Map(rows.rows.map((r) => [r.name, r.unit]));
@@ -900,6 +1037,10 @@ export class CadworkService {
       afterWrite: (slot, done) => {
         if (done.result.isError) return void (failure = `the dimensions could not be applied: ${done.result.text.slice(0, 300)}`);
         if (slot.state().conflict) return void (failure = DISK_CONFLICT_REASON);
+        // Every parameter the owner did not type is still what the card was drawn with.
+        const nowValues = paramMap(slot.params());
+        const moved = Object.keys(drawnWith.current).filter((n) => !(n in values) && (nowValues[n] === undefined || !closeTo(nowValues[n]!, drawnWith.current[n]!)));
+        if (moved.length) return void (failure = `the design's ${moved.join(", ")} changed after the card was drawn`);
         for (const n of Object.keys(values)) {
           const got = slot.params().find((p) => p.name === n)?.value;
           if (got === undefined || Math.abs(got - values[n]!) > 1e-9 * Math.max(1, Math.abs(values[n]!))) return void (failure = `SolidCraft made ${n} = ${got ?? "nothing"}, not ${values[n]}`);
@@ -959,7 +1100,9 @@ export class CadworkService {
     if (!existsSync(dir)) return undefined;
     try {
       const v = this.verifyReleaseDir(dir);
-      return v.ok ? { path: relative(ref.worktree, dir), scriptSha, at: v.manifest.createdAt } : undefined;
+      // The folder is named for 7 characters of the script's sha; the badge needs the WHOLE sha (a pack
+      // of a different script whose sha shares those 7 characters is not this script's release).
+      return v.ok && v.manifest.scriptSha === scriptSha && v.manifest.part === ref.part ? { path: relative(ref.worktree, dir), scriptSha, at: v.manifest.createdAt } : undefined;
     } catch {
       return undefined;
     }
@@ -972,7 +1115,7 @@ export class CadworkService {
    * then is the pack written — exactly the files of §4.7, atomically — and one `file.offer` sent per
    * file. Anything short of that writes nothing.
    */
-  async releasePart(sessionId: string, ref: PartRef, opts: { onParked?: () => void } = {}): Promise<{ ok: true; approved: boolean; dir?: string; files?: string[]; offered?: number } | { ok: false; error: string }> {
+  async releasePart(sessionId: string, ref: PartRef, opts: { onParked?: () => void; round?: number } = {}): Promise<{ ok: true; approved: boolean; dir?: string; files?: string[]; offered?: number } | { ok: false; error: string }> {
     this.touch(sessionId, ref);
     const session = this.deps.getSession(sessionId);
     if (!session) return { ok: false, error: "the session is gone" };
@@ -1006,14 +1149,20 @@ export class CadworkService {
       ...[...advisoryLines(gate), ...gate.warnings].map((a) => ({ label: "Advisory", new: a })),
       { label: "Bounding box (measured)", new: `${m.bbox.map(num).join(" × ")} mm` },
     ];
+    // Decision 153: the card is drawn from a snapshot (parameters, part.json, the approval on record,
+    // the script); if any of it differs when the owner approves, nothing is approved and the call
+    // starts over (a fresh refresh, a fresh card).
+    const snapCard = this.cardSnapshot(ref, { extra: () => this.manager.status(ref)?.scriptSha ?? null });
     const requestId = newId("cadx");
-    const approved = await new Promise<boolean>((resolve) => {
+    const answer = await new Promise<CardAnswer>((resolve) => {
       this.park({
         requestId,
         sessionId,
         ref,
         kind: "release",
+        snap: snapCard,
         settle: resolve,
+        stale: () => !this.stillShows(ref, snapCard, () => this.manager.status(ref)?.scriptSha ?? null),
         body: {
           type: "cad.expectations.request",
           requestId,
@@ -1022,19 +1171,20 @@ export class CadworkService {
           part: ref.part,
           kind: "release",
           ...(agentNumbers ? { note: RELEASE_AGENT_NUMBERS } : {}),
-          rows,
+          rows: [...parameterRows(snapCard), ...rows],
         },
       });
-      setStatus(session, "awaiting_permission");
       opts.onParked?.();
     });
-    setStatus(session, "running_tool");
-    if (!approved) return { ok: true, approved: false };
+    if (answer === "stale" && (opts.round ?? 0) < 2) return this.releasePart(sessionId, ref, { round: (opts.round ?? 0) + 1 });
+    if (answer === "stale") return refuse(`cad/${ref.part} kept changing while the owner was being asked`);
+    if (answer !== "approved") return { ok: true, approved: false };
 
     // The owner saw these numbers on the release card: release is never on numbers nobody approved.
+    // The confirmation is written from the approval the card was drawn with (unchanged: checked above).
     if (agentNumbers) {
       const locked = readLocked(ref, this.locks, this.machine());
-      if (locked.part.kind !== "ok" || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file)) return refuse("part.json changed while the card was open");
+      if (locked.part.kind !== "ok" || !locked.lock || locked.lock.sha !== lockedBlockSha(locked.part.file) || !this.stillShows(ref, snapCard, () => this.manager.status(ref)?.scriptSha ?? null)) return refuse("part.json changed while the card was open");
       const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
       this.approve(ref, { ...rest, approvedBy: "owner", at: new Date().toISOString() });
     }
@@ -1453,6 +1603,25 @@ export class CadworkService {
     this.broadcast(this.designEvent(snap));
   }
 
+  /**
+   * A part's process stopped (idle, evicted, exited, reload): drop its per-part timer state — the
+   * busy notice and the `cad.design` coalescer — so nothing fires for a process that is gone and the
+   * maps do not grow with every part ever opened. A trailing emit still pending goes out now.
+   */
+  private onStopped(key: string): void {
+    const armed = this.busyTimers.get(key);
+    if (armed !== undefined) this.clock.clearTimeout(armed);
+    this.busyTimers.delete(key);
+    const st = this.emitState.get(key);
+    if (st?.timer !== undefined) {
+      this.clock.clearTimeout(st.timer);
+      const latest = this.snapshots.get(key);
+      if (latest) this.broadcast(this.designEvent(latest));
+    }
+    this.emitState.delete(key);
+    this.busyEpoch.delete(key);
+  }
+
   /** A part is (or is no longer) held for a SolidCraft slot: said at once, the UI shows "waiting for a CAD slot". */
   private onWaiting(key: string, part: string, waiting: boolean): void {
     const snap = this.ensureSnapshot(key, part);
@@ -1475,13 +1644,24 @@ export class CadworkService {
       typed = v.values;
     }
     this.cards.delete(requestId);
-    let approved = approve;
     // The waiting tool call does the writing for these.
     const toolCard = card.kind === "propose" || card.kind === "initial" || card.kind === "dimensions" || card.kind === "release";
-    if (!toolCard && approve) approved = card.kind === "confirm" ? this.confirm(card) : this.adopt(card);
-    this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId, approved } satisfies CadExpectationsResolvedEvent);
-    card.settle?.(approved, typed);
-    if (!toolCard) this.recheck(card.ref, card.kind === "adopt-rules");
+    // Decision 153: an approval is for exactly what the card showed. If anything on it changed while
+    // it was open, nothing is approved and a fresh card is drawn (by the waiting call, or the recheck).
+    const stale = approve && !!card.stale?.();
+    let approved = approve && !stale;
+    let superseded = stale;
+    if (!toolCard && approved) {
+      approved = card.kind === "confirm" ? this.confirm(card) : this.adopt(card);
+      superseded = !approved;
+    }
+    this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId, approved, ...(superseded ? { superseded: true } : {}) } satisfies CadExpectationsResolvedEvent);
+    this.releaseStatus(card);
+    card.settle?.(approved ? "approved" : superseded ? "stale" : "denied", typed);
+    if (!toolCard) {
+      if (superseded && card.kind === "confirm") this.confirmNumbers(card.sessionId, card.ref); // redraw it, showing what is there now
+      this.recheck(card.ref, card.kind === "adopt-rules");
+    }
     return true;
   }
 
@@ -1492,7 +1672,8 @@ export class CadworkService {
       if (card.sessionId !== sessionId) continue;
       this.cards.delete(card.requestId);
       this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId: card.requestId, approved: false, superseded: true } satisfies CadExpectationsResolvedEvent);
-      card.settle?.(false);
+      this.releaseStatus(card);
+      card.settle?.("denied");
     }
   }
 
@@ -1539,6 +1720,30 @@ export class CadworkService {
   private park(card: Card): void {
     this.cards.set(card.requestId, card);
     this.broadcast({ ...card.body, v: PROTOCOL_VERSION, ts: now() } as CadExpectationsRequestEvent);
+    if (card.settle) this.holdStatus(card);
+  }
+
+  /**
+   * A card a tool call waits on shows the session as `awaiting_permission` — but ONLY while a turn is
+   * running. A card raised with no turn (the Release button) leaves the status alone, so an idle
+   * session is never left looking busy.
+   */
+  private holdStatus(card: Card): void {
+    const s = this.deps.getSession(card.sessionId) as unknown as { data?: { status?: string } } | undefined;
+    const prev = s?.data?.status;
+    if (!prev || !TURN_STATUSES.has(prev)) return;
+    card.prevStatus = prev;
+    setStatus(s, "awaiting_permission");
+  }
+  /** The card is answered or gone: give the session back the status it had, if this card changed it. */
+  private releaseStatus(card: Card): void {
+    const prev = card.prevStatus;
+    card.prevStatus = undefined;
+    if (!prev) return;
+    const s = this.deps.getSession(card.sessionId) as unknown as { data?: { status?: string } } | undefined;
+    if (s?.data?.status !== "awaiting_permission") return; // the turn ended (or moved on) meanwhile: leave it
+    if ([...this.cards.values()].some((c) => c.sessionId === card.sessionId && c.prevStatus)) return; // another card still holds it
+    setStatus(s, "running_tool"); // the tool call that raised the card goes on (settled against any other parked prompt)
   }
 
   /** Post-step 5: record the outcome, broadcast `cad.design`, and raise or retire adopt cards. */
@@ -1570,30 +1775,43 @@ export class CadworkService {
     const wanted = new Set(pendingAdoptions(gate));
     const locked = readLocked(ref, this.locks, this.machine());
     const attended = [...(this.partSessions.get(ref.key) ?? [])].map((id) => this.deps.getSession(id)).find((s) => s && !isUnattended(s));
-    const build: Partial<Record<CardKind, () => { sha: string; rows: CadExpectationsRow[]; rulesDiff?: CadExpectationsRequestEvent["rulesDiff"] } | undefined>> = {
+    // Decision 153: every part card is drawn from one snapshot — accepted values, the design's values
+    // (as just measured), and everything else the card shows. "Old" is the accepted numbers; a
+    // parameter the agent moved is its own row; approval writes the snapshot, and refuses (and
+    // redraws) if anything on the card changed meanwhile.
+    const snap = this.cardSnapshot(ref, { current: paramMap(params) });
+    type Built = { sha: string; rows: CadExpectationsRow[]; values?: EvaluatedExpectations; rulesDiff?: CadExpectationsRequestEvent["rulesDiff"] };
+    const build: Partial<Record<CardKind, () => Built | undefined>> = {
       "adopt-expectations": () => {
         if (locked.part.kind !== "ok") return undefined;
         const f = locked.part.file;
-        // Evaluated from the ACCEPTED parameter values where there are any (an agent's unapproved
-        // change does not ride in on an adoption), the design's for names never accepted.
-        const p = acceptedBase(locked.lock, params);
         // A card always shows evaluated numbers: expectations that do not evaluate cannot be adopted
         // (the gate says which formula fails), so no card is drawn for them.
-        if (f.expectations && !evalOrUndefined(f.expectations, p)) return undefined;
+        const values = f.expectations ? evalOrUndefined(f.expectations, snap.current) : undefined;
+        if (f.expectations && !values) return undefined;
+        const old = hasValues(locked.lock?.values) ? locked.lock.values : undefined;
         const rows: CadExpectationsRow[] = [
           { label: "Process", new: f.process },
           { label: "Status", ...(locked.lock ? { old: locked.lock.status } : {}), new: f.status },
-          ...(f.expectations ? expectationRows(undefined, f.expectations, p, locked.lock?.values) : [{ label: "Expectations", ...(locked.lock?.values ? { old: valueText(locked.lock.values) } : {}), new: "none" }]),
+          ...parameterRows(snap),
+          ...(f.expectations ? expectationRows(undefined, f.expectations, old, values) : [{ label: "Expectations", ...(old ? { old: valueText(old) } : {}), new: "none" }]),
           ...(f.expectations ? [{ label: "Approved by (as the file claims)", new: f.expectations.lockedBy }] : []),
         ];
-        return { sha: lockedBlockSha(f), rows };
+        return { sha: lockedBlockSha(f), rows, ...(values ? { values } : {}) };
       },
       "adopt-ownerParams": () => {
         if (locked.part.kind !== "ok") return undefined;
         const now_ = locked.part.file.ownerParams ?? {};
         const old = locked.lock?.ownerParams ?? {};
         const names = [...new Set([...Object.keys(old), ...Object.keys(now_)])].sort();
-        return { sha: ownerParamsCardSha(locked.part.file.ownerParams), rows: names.map((n) => ({ label: n, ...(old[n] !== undefined ? { old: String(old[n]) } : {}), ...(now_[n] !== undefined ? { new: String(now_[n]) } : {}) })) };
+        const exp = locked.part.file.expectations;
+        const values = exp ? evalOrUndefined(exp, snap.current) : undefined;
+        return {
+          sha: ownerParamsCardSha(locked.part.file.ownerParams),
+          // Moved parameters ride on this card only when the numbers they lead to can be shown.
+          rows: [...(values ? parameterRows(snap) : []), ...names.map((n) => ({ label: n, ...(old[n] !== undefined ? { old: String(old[n]) } : {}), ...(now_[n] !== undefined ? { new: String(now_[n]) } : {}) }))],
+          ...(values ? { values } : {}),
+        };
       },
       "adopt-rules": () => {
         if (locked.rules.kind === "missing") return undefined;
@@ -1611,20 +1829,32 @@ export class CadworkService {
     for (const kind of ["adopt-expectations", "adopt-ownerParams", "adopt-rules"] as const) {
       const open = [...this.cards.values()].filter((c) => sameScope(c, kind));
       const next = wantedKinds.has(kind) ? build[kind]!() : undefined;
+      // A card's identity is everything it shows (not just the file's hash): a card whose numbers
+      // would read differently now is replaced, never kept open under its old rows.
+      const nextKey = next ? JSON.stringify([next.sha, next.rows, next.rulesDiff ?? null]) : undefined;
       for (const c of open) {
-        if (next && c.sha === next.sha) continue; // the same question is already on screen
+        if (nextKey !== undefined && c.key === nextKey && !c.stale?.()) continue; // the same question is already on screen
         this.cards.delete(c.requestId);
         this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId: c.requestId, approved: false, superseded: true } satisfies CadExpectationsResolvedEvent);
       }
       if (!next || !attended) continue; // nothing to adopt, or nobody there to answer (the part stays unverified)
       if ([...this.cards.values()].some((c) => sameScope(c, kind))) continue;
       const requestId = newId("cadx");
-      this.park({ requestId, sessionId: attended.id, ref, kind, sha: next.sha, body: { type: "cad.expectations.request", requestId, sessionId: attended.id, cwd: ref.worktree, part: ref.part, kind, rows: next.rows, ...(next.rulesDiff ? { rulesDiff: next.rulesDiff } : {}) } });
+      const rulesSha = locked.rules.kind === "missing" ? null : locked.rules.sha;
+      const stale =
+        kind === "adopt-rules"
+          ? () => {
+              const r = readLocked(ref, this.locks, this.machine()).rules;
+              return (r.kind === "missing" ? null : r.sha) !== rulesSha;
+            }
+          : () => !this.stillShows(ref, snap);
+      this.park({ requestId, sessionId: attended.id, ref, kind, sha: next.sha, key: nextKey, snap, stale, ...(next.values ? { values: next.values } : {}), body: { type: "cad.expectations.request", requestId, sessionId: attended.id, cwd: ref.worktree, part: ref.part, kind, rows: next.rows, ...(next.rulesDiff ? { rulesDiff: next.rulesDiff } : {}) } });
     }
   }
 
   /** The owner tapped Approve on an adopt card: record exactly what the card showed, and nothing
-   *  else — every kind compares the card's hash with what is on disk now. */
+   *  else — every kind compares the card's hash with what is on disk now, and the parameter values
+   *  recorded are the snapshot's (decision 153), never the design's at approval time. */
   private adopt(card: Card): boolean {
     const { ref } = card;
     const locked = readLocked(ref, this.locks, this.machine());
@@ -1634,28 +1864,28 @@ export class CadworkService {
       this.approveRules(ref.worktree, { sha: locked.rules.sha, text: locked.rules.text, at });
       return true;
     }
-    if (locked.part.kind !== "ok") return false;
+    if (locked.part.kind !== "ok" || !card.snap) return false;
     const file = locked.part.file;
+    const snap = card.snap;
     if (card.kind === "adopt-expectations") {
       if (lockedBlockSha(file) !== card.sha) return false;
-      // The accepted numbers are fixed here, at approval, from the same values the card showed.
-      // Formulas that do not evaluate cannot be approved.
-      const base = acceptedBase(locked.lock, this.manager.status(ref)?.params ?? []);
-      const values = file.expectations ? evalOrUndefined(file.expectations, base) : undefined;
-      if (file.expectations && !values) return false;
-      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(values ? { values, declared: base } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+      if (file.expectations && !card.values) return false; // formulas that do not evaluate cannot be approved
+      this.approve(ref, { sha: card.sha, approvedBy: "owner", status: file.status, ...(card.values ? { values: card.values, declared: { ...snap.current } } : {}), ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
       return true;
     }
     if (card.kind !== "adopt-ownerParams" || !locked.lock) return false;
     if (ownerParamsCardSha(file.ownerParams) !== card.sha) return false; // not the dimensions the card showed
     const { ownerParams: _old, repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
-    this.approve(ref, { ...rest, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+    // Moved parameters were rows on the card (only when their numbers could be shown): approved with it.
+    const moved = card.values && snap.changed.length && rest.sha === lockedBlockSha(file) ? { values: card.values, declared: { ...snap.current } } : {};
+    this.approve(ref, { ...rest, ...moved, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
     return true;
   }
 
   /**
    * "Confirm numbers" (`cad.expectations.confirm`): raise the standard owner card for a part whose
-   * numbers the agent recorded. Approving it makes the owner the approver of exactly that block.
+   * numbers the agent recorded. Approving it makes the owner the approver of exactly that block — and,
+   * like every card, of any parameter the agent moved, which is listed as its own row.
    */
   confirmNumbers(sessionId: string, ref: PartRef): ExpectationsReply {
     const session = this.deps.getSession(sessionId);
@@ -1668,14 +1898,22 @@ export class CadworkService {
     if (locked.lock.approvedBy !== "agent-initial") return { ok: false, error: `cad/${ref.part}'s numbers are already approved by the ${locked.lock.approvedBy}` };
     this.touch(sessionId, ref);
     for (const c of [...this.cards.values()]) if (c.kind === "confirm" && c.ref.key === ref.key) return { ok: true, note: "a card is already open" };
+    const snap = this.cardSnapshot(ref);
+    const accepted = locked.lock.values;
+    // The numbers approving writes: the accepted ones, or — when a parameter moved — the block at the
+    // design's values (shown as "To confirm", with the moved parameter as its own row).
+    const values = snap.changed.length ? evalOrUndefined(file.expectations!, snap.current) : accepted;
+    if (!values) return { ok: false, error: `cad/${ref.part}'s formulas do not evaluate against the design's parameters; nothing to confirm` };
     const requestId = newId("cadx");
-    const v = locked.lock.values;
     this.park({
       requestId,
       sessionId,
       ref,
       kind: "confirm",
       sha,
+      snap,
+      values,
+      stale: () => !this.stillShows(ref, snap),
       body: {
         type: "cad.expectations.request",
         requestId,
@@ -1683,7 +1921,7 @@ export class CadworkService {
         cwd: ref.worktree,
         part: ref.part,
         kind: "confirm",
-        rows: [{ label: "Process", new: file.process }, { label: "Status", new: file.status }, ...expectationRows(undefined, file.expectations!, paramMap(this.manager.status(ref)?.params ?? []), v), { label: "Recorded by", old: "the agent", new: "you, once approved" }],
+        rows: [{ label: "Process", new: file.process }, { label: "Status", new: file.status }, ...parameterRows(snap), ...expectationRows(file.expectations, file.expectations!, accepted, values), { label: "Recorded by", old: "the agent", new: "you, once approved" }],
       },
     });
     return { ok: true };
@@ -1691,9 +1929,10 @@ export class CadworkService {
 
   private confirm(card: Card): boolean {
     const locked = readLocked(card.ref, this.locks, this.machine());
-    if (locked.part.kind !== "ok" || !locked.lock || lockedBlockSha(locked.part.file) !== card.sha || locked.lock.sha !== card.sha || !hasValues(locked.lock.values)) return false;
+    if (locked.part.kind !== "ok" || !locked.lock || lockedBlockSha(locked.part.file) !== card.sha || locked.lock.sha !== card.sha || !hasValues(locked.lock.values) || !card.snap || !card.values) return false;
     const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = locked.lock;
-    this.approve(card.ref, { ...rest, approvedBy: "owner", at: new Date().toISOString() });
+    const moved = card.snap.changed.length ? { values: card.values, declared: { ...card.snap.current } } : {};
+    this.approve(card.ref, { ...rest, ...moved, approvedBy: "owner", at: new Date().toISOString() });
     return true;
   }
 
@@ -1745,7 +1984,7 @@ export class CadworkService {
     for (const t of this.busyTimers.values()) this.clock.clearTimeout(t);
     for (const st of this.emitState.values()) if (st.timer !== undefined) this.clock.clearTimeout(st.timer);
     this.busyTimers.clear();
-    for (const card of [...this.cards.values()]) card.settle?.(false);
+    for (const card of [...this.cards.values()]) card.settle?.("denied");
     this.cards.clear();
     await this.manager.shutdown();
     await this.lockSync.settled();
@@ -1767,13 +2006,22 @@ function evalOrUndefined(exp: Expectations, params: Record<string, number>): Eva
   }
 }
 const paramMap = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
+const closeTo = (a: number, b: number): boolean => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+/** The same names with the same values. */
+function sameValues(a: Record<string, number>, b: Record<string, number>): boolean {
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i] && closeTo(a[k]!, b[k]!));
+}
 const partRefOf = (key: string, part: string): PartRef => ({ key, part, dir: key, worktree: key.slice(0, key.length - `/cad/${part}`.length) });
 const num = (v: number): string => String(Math.round(v * 1e4) / 1e4);
 
-function setStatus(session: unknown, status: "awaiting_permission" | "running_tool"): void {
-  const s = session as { setStatus?: (st: string) => void; settleStatus?: (st: string) => string };
+/** The statuses of a session whose turn is running (an owner card may show it as waiting on the owner). */
+const TURN_STATUSES = new Set(["thinking", "running_tool", "awaiting_permission", "awaiting_question"]);
+function setStatus(session: unknown, status: string): void {
+  const s = session as { setStatus?: (st: string) => void; settleStatus?: (st: string) => string } | undefined;
   try {
-    if (typeof s.setStatus === "function") s.setStatus(status === "running_tool" && typeof s.settleStatus === "function" ? s.settleStatus(status) : status);
+    if (s && typeof s.setStatus === "function") s.setStatus(status !== "awaiting_permission" && typeof s.settleStatus === "function" ? s.settleStatus(status) : status);
   } catch {
     /* status is cosmetic here */
   }
@@ -1784,17 +2032,28 @@ function valueText(v: EvaluatedExpectations): string {
   return `box ${v.bbox.map(num).join(" × ")} mm; volume ${num(v.volume)} mm³; ${v.bodies} bod${v.bodies === 1 ? "y" : "ies"}; holes ${holes}`;
 }
 
-/** The rows of an expectations card: each value as written (a formula) with what it evaluates to. */
-export function expectationRows(before: Expectations | undefined, after: Expectations, params: Record<string, number>, acceptedBefore?: EvaluatedExpectations): CadExpectationsRow[] {
-  const ev = (e: Expectations | undefined): EvaluatedExpectations | undefined => {
-    if (!e) return undefined;
-    try {
-      return evaluateExpectations(e, params);
-    } catch {
-      return undefined;
-    }
-  };
-  const [vb, va] = [ev(before) ?? acceptedBefore, ev(after)];
+/** How a parameter row says its value is not the approved one (decision 153). */
+export const UNAPPROVED_PARAMETER = "changed by the agent, not approved";
+/** The parameter rows of an owner card: one per parameter whose current value is not the accepted
+ *  one. Approving the card approves these too — which is why they are shown. */
+export function parameterRows(snap: CardSnapshot): CadExpectationsRow[] {
+  const rows: CadExpectationsRow[] = snap.changed.map((n) => ({
+    label: `Parameter ${n}`,
+    old: num(snap.accepted[n]!),
+    new: snap.current[n] === undefined ? `removed (${UNAPPROVED_PARAMETER})` : `${num(snap.current[n]!)} (${UNAPPROVED_PARAMETER})`,
+    unapproved: true,
+  }));
+  if (snap.noDeclared) rows.push({ label: "Parameters", old: "not recorded with the earlier approval", new: "approving accepts the design's current values — compare the numbers below", unapproved: true });
+  return rows;
+}
+
+/**
+ * The rows of an expectations card: each value as written (a formula) with what it evaluates to.
+ * `oldValues` are the ACCEPTED numbers (the lock's, or the old block evaluated at the accepted
+ * parameter values); `newValues` are the new block evaluated at the values the card approves.
+ */
+export function expectationRows(before: Expectations | undefined, after: Expectations, oldValues: EvaluatedExpectations | undefined, newValues: EvaluatedExpectations | undefined): CadExpectationsRow[] {
+  const [vb, va] = [oldValues, newValues];
   const withValue = (written: string, value: string | undefined): string => (value === undefined || value === written ? written : `${written}  (= ${value})`);
   const side = (e: Expectations | undefined, v: EvaluatedExpectations | undefined) => ({
     bbox: e ? withValue(e.bbox.join(" × "), v?.bbox.map(num).join(" × ")) : v ? v.bbox.map(num).join(" × ") : undefined,
@@ -1831,15 +2090,25 @@ export function parseDimensionRows(raw: unknown): { ok: true; rows: CadDimension
     if (!x || typeof x !== "object") return { ok: false, error: `proposed[${i}] must be {name, value, unit?, note?}` };
     if (typeof x.name !== "string" || !PARAM_NAME_RE.test(x.name) || x.name === "pi") return { ok: false, error: `proposed[${i}].name must be a parameter name` };
     if (rows.some((y) => y.name === x.name)) return { ok: false, error: `proposed[${i}].name ${x.name} is listed twice` };
-    if (typeof x.value !== "number" || !Number.isFinite(x.value)) return { ok: false, error: `proposed[${i}].value must be a number` };
+    const bad = dimensionError(x.value);
+    if (bad) return { ok: false, error: `proposed[${i}].value ${bad}` };
     if (x.unit !== undefined && x.unit !== "mm" && x.unit !== "") return { ok: false, error: `proposed[${i}].unit must be "mm" (dimensions are lengths)` };
     if (x.note !== undefined && typeof x.note !== "string") return { ok: false, error: `proposed[${i}].note must be text` };
-    rows.push({ name: x.name, value: x.value, ...(x.unit ? { unit: "mm" } : {}), ...(typeof x.note === "string" && x.note.trim() ? { note: x.note.trim().slice(0, 200) } : {}) });
+    rows.push({ name: x.name, value: x.value as number, ...(x.unit ? { unit: "mm" } : {}), ...(typeof x.note === "string" && x.note.trim() ? { note: x.note.trim().slice(0, 200) } : {}) });
   }
   return { ok: true, rows };
 }
 
-/** The owner's answer to a dimensions card: a finite number for exactly the card's names. */
+/** Why a dimension value is refused (decision 154): it must be a finite length above 0 and at most
+ *  `CAD_DIMENSION_MAX_MM`. Undefined when it is fine. */
+export function dimensionError(x: unknown): string | undefined {
+  if (typeof x !== "number" || !Number.isFinite(x)) return "must be a number";
+  if (x <= 0) return "must be above 0 mm";
+  if (x > CAD_DIMENSION_MAX_MM) return `must be at most ${CAD_DIMENSION_MAX_MM} mm`;
+  return undefined;
+}
+
+/** The owner's answer to a dimensions card: a positive, bounded number for exactly the card's names. */
 export function checkDimensionValues(names: string[], raw: unknown): { ok: true; values: Record<string, number> } | { ok: false; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "the dimensions card needs a number for every dimension" };
   const v = raw as Record<string, unknown>;
@@ -1848,8 +2117,9 @@ export function checkDimensionValues(names: string[], raw: unknown): { ok: true;
   const out: Record<string, number> = {};
   for (const n of names) {
     const x = v[n];
-    if (typeof x !== "number" || !Number.isFinite(x)) return { ok: false, error: `${n} must be a number` };
-    out[n] = x;
+    const bad = dimensionError(x);
+    if (bad) return { ok: false, error: `${n} ${bad}` };
+    out[n] = x as number;
   }
   return { ok: true, values: out };
 }

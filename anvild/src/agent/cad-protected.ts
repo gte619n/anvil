@@ -17,7 +17,8 @@
  *     `<stateDir>/solidcraft`, `<stateDir>/browser-profile`) or `solidcraft-cli`, or that pass
  *     `--remote-debugging-port` or `--user-data-dir`.
  *  Every file-tool target is resolved by ONE resolver (./tool-paths.ts): `~` / `~/` expand to the
- *  daemon user's home as the CLI does, `~user` is refused outright, and comparisons ignore case.
+ *  daemon user's home as the CLI does, `~user` is refused outright, and comparisons ignore case
+ *  and Unicode look-alikes (NFKC); a NEW name under `cad/` outside printable ASCII is denied.
  *  ALWAYS PROMPT (no "always allow"; denied when nobody is there to answer)
  *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to `cad/rules.json`.
  *   - `Edit` / `Write` / `MultiEdit` / `NotebookEdit` to `cad/<part>/design.json`: the script is
@@ -34,7 +35,7 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { gitToplevel } from "../cadwork/partfolder";
-import { isUnder, realish, relUnder, resolveToolPath, toolPathArg } from "./tool-paths";
+import { isUnder, newComponentsSafe, realish, relUnder, resolveToolPath, toolPathArg } from "./tool-paths";
 import { CAD_OWNER_CARD_TOOL_IDS, cadToolId } from "./cad-tool-ids";
 import { registerProtectedRule, type ProtectedContext, type ProtectedRule, type ProtectedVerdict } from "./protected";
 
@@ -137,6 +138,12 @@ export const cadProtectedRule: ProtectedRule = (ctx): ProtectedVerdict => {
     const state = refusedStatePath(target.abs, ctx.cwd);
     if (state) return { kind: "deny", reason: state };
     const rel = targetInWorktree(target.abs, ctx.cwd);
+    // A NEW file or folder under cad/ must be named in printable ASCII: the volume folds Unicode look-
+    // alikes (`ſ`, `K`, fullwidth letters, combining marks) onto protected names in ways no rule should
+    // have to predict. Existing names are what the file system says they are (realpath).
+    if (rel && (rel === "cad" || rel.startsWith("cad/")) && !newComponentsSafe(target.abs)) {
+      return { kind: "deny", reason: `${JSON.stringify(toolPathArg(ctx.input))} creates a name under cad/ with characters outside printable ASCII; part folders and their files are named in plain ASCII` };
+    }
     if (rel && DAEMON_DIR_RE.test(rel)) {
       return { kind: "deny", reason: `${rel} is in a folder the daemon writes (previews, thumbnails, release packs); it is not a session's to edit` };
     }

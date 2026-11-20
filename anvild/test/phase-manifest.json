@@ -469,6 +469,13 @@
           "names": [
             "cad protected rules > [A3] review: the file tools cannot write the daemon's own folders of a part — cad/<part>/.cache/ (previews, thumbnails) and cad/<part>/release/ — under any policy"
           ]
+        },
+        {
+          "file": "test/integration/cad-a4-review.test.ts",
+          "names": [
+            "A4 review: owner cards approve exactly what they show (decision 153) > [A3] review: an adopt card drawn at L=80 (fresh state) is refused on approval after the agent set L=120 while it was open, and redrawn showing 120",
+            "A4 review: owner cards approve exactly what they show (decision 153) > [A3] review: an adopt card drawn with the agent's moved L lists it as its own row; approving accepts exactly that"
+          ]
         }
       ],
       "playwright": [
@@ -482,7 +489,8 @@
             "real SolidCraft: live preview and the owner's parameter change > [A3] real: after the plate batch a preview-<rev>.glb exists, is a valid GLB with a mesh, and is served by the daemon route the viewer uses",
             "real SolidCraft: live preview and the owner's parameter change > [A3] real: an owner cad.param.set L=120 yields a new preview whose bounding box is 120 mm long, the documented volume, and a passing gate",
             "real SolidCraft: live preview and the owner's parameter change > [A3] real: old previews are pruned to three, and script write + refresh time for the plate is recorded",
-            "real SolidCraft: live preview and the owner's parameter change > [A3] real: review — the agent sets L=120, the owner edits T=6.5 in the panel: the gate still fails on L (80 → 120) and the accepted numbers move for T only"
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: review — the agent sets L=120, the owner edits T=6.5 in the panel: the gate still fails on L (80 → 120) and the accepted numbers move for T only",
+            "real SolidCraft: live preview and the owner's parameter change > [A3] real: review — an adopt card drawn at L=80 on a fresh lock store is refused on approval after the agent set L=120 while it was open, and redrawn showing 120"
           ]
         }
       ]
@@ -529,9 +537,10 @@
           "names": [
             "release pack > [A4] a pack holds exactly the §4.7 files (3MF only for FDM); the manifest hashes every file and its HMAC verifies with this machine's key (created 0600)",
             "release pack > [A4] verifyRelease refuses an edited file, an extra or missing file, a renamed folder and another machine's key",
-            "release pack > [A4] re-releasing the same script replaces the folder atomically; a failing export writes nothing",
+            "release pack > [A4] re-releasing the same script replaces the folder (old moved aside, new renamed in, old removed — nothing left over); a failing export writes nothing",
             "release pack > [A4] the spec sheet is headed 'Not a drawing', escapes every user-derived string (a hostile part or parameter name stays text), and has one hole row per distinct diameter with centres",
-            "release pack > [A4] the hole table can carry each hole's centre (on request only; rows are keyed without it)"
+            "release pack > [A4] the hole table can carry each hole's centre (on request only; rows are keyed without it)",
+            "release pack > [A4] review: .DS_Store, ._* and Thumbs.db in a pack are ignored when verifying and never listed in a manifest"
           ]
         },
         {
@@ -540,7 +549,8 @@
             "concept parts and dimensions > [A4] proposed dimensions: 1–50 unique parameter names with finite numbers in mm; the owner's answer must give a finite number for exactly those names",
             "concept parts and dimensions > [A4] open_part {concept: true} is honoured only for a brand-new part: an existing part, or one with a design, is left as it is",
             "concept parts and dimensions > [A4] a concept written into part.json by hand is not honoured (the lock store must agree), and request_dimensions is only for a concept",
-            "concept parts and dimensions > [A4] request_dimensions is denied without a card in an unattended session"
+            "concept parts and dimensions > [A4] request_dimensions is denied without a card in an unattended session",
+            "concept parts and dimensions > [A4] review: a dimension must be a finite length above 0 and at most CAD_DIMENSION_MAX_MM (1e6 mm), in the proposal and the owner's answer"
           ]
         },
         {
@@ -559,13 +569,35 @@
             "[A4] a gap is shown with its text and a Clear gap button (sending cad.gap.clear); the script size shows only above 5 MB; a concept's picture score is an advisory line",
             "[A4] the dimensions card has a numeric input per dimension, prefilled with the proposal; Submit sends the owner's typed numbers, a non-number is caught before sending, Deny sends a denial",
             "[A4] the release card shows expected and measured numbers and says prominently when the numbers are the agent's; Approve / Deny only",
-            "[A4] a refused dimensions submission re-enables Submit and Deny and shows the daemon's message inline; a fixed resubmission is sent"
+            "[A4] review: the dimensions card refuses 0, negative and over-1e6 mm numbers before sending; when the daemon refuses an answer the buttons come back and its error is shown on the card",
+            "[A4] review: Confirm numbers is its own action button, never a second .cad-part-open"
           ]
         },
         {
           "file": "test/unit/push-open-only.test.ts",
           "names": [
             "notifications for cards that must be seen > [A4] every CAD owner card (expectations, dimensions, release) sends a push that only opens the session; a replayed card sends none"
+          ]
+        },
+        {
+          "file": "test/integration/cad-a4-review.test.ts",
+          "names": [
+            "A4 review: owner cards approve exactly what they show (decision 153) > [A4] review: the agent sets L=120, then proposes only a tighter tolerance — the card's old numbers are the accepted ones, L is its own row; denied the gate still fails on L, approved it passes with L accepted by the owner",
+            "A4 review: owner cards approve exactly what they show (decision 153) > [A4] review: a propose card whose parameters change while it is open is refused on approval and redrawn showing the new value",
+            "A4 review: owner cards approve exactly what they show (decision 153) > [A4] review: the agent sets L=120, then imports a clear reference — the card shows the accepted numbers and L as its own row; denied nothing is imported and the gate fails on L, approved it passes with L accepted",
+            "A4 review: owner cards approve exactly what they show (decision 153) > [A4] review: replacing a reference says so on the card — old and new sha and body counts",
+            "A4 review: the Release button and session status > [A4] review: cad.release.request is refused for a session of another worktree, and a release card raised with no turn running leaves the session's status alone",
+            "A4 review: the Release button and session status > [A4] review: a tool's owner card shows awaiting_permission only while the session's turn is running, and gives it back after",
+            "A4 review: the Released badge > [A4] review: a verifying pack whose manifest names a different script with the same 7-character prefix does not get the Released badge; file-browser litter in the pack does not remove it",
+            "A4 review: dimensions > [A4] review: non-positive, non-finite and over-1e6 mm dimensions are refused by the daemon and the card stays open; a second request_dimensions for the part is refused while one is open",
+            "A4 review: per-part timer state > [A4] review: when a part's process stops, its busy notice and cad.design coalescer state are dropped (a pending trailing emit goes out first)"
+          ]
+        },
+        {
+          "file": "test/unit/cad-protected.test.ts",
+          "names": [
+            "cad protected rules > [A4] review: Unicode look-alikes (ſ, Kelvin K, fullwidth letters, combining marks) cannot name a protected file that does not exist yet; a new name under cad/ outside printable ASCII is denied",
+            "cad protected rules > [A4] review: the path fold matches the volume's — NFKC then lower case"
           ]
         }
       ],
@@ -575,7 +607,9 @@
           "names": [
             "real SolidCraft: references and the release pack > [A4] real: a STEP block imported as a reference into the plate it overlaps fails the gate on interference with a volume; re-imported clear it passes; the reference body is a BaseFeature body, excluded from the measurement",
             "real SolidCraft: references and the release pack > [A4] real: editing refs/x.step makes the part unverified ('reference changed; re-import') — the sha of refs/ against the embedded text",
-            "real SolidCraft: references and the release pack > [A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded"
+            "real SolidCraft: references and the release pack > [A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded",
+            "real SolidCraft: references and the release pack > [A4] real: review — the agent sets L=120, then proposes only a tighter tolerance: the card shows the accepted numbers and L as its own row; denied the gate still fails on L, approved it passes with L accepted by the owner",
+            "real SolidCraft: references and the release pack > [A4] real: review — the agent sets L=120, then imports a clear reference: the card shows the accepted numbers and L as its own row; denied nothing is imported and the gate fails on L, approved it passes with L accepted"
           ]
         }
       ]
