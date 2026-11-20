@@ -292,8 +292,10 @@ interface PartRec {
   refused?: { sha: string; reason: string };
   /** Undo depth right after the script was loaded: the agent's `undo` never goes below it. */
   loadDepth: number;
-  /** The last thing undone was a daemon rollback (`slot.revert`): `redo` is refused until the next change. */
-  noRedo?: boolean;
+  /** A daemon rollback (`slot.revert`) left the design at this undo depth: the rolled-back change sits
+   *  just above it, so `redo` never steps to or past it. The agent may still undo its own requests
+   *  below it and redo them back up to it. Cleared by the next change (or a restart). */
+  noRedoAt?: number;
 }
 
 export function maxProcsFromEnv(env: Record<string, string | undefined> = process.env): number {
@@ -568,7 +570,7 @@ export class CadManager {
         const result = await this.undoRedo(rec, "undo", this.requestTimeoutMs, info.notes);
         await this.afterMutation(rec, result, "undo", info.notes);
         rec.redoStack = [];
-        rec.noRedo = true;
+        rec.noRedoAt = rec.depth;
         return result;
       },
     };
@@ -809,7 +811,7 @@ export class CadManager {
     rec.scriptSha = disk.scriptSha;
     rec.undoStack = [];
     rec.redoStack = [];
-    rec.noRedo = false;
+    rec.noRedoAt = undefined;
     rec.conflict = false;
     rec.replayFailure = replayFailure;
     void client.exited.then(() => this.onExit(rec, client));
@@ -926,7 +928,9 @@ export class CadManager {
     const stack = dir === "undo" ? rec.undoStack : rec.redoStack;
     const other = dir === "undo" ? rec.redoStack : rec.undoStack;
     const start = rec.depth;
-    if (dir === "redo" && rec.noRedo) {
+    // Nothing above the rollback point is the agent's to redo: the rolled-back change never comes back.
+    const ceiling = dir === "redo" ? rec.noRedoAt : undefined;
+    if (ceiling !== undefined && rec.depth >= ceiling) {
       return { isError: true, content: [{ type: "text", text: "nothing to redo" }], texts: ["nothing to redo"], text: "nothing to redo", images: [] } as unknown as McpToolResult;
     }
     // The design was loaded as a batch of undo steps (no `--in`): those are not the agent's to undo.
@@ -941,7 +945,7 @@ export class CadManager {
     }
     let steps = 1;
     if (target !== undefined) {
-      const short = (d: number) => (dir === "undo" ? d > target : d < target);
+      const short = (d: number) => (dir === "undo" ? d > target : d < target && (ceiling === undefined || d < ceiling));
       let depth = await this.depthNow(rec);
       while (short(depth) && steps < 10_000) {
         const r = await this.call(rec, dir, {}, timeoutMs);
@@ -965,7 +969,7 @@ export class CadManager {
     const changed = !result.isError || rec.depth !== before.depth || rec.revision !== before.revision;
     if (!changed) return false;
     if (kind === "mutate") {
-      rec.noRedo = false;
+      rec.noRedoAt = undefined;
       if (rec.depth > before.depth) rec.undoStack.push(before.depth);
       if (rec.redoDepth === 0) rec.redoStack = [];
     }

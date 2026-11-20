@@ -227,6 +227,9 @@ export class CadworkService {
   private readonly snapshots = new Map<string, PartSnapshot>();
   private readonly partSessions = new Map<string, Set<string>>();
   private readonly cards = new Map<string, Card>();
+  /** Adopt cards the owner DENIED, by scope (`adoptScope`) → the card's key. The same card is not
+   *  drawn again until what it would show changes, or the owner asks again (Rebuild on the part card). */
+  private readonly deniedAdopt = new Map<string, string>();
   private readonly nextBy = new Map<string, "panel" | "reload">();
   private readonly offProtected?: () => void;
   private readonly clock: CadClock;
@@ -1625,6 +1628,8 @@ export class CadworkService {
     if (why) throw new Error(`CAD is not available on this machine: ${why}`);
     const ref = this.refFor(worktree, part);
     if (!existsSync(ref.dir)) throw new Error(`cad/${ref.part} does not exist`);
+    // The owner asking for a rebuild is the owner asking again: a denied adopt card may come back.
+    for (const kind of ADOPT_KINDS) this.deniedAdopt.delete(adoptScope(kind, ref));
     await this.manager.reload(ref);
   }
 
@@ -1824,6 +1829,8 @@ export class CadworkService {
     this.releaseStatus(card);
     card.settle?.(approved ? "approved" : superseded ? "stale" : "denied", typed);
     if (!toolCard) {
+      // A denied adopt card is not redrawn as it was (the recheck below would put it straight back).
+      if (!approved && !superseded && card.key !== undefined && isAdoptKind(card.kind)) this.deniedAdopt.set(adoptScope(card.kind, card.ref), card.key);
       if (superseded && card.kind === "confirm") this.confirmNumbers(card.sessionId, card.ref); // redraw it, showing what is there now
       this.recheck(card.ref, card.kind === "adopt-rules");
     }
@@ -2009,7 +2016,10 @@ export class CadworkService {
         this.cards.delete(c.requestId);
         this.broadcast({ v: PROTOCOL_VERSION, type: "cad.expectations.resolved", ts: now(), requestId: c.requestId, approved: false, superseded: true } satisfies CadExpectationsResolvedEvent);
       }
+      const scope = adoptScope(kind, ref);
+      if (this.deniedAdopt.has(scope) && this.deniedAdopt.get(scope) !== nextKey) this.deniedAdopt.delete(scope); // it changed: ask again
       if (!next || !attended) continue; // nothing to adopt, or nobody there to answer (the part stays unverified)
+      if (this.deniedAdopt.get(scope) === nextKey) continue; // the owner said no to exactly this card
       if ([...this.cards.values()].some((c) => sameScope(c, kind))) continue;
       const requestId = newId("cadx");
       const rulesSha = locked.rules.kind === "missing" ? null : locked.rules.sha;
@@ -2404,6 +2414,12 @@ type CardAction =
       leftBehind: string;
     }
   | { ok: false; error: string };
+
+const ADOPT_KINDS = ["adopt-expectations", "adopt-ownerParams", "adopt-rules"] as const;
+type AdoptKind = (typeof ADOPT_KINDS)[number];
+const isAdoptKind = (k: CardKind): k is AdoptKind => (ADOPT_KINDS as readonly string[]).includes(k);
+/** Where an adopt card is asked: a rules card per worktree, a part's cards per part. */
+const adoptScope = (kind: AdoptKind, ref: PartRef): string => `${kind}\0${kind === "adopt-rules" ? ref.worktree : ref.key}`;
 
 /** The part.json half of an owner card's fingerprint. */
 function partKeyOf(part: PartRead): unknown {

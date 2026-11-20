@@ -374,9 +374,13 @@ describe("cad gate (the refresh, against the fake)", () => {
     // Checking again does not stack up duplicate cards.
     await other.tools.check_part!({ part: "plate" });
     expect(other.openCards()).toHaveLength(2);
-    // Deny leaves it unverified (and asks again on the next check); Approve restores pass.
+    // Deny leaves it unverified, and the same card is not asked again on the next check; the
+    // owner's Rebuild asks again, and Approve restores pass.
     other.service.respond(card.requestId, false);
     expect((await other.tools.check_part!({ part: "plate" })).json.state).toBe("unverified");
+    expect(other.openCards().map((c: any) => c.kind)).toEqual(["adopt-rules"]);
+    await other.service.refreshDesign(repo, "plate");
+    await other.tools.check_part!({ part: "plate" });
     expect(approveCards(other).sort()).toEqual(["adopt-expectations", "adopt-rules"]);
     expect((await other.tools.check_part!({ part: "plate" })).json.state).toBe("pass");
     expect(other.service.locks.getPart(repo, "plate")!.approvedBy).toBe("owner");

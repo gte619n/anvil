@@ -204,14 +204,23 @@ export function referenceOnDisk(ref: PartRef, name: string): { sha256: string } 
   }
 }
 
+/** Why two or more STEP imports in one design carrying the same file name fail the gate. */
+export const DUPLICATE_REFERENCE = "duplicate reference import";
+
 /**
- * Integrity of each named reference: on disk in `refs/`, embedded in the design, and the same bytes.
- * `embedded` undefined means the design's script could not be read for the script the process runs.
+ * Integrity of each named reference, and of EVERY STEP import embedded in the design: on disk in
+ * `refs/`, embedded exactly once, and the same bytes. Two imports with one file name fail closed
+ * ("duplicate reference import x.step") — each must be checked against its own `refs/` file, and one
+ * file can only ever be one of them. `embedded` undefined means the design's script could not be
+ * read for the script the process runs. `clean` is the file names whose single import matches its
+ * `refs/` file: the only imports whose bodies count as known references.
  */
-export function referenceChecks(names: string[], onDisk: (name: string) => { sha256: string } | { missing: string }, embedded: EmbeddedReference[] | undefined): { checks: GateCheck[]; unverified: boolean } {
+export function referenceChecks(names: string[], onDisk: (name: string) => { sha256: string } | { missing: string }, embedded: EmbeddedReference[] | undefined): { checks: GateCheck[]; unverified: boolean; clean: Set<string> } {
   const checks: GateCheck[] = [];
+  const clean = new Set<string>();
   let unverified = false;
-  for (const name of [...new Set(names)].sort()) {
+  const all = [...new Set([...names, ...(embedded ?? []).map((e) => e.file)])].sort();
+  for (const name of all) {
     const id = `ref ${name}`;
     const expected = `refs/${name} is the STEP embedded in the design`;
     if (!embedded) {
@@ -220,19 +229,23 @@ export function referenceChecks(names: string[], onDisk: (name: string) => { sha
       continue;
     }
     const disk = onDisk(name);
-    const emb = embedded.find((e) => e.file === name);
+    const embs = embedded.filter((e) => e.file === name);
     if ("missing" in disk) {
       checks.push({ id, expected, measured: `${disk.missing} — restore it from git, or import the reference again`, ok: false, hard: true });
-    } else if (!emb) {
+    } else if (embs.length === 0) {
       checks.push({ id, expected, measured: `the design does not contain refs/${name} — import it with import_reference`, ok: false, hard: true });
-    } else if (emb.sha256 !== disk.sha256) {
+    } else if (embs.length > 1) {
+      const each = embs.map((e, i) => `import ${i + 1} (${e.name ?? "unnamed"}, bodies ${e.bodies.join(", ") || "none"}) ${e.sha256 === disk.sha256 ? "matches" : `holds ${e.sha256.slice(0, 12)}`}`);
+      checks.push({ id, expected, measured: `${DUPLICATE_REFERENCE} ${name}: ${embs.length} imports carry this file name — ${each.join("; ")}; remove all but one`, ok: false, hard: true });
+    } else if (embs[0]!.sha256 !== disk.sha256) {
       unverified = true;
-      checks.push({ id, expected, measured: `${REFERENCE_CHANGED} (refs/${name} is ${disk.sha256.slice(0, 12)}, the design holds ${emb.sha256.slice(0, 12)})`, ok: false, hard: true });
+      checks.push({ id, expected, measured: `${REFERENCE_CHANGED} (refs/${name} is ${disk.sha256.slice(0, 12)}, the design holds ${embs[0]!.sha256.slice(0, 12)})`, ok: false, hard: true });
     } else {
+      clean.add(name);
       checks.push({ id, expected, measured: `unchanged (${disk.sha256.slice(0, 12)})`, ok: true, hard: true });
     }
   }
-  return { checks, unverified };
+  return { checks, unverified, clean };
 }
 
 /** The `inspect.interference` request for the design bodies against ONE reference's bodies: every

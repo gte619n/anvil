@@ -693,6 +693,38 @@ describe("cad manager", () => {
     expect(m.status(ref)!.params.find((p) => p.name === "L")!.value).toBe(80);
   });
 
+  test("[A4] re-review: after a daemon rollback (slot.revert) the agent can undo its own request and redo it back, but redo never brings back the rolled-back change", async () => {
+    const repo = tempRepo();
+    const m = fakeManager();
+    const ref = partRef(repo, "plate");
+    const undo = () => m.request(ref, { tool: "undo", kind: "undo" });
+    const redo = () => m.request(ref, { tool: "redo", kind: "redo" });
+    const param = (n: string) => m.status(ref)!.params.find((p) => p.name === n)!.value;
+    await m.request(ref, { tool: "batch", args: { commands: REFERENCE_PLATE, verbose: false }, kind: "mutate" });
+    await exec(m, ref, "parameters.change", { changes: { L: "120" } }); // the agent's own request
+    // A composite job changes W and the daemon rolls it back (what a refused import does).
+    await m.run(ref, async (slot) => {
+      await slot.mutate("execute", { command: "parameters.change", params: { changes: { W: "60" } } });
+      expect(slot.params().find((p) => p.name === "W")!.value).toBe(60);
+      await slot.revert();
+    });
+    expect(param("W")).toBe(50);
+    expect((await redo()).result.text).toBe("nothing to redo");
+    expect(param("W")).toBe(50);
+    // The agent undoes its own change below the rollback point, and may redo exactly that.
+    await undo();
+    expect(param("L")).toBe(80);
+    const r = await redo();
+    expect(r.result.isError).toBe(false);
+    expect(param("L")).toBe(120);
+    expect(param("W")).toBe(50);
+    // One more redo would be the rolled-back change: refused, and nothing moves.
+    const again = await redo();
+    expect(again.result.text).toBe("nothing to redo");
+    expect(param("W")).toBe(50);
+    expect(design(ref).commands.some((c: any) => JSON.stringify(c).includes('"W":"60"'))).toBe(false);
+  });
+
   test("[A1] the refresh hook runs after a change, is debounced in a burst, can be forced, and is a no-op when absent", async () => {
     const repo = tempRepo();
     const clock = new FakeClock();

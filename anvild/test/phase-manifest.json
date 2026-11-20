@@ -530,7 +530,10 @@
             "reference integrity and interference > [A4] embedded imports are read from the script's timeline.add import features; refs/x.step must have the embedded text's sha256, else 'reference changed; re-import' (unverified)",
             "reference integrity and interference > [A4] interference: only count 0 with nothing unchecked, not truncated and within budget passes — an overlap names the pair and volume; unchecked, truncated or budget_exceeded fail",
             "the manager's working folder > [A4] SolidCraft is spawned with its working folder set to the part folder (absolute), so a plain name it resolves stays inside the part (decision 115)",
-            "reference integrity and interference > [A4] re-review: coverage fails closed — every recorded, embedded or imported reference body must be under a must-not-touch rule"
+            "reference integrity and interference > [A4] re-review: coverage fails closed — every recorded, embedded or imported reference body must be under a must-not-touch rule",
+            "every embedded import is checked (the second import of a file name) > [A4] re-review: two imports carrying the same file name fail closed ('duplicate reference import far.step'); the interference check covers the bodies of BOTH and finds the second one's overlap",
+            "every embedded import is checked (the second import of a file name) > [A4] re-review: the SECOND import's bytes differ from refs/ — named on the duplicate line, and its body is not a known reference",
+            "every embedded import is checked (the second import of a file name) > [A4] re-review: a reference body no checked import accounts for fails naming it — a stray BaseFeature body; an uncovered import whose bytes match refs/ fails on its own line"
           ]
         },
         {
@@ -598,7 +601,8 @@
             "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: the replace rows are worked out on every round — a refs/ file that appears while the card is open makes the redrawn card say Replaces",
             "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: the gate fails closed — a reference in the design that no must-not-touch rule names (an import feature, a refs record in part.json) fails with 'reference <name> is not covered'",
             "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: an adopt-ownerParams card that also approves a parameter the agent moved shows the numbers it leads to (accepted → new); approving records exactly those",
-            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: a parameter nobody approved and no expected number uses is never approved silently — it stays out of `declared`"
+            "A4 re-review: an owner card's write re-checks its snapshot inside the part's queue (decision 204) > [A4] re-review: a parameter nobody approved and no expected number uses is never approved silently — it stays out of `declared`",
+            "A4 re-review: a denied adopt card > [A4] re-review: denying an adopt-expectations card does not redraw the same card — a client that keeps denying sees one card, not a stream; a change to what it would show, or the owner's Rebuild, asks again"
           ]
         },
         {
@@ -606,6 +610,12 @@
           "names": [
             "cad protected rules > [A4] review: Unicode look-alikes (ſ, Kelvin K, fullwidth letters, combining marks) cannot name a protected file that does not exist yet; a new name under cad/ outside printable ASCII is denied",
             "cad protected rules > [A4] review: the path fold matches the volume's — NFKC then lower case"
+          ]
+        },
+        {
+          "file": "test/unit/cad-manager.test.ts",
+          "names": [
+            "cad manager > [A4] re-review: after a daemon rollback (slot.revert) the agent can undo its own request and redo it back, but redo never brings back the rolled-back change"
           ]
         }
       ],
@@ -624,7 +634,8 @@
             "real SolidCraft: references and the release pack > [A4] real: review — the agent sets L=120, then imports a clear reference: the card shows the accepted numbers and L as its own row; denied nothing is imported and the gate fails on L, approved it passes with L accepted",
             "real SolidCraft: references and the release pack > [A4] real: re-review — the card shows Process fdm-0.4; part.json is rewritten to cnc-3axis while the approved import runs: nothing is recorded, the import is rolled back in full and cannot be redone, the redrawn card shows cnc-3axis, the gate does not pass",
             "real SolidCraft: references and the release pack > [A4] real: re-review — a parameter change queued ahead of the approved import refuses the approval before anything is imported; redrawn with the move, denied, nothing is left and no reference goes unchecked",
-            "real SolidCraft: references and the release pack > [A4] real: re-review — a real STEP imported past import_reference (no must-not-touch rule) fails the gate: 'reference <name> is not covered by a must-not-touch rule'"
+            "real SolidCraft: references and the release pack > [A4] real: re-review — a real STEP imported past import_reference (no must-not-touch rule) fails the gate: 'reference <name> is not covered by a must-not-touch rule'",
+            "real SolidCraft: references and the release pack > [A4] real: re-review — a SECOND import carrying the approved reference's file name (other STEP text: a 10 mm block at the origin, body far_b) added to design.json fails the gate ('duplicate reference import far.step', the overlap with far_b found); release_part writes nothing and verify-cli exits 1"
           ]
         }
       ]

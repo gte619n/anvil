@@ -599,3 +599,40 @@ describe("A4 review: per-part timer state", () => {
     expect(x.broadcasts.filter((e) => e.type === "cad.design").length).toBe(before + 1); // the pending emit, flushed
   });
 });
+
+describe("A4 re-review: a denied adopt card", () => {
+  test("[A4] re-review: denying an adopt-expectations card does not redraw the same card — a client that keeps denying sees one card, not a stream; a change to what it would show, or the owner's Rebuild, asks again", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    expect(x.gate.state).toBe("pass");
+    const adoptCards = () => x.broadcasts.filter((e) => e.type === "cad.expectations.request" && e.kind === "adopt-expectations");
+    // Expectations edited outside the approval flow: one adopt card.
+    editJsonFile(x.partJson, (d) => void (d.expectations.holes = []));
+    let g = await x.check();
+    expect(g.needsAdoption).toBe("expectations");
+    expect(adoptCards()).toHaveLength(1);
+    // A client that denies whatever it is shown, as fast as it can.
+    for (let i = 0; i < 20; i++) {
+      for (const c of x.openCards()) x.service.respond(c.requestId, false);
+      g = await x.check();
+    }
+    expect(adoptCards()).toHaveLength(1);
+    expect(x.openCards()).toEqual([]);
+    expect(g.state).toBe("unverified"); // denied is not approved: the part stays unverified
+    expect(g.needsAdoption).toBe("expectations");
+    // What the card would show changes: it is asked again (once).
+    editJsonFile(x.partJson, (d) => void (d.process = "cnc-3axis"));
+    await x.check();
+    expect(adoptCards()).toHaveLength(2);
+    x.service.respond(x.openCards()[0].requestId, false);
+    await x.check();
+    expect(adoptCards()).toHaveLength(2);
+    // The owner's Rebuild on the part card asks again, and approving then adopts.
+    await x.service.refreshDesign(repo, "plate");
+    await x.check();
+    expect(adoptCards()).toHaveLength(3);
+    x.service.respond(x.openCards()[0].requestId, true);
+    await until(() => x.openCards().length === 0, "the approval");
+    expect((await x.check()).needsAdoption).toBeUndefined();
+  });
+});

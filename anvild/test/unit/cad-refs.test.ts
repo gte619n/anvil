@@ -15,11 +15,13 @@ import {
   referenceChecks,
   referenceName,
   resolveReferenceSource,
+  DUPLICATE_REFERENCE,
   REFERENCE_CHANGED,
   REFERENCE_MAX_BYTES,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
-import { coverageChecks, REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
+import { coverageChecks, referenceGate, REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
+import { readDesignFile } from "../../src/cadwork/poststep";
 import { cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempRepo } from "../helpers/cad-work";
 
 afterEach(async () => {
@@ -93,16 +95,16 @@ describe("reference integrity and interference", () => {
   test("[A4] re-review: coverage fails closed — every recorded, embedded or imported reference body must be under a must-not-touch rule", () => {
     const emb = [{ file: "a.step", bodies: ["a1"] }, { file: "b.step", bodies: ["b1", "b2"] }];
     // Everything covered: no check at all.
-    expect(coverageChecks(["a.step", "b.step"], ["a.step"], emb, ["a1", "b1", "b2"])).toEqual([]);
+    expect(coverageChecks(["a.step", "b.step"], ["a.step"], emb, ["a1", "b1", "b2"], new Set(["a.step", "b.step"]))).toEqual([]);
     // An embedded import and a part.json record that no rule names, and an imported body nothing accounts for.
-    const c = coverageChecks(["a.step"], ["a.step", "c.step"], emb, ["a1", "b1", "b2", "stray"]);
+    const c = coverageChecks(["a.step"], ["a.step", "c.step"], emb, ["a1", "b1", "b2", "stray"], new Set(["a.step", "b.step"]));
     expect(c.map((x) => [x.id, x.measured, x.ok, x.hard])).toEqual([
       ["covered b.step", `reference b.step ${REFERENCE_NOT_COVERED}`, false, true],
       ["covered c.step", `reference c.step ${REFERENCE_NOT_COVERED}`, false, true],
       ["covered reference bodies", `reference stray ${REFERENCE_NOT_COVERED}`, false, true],
     ]);
     // The script could not be read: every imported body is unaccounted for.
-    expect(coverageChecks([], [], undefined, ["a1"]).map((x) => x.ok)).toEqual([false]);
+    expect(coverageChecks([], [], undefined, ["a1"], new Set()).map((x) => x.ok)).toEqual([false]);
   });
 
 
@@ -116,7 +118,7 @@ describe("reference integrity and interference", () => {
     };
     const emb = embeddedReferences(script);
     expect(emb).toEqual([{ file: "a.step", name: "ref-a.step", sha256: sha("AAA"), bodies: ["a"], bytes: 3 }]);
-    expect(referenceChecks(["a.step"], () => ({ sha256: sha("AAA") }), emb)).toEqual({ checks: [{ id: "ref a.step", expected: "refs/a.step is the STEP embedded in the design", measured: `unchanged (${sha("AAA").slice(0, 12)})`, ok: true, hard: true }], unverified: false });
+    expect(referenceChecks(["a.step"], () => ({ sha256: sha("AAA") }), emb)).toEqual({ checks: [{ id: "ref a.step", expected: "refs/a.step is the STEP embedded in the design", measured: `unchanged (${sha("AAA").slice(0, 12)})`, ok: true, hard: true }], unverified: false, clean: new Set(["a.step"]) });
     const changed = referenceChecks(["a.step"], () => ({ sha256: sha("BBB") }), emb);
     expect(changed.unverified).toBe(true);
     expect(changed.checks[0]!.ok).toBe(false);
@@ -148,6 +150,70 @@ describe("reference integrity and interference", () => {
     // Design–design and reference–reference pairs are excluded, so `count` is only what matters.
     expect(interferenceRequest(["B1", "B2"], ["r1", "r2"])).toEqual({ command: "inspect.interference", params: { bodies: ["B1", "B2", "r1", "r2"], exclude_pairs: [["B1", "B2"], ["r1", "r2"]] } });
     expect(interferenceRequest(["B1"], ["r1"])).toEqual({ command: "inspect.interference", params: { bodies: ["B1", "r1"] } });
+  });
+});
+
+/** A part folder whose design.json holds `imports` (STEP text per import) and whose refs/ holds `refs`. */
+function refsPart(imports: { file: string; step: string; bodies: string[] }[], refs: Record<string, string>) {
+  const repo = tempRepo();
+  const ref = partRef(repo, "plate");
+  mkdirSync(join(ref.dir, "refs"), { recursive: true });
+  for (const [n, t] of Object.entries(refs)) writeFileSync(join(ref.dir, "refs", n), t);
+  const commands = [
+    { command: "timeline.add", params: { feature: { type: "box", name: "Plate" } } },
+    ...imports.map((im, i) => ({ command: "timeline.add", params: { feature: { type: "import", name: `ref-${im.file}-${i}`, file: im.file, step: im.step, body_names: im.bodies } } })),
+  ];
+  writeFileSync(join(ref.dir, "design.json"), JSON.stringify({ about: {}, commands }, null, 2));
+  return { ref, scriptSha: readDesignFile(ref.dir).scriptSha };
+}
+/** inspect.interference as SolidCraft answers it: `hot` bodies overlap Body1 by 600 mm³. */
+function interferenceStub(hot: string[]) {
+  const asked: string[][] = [];
+  const call = async (_tool: string, args: Record<string, unknown>) => {
+    const bodies = (args.params as { bodies: string[] }).bodies;
+    asked.push(bodies);
+    const hits = bodies.filter((b) => hot.includes(b)).map((b) => ({ a: "Body1", b, volume_mm3: 600 }));
+    return reply({ budget_exceeded: false, count: hits.length, interferences: hits, truncated: false, unchecked: [] });
+  };
+  return { call, asked };
+}
+const ruled = (must: string[]) => ({ kind: "ok", file: { expectations: { noInterferenceWith: must }, refs: [] } }) as any;
+const failing = (checks: { id: string; ok: boolean; hard: boolean; measured: unknown }[]) => checks.filter((c) => !c.ok && c.hard).map((c) => `${c.id}: ${String(c.measured)}`);
+
+describe("every embedded import is checked (the second import of a file name)", () => {
+  test("[A4] re-review: two imports carrying the same file name fail closed ('duplicate reference import far.step'); the interference check covers the bodies of BOTH and finds the second one's overlap", async () => {
+    const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }, { file: "far.step", step: "FAR", bodies: ["far_b"] }], { "far.step": "FAR" });
+    const s = interferenceStub(["far_b"]);
+    const g = await referenceGate(s.call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a", "far_b"] });
+    const bad = failing(g.checks);
+    expect(bad.find((l) => l.startsWith("ref far.step:"))).toContain(`${DUPLICATE_REFERENCE} far.step: 2 imports`);
+    expect(s.asked).toEqual([["Body1", "far_a", "far_b"]]);
+    expect(bad.find((l) => l.startsWith("interference far.step:"))).toContain("overlaps far_b by 600 mm³");
+    // Neither import's bodies count as a checked reference.
+    expect(bad.find((l) => l.startsWith("covered reference bodies:"))).toContain("far_a, far_b");
+  });
+
+  test("[A4] re-review: the SECOND import's bytes differ from refs/ — named on the duplicate line, and its body is not a known reference", async () => {
+    const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }, { file: "far.step", step: "BLOCK AT ORIGIN", bodies: ["far_b"] }], { "far.step": "FAR" });
+    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a", "far_b"] });
+    const dup = failing(g.checks).find((l) => l.startsWith("ref far.step:"))!;
+    expect(dup).toContain(DUPLICATE_REFERENCE);
+    expect(dup).toContain("import 1 (ref-far.step-0, bodies far_a) matches");
+    expect(dup).toContain(`import 2 (ref-far.step-1, bodies far_b) holds ${sha("BLOCK AT ORIGIN").slice(0, 12)}`);
+    expect(failing(g.checks).find((l) => l.startsWith("covered reference bodies:"))).toContain("far_b");
+    // The same import alone, with the bytes of refs/: everything passes.
+    const one = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }], { "far.step": "FAR" });
+    const ok = await referenceGate(interferenceStub([]).call as any, one.ref, ruled(["far.step"]), one.scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a"] });
+    expect(failing(ok.checks)).toEqual([]);
+  });
+
+  test("[A4] re-review: a reference body no checked import accounts for fails naming it — a stray BaseFeature body; an uncovered import whose bytes match refs/ fails on its own line", async () => {
+    const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far_a"] }, { file: "other.step", step: "OTHER", bodies: ["other_a"] }], { "far.step": "FAR", "other.step": "OTHER" });
+    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far_a", "other_a", "ghost"] });
+    const bad = failing(g.checks);
+    expect(bad).toContain(`covered other.step: reference other.step ${REFERENCE_NOT_COVERED}`);
+    expect(bad).toContain(`covered reference bodies: reference ghost ${REFERENCE_NOT_COVERED}`);
+    expect(bad.some((l) => l.includes("far_a"))).toBe(false);
   });
 });
 

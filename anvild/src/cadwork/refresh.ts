@@ -268,15 +268,17 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
   const embedded = disk.script && scriptSha !== undefined && disk.scriptSha === scriptSha ? embeddedReferences(disk.script) : undefined;
   const integrity = referenceChecks(names, (n) => referenceOnDisk(ref, n), embedded);
   const checks = [...integrity.checks];
-  if (exp) checks.push(...coverageChecks(must, recorded, embedded, design.referenceBodies));
+  if (exp) checks.push(...coverageChecks(must, recorded, embedded, design.referenceBodies, integrity.clean));
   for (const name of [...new Set(must)].sort()) {
-    const emb = embedded?.find((e) => e.file === name);
-    if (!emb) {
+    // EVERY import carrying this file name is checked (a second one is also a duplicate, failed above).
+    const embs = embedded?.filter((e) => e.file === name) ?? [];
+    if (embs.length === 0) {
       checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: `refs/${name} is not in the design, so nothing could be checked`, ok: false, hard: true });
       continue;
     }
+    const emb = { bodies: [...new Set(embs.flatMap((e) => e.bodies))] };
     const missing = emb.bodies.filter((b) => !design.referenceBodies.includes(b));
-    if (emb.bodies.length === 0 || missing.length) {
+    if (embs.some((e) => e.bodies.length === 0) || missing.length) {
       checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: `the reference's bodies (${missing.join(", ") || "none listed"}) are not in the design`, ok: false, hard: true });
       continue;
     }
@@ -301,9 +303,11 @@ export const REFERENCE_NOT_COVERED = "is not covered by a must-not-touch rule";
 /**
  * Fail closed (decision 204): once a part has expectations, every reference in the design — a
  * `refs` record in part.json, a STEP import embedded in the script, or any imported (BaseFeature)
- * body — must be named in `noInterferenceWith`, so no reference is ever in the part unchecked.
+ * body — must be named in `noInterferenceWith`, so no reference is ever in the part unchecked. An
+ * imported body counts as accounted for only when it came from a covered import that is the single,
+ * byte-checked import of its file (`clean`, from `referenceChecks`).
  */
-export function coverageChecks(must: string[], recorded: string[], embedded: { file: string; bodies: string[] }[] | undefined, referenceBodies: string[]): GateCheck[] {
+export function coverageChecks(must: string[], recorded: string[], embedded: { file: string; bodies: string[] }[] | undefined, referenceBodies: string[], clean: ReadonlySet<string>): GateCheck[] {
   const checks: GateCheck[] = [];
   const covered = new Set(must);
   const named = [...new Set([...recorded, ...(embedded ?? []).map((e) => e.file)])].sort();
@@ -311,9 +315,13 @@ export function coverageChecks(must: string[], recorded: string[], embedded: { f
     if (covered.has(n)) continue;
     checks.push({ id: `covered ${n}`, expected: `refs/${n} is in noInterferenceWith`, measured: `reference ${n} ${REFERENCE_NOT_COVERED}`, ok: false, hard: true });
   }
-  // Imported bodies no embedded reference accounts for (or the script could not be read for them).
-  const known = new Set((embedded ?? []).flatMap((e) => e.bodies));
-  const stray = referenceBodies.filter((b) => !known.has(b));
+  // Imported bodies no CHECKED reference accounts for: a body is known only when its import is under
+  // a rule and is the one import of that file whose bytes match refs/ (`clean`). Anything else — a
+  // second import of a covered name, an import whose bytes differ, an unreadable script — is named.
+  // (The bodies of an import whose file no rule names are left to its own "covered" line above.)
+  const known = new Set((embedded ?? []).filter((e) => covered.has(e.file) && clean.has(e.file)).flatMap((e) => e.bodies));
+  const flagged = new Set((embedded ?? []).filter((e) => !covered.has(e.file)).flatMap((e) => e.bodies));
+  const stray = referenceBodies.filter((b) => !known.has(b) && !flagged.has(b));
   if (stray.length) checks.push({ id: "covered reference bodies", expected: "every imported body belongs to a reference in noInterferenceWith", measured: `reference ${stray.join(", ")} ${REFERENCE_NOT_COVERED}`, ok: false, hard: true });
   return checks;
 }

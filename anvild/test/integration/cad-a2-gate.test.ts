@@ -428,9 +428,13 @@ describe("Phase A2 acceptance", () => {
     expect(card.kind).toBe("adopt-rules");
     expect(card.rulesDiff.filter((d: any) => d.op === "-").map((d: any) => d.line.trim())).toContain("250,");
     expect(card.rulesDiff.filter((d: any) => d.op === "+").map((d: any) => d.line.trim())).toContain("2500,");
-    // Denied: still unverified, and the old rules stay the approved ones.
+    // Denied: still unverified, and the old rules stay the approved ones. The same card is not
+    // asked again on its own; the owner's Rebuild asks again.
     x.service.respond(card.requestId, false);
     expect((await x.check()).state).toBe("unverified");
+    expect(x.openCards()).toEqual([]);
+    await x.service.refreshDesign(repo, "plate");
+    await x.check();
     // Approved: the new hash is recorded and the part is judged by the new rules.
     expect(approveCards(x)).toEqual(["adopt-rules"]);
     const adopted = await x.check();

@@ -8,13 +8,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { partRef } from "../../src/cadwork/partfolder";
-import { REFERENCE_CHANGED, importFeatureName } from "../../src/cadwork/refs";
+import { DUPLICATE_REFERENCE, REFERENCE_CHANGED, importFeatureName } from "../../src/cadwork/refs";
 import { REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
 import { expectedReleaseFiles, MANIFEST } from "../../src/cadwork/release";
 import { PLATE_EXPECTATIONS, buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
 import { repoIdentity } from "../../src/cadwork/locks";
 import { UNAPPROVED_PARAMETER } from "../../src/session/cadwork-service";
 import { REAL, SOLIDCRAFT_CLI, hasSolidcraft } from "../helpers/real-tools";
+import { runVerifyCli } from "../helpers/cad-verify";
 
 afterEach(async () => {
   await stopServices();
@@ -261,6 +262,57 @@ describe("real SolidCraft: references and the release pack", () => {
     const g = await x.check();
     expect(g.state).toBe("fail");
     expect(g.failing.join("\n")).toContain(`reference far.step ${REFERENCE_NOT_COVERED}`);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: re-review — a SECOND import carrying the approved reference's file name (other STEP text: a 10 mm block at the origin, body far_b) added to design.json fails the gate ('duplicate reference import far.step', the overlap with far_b found); release_part writes nothing and verify-cli exits 1", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const far = await blockStep(x, repo, "far", [100, 0, 0]);
+    const near = await blockStep(x, repo, "near", [0, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(far, join(repo, ".anvil-downloads", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }))).json.imported).toBe(true);
+    let g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    // A Bash write (or an owner-allowed edit) appends a second import with file "far.step" but other text.
+    const designPath = join(repo, "cad", "plate", "design.json");
+    const doc = JSON.parse(readFileSync(designPath, "utf8"));
+    const first = doc.commands.find((c: any) => c.command === "timeline.add" && c.params?.feature?.type === "import");
+    const second = JSON.parse(JSON.stringify(first));
+    second.params.feature.step = readFileSync(near, "utf8");
+    second.params.feature.name = "ref-far.step-2";
+    second.params.feature.body_names = ["far_b"];
+    second.params.feature.id = 1 + Math.max(...doc.commands.map((c: any) => Number(c.params?.feature?.id ?? 0)));
+    for (const k of ["component", "components", "inserted"]) delete second.params.feature[k];
+    doc.commands.push(second);
+    writeFileSync(designPath, JSON.stringify(doc, null, 2) + "\n");
+    g = await x.check(); // reloads the design from disk
+    const insp = (await x.tools.inspect_design!({ measure: false, sketches: false, timeline: "summary", bodies: true })).json;
+    expect(insp.bodies.map((b: any) => b.name)).toContain("far_b");
+    expect(g.state).toBe("fail");
+    const lines = g.failing.join("\n");
+    expect(lines).toContain(`${DUPLICATE_REFERENCE} far.step: 2 imports`);
+    expect(g.checks.find((c: any) => c.id === "ref far.step").ok).toBe(false);
+    const hit = g.checks.find((c: any) => c.id === "interference far.step");
+    expect(hit.ok).toBe(false);
+    expect(hit.measured).toMatch(/overlaps far_b by 600 mm³/);
+    expect(lines).toContain(REFERENCE_NOT_COVERED); // neither import's bodies count as a checked reference
+    // Release is refused and writes nothing.
+    const rel = await asOwner(x, x.tools.release_part!({ part: "plate" }));
+    expect(rel.isError).toBe(true);
+    expect(rel.text).toContain("the gate is fail");
+    expect(existsSync(join(repo, "cad", "plate", "release"))).toBe(false);
+    // The merge guard judges it the same way (the shared evaluation), in its own real process.
+    const stateDir = x.service.locks.file.replace(/\/cadwork\/locks\.json$/, "");
+    const v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    const p = v.json.parts.find((q: any) => q.part === "plate");
+    expect(p.state).toBe("fail");
+    expect(p.failing.join("\n")).toContain(`${DUPLICATE_REFERENCE} far.step`);
+    expect(p.failing.join("\n")).toMatch(/overlaps far_b by 600 mm³/);
   }, 300_000);
 
   test.skipIf(!REAL)("[A4] real: a release pack of the plate has exactly the listed files, a STEP the binary re-opens as 1 body, four different non-empty PNGs, a valid 3MF, a verifying manifest, and the hole table 3.4 mm ×4; wall time recorded", async () => {
