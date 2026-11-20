@@ -436,9 +436,10 @@ function renderSessionItem(s: Session, isMember: boolean, ctx: RenderCtx): HTMLL
 // row can be dragged from either into the other (and back out of Finished). forceFallback uses
 // SortableJS's own cloned-element drag rather than native HTML5 DnD — which never fires on touch —
 // so it behaves identically on desktop and in the Android WebView. delayOnTouchOnly + a touch
-// threshold give the familiar press-and-hold-then-drag feel on touch while keeping an immediate grab
-// with the mouse. The pinned concierge row lives in its own list (not a sortable), so it can't be
-// reordered or dropped into Finished. `dragging`/`justDragged` are declared in the early-init cluster.
+// threshold give the familiar press-and-hold-then-drag feel on touch; the mouse needs no hold but
+// must move past fallbackTolerance before a drag engages (accidental-move guard). The pinned
+// concierge row lives in its own list (not a sortable), so it can't be reordered or dropped into
+// Finished. `dragging`/`justDragged` are declared in the early-init cluster.
 let sortablesReady = false;
 export function initSortables(): void {
   if (sortablesReady) return; // also guards the double-import race: the flag flips before the await
@@ -458,8 +459,9 @@ function wireSortables(SortableJs: typeof Sortable): void {
     filter: ".row-btn", // taps on the open-tab / + buttons must not begin a drag
     preventOnFilter: false, // …and must still fire their own click
     animation: 150,
-    delay: 250, // press-and-hold before a touch drag engages
-    delayOnTouchOnly: true, // mouse drags start immediately
+    delay: 450, // press-and-hold before a touch drag engages (~OS long-press, so a slow tap/scroll won't)
+    delayOnTouchOnly: true, // mouse drags start without a hold…
+    fallbackTolerance: 8, // …but only after the pointer travels 8px, so a wobbly click stays a click
     touchStartThreshold: 9, // a small finger move within the delay = scroll, so abandon the drag
     forceFallback: true, // cloned-element fallback everywhere: touch-safe and consistent
     fallbackClass: "session-fallback",
