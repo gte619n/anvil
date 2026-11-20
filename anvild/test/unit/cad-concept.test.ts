@@ -7,7 +7,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { partRef } from "../../src/cadwork/partfolder";
-import { checkDimensionValues, parseDimensionRows } from "../../src/session/cadwork-service";
+import { CAD_DIMENSION_MAX_MM } from "@protocol";
+import { checkDimensionValues, dimensionError, parseDimensionRows } from "../../src/session/cadwork-service";
 import { RULES, cleanupTemp, fakeCadSession, stopServices, tempRepo, writeRules } from "../helpers/cad-work";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 
@@ -31,6 +32,21 @@ describe("concept parts and dimensions", () => {
     }
     expect(checkDimensionValues(["L", "W"], { L: 95, W: 20 })).toEqual({ ok: true, values: { L: 95, W: 20 } });
     for (const bad of [{ L: 95 }, { L: 95, W: "20" }, { L: NaN, W: 1 }, { L: 1, W: 2, X: 3 }, null, [95, 20]]) expect(checkDimensionValues(["L", "W"], bad).ok).toBe(false);
+  });
+
+  test("[A4] review: a dimension must be a finite length above 0 and at most CAD_DIMENSION_MAX_MM (1e6 mm), in the proposal and the owner's answer", () => {
+    expect(CAD_DIMENSION_MAX_MM).toBe(1e6);
+    for (const v of [0, -0, -1, -1e-9, 1e6 + 1, 1e308, Infinity, -Infinity, NaN]) {
+      expect(checkDimensionValues(["L"], { L: v }).ok).toBe(false);
+      expect(parseDimensionRows([{ name: "L", value: v }]).ok).toBe(false);
+      expect(dimensionError(v)).toBeDefined();
+    }
+    for (const v of [1e-6, 0.4, 95, 1e6]) {
+      expect(checkDimensionValues(["L"], { L: v })).toEqual({ ok: true, values: { L: v } });
+      expect(parseDimensionRows([{ name: "L", value: v }]).ok).toBe(true);
+    }
+    expect(checkDimensionValues(["L"], { L: -5 })).toEqual({ ok: false, error: "L must be above 0 mm" });
+    expect(checkDimensionValues(["L"], { L: 2e6 })).toEqual({ ok: false, error: "L must be at most 1000000 mm" });
   });
 
   test("[A4] open_part {concept: true} is honoured only for a brand-new part: an existing part, or one with a design, is left as it is", async () => {

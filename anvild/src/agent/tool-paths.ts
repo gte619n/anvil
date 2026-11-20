@@ -11,7 +11,13 @@
  * then symlinks of the nearest EXISTING ancestor are followed (the file may not exist yet).
  *
  * Comparisons are case-insensitive: macOS volumes (APFS, HFS+) are case-insensitive by default, so
- * `CAD/Plate/PART.JSON` is the same file as `cad/plate/part.json`.
+ * `CAD/Plate/PART.JSON` is the same file as `cad/plate/part.json`. They also fold the way the volume
+ * does for Unicode (A4 review): APFS matches `ſ` (long s) to `s`, `K` (Kelvin) to `k`, fullwidth
+ * letters to ASCII and ignores normalisation, so every comparison is made after NFKC + lower-case.
+ * The existing part of a path is resolved by the file system (realpath); only the NEW components (a
+ * file not created yet) are folded by us — and `newComponentsSafe` lets a protected rule refuse any
+ * new component outside printable ASCII outright, so no folding gap can be used to name a protected
+ * file that does not exist yet.
  */
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -26,6 +32,11 @@ export function toolPathArg(input: Record<string, unknown>): unknown {
 
 /** Resolve symlinks on the deepest existing ancestor and keep the rest. */
 export function realish(p: string): string {
+  return splitExisting(p).abs;
+}
+
+/** `p` resolved: the deepest existing ancestor through realpath, plus the components that do not exist yet. */
+export function splitExisting(p: string): { abs: string; fresh: string[] } {
   let dir = resolve(p);
   const rest: string[] = [];
   while (!existsSync(dir) && dirname(dir) !== dir) {
@@ -33,10 +44,17 @@ export function realish(p: string): string {
     dir = dirname(dir);
   }
   try {
-    return join(realpathSync(dir), ...rest);
+    return { abs: join(realpathSync(dir), ...rest), fresh: rest };
   } catch {
-    return resolve(p);
+    return { abs: resolve(p), fresh: rest };
   }
+}
+
+/** Printable ASCII only (space through `~`). */
+const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
+/** True when every component of `p` that does not exist yet is printable ASCII. */
+export function newComponentsSafe(p: string): boolean {
+  return splitExisting(p).fresh.every((c) => PRINTABLE_ASCII.test(c));
 }
 
 /** Where a file tool's path really lands. Undefined when there is no path at all. */
@@ -49,7 +67,9 @@ export function resolveToolPath(raw: unknown, cwd: string, home: string = homedi
   return { ok: true, abs: realish(isAbsolute(p) ? p : resolve(cwd, p)) };
 }
 
-const fold = (p: string): string => p.toLowerCase();
+/** How the volume compares names: compatibility-normalised (NFKC: `ſ`→`s`, `K`→`K`, fullwidth→ASCII,
+ *  composed accents) and lower-cased, then normalised again (lower-casing can decompose, e.g. `İ`). */
+export const fold = (p: string): string => p.normalize("NFKC").toLowerCase().normalize("NFKC");
 
 /** `p` is `dir` or inside it (case-insensitive). */
 export function isUnder(p: string, dir: string): boolean {

@@ -695,7 +695,12 @@ export interface CadExpectationsRow {
   label: string;
   old?: string;
   new?: string;
+  /** The row is something the owner has NOT approved yet that approving this card approves — a
+   *  parameter the agent changed, a replaced reference. Shown highlighted (decision 153). */
+  unapproved?: boolean;
 }
+/** The largest dimension (mm) a `dimensions` card accepts; values must also be finite and above 0. */
+export const CAD_DIMENSION_MAX_MM = 1e6;
 /** One named dimension on a `dimensions` card (Phase A4): the agent's proposal, which the owner edits. */
 export interface CadDimensionRow {
   name: string;

@@ -13,7 +13,7 @@ import { cadTools } from "../../src/agent/cad-tools";
 import { AccountStore } from "../../src/auth/accounts";
 import { partRef } from "../../src/cadwork/partfolder";
 import { createServer, type ServerHandle } from "../../src/server/http";
-import { PLATE_VOLUME, RULES, buildPlate, callable, cleanupTemp, modelPlate, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
+import { PLATE_VOLUME, RULES, buildPlate, callable, cleanupTemp, fakeCadSession, modelPlate, stopServices, tempRepo, until, writeRules } from "../helpers/cad-work";
 import { evalExpr } from "../../src/cadwork/expr";
 import { MOVED_WITHOUT_APPROVAL } from "../../src/cadwork/gate";
 import { repoIdentity } from "../../src/cadwork/locks";
@@ -190,4 +190,38 @@ describe("real SolidCraft: live preview and the owner's parameter change", () =>
     expect(lock.values!.volume).toBeCloseTo(evalExpr(PLATE_VOLUME, { L: 80, W: 50, T: 6.5 }), 3);
     expect(lock.declared).toEqual({ L: 80, W: 50, T: 6.5 });
   }, 180_000);
+
+  test.skipIf(!REAL)("[A3] real: review — an adopt card drawn at L=80 on a fresh lock store is refused on approval after the agent set L=120 while it was open, and redrawn showing 120", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const first = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    expect(first.gate.state).toBe("pass");
+    await first.service.shutdown();
+    const x = fakeCadSession(repo, { resolveCli: () => ({ path: SOLIDCRAFT_CLI, source: "env" }) }, "sess_cad", { expectations: "manual" });
+    await x.tools.open_part!({ part: "plate" });
+    await x.tools.check_part!({ part: "plate" });
+    await until(() => x.openCards().some((c) => c.kind === "adopt-expectations"), "the adopt card", 30_000);
+    for (const c of x.openCards().filter((c) => c.kind === "adopt-rules")) x.service.respond(c.requestId, true);
+    const card = x.openCards().find((c) => c.kind === "adopt-expectations")!;
+    const bbox = (c: any) => c.rows.find((r: any) => r.label === "Bounding box (mm)").new;
+    expect(bbox(card)).toBe("L × W × T  (= 6 × 50 × 80)");
+    let answered: boolean | undefined;
+    await x.manager.request(partRef(repo, "plate"), {
+      tool: "execute",
+      args: { command: "parameters.change", params: { changes: { L: "120 mm" } } },
+      kind: "mutate",
+      afterWrite: () => void (answered = x.service.respond(card.requestId, true)),
+    });
+    expect(answered).toBe(true);
+    expect(x.broadcasts.find((e) => e.type === "cad.expectations.resolved" && e.requestId === card.requestId)).toMatchObject({ approved: false, superseded: true });
+    expect(x.service.locks.findPart(repoIdentity(repo), "plate")?.values).toBeUndefined();
+    await until(() => x.openCards().some((c) => c.kind === "adopt-expectations" && c.requestId !== card.requestId), "the redrawn adopt card", 30_000);
+    const fresh = x.openCards().find((c) => c.kind === "adopt-expectations")!;
+    expect(bbox(fresh)).toBe("L × W × T  (= 6 × 50 × 120)");
+    x.service.respond(fresh.requestId, true);
+    const g = (await x.tools.check_part!({ part: "plate" })).json;
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    expect(x.service.locks.findPart(repoIdentity(repo), "plate")).toMatchObject({ approvedBy: "owner", declared: { L: 120, W: 50, T: 6 } });
+  }, 300_000);
 });

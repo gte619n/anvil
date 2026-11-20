@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionSuggestion } from "@protocol";
 import { cadProtectedRule, refusedBash, registerCadProtectedRules, resetCadProtectedForTest } from "../../src/agent/cad-protected";
+import { fold, newComponentsSafe } from "../../src/agent/tool-paths";
 import { PermissionBroker, makePreToolUseHook } from "../../src/agent/permissions";
 import { protectedVerdict, resetProtectedRulesForTest } from "../../src/agent/protected";
 import { CadworkService } from "../../src/session/cadwork-service";
@@ -340,5 +341,48 @@ describe("cad protected rules", () => {
     }
     // The rest of the part folder is not this rule's: refs/ is written by import, and is a normal file.
     expect((await gate(fakeSession(), "Write", { file_path: join(repo, "cad", "plate", "notes.md"), content: "" })).decision).toBe("allow");
+  });
+
+  test("[A4] review: Unicode look-alikes (ſ, Kelvin K, fullwidth letters, combining marks) cannot name a protected file that does not exist yet; a new name under cad/ outside printable ASCII is denied", async () => {
+    mkdirSync(join(repo, "cad", "plate"), { recursive: true });
+    const s = fakeSession();
+    s.remembered.add("Write").add("Edit");
+    const denied = [
+      "cad/plate/part.j\u017Fon", // ſ (long s): APFS folds it onto `s`
+      "cad/plate/de\u017Fign.json",
+      "cad/plate/relea\u017Fe/plate-abc/plate.step",
+      "cad/newpart/part.j\u017Fon", // a part folder that does not exist yet either
+      "cad/plate/\u212Aey.json", // K (Kelvin sign)
+      "\uFF43\uFF41\uFF44/plate/part.json", // fullwidth "cad"
+      "cad/plate/\uFF50\uFF41\uFF52\uFF54.json", // fullwidth "part"
+      "cad/plate/.cac\uFF48e/preview-1.glb",
+      "cad/plate/part.jso\u0301n", // a combining accent
+      "cad/plate/notes\u0301.md",
+      "cad/rule\u017F.json",
+    ].map((p) => JSON.parse(`"${p}"`) as string);
+    for (const file_path of denied) {
+      for (const p of [file_path, join(repo, file_path)]) {
+        const g = await gate(s, "Write", { file_path: p, content: "{}" });
+        expect([p, g.decision]).toEqual([p, "deny"]);
+        expect(s.asked).toEqual([]); // refused outright, never a prompt the owner could wave through
+      }
+    }
+    // Plain ASCII names elsewhere in the part are still a normal file, and Unicode outside cad/ is not this rule's.
+    expect((await gate(s, "Write", { file_path: join(repo, "cad", "plate", "notes.md"), content: "" })).decision).toBe("allow");
+    expect((await gate(s, "Write", { file_path: join(repo, "docs", "\u017Fpec.md"), content: "" })).decision).toBe("allow");
+    // An EXISTING folder with a non-ASCII name is what the file system says it is: a new ASCII file in it is fine.
+    mkdirSync(join(repo, "cad", "pl\u00E2te"), { recursive: true });
+    expect((await gate(s, "Write", { file_path: join(repo, "cad", "pl\u00E2te", "notes.md"), content: "" })).decision).toBe("allow");
+    // …but its part.json, spelled with a look-alike, is still part.json.
+    expect((await gate(s, "Write", { file_path: join(repo, "cad", "pl\u00E2te", "part.j\u017Fon"), content: "" })).decision).toBe("deny");
+  });
+
+  test("[A4] review: the path fold matches the volume's — NFKC then lower case", () => {
+    expect(fold("part.j\u017Fon")).toBe("part.json");
+    expect(fold("\u212A")).toBe("k");
+    expect(fold("\uFF30\uFF21\uFF32\uFF34.JSON")).toBe("part.json");
+    expect(fold("e\u0301")).toBe("\u00E9");
+    expect(newComponentsSafe(join(repo, "cad", "plate", "part.json"))).toBe(true);
+    expect(newComponentsSafe(join(repo, "cad", "plate", "part.j\u017Fon"))).toBe(false);
   });
 });

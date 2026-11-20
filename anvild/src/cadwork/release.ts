@@ -10,7 +10,9 @@
  *     spec-sheet.html                 the same, self-contained (the four views as data: URIs)
  *     manifest.json                   sha256 of every other file + an HMAC over them
  *
- * EXACTLY those files: `verifyRelease` refuses a folder with anything more or less.
+ * EXACTLY those files: `verifyRelease` refuses a folder with anything more or less — except the
+ * litter a file browser drops into any folder it shows (`.DS_Store`, `._*` AppleDouble files,
+ * `Thumbs.db`, see `isOsLitter`), which is ignored when verifying and never listed in a manifest.
  *
  * THE HMAC. HMAC-SHA256 with a per-machine key, `<stateDir>/cadwork/release.key` (32 random bytes,
  * created 0600 on first use), over the canonical JSON of {part, scriptSha, solidcraft, createdAt,
@@ -18,8 +20,13 @@
  * so a hand-assembled or edited folder is never presented as a release. (Same-user limit, §6: the
  * agent's shell could read the key; the Bash tripwire denies `<stateDir>/cadwork` by name.)
  *
- * ATOMIC. The pack is built in `release/.tmp-*` beside its final name and renamed into place; a
- * re-release of the same script replaces the old folder in one rename. A failure leaves nothing.
+ * ATOMIC (as far as POSIX allows). The pack is built in `release/.tmp-*` beside its final name and
+ * renamed into place, so a reader never sees a half-written pack. A RE-release of the same script
+ * takes two renames — the old folder is moved aside to `release/.old-*`, then the new one renamed in,
+ * then the old one removed — because `rename(2)` cannot replace a non-empty folder and Node has no
+ * atomic swap. Between those two renames the folder is briefly absent (the badge then reads "not
+ * released" until the next check); if the second rename fails the old folder is put back. A failure
+ * leaves nothing new behind.
  *
  * Every user-derived string (part, parameter and reference names, expressions, warnings) is escaped
  * for HTML and for Markdown table cells; the HTML also carries a CSP that allows nothing but its own
@@ -73,6 +80,8 @@ export interface ReleaseManifest {
 }
 
 export const releaseFolderName = (part: string, scriptSha: string): string => `${part}-${scriptSha.slice(0, 7)}`;
+/** Files an OS file browser leaves in a folder it shows: never part of a pack, ignored when verifying. */
+export const isOsLitter = (name: string): boolean => name === ".DS_Store" || name.startsWith("._") || name.toLowerCase() === "thumbs.db";
 export const releaseFolder = (ref: PartRef, scriptSha: string): string => join(ref.dir, RELEASE_DIR, releaseFolderName(ref.part, scriptSha));
 
 /** The files a pack must hold, by process kind (manifest.json included). */
@@ -128,9 +137,11 @@ export function verifyRelease(dir: string, key: Buffer): ReleaseVerdict {
     return no(`the folder cannot be read: ${e instanceof Error ? e.message : String(e)}`);
   }
   const listed = Object.keys(m.files).sort();
-  const present = entries.filter((e) => e.name !== MANIFEST).map((e) => e.name).sort();
+  if (listed.some(isOsLitter)) return no(`${MANIFEST} lists a file a pack never holds`);
+  const real = entries.filter((e) => !isOsLitter(e.name));
+  const present = real.filter((e) => e.name !== MANIFEST).map((e) => e.name).sort();
   if (JSON.stringify(listed) !== JSON.stringify(present)) return no("the folder's files are not exactly the ones the manifest lists");
-  for (const e of entries) if (!e.isFile()) return no(`${e.name} is not a regular file`);
+  for (const e of real) if (!e.isFile()) return no(`${e.name} is not a regular file`);
   for (const name of listed) {
     if (sha256(readFileSync(join(dir, name))) !== m.files[name]) return no(`${name} does not match its sha256 in the manifest`);
   }
@@ -313,11 +324,12 @@ export async function writeReleasePack(call: Call, ref: PartRef, data: ReleaseDa
     writeFileSync(join(tmp, "spec-sheet.md"), specSheetMarkdown(data));
     writeFileSync(join(tmp, "spec-sheet.html"), specSheetHtml(data, views));
     const files: Record<string, string> = {};
-    for (const name of readdirSync(tmp).sort()) files[name] = sha256(readFileSync(join(tmp, name)));
+    for (const name of readdirSync(tmp).sort()) if (!isOsLitter(name)) files[name] = sha256(readFileSync(join(tmp, name)));
     const body = { part: ref.part, scriptSha: data.scriptSha, solidcraft: data.solidcraft, createdAt: data.createdAt, files };
     const manifest: ReleaseManifest = { schema: 1, ...body, hmac: hmacOf(key, body) };
     writeFileSync(join(tmp, MANIFEST), JSON.stringify(manifest, null, 2) + "\n");
-    // Into place in one rename; an earlier pack of the same script is moved aside first, then removed.
+    // Into place: an earlier pack of the same script is moved aside, the new one renamed in, the old
+    // one removed (two renames — see the header; a failed second rename puts the old one back).
     let old: string | undefined;
     if (existsSync(final)) {
       old = join(root, `.old-${process.pid}-${Date.now()}-${++seq}`);
@@ -330,7 +342,7 @@ export async function writeReleasePack(call: Call, ref: PartRef, data: ReleaseDa
       throw e;
     }
     if (old) rmSync(old, { recursive: true, force: true });
-    return { dir: final, files: readdirSync(final).sort().map((n) => join(final, n)) };
+    return { dir: final, files: readdirSync(final).filter((n) => !isOsLitter(n)).sort().map((n) => join(final, n)) };
   } catch (e) {
     rmSync(tmp, { recursive: true, force: true });
     throw e;

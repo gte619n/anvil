@@ -14,6 +14,7 @@ import {
   expectedReleaseFiles,
   holeRowsByDiameter,
   releaseFolderName,
+  isOsLitter,
   releaseKey,
   specSheetHtml,
   specSheetMarkdown,
@@ -101,7 +102,7 @@ describe("release pack", () => {
     expect(verifyRelease(moved, key)).toMatchObject({ ok: false, reason: "the folder is not named for the part and script the manifest describes" });
   });
 
-  test("[A4] re-releasing the same script replaces the folder atomically; a failing export writes nothing", async () => {
+  test("[A4] re-releasing the same script replaces the folder (old moved aside, new renamed in, old removed — nothing left over); a failing export writes nothing", async () => {
     const repo = tempRepo();
     const key = releaseKey(tempDir());
     const { m, ref } = await plateWithBox(repo);
@@ -115,6 +116,29 @@ describe("release pack", () => {
     // A body that does not exist: the STEP cannot be written, and nothing new is left behind.
     await expect(m.run(ref, async (slot) => writeReleasePack((t, a) => slot.call(t, a), ref, data({ scriptSha: "3333333cccc" }), ["NoSuchBody"], key))).rejects.toThrow("the STEP could not be written");
     expect(readdirSync(join(ref.dir, "release"))).toEqual([releaseFolderName("plate", data().scriptSha)]);
+  });
+
+  test("[A4] review: .DS_Store, ._* and Thumbs.db in a pack are ignored when verifying and never listed in a manifest", async () => {
+    const repo = tempRepo();
+    const key = releaseKey(tempDir());
+    const { m, ref } = await plateWithBox(repo);
+    const out = await m.run(ref, async (slot) => writeReleasePack((t, a) => slot.call(t, a), ref, data(), ["Body1"], key));
+    for (const f of [".DS_Store", "._plate.step", "._.DS_Store", "Thumbs.db", "thumbs.db"]) {
+      expect(isOsLitter(f)).toBe(true);
+      writeFileSync(join(out.dir, f), "litter");
+    }
+    expect(verifyRelease(out.dir, key)).toMatchObject({ ok: true });
+    for (const f of ["plate.step", "manifest.json", "DS_Store", "x._y"]) expect(isOsLitter(f)).toBe(false);
+    // A manifest that LISTS litter is not one this daemon wrote.
+    const man = JSON.parse(readFileSync(join(out.dir, MANIFEST), "utf8"));
+    expect(Object.keys(man.files).some(isOsLitter)).toBe(false);
+    writeFileSync(join(out.dir, MANIFEST), JSON.stringify({ ...man, files: { ...man.files, ".DS_Store": "0".repeat(64) } }));
+    expect(verifyRelease(out.dir, key).ok).toBe(false);
+    // Litter in the folder being re-released is not carried into the new pack's manifest.
+    writeFileSync(join(out.dir, MANIFEST), JSON.stringify(man));
+    const again = await m.run(ref, async (slot) => writeReleasePack((t, a) => slot.call(t, a), ref, data({ createdAt: "2026-03-03T00:00:00.000Z" }), ["Body1"], key));
+    expect(Object.keys(JSON.parse(readFileSync(join(again.dir, MANIFEST), "utf8")).files).some(isOsLitter)).toBe(false);
+    expect(again.files.map((f) => f.split("/").at(-1)!).some(isOsLitter)).toBe(false);
   });
 
   test("[A4] the spec sheet is headed 'Not a drawing', escapes every user-derived string (a hostile part or parameter name stays text), and has one hole row per distinct diameter with centres", () => {

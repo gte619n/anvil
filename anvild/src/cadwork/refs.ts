@@ -74,17 +74,29 @@ export function resolveReferenceSource(worktree: string, file: unknown, opts: { 
   }
   if (real !== abs) return say(`${JSON.stringify(file)} sits behind a symbolic link (it really is ${real}); copy the real file into the repo instead`);
   if (st.size > max) return say(`${JSON.stringify(file)} is ${mb(st.size)}; a reference is capped at ${mb(max)}`);
-  // Read through a descriptor that refuses a link, and re-check what was actually opened.
+  const read = readRegularFile(abs, st.ino, max);
+  if (!read.ok) return say(`${JSON.stringify(file)} ${read.error}`);
+  return { ok: true, abs, rel, bytes: read.bytes, sha256: sha256(read.bytes) };
+}
+
+/**
+ * Read a file the caller already lstat-checked as a regular file (`ino`): through a descriptor that
+ * refuses a link (O_NOFOLLOW) and never blocks on open (O_NONBLOCK — a FIFO swapped in after the check
+ * would otherwise hang the daemon until something wrote to it), checked again on that descriptor.
+ * O_NONBLOCK has no effect on reads of a regular file, which is all this ever reads, so it does not
+ * need clearing (Node has no fcntl to clear it with).
+ */
+export function readRegularFile(abs: string, ino: number, max: number): { ok: true; bytes: Buffer } | { ok: false; error: string } {
   let fd: number;
   try {
-    fd = openSync(abs, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch {
-    return say(`${JSON.stringify(file)} could not be opened (a link, or unreadable)`);
+    return { ok: false, error: "could not be opened (a link, or unreadable)" };
   }
   try {
     const fst = fstatSync(fd);
-    if (!fst.isFile() || fst.ino !== st.ino) return say(`${JSON.stringify(file)} changed while it was being read`);
-    if (fst.size > max) return say(`${JSON.stringify(file)} is ${mb(fst.size)}; a reference is capped at ${mb(max)}`);
+    if (!fst.isFile() || fst.ino !== ino) return { ok: false, error: "changed while it was being read" };
+    if (fst.size > max) return { ok: false, error: `is ${mb(fst.size)}; the cap is ${mb(max)}` };
     const bytes = Buffer.alloc(fst.size);
     let at = 0;
     while (at < bytes.length) {
@@ -92,11 +104,19 @@ export function resolveReferenceSource(worktree: string, file: unknown, opts: { 
       if (n <= 0) break;
       at += n;
     }
-    if (at !== bytes.length) return say(`${JSON.stringify(file)} changed while it was being read`);
-    return { ok: true, abs, rel, bytes, sha256: sha256(bytes) };
+    if (at !== bytes.length) return { ok: false, error: "changed while it was being read" };
+    return { ok: true, bytes };
+  } catch (e) {
+    return { ok: false, error: `could not be read (${e instanceof Error ? e.message : String(e)})` };
   } finally {
     closeSync(fd);
   }
+}
+
+/** How many solid bodies a STEP file declares (its B-rep solid entities), or 0 when it names none —
+ *  what a replacement card can say before the import runs. */
+export function stepSolidCount(bytes: Buffer): number {
+  return (bytes.toString("latin1").match(/=\s*(?:MANIFOLD_SOLID_BREP|BREP_WITH_VOIDS|FACETED_BREP)\s*\(/gi) ?? []).length;
 }
 
 /** The name a reference gets in `refs/`: the source's file name, reduced to `[A-Za-z0-9._-]`, with a
