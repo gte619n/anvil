@@ -167,6 +167,12 @@ function sameRepo(lock: { repo: string; remote?: string; path?: string; machine?
 
 let quarantineSeq = 0;
 
+/** What the gate reads from the lock store. The merge guard (verify.ts) needs nothing more. */
+export type LockReader = Pick<LockStore, "findPart" | "findRules" | "findGap">;
+
+/** Thrown by any write to a store opened with `{ readOnly: true }`. */
+export const READ_ONLY_LOCKS = "this lock store was opened read-only";
+
 export class LockStore {
   readonly file: string;
   private parts = new Map<string, PartLock>();
@@ -177,10 +183,18 @@ export class LockStore {
   private readonly listeners = new Set<() => void>();
   /** Set when the file on disk could not be read and was moved aside. */
   quarantined: string | undefined;
+  /** Read-only stores only: why the file on disk could not be read (it is left where it is). */
+  unreadable: string | undefined;
+  private readonly readOnly: boolean;
 
-  constructor(stateDir: string) {
+  /**
+   * `readOnly` (the merge guard, `verify-cli.ts`): no folder is created, a file that does not parse
+   * is reported in `unreadable` and left in place, and every write throws `READ_ONLY_LOCKS`.
+   */
+  constructor(stateDir: string, opts: { readOnly?: boolean } = {}) {
     const dir = join(stateDir, "cadwork");
-    mkdirSync(dir, { recursive: true });
+    this.readOnly = opts.readOnly === true;
+    if (!this.readOnly) mkdirSync(dir, { recursive: true });
     this.file = join(dir, "locks.json");
     this.load();
   }
@@ -320,6 +334,16 @@ export class LockStore {
       this.queue = Array.isArray(raw.pending) ? raw.pending.filter((q) => q && typeof q.id === "string" && (q.kind === "part" || q.kind === "rules" || q.kind === "gap") && q.lock) : [];
       this.hubInfo = raw.hub && typeof raw.hub.serverId === "string" ? { serverId: raw.hub.serverId, ...(typeof raw.hub.url === "string" ? { url: raw.hub.url } : {}) } : undefined;
     } catch (e) {
+      if (this.readOnly) {
+        // A reader never moves the daemon's file: it says so, and holds nothing.
+        this.unreadable = e instanceof Error ? e.message : String(e);
+        this.parts = new Map();
+        this.rules = new Map();
+        this.gaps = new Map();
+        this.queue = [];
+        this.hubInfo = undefined;
+        return;
+      }
       // Quarantine, never guess: an unreadable store means nothing is approved on this machine.
       const aside = `${this.file}.corrupt-${Date.now()}-${++quarantineSeq}`;
       try {
@@ -338,6 +362,7 @@ export class LockStore {
   }
 
   private save(): void {
+    if (this.readOnly) throw new Error(READ_ONLY_LOCKS);
     const doc: LockFile = { schema: 1, parts: [...this.parts.values()], rules: [...this.rules.values()], ...(this.gaps.size ? { gaps: [...this.gaps.values()] } : {}), pending: this.queue, ...(this.hubInfo ? { hub: this.hubInfo } : {}) };
     writeFileAtomic(this.file, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
   }

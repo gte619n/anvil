@@ -22,8 +22,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } fr
 import { join, relative } from "node:path";
 import { evaluateGate, failingLines, gateError, type GateCheck, type GateInput, type GateResult, type Measurement } from "./gate";
 import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
-import { repoIdentity, type LockStore, type RepoIdentity } from "./locks";
-import type { CadParamInfo, FeatureIssue, RefreshJob, SlotContext } from "./manager";
+import { repoIdentity, type LockReader, type LockStore, type RepoIdentity } from "./locks";
+import type { CadParamInfo, FeatureIssue, PartState, RefreshJob, SlotContext } from "./manager";
 import type { McpToolResult } from "./mcp-client";
 import type { PartRef } from "./partfolder";
 import { readPartFile, writeMeasured, type GapRecord, type Measured, type PartRead } from "./partfile";
@@ -167,7 +167,7 @@ export interface RefreshDeps {
 
 type Call = (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>;
 
-interface DesignRead {
+export interface DesignRead {
   version: string;
   designBodies: string[];
   /** Bodies made by a `BaseFeature` (a STEP import): the references. */
@@ -235,7 +235,7 @@ export async function measureDesign(call: Call, designBodies: string[]): Promise
 
 /** Everything the gate reads that is not the live process: the repo files and the lock store. An
  *  approval is found under ANY identity of the repo (its remote, its main checkout's path). */
-export function readLocked(ref: PartRef, locks: LockStore, machine?: string): Pick<GateInput, "part" | "lock" | "rules" | "rulesLock"> & { repo: string; identity: RepoIdentity } {
+export function readLocked(ref: PartRef, locks: LockReader, machine?: string): Pick<GateInput, "part" | "lock" | "rules" | "rulesLock"> & { repo: string; identity: RepoIdentity } {
   const identity = repoIdentity(ref.worktree);
   return { repo: identity.key, identity, part: readPartFile(ref.dir), lock: locks.findPart(identity, ref.part, machine), rules: readRules(ref.worktree), rulesLock: locks.findRules(identity, machine) };
 }
@@ -294,6 +294,75 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
 
 const paramValues = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
 
+/** What `measureAndEvaluate` gathered: the gate's verdict and everything it was reached from. */
+export interface GateEvaluation {
+  gate: GateResult;
+  measurement?: Measurement;
+  /** The full hole table (depths, counterbores). */
+  holes: HoleRow[];
+  design: DesignRead;
+  scriptSha?: string;
+}
+
+export interface EvaluateDeps {
+  /** Read only: nothing here ever writes an approval. */
+  locks: LockReader;
+  machine?: string;
+  evaluateImpl?: (input: GateInput) => GateResult;
+  /** Advisory checks (a concept's picture score). */
+  advisory?: GateCheck[];
+}
+
+/**
+ * Steps 2 and 3 WITHOUT any write: measure the design bodies of the process behind `call`, read the
+ * repo files and the lock store for `ref`, and evaluate the gate. This is the ONE evaluation the live
+ * refresh and the merge guard (`verify.ts`) share, so the two can never judge a part differently.
+ * `slot` is what the manager knows about the process: the sha of the script it holds and its state
+ * (a disk conflict, a script that did not replay). Throws only when the design cannot be read at
+ * all — callers turn that into an `unverified` result (fail closed).
+ */
+export async function measureAndEvaluate(call: Call, ref: PartRef, slot: { scriptSha: string | undefined; state: Pick<PartState, "conflict" | "reason" | "replayFailure"> }, deps: EvaluateDeps): Promise<GateEvaluation> {
+  const design = await readDesign(call);
+  const scriptSha = slot.scriptSha;
+  let measurement: Measurement | undefined;
+  let holes: HoleRow[] = [];
+  let measureError: string | undefined;
+  try {
+    const m = await measureDesign(call, design.designBodies);
+    holes = m.holes;
+    measurement = { bbox: m.bbox, volume: m.volume, faces: m.faces, bodies: m.bodies, holes: holeSummary(m.holes), scriptSha: scriptSha ?? "", solidcraft: design.version };
+  } catch (e) {
+    measureError = `could not measure: ${e instanceof Error ? e.message : String(e)}`;
+  }
+
+  // The accepted numbers were fixed when the expectations were approved. Nothing is pinned here:
+  // this only ever READS the lock store.
+  const locked = readLocked(ref, deps.locks, deps.machine);
+  const params = paramValues(design.params);
+  const state = slot.state;
+  const refs = await referenceGate(call, ref, locked.part, scriptSha, design);
+  const gap = gapOf(locked.part, deps.locks.findGap(locked.identity, ref.part, deps.machine));
+  const advisory = deps.advisory ?? [];
+  const gate = evaluateGate(
+    {
+      ...locked,
+      params,
+      measurement,
+      measureError,
+      scriptSha,
+      solidcraft: design.version,
+      featureErrors: design.featureErrors,
+      warnings: design.warnings,
+      designFailure: state.conflict ? state.reason : state.replayFailure ? `design.json failed to replay: ${state.replayFailure}` : undefined,
+      ...(refs.checks.length || advisory.length ? { extraChecks: [...refs.checks, ...advisory] } : {}),
+      ...(refs.unverified ? { extraUnverified: true } : {}),
+      ...(gap ? { gap } : {}),
+    },
+    deps.evaluateImpl,
+  );
+  return { gate, measurement, holes, design, scriptSha };
+}
+
 export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
   const now = deps.now ?? (() => new Date().toISOString());
   return async (slot) => {
@@ -304,45 +373,13 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
     let designBodies: string[] | undefined;
     try {
       deps.beforeMeasure?.(ref);
-      const design = await readDesign(call);
+      const { gate, measurement, holes, design, scriptSha } = await measureAndEvaluate(call, ref, { scriptSha: slot.scriptSha(), state: slot.state() }, {
+        locks: deps.locks,
+        machine: deps.machine?.(),
+        evaluateImpl: deps.evaluateImpl,
+        advisory: deps.advisoryFor?.(ref) ?? [],
+      });
       designBodies = design.designBodies;
-      const scriptSha = slot.scriptSha();
-      let measurement: Measurement | undefined;
-      let holes: HoleRow[] = [];
-      let measureError: string | undefined;
-      try {
-        const m = await measureDesign(call, design.designBodies);
-        holes = m.holes;
-        measurement = { bbox: m.bbox, volume: m.volume, faces: m.faces, bodies: m.bodies, holes: holeSummary(m.holes), scriptSha: scriptSha ?? "", solidcraft: design.version };
-      } catch (e) {
-        measureError = `could not measure: ${e instanceof Error ? e.message : String(e)}`;
-      }
-
-      // The accepted numbers were fixed when the expectations were approved. Nothing is pinned here:
-      // a refresh only ever READS the lock store.
-      const locked = readLocked(ref, deps.locks, deps.machine?.());
-      const params = paramValues(design.params);
-      const state = slot.state();
-      const refs = await referenceGate(call, ref, locked.part, scriptSha, design);
-      const gap = gapOf(locked.part, deps.locks.findGap(locked.identity, ref.part, deps.machine?.()));
-      const advisory = deps.advisoryFor?.(ref) ?? [];
-      const gate = evaluateGate(
-        {
-          ...locked,
-          params,
-          measurement,
-          measureError,
-          scriptSha,
-          solidcraft: design.version,
-          featureErrors: design.featureErrors,
-          warnings: design.warnings,
-          designFailure: state.conflict ? state.reason : state.replayFailure ? `design.json failed to replay: ${state.replayFailure}` : undefined,
-          ...(refs.checks.length || advisory.length ? { extraChecks: [...refs.checks, ...advisory] } : {}),
-          ...(refs.unverified ? { extraUnverified: true } : {}),
-          ...(gap ? { gap } : {}),
-        },
-        deps.evaluateImpl,
-      );
       if (measurement) {
         const measured: Measured = { at: now(), solidcraft: measurement.solidcraft, scriptSha: measurement.scriptSha, bbox: measurement.bbox, volume: measurement.volume, faces: measurement.faces, bodies: measurement.bodies, holes: measurement.holes, warnings: design.warnings };
         try {

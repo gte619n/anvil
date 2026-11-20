@@ -53,6 +53,7 @@ import {
 } from "../cadwork/partfile";
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
 import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
+import { verifyParts, type VerifyResult } from "../cadwork/verify";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
 import { holeTable, mergeHoleTables } from "../cadwork/holes";
 import { readRules } from "../cadwork/rules";
@@ -1976,6 +1977,23 @@ export class CadworkService {
     }
     s.emit({ type: "file.offer", file: offer });
     return true;
+  }
+
+  /**
+   * The merge guard in-process (spec §4.11; Phase B3's autopilot verify hook calls this): the same
+   * `verifyParts` as `verify-cli.ts`, against THIS daemon's lock store, machine id and binary, in
+   * fresh sandboxed processes of its own (never the session's live ones). Read only. A machine that
+   * cannot run CAD right now (no binary, off the fleet pin) gets `{ ok: false, error }`.
+   */
+  async verifyParts(worktree: string, opts: { parts?: string[]; changedSince?: string } = {}): Promise<VerifyResult> {
+    const why = this.unavailableReason();
+    const cli = this.resolveCli();
+    const selection = { all: false, named: opts.parts ?? [], changed: [], rulesChanged: false, ...(opts.changedSince !== undefined ? { changedSince: opts.changedSince } : {}) };
+    if (why || !cli) return { ok: false, error: `CAD is not available on this machine: ${why ?? NO_SOLIDCRAFT}`, parts: [], selection };
+    // Only how processes are spawned (tests point these at the fake); never the live manager's hooks.
+    const m = this.deps.manager ?? {};
+    const manager = { ...(m.spawn ? { spawn: m.spawn } : {}), ...(m.extraEnv ? { extraEnv: m.extraEnv } : {}), ...(m.requestTimeoutMs ? { requestTimeoutMs: m.requestTimeoutMs } : {}), ...(m.batchTimeoutMs ? { batchTimeoutMs: m.batchTimeoutMs } : {}) };
+    return verifyParts({ worktree, ...opts, binary: cli, lockStore: this.locks, machine: this.machine(), manager });
   }
 
   /** Stop every SolidCraft process (daemon shutdown). */

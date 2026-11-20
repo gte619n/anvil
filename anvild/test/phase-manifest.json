@@ -616,7 +616,51 @@
     },
     "A5": {
       "title": "merge guard",
-      "tests": []
+      "tests": [
+        {
+          "file": "test/unit/cad-verify.test.ts",
+          "names": [
+            "measuredChecks: part.json.measured against the replay > [A5] a measurement of the same script with the same numbers (in any bbox order) passes every check",
+            "measuredChecks: part.json.measured against the replay > [A5] another script, numbers beyond the part's tolerance, other bodies or holes, or no measurement at all each fail",
+            "measuredChecks: part.json.measured against the replay > [A5] the tolerance is the part's own clamped to the caps, and the defaults for a part with no expectations",
+            "changedParts: what --changed-since selects > [A5] parts under cad/<part>/ changed since the merge base in the working tree, rules.json, daemon folders and bad refs",
+            "verify-cli arguments, state dir and binary > [A5] parseArgs: --changed-since, --part (repeated or several names), --json; anything else is an error",
+            "verify-cli arguments, state dir and binary > [A5] the state dir is ANVIL_STATE_DIR (with ~ expanded) or ~/.anvil, as the daemon resolves it",
+            "verify-cli arguments, state dir and binary > [A5] the binary: ANVIL_SOLIDCRAFT_CLI first (the documented same-user override), else the pinned managed build; a pin with no verified install, or a missing file, is an error",
+            "the read-only lock store > [A5] opened read-only it creates no folder, leaves a corrupt file where it is, reads a good one, and refuses every write",
+            "the read-only lock store > [A5] verifyParts reports an unreadable lock store as could-not-run, never as 'nothing approved'",
+            "daemon integration: the prompt and the Bash rule > [A5] the CAD system prompt tells the agent to run verify-cli --changed-since <base> after any merge or rebase touching cad/, and not to commit a merge that fails it",
+            "daemon integration: the prompt and the Bash rule > [A5] the protected Bash rule lets the merge guard through (the relative form and the prompt's absolute path, under every policy), and still denies solidcraft-cli"
+          ]
+        },
+        {
+          "file": "test/integration/cad-a5-verify.test.ts",
+          "names": [
+            "Phase A5 acceptance > [A5] acceptance 1: two branches each change a different parameter of one part; after a clean text merge verify-cli exits non-zero because part.json's measured no longer matches the replay",
+            "Phase A5 acceptance > [A5] acceptance 2: after the refresh runs on the merged script and the result passes, verify-cli exits 0",
+            "Phase A5 acceptance > [A5] acceptance 3: a part.json whose expectations do not match the lock store exits non-zero (adoption pending)",
+            "Phase A5 edge cases and gaming (§7) > [A5] two sessions on two worktrees of one repo, same part: different keys and processes; verify judges each checkout against the one shared approval",
+            "Phase A5 edge cases and gaming (§7) > [A5] gamed: a merge that edits the expectations text fails as adoption pending, even with a matching measured block",
+            "Phase A5 edge cases and gaming (§7) > [A5] gamed: part.json.measured rewritten to match the replay never makes a failing part pass (decision 97)",
+            "Phase A5 edge cases and gaming (§7) > [A5] a design.json that fails the script screen is refused: no SolidCraft process is started and nothing is written",
+            "Phase A5 edge cases and gaming (§7) > [A5] a design with a feature error fails on the feature-error check (timeline[].error), though the replay itself succeeded",
+            "Phase A5 edge cases and gaming (§7) > [A5] references: an overlapping reference fails on interference, a clear one passes with the reference left out of the measurement, and an edited refs/ file fails as changed",
+            "Phase A5 edge cases and gaming (§7) > [A5] gap → fail; concept → reported, not failing",
+            "Phase A5 edge cases and gaming (§7) > [A5] --changed-since selects the parts changed since the merge base (committed, uncommitted and untracked), every part when cad/rules.json changed, and none for a change outside cad/",
+            "Phase A5 edge cases and gaming (§7) > [A5] exit code 2: no binary, a pinned build that is not installed, not a git repo, an unknown ref, a bad argument, an unreadable lock store",
+            "Phase A5 edge cases and gaming (§7) > [A5] verify never writes: the lock store, part.json, design.json, rules.json and the worktree are byte-identical after failing and passing runs; a state dir with no lock store gets no folder",
+            "Phase A5 edge cases and gaming (§7) > [A5] the service's verifyParts (what Phase B3's hook calls) gives the CLI's verdicts in process, and refuses with the reason when CAD is unavailable here"
+          ]
+        }
+      ],
+      "real": [
+        {
+          "file": "test/real/cad-a5.test.ts",
+          "names": [
+            "real SolidCraft: the merge guard > [A5] real: two branches change L and T of the plate; after the clean merge verify-cli exits 1 on the stale measurement, after check_part it exits 0, and an edited expectations block exits 1; wall time recorded"
+          ]
+        }
+      ]
     },
     "B0": {
       "title": "spike",

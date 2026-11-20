@@ -6,6 +6,8 @@
  * PreToolUse hook, where read-only tools are allowed under `allowlist` and the mutating ones follow
  * the session's autonomy policy exactly like `Edit`.
  */
+import { join } from "node:path";
+
 export const CAD_MCP_SERVER_NAME = "anvil_cad";
 
 /** Read-only pass-through tools: they never change the design or write a file. */
@@ -59,7 +61,16 @@ export const CAD_MUTATING_TOOL_IDS: readonly string[] = CAD_MUTATING_TOOLS.map(c
 export const CAD_TOOL_IDS: readonly string[] = [...CAD_READ_ONLY_TOOL_IDS, ...CAD_MUTATING_TOOL_IDS];
 export const CAD_OWNER_CARD_TOOL_IDS: readonly string[] = CAD_OWNER_CARD_TOOLS.map(cadToolId);
 
-/** The paragraph a session with the `anvil_cad` server gets in its system prompt (spec §4.4). */
+/**
+ * The merge guard's script (spec §4.11), as an absolute path into THIS daemon's checkout, so a session
+ * in any repo can run it (`bun anvild/src/cadwork/verify-cli.ts` is the same file, relative to the
+ * Anvil repo itself).
+ */
+export const VERIFY_CLI_PATH = join(import.meta.dir, "..", "cadwork", "verify-cli.ts");
+/** The command the prompt tells the agent to run after a merge or rebase that touches `cad/`. */
+export const VERIFY_CLI_COMMAND = `bun ${VERIFY_CLI_PATH} --changed-since <base>`;
+
+/** The paragraph a session with the `anvil_cad` server gets in its system prompt (spec §4.4, §4.11). */
 export const CAD_SYSTEM_PROMPT =
   "\n\nCAD PARTS (anvil_cad tools): Work on ONE part at a time (open_part). Before the first modeling call on a part, " +
   "record what it must be with record_expectations (bounding box, volume, body count, holes); modeling is refused until " +
@@ -73,4 +84,8 @@ export const CAD_SYSTEM_PROMPT =
   "repo, e.g. .anvil-downloads/x.step); the part must not touch it. A part built from a picture with no dimensions is a " +
   "concept (open_part {part, concept: true, process}): model it, then call request_dimensions so the OWNER types the " +
   "numbers, then record_expectations with exactly those values. release_part asks the owner on a card; never claim a " +
-  "release without it.";
+  "release without it. MERGES: after any git merge or rebase that touches cad/, run the CAD merge guard from the repo, " +
+  `\`${VERIFY_CLI_COMMAND}\` (<base> = the branch or commit you merged or rebased onto, e.g. origin/main). It replays ` +
+  "every changed part in a fresh SolidCraft and exits 0 only when each one passes. Do not commit a merge (or finish a " +
+  "rebase) while it fails: a text merge of design.json can build something neither branch meant, and part.json's " +
+  "measurement must be the daemon's measurement of the merged design (check_part re-measures it).";
