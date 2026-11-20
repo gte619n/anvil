@@ -29,7 +29,7 @@
 import type { PermissionSuggestion, ToolResultImage } from "@protocol";
 import type { McpKindVerdict } from "../agent/mcp-gate";
 import { isUnattended } from "../agent/protected";
-import type { BrowserActionInfo } from "./gate";
+import { TRAFFIC_LOST_SITE, type BrowserActionInfo } from "./gate";
 
 /** The keys that count as scrolling (item 27). Compared exactly: `pagedown`, `Shift+End`, ` End` ask. */
 export const SCROLL_KEYS: readonly string[] = ["PageDown", "PageUp", "Home", "End"];
@@ -42,6 +42,8 @@ export const HARD_STOP_LABELS = (site: string): [string, string, string] => ["Al
 
 const suggestions = (site: string): PermissionSuggestion[] => {
   const [once, unlock, no] = HARD_STOP_LABELS(site);
+  // Unknown embedded content (C4 review, item 2) is not a site: there is nothing to unlock.
+  if (site === TRAFFIC_LOST_SITE) return [{ decision: "allow", label: once }, { decision: "deny", label: no }];
   return [
     { decision: "allow", label: once },
     // `allow_always` on the wire (no new decision value, so every client can send it); on THIS card
@@ -81,6 +83,7 @@ export function runsWithoutPrompt(info: BrowserActionInfo, site: string): boolea
 /** What the card says the call does — built from the tool name and tracked facts only. */
 function describe(info: BrowserActionInfo, site: string): string {
   const tool = info.ctx.tool.replace(/^browser_/, "").replace(/_/g, " ");
+  if (site === TRAFFIC_LOST_SITE) return `${tool} on ${info.currentSite ?? "a page"} whose embedded content is unknown: the page made more connections than Anvil keeps track of, so Anvil lost track of what it loaded (a frame from a logged-in site may be on it)`;
   if (site !== info.currentSite && site !== info.target?.site) return `${tool} on ${info.currentSite ?? "a page"} that has loaded ${site}, a logged-in site (a frame or widget from it may be on the page)`;
   if (info.target && info.target.site !== site) return `leave ${site} for ${info.target.site} (${tool})`;
   if (info.target) return `open ${info.target.url.slice(0, 160)} on ${site} without https (${tool})`;
@@ -93,7 +96,8 @@ export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo
     // …and the locked logged-in sites this page has loaded something from (C3 review, item 4): a frame
     // from one of them is acted on as if the page were on it.
     const touched = [info.currentSite, info.target?.site, ...(info.embeddedSites ?? [])].filter((s, i, all): s is string => !!s && all.indexOf(s) === i);
-    const site = touched.find((s) => deps.isLocked(s) && !runsWithoutPrompt(info, s));
+    // Unknown embedded content counts as a locked logged-in site (fail closed).
+    const site = touched.find((s) => (s === TRAFFIC_LOST_SITE || deps.isLocked(s)) && !runsWithoutPrompt(info, s));
     // The daemon does not know which page the current tab shows: assume the worst — a locked
     // logged-in site — never "not logged in". Only a read runs; anything else is refused until a
     // snapshot says where the page is (the gate refuses such calls too; this is the second lock).
@@ -122,7 +126,7 @@ export function makeHardStopPolicy(deps: HardStopDeps): (info: BrowserActionInfo
       card: { reason, image },
       timeoutMs: deps.timeoutMs ?? HARD_STOP_TIMEOUT_MS,
       onAnswer: (decision) => {
-        if (decision === "allow_always") deps.unlock(site, session.id);
+        if (decision === "allow_always" && site !== TRAFFIC_LOST_SITE) deps.unlock(site, session.id);
       },
     };
   };

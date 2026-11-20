@@ -8,7 +8,7 @@
  * The request and reply shapes are from the C0 research table, NOT read on Mouser's own docs (its
  * Swagger page is script-rendered); the fixtures in the tests are hand-written to that shape.
  */
-import { DAY, MINUTE, RateLimiter } from "./ratelimit";
+import { DailyCounter, MINUTE, RateLimiter } from "./ratelimit";
 import { httpsUrl, vendorCall } from "./http";
 import { PartSourceError, type ConnectorDeps, type PartResult, type PartSearchOpts, type PartSource } from "./types";
 
@@ -43,11 +43,16 @@ export class MouserSource implements PartSource {
   private readonly limiter: RateLimiter;
 
   constructor(private readonly deps: ConnectorDeps) {
-    this.limiter = new RateLimiter([{ limit: 30, perMs: MINUTE }, { limit: 1000, perMs: DAY }], deps.now);
+    this.limiter = new RateLimiter([{ limit: 30, perMs: MINUTE }], deps.now, { counter: deps.daily ?? new DailyCounter(undefined, deps.now), source: "mouser", limit: 1000 });
   }
 
   configured(): boolean {
     return !!this.deps.keys().MOUSER_API_KEY?.trim();
+  }
+
+  secrets(): string[] {
+    const k = this.deps.keys().MOUSER_API_KEY;
+    return k ? [k, k.trim()] : [];
   }
 
   private async keyword(keyword: string, records: number): Promise<MouserReply> {

@@ -7,7 +7,8 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { TEST_DAEMON_ENV_KEYS, TEST_DAEMON_HOME_PREFIX, TEST_DAEMON_LEDGER, TEST_DAEMON_TTL_MS, TestDaemonService, testDaemonEnv, type TestDaemonPorts } from "../../src/browser/testdaemon";
+import { spawn } from "node:child_process";
+import { TEST_DAEMON_ENV_KEYS, TEST_DAEMON_HOME_PREFIX, TEST_DAEMON_LEDGER, TEST_DAEMON_TTL_MS, TestDaemonService, psIdentity, testDaemonEnv, type TestDaemonPorts } from "../../src/browser/testdaemon";
 import { FAKE_BUN, capturedTimers, fakeAnvilCheckout, fakeRunner, type CapturedTimers, type FakeRunner } from "../helpers/testdaemon";
 
 let stateDir: string;
@@ -264,10 +265,10 @@ describe("the crash ledger", () => {
     const real = fakeRunner();
     const spawn = real.spawn.bind(real);
     real.spawn = (c, a, o) => Object.assign(spawn(c, a, o), { pid });
-    svc = make({ runner: real });
+    svc = make({ runner: real, identify: (p) => (p === pid ? { started: "Thu Nov 19 10:00:00 2026", command: `${FAKE_BUN} run src/main.ts` } : undefined) });
     await svc.start(session());
     const home = real.starts[0]!.opts.env.HOME!;
-    expect(JSON.parse(readFileSync(join(stateDir, TEST_DAEMON_LEDGER), "utf8"))).toEqual([{ pid, home }]);
+    expect(JSON.parse(readFileSync(join(stateDir, TEST_DAEMON_LEDGER), "utf8"))).toEqual([{ pid, home, started: "Thu Nov 19 10:00:00 2026", command: `${FAKE_BUN} run src/main.ts` }]);
     svc.stop("s1", "done");
     expect(existsSync(join(stateDir, TEST_DAEMON_LEDGER))).toBe(false);
     homes.push(home);
@@ -282,7 +283,9 @@ describe("the crash ledger", () => {
     writeFileSync(join(stateDir, TEST_DAEMON_LEDGER), JSON.stringify([{ pid: 99_999_999, home: orphan }, { pid: 99_999_998, home: notOurs }, { pid: 99_999_997, home: unmarked }, { pid: 1, home: orphan }, "junk", { home: 3 }]));
     const asked: number[] = [];
     try {
-      expect(svc.reapOrphans((pid) => (asked.push(pid), "some unrelated program"))).toBe(1); // never "src/main.ts" → nothing is signalled
+      // Rows without a recorded identity are never signalled; the home a row names is still ours to delete.
+      writeFileSync(join(stateDir, TEST_DAEMON_LEDGER), JSON.stringify([{ pid: 99_999_999, home: orphan, started: "Thu Nov 19 10:00:00 2026", command: "bun run src/main.ts" }, { pid: 99_999_998, home: notOurs }, { pid: 99_999_997, home: unmarked }, { pid: 1, home: orphan }, "junk", { home: 3 }]));
+      expect(svc.reapOrphans((pid) => (asked.push(pid), { started: "Thu Nov 19 11:11:11 2026", command: "some unrelated program" }))).toBe(1); // not the process that was started → nothing is signalled
       expect(asked).toEqual([99_999_999]);
       expect(existsSync(orphan)).toBe(false);
       expect(existsSync(notOurs)).toBe(true);
@@ -292,6 +295,67 @@ describe("the crash ledger", () => {
       expect(readdirSync(stateDir)).toEqual([]);
     } finally {
       for (const d of [orphan, notOurs, unmarked]) rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  test("[C4] reapOrphans signals a recorded pid only when ps still reports the same start time, the exact command line and HOME the row's temp home; a reused pid only loses its row", async () => {
+    const mk = (): string => {
+      const h = realpathSync(mkdtempSync(join(tmpdir(), TEST_DAEMON_HOME_PREFIX)));
+      writeFileSync(join(h, ".anvil-test-daemon"), "");
+      return h;
+    };
+    const homeA = mk();
+    const homeB = mk();
+    // A real stand-in process (bun, so `ps eww` can read its environment), its own group, HOME = homeA.
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { env: { HOME: homeA, PATH: "/usr/bin:/bin" }, detached: true, stdio: "ignore" });
+    const exited = new Promise<void>((r) => child.once("exit", () => r()));
+    try {
+      const pid = child.pid!;
+      let id = psIdentity(pid);
+      for (let i = 0; i < 40 && !id?.home; i++) {
+        await Bun.sleep(50);
+        id = psIdentity(pid);
+      }
+      expect(id).toMatchObject({ home: homeA });
+      expect(id!.started.length).toBeGreaterThan(0);
+      expect(id!.command).toContain("setTimeout");
+      const alive = (): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      // The same pid, but recorded with another start time, another command line or another home:
+      // nothing is signalled, the rows (and the homes they name) go.
+      for (const row of [
+        { started: "Mon Jan  1 00:00:00 2024", command: id!.command, home: homeB },
+        { started: id!.started, command: `${id!.command} --other`, home: homeB },
+        { started: id!.started, command: id!.command, home: homeB },
+      ]) {
+        mkdirSync(homeB, { recursive: true });
+        writeFileSync(join(homeB, ".anvil-test-daemon"), "");
+        writeFileSync(join(stateDir, TEST_DAEMON_LEDGER), JSON.stringify([{ pid, ...row }]));
+        expect(svc.reapOrphans()).toBe(1);
+        expect(existsSync(homeB)).toBe(false);
+        expect(existsSync(join(stateDir, TEST_DAEMON_LEDGER))).toBe(false);
+        await Bun.sleep(100);
+        expect(alive()).toBe(true);
+      }
+      // All three match: the process this daemon started is killed and its home deleted.
+      writeFileSync(join(stateDir, TEST_DAEMON_LEDGER), JSON.stringify([{ pid, home: homeA, started: id!.started, command: id!.command }]));
+      expect(svc.reapOrphans()).toBe(1);
+      await exited;
+      expect(alive()).toBe(false);
+      expect(existsSync(homeA)).toBe(false);
+    } finally {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* gone */
+      }
+      for (const d of [homeA, homeB]) rmSync(d, { recursive: true, force: true });
     }
   });
 });

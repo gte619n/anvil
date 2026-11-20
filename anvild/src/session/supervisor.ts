@@ -94,7 +94,7 @@ import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
 import { HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, buildHumanToolsServer } from "../agent/human-tools";
 import { TEST_MCP_SERVER_NAME, buildTestDaemonToolsServer } from "../agent/testdaemon-tools";
-import { PARTS_MCP_SERVER_NAME, PARTS_TOOL_IDS, buildPartsToolsServer } from "../agent/parts-tools";
+import { PARTS_MCP_SERVER_NAME, buildPartsToolsServer } from "../agent/parts-tools";
 import { PartsService, type PartsServiceDeps } from "../integrations/parts/service";
 import { envFile as launcherEnvFile } from "../auth/env-file";
 import { isOrdinarySession } from "../agent/mcp-external";
@@ -204,10 +204,13 @@ export interface SupervisorConfig {
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
   fleet?: ConciergeFleetOps;
+  /** Hostnames of the fleet's member machines (the FleetStore roster's hosts and URL hostnames),
+   *  refused by `parts_fetch` whatever they resolve to. Defined in http.ts; omitted in unit tests. */
+  fleetHosts?: () => readonly string[];
   /** Test seams for the MCP integration registry (fake prober / fake clock / no timer). */
   mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number; browser?: McpIntegrationServiceDeps["browser"] };
   /** Test seams for the part sources (Phase C5; "part-sources" feature): fake fetch, base URLs, … */
-  parts?: Omit<Partial<PartsServiceDeps>, "envFile" | "onKeysChanged">;
+  parts?: Omit<Partial<PartsServiceDeps>, "envFile" | "stateDir" | "onKeysChanged">;
 }
 
 /**
@@ -412,10 +415,15 @@ export class Supervisor {
     });
     // Part sources (Phase C5): only with the "part-sources" feature. Keys live in the launcher env file
     // (a test's own when it passes one); a change is broadcast and, on a hub, pushed to the members.
+    // parts_fetch refuses every fleet machine the way the browser proxy does: the roster's hosts, and
+    // what the browser's allowed-sites sync knows (on a member, the hub that paired it).
+    const partsFleetHosts = cfg.parts?.fleetHosts;
     this.parts = featureEnabled(cfg, "part-sources")
       ? new PartsService({
           ...cfg.parts,
           envFile: cfg.envFile ?? launcherEnvFile(),
+          stateDir: cfg.stateDir,
+          fleetHosts: () => [...new Set([...(cfg.fleetHosts?.() ?? []), ...(this.mcp.browser?.sites.fleetHosts() ?? []), ...(partsFleetHosts?.() ?? [])])],
           onKeysChanged: (event, origin) => {
             this.registry.toAll(event);
             this.rebuildIdleDriversForParts();
@@ -1968,7 +1976,7 @@ export class Supervisor {
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
         this.mcp.serversFor(s, inProcessServers),
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser || hasParts ? [...(hasBrowser ? HUMAN_TOOL_IDS : []), ...(hasParts ? PARTS_TOOL_IDS : [])] : undefined,
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser ? HUMAN_TOOL_IDS : undefined,
         this.planReviewer(s),
         this.sessionQueryFn, // queryFn — the SDK default unless a test injected one
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
@@ -2005,7 +2013,7 @@ export class Supervisor {
       // `request_human` and the throwaway test daemon's tools (Phases C3, C4). The test tools' ids are
       // deliberately NOT in `allowedTools`: every call goes through the permission hook.
       ...(hasBrowser ? { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s), [TEST_MCP_SERVER_NAME]: buildTestDaemonToolsServer(this.mcp.browser!.testDaemons, s) } : {}),
-      // parts_search is read-only (allowed in `allowedTools`); parts_fetch goes through the hook.
+      // No allowedTools entry: both go through the hook (parts_search as read-only, parts_fetch as a write).
       ...(hasParts ? { [PARTS_MCP_SERVER_NAME]: buildPartsToolsServer(this.parts!, s) } : {}),
     };
     return Object.keys(servers).length > 0 ? servers : undefined;

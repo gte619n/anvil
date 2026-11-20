@@ -8,17 +8,16 @@ import type { PartsFetchOutcome, PartsSearchOutcome } from "../integrations/part
  * `anvil_parts` with `parts_search` and `parts_fetch`, given to ordinary sessions while at least one
  * source is configured. The work is `integrations/parts/`; this file is the tool surface only.
  *
- * Permission: `parts_search` is read-only (in the driver's allowed tools and the autonomy policy's
- * read-only set); `parts_fetch` writes into the worktree's quarantine, so it is NOT allowed by
- * default — the PreToolUse hook decides it as an ordinary write under the session's autonomy policy,
- * and the `canUseTool` backstop denies it if the hook ever fails.
+ * Permission: neither tool has an `allowedTools` entry (spec §6: integration tools never do), so
+ * both go through the PreToolUse hook. `parts_search` is in the autonomy policy's read-only set
+ * (`danger-list.ts`), so the hook allows it without a prompt under every policy but `prompt-all`;
+ * `parts_fetch` writes into the worktree's quarantine, so the hook decides it as an ordinary write
+ * under the session's autonomy policy. If the hook ever fails, the `canUseTool` backstop denies both.
  */
 
 export const PARTS_MCP_SERVER_NAME = "anvil_parts";
 export const PARTS_SEARCH_TOOL_ID = `mcp__${PARTS_MCP_SERVER_NAME}__parts_search`;
 export const PARTS_FETCH_TOOL_ID = `mcp__${PARTS_MCP_SERVER_NAME}__parts_fetch`;
-/** The ids the driver auto-allows (the read-only one only). */
-export const PARTS_TOOL_IDS = [PARTS_SEARCH_TOOL_ID];
 
 /** What a session with these tools gets in its system prompt (see `browserSessionPrompt`). */
 export const PARTS_SESSION_PROMPT =

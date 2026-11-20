@@ -1469,6 +1469,23 @@
             "notifications for cards that must be seen > [C3] a hard-stop card (screenshot + reason) is pushed as open-only: kind question, no requestId; an ordinary prompt keeps Allow/Deny",
             "notifications for cards that must be seen > [C3] the notification-button endpoint cannot approve a hard stop (deny works); an ordinary prompt can still be approved from it"
           ]
+        },
+        {
+          "file": "test/integration/browser-c4-review.test.ts",
+          "names": [
+            "item 2: an overflowing traffic log > [C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to a page with a complete log clears it",
+            "item 3: the card's picture cannot be chosen by the agent > [C3] review C4-3: browser_take_screenshot with any filename is denied, without one it is allowed; a file it links — even one written during the call — never becomes the card image, only its inline image does",
+            "item 3: the card's picture cannot be chosen by the agent > [C3] review C4-3: the agent's Write, Edit, MultiEdit and NotebookEdit are denied inside .anvil-browser/ (also through a link into it); Read there and writes elsewhere are not",
+            "item 4: time passing with the page live > [C3] review C4-4: after browser_wait_for whose result has no page block the next click needs a snapshot; a wait whose result carries the page block does not"
+          ]
+        },
+        {
+          "file": "test/unit/browser-gate-fresh.test.ts",
+          "names": [
+            "the freshness rule (C4 review, item 4) > [C3] review C4-4: FRESH_PAGE_MS is 2 s; an input, upload or script call more than 2 s after the last result that said where the page is is refused with 'take a snapshot first', at 2 s it is not",
+            "the freshness rule (C4 review, item 4) > [C3] review C4-4: any result carrying the server's page block counts (a click's own result); one without it (a screenshot, a console read) does not refresh the clock",
+            "the freshness rule (C4 review, item 4) > [C3] review C4-4: a browser_wait_for whose result has no page block makes the page unknown for input even within 2 s; one whose result carries it is fresh"
+          ]
         }
       ],
       "real": [
@@ -1489,6 +1506,13 @@
             "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (meta): after A's own meta sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
             "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 1 (replace): after A's own replace sends it to B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
             "real Chrome: a page that moves itself to a locked logged-in site > [C3] real review 4: a frame from the locked site B on allowed page A — a click on A is a hard stop naming B (screenshot first, then a card), and B records zero presses"
+          ]
+        },
+        {
+          "file": "test/real/browser-c4-review.test.ts",
+          "names": [
+            "real Chrome: the C4 review's bypasses > [C3] real review C4-2: allowed A frames locked B, then makes 2100 same-site fetches — after a snapshot the click is still a hard stop naming that Anvil lost track, and B records zero presses",
+            "real Chrome: the C4 review's bypasses > [C3] real review C4-3: while a background loop keeps replacing every PNG in .anvil-browser/ with a planted one, browser_take_screenshot with a filename is refused and the hard-stop card shows the real server's inline image, byte for byte — never the planted file"
           ]
         }
       ]
@@ -1536,7 +1560,8 @@
             "ending > [C4] the 15-minute timer stops the daemon by itself and says so in the session; stopping first disarms it",
             "ending > [C4] stopAll (daemon shutdown) ends every session's test daemon; a daemon that exits by itself is cleaned up the same way",
             "the crash ledger > [C4] a started daemon with a real pid is listed in <stateDir>/testdaemons.json and removed from it when stopped",
-            "the crash ledger > [C4] reapOrphans deletes a home a crashed run left behind, asks what the pid is before signalling it, and ignores rows that do not name a folder this code made"
+            "the crash ledger > [C4] reapOrphans deletes a home a crashed run left behind, asks what the pid is before signalling it, and ignores rows that do not name a folder this code made",
+            "the crash ledger > [C4] reapOrphans signals a recorded pid only when ps still reports the same start time, the exact command line and HOME the row's temp home; a reused pid only loses its row"
           ]
         },
         {
@@ -1567,6 +1592,13 @@
             "permission and availability > [C4] start_test_daemon follows the session's autonomy policy as a mutating tool: prompt-all and allowlist park a card (Deny refuses it), mostly-autonomous and bypass run it; it is not in allowedTools, so the canUseTool backstop denies it",
             "permission and availability > [C4] only an ordinary session with the browser switched on gets the anvil_test server: a plain session, the concierge and a team lead do not, and with the browser feature off nothing of it exists"
           ]
+        },
+        {
+          "file": "test/integration/browser-c4-review.test.ts",
+          "names": [
+            "item 1: the session's own test daemon has no exemption from the traffic rules > [C4] review 1: an own-origin page that moves itself to a locked logged-in site — the next key press, click and script are refused with 'take a snapshot first'; the snapshot then shows the site under its hard stop",
+            "item 1: the session's own test daemon has no exemption from the traffic rules > [C4] review 1: an own-origin page that frames a locked logged-in site — a click is a hard stop naming it and browser_evaluate is refused; the own origin itself still needs no site prompt and a page with no such frame acts freely"
+          ]
         }
       ],
       "real": [
@@ -1577,6 +1609,14 @@
             "the worktree's real daemon, credential-less, through the real proxy > [C4] real: it listens on loopback only — lsof shows one listener, on 127.0.0.1 — and a connection to a non-loopback local address on that port is refused",
             "the worktree's real daemon, credential-less, through the real proxy > [C4] real: the real headless browser, launched with C2's line through session A's proxy, loads the test daemon's root page; session B's proxy gets 403 on the same port and a loopback fixture standing in for the live daemon is refused for both",
             "the worktree's real daemon, credential-less, through the real proxy > [C4] real: the child writes only under its own temp home — every file it holds open for writing is inside that home — and its process and temp home are gone after the turn ends"
+          ]
+        },
+        {
+          "file": "test/real/browser-c4-review.test.ts",
+          "names": [
+            "real Chrome: the C4 review's bypasses > [C4] real review: setup — the real server starts headless through the real proxy; the session's test daemon (stand-in) is running and its origin is the session's own; A (127.0.0.1) is allowed, B (localhost) is a locked logged-in site",
+            "real Chrome: the C4 review's bypasses > [C4] real review 1 (timer): after the own-origin page's own timer sends it to locked B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
+            "real Chrome: the C4 review's bypasses > [C4] real review 1 (frame): an own-origin page that frames locked B — a key press and a click are hard stops naming B (screenshot first, then a card), browser_evaluate is refused, and B records zero presses"
           ]
         }
       ]
@@ -1604,7 +1644,10 @@
           "names": [
             "rate limiter > [C5] rate limiter: a per-minute and a per-day window are both enforced, refill over time, and a refused call says how long to wait",
             "rate limiter > [C5] rate limited calls never reach the vendor and come back as 'rate limited, retry after'",
-            "rate limiter > [C5] keys are scrubbed from text, raw and URL-encoded"
+            "rate limiter > [C5] keys are scrubbed from text, raw and URL-encoded",
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: N calls use up the UTC day, a new limiter over the same file (a restart) still refuses, the refusal waits until UTC midnight, and the next UTC day allows again",
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a refused short window does not count against the day, and the vendor's pause leaves the day alone",
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a corrupt or wrong-shaped file fails closed for the rest of that UTC day, then the next day rewrites it; a missing file is a fresh day"
           ]
         },
         {
@@ -1648,7 +1691,19 @@
             "tools, permissions and keys > [C5] Settings: Test makes one cheap authenticated call per source and reports it; an unconfigured source says what is missing; with the feature off every command is refused",
             "key propagation hub → member (two real daemons) > [C5] keys set in Settings on the hub reach a member with the fleet's credential push (the OpenRouter key's path): stored in the member's env file, masked in its parts.sources, used by its tools; a push from an unknown hub is refused",
             "key propagation hub → member (two real daemons) > [C5] a key change on the hub triggers the fleet push (onRosterChanged), and a member's adoption is broadcast without pushing on",
-            "Acceptance: parts_fetch > [C5] parts_fetch never writes through a symlinked .anvil-browser"
+            "Acceptance: parts_fetch > [C5] parts_fetch never writes through a symlinked .anvil-browser",
+            "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] a vendor that echoes the keys and the Authorization header into result fields: the tool text carries none of them (raw or URL-encoded), and a link that carried one is dropped and cannot be fetched",
+            "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] the daily quota is counted in the daemon's state dir, so a restarted daemon (a new service over the same dir) does not get a fresh day",
+            "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] parts_fetch refuses a URL whose host is a fleet member (the FleetStore roster http.ts hands the supervisor), whatever it resolves to; nothing is fetched",
+            "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] neither parts tool is in allowedTools; the autonomy policy classifies parts_search as read-only (allowed by the hook without a prompt under the default policy) and parts_fetch as a write"
+          ]
+        },
+        {
+          "file": "test/unit/parts-block-list.test.ts",
+          "names": [
+            "block list: 6to4 and 198.18.0.0/15 > [C5] 6to4 (2002::/16) is refused — those embedding loopback, RFC 1918 or tailnet IPv4 name the embedded address, and one with a public IPv4 is refused too",
+            "block list: 6to4 and 198.18.0.0/15 > [C5] 198.18.0.0/15 is refused (plain and v4-mapped); its neighbours are not",
+            "block list: 6to4 and 198.18.0.0/15 > [C5] vetTarget (the proxy's and parts_fetch's check) refuses a 6to4 or 198.18/15 literal and a name that resolves to one"
           ]
         }
       ],

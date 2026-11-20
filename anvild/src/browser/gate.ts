@@ -7,8 +7,8 @@
  *   1. No network block running for this session → deny (fail closed).
  *   2. CLOSING (a refused page is still open) → only `browser_navigate` with the url written exactly
  *      `about:blank`, or `browser_close`, is allowed.
- *   3. Tool not in the closed table, `browser_run_code_unsafe`, `browser_evaluate`, or a `filename`
- *      argument that is absolute or has `..` → deny.
+ *   3. Tool not in the closed table, `browser_run_code_unsafe`, `browser_evaluate`, a `filename`
+ *      argument that is absolute or has `..`, or any `filename` on `browser_take_screenshot` → deny.
  *   4. A navigation target that is not a plain `http:`/`https:` URL in its normal form (or exactly
  *      `about:blank`) → deny. The string that is checked is the string that is forwarded.
  *   5. `browser_navigate_back` after the owner refused a page in this browser → deny (the history
@@ -56,6 +56,29 @@
  * upload, script and housekeeping calls on that page are hard-stopped as if they were on that site,
  * naming it (`BrowserActionInfo.embeddedSites`). Reads and navigations are not.
  *
+ * The session's own test daemon (C4 review, item 1) gets NO exemption from either rule: the agent
+ * wrote that page itself, so it is the least trusted page there is. The only differences are that its
+ * origin needs no site prompt, is never a logged-in site, and its own port is not in the traffic log;
+ * everything else it contacts — another site it moves itself to, a frame it embeds — counts exactly as
+ * on any other page (it has no "own site" whose traffic is ignored).
+ *
+ * A traffic log that overflowed (C4 review, item 2). The log is bounded; when entries since the
+ * navigation to the current page were dropped, Anvil no longer knows what that page loaded. Then the
+ * page is UNKNOWN for input (snapshot first, like any traffic since the last result), and after the
+ * snapshot every input-like call on it is hard-stopped as "unknown embedded content"
+ * (`TRAFFIC_LOST_SITE` in `embeddedSites`), naming that Anvil lost track, until a navigation to a page
+ * whose log is complete.
+ *
+ * Time (C4 review, item 4). Chrome can reuse an HTTPS tunnel it already holds, so a page can move
+ * itself to another page on a site it is already connected to without the proxy seeing anything new.
+ * So an input, upload or script call needs a result that said where the page is (the server's own page
+ * block — a snapshot's, or the previous call's) no more than `FRESH_PAGE_MS` (2 s) ago, and after the
+ * last `browser_wait_for` (a wait whose result carries no page block makes the page unknown for input).
+ * Otherwise the call is refused with "take a snapshot first". What remains: a page can still navigate
+ * by itself over a reused tunnel between that result and the input, within those 2 s (or while an
+ * owner's prompt for the call is open); the input's own result then reveals the new page, and the next
+ * call is decided on it.
+ *
  * `browser_close` is always allowed: it is the way out, in every state (C3 review, item 6).
  *
  * Deny. The daemon has no connection of its own to the browser, so it cannot navigate by itself, and
@@ -76,6 +99,11 @@ import { CHROME_ERROR_URL, checkNavigationInput, checkUrl, readPage, toolResultT
 import { classifyBrowserTool, filenameProblem, uploadPathProblem, uploadPaths, type BrowserToolClass } from "./tools";
 
 export const BLANK_URL = "about:blank";
+/** How recent the result that said where the page is must be for an input-like call (C4 review, item 4). */
+export const FRESH_PAGE_MS = 2000;
+/** What `trafficSince` reports when the bounded log no longer reaches back that far — and the name a
+ *  hard stop shows for what the page may have embedded then. Not a hostname: never on any list. */
+export const TRAFFIC_LOST_SITE = "(unknown embedded content: more connections than Anvil keeps track of)";
 
 export interface BrowserSessionState {
   /** Sites answered "Allow once" (or allowed by `bypass`) in this session. */
@@ -85,8 +113,11 @@ export interface BrowserSessionState {
   /** The current tab's address, as last established by a result. */
   currentUrl?: string;
   /** The current tab's address is NOT known: the last result that could have changed it did not say.
-   *  `navigation`: a call that changes the page. `input`: an input-class call. */
-  unknown?: "navigation" | "input" | "traffic";
+   *  `navigation`: a call that changes the page. `input`: an input-class call. `traffic`: the browser
+   *  contacted something since. `wait`: a `browser_wait_for` whose result had no page block. */
+  unknown?: "navigation" | "input" | "traffic" | "wait";
+  /** When (the gate's clock) the last result that said where the page is was read. */
+  establishedAt?: number;
   /** The proxy's traffic sequence when the last result established the page. */
   resultSeq?: number;
   /** The traffic sequence when the navigation that led to the current page began. */
@@ -166,6 +197,8 @@ export interface BrowserGateDeps {
    *  Undefined when Anvil did not start a browser for the session. */
   runtime: (sessionId: string) => { mode: BrowserMode; proxyRunning: boolean } | undefined;
   hooks: BrowserGateHooks;
+  /** Milliseconds, for the freshness rule (default `Date.now`; a test seam). */
+  clock?: () => number;
 }
 
 const SITE_SUGGESTIONS = (site: string): PermissionSuggestion[] => [
@@ -209,6 +242,7 @@ export class BrowserGate {
     st.resultSeq = undefined;
     st.pageSeq = undefined;
     st.navCallSeq = undefined;
+    st.establishedAt = undefined;
     st.hold = undefined;
     st.closing = undefined;
     st.unknown = undefined;
@@ -273,6 +307,10 @@ export class BrowserGate {
       return { kind: "deny", reason: `the page may have changed by itself: since the last result the browser contacted ${moved}. Call browser_snapshot first; no action runs until a snapshot says where the page is.` };
     }
 
+    // The page may have moved over a connection Chrome already held (C4 review, item 4).
+    const stale = this.staleForInput(ctx, st);
+    if (stale) return { kind: "deny", reason: `${stale}, and the page may have changed by itself since. Call browser_snapshot first, then make this call again.` };
+
     // What the call would get on its own merits. A call that is refused anyway never costs a prompt.
     const plan = this.plan(ctx, st, rt.mode);
     if (plan.verdict.kind === "deny") return plan.verdict;
@@ -284,7 +322,9 @@ export class BrowserGate {
         reason:
           st.unknown === "navigation"
             ? "Anvil does not know which page the browser is showing after the last call. Call browser_snapshot (or browser_tabs with action \"list\") first; nothing else runs until then."
-            : "the last action may have moved the page, and its result did not say where the page is. Call browser_snapshot first; no further action runs until then.",
+            : st.unknown === "wait"
+              ? "the page may have changed while browser_wait_for waited, and its result did not say where the page is. Call browser_snapshot first; no further action runs until then."
+              : "the last action may have moved the page, and its result did not say where the page is. Call browser_snapshot first; no further action runs until then.",
       };
     }
 
@@ -322,14 +362,36 @@ export class BrowserGate {
     if (ctx.tool === "browser_navigate" && ctx.input.url === BLANK_URL) return undefined; // the way out
     const cls = classifyBrowserTool(ctx.tool, ctx.input);
     if (!("cls" in cls) || cls.cls === "read") return undefined;
-    if (this.isOwn(ctx.session.id, st.currentUrl)) return undefined;
-    const here = this.currentSite(st);
-    const bad = this.trafficSince(ctx.session.id, st.resultSeq).filter((s) => s !== here && (this.isLocked(s) || !this.siteAllowed(st, s)));
+    // The session's own test daemon has no exemption (C4 review, item 1): only its own port is
+    // left out of the log, and it has no "own site" whose traffic is ignored.
+    const here = this.pageOwnSite(ctx.session.id, st);
+    const bad = this.trafficSince(ctx.session.id, st.resultSeq).filter((s) => s === TRAFFIC_LOST_SITE || (s !== here && (this.isLocked(s) || !this.siteAllowed(st, s))));
     if (!bad.length) return undefined;
     return bad
       .slice(0, 4)
-      .map((s) => (this.isLocked(s) ? `${s} (a locked logged-in site)` : `${s} (not allowed in this session)`))
+      .map((s) => (s === TRAFFIC_LOST_SITE ? "more connections than Anvil keeps track of (it lost track of what the page loaded)" : this.isLocked(s) ? `${s} (a locked logged-in site)` : `${s} (not allowed in this session)`))
       .join(", ");
+  }
+
+  /** The site whose traffic belongs to the page itself: the current page's site — none for the
+   *  session's own test daemon, whose own port never reaches the log. */
+  private pageOwnSite(sessionId: string, st: BrowserSessionState): string | undefined {
+    return this.isOwn(sessionId, st.currentUrl) ? undefined : this.currentSite(st);
+  }
+
+  /**
+   * Before an input, upload or script call (C4 review, item 4): why the last word on where the page
+   * is is too old to act on, or undefined. Needs a result with the server's page block no more than
+   * `FRESH_PAGE_MS` ago (a wait with no page block already made the page unknown).
+   */
+  private staleForInput(ctx: McpKindGateContext, st: BrowserSessionState): string | undefined {
+    if (st.currentUrl === undefined || st.unknown) return undefined; // no page yet, or already unknown
+    const cls = classifyBrowserTool(ctx.tool, ctx.input);
+    if (!("cls" in cls) || (cls.cls !== "input" && cls.cls !== "upload" && cls.cls !== "script")) return undefined;
+    const now = (this.deps.clock ?? Date.now)();
+    if (st.establishedAt !== undefined && now - st.establishedAt <= FRESH_PAGE_MS && now >= st.establishedAt) return undefined;
+    const ago = st.establishedAt === undefined ? undefined : Math.round((now - st.establishedAt) / 100) / 10;
+    return `the last result that said where the page is is ${ago === undefined ? "missing" : `${ago} s old`} (an action needs one from the last ${FRESH_PAGE_MS / 1000} s)`;
   }
 
   /** An allowed navigation-class call: the traffic from here on belongs to the page it leads to. */
@@ -341,11 +403,11 @@ export class BrowserGate {
 
   /** Whether this call is one that may run while the page's address is unknown: the calls whose
    *  result establishes it, the way out, and — after an input-class call only — any read. */
-  private establishesPage(ctx: McpKindGateContext, unknown: "navigation" | "input" | "traffic"): boolean {
+  private establishesPage(ctx: McpKindGateContext, unknown: NonNullable<BrowserSessionState["unknown"]>): boolean {
     if (ctx.tool === "browser_snapshot" || ctx.tool === "browser_close") return true;
     if (ctx.tool === "browser_tabs" && ctx.input.action === "list") return true;
     if (ctx.tool === "browser_navigate" && ctx.input.url === BLANK_URL) return true;
-    if (unknown === "input" || unknown === "traffic") {
+    if (unknown === "input" || unknown === "traffic" || unknown === "wait") {
       const cls = classifyBrowserTool(ctx.tool, ctx.input);
       return "cls" in cls && cls.cls === "read";
     }
@@ -356,6 +418,9 @@ export class BrowserGate {
   private plan(ctx: McpKindGateContext, st: BrowserSessionState, mode: BrowserMode): Plan {
     const cls = classifyBrowserTool(ctx.tool, ctx.input);
     if ("deny" in cls) return deny(cls.deny);
+    // A screenshot is only ever returned inline (C4 review, item 3): a file the agent could replace is
+    // never what a hard-stop card shows, so the screenshot tool is not asked to write one.
+    if (ctx.tool === "browser_take_screenshot" && ctx.input.filename !== undefined) return deny("browser_take_screenshot may not save to a file: call it without filename (the screenshot is returned to you inline)");
     const badName = filenameProblem(ctx.input);
     if (badName) return deny(`${ctx.tool}: ${badName}`);
     if (ctx.tool === "browser_run_code_unsafe") return deny("browser_run_code_unsafe is never allowed: it runs arbitrary code in the browser's server");
@@ -367,12 +432,16 @@ export class BrowserGate {
     const onOwn = this.isOwn(ctx.session.id, st.currentUrl);
     const shownSite = onOwn ? OWN_TEST_DAEMON_SITE : currentSite;
     // Locked logged-in sites this page has loaded something from (a frame, a widget): input-like calls
-    // are hard-stopped as if on them. Not for the session's own test daemon.
-    const embedded = onOwn || cls.cls === "read" || cls.cls === "navigation" ? [] : this.trafficSince(ctx.session.id, st.pageSeq).filter((s) => s !== currentSite && this.isLocked(s));
+    // are hard-stopped as if on them — on the session's own test daemon too (C4 review, item 1). When
+    // the log lost entries since the navigation here, what the page loaded is unknown (item 2).
+    const here = onOwn ? undefined : currentSite;
+    const embedded = cls.cls === "read" || cls.cls === "navigation" ? [] : this.trafficSince(ctx.session.id, st.pageSeq).filter((s) => s === TRAFFIC_LOST_SITE || (s !== here && this.isLocked(s)));
     const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(shownSite ? { currentSite: shownSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}), ...(embedded.length ? { embeddedSites: embedded } : {}) };
     const session = ctx.session;
 
     if (cls.cls === "script") {
+      // A script can reach into a frame (`ref` in it): never with a locked site's frame on the page.
+      if (embedded.length) return deny(`browser_evaluate is not allowed on a page that has loaded ${embedded.slice(0, 3).join(", ")}${embedded.includes(TRAFFIC_LOST_SITE) ? "" : " (a locked logged-in site)"}`);
       if (this.deps.hooks.allowEvaluate?.(info) === true) return { verdict: { kind: "allow", reason: "script evaluation on the session's own test daemon" } };
       return deny("browser_evaluate is only allowed on this session's own throwaway test daemon");
     }
@@ -529,10 +598,12 @@ export class BrowserGate {
     if (reading.kind === "none") {
       if (changesPage) st.unknown = "navigation";
       else if ("cls" in cls && (cls.cls === "input" || cls.cls === "upload" || cls.cls === "script")) st.unknown ??= "input";
+      else if (result.tool === "browser_wait_for") st.unknown ??= "wait"; // time passed with the page live
       return { purge: false };
     }
 
     st.unknown = undefined;
+    st.establishedAt = (this.deps.clock ?? Date.now)();
     // The traffic so far is accounted for by this result; traffic before the navigation that led here
     // belongs to an earlier page.
     const seq = this.deps.hooks.trafficSeq?.(sessionId);

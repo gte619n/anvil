@@ -18,14 +18,20 @@ import { refusedBash, refusedStatePath } from "./cad-protected";
 import { registerProtectedRule, type ProtectedRule } from "./protected";
 import { resolveToolPath, toolPathArg } from "./tool-paths";
 
-/** Daemon-written folders inside a worktree (compared case-insensitively, as tool-paths does). */
-const DAEMON_WORKTREE_DIRS = [".anvil-browser", ".anvil-downloads"];
+/** Daemon-written folders inside a worktree, and who writes them (compared case-insensitively). */
+const DAEMON_WORKTREE_DIRS: [string, string][] = [
+  [".anvil-browser", "the agent browser"],
+  [".anvil-downloads", "the download quarantine"],
+];
 
-/** Why `abs` is inside a daemon-written worktree folder, or undefined. */
-export function refusedDaemonFolder(abs: string): string | undefined {
-  const parts = abs.toLowerCase().split("/");
-  const hit = DAEMON_WORKTREE_DIRS.find((d) => parts.includes(d));
-  return hit ? `${hit}/ is written by the daemon's browser and its download quarantine; it is not a session's to edit` : undefined;
+/** Why a path (as written, or where it really lands) is inside a daemon-written worktree folder. */
+export function refusedDaemonFolder(...paths: string[]): string | undefined {
+  for (const p of paths) {
+    const parts = p.toLowerCase().split("/");
+    const hit = DAEMON_WORKTREE_DIRS.find(([d]) => parts.includes(d));
+    if (hit) return `${hit[0]}/ is written by ${hit[1]} only; the session's file tools may read it but not write in it`;
+  }
+  return undefined;
 }
 
 const FILE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -38,10 +44,12 @@ export function registerStateDirProtection(stateDir: string, writable: string[])
   const dirs: [string, string[]][] = [[stateDir, writable]];
   const rule: ProtectedRule = (ctx) => {
     if (FILE_TOOLS.has(ctx.tool)) {
-      const target = resolveToolPath(toolPathArg(ctx.input), ctx.cwd);
+      const raw = toolPathArg(ctx.input);
+      const target = resolveToolPath(raw, ctx.cwd);
       if (!target) return undefined;
       if (!target.ok) return { kind: "deny", reason: target.reason };
-      const why = refusedDaemonFolder(target.abs) ?? refusedStatePath(target.abs, ctx.cwd, dirs);
+      // The path as written and where it really lands (symlinks followed by the resolver).
+      const why = refusedDaemonFolder(String(raw), target.abs) ?? refusedStatePath(target.abs, ctx.cwd, dirs);
       return why ? { kind: "deny", reason: why } : undefined;
     }
     if (ctx.tool === "Bash") {

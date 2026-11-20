@@ -6,7 +6,7 @@
  * `X-DIGIKEY-Client-Id` + `Authorization: Bearer`. Terms: no database building or bulk download;
  * attribution. Limits: 120/min, 1000/day (client-side, `RateLimiter`).
  */
-import { DAY, MINUTE, RateLimiter } from "./ratelimit";
+import { DailyCounter, MINUTE, RateLimiter } from "./ratelimit";
 import { httpsUrl, modelFormat, vendorCall } from "./http";
 import { PartSourceError, type ConnectorDeps, type PartModelLink, type PartResult, type PartSearchOpts, type PartSource } from "./types";
 
@@ -39,7 +39,7 @@ export class DigiKeySource implements PartSource {
   tokenRequests = 0;
 
   constructor(private readonly deps: ConnectorDeps) {
-    this.limiter = new RateLimiter([{ limit: 120, perMs: MINUTE }, { limit: 1000, perMs: DAY }], deps.now);
+    this.limiter = new RateLimiter([{ limit: 120, perMs: MINUTE }], deps.now, { counter: deps.daily ?? new DailyCounter(undefined, deps.now), source: "digikey", limit: 1000 });
     this.tokenLimiter = new RateLimiter([{ limit: 30, perMs: MINUTE }], deps.now);
   }
 
@@ -53,7 +53,7 @@ export class DigiKeySource implements PartSource {
     if (!id || !secret) throw new PartSourceError("not-configured", `${LABEL} is not configured (client ID and secret)`);
     return { id, secret };
   }
-  private secrets(): string[] {
+  secrets(): string[] {
     const k = this.deps.keys();
     return [k.DIGIKEY_CLIENT_ID, k.DIGIKEY_CLIENT_SECRET, this.token?.value].filter((x): x is string => !!x);
   }

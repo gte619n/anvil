@@ -52,7 +52,7 @@ describe("state-dir protection for Track B and C state", () => {
     for (const path of [".anvil-browser/page.yml", join(repo, ".anvil-browser", "report.step"), "src/../.ANVIL-BROWSER/x.png", ".anvil-downloads/part.step"]) {
       const v = write(path, repo);
       expect(v?.kind).toBe("deny");
-      if (v?.kind === "deny") expect(v.reason).toContain("written by the daemon");
+      if (v?.kind === "deny") expect(v.reason).toMatch(/^\.anvil-(browser|downloads)\/ is written by the (agent browser|download quarantine) only/);
     }
     expect(protectedVerdict({ session, tool: "Edit", input: { file_path: ".anvil-browser/x", old_string: "a", new_string: "b" }, cwd: repo })?.kind).toBe("deny");
     expect(write("notes/anvil-browser.md", repo)).toBeUndefined();

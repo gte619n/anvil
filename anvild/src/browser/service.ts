@@ -7,7 +7,7 @@
  * are on. Without it nothing here exists: the preset is not registered (so `mcp.integration.add`
  * refuses the kind), no proxy listens and nothing is written.
  */
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { BrowserIntegrationInfo, McpHealth, McpIntegration, McpTransport, ServerEvent, ToolResultImage } from "@protocol";
@@ -18,7 +18,7 @@ import { isUnder, realish, resolveToolPath } from "../agent/tool-paths";
 import { resolveOnPath } from "../mcp/health";
 import { registerMcpPreset, type McpPreset, type McpPresetContext } from "../mcp/presets";
 import { DOWNLOADS_DIRNAME, downloadContext, downloadNotice, downloadsProtectedRule, outputDirProblem, parseDownloadLines, quarantineFile, requestedOutputFiles, sweepOutputDir, type DownloadOutcome } from "./downloads";
-import { BrowserGate, type BrowserGateHooks } from "./gate";
+import { BrowserGate, TRAFFIC_LOST_SITE, type BrowserGateHooks } from "./gate";
 import { makeHardStopPolicy } from "./hardstops";
 import { BROWSER_LOGGEDIN_FILE, LoggedInSitesService, runOwnerBrowser, type AgentBrowserLauncher, type AgentBrowserProcess } from "./loggedin";
 import {
@@ -92,6 +92,8 @@ export interface BrowserServiceDeps {
   hardStopTimeoutMs?: number;
   /** The per-file download limit (default 200 MB). */
   maxDownloadBytes?: number;
+  /** The browser gate's clock for its freshness rule (default `Date.now`; a test seam). */
+  pageClock?: () => number;
   // ── Phase C4 ──
   /** How the throwaway test daemon is built, started, probed and timed (test seams). */
   testDaemon?: Partial<TestDaemonSeams>;
@@ -186,35 +188,20 @@ interface Shot {
 const MAX_SHOT_BASE64 = 12 * 1024 * 1024;
 
 /**
- * The image in a `browser_take_screenshot` result (C3 review, item 2: never another tool's): an image
- * content block (the SDK's `source` shape or MCP's `data`/`mimeType` shape), or — when the server only
- * linked a file — the PNG/JPEG its own result links, and only when that file is a regular file (not a
- * link, one name only) directly inside this session's real output folder and was written after the
- * call began (`since`). A path merely mentioned in some text is never read.
+ * The image in a `browser_take_screenshot` result (C3 review, item 2: never another tool's): an INLINE
+ * image content block only (the SDK's `source` shape or MCP's `data`/`mimeType` shape). A file — even
+ * one the result links in the browser's own output folder — is never read (C4 review, item 3): the
+ * agent can replace a file between the server writing it and the daemon reading it, and the gate
+ * refuses `filename` on this tool, so the server always returns the picture inline.
  */
-export function resultImage(content: unknown, outputDir?: string, since?: number): { mediaType: string; dataBase64: string } | undefined {
-  if (Array.isArray(content)) {
-    for (const b of [...content].reverse() as Record<string, unknown>[]) {
-      if (!b || typeof b !== "object" || b.type !== "image") continue;
-      const src = b.source as { type?: unknown; media_type?: unknown; data?: unknown } | undefined;
-      const data = typeof b.data === "string" ? b.data : src?.type === "base64" && typeof src.data === "string" ? src.data : undefined;
-      const mediaType = typeof b.mimeType === "string" ? b.mimeType : typeof src?.media_type === "string" ? src.media_type : "image/png";
-      if (data && data.length <= MAX_SHOT_BASE64 && /^image\/(png|jpeg|webp)$/.test(mediaType)) return { mediaType, dataBase64: data };
-    }
-  }
-  if (!outputDir || since === undefined) return undefined;
-  for (const file of resultFileLinks(toolResultText(content))) {
-    try {
-      const ext = /\.(png|jpe?g)$/i.exec(file)?.[1]?.toLowerCase();
-      if (!ext) continue;
-      if (realpathSync(dirname(file)) !== realpathSync(outputDir)) continue;
-      const st = lstatSync(file);
-      if (!st.isFile() || st.isSymbolicLink() || st.nlink > 1 || st.size > (MAX_SHOT_BASE64 * 3) / 4) continue;
-      if (st.mtimeMs < since - 5) continue; // there before the call: not this screenshot
-      return { mediaType: ext === "png" ? "image/png" : "image/jpeg", dataBase64: readFileSync(file).toString("base64") };
-    } catch {
-      /* not there, or not readable */
-    }
+export function resultImage(content: unknown): { mediaType: string; dataBase64: string } | undefined {
+  if (!Array.isArray(content)) return undefined;
+  for (const b of [...content].reverse() as Record<string, unknown>[]) {
+    if (!b || typeof b !== "object" || b.type !== "image") continue;
+    const src = b.source as { type?: unknown; media_type?: unknown; data?: unknown } | undefined;
+    const data = typeof b.data === "string" ? b.data : src?.type === "base64" && typeof src.data === "string" ? src.data : undefined;
+    const mediaType = typeof b.mimeType === "string" ? b.mimeType : typeof src?.media_type === "string" ? src.media_type : "image/png";
+    if (data && data.length <= MAX_SHOT_BASE64 && /^image\/(png|jpeg|webp)$/.test(mediaType)) return { mediaType, dataBase64: data };
   }
   return undefined;
 }
@@ -327,8 +314,6 @@ export class BrowserService {
   /** Per session: entries up to this sequence were dropped (the log is bounded). */
   private readonly trafficDropped = new Map<string, number>();
   private trafficCounter = 0;
-  /** When each session's last `browser_take_screenshot` call was allowed (its file must be newer). */
-  private readonly shotCallAt = new Map<string, number>();
 
   constructor(private readonly deps: BrowserServiceDeps) {
     this.sites = new AllowedSitesService({ stateDir: deps.stateDir, broadcast: deps.broadcast, clock: deps.clock, fetchImpl: deps.fetchImpl, intervalMs: deps.sitesIntervalMs });
@@ -357,6 +342,7 @@ export class BrowserService {
         return rt ? { mode: rt.mode, proxyRunning: this.proxies.running(sessionId) } : undefined;
       },
       hooks: this.hooks,
+      ...(deps.pageClock ? { clock: deps.pageClock } : {}),
     });
     // Phase C3 fills the hooks Phase C2 left open.
     this.loggedIn = new LoggedInSitesService({ stateDir: deps.stateDir, broadcast: deps.broadcast, clock: deps.clock, fetchImpl: deps.fetchImpl, intervalMs: deps.sitesIntervalMs });
@@ -537,10 +523,11 @@ export class BrowserService {
   }
 
   /** The sites the session's browser contacted after `seq` (each once). When the bounded log no
-   *  longer reaches back that far, an unknown site is reported, so the caller fails closed. */
+   *  longer reaches back that far, `TRAFFIC_LOST_SITE` is reported too, and the gate fails closed on it
+   *  (C4 review, item 2). */
   trafficSince(sessionId: string, seq: number): string[] {
     const out = new Set<string>();
-    if ((this.trafficDropped.get(sessionId) ?? 0) > seq) out.add("(more traffic than Anvil keeps)");
+    if ((this.trafficDropped.get(sessionId) ?? 0) > seq) out.add(TRAFFIC_LOST_SITE);
     for (const e of this.traffic.get(sessionId) ?? []) if (e.seq > seq) out.add(e.site);
     return [...out];
   }
@@ -583,9 +570,9 @@ export class BrowserService {
   private noteShot(sessionId: string, rt: Runtime | undefined, result: Parameters<BrowserGate["onResult"]>[1]): void {
     const cls = classifyBrowserTool(result.tool, result.input);
     const read = "cls" in cls && cls.cls === "read";
-    // Only browser_take_screenshot's own result is a picture of the page (C3 review, item 2).
-    const outDir = rt && !outputDirProblem(rt.worktree) ? join(rt.worktree, BROWSER_OUTPUT_DIRNAME) : undefined;
-    const image = result.tool === "browser_take_screenshot" && !result.isError ? resultImage(result.content, outDir, this.shotCallAt.get(sessionId)) : undefined;
+    // Only browser_take_screenshot's own inline image is a picture of the page (C3 review item 2,
+    // C4 review item 3).
+    const image = result.tool === "browser_take_screenshot" && !result.isError ? resultImage(result.content) : undefined;
     if (image) this.shots.set(sessionId, { ...image, url: this.gate.state(sessionId).currentUrl, stale: false, seq: this.trafficCounter });
     else if (!read) {
       // A click, a key, a navigation, a resize…: whatever was photographed may look different now.
@@ -778,7 +765,6 @@ export class BrowserService {
     if (this.ownerBrowser) return { kind: "deny", reason: "the agent browser is in use by the owner (Open agent browser); it is free again when that Chrome window is closed" };
     const verdict = this.gate.gate(ctx);
     if (verdict?.kind !== "deny") this.retireOtherHeadedBrowsers(ctx.session.id);
-    if (verdict?.kind === "allow" && ctx.tool === "browser_take_screenshot") this.shotCallAt.set(ctx.session.id, Date.now());
     return this.withDownloadReport(ctx.session.id, this.withRefusals(ctx.session.id, verdict));
   };
 
@@ -865,7 +851,6 @@ export class BrowserService {
     this.gate.forget(sessionId);
     this.refusals.delete(sessionId);
     this.shots.delete(sessionId);
-    this.shotCallAt.delete(sessionId);
     this.traffic.delete(sessionId);
     this.trafficDropped.delete(sessionId);
     this.requested.delete(sessionId);
@@ -921,6 +906,8 @@ export class BrowserService {
       if (!r) continue;
       if (!r.ok) return { kind: "deny", reason: r.reason };
       if (guarded.some((p) => isUnder(r.abs, realish(p)))) return { kind: "deny", reason };
+      // `.anvil-browser/` (the browser's output folder, C4 review item 3) is denied to the file tools
+      // by the ONE state-folder rule (agent/state-protected.ts), registered with the browser feature.
     }
     return undefined;
   };
