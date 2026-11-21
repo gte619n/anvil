@@ -43,18 +43,20 @@ const fake = (repo: string, extraEnv: Record<string, string> = {}, spawn = recor
 function recordingManager() {
   const requests: any[] = [];
   const guards: ((slot: any) => Promise<string | undefined>)[] = [];
+  const afters: ((slot: any, done: any) => Promise<string | undefined>)[] = [];
   const manager = {
     open: async () => ({ notes: [], reloaded: false, waitedForSlot: false, state: { status: "unverified", featureErrors: [], featureWarnings: [], conflict: false }, params: [], hasDesign: false }),
     request: async (_ref: unknown, req: any) => {
-      // The reference guard (`before`) runs in the real manager's slot; recorded apart from the request.
-      const { before, ...rest } = req;
+      // The reference guard (`before`, `after`) runs in the real manager's slot; recorded apart from the request.
+      const { before, after, ...rest } = req;
       if (before) guards.push(before);
+      if (after) afters.push(after);
       requests.push(rest);
       return { result: { isError: false, content: [{ type: "text", text: "{}" }], texts: ["{}"], text: "{}", json: {}, images: [] }, notes: [], reloaded: false, waitedForSlot: false, wrote: false, state: { status: "unverified", featureErrors: [], featureWarnings: [], conflict: false } };
     },
     status: () => undefined,
   } as unknown as CadManager;
-  return { manager, requests, guards };
+  return { manager, requests, guards, afters };
 }
 
 describe("anvil_cad names and permission classes", () => {
@@ -461,7 +463,9 @@ describe("anvil_cad tools", () => {
     const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
     await tools.open_part!({ part: "plate" });
     const answer = (json: unknown, isError = false) => ({ isError, content: [], texts: [], text: isError ? "boom" : "", json, images: [] });
-    const slot = (listOk = true, imports: number | undefined = 1) => ({ imports: () => imports, call: async (tool: string, args: any) => (tool === "inspect_design" ? answer(design) : args?.command === "component.list" ? (listOk ? answer(list) : answer(undefined, true)) : answer({})) });
+    // inspect.measure answers each reference body as the real build does (the guard measures them before and after).
+    const measured = (names: string[]) => ({ bodies: names.map((name) => ({ name, volume_mm3: 1000, bbox: { min: [100, 0, 0], max: [110, 10, 10] }, faces: 6, center_of_mass: [105, 5, 5] })) });
+    const slot = (listOk = true, imports: number | undefined = 1) => ({ imports: () => imports, call: async (tool: string, args: any) => (tool === "inspect_design" ? answer(design) : args?.command === "component.list" ? (listOk ? answer(list) : answer(undefined, true)) : args?.command === "inspect.measure" ? answer(measured(args.params.bodies)) : answer({})) });
     await tools.execute!({ command: "occurrence.ground", params: { occurrence: "innocent:1", grounded: false } });
     expect(await guards.at(-1)!(slot())).toContain("may not change the reference ref-far.step");
     await tools.batch!({ commands: [BOX(), { command: "occurrence.move", params: { occurrence: 8, translate: [1000, 0, 0] } }] });
@@ -473,6 +477,94 @@ describe("anvil_cad tools", () => {
     expect(await guards.at(-1)!(slot(false, 0))).toBeUndefined(); // no import in the timeline: nothing to read, nothing is a reference
     await tools.execute!({ command: "component.rename", params: { component: "Bracket", name: "ref-bracket" } });
     expect(await guards.at(-1)!(slot(false, 0))).toContain('names starting with "ref-" belong to imported references');
+  });
+
+  test("[A4] veto: a timeline command on a reference's import is refused by its name or id (suppress, delete, reorder, edit, redefine, rename, folder moves), and so is a history-marker move before it (roll_to / rollback by position or by feature, or a position that cannot be told); occurrence.align by `paths` and every other placement-path key of occurrence.* / component.* names the reference by id", () => {
+    const occ = { component: 7, grounded: true, id: 8, name: "ref-far.step:1", parent: 0, transform: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]] };
+    const list = { active: 0, components: [{ bodies: ["Body1"], children: [occ], features: ["Plate", "Fillet1"], id: 0, name: "Untitled", occurrences: [] }, { bodies: ["far"], children: [], features: ["ref-far.step"], id: 7, name: "ref-far.step", occurrences: [occ] }], pending_moves: [] };
+    const timeline = [{ id: 1, name: "Plate", type: "BoxFeature" }, { id: 4, name: "ref-far.step", type: "BaseFeature" }, { id: 5, name: "Fillet1", type: "FilletFeature" }];
+    const bodies = [{ feature: 1, name: "Body1" }, { feature: 4, name: "far" }];
+    const t = referenceTargets(liveReferences(readComponentList(list), timeline, bodies), (r) => r.imports[0] ?? r.name, timeline);
+    expect(t.importsEnd).toBe(2);
+    const imp = "may not change the import of the reference ref-far.step";
+    const marker = "may not move the history marker before the import of a reference (keep at least 2 features active)";
+    for (const [command, params, why] of [
+      ["timeline.suppress", { feature: 4 }, imp],
+      ["timeline.suppress", { features: [5, 4], suppressed: true }, imp],
+      ["timeline.delete", { feature: " REF-far.step" }, imp],
+      ["timeline.reorder", { feature: 4, position: 2, active: false }, imp],
+      ["timeline.reorder_many", { features: [4], position: 0 }, imp],
+      ["timeline.move_many", { features: [4], position: 3 }, imp],
+      ["timeline.edit", { feature: 4, set: { name: "x" } }, imp],
+      ["timeline.redefine", { feature: 4, command: "solid.box", params: {} }, imp],
+      ["timeline.rename", { feature: 4, name: "innocent" }, imp],
+      ["timeline.move_to_group", { features: [4], group: 9 }, imp],
+      ["timeline.roll_to", { feature: "ref-far.step" }, imp], // naming the import at all is refused, even where it would keep it
+      ["timeline.roll_to", { position: 1 }, marker],
+      ["timeline.rollback", { position: 0 }, marker],
+      ["timeline.roll_to", { feature: "Plate" }, marker],
+      ["timeline.roll_to", { feature: 1 }, marker],
+      ["timeline.rollback", { position: "1" }, "where the history marker would go cannot be told"],
+      ["occurrence.align", { paths: [[8]], from: [0, 0, 0], to: [0, 0, 100], move_grounded: true }, "`occurrence.align` may not change the reference ref-far.step"],
+      ["occurrence.align", { occurrence_paths: [[8]], to: [0, 0, 1] }, "may not change the reference ref-far.step"],
+      ["component.copy_bodies", { bodies: ["Body1"], component_path: [8] }, "may not change the reference ref-far.step"],
+      ["occurrence.reparent", { occurrence: "Bracket:1", parent: 0, parent_paths: [[8]] }, "may not change the reference ref-far.step"],
+    ] as [string, Record<string, unknown>, string][]) {
+      expect(refusedReferenceChange(command, params, t)).toContain(why);
+    }
+    // What leaves the import as it is passes: the marker kept after it, other features, reads.
+    for (const [command, params] of [
+      ["timeline.roll_to", { position: 2 }],
+      ["timeline.roll_to", { position: "end" }],
+      ["timeline.rollback", {}],
+      ["timeline.suppress", { feature: 5 }],
+      ["timeline.reorder", { feature: 5, position: 0 }],
+      ["timeline.inspect", { feature: 4 }],
+      ["timeline.dependents", { feature: "ref-far.step" }],
+    ] as [string, Record<string, unknown>][])
+      expect(refusedReferenceChange(command, params, t)).toBeUndefined();
+    // A design with no import: the timeline is the design's own.
+    const none = referenceTargets([], undefined, [{ id: 1, name: "Plate", type: "BoxFeature" }]);
+    expect(refusedReferenceChange("timeline.rollback", { position: 0 }, none)).toBeUndefined();
+  });
+
+  test("[A4] veto: after execute or batch ran, the guard refuses it when SolidCraft's reply lists a reference body under changed_bodies or removed_bodies (any batch step), when an import was deleted, suppressed or rolled back, or when a reference measures differently than just before (a move by placement path); otherwise it stands", async () => {
+    const occ = { component: 7, grounded: true, id: 8, name: "ref-far.step:1", parent: 0, transform: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]] };
+    const list = { active: 0, components: [{ bodies: ["Body1"], children: [occ], features: ["Plate"], id: 0, name: "Untitled", occurrences: [] }, { bodies: ["far"], children: [], features: ["ref-far.step"], id: 7, name: "ref-far.step", occurrences: [occ] }], pending_moves: [] };
+    const design = (imp: Record<string, unknown> | null = { id: 4, name: "ref-far.step", type: "BaseFeature" }) => ({ timeline: [{ id: 1, name: "Plate", type: "BoxFeature" }, ...(imp ? [imp] : [])], bodies: [{ feature: 1, name: "Body1" }, ...(imp && !imp.suppressed && !imp.rolled_back ? [{ feature: 4, name: "far" }] : [])] });
+    const far = (z = 0, volume = 1000) => ({ bodies: [{ name: "far", volume_mm3: volume, bbox: { min: [100, 0, z], max: [110, 10, z + 10] }, faces: 6, center_of_mass: [105, 5, z + 5] }] });
+    const answer = (json: unknown, isError = false) => ({ isError, content: [], texts: [], text: isError ? "boom" : "", json, images: [] });
+    // A slot whose design is `now()` and whose reference measures `measured()` — read again on every call.
+    const slot = (state: { design: any; measured: any }) => ({
+      imports: () => 1,
+      call: async (tool: string, args: any) => (tool === "inspect_design" ? answer(state.design) : args?.command === "component.list" ? answer(list) : args?.command === "inspect.measure" ? (state.measured ? answer(state.measured) : answer(undefined, true)) : answer({})),
+    });
+    const run = async (steps: { command: string; params?: Record<string, unknown> }[], reply: unknown, after: { design: any; measured: any }) => {
+      const { manager, guards, afters } = recordingManager();
+      const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
+      await tools.open_part!({ part: "plate" });
+      if (steps.length === 1) await tools.execute!(steps[0]!);
+      else await tools.batch!({ commands: steps });
+      const state = { design: design(), measured: far() };
+      expect(await guards.at(-1)!(slot(state))).toBeUndefined();
+      Object.assign(state, after);
+      return afters.at(-1)!(slot(state), { result: answer(reply), wrote: true });
+    };
+    const offset = { command: "solid.offset_face", params: { faces: [[105, 5, 10]], distance: "-5" } };
+    // SolidCraft's own reply names the body, whatever selected it.
+    expect(await run([offset], { changed_bodies: ["far"], removed_bodies: [] }, { design: design(), measured: far(0, 500) })).toBe(
+      "`solid.offset_face` changed the reference ref-far.step (SolidCraft reports changed_bodies far; it does not match what was imported: volume 1000 → 500 mm³): a reference stays as import_reference imported it — model the part around it, and re-import it to change it",
+    );
+    expect(await run([BOX(), offset], { results: [{ changed_bodies: [], created_bodies: ["Box"] }, { changed_bodies: ["far"] }] }, { design: design(), measured: far() })).toStartWith("this batch changed the reference ref-far.step (SolidCraft reports changed_bodies far)");
+    expect(await run([{ command: "solid.combine", params: { target: "Body1", tools: ["Body1"] } }], { removed_bodies: ["far"] }, { design: design(), measured: far() })).toContain("SolidCraft reports removed_bodies far");
+    // The timeline: deleted, suppressed (a folder), rolled back.
+    expect(await run([{ command: "timeline.delete", params: { groups: [9] } }], { deleted: [4] }, { design: design(null), measured: undefined })).toContain("the import ref-far.step was deleted");
+    expect(await run([{ command: "timeline.suppress", params: { groups: [9] } }], { suppressed: true }, { design: design({ id: 4, name: "ref-far.step", type: "BaseFeature", suppressed: true }), measured: undefined })).toContain("the import ref-far.step was suppressed");
+    expect(await run([{ command: "timeline.move_many", params: { groups: [9], position: 0, active: false } }], {}, { design: design({ id: 4, name: "ref-far.step", type: "BaseFeature", rolled_back: true }), measured: undefined })).toContain("the history marker was moved before the import ref-far.step");
+    // No reply field, no timeline change — only the geometry says it moved.
+    expect(await run([{ command: "occurrence.align", params: { occurrence: "Body1", to: [0, 0, 0] } }], { occurrences: [8], pending: false }, { design: design(), measured: far(100) })).toContain("bounding box [100, 0, 0]…[110, 10, 10] → [100, 0, 100]…[110, 10, 110]");
+    // Nothing of the reference changed: it stands.
+    expect(await run([BOX()], { changed_bodies: [], created_bodies: ["Box"], removed_bodies: [] }, { design: design(), measured: far() })).toBeUndefined();
   });
 
   test("[A1] execute and batch are default-deny: only allow-listed command ids run, and a new unknown id is refused", async () => {

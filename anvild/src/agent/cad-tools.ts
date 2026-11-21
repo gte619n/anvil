@@ -29,11 +29,11 @@ import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type Sdk
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { advisoryLines, failingLines, type GateResult } from "../cadwork/gate";
-import type { CadManager, CadReply, PartState } from "../cadwork/manager";
+import type { CadManager, CadReply, CadRequest, PartState } from "../cadwork/manager";
 import type { McpToolResult } from "../cadwork/mcp-client";
 import { EXPORTS_DIR, listParts, partRef, type PartRef } from "../cadwork/partfolder";
 import { DESIGN_FILE } from "../cadwork/poststep";
-import { liveReferences, readComponentList } from "../cadwork/refs";
+import { liveReferences, readComponentList, readReferenceMeasures, referenceDifferences, REFERENCE_RESHAPED, type ReferenceBodyMeasure } from "../cadwork/refs";
 import type { SlotContext } from "../cadwork/manager";
 import { referenceTargets, refusedReferenceChange, refusedStep } from "./cad-command-allow";
 import { CAD_MCP_SERVER_NAME } from "./cad-tool-ids";
@@ -172,42 +172,100 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind: "read" }));
     });
   /** A MODELING call: refused on a dimensioned part that has no expectations yet (spec §4.5). */
-  const mutate = (name: string, args: Record<string, unknown>, kind: "mutate" | "undo" | "redo" = "mutate", modeling = true, before?: (slot: SlotContext) => Promise<string | undefined>) =>
+  const mutate = (name: string, args: Record<string, unknown>, kind: "mutate" | "undo" | "redo" = "mutate", modeling = true, guard?: Pick<CadRequest, "before" | "after">) =>
     guarded(async () => {
       const ref = selected();
       if (modeling) {
         const refused = deps.modelingRefusal(ref);
         if (refused) return fail(refused);
       }
-      return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind, ...(before ? { before } : {}) }));
+      return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind, ...(guard?.before ? { before: guard.before } : {}), ...(guard?.after ? { after: guard.after } : {}) }));
     });
   /**
-   * The reference check for execute / batch, run in the request's own queue slot just before it is
-   * sent: the references are read from the LIVE design (`component.list` + the timeline — a component
-   * an import made, whatever it is called now), and any step that names one is refused. Fails closed:
-   * a design whose components cannot be read sends nothing.
+   * The reference check for execute / batch, run in the request's own queue slot.
+   *
+   * BEFORE it is sent: the references are read from the LIVE design (`component.list` + the timeline —
+   * a component an import made, whatever it is called now), and any step that names one is refused,
+   * as is a timeline command on an import or a marker move before one. Fails closed: a design whose
+   * components cannot be read sends nothing.
+   *
+   * AFTER it ran, whatever it named: if SolidCraft's reply lists a reference body under
+   * `changed_bodies` or `removed_bodies` (every `results[]` entry of a batch), if an import is gone,
+   * `suppressed` or `rolled_back` in the timeline, or if a reference no longer measures what it did
+   * just before (volume, world bounding box, faces, centre of mass) — a face picked by a POINT, an
+   * align by placement path, a folder suppressed — the request is undone at once (the manager's
+   * one-request undo; it cannot be redone) and refused.
    */
-  const referenceGuard = (steps: { command: unknown; params?: unknown }[]) => async (slot: SlotContext): Promise<string | undefined> => {
-    let targets = referenceTargets([]);
-    // No import in the timeline (the manager's snapshot after the last change): nothing to read.
-    if (slot.imports() !== 0) {
-      try {
-        const d = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: true });
-        if (d.isError || !d.json) throw new Error(d.text.slice(0, 200) || "inspect_design failed");
-        const timeline: any[] = Array.isArray(d.json.timeline) ? d.json.timeline : [];
-        const bodies: any[] = Array.isArray(d.json.bodies) ? d.json.bodies : [];
-        const l = await slot.call("execute", { command: "component.list", params: {} });
-        if (l.isError || !l.json) throw new Error(l.text.slice(0, 200) || "component.list failed");
-        targets = referenceTargets(liveReferences(readComponentList(l.json), timeline, bodies), (r) => r.imports[0] ?? r.name);
-      } catch (e) {
-        return `the design's references could not be read (${e instanceof Error ? e.message : String(e)}), so nothing was sent`;
+  const referenceGuard = (steps: { command: unknown; params?: unknown }[]) => {
+    let pre: { label: string; bodies: string[]; imports: { id: unknown; label: string }[]; measured: ReferenceBodyMeasure[] } | undefined;
+    const readDesign = async (slot: SlotContext) => {
+      const d = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: true });
+      if (d.isError || !d.json) throw new Error(d.text.slice(0, 200) || "inspect_design failed");
+      return { timeline: (Array.isArray(d.json.timeline) ? d.json.timeline : []) as any[], bodies: (Array.isArray(d.json.bodies) ? d.json.bodies : []) as any[] };
+    };
+    const measure = async (slot: SlotContext, bodies: string[]): Promise<ReferenceBodyMeasure[]> => {
+      const m = await slot.call("execute", { command: "inspect.measure", params: { bodies } });
+      if (m.isError) throw new Error(m.text.slice(0, 200) || "inspect.measure failed");
+      return readReferenceMeasures(m.json, bodies);
+    };
+    const before = async (slot: SlotContext): Promise<string | undefined> => {
+      pre = undefined;
+      let targets = referenceTargets([]);
+      // No import in the timeline (the manager's snapshot after the last change): nothing to read.
+      if (slot.imports() !== 0) {
+        try {
+          const { timeline, bodies } = await readDesign(slot);
+          const l = await slot.call("execute", { command: "component.list", params: {} });
+          if (l.isError || !l.json) throw new Error(l.text.slice(0, 200) || "component.list failed");
+          const live = liveReferences(readComponentList(l.json), timeline, bodies);
+          const label = (r: (typeof live)[number]) => r.imports[0] ?? r.name;
+          targets = referenceTargets(live, label, timeline);
+          const refBodies = [...new Set(live.flatMap((r) => r.bodies))];
+          const imports = timeline.filter((f) => f?.type === "BaseFeature" && !f.suppressed && !f.rolled_back).map((f) => ({ id: f.id, label: targets.features.get(f.id) ?? String(f.name ?? f.id) }));
+          if (refBodies.length || imports.length) pre = { label: live.map(label).join(", "), bodies: refBodies, imports, measured: refBodies.length ? await measure(slot, refBodies) : [] };
+        } catch (e) {
+          return `the design's references could not be read (${e instanceof Error ? e.message : String(e)}), so nothing was sent`;
+        }
       }
-    }
-    for (const [i, step] of steps.entries()) {
-      const why = refusedReferenceChange(step.command, step.params, targets);
-      if (why) return steps.length > 1 ? `step ${i + 1}: ${why}` : why;
-    }
-    return undefined;
+      for (const [i, step] of steps.entries()) {
+        const why = refusedReferenceChange(step.command, step.params, targets);
+        if (why) return steps.length > 1 ? `step ${i + 1}: ${why}` : why;
+      }
+      return undefined;
+    };
+    const after = async (slot: SlotContext, done: { result: McpToolResult }): Promise<string | undefined> => {
+      const was = pre;
+      pre = undefined;
+      if (!was) return undefined;
+      const problems: string[] = [];
+      const j = done.result.json;
+      const replies: any[] = Array.isArray(j?.results) ? j.results : j && typeof j === "object" ? [j] : [];
+      for (const key of ["changed_bodies", "removed_bodies"] as const) {
+        const hit = [...new Set(replies.flatMap((r) => (Array.isArray(r?.[key]) ? r[key].map(String) : [])).filter((b: string) => was.bodies.includes(b)))];
+        if (hit.length) problems.push(`SolidCraft reports ${key} ${hit.join(", ")}`);
+      }
+      const { timeline } = await readDesign(slot);
+      for (const imp of was.imports) {
+        const f = timeline.find((x) => x?.id === imp.id);
+        if (!f) problems.push(`the import ${imp.label} was deleted`);
+        else if (f.suppressed) problems.push(`the import ${imp.label} was suppressed`);
+        else if (f.rolled_back) problems.push(`the history marker was moved before the import ${imp.label}`);
+      }
+      if (was.bodies.length) {
+        let now: ReferenceBodyMeasure[] | undefined;
+        try {
+          now = await measure(slot, was.bodies);
+        } catch (e) {
+          problems.push(`the reference bodies can no longer be measured (${e instanceof Error ? e.message : String(e)})`);
+        }
+        const diffs = now ? referenceDifferences(was.measured, now) : [];
+        if (diffs.length) problems.push(`it ${REFERENCE_RESHAPED}: ${diffs.join("; ")}`);
+      }
+      if (!problems.length) return undefined;
+      const what = steps.length === 1 ? `\`${String(steps[0]!.command)}\`` : "this batch";
+      return `${what} changed the reference ${was.label} (${problems.join("; ")}): a reference stays as import_reference imported it — model the part around it, and re-import it to change it`;
+    };
+    return { before, after };
   };
   /** Drop keys the agent may not set (paths), and undefined ones. */
   const clean = (args: Record<string, unknown>, drop: string[] = []): Record<string, unknown> =>

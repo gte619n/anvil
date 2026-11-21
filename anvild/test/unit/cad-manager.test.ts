@@ -725,6 +725,51 @@ describe("cad manager", () => {
     expect(design(ref).commands.some((c: any) => JSON.stringify(c).includes('"W":"60"'))).toBe(false);
   });
 
+  test("[A4] veto: a mutate request whose `after` hook objects is UNDONE as one agent request (a whole batch), cannot be redone, and replies with the reason; a hook that throws objects too; a request that kept nothing undoes nothing", async () => {
+    const repo = tempRepo();
+    const m = fakeManager();
+    const ref = partRef(repo, "plate");
+    const redo = () => m.request(ref, { tool: "redo", kind: "redo" });
+    const param = (n: string) => m.status(ref)!.params.find((p) => p.name === n)!.value;
+    await m.request(ref, { tool: "batch", args: { commands: REFERENCE_PLATE, verbose: false }, kind: "mutate" });
+    await exec(m, ref, "parameters.change", { changes: { L: "120" } }); // the agent's own earlier request stays
+    const script = designBytes(ref);
+    const seen: { isError?: boolean; wrote: boolean }[] = [];
+    const objecting = async (_slot: unknown, done: { result: { isError?: boolean }; wrote: boolean }) => {
+      seen.push({ isError: done.result.isError, wrote: done.wrote });
+      return "it changed the reference far.step";
+    };
+    const r = await m.request(ref, {
+      tool: "batch",
+      args: { commands: [{ command: "parameters.change", params: { changes: { W: "60" } } }, { command: "parameters.change", params: { changes: { T: "8" } } }], verbose: false },
+      kind: "mutate",
+      after: objecting,
+    });
+    expect(seen).toEqual([{ isError: false, wrote: true }]); // the hook saw the change made and written
+    expect(r.result.isError).toBe(true);
+    expect(r.result.text).toBe("it changed the reference far.step. It was undone: the design and design.json are as they were before it, and it cannot be redone.");
+    expect(r.wrote).toBe(false);
+    expect(param("W")).toBe(50);
+    expect(param("T")).toBe(6);
+    expect(param("L")).toBe(120);
+    expect(designBytes(ref)).toBe(script);
+    expect((await redo()).result.text).toBe("nothing to redo");
+    expect(param("W")).toBe(50);
+    // A hook that throws is an objection (fail closed).
+    const t = await m.request(ref, { tool: "execute", args: { command: "parameters.change", params: { changes: { W: "70" } } }, kind: "mutate", after: async () => { throw new Error("unreadable"); } });
+    expect(t.result.text).toStartWith("what the request did could not be checked (unreadable)");
+    expect(param("W")).toBe(50);
+    // A request that failed and kept nothing: nothing is undone (the agent's earlier L=120 stays).
+    const f = await m.request(ref, { tool: "execute", args: { command: "parameters.change", params: { changes: { Nope: "1" } } }, kind: "mutate", after: objecting });
+    expect(f.result.text).toBe("it changed the reference far.step. Nothing of it was kept.");
+    expect(param("L")).toBe(120);
+    expect(designBytes(ref)).toBe(script);
+    // No objection: the request stands.
+    const ok = await m.request(ref, { tool: "execute", args: { command: "parameters.change", params: { changes: { W: "55" } } }, kind: "mutate", after: async () => undefined });
+    expect(ok.result.isError).toBeFalsy();
+    expect(param("W")).toBe(55);
+  });
+
   test("[A4] re-review: a read sent through execute after a rollback (inspect.measure, inspect.interference) keeps SolidCraft's redo history, so the ceiling stays: redo is 'nothing to redo' and design.json is unchanged; a real change clears both", async () => {
     const repo = tempRepo();
     const m = fakeManager();

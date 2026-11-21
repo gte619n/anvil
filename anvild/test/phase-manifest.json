@@ -541,7 +541,10 @@
             "references stay where they were imported; every design placement is measured > [A4] veto: a placement's world transform follows its parents (column-major); a parent placed twice cannot be told and counts as moved",
             "references stay where they were imported; every design placement is measured > [A4] veto: un-grounded and moved 1000 mm away is a hard fail 'reference far.step was moved from where it was imported' and '…is not grounded'; a pending move, a turn and a feature in its component fail too; identity, grounded passes",
             "references stay where they were imported; every design placement is measured > [A4] veto: the reference gate fails a moved reference (shared by refresh and verify), and a script feature naming a reference body ('Move1' of far) fails 'reference far.step is changed by feature Move1'",
-            "references stay where they were imported; every design placement is measured > [A4] veto: a design body placed more than once is a hard fail 'body Body2 is placed 2 times; a design body may be placed once'; placed once passes"
+            "references stay where they were imported; every design placement is measured > [A4] veto: a design body placed more than once is a hard fail 'body Body2 is placed 2 times; a design body may be placed once'; placed once passes",
+            "a reference measures what its import did > [A4] veto: a reference body's measure is read from inspect.measure (volume, WORLD bounding box, faces, centre of mass) in the order asked, and any other answer throws; differences are named within 1e-6 of its size",
+            "a reference measures what its import did > [A4] veto: the geometry check holds each byte-checked reference to the lock store's record of its import (same STEP text), else to a replay of the import alone; reshaped, moved or gone fails; a record for other text on a part with expectations, an unreadable record, no replay, a failed replay and an unmeasurable reference are unverified",
+            "a reference measures what its import did > [A4] veto: the replay imports ONLY the reference's STEP text, in a throwaway process allowed nothing but its own temp folder, and measures what file.insert_step made; one process per binary and text (cached); no binary is an error"
           ]
         },
         {
@@ -624,14 +627,17 @@
           "file": "test/unit/cad-manager.test.ts",
           "names": [
             "cad manager > [A4] re-review: after a daemon rollback (slot.revert) the agent can undo its own request and redo it back, but redo never brings back the rolled-back change",
-            "cad manager > [A4] re-review: a read sent through execute after a rollback (inspect.measure, inspect.interference) keeps SolidCraft's redo history, so the ceiling stays: redo is 'nothing to redo' and design.json is unchanged; a real change clears both"
+            "cad manager > [A4] re-review: a read sent through execute after a rollback (inspect.measure, inspect.interference) keeps SolidCraft's redo history, so the ceiling stays: redo is 'nothing to redo' and design.json is unchanged; a real change clears both",
+            "cad manager > [A4] veto: a mutate request whose `after` hook objects is UNDONE as one agent request (a whole batch), cannot be redone, and replies with the reason; a hook that throws objects too; a request that kept nothing undoes nothing"
           ]
         },
         {
           "file": "test/unit/cad-tools.test.ts",
           "names": [
             "anvil_cad tools > [A4] re-review: execute and batch refuse placing a reference again — occurrence.copy or a component pattern of a ref- component, or of one named by id or path; the agent's own components still copy",
-            "anvil_cad tools > [A4] veto: execute and batch refuse every command that changes a reference — ground, move, align, reparent, rename, delete, activate, copy, pattern, a feature on its body — found from the LIVE component list (renamed 'innocent' included; by name, world name, id or path); renaming to or from ref- is refused; reads and the design's own commands pass; an unreadable list sends nothing"
+            "anvil_cad tools > [A4] veto: execute and batch refuse every command that changes a reference — ground, move, align, reparent, rename, delete, activate, copy, pattern, a feature on its body — found from the LIVE component list (renamed 'innocent' included; by name, world name, id or path); renaming to or from ref- is refused; reads and the design's own commands pass; an unreadable list sends nothing",
+            "anvil_cad tools > [A4] veto: a timeline command on a reference's import is refused by its name or id (suppress, delete, reorder, edit, redefine, rename, folder moves), and so is a history-marker move before it (roll_to / rollback by position or by feature, or a position that cannot be told); occurrence.align by `paths` and every other placement-path key of occurrence.* / component.* names the reference by id",
+            "anvil_cad tools > [A4] veto: after execute or batch ran, the guard refuses it when SolidCraft's reply lists a reference body under changed_bodies or removed_bodies (any batch step), when an import was deleted, suppressed or rolled back, or when a reference measures differently than just before (a move by placement path); otherwise it stands"
           ]
         }
       ],
@@ -657,7 +663,11 @@
             "real SolidCraft: references and the release pack > [A4] real: veto — the only placement of an overlapping reference un-grounded (occurrence.ground false) and moved 1000 mm away (occurrence.move): the agent's execute refuses both; made past the tool, the gate fails 'reference block.step was moved from where it was imported' and '…is not grounded' although the overlap is gone, release_part writes nothing and verify-cli exits 1",
             "real SolidCraft: references and the release pack > [A4] real: veto — renaming the reference's component (component.rename ref-far.step → innocent) is refused; made past the tool, the renamed reference is still found by its import: ground, copy, rename back to ref-, and solid.move of its body are refused, the gate still holds it ('reference far.step was moved…') and a body move past the tool fails ('…is changed by feature')",
             "real SolidCraft: references and the release pack > [A4] real: veto — a design component placed twice (occurrence.copy of Design2, 500 mm away) fails the gate 'body Body2 is placed 2 times; a design body may be placed once', so the measurement, export and release never leave a copy out",
-            "real SolidCraft: references and the release pack > [A4] real: re-review — after a refused import is rolled back, a read through execute (inspect.measure) does not lift the redo ceiling: redo is refused, design.json is unchanged and no BaseFeature comes back"
+            "real SolidCraft: references and the release pack > [A4] real: re-review — after a refused import is rolled back, a read through execute (inspect.measure) does not lift the redo ceiling: redo is refused, design.json is unchanged and no BaseFeature comes back",
+            "real SolidCraft: a reference measures what its import did > [A4] real: veto — a hand-written design.json feature reshapes the reference by a face POINT (offset_face {faces: [[5, 5, -2]], distance: -9}, no body or face names): no overlap is left and no feature names a reference body, but the gate fails 'reference block.step does not match what was imported (volume 1000 → 100 mm³ …)' against the lock store's record, release_part writes nothing and verify-cli exits 1",
+            "real SolidCraft: a reference measures what its import did > [A4] real: veto — the agent's point-based reshapes of a reference (solid.offset_face, replace_face, press_pull, face.delete, draft, split_face, fillet, chamfer, shell, hole by a point on it) are refused from SolidCraft's changed_bodies and UNDONE: design.json unchanged, nothing to redo, and a batch is undone as a whole",
+            "real SolidCraft: a reference measures what its import did > [A4] real: veto — timeline.suppress / delete / roll_to / rollback / reorder / edit of the reference's import are refused before anything is sent (by name, by id, by marker position); a suppress through a timeline folder is caught after it ran and undone; occurrence.align {paths: [[<occurrence id>]], move_grounded: true} of the reference is refused",
+            "real SolidCraft: a reference measures what its import did > [A4] real: a part approved before reference measurements were recorded (its lock has no `references`) is checked against its import replayed alone: untouched it passes in check_part and verify-cli; reshaped past the tools by a face point it fails 'reference far.step does not match what was imported (volume 1000 → 500 mm³ …)' in both"
           ]
         }
       ]

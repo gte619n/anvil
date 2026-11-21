@@ -173,26 +173,109 @@ export interface ReferenceTargets {
   names: Map<string, string>;
   /** Component and occurrence ids → the reference. */
   ids: Map<number, string>;
+  /** The import (BaseFeature) features, by id and by lower-cased name → the reference. */
+  features: Map<number | string, string>;
+  /** Every timeline feature, by id and by lower-cased name → its index in the timeline. */
+  index: Map<number | string, number>;
+  /** How many features the history marker must keep active so every import stays in: the last
+   *  import's index + 1 (0 with no import). */
+  importsEnd: number;
 }
 
-/** Build the targets from `liveReferences` (../cadwork/refs.ts). `label` names a reference to the agent. */
-export function referenceTargets<R extends { component: number; name: string; bodies: string[]; placements: { id: number; name: string }[] }>(refs: readonly R[], label: (r: R) => string = (r) => r.name): ReferenceTargets {
+/** Build the targets from `liveReferences` (../cadwork/refs.ts) and the live timeline (`inspect_design
+ *  {timeline: "summary"}`). `label` names a reference to the agent. */
+export function referenceTargets<R extends { component: number; name: string; bodies: string[]; imports?: string[]; placements: { id: number; name: string }[] }>(
+  refs: readonly R[],
+  label: (r: R) => string = (r) => r.name,
+  timeline: readonly { id?: unknown; name?: unknown; type?: unknown }[] = [],
+): ReferenceTargets {
   const names = new Map<string, string>();
   const ids = new Map<number, string>();
+  const features = new Map<number | string, string>();
+  const index = new Map<number | string, number>();
+  let importsEnd = 0;
   for (const r of refs) {
     const l = label(r);
-    for (const n of [r.name, ...r.bodies, ...r.placements.map((p) => p.name)]) names.set(n.trim().toLowerCase(), l);
+    for (const n of [r.name, ...r.bodies, ...r.placements.map((p) => p.name), ...(r.imports ?? [])]) names.set(n.trim().toLowerCase(), l);
     ids.set(r.component, l);
     for (const p of r.placements) ids.set(p.id, l);
   }
-  return { names, ids };
+  for (const [i, f] of timeline.entries()) {
+    const name = typeof f?.name === "string" ? f.name.trim().toLowerCase() : undefined;
+    if (typeof f?.id === "number") index.set(f.id, i);
+    if (name !== undefined) index.set(name, i);
+    if (f?.type !== "BaseFeature") continue;
+    const r = refs.find((x) => typeof f.name === "string" && (x.imports ?? []).includes(f.name));
+    const l = r ? label(r) : typeof f.name === "string" ? f.name : `import ${String(f.id)}`;
+    if (typeof f.id === "number") features.set(f.id, l);
+    if (name !== undefined) features.set(name, l);
+    importsEnd = i + 1;
+  }
+  return { names, ids, features, index, importsEnd };
+}
+
+/** Timeline commands that only read. Every other `timeline.*` command is checked against the imports. */
+const TIMELINE_READS = new Set(["timeline.inspect", "timeline.dependents", "timeline.export_script", "timeline.compute_all"]);
+
+/**
+ * Why a `timeline.*` command may not run given the imports, or undefined: one that names an import
+ * feature (by id or name, under `feature` / `features`) — suppress, delete, reorder, edit, redefine,
+ * rename, move it — or moves the history marker to before an import (`roll_to` / `rollback` to a
+ * `position` that keeps fewer features active, or to just after a feature that comes before it). A
+ * marker position that is not a number or "end" is refused (fail closed). Folders (`groups`) are not
+ * read here: what such a command does to an import is caught after it ran, and it is undone.
+ */
+export function refusedTimelineChange(cmd: string, p: Record<string, unknown>, refs: ReferenceTargets): string | undefined {
+  if (!cmd.startsWith("timeline.") || TIMELINE_READS.has(cmd) || refs.importsEnd === 0) return undefined;
+  const key = (v: unknown): number | string | undefined => (typeof v === "number" ? v : typeof v === "string" ? v.trim().toLowerCase() : undefined);
+  for (const k of ["feature", "features"]) {
+    for (const v of Array.isArray(p[k]) ? (p[k] as unknown[]) : [p[k]]) {
+      const kv = key(v);
+      const hit = kv === undefined ? undefined : refs.features.get(kv);
+      if (hit) return `\`${cmd}\` may not change the import of the reference ${hit}: ${REFERENCE_FIXED}`;
+    }
+  }
+  if (cmd === "timeline.roll_to" || cmd === "timeline.rollback") {
+    let keep: number | undefined;
+    if (p.feature !== undefined && cmd === "timeline.roll_to") {
+      const kv = key(p.feature);
+      const i = kv === undefined ? undefined : refs.index.get(kv);
+      keep = i === undefined ? undefined : i + 1;
+    } else if (p.position === undefined || p.position === null || p.position === "end") keep = Infinity;
+    else if (typeof p.position === "number" && Number.isFinite(p.position)) keep = p.position;
+    if (keep === undefined) return `\`${cmd}\`: where the history marker would go cannot be told, so it may not move while the design has a reference (give \`position\` as a number or "end")`;
+    if (keep < refs.importsEnd) return `\`${cmd}\` may not move the history marker before the import of a reference (keep at least ${refs.importsEnd} features active): ${REFERENCE_FIXED}`;
+  }
+  return undefined;
 }
 
 /** Commands that only read: they may name a reference (to measure it, check against it). */
 const READS_REFERENCES = ["inspect.", "model.", "view."];
-const READ_IDS = new Set(["occurrence.properties", "component.properties", "component.list", "component.metadata", "material.list", "material.inspect", "document.inspect", "expr.evaluate", "parameters.list", "parameters.graph", "parameters.users", "parameters.complete"]);
+const READ_IDS = new Set(["timeline.inspect", "timeline.dependents", "occurrence.properties", "component.properties", "component.list", "component.metadata", "material.list", "material.inspect", "document.inspect", "expr.evaluate", "parameters.list", "parameters.graph", "parameters.users", "parameters.complete"]);
 /** Parameter names whose NUMBERS are component or occurrence ids (a path is a list of them). */
-const ID_KEYS = new Set(["occurrence", "occurrences", "component", "components", "path", "parent", "parent_path", "target", "targets", "source", "sources", "tool", "tools", "id", "ids"]);
+const ID_KEYS = new Set([
+  "occurrence",
+  "occurrences",
+  "component",
+  "components",
+  "path",
+  "paths",
+  "occurrence_path",
+  "occurrence_paths",
+  "component_path",
+  "component_paths",
+  "parent",
+  "parent_path",
+  "parent_paths",
+  "target",
+  "targets",
+  "source",
+  "sources",
+  "tool",
+  "tools",
+  "id",
+  "ids",
+]);
 
 const REFERENCE_FIXED = "a reference stays where import_reference put it, as it was imported (re-import it to change it; model the part around it)";
 
@@ -213,6 +296,8 @@ export function refusedReferenceChange(command: unknown, params: unknown, refs: 
   if (cmd === "component.rename" && typeof p.component === "string" && p.component.trim().toLowerCase().startsWith(REFERENCE_PREFIX)) {
     return `\`${cmd}\` may not rename ${JSON.stringify(p.component.slice(0, 80))}: ${REFERENCE_FIXED}`;
   }
+  const timeline = refusedTimelineChange(cmd, p, refs);
+  if (timeline) return timeline;
   const reads = READ_IDS.has(cmd) || READS_REFERENCES.some((f) => cmd.startsWith(f));
   let hit: string | undefined;
   const walk = (v: unknown, key: string, depth: number): string | undefined => {

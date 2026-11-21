@@ -54,7 +54,8 @@ import {
 } from "../cadwork/partfile";
 import { exprNames } from "../cadwork/expr";
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
-import { embeddedReferences, importFeatureName, liveReferences, readComponentList, readRegularFile, referenceName, referenceOnDisk, referencePlacementChecks, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
+import { embeddedReferences, importFeatureName, liveReferences, readComponentList, readReferenceMeasures, readRegularFile, referenceName, referenceOnDisk, referencePlacementChecks, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR, type ReferenceMeasure } from "../cadwork/refs";
+import { makeReferenceReplay, type ReferenceReplay } from "../cadwork/refreplay";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
 import { canonicalBlock, checkPlanPart, keepsApproval, parseDeclared, planWrite, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
@@ -245,11 +246,24 @@ export class CadworkService {
   private readonly busyEpoch = new Map<string, number>();
   /** A concept part's last picture comparison (advisory, shown on the card). */
   private readonly pictureScores = new Map<string, { overlap: number; picture: string; at: string }>();
+  /**
+   * Per part (key): each reference as THIS daemon measured it straight after importing it
+   * (`insertInSlot`), until it goes into the part's next approval (`approve`), where it is kept for
+   * good. Never read from part.json, which the agent can write.
+   */
+  private readonly importedMeasures = new Map<string, Record<string, ReferenceMeasure>>();
+  /** A reference's import replayed alone, for one no approval holds a measurement of (the gate's fallback). */
+  private readonly replayReference: ReferenceReplay;
 
   constructor(private readonly deps: CadworkServiceDeps) {
     this.resolveCli = deps.resolveCli ?? (() => resolveSolidcraftCli());
     this.readVersion = deps.readVersion ?? readSolidcraftVersion;
     this.manager = new CadManager({ resolveCli: this.resolveCli, ...deps.manager });
+    {
+      // Only how processes are spawned (tests point these at the fake); never the live manager's hooks.
+      const m = deps.manager ?? {};
+      this.replayReference = makeReferenceReplay({ resolveCli: this.resolveCli, manager: { ...(m.spawn ? { spawn: m.spawn } : {}), ...(m.extraEnv ? { extraEnv: m.extraEnv } : {}), ...(m.requestTimeoutMs ? { requestTimeoutMs: m.requestTimeoutMs } : {}) } });
+    }
     // Daemon start: the SolidCraft temp roots a daemon that is gone left behind (killed, crashed, a test
     // run that never shut down) are removed — only `anvil-sc-<dead pid>-*`, only when over an hour old.
     if (!deps.manager?.tmpRoot) sweepOrphanedTmpRoots();
@@ -277,6 +291,7 @@ export class CadworkService {
           evaluateImpl: deps.gateImpl,
           beforeMeasure: deps.beforeMeasure,
           advisoryFor: (ref) => this.advisoryFor(ref),
+          replayReference: this.replayReference,
         }),
       );
       this.manager.subscribe((e) => {
@@ -454,7 +469,11 @@ export class CadworkService {
   /** Record an approval, stamped with both identities of the repo so a changed remote cannot orphan it. */
   private approve(ref: PartRef, lock: Omit<PartLock, "repo" | "part" | "remote" | "path">): void {
     const id = repoIdentity(ref.worktree);
-    this.lockSync.approvePart({ ...lock, repo: id.key, part: ref.part, ...(id.remote ? { remote: id.remote } : {}), path: id.path });
+    // What each reference measured as imported travels with every approval of the part: the earlier
+    // approval's records, then what this daemon measured at its own imports since.
+    const references = { ...(this.findLock(ref)?.references ?? {}), ...(this.importedMeasures.get(ref.key) ?? {}), ...(lock.references ?? {}) };
+    this.importedMeasures.delete(ref.key);
+    this.lockSync.approvePart({ ...lock, ...(Object.keys(references).length ? { references } : {}), repo: id.key, part: ref.part, ...(id.remote ? { remote: id.remote } : {}), path: id.path });
   }
   private approveRules(worktree: string, lock: Omit<RulesLock, "repo" | "remote" | "path">): void {
     const id = repoIdentity(worktree);
@@ -1029,8 +1048,11 @@ export class CadworkService {
     }
     const leftBehind = `the design may still hold refs/${name}; the gate fails the part until it is removed (undo) or approved`;
     let changed = false;
+    const measuresBefore = this.importedMeasures.get(ref.key);
     const rollback = async (): Promise<string | undefined> => {
       let err: string | undefined;
+      if (measuresBefore) this.importedMeasures.set(ref.key, measuresBefore);
+      else this.importedMeasures.delete(ref.key);
       if (changed) {
         try {
           const u = await slot.revert();
@@ -1078,6 +1100,12 @@ export class CadworkService {
       if (live.length !== 1 || live[0]!.placements.length !== 1) return fail(`import_reference: SolidCraft imported refs/${name} but its component could not be found once in the design`);
       const misplaced = referencePlacementChecks(live, [{ file: name, name: importFeatureName(name), bodies }]);
       if (misplaced.length) return fail(`import_reference: ${misplaced.map((c) => String(c.measured)).join("; ")}`);
+      // What it measures as imported, in this slot straight after the import: the gate holds the
+      // reference to these numbers for good (they go into the part's next approval, never part.json).
+      const m = await slot.call("execute", { command: "inspect.measure", params: { bodies } });
+      if (m.isError) return fail(`import_reference: SolidCraft imported refs/${name} but could not measure it: ${m.text.slice(0, 300)}`);
+      const measure: ReferenceMeasure = { sha256, bodies: readReferenceMeasures(m.json, bodies) };
+      this.importedMeasures.set(ref.key, { ...(measuresBefore ?? {}), [name]: measure });
       const placed = list.components.find((c) => c.id === live[0]!.component)!.occurrences[0]!;
       const record: PartReference = { name, source, sha256, bodies, placement: { transform: placed.transform, grounded: placed.grounded }, at: new Date().toISOString() };
       return { ok: true, bodies, replaced: !!prior, refs: (refs) => [...refs.filter((x) => x.name !== name), record], rollback, leftBehind };

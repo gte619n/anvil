@@ -14,7 +14,11 @@
  *                where it sits. Every reference sits where its import put it — identity in the
  *                design, grounded, read from `component.list` — and no feature names its bodies
  *                ("reference far.step was moved from where it was imported", "…is not grounded",
- *                "…is changed by feature Move1"). Every DESIGN body is placed once too ("body Body1
+ *                "…is changed by feature Move1"). And every reference MEASURES what its import did —
+ *                volume, world bounding box, faces, centre of mass, against the lock store's record
+ *                made at import_reference or a replay of the import alone — so a feature that picks
+ *                it by a face point is caught too ("reference block.step does not match what was
+ *                imported (volume 1000 → 100 mm³ …)"). Every DESIGN body is placed once too ("body Body1
  *                is placed 2 times"), so the measurement, export and release describe all of it.
  *   4. PREVIEW   export the design bodies to `.cache/preview-<rev>.glb` (metres, Y up) and keep the
  *                newest three, plus a small `.cache/thumb-<rev>.png` for the part card (Phase A4).
@@ -35,7 +39,28 @@ import type { McpToolResult } from "./mcp-client";
 import type { PartRef } from "./partfolder";
 import { readPartFile, writeMeasured, type GapRecord, type Measured, type PartRead } from "./partfile";
 import { CACHE_DIR, DESIGN_FILE, readDesignFile } from "./poststep";
-import { embeddedReferences, interferenceCheck, interferenceRequest, liveReferences, readComponentList, referenceChecks, referenceEditChecks, referenceLabel, referenceOnDisk, referencePlacementChecks, type LiveReference } from "./refs";
+import {
+  embeddedReferences,
+  embeddedStepTexts,
+  interferenceCheck,
+  interferenceRequest,
+  isReferenceMeasure,
+  liveReferences,
+  readComponentList,
+  readReferenceMeasures,
+  referenceChecks,
+  referenceDifferences,
+  referenceEditChecks,
+  referenceLabel,
+  referenceOnDisk,
+  referencePlacementChecks,
+  REFERENCE_RESHAPED,
+  type EmbeddedReference,
+  type ReferenceBodyMeasure,
+  type LiveReference,
+} from "./refs";
+import type { PartLock } from "./locks";
+import type { ReferenceReplay } from "./refreplay";
 import { readRules } from "./rules";
 
 export interface RefreshOutcome {
@@ -170,6 +195,8 @@ export interface RefreshDeps {
   beforeMeasure?: (ref: PartRef) => void;
   /** Phase A4: advisory checks the service holds for a part (a concept's picture score). */
   advisoryFor?: (ref: PartRef) => GateCheck[];
+  /** Replays a reference's import alone (see `EvaluateDeps.replayReference`). */
+  replayReference?: ReferenceReplay;
 }
 
 type Call = (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>;
@@ -338,7 +365,13 @@ export function gapOf(part: PartRead, store: { gap?: GapRecord; at: string } | u
  * Phase A4: the reference checks for a part, inside its queue slot. Nothing is asked of SolidCraft
  * for a part that names no reference.
  */
-export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies" | "placements" | "references">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
+export async function referenceGate(
+  call: Call,
+  ref: PartRef,
+  part: PartRead,
+  scriptSha: string | undefined,
+  design: Pick<DesignRead, "designBodies" | "referenceBodies" | "placements" | "references">,
+): Promise<{ checks: GateCheck[]; unverified: boolean; embedded?: EmbeddedReference[]; clean?: ReadonlySet<string>; script?: DesignScriptLike }> {
   if (part.kind !== "ok") return { checks: [], unverified: false };
   const exp = part.file.expectations;
   const must = exp?.noInterferenceWith ?? [];
@@ -383,7 +416,98 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
     }
     checks.push(interferenceCheck(name, reply));
   }
-  return { checks, unverified: integrity.unverified };
+  return { checks, unverified: integrity.unverified, ...(embedded ? { embedded, clean: integrity.clean, script: disk.script } : {}) };
+}
+
+type DesignScriptLike = Parameters<typeof embeddedStepTexts>[0];
+
+/** Why a reference fails when the lock store's record of it is for other STEP text. */
+export const REFERENCE_NOT_APPROVED = "is not the STEP that was approved";
+
+/**
+ * GEOMETRY: every reference — each byte-checked import (`clean`) — must measure, where
+ * it is now, exactly what its import measured: volume, world bounding box, face count and centre of
+ * mass, within 1e-6 of its size. Whatever selected it (a body name, a face name, a POINT on one of its
+ * faces), a feature that reshapes it, a suppressed, rolled-back or deleted import, or a move fails
+ * "reference block.step does not match what was imported (volume 1000 → 100 mm³; …)".
+ *
+ * What it measured AS IMPORTED is the lock store's record (`PartLock.references`, made by
+ * `import_reference`) when it is for the same STEP text, else a replay of the import alone from the
+ * embedded text (`replay`): a part approved before records were kept needs no owner action. A record
+ * for OTHER text on a part with expectations means the reference was swapped without the owner's card:
+ * unverified. A record that cannot be read, a replay that fails and a reference that cannot be
+ * measured are unverified too (fail closed).
+ */
+export async function referenceGeometryChecks(
+  call: Call,
+  input: { embedded: readonly EmbeddedReference[]; clean: ReadonlySet<string>; script: DesignScriptLike; referenceBodies: readonly string[] },
+  lock: Pick<PartLock, "references"> | undefined,
+  hasExpectations: boolean,
+  replay: ReferenceReplay | undefined,
+): Promise<{ checks: GateCheck[]; unverified: boolean }> {
+  const checks: GateCheck[] = [];
+  let unverified = false;
+  for (const file of [...input.clean].sort()) {
+    const id = `geometry ${file}`;
+    const expected = `refs/${file} measures what its import did (volume, bounding box, faces, centre of mass)`;
+    const bad = (measured: string, unv: boolean) => {
+      if (unv) unverified = true;
+      checks.push({ id, expected, measured, ok: false, hard: true });
+    };
+    const e = input.embedded.find((x) => x.file === file);
+    const text = embeddedStepTexts(input.script, file)[0];
+    if (!e || text === undefined) {
+      bad(`the design's import of refs/${file} could not be read`, true);
+      continue;
+    }
+    if (e.bodies.length === 0) {
+      bad(`reference ${file} ${REFERENCE_RESHAPED} (its import lists no bodies)`, false);
+      continue;
+    }
+    let asImported: { bodies: ReferenceBodyMeasure[] } | undefined;
+    const rec = lock?.references?.[file];
+    if (rec !== undefined) {
+      if (!isReferenceMeasure(rec)) {
+        bad(`the measurement recorded for refs/${file} when it was imported cannot be read`, true);
+        continue;
+      }
+      if (rec.sha256 === e.sha256) asImported = rec;
+      else if (hasExpectations) {
+        bad(`reference ${file} ${REFERENCE_NOT_APPROVED} (approved ${rec.sha256.slice(0, 12)}, the design holds ${e.sha256.slice(0, 12)}); import it again with import_reference so the owner approves it`, true);
+        continue;
+      }
+    }
+    if (!asImported) {
+      if (!replay) {
+        bad(`what refs/${file} measured when it was imported is not recorded, and its import could not be replayed here`, true);
+        continue;
+      }
+      try {
+        asImported = await replay(text, file);
+      } catch (err) {
+        bad(`what refs/${file} measured when it was imported could not be worked out: ${err instanceof Error ? err.message : String(err)}`, true);
+        continue;
+      }
+    }
+    const gone = e.bodies.filter((b) => !input.referenceBodies.includes(b));
+    if (gone.length) {
+      bad(`reference ${file} ${REFERENCE_RESHAPED} (${gone.join(", ")} ${gone.length === 1 ? "is" : "are"} not in the design: its import is suppressed, rolled back or deleted)`, false);
+      continue;
+    }
+    let live: ReferenceBodyMeasure[];
+    try {
+      const m = await call("execute", { command: "inspect.measure", params: { bodies: [...e.bodies] } });
+      if (m.isError) throw new Error(m.text.slice(0, 300) || "inspect.measure failed");
+      live = readReferenceMeasures(m.json, e.bodies);
+    } catch (err) {
+      bad(`reference ${file} could not be measured: ${err instanceof Error ? err.message : String(err)}`, true);
+      continue;
+    }
+    const diffs = referenceDifferences(asImported.bodies, live);
+    if (diffs.length) bad(`reference ${file} ${REFERENCE_RESHAPED} (${diffs.join("; ")})`, false);
+    else checks.push({ id, expected, measured: "as imported", ok: true, hard: true });
+  }
+  return { checks, unverified };
 }
 
 /** Why a reference in the design fails the gate when no must-not-touch rule names it (decision 204). */
@@ -434,6 +558,9 @@ export interface EvaluateDeps {
   evaluateImpl?: (input: GateInput) => GateResult;
   /** Advisory checks (a concept's picture score). */
   advisory?: GateCheck[];
+  /** Replays a reference's import alone, for one the lock store has no measurement of (./refreplay.ts).
+   *  Absent: such a reference is unverified (fail closed). */
+  replayReference?: ReferenceReplay;
 }
 
 /**
@@ -464,6 +591,17 @@ export async function measureAndEvaluate(call: Call, ref: PartRef, slot: { scrip
   const params = paramValues(design.params);
   const state = slot.state;
   const refs = await referenceGate(call, ref, locked.part, scriptSha, design);
+  if (refs.embedded && refs.clean && refs.clean.size) {
+    const geo = await referenceGeometryChecks(
+      call,
+      { embedded: refs.embedded, clean: refs.clean, script: refs.script, referenceBodies: design.referenceBodies },
+      locked.lock,
+      locked.part.kind === "ok" && !!locked.part.file.expectations,
+      deps.replayReference,
+    );
+    refs.checks.push(...geo.checks);
+    if (geo.unverified) refs.unverified = true;
+  }
   const placed = designPlacementChecks(design.designBodies, design.placements);
   const gap = gapOf(locked.part, deps.locks.findGap(locked.identity, ref.part, deps.machine));
   const advisory = deps.advisory ?? [];
@@ -502,6 +640,7 @@ export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
         machine: deps.machine?.(),
         evaluateImpl: deps.evaluateImpl,
         advisory: deps.advisoryFor?.(ref) ?? [],
+        replayReference: deps.replayReference,
       });
       designBodies = design.designBodies;
       if (measurement) {

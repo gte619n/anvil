@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { partRef } from "../../src/cadwork/partfolder";
-import { DUPLICATE_REFERENCE, REFERENCE_CHANGED, REFERENCE_MOVED, REFERENCE_NOT_GROUNDED, importFeatureName } from "../../src/cadwork/refs";
+import { DUPLICATE_REFERENCE, REFERENCE_CHANGED, REFERENCE_MOVED, REFERENCE_NOT_GROUNDED, REFERENCE_RESHAPED, importFeatureName } from "../../src/cadwork/refs";
 import { DESIGN_PLACED_ONCE, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { expectedReleaseFiles, MANIFEST } from "../../src/cadwork/release";
 import { PLATE_EXPECTATIONS, buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
@@ -589,5 +589,176 @@ describe("real SolidCraft: references and the release pack", () => {
     expect(x.emitted.filter((e) => e.type === "file.offer")).toHaveLength(9);
     console.log(`[A4 real] release pack for the plate (forced refresh, card, STEP + 3MF + 4 views + sheets + manifest): ${ms.toFixed(0)} ms wall time`);
     expect(ms).toBeGreaterThan(0);
+  }, 300_000);
+});
+
+/** The plate with `block.step` (a 10 mm block at `corner`) imported as an approved reference. */
+async function plateWithBlock(corner: number[], file = "block.step") {
+  const repo = tempRepo("anvil-cad-real-");
+  const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+  const step = await blockStep(x, repo, file.replace(/\.step$/, ""), corner);
+  mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+  copyFileSync(step, join(repo, ".anvil-downloads", file));
+  await must(x.tools.open_part!({ part: "plate" }));
+  expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: `.anvil-downloads/${file}` }))).json.imported).toBe(true);
+  const designPath = join(repo, "cad", "plate", "design.json");
+  const stateDir = x.service.locks.file.replace(/\/cadwork\/locks\.json$/, "");
+  return { repo, x, ref: partRef(repo, "plate"), designPath, stateDir };
+}
+const timelineOf = async (x: X) => (await x.tools.inspect_design!({ measure: false, sketches: false, timeline: "summary", bodies: true })).json;
+
+describe("real SolidCraft: a reference measures what its import did", () => {
+  test.skipIf(!REAL)("[A4] real: veto — a hand-written design.json feature reshapes the reference by a face POINT (offset_face {faces: [[5, 5, -2]], distance: -9}, no body or face names): no overlap is left and no feature names a reference body, but the gate fails 'reference block.step does not match what was imported (volume 1000 → 100 mm³ …)' against the lock store's record, release_part writes nothing and verify-cli exits 1", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const { repo, x, ref, designPath, stateDir } = await plateWithBlock([0, 0, -2]); // z -2…8: overlaps the plate (z 0…6) by 600 mm³
+    // The lock store holds the reference as it measured when it was imported (not only part.json).
+    const rec = x.service.locks.findPart(repoIdentity(repo), "plate")!.references!["block.step"]!;
+    expect(rec.bodies).toHaveLength(1);
+    expect(rec.bodies[0]).toMatchObject({ name: "block", volume: 1000, faces: 6, bbox: { min: [0, 0, -2], max: [10, 10, 8] }, centerOfMass: [5, 5, 3] });
+    let g = await x.check();
+    expect(g.checks.find((c: any) => c.id === "interference block.step").measured).toMatch(/overlaps block by 600 mm³/);
+    expect(g.checks.find((c: any) => c.id === "geometry block.step")).toMatchObject({ ok: true, measured: "as imported" });
+    // Past the tools, as a hand-written design.json: the command, then its body and face names taken out.
+    expect((await x.manager.request(ref, { tool: "execute", args: { command: "solid.offset_face", params: { faces: [[5, 5, -2]], distance: "-9" } }, kind: "mutate" })).result.isError).toBe(false);
+    const doc = JSON.parse(readFileSync(designPath, "utf8"));
+    const feat = doc.commands.find((c: any) => c.params?.feature?.type === "offset_face").params.feature;
+    delete feat.body;
+    delete feat.face_names;
+    expect(JSON.stringify(feat)).not.toContain("block");
+    writeFileSync(designPath, JSON.stringify(doc, null, 2) + "\n");
+    g = await x.check();
+    expect(readFileSync(designPath, "utf8")).not.toContain("face_names"); // the hand-written script is what runs
+    expect(g.state).toBe("fail");
+    expect(g.checks.find((c: any) => c.id === "interference block.step")).toMatchObject({ ok: true, measured: "no overlap" }); // the hole: no overlap any more
+    const lines = g.failing.join("\n");
+    expect(lines).not.toMatch(/is changed by feature/); // no feature names a reference body
+    expect(lines).toContain(`reference block.step ${REFERENCE_RESHAPED} (volume 1000 → 100 mm³`);
+    expect(lines).toContain("bounding box [0, 0, -2]…[10, 10, 8] → [0, 0, 7]…[10, 10, 8]");
+    const rel = await asOwner(x, x.tools.release_part!({ part: "plate" }));
+    expect(rel.isError).toBe(true);
+    expect(rel.text).toContain("the gate is fail");
+    expect(existsSync(join(repo, "cad", "plate", "release"))).toBe(false);
+    const v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    const p = v.json.parts.find((q: any) => q.part === "plate");
+    expect(p.state).toBe("fail");
+    expect(p.failing.join("\n")).toContain(`reference block.step ${REFERENCE_RESHAPED} (volume 1000 → 100 mm³`);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: veto — the agent's point-based reshapes of a reference (solid.offset_face, replace_face, press_pull, face.delete, draft, split_face, fillet, chamfer, shell, hole by a point on it) are refused from SolidCraft's changed_bodies and UNDONE: design.json unchanged, nothing to redo, and a batch is undone as a whole", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const { x, designPath } = await plateWithBlock([0, 0, -2]);
+    const top = [5, 5, 8];
+    const side = [10, 5, 7];
+    const edge = [10, 5, 8];
+    const reshapes: [string, Record<string, unknown>][] = [
+      ["solid.offset_face", { faces: [top], distance: "-1" }],
+      ["solid.replace_face", { faces: [top], target: { origin: [0, 0, 7], normal: [0, 0, 1] } }],
+      ["solid.press_pull", { face: top, distance: "-1" }],
+      ["face.delete", { faces: [top], heal: false }],
+      ["solid.draft", { faces: [side], angle: "5 deg", neutral: "XY" }],
+      ["solid.split_face", { faces: [top], plane: { origin: [5, 0, 0], normal: [1, 0, 0] } }],
+      ["solid.fillet", { edges: [edge], radius: "1" }],
+      ["solid.chamfer", { edges: [edge], distance: "1" }],
+      ["solid.shell", { faces: [top], thickness: "1" }],
+      ["solid.hole", { position: top, diameter: "2", depth: "3" }],
+    ];
+    const script = readFileSync(designPath, "utf8");
+    const features = (await timelineOf(x)).timeline.length;
+    for (const [command, params] of reshapes) {
+      const r = await x.tools.execute!({ command, params });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain(`\`${command}\` changed the reference ref-block.step`);
+      expect(r.text).toContain("SolidCraft reports changed_bodies block");
+      expect(r.text).toContain("It was undone");
+      expect(readFileSync(designPath, "utf8")).toBe(script);
+      expect((await timelineOf(x)).timeline.length).toBe(features);
+      const redo = await x.tools.redo!({});
+      expect(redo.isError).toBe(true);
+      expect(readFileSync(designPath, "utf8")).toBe(script);
+    }
+    // In a batch, the design's own step goes with it: the request is undone as a whole.
+    const b = await x.tools.batch!({ commands: [{ command: "solid.box", params: { length: 2, width: 2, height: 2, corner: [30, 0, 6], name: "Nub" } }, { command: "solid.offset_face", params: { faces: [top], distance: "-1" } }] });
+    expect(b.isError).toBe(true);
+    expect(b.text).toContain("this batch changed the reference ref-block.step");
+    expect(readFileSync(designPath, "utf8")).toBe(script);
+    expect((await timelineOf(x)).bodies.map((q: any) => q.name)).not.toContain("Nub");
+    // The design's own modeling still goes through.
+    expect((await x.tools.execute!({ command: "solid.fillet", params: { edges: [[40, 0, 6]], radius: "0.5", body: "Body1" } })).isError).toBe(false);
+    const g = await x.check();
+    expect(g.checks.find((c: any) => c.id === "geometry block.step")).toMatchObject({ ok: true });
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: veto — timeline.suppress / delete / roll_to / rollback / reorder / edit of the reference's import are refused before anything is sent (by name, by id, by marker position); a suppress through a timeline folder is caught after it ran and undone; occurrence.align {paths: [[<occurrence id>]], move_grounded: true} of the reference is refused", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const { x, ref, designPath } = await plateWithBlock([100, 0, 0]);
+    const insp = await timelineOf(x);
+    const at = insp.timeline.findIndex((f: any) => f.type === "BaseFeature");
+    const imp = insp.timeline[at];
+    expect(imp.name).toBe(importFeatureName("block.step"));
+    const script = readFileSync(designPath, "utf8");
+    const upFront: [string, Record<string, unknown>][] = [
+      ["timeline.suppress", { feature: imp.name }],
+      ["timeline.suppress", { feature: imp.id }],
+      ["timeline.suppress", { features: [imp.id], suppressed: true }],
+      ["timeline.delete", { feature: imp.id }],
+      ["timeline.roll_to", { position: at }],
+      ["timeline.roll_to", { feature: insp.timeline[at - 1].id }],
+      ["timeline.rollback", { position: 1 }],
+      ["timeline.reorder", { feature: imp.id, position: insp.timeline.length - 1, active: false }],
+      ["timeline.edit", { feature: imp.id, set: { name: "innocent" } }],
+    ];
+    for (const [command, params] of upFront) {
+      const r = await x.tools.execute!({ command, params });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/may not (change the import of the reference ref-block\.step|move the history marker before the import of a reference|change the reference ref-block\.step)/);
+      expect(r.text).not.toContain("undone"); // nothing was sent
+      expect(readFileSync(designPath, "utf8")).toBe(script);
+    }
+    // A marker move that keeps the import in is fine.
+    expect((await x.tools.execute!({ command: "timeline.rollback", params: { position: "end" } })).isError).toBe(false);
+    // A folder holding the import (made past the tools), suppressed by the agent: caught after it ran, undone.
+    const grouped = await x.manager.request(ref, { tool: "execute", args: { command: "timeline.group", params: { name: "Refs", features: [imp.id] } }, kind: "mutate" });
+    expect(grouped.result.isError).toBe(false);
+    const gid = grouped.result.json?.group ?? grouped.result.json?.id;
+    expect(typeof gid).toBe("number");
+    const scriptGrouped = readFileSync(designPath, "utf8");
+    const s = await x.tools.execute!({ command: "timeline.suppress", params: { groups: [gid], suppressed: true } });
+    expect(s.isError).toBe(true);
+    expect(s.text).toContain("the import ref-block.step was suppressed");
+    expect(s.text).toContain("It was undone");
+    expect(readFileSync(designPath, "utf8")).toBe(scriptGrouped);
+    expect((await timelineOf(x)).timeline.find((f: any) => f.id === imp.id).suppressed).toBeUndefined();
+    // occurrence.align by placement path.
+    const occId = (await x.tools.execute!({ command: "component.list", params: {} })).json.components.find((c: any) => c.name === "ref-block.step").occurrences[0].id;
+    const al = await x.tools.execute!({ command: "occurrence.align", params: { paths: [[occId]], from: [100, 0, 0], to: [0, 0, -2], move_grounded: true } });
+    expect(al.isError).toBe(true);
+    expect(al.text).toContain("`occurrence.align` may not change the reference ref-block.step");
+    expect(readFileSync(designPath, "utf8")).toBe(scriptGrouped);
+    expect((await x.check()).failing).toEqual([]);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: a part approved before reference measurements were recorded (its lock has no `references`) is checked against its import replayed alone: untouched it passes in check_part and verify-cli; reshaped past the tools by a face point it fails 'reference far.step does not match what was imported (volume 1000 → 500 mm³ …)' in both", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const { repo, x, ref, stateDir } = await plateWithBlock([100, 0, 0], "far.step");
+    const id = repoIdentity(repo);
+    const { references, ...legacy } = x.service.locks.findPart(id, "plate")!;
+    expect(references!["far.step"]).toBeDefined();
+    x.service.locks.putPart(legacy); // what an approval made before this change looks like
+    expect(x.service.locks.findPart(id, "plate")!.references).toBeUndefined();
+    let g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
+    expect(g.checks.find((c: any) => c.id === "geometry far.step")).toMatchObject({ ok: true, measured: "as imported" });
+    let v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.json.parts[0].checks.find((c: any) => c.id === "geometry far.step")).toMatchObject({ ok: true, measured: "as imported" });
+    expect(v.code).toBe(0);
+    expect((await x.manager.request(ref, { tool: "execute", args: { command: "solid.offset_face", params: { faces: [[105, 5, 10]], distance: "-5" } }, kind: "mutate" })).result.isError).toBe(false);
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`reference far.step ${REFERENCE_RESHAPED} (volume 1000 → 500 mm³`);
+    v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    expect(v.json.parts[0].failing.join("\n")).toContain(`reference far.step ${REFERENCE_RESHAPED} (volume 1000 → 500 mm³`);
   }, 300_000);
 });

@@ -10,8 +10,8 @@
  *               is that folder, never the repo), loaded by `batch` — never `--in` (decision 88).
  *   3. MEASURE  and GATE with `measureAndEvaluate`, the very function the live refresh runs: design
  *               bodies only, the hole table, feature errors (`timeline[].error`), the lock store's
- *               accepted numbers, tolerance caps, the rules hash, references (integrity and
- *               interference), the gap.
+ *               accepted numbers, tolerance caps, the rules hash, references (integrity,
+ *               interference, and geometry: each measures what its import did), the gap.
  *   4. COMPARE  `part.json.measured` with the replay: the script it was measured from and the numbers,
  *               within the part's tolerance. A text merge of two branches gives a script neither
  *               branch measured, so this fails until the refresh has run on the merged script and
@@ -41,6 +41,7 @@ import { CAD_DIR, isValidPartName, listParts, partRef, type PartRef } from "./pa
 import { DEFAULT_TOLERANCE, TOLERANCE_CAPS, readPartFile, type Measured } from "./partfile";
 import { DESIGN_FILE } from "./poststep";
 import { measureAndEvaluate } from "./refresh";
+import { makeReferenceReplay, type ReferenceReplay } from "./refreplay";
 import { screenScriptText } from "../solidcraft/script-screen";
 
 export interface VerifyOptions {
@@ -225,7 +226,7 @@ const failed = (part: string, reason: string, t0: number, state: GateState = "fa
 });
 
 /** One part: screen, replay in a fresh sandboxed process, measure, gate, compare with part.json. */
-async function verifyOne(ref: PartRef, locks: LockReader, opts: VerifyOptions): Promise<PartVerdict> {
+async function verifyOne(ref: PartRef, locks: LockReader, opts: VerifyOptions, replayReference: ReferenceReplay): Promise<PartVerdict> {
   const t0 = performance.now();
   let bytes: Buffer;
   try {
@@ -254,7 +255,7 @@ async function verifyOne(ref: PartRef, locks: LockReader, opts: VerifyOptions): 
     if (bytes.length) writeFileSync(join(dir, DESIGN_FILE), bytes);
     const box: PartRef = { key: dir, worktree: root, part: ref.part, dir };
     const evaluated = await manager.run(box, async (slot) =>
-      measureAndEvaluate((tool, args) => slot.call(tool, args), ref, { scriptSha: slot.scriptSha(), state: slot.state() }, { locks, machine: opts.machine }),
+      measureAndEvaluate((tool, args) => slot.call(tool, args), ref, { scriptSha: slot.scriptSha(), state: slot.state() }, { locks, machine: opts.machine, replayReference }),
     );
     const part = readPartFile(ref.dir);
     const extra = evaluated.measurement && part.kind === "ok" ? measuredChecks(part.file.measured, evaluated.measurement, part.file.expectations?.tolerance) : [];
@@ -312,6 +313,10 @@ export async function verifyParts(opts: VerifyOptions): Promise<VerifyResult> {
   }
 
   const parts: PartVerdict[] = [];
+  // A reference the lock store holds no measurement of is checked against its import replayed alone,
+  // in a throwaway process of the same binary (./refreplay.ts).
+  const m = opts.manager ?? {};
+  const replayReference = makeReferenceReplay({ resolveCli: () => opts.binary, manager: { ...(m.spawn ? { spawn: m.spawn } : {}), ...(m.extraEnv ? { extraEnv: m.extraEnv } : {}), ...(m.requestTimeoutMs ? { requestTimeoutMs: m.requestTimeoutMs } : {}) }, ...(opts.tmpRoot ? { tmpRoot: opts.tmpRoot } : {}) });
   for (const name of [...selected].sort()) {
     const t0 = performance.now();
     let ref: PartRef;
@@ -325,7 +330,7 @@ export async function verifyParts(opts: VerifyOptions): Promise<VerifyResult> {
       parts.push(failed(name, `cad/${name} does not exist`, t0));
       continue;
     }
-    parts.push(await verifyOne(ref, locks, opts));
+    parts.push(await verifyOne(ref, locks, opts, replayReference));
   }
   return { ok: parts.every((p) => p.ok), parts, selection };
 }

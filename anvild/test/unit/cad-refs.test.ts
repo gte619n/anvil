@@ -25,10 +25,16 @@ import {
   DUPLICATE_REFERENCE,
   REFERENCE_CHANGED,
   REFERENCE_MAX_BYTES,
+  REFERENCE_RESHAPED,
+  isReferenceMeasure,
+  readReferenceMeasures,
+  referenceDifferences,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
-import { coverageChecks, designPlacementChecks, placementChecks, readPlacements, referenceGate, DESIGN_PLACED_ONCE, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
+import { coverageChecks, designPlacementChecks, placementChecks, readPlacements, referenceGate, referenceGeometryChecks, DESIGN_PLACED_ONCE, REFERENCE_NOT_APPROVED, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { readDesignFile } from "../../src/cadwork/poststep";
+import { makeReferenceReplay } from "../../src/cadwork/refreplay";
+import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 import { cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempRepo } from "../helpers/cad-work";
 
 afterEach(async () => {
@@ -346,5 +352,111 @@ describe("the manager's working folder", () => {
     await m.open(ref);
     expect(log.cwds).toEqual([ref.dir]);
     expect(ref.dir.startsWith("/")).toBe(true);
+  });
+});
+
+describe("a reference measures what its import did", () => {
+  /** inspect.measure as the real 0.44.1 answers one block (A4 probe: the 10 mm block at [0, 0, -2]). */
+  const block = (over: Record<string, unknown> = {}) => ({ name: "block", volume_mm3: 1000, bbox: { min: [0, 0, -2], max: [10, 10, 8] }, faces: 6, center_of_mass: [5, 5, 3], closed: true, ...over });
+  const asImported = { name: "block", volume: 1000, bbox: { min: [0, 0, -2] as [number, number, number], max: [10, 10, 8] as [number, number, number] }, faces: 6, centerOfMass: [5, 5, 3] as [number, number, number] };
+
+  test("[A4] veto: a reference body's measure is read from inspect.measure (volume, WORLD bounding box, faces, centre of mass) in the order asked, and any other answer throws; differences are named within 1e-6 of its size", () => {
+    expect(readReferenceMeasures({ bodies: [block()] }, ["block"])).toEqual([asImported]);
+    expect(readReferenceMeasures({ bodies: [block({ center_of_mass: undefined })] }, ["block"])[0]!.centerOfMass).toBeUndefined();
+    expect(() => readReferenceMeasures({ bodies: [] }, ["block"])).toThrow("answered 0 bodies; 1 were asked for");
+    expect(() => readReferenceMeasures({ bodies: [{ name: "block", error: "not closed" }] }, ["block"])).toThrow("could not be measured: not closed");
+    expect(() => readReferenceMeasures({ bodies: [block({ volume_mm3: null })] }, ["block"])).toThrow("no volume, bounding box and face count");
+    expect(() => readReferenceMeasures(undefined, ["block"])).toThrow();
+    // The same numbers (a rounding far below 1e-6 of its size) match.
+    expect(referenceDifferences([asImported], [{ ...asImported, bbox: { min: [-1.7763568394002505e-15, 0, -2], max: [10, 10, 8] }, volume: 1000 + 1e-7 }])).toEqual([]);
+    // The A4 veto: offset by a point on the bottom face, -9 mm.
+    expect(referenceDifferences([asImported], [{ ...asImported, volume: 100, bbox: { min: [0, 0, 7], max: [10, 10, 8] }, centerOfMass: [5, 5, 7.5] }])).toEqual([
+      "volume 1000 → 100 mm³",
+      "bounding box [0, 0, -2]…[10, 10, 8] → [0, 0, 7]…[10, 10, 8]",
+      "centre of mass [5, 5, 3] → [5, 5, 7.5]",
+    ]);
+    expect(referenceDifferences([asImported], [{ ...asImported, faces: 7 }])).toEqual(["faces 6 → 7"]);
+    expect(referenceDifferences([asImported], [{ ...asImported, bbox: { min: [0, 0, -2 + 1e-4], max: [10, 10, 8] } }])).toHaveLength(1); // 1e-4 mm is more than 1e-6 of 10 mm
+    const { centerOfMass: _c, ...noCom } = asImported;
+    expect(referenceDifferences([asImported], [noCom])).toEqual(["centre of mass [5, 5, 3] → not reported"]);
+    expect(referenceDifferences([noCom], [asImported])).toEqual([]); // a build that never reported it (the fake)
+    expect(referenceDifferences([asImported, { ...asImported, name: "b2" }], [asImported])).toEqual(["2 bodies → 1"]);
+    expect(referenceDifferences([asImported, { ...asImported, name: "b2" }], [asImported, { ...asImported, name: "b2", volume: 1 }])).toEqual(["b2: volume 1000 → 1 mm³"]);
+    expect(isReferenceMeasure({ sha256: "x", bodies: [asImported] })).toBe(true);
+    for (const bad of [undefined, {}, { sha256: "x", bodies: [] }, { sha256: "x", bodies: [{ ...asImported, faces: "6" }] }, { sha256: 1, bodies: [asImported] }]) expect(isReferenceMeasure(bad)).toBe(false);
+  });
+
+  test("[A4] veto: the geometry check holds each byte-checked reference to the lock store's record of its import (same STEP text), else to a replay of the import alone; reshaped, moved or gone fails; a record for other text on a part with expectations, an unreadable record, no replay, a failed replay and an unmeasurable reference are unverified", async () => {
+    const script = { about: {}, commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "ref-block.step", file: "block.step", step: "BLOCK", body_names: ["block"] } } }] };
+    const embedded = embeddedReferences(script);
+    const input = { embedded, clean: new Set(["block.step"]), script, referenceBodies: ["block"] };
+    const asked: unknown[] = [];
+    const measuring = (b: Record<string, unknown> | "error") => async (_t: string, args: any) => {
+      asked.push(args);
+      return b === "error" ? reply({ error: "no" }, true) : reply({ bodies: [b] });
+    };
+    const record = { references: { "block.step": { sha256: sha("BLOCK"), bodies: [asImported] } } };
+    const replays: string[] = [];
+    const replay = async (step: string, file: string) => {
+      replays.push(`${file}:${step}`);
+      return { sha256: sha(step), bodies: [asImported] };
+    };
+    const lines = (r: { checks: { id: string; ok: boolean; measured: unknown }[] }) => r.checks.map((c) => `${c.id}: ${c.ok ? "ok" : "FAIL"} ${String(c.measured)}`);
+    // Untouched: as imported, from the record — no replay.
+    let r = await referenceGeometryChecks(measuring(block()), input, record, true, replay);
+    expect(lines(r)).toEqual(["geometry block.step: ok as imported"]);
+    expect(r.unverified).toBe(false);
+    expect(asked).toEqual([{ command: "inspect.measure", params: { bodies: ["block"] } }]);
+    expect(replays).toEqual([]);
+    // Reshaped by a point (nothing in the script names the body): a hard fail with the numbers.
+    r = await referenceGeometryChecks(measuring(block({ volume_mm3: 100, bbox: { min: [0, 0, 7], max: [10, 10, 8] }, center_of_mass: [5, 5, 7.5] })), input, record, true, replay);
+    expect(lines(r)[0]).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (volume 1000 → 100 mm³; bounding box [0, 0, -2]…[10, 10, 8] → [0, 0, 7]…[10, 10, 8]; centre of mass [5, 5, 3] → [5, 5, 7.5])`);
+    expect(r.unverified).toBe(false);
+    // Moved (its placement), measured in world coordinates.
+    expect(lines(await referenceGeometryChecks(measuring(block({ bbox: { min: [0, 0, 98], max: [10, 10, 108] }, center_of_mass: [5, 5, 103] })), input, record, true, replay))[0]).toContain(REFERENCE_RESHAPED);
+    // Gone (suppressed, rolled back, deleted): its body is not in the design.
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, referenceBodies: [] }, record, true, replay))[0]).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (block is not in the design: its import is suppressed, rolled back or deleted)`);
+    // A legacy approval (no record): the import replayed alone from the embedded text.
+    r = await referenceGeometryChecks(measuring(block()), input, {}, true, replay);
+    expect(lines(r)).toEqual(["geometry block.step: ok as imported"]);
+    expect(replays).toEqual(["block.step:BLOCK"]);
+    expect(lines(await referenceGeometryChecks(measuring(block({ volume_mm3: 100 })), input, undefined, true, replay))[0]).toContain("volume 1000 → 100 mm³");
+    // A record for OTHER text: on a part with expectations the reference was swapped without the card.
+    const other = { references: { "block.step": { sha256: sha("OTHER"), bodies: [asImported] } } };
+    r = await referenceGeometryChecks(measuring(block()), input, other, true, replay);
+    expect(lines(r)[0]).toContain(`reference block.step ${REFERENCE_NOT_APPROVED} (approved ${sha("OTHER").slice(0, 12)}, the design holds ${sha("BLOCK").slice(0, 12)})`);
+    expect(r.unverified).toBe(true);
+    // …on a part with none yet (re-imported freely), the replay decides.
+    expect(lines(await referenceGeometryChecks(measuring(block()), input, other, false, replay))).toEqual(["geometry block.step: ok as imported"]);
+    // Fail closed.
+    for (const [lock, rp, call, why] of [
+      [{ references: { "block.step": { sha256: sha("BLOCK"), bodies: [] } } }, replay, measuring(block()), "cannot be read"],
+      [undefined, undefined, measuring(block()), "is not recorded, and its import could not be replayed here"],
+      [undefined, async () => { throw new Error("no SolidCraft"); }, measuring(block()), "could not be worked out: no SolidCraft"],
+      [record, replay, measuring("error"), "reference block.step could not be measured"],
+    ] as [any, any, any, string][]) {
+      const f = await referenceGeometryChecks(call, input, lock, true, rp);
+      expect(lines(f)[0]).toContain(why);
+      expect(f.unverified).toBe(true);
+      expect(f.checks[0]!.ok).toBe(false);
+    }
+    // An import whose script lists no bodies.
+    const bare = { about: {}, commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "ref-block.step", file: "block.step", step: "BLOCK" } } }] };
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, embedded: embeddedReferences(bare), script: bare }, record, true, replay))[0]).toContain("its import lists no bodies");
+  });
+
+  test("[A4] veto: the replay imports ONLY the reference's STEP text, in a throwaway process allowed nothing but its own temp folder, and measures what file.insert_step made; one process per binary and text (cached); no binary is an error", async () => {
+    const log = recordingSpawn();
+    const replay = makeReferenceReplay({ resolveCli: () => ({ path: FAKE_SOLIDCRAFT }), manager: { spawn: log.spawn } });
+    const step = `ISO-10303-21; /* fake-solidcraft {"bodies":[{"name":"block","volume":1000,"faces":6,"min":[0,0,-2],"max":[10,10,8]}]} */`;
+    const m = await replay(step, "block.step");
+    expect(m).toEqual({ sha256: sha(step), bodies: [{ name: "block", volume: 1000, bbox: { min: [0, 0, -2], max: [10, 10, 8] }, faces: 6 }] });
+    expect(log.cmds).toHaveLength(1);
+    const allow = log.cmds[0]![log.cmds[0]!.indexOf("--allow-path") + 1]!;
+    expect(allow).toContain("anvil-refreplay-");
+    expect(log.cmds[0]).toContain("--require-allow-path");
+    expect(await replay(step, "block.step")).toEqual(m); // cached: no second process
+    expect(log.cmds).toHaveLength(1);
+    await expect(makeReferenceReplay({ resolveCli: () => undefined })(step, "block.step")).rejects.toThrow("SolidCraft is not installed");
   });
 });

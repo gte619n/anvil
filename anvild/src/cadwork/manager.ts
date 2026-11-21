@@ -173,6 +173,14 @@ export interface CadRequest {
    * can change the design between the check and the command.
    */
   before?: (slot: SlotContext) => Promise<string | undefined>;
+  /**
+   * Runs INSIDE the same queue slot straight after a `mutate` request and its script write (before
+   * `afterWrite`): a reason means the request must not stand — it is UNDONE at once as the agent's
+   * `undo` would (and cannot be redone), and the reply is an error with that reason. The agent's
+   * execute / batch use it to refuse any command that changed a reference, read from SolidCraft's
+   * reply and the live design. A hook that throws counts as a reason (fail closed).
+   */
+  after?: (slot: SlotContext, done: { result: McpToolResult; wrote: boolean }) => Promise<string | undefined>;
 }
 
 export interface CadReply {
@@ -419,8 +427,34 @@ export class CadManager {
           const r = { isError: true, content: [{ type: "text", text: refused }], texts: [refused], text: refused, images: [] } as unknown as McpToolResult;
           return { result: r, notes: slot.notes, reloaded: slot.reloaded, waitedForSlot: slot.waitedForSlot, wrote: false, state: this.stateOf(rec), scriptSha: rec.scriptSha };
         }
+        const stackBefore = rec.undoStack.length;
         result = req.kind === "mutate" ? await this.call(rec, req.tool, args, timeout) : await this.undoRedo(rec, req.kind, timeout, slot.notes);
         wrote = await this.afterMutation(rec, result, req.kind, slot.notes);
+        if (req.kind === "mutate" && req.after) {
+          let why: string | undefined;
+          try {
+            why = await req.after(slot, { result, wrote });
+          } catch (e) {
+            why = `what the request did could not be checked (${e instanceof Error ? e.message : String(e)})`;
+          }
+          if (why !== undefined) {
+            let tail: string;
+            if (rec.undoStack.length > stackBefore) {
+              // Exactly this request (a batch as a whole), as `slot.revert` does for a rolled-back import.
+              let undone: McpToolResult | undefined;
+              let err: string | undefined;
+              try {
+                undone = await slot.revert();
+              } catch (e) {
+                err = e instanceof Error ? e.message : String(e);
+              }
+              tail = !err && undone && !undone.isError ? "It was undone: the design and design.json are as they were before it, and it cannot be redone." : `It could NOT be undone (${err ?? undone?.text.slice(0, 200) ?? "no reply"}); call undo, and check_part fails the part until it is.`;
+            } else tail = wrote ? "It could NOT be undone (it added no undo step); check_part fails the part until it is put back." : "Nothing of it was kept.";
+            const text = `${why}. ${tail}`;
+            result = { isError: true, content: [{ type: "text", text }], texts: [text], text, images: [] } as unknown as McpToolResult;
+            wrote = false;
+          }
+        }
         if (req.afterWrite) await req.afterWrite(slot, { result, wrote });
         if (req.refreshAfter) await this.runRefresh(rec, slot, true);
       }

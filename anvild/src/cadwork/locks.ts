@@ -33,6 +33,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync } from "n
 import { dirname, join } from "node:path";
 import { writeFileAtomic } from "../util/atomic";
 import type { EvaluatedExpectations, GapRecord, LockedBy, PartStatusKind } from "./partfile";
+import type { ReferenceMeasure } from "./refs";
 
 export interface PartLock {
   repo: string;
@@ -50,6 +51,14 @@ export interface PartLock {
   remote?: string;
   path?: string;
   ownerParams?: Record<string, number>;
+  /**
+   * Each reference (by its `refs/` file name) as it measured when `import_reference` imported it: the
+   * sha of its STEP text and every body's volume, world bounding box, face count and centre of mass.
+   * Recorded by the daemon (never read from part.json) and carried into every later approval of the
+   * part; the gate holds the live reference to it (refresh.ts `referenceGeometryChecks`). Absent in an
+   * approval made before this was recorded: the gate then replays the import alone (./refreplay.ts).
+   */
+  references?: Record<string, ReferenceMeasure>;
   /** ISO time of the approval — the conflict rule's clock. */
   at: string;
   /** serverId of the machine the approval was made on. */

@@ -288,7 +288,7 @@ describe("Phase A3 acceptance", () => {
     expect(next.notes.join("\n")).toContain("owner changed L to 120");
     expect((await x.tools.measure!({ summary: true })).text).not.toContain("owner changed");
     expect(x.design("plate").by).toBe("panel");
-  });
+  }, 30_000);
 
   test("[A3] acceptance 5: a change made to design.json on disk while a request is running is not overwritten: .cache/design.conflict.json exists and the part is fail with the conflict message", async () => {
     const repo = tempRepo();

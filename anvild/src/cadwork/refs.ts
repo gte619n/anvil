@@ -15,6 +15,8 @@
  *     between the design bodies and that reference's bodies must report EXACTLY "no interference":
  *     `count == 0 && unchecked == [] && !budget_exceeded && !truncated` (A0 evidence). Anything else —
  *     an overlap, or a check that did not finish — is a hard fail naming the pair and the volume.
+ *   - geometry: each reference measures, where it is, what its import measured
+ *     (`referenceDifferences`; the gate's `referenceGeometryChecks` in ./refresh.ts).
  *
  * SOURCE RULES (`resolveReferenceSource`): a path relative to the worktree root; it must stay inside
  * the worktree after resolving (no `..` out, no absolute path), be a regular file that is not a
@@ -188,6 +190,16 @@ export function embeddedReferences(script: DesignScript | undefined): EmbeddedRe
       bodies: Array.isArray(f.body_names) ? f.body_names.map(String) : [],
       bytes: Buffer.byteLength(f.step),
     });
+  }
+  return out;
+}
+
+/** The embedded STEP text of every import of `file` in a design script (in script order). */
+export function embeddedStepTexts(script: DesignScript | undefined, file: string): string[] {
+  const out: string[] = [];
+  for (const c of Array.isArray(script?.commands) ? script!.commands : []) {
+    const f = (c as { command?: unknown; params?: { feature?: Record<string, unknown> } })?.params?.feature;
+    if ((c as { command?: unknown })?.command === "timeline.add" && f?.type === "import" && f.file === file && typeof f.step === "string") out.push(f.step);
   }
   return out;
 }
@@ -471,4 +483,92 @@ export function referenceEditChecks(script: DesignScript | undefined, refBodies:
     for (const l of labels) checks.push({ id: `changed ${l}`, expected: "no feature changes a reference", measured: `reference ${l} is changed by feature ${String(f.name ?? f.id ?? "?")} (it names ${hit.join(", ")})`, ok: false, hard: true });
   }
   return checks;
+}
+
+// ── what a reference measures (the gate's geometry check, the tool's after-check) ─────────────────
+//
+// `inspect.measure {bodies}` (real 0.44.1) answers each body in WORLD coordinates: `volume_mm3`,
+// `bbox {min, max}`, `faces`, `center_of_mass` (absent on the fake). A reference must measure exactly
+// what its import measured — whatever selected it (a body name, a face name, a point on a face), a
+// feature that reshapes it, a suppressed or rolled-back import, or a move of its placement changes one
+// of these numbers. Compared within `REFERENCE_MEASURE_REL` of its size.
+
+/** One reference body as measured. */
+export interface ReferenceBodyMeasure {
+  name: string;
+  volume: number;
+  bbox: { min: [number, number, number]; max: [number, number, number] };
+  faces: number;
+  /** The centre of mass, when the build reports one (the real one does). */
+  centerOfMass?: [number, number, number];
+}
+
+/** A reference as imported: the sha of its STEP text and its bodies in import order. */
+export interface ReferenceMeasure {
+  sha256: string;
+  bodies: ReferenceBodyMeasure[];
+}
+
+/** How close a reference must measure to its import: 1e-6 of its size (relative). */
+export const REFERENCE_MEASURE_REL = 1e-6;
+/** The gate's and the tool's wording when a reference does not measure what its import did. */
+export const REFERENCE_RESHAPED = "does not match what was imported";
+
+const isV3 = (v: unknown): v is [number, number, number] => Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "number" && Number.isFinite(x));
+
+/** `inspect.measure {bodies: names}` → each body's measure, in the order asked. Throws on anything
+ *  else (a missing body, an error, a number that is not one): the caller fails closed. */
+export function readReferenceMeasures(j: any, names: readonly string[]): ReferenceBodyMeasure[] {
+  const list: any[] = Array.isArray(j?.bodies) ? j.bodies : [];
+  if (list.length !== names.length) throw new Error(`inspect.measure answered ${list.length} bodies; ${names.length} were asked for`);
+  return list.map((b, i) => {
+    if (b?.error) throw new Error(`body ${names[i]} could not be measured: ${String(b.error)}`);
+    if (typeof b?.volume_mm3 !== "number" || !Number.isFinite(b.volume_mm3) || !isV3(b?.bbox?.min) || !isV3(b?.bbox?.max) || typeof b?.faces !== "number") {
+      throw new Error(`body ${names[i]} has no volume, bounding box and face count`);
+    }
+    return {
+      name: String(b.name ?? names[i]),
+      volume: b.volume_mm3,
+      bbox: { min: [...b.bbox.min] as [number, number, number], max: [...b.bbox.max] as [number, number, number] },
+      faces: b.faces,
+      ...(isV3(b.center_of_mass) ? { centerOfMass: [...b.center_of_mass] as [number, number, number] } : {}),
+    };
+  });
+}
+
+/** Whether a stored record has the shape of a `ReferenceMeasure` (the lock store is JSON). */
+export function isReferenceMeasure(x: any): x is ReferenceMeasure {
+  return (
+    !!x &&
+    typeof x.sha256 === "string" &&
+    Array.isArray(x.bodies) &&
+    x.bodies.length > 0 &&
+    x.bodies.every((b: any) => b && typeof b.name === "string" && typeof b.volume === "number" && isV3(b.bbox?.min) && isV3(b.bbox?.max) && typeof b.faces === "number" && (b.centerOfMass === undefined || isV3(b.centerOfMass)))
+  );
+}
+
+const v3 = (v: readonly number[]): string => `[${v.map(fmt).join(", ")}]`;
+
+/**
+ * What differs between a reference as imported (`expected`) and as it is (`live`, the same bodies in
+ * the same order), as short phrases — empty when it matches. Lengths within 1e-6 of the reference's
+ * size, the volume within 1e-6 of itself, faces exactly; the centre of mass is compared whenever the
+ * import recorded one (a reply that lost it is a difference).
+ */
+export function referenceDifferences(expected: readonly ReferenceBodyMeasure[], live: readonly ReferenceBodyMeasure[]): string[] {
+  if (live.length !== expected.length) return [`${expected.length} bod${expected.length === 1 ? "y" : "ies"} → ${live.length}`];
+  const out: string[] = [];
+  for (let i = 0; i < expected.length; i++) {
+    const e = expected[i]!;
+    const l = live[i]!;
+    const who = expected.length > 1 ? `${e.name}: ` : "";
+    const size = Math.max(1, ...[0, 1, 2].map((k) => Math.abs(e.bbox.max[k]! - e.bbox.min[k]!)), ...e.bbox.min.map(Math.abs), ...e.bbox.max.map(Math.abs));
+    const lenTol = REFERENCE_MEASURE_REL * size;
+    const near = (a: readonly number[], b: readonly number[]) => a.every((x, k) => Math.abs(x - b[k]!) <= lenTol);
+    if (!(Math.abs(l.volume - e.volume) <= REFERENCE_MEASURE_REL * Math.max(1, Math.abs(e.volume)))) out.push(`${who}volume ${fmt(e.volume)} → ${fmt(l.volume)} mm³`);
+    if (!near(e.bbox.min, l.bbox.min) || !near(e.bbox.max, l.bbox.max)) out.push(`${who}bounding box ${v3(e.bbox.min)}…${v3(e.bbox.max)} → ${v3(l.bbox.min)}…${v3(l.bbox.max)}`);
+    if (l.faces !== e.faces) out.push(`${who}faces ${e.faces} → ${l.faces}`);
+    if (e.centerOfMass && (!l.centerOfMass || !near(e.centerOfMass, l.centerOfMass))) out.push(`${who}centre of mass ${v3(e.centerOfMass)} → ${l.centerOfMass ? v3(l.centerOfMass) : "not reported"}`);
+  }
+  return out;
 }
