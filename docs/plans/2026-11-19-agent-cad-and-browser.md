@@ -1329,6 +1329,38 @@ Defaults assumed unless you object:
 
 ## 11. Evidence log
 
+**Final verification (supersedes the 2026-11-20 run below): 2026-11-21 at code sha `05632f3c16a347422ad01f99b5cc46268226c737`** (the merge of `fix-c-final` into `computer-use`, pushed as `final-merge` and merged into `computer-use` as `9d07b99`; the only difference is the decision log). M4, SolidCraft 0.44.1, bun 1.3.14, clean tree, `--require-real`, each gate its own serial command; all 17 passed on the first run, no flakes. Full suite in every run: 2541 passed, 0 failed, 105 skipped. Golden regenerates with no diff.
+
+| Gate | Named | Real | Playwright |
+|---|---|---|---|
+| F0 | 75/75 | none listed | — |
+| A0 | spike evidence | — | — |
+| A1 | 74/74 | 8/8 | — |
+| A2 | 100/100 | 8/8 | — |
+| A3 | 37/37 | 5/5 | 1 spec |
+| A4 | 91/91 | 22/22 | 1 spec |
+| A5 | 34/34 | 1/1 | — |
+| B0 | spike evidence | — | — |
+| B1 | 93/93 | 3/3 | — |
+| B2 | 110/110 | 4/4 | — |
+| B3 | 63/63 | 1/1 | — |
+| C0 | spike evidence | — | — |
+| C1 | 137/137 | 1/1 | — |
+| C2 | 153/153 | 16/16 | — |
+| C3 | 117/117 | 25/25 | — |
+| C4 | 45/45 | 9/9 | — |
+| C5 | 51/51 | none listed | — |
+
+**Review rounds after the 2026-11-20 run** (decision numbers in parentheses). Decision 202 found that two fix rounds had not been re-reviewed; both were, and the reviews continued until every finding was closed:
+- **Track A (A3/A4 cards and references):** vetoed (203) → `71fd0ce` → vetoed (215) → `a2d9f43` → vetoed (221) → `7507836` → vetoed (224) → `65f9a3c` → vetoed (228) → `fd4b2fe` → vetoed (232) → `568a797` → vetoed (236) → `c3d08bf` → **passed (239)**.
+- **Track C (C3/C4/C5 browser and parts):** vetoed (205) → `53d82c7` → vetoed (213) → `1faded1` → **passed (222)**.
+- **B3:** vetoed (181) → `5f2b2a6`/`9ea3a95` → vetoed (190) → `22b2fc2` → **passed (195)**.
+- A5 passed on first review (173).
+
+Every phase and every fix round has now passed a fresh adversarial review. Owner-witnessed checks (§8.3) and A0 S7 are still pending; see §5 and §12.
+
+### Earlier run (2026-11-20)
+
 Final verification on 2026-11-20 at code sha `4b71da002dcf78df7953b902c27b60b6a5bb7c36` (branch `computer-use`, equal to `origin/computer-use`), on the M4 with SolidCraft 0.44.1 and bun 1.3.14, after `bun install --frozen-lockfile` and `bun run build:web`. Every gate was run serially with `--require-real` on a clean tree; spikes with `--spike-evidence`. All 17 passed on the first run; no flakes and no re-runs. During the runs only this spec file was uncommitted (allowed by §4.14 item 46; the gate listed it as not blocking). Full suite in every run: 2496 passed, 0 failed, 72 skipped, 17959 assertions.
 
 Review history uses decision-log numbers in parentheses and fix commit shas. Owner-witnessed checks (§8.3) and A0 S7 are not yet recorded; see §5 and §12.
@@ -1776,5 +1808,9 @@ PHASE C5: PASS
 - **The throwaway test daemon has ordinary network access (decision 151)** and agent-modified code in it can read files by absolute path; only the browser is fenced.
 - **Same-user risk (§6, §10 item 12, §4.14 item 40).** The agent runs as the daemon's user; guards stop easy routes, not a determined one. A separate OS user for agent shells is a separate project.
 - **Large design parse cost (decision 115).** A 64 MB design file of tiny values takes about 2 s and several GB of memory to parse before the screen refuses it (linear, bounded).
+- **Geometry check resolution (decision 237).** A passing part does not overlap the approved reference by more than about (d/1000)³ mm³ of the smaller body (d = its bounding-box diagonal; about 0.6 mm³ for a 600 mm block, far less for small parts), except penetrations under about 20 nm, which SolidCraft treats as contact. A reference in the design may differ from the approved file by at most area × 0.1 nm + 1e-6 mm³.
+- **Visible-browser prompting (decision 219).** While any logged-in site is locked, every click, key press and form fill in the visible (headed) browser prompts and scripts are refused, on every page; unlocking sites in Settings is the way to work without prompts. The headless browser prompts only after a locked site has actually loaded, until the browser is closed.
+- **One placement per body (decision 226).** A part may not contain more than one placement of the same body, and references must stay exactly where they were imported.
+- **Leftovers after a daemon crash (decision 222).** Per-launch browser cache folders and orphaned Chrome processes are not cleaned up; closing the browser can pause the daemon for up to a second.
 - **Owner-witnessed checks pending (§8.3)** for Tracks A, B and C, and A0 S7 (M1 over SSH with no one logged in).
-- **Gate flakes:** none in the final verification run. Earlier in the build the B1/B2 real tests depended on SolidCraft zips under `/tmp` (decision 168), fixed by the persistent cache (`1048fe5`).
+- **Gate flakes:** none in the final verification run (2026-11-21). The phase gate now has per-step time limits and logs (decision 235); an earlier one-off hang (decision 231) did not recur. Earlier in the build the B1/B2 real tests depended on SolidCraft zips under `/tmp` (decision 168), fixed by the persistent cache (`1048fe5`).
