@@ -11,7 +11,11 @@
  *                reference in `noInterferenceWith` (./refs.ts), and the gap (`report_gap`). A
  *                reference is placed once (a copy or pattern of its component fails), and the
  *                interference check names every placement by its world name, so each is checked
- *                where it sits.
+ *                where it sits. Every reference sits where its import put it — identity in the
+ *                design, grounded, read from `component.list` — and no feature names its bodies
+ *                ("reference far.step was moved from where it was imported", "…is not grounded",
+ *                "…is changed by feature Move1"). Every DESIGN body is placed once too ("body Body1
+ *                is placed 2 times"), so the measurement, export and release describe all of it.
  *   4. PREVIEW   export the design bodies to `.cache/preview-<rev>.glb` (metres, Y up) and keep the
  *                newest three, plus a small `.cache/thumb-<rev>.png` for the part card (Phase A4).
  *                An empty design has no preview. A failed export never touches the gate.
@@ -31,7 +35,7 @@ import type { McpToolResult } from "./mcp-client";
 import type { PartRef } from "./partfolder";
 import { readPartFile, writeMeasured, type GapRecord, type Measured, type PartRead } from "./partfile";
 import { CACHE_DIR, DESIGN_FILE, readDesignFile } from "./poststep";
-import { embeddedReferences, interferenceCheck, interferenceRequest, referenceChecks, referenceOnDisk } from "./refs";
+import { embeddedReferences, interferenceCheck, interferenceRequest, liveReferences, readComponentList, referenceChecks, referenceEditChecks, referenceLabel, referenceOnDisk, referencePlacementChecks, type LiveReference } from "./refs";
 import { readRules } from "./rules";
 
 export interface RefreshOutcome {
@@ -182,6 +186,9 @@ export interface DesignRead {
    * check that placement where it sits (real 0.44.1; a bare body name means its first placement only).
    */
   placements: Record<string, string[]>;
+  /** The reference components as `component.list` has them (found by their import feature, not by
+   *  name), each placement with where it is in the world. */
+  references: LiveReference[];
   featureErrors: FeatureIssue[];
   warnings: string[];
   params: CadParamInfo[];
@@ -203,12 +210,15 @@ export async function readDesign(call: Call): Promise<DesignRead> {
   const referenceBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) === "BaseFeature").map((b) => String(b.name));
   const params: any[] = Array.isArray(d.params) ? d.params : [];
   const placements = readPlacements(need(await call("execute", { command: "inspect.measure", params: { names_only: true } }), "inspect.measure names_only"));
+  // Where each reference sits; a timeline with no import (BaseFeature) has none, so nothing is asked.
+  const references = timeline.some((f) => f?.type === "BaseFeature") ? liveReferences(readComponentList(need(await call("execute", { command: "component.list", params: {} }), "component.list")), timeline, bodies) : [];
   const version = need(await call("version", {}), "version").version;
   return {
     version: String(version ?? ""),
     designBodies,
     referenceBodies,
     placements,
+    references,
     featureErrors: timeline.filter((f) => f?.error).map((f) => ({ id: f.id, feature: String(f.name ?? f.id), message: String(f.error) })),
     warnings: timeline.filter((f) => f?.warning).map((f) => `${String(f.name ?? f.id)}: ${String(f.warning)}`),
     params: params
@@ -258,6 +268,19 @@ export function placementChecks(embedded: { file: string; bodies: string[] }[] |
     checks.push({ id: `placed ${name}`, expected: "the reference is placed once", measured: `reference ${name} is placed ${n} times; ${REFERENCE_PLACED_ONCE} (${world.join(", ").slice(0, 200)})`, ok: false, hard: true });
   }
   return checks;
+}
+
+/** Why a design body placed more than once fails the gate: the measurement, the preview, the export
+ *  and the release name bodies by their own name, which is the FIRST placement only. */
+export const DESIGN_PLACED_ONCE = "a design body may be placed once";
+
+/** Every design body must be placed exactly once (hard fail "body Body1 is placed 2 times; a design
+ *  body may be placed once"), so what is measured, exported and released is the whole design. */
+export function designPlacementChecks(designBodies: string[], placements: Record<string, string[]>): GateCheck[] {
+  return [...new Set(designBodies)]
+    .sort()
+    .filter((b) => (placements[b]?.length ?? 0) > 1)
+    .map((b) => ({ id: `placed body ${b}`, expected: "the body is placed once", measured: `body ${b} is placed ${placements[b]!.length} times; ${DESIGN_PLACED_ONCE} (${placements[b]!.join(", ").slice(0, 200)})`, ok: false, hard: true }));
 }
 
 /** A body's placements by world name; a body the list does not have is sent by its own name, so
@@ -315,7 +338,7 @@ export function gapOf(part: PartRead, store: { gap?: GapRecord; at: string } | u
  * Phase A4: the reference checks for a part, inside its queue slot. Nothing is asked of SolidCraft
  * for a part that names no reference.
  */
-export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies" | "placements">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
+export async function referenceGate(call: Call, ref: PartRef, part: PartRead, scriptSha: string | undefined, design: Pick<DesignRead, "designBodies" | "referenceBodies" | "placements" | "references">): Promise<{ checks: GateCheck[]; unverified: boolean }> {
   if (part.kind !== "ok") return { checks: [], unverified: false };
   const exp = part.file.expectations;
   const must = exp?.noInterferenceWith ?? [];
@@ -326,7 +349,13 @@ export async function referenceGate(call: Call, ref: PartRef, part: PartRead, sc
   const disk = readDesignFile(ref.dir);
   const embedded = disk.script && scriptSha !== undefined && disk.scriptSha === scriptSha ? embeddedReferences(disk.script) : undefined;
   const integrity = referenceChecks(names, (n) => referenceOnDisk(ref, n), embedded);
-  const checks = [...integrity.checks, ...placementChecks(embedded, design.referenceBodies, design.placements)];
+  const checks = [...integrity.checks, ...placementChecks(embedded, design.referenceBodies, design.placements), ...referencePlacementChecks(design.references, embedded)];
+  // A feature naming a reference body changes it where no placement shows it (solid.move of `far`).
+  const refBodies = new Map<string, string>();
+  for (const r of design.references) for (const b of r.bodies) refBodies.set(b, referenceLabel(r, embedded));
+  for (const e of embedded ?? []) for (const b of e.bodies) if (!refBodies.has(b)) refBodies.set(b, e.file);
+  for (const b of design.referenceBodies) if (!refBodies.has(b)) refBodies.set(b, `body ${b}`);
+  checks.push(...referenceEditChecks(embedded ? disk.script : undefined, refBodies));
   if (exp) checks.push(...coverageChecks(must, recorded, embedded, design.referenceBodies, integrity.clean));
   for (const name of [...new Set(must)].sort()) {
     // EVERY import carrying this file name is checked (a second one is also a duplicate, failed above).
@@ -435,6 +464,7 @@ export async function measureAndEvaluate(call: Call, ref: PartRef, slot: { scrip
   const params = paramValues(design.params);
   const state = slot.state;
   const refs = await referenceGate(call, ref, locked.part, scriptSha, design);
+  const placed = designPlacementChecks(design.designBodies, design.placements);
   const gap = gapOf(locked.part, deps.locks.findGap(locked.identity, ref.part, deps.machine));
   const advisory = deps.advisory ?? [];
   const gate = evaluateGate(
@@ -448,7 +478,7 @@ export async function measureAndEvaluate(call: Call, ref: PartRef, slot: { scrip
       featureErrors: design.featureErrors,
       warnings: design.warnings,
       designFailure: state.conflict ? state.reason : state.replayFailure ? `design.json failed to replay: ${state.replayFailure}` : undefined,
-      ...(refs.checks.length || advisory.length ? { extraChecks: [...refs.checks, ...advisory] } : {}),
+      ...(refs.checks.length || placed.length || advisory.length ? { extraChecks: [...placed, ...refs.checks, ...advisory] } : {}),
       ...(refs.unverified ? { extraUnverified: true } : {}),
       ...(gap ? { gap } : {}),
     },

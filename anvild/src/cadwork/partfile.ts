@@ -76,6 +76,9 @@ export interface PartReference {
   sha256: string;
   /** The bodies the import created (`created_bodies`). */
   bodies: string[];
+  /** Where the import placed it (`component.list`): identity in the design, grounded. Informational
+   *  too — the gate holds every reference to that placement itself (./refs.ts `referencePlacementChecks`). */
+  placement?: { transform: number[][]; grounded: boolean };
   at: string;
 }
 

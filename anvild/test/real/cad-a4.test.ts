@@ -8,8 +8,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { partRef } from "../../src/cadwork/partfolder";
-import { DUPLICATE_REFERENCE, REFERENCE_CHANGED, importFeatureName } from "../../src/cadwork/refs";
-import { REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
+import { DUPLICATE_REFERENCE, REFERENCE_CHANGED, REFERENCE_MOVED, REFERENCE_NOT_GROUNDED, importFeatureName } from "../../src/cadwork/refs";
+import { DESIGN_PLACED_ONCE, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { expectedReleaseFiles, MANIFEST } from "../../src/cadwork/release";
 import { PLATE_EXPECTATIONS, buildPlate, cleanupTemp, stopServices, tempRepo, type ToolReply } from "../helpers/cad-work";
 import { repoIdentity } from "../../src/cadwork/locks";
@@ -373,11 +373,139 @@ describe("real SolidCraft: references and the release pack", () => {
     expect(g.state).toBe("fail");
     expect(g.failing.join("\n")).toContain(`reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE}`);
     expect(g.checks.find((c: any) => c.id === "interference far.step")).toMatchObject({ ok: true, measured: "no overlap" }); // both placements are clear at x=100
-    await must(x.tools.execute!({ command: "occurrence.move", params: { occurrence: "ref-far.step:2", translate: [-100, 0, 0] } }));
+    // The agent's own tool refuses to move a placement of the reference; the gate is shown the move made past it.
+    const refused = await x.tools.execute!({ command: "occurrence.move", params: { occurrence: "ref-far.step:2", translate: [-100, 0, 0] } });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("may not change the reference ref-far.step");
+    expect((await x.manager.request(ref, { tool: "execute", args: { command: "occurrence.move", params: { occurrence: "ref-far.step:2", translate: [-100, 0, 0] } }, kind: "mutate" })).result.isError).toBe(false);
     g = await x.check();
     expect(g.state).toBe("fail");
     expect(g.failing.join("\n")).toContain(`reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE}`);
     expect(g.checks.find((c: any) => c.id === "interference far.step").measured).toMatch(/Body1 overlaps far \(ref-far\.step:2\) by 600 mm³/);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: veto — the only placement of an overlapping reference un-grounded (occurrence.ground false) and moved 1000 mm away (occurrence.move): the agent's execute refuses both; made past the tool, the gate fails 'reference block.step was moved from where it was imported' and '…is not grounded' although the overlap is gone, release_part writes nothing and verify-cli exits 1", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const near = await blockStep(x, repo, "block", [0, 0, 0]); // overlaps the plate by 600 mm³
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(near, join(repo, ".anvil-downloads", "block.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" }))).json.imported).toBe(true);
+    // part.json records where the import put it: identity in the design, grounded.
+    const rec = JSON.parse(readFileSync(x.partJson, "utf8")).refs.find((r: any) => r.name === "block.step");
+    expect(rec.placement).toEqual({ transform: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], grounded: true });
+    let g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.checks.find((c: any) => c.id === "interference block.step").measured).toMatch(/overlaps block by 600 mm³/);
+    const unground = { command: "occurrence.ground", params: { occurrence: "ref-block.step:1", grounded: false } };
+    const away = { command: "occurrence.move", params: { occurrence: "ref-block.step:1", translate: [1000, 0, 0] } };
+    // The agent's own tools refuse both, by name, by id and inside a batch.
+    for (const step of [unground, away]) {
+      const r = await x.tools.execute!(step);
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("may not change the reference ref-block.step");
+    }
+    const occId = (await x.tools.execute!({ command: "component.list", params: {} })).json.components.find((c: any) => c.name === "ref-block.step").occurrences[0].id;
+    expect((await x.tools.execute!({ command: "occurrence.ground", params: { occurrence: occId, grounded: false } })).isError).toBe(true);
+    expect((await x.tools.batch!({ commands: [unground, away] })).text).toContain("step 1: `occurrence.ground` may not change the reference ref-block.step");
+    // Made past the tools (a step in design.json is what a Bash write can add), here run as two.
+    const ref = partRef(repo, "plate");
+    for (const step of [unground, away]) expect((await x.manager.request(ref, { tool: "execute", args: step, kind: "mutate" })).result.isError).toBe(false);
+    expect(readFileSync(join(repo, "cad", "plate", "design.json"), "utf8")).toContain('"occurrence.move"');
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.checks.find((c: any) => c.id === "interference block.step")).toMatchObject({ ok: true, measured: "no overlap" }); // the hole: it no longer overlaps
+    const lines = g.failing.join("\n");
+    expect(lines).toContain(`reference block.step ${REFERENCE_MOVED} (placement ref-block.step:1: its translation is [1000, 0, 0])`);
+    expect(lines).toContain(`reference block.step ${REFERENCE_NOT_GROUNDED}`);
+    const rel = await asOwner(x, x.tools.release_part!({ part: "plate" }));
+    expect(rel.isError).toBe(true);
+    expect(rel.text).toContain("the gate is fail");
+    expect(existsSync(join(repo, "cad", "plate", "release"))).toBe(false);
+    const stateDir = x.service.locks.file.replace(/\/cadwork\/locks\.json$/, "");
+    const v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    const p = v.json.parts.find((q: any) => q.part === "plate");
+    expect(p.state).toBe("fail");
+    expect(p.failing.join("\n")).toContain(`reference block.step ${REFERENCE_MOVED}`);
+    expect(p.failing.join("\n")).toContain(`reference block.step ${REFERENCE_NOT_GROUNDED}`);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: veto — renaming the reference's component (component.rename ref-far.step → innocent) is refused; made past the tool, the renamed reference is still found by its import: ground, copy, rename back to ref-, and solid.move of its body are refused, the gate still holds it ('reference far.step was moved…') and a body move past the tool fails ('…is changed by feature')", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const far = await blockStep(x, repo, "far", [100, 0, 0]);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(far, join(repo, ".anvil-downloads", "far.step"));
+    await must(x.tools.open_part!({ part: "plate" }));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/far.step" }))).json.imported).toBe(true);
+    expect((await x.check()).state).toBe("pass");
+    const rename = { command: "component.rename", params: { component: "ref-far.step", name: "innocent" } };
+    const r0 = await x.tools.execute!(rename);
+    expect(r0.isError).toBe(true);
+    expect(r0.text).toContain("may not");
+    const ref = partRef(repo, "plate");
+    expect((await x.manager.request(ref, { tool: "execute", args: rename, kind: "mutate" })).result.isError).toBe(false);
+    const comps = (await x.tools.execute!({ command: "component.list", params: {} })).json.components;
+    expect(comps.map((c: any) => c.name)).toContain("innocent");
+    // Renamed, it is still a reference: found by its import feature, not by its name.
+    for (const step of [
+      { command: "occurrence.ground", params: { occurrence: "innocent:1", grounded: false } },
+      { command: "occurrence.move", params: { occurrence: "innocent:1", translate: [1000, 0, 0] } },
+      { command: "component.rename", params: { component: "innocent", name: "still-innocent" } },
+      { command: "component.delete", params: { component: "innocent" } },
+      { command: "solid.move", params: { bodies: ["far"], translate: [-100, 0, 0] } },
+    ]) {
+      const r = await x.tools.execute!(step);
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("may not change the reference ref-far.step");
+    }
+    const copy = await x.tools.execute!({ command: "occurrence.copy", params: { component: "innocent", translate: [-100, 0, 0] } });
+    expect(copy.isError).toBe(true);
+    expect(copy.text).toContain(REFERENCE_PLACED_ONCE);
+    const back = await x.tools.execute!({ command: "component.rename", params: { component: "Untitled", name: "ref-plate" } });
+    expect(back.isError).toBe(true);
+    expect(back.text).toContain('names starting with "ref-" belong to imported references');
+    // The rename alone moves nothing: the gate passes, and holds the renamed reference where it was imported.
+    let g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect((await x.manager.request(ref, { tool: "execute", args: { command: "occurrence.move", params: { occurrence: "innocent:1", translate: [0, 0, 50], move_grounded: true } }, kind: "mutate" })).result.isError).toBe(false);
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`reference far.step ${REFERENCE_MOVED} (placement innocent:1: its translation is [0, 0, 50])`);
+    // A move of the reference's BODY (not its placement) is caught too, from the design script.
+    await x.manager.request(ref, { tool: "undo", args: {}, kind: "undo" });
+    expect((await x.check()).failing).toEqual([]);
+    expect((await x.manager.request(ref, { tool: "execute", args: { command: "solid.move", params: { bodies: ["far"], translate: [-100, 0, 0] } }, kind: "mutate" })).result.isError).toBe(false);
+    g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toMatch(/reference far\.step is changed by feature Move\d* \(it names far\)/);
+  }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: veto — a design component placed twice (occurrence.copy of Design2, 500 mm away) fails the gate 'body Body2 is placed 2 times; a design body may be placed once', so the measurement, export and release never leave a copy out", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    expect(x.gate.state).toBe("pass");
+    await must(x.tools.execute!({ command: "component.create", params: { name: "Design2" } }));
+    await must(x.tools.execute!({ command: "solid.box", params: { length: 5, width: 5, height: 5, corner: [0, 0, 50], name: "Box2" } }));
+    await must(x.tools.execute!({ command: "component.activate", params: { component: 0 } }));
+    await must(x.tools.execute!({ command: "occurrence.copy", params: { component: "Design2", translate: [500, 0, 0] } }));
+    const names = (await x.tools.execute!({ command: "inspect.measure", params: { names_only: true } })).json.bodies.map((b: any) => b.name);
+    expect(names).toContain("Body2 (Design2:2)");
+    const g = await x.check();
+    expect(g.state).toBe("fail");
+    expect(g.failing.join("\n")).toContain(`body Body2 is placed 2 times; ${DESIGN_PLACED_ONCE} (Body2, Body2 (Design2:2))`);
+    const rel = await asOwner(x, x.tools.release_part!({ part: "plate" }));
+    expect(rel.isError).toBe(true);
+    expect(existsSync(join(repo, "cad", "plate", "release"))).toBe(false);
+    const stateDir = x.service.locks.file.replace(/\/cadwork\/locks\.json$/, "");
+    const v = await runVerifyCli(repo, ["--json", "--part", "plate"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    expect(v.json.parts.find((q: any) => q.part === "plate").failing.join("\n")).toContain(`body Body2 is placed 2 times; ${DESIGN_PLACED_ONCE}`);
   }, 300_000);
 
   test.skipIf(!REAL)("[A4] real: re-review — after a refused import is rolled back, a read through execute (inspect.measure) does not lift the redo ceiling: redo is refused, design.json is unchanged and no BaseFeature comes back", async () => {

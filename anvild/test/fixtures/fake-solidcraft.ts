@@ -54,6 +54,8 @@
  *                         flag (a pair left unchecked, a truncated list, an exhausted budget), with
  *                         `count` 0 — the replies the gate must never read as "no interference".
  *   FAKE_SC_OVERLAP       the `overlap` compare_picture reports (default 0.9).
+ *   FAKE_SC_REF_PLACEMENT "moved" | "free" | "pending" | "copied": what `component.list` says of every
+ *                         import's placement (see `componentList`); default: identity, grounded, once.
  *
  * PHASE A4 SHAPES. `file.insert_step` embeds the STEP text in the script exactly as the real tool
  * does: `timeline.export_script` writes the import as `timeline.add {feature: {type: "import", name,
@@ -1166,6 +1168,7 @@ const READ_ONLY: Record<string, (m: Model, p: Json) => Json> = {
   "inspect.interference": interference,
   "inspect.measure": (m, p) => measure(m, p),
   "view.pick": pick,
+  "component.list": componentList,
   "timeline.export_script": (m, p) => {
     const script = exportScript(m);
     const path = p.path === undefined ? null : allowedPath(p.path, "timeline.export_script");
@@ -1173,6 +1176,29 @@ const READ_ONLY: Record<string, (m: Model, p: Json) => Json> = {
     return { omitted: [], path, script, steps: script.commands.length };
   },
 };
+/**
+ * `component.list` in the real shape: the design (id 0) holds every body an import did not make; each
+ * import (BaseFeature) is a component named after the feature holding its bodies, placed once in the
+ * design, grounded, at the identity (as the real `file.insert_step` places it). FAKE_SC_REF_PLACEMENT
+ * "moved" | "free" | "pending" | "copied" makes every import's placement translated by [1000, 0, 0],
+ * not grounded, with a move pending, or placed twice.
+ */
+function componentList(m: Model): Json {
+  const I = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+  const mode = process.env.FAKE_SC_REF_PLACEMENT ?? "";
+  const imports = m.timeline.filter((f) => f.type === "BaseFeature");
+  const placed = (f: Feature, k: number) => ({ component: 1000 + f.id, grounded: mode !== "free", id: 2000 + f.id * 10 + k, name: `${f.name}:${k}`, parent: 0, transform: mode === "moved" ? [I[0], I[1], I[2], [1000, 0, 0, 1]] : I });
+  const refs = imports.map((f) => ({
+    bodies: m.bodies.filter((b) => b.feature === f.id).map((b) => b.name), children: [], construction: [], features: [f.name], id: 1000 + f.id, name: f.name,
+    occurrences: mode === "copied" ? [placed(f, 1), placed(f, 2)] : [placed(f, 1)], parent: 0, sketches: [],
+  }));
+  const root = {
+    bodies: m.bodies.filter((b) => !imports.some((f) => f.id === b.feature)).map((b) => b.name), children: refs.flatMap((r) => r.occurrences), construction: [],
+    features: m.timeline.filter((f) => f.type !== "BaseFeature" && f.type !== "Sketch").map((f) => f.name), id: 0, name: designName, occurrences: [], parent: null, sketches: m.sketches.map((k) => k.name),
+  };
+  return { active: 0, active_path: [], components: [root, ...refs], pending_moves: mode === "pending" ? refs.flatMap((r) => r.occurrences.map((o) => o.id)) : [] };
+}
+
 /** The replayable script: parameters first with their current expressions, then every other step. */
 function exportScript(m: Model): { about: Json; commands: Cmd[] } {
   return {
@@ -1215,6 +1241,7 @@ const COMMANDS: { id: string; label: string; params: string }[] = [
   { id: "inspect.interference", label: "Interference", params: "bodies?: [names] → interferences: pairs that overlap" },
   { id: "inspect.measure", label: "Measure", params: "bodies?: name | [names] (default: all) → the same reply as the measure tool" },
   { id: "view.pick", label: "Pick", params: "rays: [{origin: [x,y,z], dir: [x,y,z]}] (max 1024), all?: bool → hits: per ray [{body, depth, face, normal, point}], nearest first" },
+  { id: "component.list", label: "List Components", params: "compact?, bodies? → components: the design (id 0) and its child components, each with its placements (transform, grounded)" },
   { id: "timeline.export_script", label: "Export Script", params: "path?: write the script to this file → script: {commands: [...]} that rebuilds the design" },
 ];
 const LABELS: Record<string, string> = Object.fromEntries(COMMANDS.map((c) => [c.id, c.label]));

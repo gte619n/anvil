@@ -10,6 +10,13 @@ import { createHash } from "node:crypto";
 import { partRef } from "../../src/cadwork/partfolder";
 import {
   embeddedReferences,
+  liveReferences,
+  readComponentList,
+  referenceEditChecks,
+  referencePlacementChecks,
+  worldTransform,
+  REFERENCE_MOVED,
+  REFERENCE_NOT_GROUNDED,
   interferenceCheck,
   interferenceRequest,
   referenceChecks,
@@ -20,7 +27,7 @@ import {
   REFERENCE_MAX_BYTES,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
-import { coverageChecks, placementChecks, readPlacements, referenceGate, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
+import { coverageChecks, designPlacementChecks, placementChecks, readPlacements, referenceGate, DESIGN_PLACED_ONCE, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { readDesignFile } from "../../src/cadwork/poststep";
 import { cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempRepo } from "../helpers/cad-work";
 
@@ -178,7 +185,7 @@ function interferenceStub(hot: string[]) {
   return { call, asked };
 }
 /** The design's bodies, each placed once (its world name is its own name). */
-const once = (designBodies: string[], referenceBodies: string[]) => ({ designBodies, referenceBodies, placements: Object.fromEntries([...designBodies, ...referenceBodies].map((b) => [b, [b]])) });
+const once = (designBodies: string[], referenceBodies: string[]) => ({ designBodies, referenceBodies, placements: Object.fromEntries([...designBodies, ...referenceBodies].map((b) => [b, [b]])), references: [] });
 const ruled = (must: string[]) => ({ kind: "ok", file: { expectations: { noInterferenceWith: must }, refs: [] } }) as any;
 const failing = (checks: { id: string; ok: boolean; hard: boolean; measured: unknown }[]) => checks.filter((c) => !c.ok && c.hard).map((c) => `${c.id}: ${String(c.measured)}`);
 
@@ -238,7 +245,7 @@ describe("a reference may be placed once; interference checks every placement", 
   test("[A4] re-review: the gate sends every placement by world name — the copy moved onto the plate is found, and the part fails on both the placement and the overlap", async () => {
     const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far"] }], { "far.step": "FAR" });
     const s = interferenceStub(["far (ref-far.step:2)"]);
-    const g = await referenceGate(s.call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far"], placements: { Body1: ["Body1"], far: ["far", "far (ref-far.step:2)"] } });
+    const g = await referenceGate(s.call as any, ref, ruled(["far.step"]), scriptSha, { designBodies: ["Body1"], referenceBodies: ["far"], placements: { Body1: ["Body1"], far: ["far", "far (ref-far.step:2)"] }, references: [] });
     expect(s.asked).toEqual([["Body1", "far", "far (ref-far.step:2)"]]);
     const bad = failing(g.checks);
     expect(bad).toContain(`placed far.step: reference far.step is placed 2 times; ${REFERENCE_PLACED_ONCE} (far, far (ref-far.step:2))`);
@@ -246,6 +253,87 @@ describe("a reference may be placed once; interference checks every placement", 
     // Placed once, the same reference passes.
     const ok = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, once(["Body1"], ["far"]));
     expect(failing(ok.checks)).toEqual([]);
+  });
+});
+
+/** `component.list` as the real 0.44.1 answers it for the plate with far.step imported (A4 probe). */
+const I4: [number[], number[], number[], number[]] = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+function realList(o: { name?: string; grounded?: boolean; transform?: number[][]; pending?: number[]; extraFeature?: string } = {}) {
+  const occ = { component: 7, grounded: o.grounded ?? true, id: 8, name: `${o.name ?? "ref-far.step"}:1`, parent: 0, transform: o.transform ?? I4 };
+  return {
+    active: 0,
+    active_path: [],
+    components: [
+      { bodies: ["Body1"], children: [occ], construction: [], features: ["Plate", "Corners", "Hole", "Holes"], id: 0, name: "Untitled", occurrences: [], parent: null, sketches: ["PlateSketch", "HolePts"] },
+      { bodies: ["far"], children: [], construction: [], features: ["ref-far.step", ...(o.extraFeature ? [o.extraFeature] : [])], id: 7, name: o.name ?? "ref-far.step", occurrences: [occ], parent: 0, sketches: [] },
+    ],
+    pending_moves: o.pending ?? [],
+  };
+}
+const TIMELINE = [{ id: 2, name: "Plate", type: "ExtrudeFeature" }, { id: 9, name: "ref-far.step", type: "BaseFeature" }];
+const BODIES = [{ feature: 2, name: "Body1" }, { feature: 9, name: "far" }];
+const EMB = [{ file: "far.step", name: "ref-far.step", bodies: ["far"] }];
+const live = (o: Parameters<typeof realList>[0] = {}) => liveReferences(readComponentList(realList(o)), TIMELINE, BODIES);
+
+describe("references stay where they were imported; every design placement is measured", () => {
+  test("[A4] veto: component.list is read in the real shape (4 columns, translation last; grounded; pending_moves); a reference is found by its import feature, so a renamed one ('innocent') is still one; a reply without that shape throws", () => {
+    const refs = live({ name: "innocent" });
+    expect(refs).toHaveLength(1);
+    expect(refs[0]).toMatchObject({ component: 7, name: "innocent", bodies: ["far"], imports: ["ref-far.step"], others: [], placements: [{ id: 8, name: "innocent:1", grounded: true, pending: false, world: I4 }] });
+    // Found by its body too when the feature was renamed.
+    expect(liveReferences(readComponentList(realList()), [{ id: 9, name: "renamed", type: "BaseFeature" }], BODIES)).toHaveLength(1);
+    expect(() => readComponentList({})).toThrow("no component list");
+    expect(() => readComponentList({ components: [{ id: 7, name: "x", bodies: [], features: [], occurrences: [{ id: 8, name: "x:1", parent: 0, grounded: true }] }], pending_moves: [] })).toThrow("4×4 transform");
+    expect(() => readComponentList({ ...realList(), pending_moves: undefined })).toThrow("pending moves");
+  });
+
+  test("[A4] veto: a placement's world transform follows its parents (column-major); a parent placed twice cannot be told and counts as moved", () => {
+    const list = readComponentList({
+      active: 0,
+      components: [
+        { id: 0, name: "Untitled", bodies: [], features: [], occurrences: [] },
+        { id: 11, name: "Sub", bodies: [], features: [], occurrences: [{ id: 12, name: "Sub:1", parent: 0, grounded: false, transform: [I4[0], I4[1], I4[2], [0, 0, 77, 1]] }] },
+        { id: 13, name: "ref-x.step", bodies: ["far (2)"], features: ["ref-x.step"], occurrences: [{ id: 14, name: "ref-x.step:1", parent: 11, grounded: true, transform: [I4[0], I4[1], I4[2], [5, 0, 0, 1]] }] },
+      ],
+      pending_moves: [],
+    });
+    expect(worldTransform(list, list.components[2]!.occurrences[0]!)).toEqual([I4[0], I4[1], I4[2], [5, 0, 77, 1]]);
+    const refs = liveReferences(list, [{ id: 15, name: "ref-x.step", type: "BaseFeature" }], [{ feature: 15, name: "far (2)" }]);
+    expect(referencePlacementChecks(refs, [{ file: "x.step", name: "ref-x.step", bodies: ["far (2)"] }])[0]!.measured).toBe(`reference x.step ${REFERENCE_MOVED} (placement ref-x.step:1: its translation is [5, 0, 77])`);
+    list.components[1]!.occurrences.push({ id: 16, name: "Sub:2", parent: 0, grounded: false, transform: I4 });
+    expect(worldTransform(list, list.components[2]!.occurrences[0]!)).toBeUndefined();
+  });
+
+  test("[A4] veto: un-grounded and moved 1000 mm away is a hard fail 'reference far.step was moved from where it was imported' and '…is not grounded'; a pending move, a turn and a feature in its component fail too; identity, grounded passes", () => {
+    expect(referencePlacementChecks(live(), EMB)).toEqual([]);
+    const moved = referencePlacementChecks(live({ grounded: false, transform: [I4[0], I4[1], I4[2], [1000, 0, 0, 1]] }), EMB);
+    expect(moved.map((c) => [c.id, c.measured, c.ok, c.hard])).toEqual([
+      ["where far.step", `reference far.step ${REFERENCE_MOVED} (placement ref-far.step:1: its translation is [1000, 0, 0])`, false, true],
+      ["grounded far.step", `reference far.step ${REFERENCE_NOT_GROUNDED} (placement ref-far.step:1)`, false, true],
+    ]);
+    expect(referencePlacementChecks(live({ pending: [8] }), EMB)[0]!.measured).toContain("a move is pending");
+    expect(referencePlacementChecks(live({ transform: [[0, 1, 0, 0], [-1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]] }), EMB)[0]!.measured).toContain("its translation is [0, 0, 0] and it is turned");
+    expect(referencePlacementChecks(live({ extraFeature: "Box9" }), EMB)[0]!.measured).toBe("reference far.step was changed: Box9 is in its component");
+    // Renamed, it is still reported by its refs/ file.
+    expect(referencePlacementChecks(live({ name: "innocent", grounded: false }), EMB)[0]!.measured).toContain("reference far.step is not grounded (placement innocent:1)");
+  });
+
+  test("[A4] veto: the reference gate fails a moved reference (shared by refresh and verify), and a script feature naming a reference body ('Move1' of far) fails 'reference far.step is changed by feature Move1'", async () => {
+    const { ref, scriptSha } = refsPart([{ file: "far.step", step: "FAR", bodies: ["far"] }], { "far.step": "FAR" });
+    const design = { ...once(["Body1"], ["far"]), references: live({ grounded: false, transform: [I4[0], I4[1], I4[2], [1000, 0, 0, 1]] }) };
+    const g = await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, design);
+    const bad = failing(g.checks);
+    expect(bad).toContain(`where far.step: reference far.step ${REFERENCE_MOVED} (placement ref-far.step:1: its translation is [1000, 0, 0])`);
+    expect(bad).toContain(`grounded far.step: reference far.step ${REFERENCE_NOT_GROUNDED} (placement ref-far.step:1)`);
+    expect(failing((await referenceGate(interferenceStub([]).call as any, ref, ruled(["far.step"]), scriptSha, { ...once(["Body1"], ["far"]), references: live() })).checks)).toEqual([]);
+    const script = { commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "ref-far.step", file: "far.step", step: "FAR", body_names: ["far"] } } }, { command: "timeline.add", params: { feature: { bodies: ["far"], id: 10, name: "Move1", translate: ["300", "0", "0"], type: "move" } } }, { command: "timeline.add", params: { feature: { body_names: ["Body1"], name: "Plate", type: "extrude" } } }] };
+    expect(referenceEditChecks(script as any, new Map([["far", "far.step"]]))).toEqual([{ id: "changed far.step", expected: "no feature changes a reference", measured: "reference far.step is changed by feature Move1 (it names far)", ok: false, hard: true }]);
+    expect(referenceEditChecks({ commands: script.commands.filter((c) => c.params.feature.name !== "Move1") } as any, new Map([["far", "far.step"]]))).toEqual([]);
+  });
+
+  test("[A4] veto: a design body placed more than once is a hard fail 'body Body2 is placed 2 times; a design body may be placed once'; placed once passes", () => {
+    expect(designPlacementChecks(["Body1", "Body2"], { Body1: ["Body1"], Body2: ["Body2", "Body2 (Design2:2)"] })).toEqual([{ id: "placed body Body2", expected: "the body is placed once", measured: `body Body2 is placed 2 times; ${DESIGN_PLACED_ONCE} (Body2, Body2 (Design2:2))`, ok: false, hard: true }]);
+    expect(designPlacementChecks(["Body1"], { Body1: ["Body1"] })).toEqual([]);
   });
 });
 

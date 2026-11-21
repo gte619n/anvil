@@ -288,3 +288,187 @@ export function overlapVolume(reply: McpToolResult): number {
   const list: any[] = Array.isArray(reply.json?.interferences) ? reply.json.interferences : [];
   return list.reduce((s, x) => s + (typeof x?.volume_mm3 === "number" ? x.volume_mm3 : 0), 0);
 }
+
+// ── where a reference sits (`component.list`, real SolidCraft 0.44.1) ──────────────────────────────
+//
+// `file.insert_step` makes one component per import (named after the import feature, `ref-far.step`)
+// holding the import's bodies and the `BaseFeature`, placed once (`ref-far.step:1`) in the active
+// component, grounded, at the identity. `import_reference` imports with the DESIGN active (it refuses
+// otherwise), so a reference sits where its STEP file puts it: identity in the design, grounded. The
+// STEP's bytes are checked against `refs/` (above), so where the reference is was approved with the
+// file. `component.list` gives each placement's `transform` in its parent — a 4×4 matrix as 4 COLUMNS,
+// the translation in the last (`[[1,0,0,0],[0,1,0,0],[0,0,1,0],[1000,0,0,1]]` after
+// `occurrence.move {translate: [1000, 0, 0]}`) — its `grounded` flag, and `pending_moves` (occurrence
+// ids moved with `capture: false`, whose listed transform is not where they are).
+
+/** A placement's transform: 4 columns of 4 numbers (the translation is the last column). */
+export type Matrix4 = number[][];
+export const IDENTITY: Matrix4 = [
+  [1, 0, 0, 0],
+  [0, 1, 0, 0],
+  [0, 0, 1, 0],
+  [0, 0, 0, 1],
+];
+
+export interface LivePlacement {
+  id: number;
+  name: string;
+  /** The component it sits in (0 is the design). */
+  parent: number;
+  grounded: boolean;
+  transform: Matrix4;
+}
+
+export interface LiveComponent {
+  id: number;
+  name: string;
+  bodies: string[];
+  features: string[];
+  /** Its placements. */
+  occurrences: LivePlacement[];
+}
+
+export interface ComponentList {
+  active: number;
+  components: LiveComponent[];
+  /** Occurrence ids with a move not yet captured. */
+  pending: number[];
+}
+
+const isMatrix = (m: unknown): m is Matrix4 => Array.isArray(m) && m.length === 4 && m.every((c) => Array.isArray(c) && c.length === 4 && c.every((v) => typeof v === "number" && Number.isFinite(v)));
+
+/** `component.list` (not compact) → the components and their placements. A reply that is not that
+ *  shape throws: the gate fails closed when it cannot tell where a reference is. */
+export function readComponentList(j: any): ComponentList {
+  if (!Array.isArray(j?.components)) throw new Error("component.list answered no component list");
+  const components = j.components.map((c: any): LiveComponent => {
+    if (typeof c?.id !== "number" || typeof c?.name !== "string" || !Array.isArray(c?.bodies) || !Array.isArray(c?.features) || !Array.isArray(c?.occurrences)) {
+      throw new Error(`component.list answered a component without id, name, bodies, features and placements: ${JSON.stringify(c).slice(0, 160)}`);
+    }
+    const occurrences = c.occurrences.map((o: any): LivePlacement => {
+      if (typeof o?.id !== "number" || typeof o?.name !== "string" || typeof o?.parent !== "number" || typeof o?.grounded !== "boolean" || !isMatrix(o?.transform)) {
+        throw new Error(`component.list answered a placement without id, name, parent, grounded and a 4×4 transform: ${JSON.stringify(o).slice(0, 160)}`);
+      }
+      return { id: o.id, name: o.name, parent: o.parent, grounded: o.grounded, transform: o.transform };
+    });
+    return { id: c.id, name: c.name, bodies: c.bodies.map(String), features: c.features.map(String), occurrences };
+  });
+  const pending = Array.isArray(j.pending_moves) ? j.pending_moves.filter((x: unknown) => typeof x === "number") : undefined;
+  if (!pending || pending.length !== j.pending_moves.length) throw new Error("component.list answered no list of pending moves");
+  return { active: typeof j.active === "number" ? j.active : -1, components, pending };
+}
+
+/** a·b for column-major 4×4 matrices. */
+const mul = (a: Matrix4, b: Matrix4): Matrix4 => b.map((col) => [0, 1, 2, 3].map((r) => a[0]![r]! * col[0]! + a[1]![r]! * col[1]! + a[2]![r]! * col[2]! + a[3]![r]! * col[3]!));
+
+/** Where a placement is in the world: its transform after its parent's, up to the design. Undefined
+ *  when that cannot be told — a parent placed more than once (or not at all), a loop. */
+export function worldTransform(list: ComponentList, p: LivePlacement, depth = 0): Matrix4 | undefined {
+  if (p.parent === 0) return p.transform;
+  if (depth > 64) return undefined;
+  const parent = list.components.find((c) => c.id === p.parent);
+  if (!parent || parent.occurrences.length !== 1) return undefined;
+  const up = worldTransform(list, parent.occurrences[0]!, depth + 1);
+  return up && mul(up, p.transform);
+}
+
+const isIdentity = (m: Matrix4, tol = 1e-9): boolean => m.every((col, c) => col.every((v, r) => Math.abs(v - IDENTITY[c]![r]!) <= tol));
+
+export interface LiveReference {
+  component: number;
+  name: string;
+  bodies: string[];
+  /** Its import (BaseFeature) features, by name. */
+  imports: string[];
+  /** Any other feature in its component. */
+  others: string[];
+  placements: { id: number; name: string; grounded: boolean; pending: boolean; world?: Matrix4 }[];
+}
+
+/**
+ * The reference components of the live design: every component (not the design itself) holding an
+ * import feature (`BaseFeature` in the timeline) or a body one made. Found by what made them, never
+ * by name, so a renamed reference is still one.
+ */
+export function liveReferences(list: ComponentList, timeline: readonly any[], bodies: readonly any[]): LiveReference[] {
+  const importIds = new Set(timeline.filter((f) => f?.type === "BaseFeature").map((f) => f.id));
+  const importNames = new Set(timeline.filter((f) => f?.type === "BaseFeature" && typeof f.name === "string").map((f) => String(f.name)));
+  const importBodies = new Set(bodies.filter((b) => importIds.has(b?.feature) && typeof b?.name === "string").map((b) => String(b.name)));
+  return list.components
+    .filter((c) => c.id !== 0 && (c.features.some((f) => importNames.has(f)) || c.bodies.some((b) => importBodies.has(b))))
+    .map((c) => ({
+      component: c.id,
+      name: c.name,
+      bodies: c.bodies,
+      imports: c.features.filter((f) => importNames.has(f)),
+      others: c.features.filter((f) => !importNames.has(f)),
+      placements: c.occurrences.map((o) => {
+        const world = worldTransform(list, o);
+        return { id: o.id, name: o.name, grounded: o.grounded, pending: list.pending.includes(o.id), ...(world ? { world } : {}) };
+      }),
+    }));
+}
+
+/** The gate's wording when a reference is not where its import put it. */
+export const REFERENCE_MOVED = "was moved from where it was imported";
+export const REFERENCE_NOT_GROUNDED = "is not grounded";
+
+/** The name a live reference is reported by: the `refs/` file of its import, else its component. */
+export function referenceLabel(r: Pick<LiveReference, "imports" | "bodies" | "name">, embedded: readonly { file: string; name?: string; bodies: string[] }[] | undefined): string {
+  const e = embedded?.find((x) => x.name !== undefined && r.imports.includes(x.name)) ?? embedded?.find((x) => x.bodies.some((b) => r.bodies.includes(b)));
+  return e ? e.file : `component ${r.name}`;
+}
+
+const at = (m: Matrix4 | undefined): string => {
+  if (!m) return "where it is cannot be told";
+  const turned = !isIdentity([m[0]!, m[1]!, m[2]!, [0, 0, 0, 1]]);
+  return `its translation is [${m[3]!.slice(0, 3).map(fmt).join(", ")}]${turned ? " and it is turned" : ""}`;
+};
+
+/**
+ * Every reference must sit where its import put it — identity in the design — grounded, with no move
+ * pending and nothing else in its component. Hard fails: "reference far.step was moved from where it
+ * was imported", "reference far.step is not grounded", "reference far.step is not placed",
+ * "reference far.step was changed: … are in its component".
+ */
+export function referencePlacementChecks(refs: readonly LiveReference[], embedded: readonly { file: string; name?: string; bodies: string[] }[] | undefined): GateCheck[] {
+  const checks: GateCheck[] = [];
+  for (const r of [...refs].sort((a, b) => a.component - b.component)) {
+    const label = referenceLabel(r, embedded);
+    const fail = (what: string, measured: string) => checks.push({ id: `${what} ${label}`, expected: "the reference is where import_reference put it, grounded", measured, ok: false, hard: true });
+    if (r.placements.length === 0) fail("where", `reference ${label} is not placed`);
+    for (const p of r.placements) {
+      if (p.pending || !p.world || !isIdentity(p.world)) fail("where", `reference ${label} ${REFERENCE_MOVED} (placement ${p.name}: ${p.pending ? "a move is pending" : at(p.world)})`);
+      if (!p.grounded) fail("grounded", `reference ${label} ${REFERENCE_NOT_GROUNDED} (placement ${p.name})`);
+    }
+    if (r.others.length) fail("changed", `reference ${label} was changed: ${r.others.join(", ").slice(0, 200)} ${r.others.length === 1 ? "is" : "are"} in its component`);
+  }
+  return checks;
+}
+
+/**
+ * A feature of the design script that names a reference body — `solid.move {bodies: ["far"]}` moves
+ * the body inside its component, where no placement shows it. Every `timeline.add` that is not an
+ * import is read; a string naming a reference body anywhere in it is a hard fail "reference far.step
+ * is changed by feature Move1".
+ */
+export function referenceEditChecks(script: DesignScript | undefined, refBodies: ReadonlyMap<string, string>): GateCheck[] {
+  if (refBodies.size === 0) return [];
+  const checks: GateCheck[] = [];
+  const names = (v: unknown, depth = 0, out = new Set<string>()): Set<string> => {
+    if (typeof v === "string") {
+      if (refBodies.has(v)) out.add(v);
+    } else if (v && typeof v === "object" && depth < 16) for (const x of Array.isArray(v) ? v : Object.values(v)) names(x, depth + 1, out);
+    return out;
+  };
+  for (const c of Array.isArray(script?.commands) ? script!.commands : []) {
+    const cmd = c as { command?: unknown; params?: { feature?: Record<string, unknown> } };
+    const f = cmd?.params?.feature;
+    if (cmd?.command !== "timeline.add" || !f || f.type === "import") continue;
+    const hit = [...names(f)];
+    if (!hit.length) continue;
+    const labels = [...new Set(hit.map((b) => refBodies.get(b)!))].sort();
+    for (const l of labels) checks.push({ id: `changed ${l}`, expected: "no feature changes a reference", measured: `reference ${l} is changed by feature ${String(f.name ?? f.id ?? "?")} (it names ${hit.join(", ")})`, ok: false, hard: true });
+  }
+  return checks;
+}

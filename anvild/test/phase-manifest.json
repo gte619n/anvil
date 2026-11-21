@@ -536,7 +536,12 @@
             "every embedded import is checked (the second import of a file name) > [A4] re-review: a reference body no checked import accounts for fails naming it — a stray BaseFeature body; an uncovered import whose bytes match refs/ fails on its own line",
             "a reference may be placed once; interference checks every placement > [A4] re-review: placements are read from inspect.measure names_only (world name per placement, by definition); a reply without that shape throws",
             "a reference may be placed once; interference checks every placement > [A4] re-review: a reference placed twice (occurrence.copy of ref-far.step:1) is a hard fail 'reference far.step is placed 2 times; a reference may be placed once'; an imported body no import accounts for is named too; placed once passes",
-            "a reference may be placed once; interference checks every placement > [A4] re-review: the gate sends every placement by world name — the copy moved onto the plate is found, and the part fails on both the placement and the overlap"
+            "a reference may be placed once; interference checks every placement > [A4] re-review: the gate sends every placement by world name — the copy moved onto the plate is found, and the part fails on both the placement and the overlap",
+            "references stay where they were imported; every design placement is measured > [A4] veto: component.list is read in the real shape (4 columns, translation last; grounded; pending_moves); a reference is found by its import feature, so a renamed one ('innocent') is still one; a reply without that shape throws",
+            "references stay where they were imported; every design placement is measured > [A4] veto: a placement's world transform follows its parents (column-major); a parent placed twice cannot be told and counts as moved",
+            "references stay where they were imported; every design placement is measured > [A4] veto: un-grounded and moved 1000 mm away is a hard fail 'reference far.step was moved from where it was imported' and '…is not grounded'; a pending move, a turn and a feature in its component fail too; identity, grounded passes",
+            "references stay where they were imported; every design placement is measured > [A4] veto: the reference gate fails a moved reference (shared by refresh and verify), and a script feature naming a reference body ('Move1' of far) fails 'reference far.step is changed by feature Move1'",
+            "references stay where they were imported; every design placement is measured > [A4] veto: a design body placed more than once is a hard fail 'body Body2 is placed 2 times; a design body may be placed once'; placed once passes"
           ]
         },
         {
@@ -625,7 +630,8 @@
         {
           "file": "test/unit/cad-tools.test.ts",
           "names": [
-            "anvil_cad tools > [A4] re-review: execute and batch refuse placing a reference again — occurrence.copy or a component pattern of a ref- component, or of one named by id or path; the agent's own components still copy"
+            "anvil_cad tools > [A4] re-review: execute and batch refuse placing a reference again — occurrence.copy or a component pattern of a ref- component, or of one named by id or path; the agent's own components still copy",
+            "anvil_cad tools > [A4] veto: execute and batch refuse every command that changes a reference — ground, move, align, reparent, rename, delete, activate, copy, pattern, a feature on its body — found from the LIVE component list (renamed 'innocent' included; by name, world name, id or path); renaming to or from ref- is refused; reads and the design's own commands pass; an unreadable list sends nothing"
           ]
         }
       ],
@@ -648,6 +654,9 @@
             "real SolidCraft: references and the release pack > [A4] real: re-review — a SECOND import carrying the approved reference's file name (other STEP text: a 10 mm block at the origin, body far_b) added to design.json fails the gate ('duplicate reference import far.step', the overlap with far_b found); release_part writes nothing and verify-cli exits 1",
             "real SolidCraft: references and the release pack > [A4] real: re-review — the approved far.step reference copied onto the plate (occurrence.copy of ref-far.step:1, translate -100) fails the gate: 'reference far.step is placed 2 times' and Body1 overlaps far (ref-far.step:2) by 600 mm³; the agent's execute refuses the copy; release_part writes nothing and verify-cli exits 1",
             "real SolidCraft: references and the release pack > [A4] real: re-review — a copy of the far.step reference left in place, then moved onto the plate by the agent's occurrence.move of ref-far.step:2: placed twice fails at once, and after the move the overlap is found at the copy's final position",
+            "real SolidCraft: references and the release pack > [A4] real: veto — the only placement of an overlapping reference un-grounded (occurrence.ground false) and moved 1000 mm away (occurrence.move): the agent's execute refuses both; made past the tool, the gate fails 'reference block.step was moved from where it was imported' and '…is not grounded' although the overlap is gone, release_part writes nothing and verify-cli exits 1",
+            "real SolidCraft: references and the release pack > [A4] real: veto — renaming the reference's component (component.rename ref-far.step → innocent) is refused; made past the tool, the renamed reference is still found by its import: ground, copy, rename back to ref-, and solid.move of its body are refused, the gate still holds it ('reference far.step was moved…') and a body move past the tool fails ('…is changed by feature')",
+            "real SolidCraft: references and the release pack > [A4] real: veto — a design component placed twice (occurrence.copy of Design2, 500 mm away) fails the gate 'body Body2 is placed 2 times; a design body may be placed once', so the measurement, export and release never leave a copy out",
             "real SolidCraft: references and the release pack > [A4] real: re-review — after a refused import is rolled back, a read through execute (inspect.measure) does not lift the redo ceiling: redo is refused, design.json is unchanged and no BaseFeature comes back"
           ]
         }

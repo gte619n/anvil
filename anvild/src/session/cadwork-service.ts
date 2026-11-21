@@ -54,7 +54,7 @@ import {
 } from "../cadwork/partfile";
 import { exprNames } from "../cadwork/expr";
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
-import { embeddedReferences, importFeatureName, readRegularFile, referenceName, referenceOnDisk, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
+import { embeddedReferences, importFeatureName, liveReferences, readComponentList, readRegularFile, referenceName, referenceOnDisk, referencePlacementChecks, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR } from "../cadwork/refs";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
 import { canonicalBlock, checkPlanPart, keepsApproval, parseDeclared, planWrite, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
@@ -1054,6 +1054,10 @@ export class CadworkService {
     };
     try {
       // An earlier import of the same file is replaced (its feature deleted in the same batch).
+      // A reference is imported with the design active, so it lands at the identity in the design —
+      // where its STEP file puts it, which is where the gate holds it (refs.ts referencePlacementChecks).
+      const before = readComponentList((await slot.call("execute", { command: "component.list", params: {} })).json);
+      if (before.active !== 0) return fail(`import_reference: a reference is imported into the design itself, and component ${before.components.find((c) => c.id === before.active)?.name ?? before.active} is active; run execute component.activate {component: 0} first`);
       const old = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: false });
       const timeline: any[] = Array.isArray(old.json?.timeline) ? old.json.timeline : [];
       const prior = timeline.find((f) => f?.type === "BaseFeature" && f?.name === importFeatureName(name));
@@ -1068,7 +1072,14 @@ export class CadworkService {
       const bodies: string[] = Array.isArray(j?.created_bodies) ? j.created_bodies.map(String) : [];
       if (bodies.length === 0) return fail(`import_reference: SolidCraft imported refs/${name} but reported no bodies`);
       if (typeof j?.content_sha256 === "string" && j.content_sha256 !== sha256) return fail(`import_reference: SolidCraft embedded different bytes than refs/${name} holds (${String(j.content_sha256).slice(0, 12)} ≠ ${sha256.slice(0, 12)})`);
-      const record: PartReference = { name, source, sha256, bodies, at: new Date().toISOString() };
+      const after = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: true });
+      const list = readComponentList((await slot.call("execute", { command: "component.list", params: {} })).json);
+      const live = liveReferences(list, after.json?.timeline ?? [], after.json?.bodies ?? []).filter((r) => r.bodies.some((b) => bodies.includes(b)));
+      if (live.length !== 1 || live[0]!.placements.length !== 1) return fail(`import_reference: SolidCraft imported refs/${name} but its component could not be found once in the design`);
+      const misplaced = referencePlacementChecks(live, [{ file: name, name: importFeatureName(name), bodies }]);
+      if (misplaced.length) return fail(`import_reference: ${misplaced.map((c) => String(c.measured)).join("; ")}`);
+      const placed = list.components.find((c) => c.id === live[0]!.component)!.occurrences[0]!;
+      const record: PartReference = { name, source, sha256, bodies, placement: { transform: placed.transform, grounded: placed.grounded }, at: new Date().toISOString() };
       return { ok: true, bodies, replaced: !!prior, refs: (refs) => [...refs.filter((x) => x.name !== name), record], rollback, leftBehind };
     } catch (e) {
       return fail(`import_reference: ${e instanceof Error ? e.message : String(e)}`);

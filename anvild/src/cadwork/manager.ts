@@ -166,6 +166,13 @@ export interface CadRequest {
    * so two owner edits queued back to back each get their own measurement and their own `cad.design`.
    */
   refreshAfter?: boolean;
+  /**
+   * Runs INSIDE the same queue slot BEFORE a `mutate` request is sent: a reason refuses it (an error
+   * reply with that text; nothing is sent, nothing is written). The agent's execute / batch use it to
+   * refuse a command that names a reference, read from the live design in the same slot, so nothing
+   * can change the design between the check and the command.
+   */
+  before?: (slot: SlotContext) => Promise<string | undefined>;
 }
 
 export interface CadReply {
@@ -193,6 +200,9 @@ export interface SlotContext {
   scriptSha(): string | undefined;
   /** User parameters as of the last change. */
   params(): CadParamInfo[];
+  /** How many STEP imports (BaseFeature) the timeline held at the last snapshot — taken at start and
+   *  after every change — or undefined when it was never read. */
+  imports(): number | undefined;
   /** Record the gate's verdict for the script the process holds now (the refresh calls this). */
   setVerdict(verdict: PartVerdict): void;
   /**
@@ -279,6 +289,8 @@ interface PartRec {
   featureErrors: FeatureIssue[];
   featureWarnings: FeatureIssue[];
   params: CadParamInfo[];
+  /** How many import (BaseFeature) features the timeline had at the last snapshot; undefined until read. */
+  imports?: number;
   conflict: boolean;
   replayFailure?: string;
   waitingForSlot: boolean;
@@ -402,6 +414,11 @@ export class CadManager {
       if (req.kind === "read") {
         result = await this.call(rec, req.tool, args, timeout);
       } else {
+        const refused = req.kind === "mutate" && req.before ? await req.before(slot) : undefined;
+        if (refused !== undefined) {
+          const r = { isError: true, content: [{ type: "text", text: refused }], texts: [refused], text: refused, images: [] } as unknown as McpToolResult;
+          return { result: r, notes: slot.notes, reloaded: slot.reloaded, waitedForSlot: slot.waitedForSlot, wrote: false, state: this.stateOf(rec), scriptSha: rec.scriptSha };
+        }
         result = req.kind === "mutate" ? await this.call(rec, req.tool, args, timeout) : await this.undoRedo(rec, req.kind, timeout, slot.notes);
         wrote = await this.afterMutation(rec, result, req.kind, slot.notes);
         if (req.afterWrite) await req.afterWrite(slot, { result, wrote });
@@ -561,6 +578,7 @@ export class CadManager {
       state: () => this.stateOf(rec),
       scriptSha: () => rec.scriptSha,
       params: () => rec.params,
+      imports: () => rec.imports,
       setVerdict: (verdict) => {
         rec.verdict = { ...verdict, scriptSha: rec.scriptSha };
       },
@@ -909,6 +927,7 @@ export class CadManager {
     rec.redoDepth = Number(j.redo ?? 0);
     rec.revision = Number(j.revision ?? 0);
     const timeline: any[] = Array.isArray(j.timeline) ? j.timeline : [];
+    rec.imports = Array.isArray(j.timeline) ? timeline.filter((f) => f?.type === "BaseFeature").length : undefined;
     rec.featureErrors = timeline.filter((f) => f?.error).map((f) => ({ id: f.id, feature: String(f.name ?? f.id), message: String(f.error) }));
     rec.featureWarnings = timeline.filter((f) => f?.warning).map((f) => ({ id: f.id, feature: String(f.name ?? f.id), message: String(f.warning) }));
     const params: any[] = Array.isArray(j.params) ? j.params : [];

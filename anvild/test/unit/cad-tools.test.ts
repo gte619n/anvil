@@ -18,6 +18,8 @@ import {
   refusedCommand,
   refusedStep,
 } from "../../src/agent/cad-tools";
+import { referenceTargets, refusedReferenceChange } from "../../src/agent/cad-command-allow";
+import { liveReferences, readComponentList } from "../../src/cadwork/refs";
 import { registerCadProtectedRules } from "../../src/agent/cad-protected";
 import { CAD_OWNER_CARD_TOOL_IDS } from "../../src/agent/cad-tool-ids";
 import { isReadOnly } from "../../src/agent/danger-list";
@@ -40,15 +42,19 @@ const fake = (repo: string, extraEnv: Record<string, string> = {}, spawn = recor
 /** A manager stand-in that records what would have reached SolidCraft. */
 function recordingManager() {
   const requests: any[] = [];
+  const guards: ((slot: any) => Promise<string | undefined>)[] = [];
   const manager = {
     open: async () => ({ notes: [], reloaded: false, waitedForSlot: false, state: { status: "unverified", featureErrors: [], featureWarnings: [], conflict: false }, params: [], hasDesign: false }),
-    request: async (_ref: unknown, req: unknown) => {
-      requests.push(req);
+    request: async (_ref: unknown, req: any) => {
+      // The reference guard (`before`) runs in the real manager's slot; recorded apart from the request.
+      const { before, ...rest } = req;
+      if (before) guards.push(before);
+      requests.push(rest);
       return { result: { isError: false, content: [{ type: "text", text: "{}" }], texts: ["{}"], text: "{}", json: {}, images: [] }, notes: [], reloaded: false, waitedForSlot: false, wrote: false, state: { status: "unverified", featureErrors: [], featureWarnings: [], conflict: false } };
     },
     status: () => undefined,
   } as unknown as CadManager;
-  return { manager, requests };
+  return { manager, requests, guards };
 }
 
 describe("anvil_cad names and permission classes", () => {
@@ -407,6 +413,66 @@ describe("anvil_cad tools", () => {
     expect(many.isError).toBe(true);
     expect(many.text).toContain("step 2");
     expect(requests).toEqual([]);
+  });
+
+  test("[A4] veto: execute and batch refuse every command that changes a reference — ground, move, align, reparent, rename, delete, activate, copy, pattern, a feature on its body — found from the LIVE component list (renamed 'innocent' included; by name, world name, id or path); renaming to or from ref- is refused; reads and the design's own commands pass; an unreadable list sends nothing", async () => {
+    const I4 = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+    const occ = { component: 7, grounded: true, id: 8, name: "innocent:1", parent: 0, transform: I4 };
+    const list = { active: 0, components: [{ bodies: ["Body1"], children: [occ], features: ["Plate"], id: 0, name: "Untitled", occurrences: [] }, { bodies: ["far"], children: [], features: ["ref-far.step"], id: 7, name: "innocent", occurrences: [occ] }, { bodies: ["Body2"], children: [], features: ["Box2"], id: 10, name: "Bracket", occurrences: [{ ...occ, component: 10, id: 11, name: "Bracket:1", grounded: false }] }], pending_moves: [] };
+    const design = { timeline: [{ id: 2, name: "Plate", type: "ExtrudeFeature" }, { id: 9, name: "ref-far.step", type: "BaseFeature" }, { id: 12, name: "Box2", type: "BoxFeature" }], bodies: [{ feature: 2, name: "Body1" }, { feature: 9, name: "far" }, { feature: 12, name: "Body2" }] };
+    const targets = referenceTargets(liveReferences(readComponentList(list), design.timeline, design.bodies), (r) => r.imports[0] ?? r.name);
+    const refused: [string, Record<string, unknown>][] = [
+      ["occurrence.ground", { occurrence: "innocent:1", grounded: false }],
+      ["occurrence.ground", { occurrence: 8, grounded: false }],
+      ["occurrence.move", { occurrence: "INNOCENT:1 ", translate: [1000, 0, 0] }],
+      ["occurrence.move", { occurrence: "Bracket:1", path: [8], translate: [1, 0, 0] }],
+      ["occurrence.align", { occurrence: "innocent:1", to: { face: [0, 0, 0] } }],
+      ["occurrence.reparent", { occurrence: "innocent:1", parent: 10 }],
+      ["occurrence.reparent", { occurrence: "Bracket:1", parent: 7 }],
+      ["component.rename", { component: "innocent", name: "x" }],
+      ["component.rename", { component: 7, name: "x" }],
+      ["component.delete", { component: "innocent" }],
+      ["component.activate", { component: 7 }],
+      ["solid.move", { bodies: ["far"], translate: [-100, 0, 0] }],
+      ["solid.combine", { target: "Body1", tools: ["far (innocent:1)"], operation: "cut" }],
+      ["body.rename", { body: "far", name: "x" }],
+      ["sketch.draw.dimensioned", { command: "occurrence.ground", params: { occurrence: "innocent:1" } }], // nested
+    ];
+    for (const [command, params] of refused) expect(refusedReferenceChange(command, params, targets)).toContain("may not change the reference ref-far.step");
+    expect(refusedReferenceChange("occurrence.copy", { component: "innocent" }, targets)).toContain("a reference may be placed once");
+    expect(refusedReferenceChange("solid.pattern.rectangular", { components: [7], count1: 2 }, targets)).toContain("a reference may be placed once");
+    for (const [command, params] of [["component.rename", { component: "Bracket", name: "ref-bracket" }], ["component.rename", { component: "ref-ghost", name: "x" }], ["component.create", { name: " Ref-x " }]] as [string, Record<string, unknown>][]) {
+      expect(refusedReferenceChange(command, params, targets)).toContain("may not");
+    }
+    for (const [command, params] of [
+      ["inspect.interference", { bodies: ["Body1", "far"] }],
+      ["inspect.measure", { bodies: ["far"] }],
+      ["occurrence.properties", { occurrence: "innocent:1" }],
+      ["component.list", {}],
+      ["occurrence.move", { occurrence: "Bracket:1", translate: [10, 0, 0] }],
+      ["occurrence.ground", { occurrence: 11 }],
+      ["component.rename", { component: "Bracket", name: "Holder" }],
+      ["solid.box", { length: 8, width: 8, height: 8, corner: [7, 8, 0] }], // numbers that are not ids
+    ] as [string, Record<string, unknown>][])
+      expect(refusedReferenceChange(command, params, targets)).toBeUndefined();
+
+    // Through the tools: the guard runs in the request's slot, reading the live list.
+    const { manager, guards } = recordingManager();
+    const tools = callable(cadTools({ sessionId: "s", worktree: tempRepo(), manager, unavailable: () => undefined, offerFile: () => true, ...STUB_GATE_DEPS }) as any);
+    await tools.open_part!({ part: "plate" });
+    const answer = (json: unknown, isError = false) => ({ isError, content: [], texts: [], text: isError ? "boom" : "", json, images: [] });
+    const slot = (listOk = true, imports: number | undefined = 1) => ({ imports: () => imports, call: async (tool: string, args: any) => (tool === "inspect_design" ? answer(design) : args?.command === "component.list" ? (listOk ? answer(list) : answer(undefined, true)) : answer({})) });
+    await tools.execute!({ command: "occurrence.ground", params: { occurrence: "innocent:1", grounded: false } });
+    expect(await guards.at(-1)!(slot())).toContain("may not change the reference ref-far.step");
+    await tools.batch!({ commands: [BOX(), { command: "occurrence.move", params: { occurrence: 8, translate: [1000, 0, 0] } }] });
+    expect(await guards.at(-1)!(slot())).toContain("step 2: `occurrence.move` may not change the reference ref-far.step");
+    await tools.execute!({ command: "occurrence.move", params: { occurrence: "Bracket:1", translate: [1, 0, 0] } });
+    expect(await guards.at(-1)!(slot())).toBeUndefined();
+    expect(await guards.at(-1)!(slot(false))).toContain("the design's references could not be read");
+    expect(await guards.at(-1)!(slot(false, undefined))).toContain("the design's references could not be read"); // never snapshotted: read
+    expect(await guards.at(-1)!(slot(false, 0))).toBeUndefined(); // no import in the timeline: nothing to read, nothing is a reference
+    await tools.execute!({ command: "component.rename", params: { component: "Bracket", name: "ref-bracket" } });
+    expect(await guards.at(-1)!(slot(false, 0))).toContain('names starting with "ref-" belong to imported references');
   });
 
   test("[A1] execute and batch are default-deny: only allow-listed command ids run, and a new unknown id is refused", async () => {

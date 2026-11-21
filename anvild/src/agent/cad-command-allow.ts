@@ -166,6 +166,97 @@ export function refusedReferenceCopy(cmd: string, params: unknown): string | und
   return undefined;
 }
 
+/** The references of the live design as the tools see them: every name and id that addresses one
+ *  (its component, its placements, its bodies), from `component.list` — never from a name prefix. */
+export interface ReferenceTargets {
+  /** Lower-cased, trimmed names → the reference they address (as reported). */
+  names: Map<string, string>;
+  /** Component and occurrence ids → the reference. */
+  ids: Map<number, string>;
+}
+
+/** Build the targets from `liveReferences` (../cadwork/refs.ts). `label` names a reference to the agent. */
+export function referenceTargets<R extends { component: number; name: string; bodies: string[]; placements: { id: number; name: string }[] }>(refs: readonly R[], label: (r: R) => string = (r) => r.name): ReferenceTargets {
+  const names = new Map<string, string>();
+  const ids = new Map<number, string>();
+  for (const r of refs) {
+    const l = label(r);
+    for (const n of [r.name, ...r.bodies, ...r.placements.map((p) => p.name)]) names.set(n.trim().toLowerCase(), l);
+    ids.set(r.component, l);
+    for (const p of r.placements) ids.set(p.id, l);
+  }
+  return { names, ids };
+}
+
+/** Commands that only read: they may name a reference (to measure it, check against it). */
+const READS_REFERENCES = ["inspect.", "model.", "view."];
+const READ_IDS = new Set(["occurrence.properties", "component.properties", "component.list", "component.metadata", "material.list", "material.inspect", "document.inspect", "expr.evaluate", "parameters.list", "parameters.graph", "parameters.users", "parameters.complete"]);
+/** Parameter names whose NUMBERS are component or occurrence ids (a path is a list of them). */
+const ID_KEYS = new Set(["occurrence", "occurrences", "component", "components", "path", "parent", "parent_path", "target", "targets", "source", "sources", "tool", "tools", "id", "ids"]);
+
+const REFERENCE_FIXED = "a reference stays where import_reference put it, as it was imported (re-import it to change it; model the part around it)";
+
+/**
+ * Why a step may not be sent given the live design's references, or undefined. Any command that is
+ * not a read and names a reference — its component, a placement or a body, by name, world name
+ * (`far (ref-far.step:1)`), id or path — is refused: ground, move, align, reparent, rename, delete,
+ * activate, copy, pattern, a feature on its body. Renaming or creating a component with a `ref-` name
+ * is refused too (that name is the import's). Nested commands are checked under their own id.
+ */
+export function refusedReferenceChange(command: unknown, params: unknown, refs: ReferenceTargets, nesting = 0): string | undefined {
+  const cmd = norm(command);
+  if (nesting > 6) return "commands are nested too deeply";
+  const p = (params && typeof params === "object" && !Array.isArray(params) ? params : {}) as Record<string, unknown>;
+  if ((cmd === "component.rename" || cmd === "component.create") && typeof p.name === "string" && p.name.trim().toLowerCase().startsWith(REFERENCE_PREFIX)) {
+    return `\`${cmd}\` may not name a component ${JSON.stringify(p.name.slice(0, 80))}: names starting with "${REFERENCE_PREFIX}" belong to imported references`;
+  }
+  if (cmd === "component.rename" && typeof p.component === "string" && p.component.trim().toLowerCase().startsWith(REFERENCE_PREFIX)) {
+    return `\`${cmd}\` may not rename ${JSON.stringify(p.component.slice(0, 80))}: ${REFERENCE_FIXED}`;
+  }
+  const reads = READ_IDS.has(cmd) || READS_REFERENCES.some((f) => cmd.startsWith(f));
+  let hit: string | undefined;
+  const walk = (v: unknown, key: string, depth: number): string | undefined => {
+    if (depth > 12) return `\`${cmd}\`: parameters are nested too deeply`;
+    if (typeof v === "string") {
+      if (reads) return undefined;
+      const s = v.trim().toLowerCase();
+      const world = /\(([^()]*)\)\s*$/.exec(s)?.[1]?.trim(); // `far (ref-far.step:2)`: the placement inside
+      hit = refs.names.get(s) ?? (world !== undefined ? refs.names.get(world) : undefined);
+      return undefined;
+    }
+    if (typeof v === "number") {
+      if (!reads && ID_KEYS.has(key)) hit = refs.ids.get(v) ?? hit;
+      return undefined;
+    }
+    if (!v || typeof v !== "object") return undefined;
+    if (Array.isArray(v)) {
+      for (const x of v) {
+        const why = walk(x, key, depth + 1);
+        if (why) return why;
+        if (hit) return undefined;
+      }
+      return undefined;
+    }
+    const obj = v as Record<string, unknown>;
+    if (typeof obj.command === "string") {
+      const why = refusedReferenceChange(obj.command, obj.params, refs, nesting + 1);
+      if (why) return why;
+    }
+    for (const [k, x] of Object.entries(obj)) {
+      if (typeof obj.command === "string" && (k === "command" || k === "params")) continue;
+      const why = walk(x, k.toLowerCase(), depth + 1);
+      if (why) return why;
+      if (hit) return undefined;
+    }
+    return undefined;
+  };
+  const why = walk(p, "", 0);
+  if (why) return why;
+  if (!hit) return undefined;
+  if (cmd === "occurrence.copy" || /^solid\.pattern\./.test(cmd)) return `\`${cmd}\` may not place the reference ${hit} again: a reference may be placed once (import it with import_reference)`;
+  return `\`${cmd}\` may not change the reference ${hit}: ${REFERENCE_FIXED}`;
+}
+
 /**
  * Why one step may not be sent, or undefined. Checks the command id, every command nested inside its
  * params at any depth (`sketch.draw.dimensioned` carries one), and the params themselves:

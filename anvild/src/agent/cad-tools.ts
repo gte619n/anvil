@@ -33,7 +33,9 @@ import type { CadManager, CadReply, PartState } from "../cadwork/manager";
 import type { McpToolResult } from "../cadwork/mcp-client";
 import { EXPORTS_DIR, listParts, partRef, type PartRef } from "../cadwork/partfolder";
 import { DESIGN_FILE } from "../cadwork/poststep";
-import { refusedStep } from "./cad-command-allow";
+import { liveReferences, readComponentList } from "../cadwork/refs";
+import type { SlotContext } from "../cadwork/manager";
+import { referenceTargets, refusedReferenceChange, refusedStep } from "./cad-command-allow";
 import { CAD_MCP_SERVER_NAME } from "./cad-tool-ids";
 
 export { CAD_COMMAND_ALLOW, isAllowedCommand, refusedCommand, refusedStep } from "./cad-command-allow";
@@ -170,15 +172,43 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind: "read" }));
     });
   /** A MODELING call: refused on a dimensioned part that has no expectations yet (spec §4.5). */
-  const mutate = (name: string, args: Record<string, unknown>, kind: "mutate" | "undo" | "redo" = "mutate", modeling = true) =>
+  const mutate = (name: string, args: Record<string, unknown>, kind: "mutate" | "undo" | "redo" = "mutate", modeling = true, before?: (slot: SlotContext) => Promise<string | undefined>) =>
     guarded(async () => {
       const ref = selected();
       if (modeling) {
         const refused = deps.modelingRefusal(ref);
         if (refused) return fail(refused);
       }
-      return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind }));
+      return replyContent(ref, await deps.manager.request(ref, { tool: name, args, kind, ...(before ? { before } : {}) }));
     });
+  /**
+   * The reference check for execute / batch, run in the request's own queue slot just before it is
+   * sent: the references are read from the LIVE design (`component.list` + the timeline — a component
+   * an import made, whatever it is called now), and any step that names one is refused. Fails closed:
+   * a design whose components cannot be read sends nothing.
+   */
+  const referenceGuard = (steps: { command: unknown; params?: unknown }[]) => async (slot: SlotContext): Promise<string | undefined> => {
+    let targets = referenceTargets([]);
+    // No import in the timeline (the manager's snapshot after the last change): nothing to read.
+    if (slot.imports() !== 0) {
+      try {
+        const d = await slot.call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: true });
+        if (d.isError || !d.json) throw new Error(d.text.slice(0, 200) || "inspect_design failed");
+        const timeline: any[] = Array.isArray(d.json.timeline) ? d.json.timeline : [];
+        const bodies: any[] = Array.isArray(d.json.bodies) ? d.json.bodies : [];
+        const l = await slot.call("execute", { command: "component.list", params: {} });
+        if (l.isError || !l.json) throw new Error(l.text.slice(0, 200) || "component.list failed");
+        targets = referenceTargets(liveReferences(readComponentList(l.json), timeline, bodies), (r) => r.imports[0] ?? r.name);
+      } catch (e) {
+        return `the design's references could not be read (${e instanceof Error ? e.message : String(e)}), so nothing was sent`;
+      }
+    }
+    for (const [i, step] of steps.entries()) {
+      const why = refusedReferenceChange(step.command, step.params, targets);
+      if (why) return steps.length > 1 ? `step ${i + 1}: ${why}` : why;
+    }
+    return undefined;
+  };
   /** Drop keys the agent may not set (paths), and undefined ones. */
   const clean = (args: Record<string, unknown>, drop: string[] = []): Record<string, unknown> =>
     Object.fromEntries(Object.entries(args).filter(([k, v]) => v !== undefined && !drop.includes(k)));
@@ -239,7 +269,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
       async (a) => {
         const why = refusedStep(a.command, a.params);
         if (why) return fail(why);
-        return mutate("execute", clean({ command: a.command, params: a.params ?? {}, verbose: a.verbose }));
+        return mutate("execute", clean({ command: a.command, params: a.params ?? {}, verbose: a.verbose }), "mutate", true, referenceGuard([a]));
       },
     ),
     tool(
@@ -258,7 +288,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
           const why = refusedStep(step.command, step.params);
           if (why) return fail(`step ${i + 1}: ${why}`);
         }
-        return mutate("batch", clean({ commands: a.commands, verbose: a.verbose ?? false, expect: a.expect, coalesce_parameters: a.coalesce_parameters, rollback: a.rollback }));
+        return mutate("batch", clean({ commands: a.commands, verbose: a.verbose ?? false, expect: a.expect, coalesce_parameters: a.coalesce_parameters, rollback: a.rollback }), "mutate", true, referenceGuard(a.commands));
       },
     ),
     tool(
