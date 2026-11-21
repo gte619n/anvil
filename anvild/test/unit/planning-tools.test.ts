@@ -21,7 +21,7 @@ const byName = (deps: PlanningToolDeps) => new Map(planningTools(deps).map((t) =
 const text = (r: any) => r.content[0].text as string;
 
 test("PLANNING_TOOL_IDS are the namespaced planning-session tools", () => {
-  expect(PLANNING_TOOL_IDS).toEqual(["mcp__anvil_planning__save_plan", "mcp__anvil_planning__run_pipeline"]);
+  expect(PLANNING_TOOL_IDS).toEqual(["mcp__anvil_planning__save_plan", "mcp__anvil_planning__run_pipeline", "mcp__anvil_planning__save_cad_expectations"]);
 });
 
 test("save_plan forwards the plan + ready flag and confirms the save", async () => {

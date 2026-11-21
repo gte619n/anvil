@@ -59,6 +59,13 @@ import type { AdversaryMetrics } from "../pipeline/metrics";
 import type { PhaseDeps } from "../pipeline/phases";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { buildPlanningToolsServer } from "../agent/planning-tools";
+import type { AgentFn, ChecksFn, OpenPrFn } from "../pipeline/phases";
+import { gitToplevel } from "../cadwork/partfolder";
+import { changedParts, type VerifyResult } from "../cadwork/verify";
+import { approvalPrint, approvedFingerprint, checkPlanPart, planExpectationRows, replaceNote, replacesApproval, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
+import { repoKey } from "../cadwork/locks";
+import type { CadExpectationsRow } from "@protocol";
+import { approvalChangedRefusal, CAD_BUILDS_WITH_GO, cadCardSha, cadStartRefusal, cadStatusOf, coveredParts, judgeCadVerify, needsCad, NEEDS_APPROVED_DIMENSIONS, processProblem, type CadCardContext, type CadJudgement } from "../integrations/autopilot-cad";
 import type { PushPayload } from "../push/webpush";
 import { slugify } from "./slug";
 import { BadCommand } from "./errors";
@@ -150,7 +157,11 @@ export interface AutopilotDeps {
     autonomy?: AutonomyPolicy | undefined;
     brief: string;
     workUnitId?: string | undefined;
-    workUnitRole?: "planner" | undefined;
+    workUnitRole?: "planner" | "builder" | undefined;
+    /** Runs after the session is created and stamped and BEFORE its first turn (Phase B3: a builder's
+     *  worktree gets the plan's approved CAD numbers). A throw aborts the handoff: the session is
+     *  removed and the error is the caller's. */
+    prepare?: ((s: { id: string; cwd: string }) => Promise<void> | void) | undefined;
   }) => { id: string; title: string; cwd: string } | Promise<{ id: string; title: string; cwd: string }>;
   /** Degraded-machine read model (§4.6) — suppresses the scheduled run with one alert per episode. */
   authDegraded: () => boolean;
@@ -162,7 +173,62 @@ export interface AutopilotDeps {
   broadcastLoops: () => void;
   /** Arm a run-until-done `/goal` on a freshly-created build session (Supervisor owns goal state). */
   armGoal: (sessionId: string, condition: string) => void;
+  /** Phase B3: the CAD service (applies a plan's approved numbers, verifies a builder's worktree, raises
+   *  the planner's owner cards). Absent (or disabled): a plan that touches CAD cannot start here. */
+  cadwork?: AutopilotCadwork;
+  /** Post a daemon-written markdown notice into a session's chat (the Supervisor's). Absent: none. */
+  notice?: (sessionId: string, markdown: string) => void;
+  /** Test seams for the dev pipeline's model calls and PR opener (production: the real ones). */
+  devPipeline?: { agent?: AgentFn; openPr?: (branch: string) => OpenPrFn };
 }
+
+/** What the autopilot needs from the CAD service (structurally `CadworkService`). */
+export interface AutopilotCadwork {
+  readonly enabled: boolean;
+  applyPlanExpectations(worktree: string, part: string, entry: PlanPartExpectations, sessionId?: string): Promise<{ ok: true } | { ok: false; error: string }>;
+  verifyParts(worktree: string, opts: { parts?: string[]; changedSince?: string }): Promise<VerifyResult>;
+  settleParts(worktree: string, parts: string[]): Promise<void>;
+  approvalOf(worktree: string, part: string): { approvedBy: string } | undefined;
+  /** The part's CURRENT repo-wide approval, for a plan card's "old" side and the start checks (decision 183). */
+  approvedNumbers(worktree: string, part: string): ApprovedNumbers | undefined;
+  /** The process ids in the worktree's cad/rules.json (`null`: none readable). */
+  processIds(worktree: string): string[] | null;
+  askPlanCard(sessionId: string, cwd: string, part: string, rows: CadExpectationsRow[], opts: { note?: string; stale: () => boolean }): Promise<"approved" | "denied" | "stale">;
+}
+
+/** The commit a worktree's HEAD is at, or undefined. */
+function gitHead(cwd: string): string | undefined {
+  const r = Bun.spawnSync(["git", "-C", cwd, "rev-parse", "--verify", "HEAD"], { stdout: "pipe", stderr: "pipe" });
+  return r.exitCode === 0 ? r.stdout.toString().trim() || undefined : undefined;
+}
+/** The notice a builder's chat gets when the CAD verify blocks its unit (item 5). */
+export function builderBlockedNotice(reason: string, phase: "turn" | "goal"): string {
+  return [
+    `**Autopilot: this task is blocked by the CAD verify.** ${reason}`,
+    "",
+    phase === "goal" ? "The goal ended unmet: a design is never approved by more autonomous attempts." : "The task stays blocked until a turn's verify passes.",
+    "To continue: fix the design (or have its numbers re-planned and approved in a planning session), then reply in this session. The builder resumes, its next turn is verified again, and a pass puts the task back to building. (There is no separate Unblock button for autopilot tasks; replying here is how to resume.)",
+  ].join("\n");
+}
+
+/** The name of the branch a repo's main checkout is on (what "the default branch" means on a card).
+ *  Cached per repo: it is a label, and cards are redrawn on every broadcast. */
+const branchNames = new Map<string, string>();
+function defaultBranchOf(repo: string): string {
+  const hit = branchNames.get(repo);
+  if (hit) return hit;
+  const name = readBranch(repo);
+  if (branchNames.size > 200) branchNames.clear();
+  branchNames.set(repo, name);
+  return name;
+}
+function readBranch(repo: string): string {
+  const r = Bun.spawnSync(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], { stdout: "pipe", stderr: "pipe" });
+  const b = r.exitCode === 0 ? r.stdout.toString().trim() : "";
+  return b && b !== "HEAD" ? b : "the default branch";
+}
+/** A persisted auto-start hold that only said "needs approved dimensions" is cleared once they are approved. */
+const clearCadHold = (hold: WorkUnit["hold"]): { hold?: undefined } => (hold?.reason.startsWith(NEEDS_APPROVED_DIMENSIONS) ? { hold: undefined } : {});
 
 export class AutopilotService {
   /** Work-unit + schedule stores — owned by this domain, constructed over stateDir. */
@@ -324,7 +390,24 @@ export class AutopilotService {
 
   /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
   private autopilotPlanInfo(u: WorkUnit): AutopilotPlanInfo {
-    return toPlanInfo(u, this.deps.envStore.get(u.environmentId)?.name, this.deps.renderer);
+    const env = this.deps.envStore.get(u.environmentId);
+    return toPlanInfo(u, env?.name, this.deps.renderer, needsCad(u) ? this.cadCardContext(env?.repoRoot, env?.defaultBase) : undefined);
+  }
+
+  /**
+   * What a plan card reads from the repo (decision 183): each part's CURRENT approval (the repo-wide lock
+   * entry — every worktree of the repo shares it), the processes in cad/rules.json, and the default
+   * branch's name for the "will show as unverified" note. Undefined when CAD is off or there is no repo.
+   */
+  private cadCardContext(repo: string | undefined, defaultBase?: string): CadCardContext | undefined {
+    const cad = this.deps.cadwork;
+    if (!cad?.enabled || !repo) return undefined;
+    const base = (defaultBase ?? "").replace(/^origin\//, "").trim();
+    return {
+      approved: (part) => cad.approvedNumbers(repo, part),
+      processes: cad.processIds(repo),
+      defaultBranch: base && base !== "HEAD" ? base : defaultBranchOf(repo),
+    };
   }
 
   /** The §6.3 adversary calibration metrics for the Models settings card. */
@@ -340,6 +423,17 @@ export class AutopilotService {
       plans: this.pendingPlans().map((u) => this.autopilotPlanInfo(u)),
     };
   }
+  /**
+   * Mark a work unit blocked, with the reason the card shows (the agent browser's `request_human`
+   * in an unattended builder session: "needs a human: <reason>"). Returns false for an unknown unit.
+   */
+  blockUnit(workUnitId: string, blockedReason: string): boolean {
+    if (!this.workUnits.get(workUnitId)) return false;
+    this.workUnits.update(workUnitId, { status: "blocked", blockedReason });
+    this.broadcastAutopilotPlans();
+    return true;
+  }
+
   private broadcastAutopilotPlans(): void {
     this.deps.registry.toAll(this.autopilotPlansEvent());
     this.deps.broadcastLoops(); // proposals/pipelines feed the Loops panel — keep it in lockstep with the grid
@@ -396,6 +490,7 @@ export class AutopilotService {
   async startPlanningSession(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (this.starting.has(u.id)) throw new BadCommand("this plan is already starting");
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a live session");
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
@@ -433,6 +528,7 @@ export class AutopilotService {
       sessionId,
       savePlan: (plan, ready) => this.plannerSavePlan(sessionId, plan, ready),
       runPipeline: () => this.plannerRunPipeline(sessionId),
+      saveCadExpectations: (input) => this.plannerSaveCad(sessionId, input),
     });
   }
 
@@ -456,10 +552,359 @@ export class AutopilotService {
    *  Fire-and-forget — progress streams to the Autopilot screen; returns once the run is launched. */
   private plannerRunPipeline(sessionId: string): string {
     const u = this.plannerUnit(sessionId);
+    // Refused HERE (not inside the fire-and-forget run) so the planner's tool call reports it.
+    if (needsCad(u)) throw new BadCommand(`run_pipeline refused: ${CAD_BUILDS_WITH_GO}. This plan builds CAD parts: save their numbers with save_cad_expectations and have the owner start it with Go.`);
     void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) }).catch((e) => {
       this.broadcastRunProgress(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`);
     });
     return `Started the review→development→testing pipeline for “${u.title}”. It builds in a fresh worktree and opens a PR; watch the Autopilot screen for progress.`;
+  }
+
+  /**
+   * `save_cad_expectations` (Phase B3): a planning session asks to lock ONE part's expected numbers onto
+   * its work unit. Validated exactly like `record_expectations` (declared literal parameters, shape,
+   * caps, every formula evaluating), then ALWAYS shown to the owner on a typed `plan` card drawn from a
+   * snapshot of what the unit holds for that part now; approving writes exactly the entry shown. If the
+   * unit's numbers for the part change while the card is open, the approval is refused and the card is
+   * redrawn (up to three times — decisions 153, 161).
+   */
+  private async plannerSaveCad(sessionId: string, input: { part: unknown; process: unknown; parameters: unknown; expectations: unknown }): Promise<string> {
+    const u = this.plannerUnit(sessionId);
+    const cad = this.deps.cadwork;
+    if (!cad?.enabled) throw new BadCommand("save_cad_expectations: CAD (cad-work) is not enabled on this machine");
+    // As respondCad: once its builder is running, the numbers it was started with are fixed.
+    if (this.isBuilding(u)) throw new BadCommand("save_cad_expectations refused: this plan is already building; its numbers can no longer change");
+    const c = checkPlanPart(input.part, { process: input.process, parameters: input.parameters, expectations: input.expectations });
+    if (!c.ok) throw new BadCommand(`save_cad_expectations refused: ${c.error}`);
+    const part = input.part as string;
+    const cwd = this.deps.require(sessionId).data.cwd;
+    const repo = gitToplevel(cwd) ?? cwd;
+    const bad = processProblem(c.entry.process, cad.processIds(repo));
+    if (bad) throw new BadCommand(`save_cad_expectations refused: cad/${part}: ${bad}`);
+    // The card's "old" side is what is APPROVED for the part now — the repo-wide approval — not the unit's
+    // earlier entry (decisions 153, 183). It is part of what the card shows, so a change to it redraws.
+    const approvedNow = () => cad.approvedNumbers(repo, part);
+    const shown = (): string => {
+      const now_ = this.workUnits.get(u.id);
+      return JSON.stringify([now_?.cadExpectations?.[part] ?? null, now_?.cadExpectationsStatus ?? null, approvedFingerprint(approvedNow())]);
+    };
+    const env = this.deps.envStore.get(u.environmentId);
+    const branch = this.cadCardContext(env?.repoRoot ?? repo, env?.defaultBase)?.defaultBranch ?? "the default branch";
+    for (let round = 0; round < 3; round++) {
+      const drawn = shown();
+      const approved = approvedNow();
+      const note = [
+        `The autopilot builder for “${u.title}” will be held to exactly these numbers. Approving locks them onto the plan.`,
+        ...(approved && replacesApproval(c.entry, approved) ? [replaceNote(part, branch)] : []),
+      ].join(" ");
+      const answer = await cad.askPlanCard(sessionId, cwd, part, planExpectationRows(c.entry, approved), {
+        note,
+        stale: () => shown() !== drawn,
+      });
+      if (answer === "denied") return `The owner did not approve the numbers for cad/${part}; nothing was saved.`;
+      if (answer === "stale" || shown() !== drawn) continue; // something on the card changed: ask again with what is there now
+      const latest = this.workUnits.get(u.id);
+      if (!latest) throw new BadCommand("the work unit is gone");
+      const at = new Date().toISOString();
+      // The approval the card's "old" side showed (unchanged since it was drawn): a start is refused once it changes.
+      const record = { ...(latest.cadExpectations ?? {}), [part]: { ...c.entry, approvedAt: at, approvedOver: approvalPrint(approvedNow()) } };
+      const status = cadStatusOf(record);
+      this.workUnits.update(u.id, {
+        cadExpectations: record,
+        cadExpectationsStatus: status,
+        cadExpectationsSource: "planner",
+        needsCad: true,
+        ...(status === "approved" ? { cadExpectationsApprovedAt: at } : {}),
+        ...clearCadHold(latest.hold),
+      });
+      this.broadcastAutopilotPlans();
+      const waiting = Object.keys(record).filter((p) => !record[p]!.approvedAt);
+      return `The owner approved the numbers for cad/${part}; they are locked onto “${u.title}”.${waiting.length ? ` Still awaiting the owner's approval: ${waiting.map((p) => `cad/${p}`).join(", ")}.` : ""}`;
+    }
+    return `The numbers for cad/${part} kept changing while the owner was being asked; nothing was saved.`;
+  }
+
+  /**
+   * Approve or reject the CAD numbers on a unit's card (`autopilot.cad.respond`, §4.14 item 41). `sha`
+   * is what the card was drawn from: if the numbers changed since (a re-plan, a planning session's
+   * save), nothing is approved, the grid is redrawn, and the owner sees the new numbers. Approval
+   * locks every part exactly as an interactive `save_cad_expectations` does; Reject leaves the unit
+   * unable to start ("needs approved dimensions") until a planning session supplies new numbers.
+   */
+  respondCad(workUnitId: string, approve: boolean, sha: unknown, cid?: string): AutopilotPlanResultEvent {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const parts = coveredParts(u);
+    if (!parts.length) throw new BadCommand("this plan has no CAD numbers to approve — open Plan with Claude to supply them");
+    if (this.isBuilding(u)) throw new BadCommand("this plan is already building; its numbers can no longer change");
+    const env = this.deps.envStore.get(u.environmentId);
+    const ctx = this.cadCardContext(env?.repoRoot, env?.defaultBase);
+    // The card's identity covers its "old" side too (each part's current approval): a newer approval
+    // elsewhere while the card is open refuses this answer and redraws (decision 153).
+    if (typeof sha !== "string" || sha !== cadCardSha(u.cadExpectations, ctx)) {
+      this.broadcastAutopilotPlans(); // redraw every card from what is there now
+      throw new BadCommand("the CAD numbers changed while the card was open; nothing was approved — review the redrawn card");
+    }
+    const at = new Date().toISOString();
+    if (approve) {
+      for (const p of parts) {
+        const c = checkPlanPart(p, u.cadExpectations![p]);
+        if (!c.ok) throw new BadCommand(`cannot approve: ${c.error}`);
+        const bad = processProblem(c.entry.process, ctx?.processes);
+        if (bad) throw new BadCommand(`cannot approve: cad/${p}: ${bad}`);
+      }
+      // Each part's approval the card was drawn over (its sha matched above): a start is refused once it changes.
+      const record = Object.fromEntries(parts.map((p) => [p, { ...u.cadExpectations![p]!, approvedAt: at, approvedOver: approvalPrint(ctx?.approved(p)) }]));
+      this.workUnits.update(u.id, { cadExpectations: record, cadExpectationsStatus: "approved", cadExpectationsApprovedAt: at, ...clearCadHold(u.hold) });
+    } else {
+      const record = Object.fromEntries(
+        parts.map((p) => {
+          const { approvedAt: _a, approvedOver: _o, ...rest } = u.cadExpectations![p]!;
+          return [p, rest];
+        }),
+      );
+      this.workUnits.update(u.id, { cadExpectations: record, cadExpectationsStatus: "rejected", cadExpectationsApprovedAt: undefined });
+    }
+    this.broadcastAutopilotPlans();
+    return { v: PROTOCOL_VERSION, type: "autopilot.plan", ts: now(), ...(cid ? { cid } : {}), plan: this.autopilotPlanInfo(this.workUnits.get(u.id)!) };
+  }
+
+  /**
+   * Store PROPOSED CAD numbers on a unit (the nightly planner's channel, §4.14 item 41, and a re-plan).
+   * Malformed parts are dropped with a note on the card; a unit with any proposal (even a malformed
+   * one) needs CAD, so it cannot start until valid numbers are approved.
+   */
+  proposeCadExpectations(workUnitId: string, fields: Partial<WorkUnit>): void {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    const { needsCad, cadExpectations, cadExpectationsSource, cadNote } = fields;
+    this.workUnits.update(u.id, {
+      needsCad: !!needsCad,
+      cadExpectations: cadExpectations && Object.keys(cadExpectations).length ? cadExpectations : undefined,
+      cadExpectationsStatus: cadExpectations && Object.keys(cadExpectations).length ? "proposed" : undefined,
+      cadExpectationsSource: cadExpectationsSource ?? "nightly",
+      cadExpectationsApprovedAt: undefined,
+      cadNote,
+    });
+    this.broadcastAutopilotPlans();
+  }
+
+  /** The unit's builder (or linked session) is running: its numbers are fixed. A builder the verify
+   *  blocked is still running (it resumes when the owner replies, item 5). */
+  private isBuilding(u: WorkUnit): boolean {
+    return (u.status === "building" || u.status === "blocked") && this.liveSession(u.sessionId);
+  }
+
+  /** A session that can still take turns: it exists and is not archived. (A session's process exiting does
+   *  not end it — the next prompt respawns it — so only archival does.) */
+  private liveSession(id: string | undefined): boolean {
+    const s = id ? this.deps.getSession(id) : undefined;
+    return !!s && !s.data.archived;
+  }
+
+  /**
+   * Starts in flight (decision 183 (c)): taken synchronously BEFORE `startPlan`'s first await and dropped
+   * in its `finally` — by then a successful start has set the unit's `sessionId` and status, so the live
+   * builder's hold (`holdsParts`) takes over with no gap. Keyed by unit id; carries the repo identity and
+   * parts it reserves. Two Go clicks (on one unit, or on two units over the same part) cannot both pass.
+   */
+  private readonly starting = new Map<string, { title: string; repo: string; parts: string[] }>();
+
+  /** The repo identity approvals are stored under (`repoKey`) for an environment, memoized per call site. */
+  private repoKeyOf(environmentId: string | undefined, memo?: Map<string, string | undefined>): string | undefined {
+    const root = (environmentId ? this.deps.envStore.get(environmentId) : undefined)?.repoRoot;
+    if (!root) return undefined;
+    if (memo?.has(root)) return memo.get(root);
+    let key: string | undefined;
+    try {
+      key = repoKey(root);
+    } catch {
+      key = root;
+    }
+    memo?.set(root, key);
+    return key;
+  }
+
+  /**
+   * A unit's builder HOLDS its planned parts while: the unit is `building` or `blocked`, its `sessionId`
+   * names a session that exists, is not archived, and is that unit's builder. A unit that is completed,
+   * dismissed, expired or in review releases its parts; so does one whose session moved on (another
+   * session, archived, gone).
+   */
+  private holdsParts(other: WorkUnit): boolean {
+    if (!other.sessionId || (other.status !== "building" && other.status !== "blocked")) return false;
+    const s = this.deps.getSession(other.sessionId);
+    return !!s && !s.data.archived && s.data.workUnitRole === "builder" && s.data.workUnitId === other.id;
+  }
+
+  /**
+   * Decision 183 (c): another unit's builder — live (`holdsParts`) or starting (`starting`) — holds one of
+   * these parts of the same repo. Two builders on one part would each replace the other's approval (it is
+   * one per repo and part).
+   */
+  private partHeldBy(u: WorkUnit, parts: string[]): string | undefined {
+    if (!parts.length) return undefined;
+    const memo = new Map<string, string | undefined>();
+    const repo = this.repoKeyOf(u.environmentId, memo);
+    if (!repo) return undefined;
+    const held = (part: string, title: string) => `cad/${part} is being built by “${title}” — finish, dismiss or archive that session first`;
+    for (const [id, r] of this.starting) {
+      if (id === u.id || r.repo !== repo) continue;
+      const p = r.parts.find((x) => parts.includes(x));
+      if (p) return held(p, r.title);
+    }
+    for (const other of this.workUnits.list()) {
+      if (other.id === u.id || !this.holdsParts(other)) continue;
+      const p = coveredParts(other).find((x) => parts.includes(x));
+      if (p && this.repoKeyOf(other.environmentId, memo) === repo) return held(p, other.title);
+    }
+    return undefined;
+  }
+
+  /** Why a CAD unit cannot start NOW beyond its own numbers (decision 183): a process the repo's rules do
+   *  not define, an approval that changed after the plan's, or another live builder on the same part. */
+  private cadStartStop(u: WorkUnit, repo: string, defaultBase?: string): string | undefined {
+    const parts = coveredParts(u);
+    if (!parts.length) return undefined;
+    const ctx = this.cadCardContext(repo, defaultBase);
+    if (!ctx) return undefined; // CAD off: refused by the caller
+    for (const p of parts) {
+      const bad = processProblem(u.cadExpectations![p]!.process, ctx.processes);
+      if (bad) return `this plan cannot start: cad/${p}: ${bad}`;
+    }
+    const held = this.partHeldBy(u, parts);
+    if (held) return `this plan cannot start: ${held}`;
+    const changed = approvalChangedRefusal(u, ctx.approved);
+    if (changed) return `this plan cannot start: ${changed}`;
+    return undefined;
+  }
+
+  /** The parts an autopilot builder session may work on: its unit's planned parts (`[]` when the unit is
+   *  gone or plans none). `undefined` for a session that is not linked to a work unit as its builder
+   *  (every Go session is: startPlan stamps both the role and the unit). */
+  builderParts(sessionId: string): string[] | undefined {
+    const s = this.deps.getSession(sessionId);
+    if (s?.data.workUnitRole !== "builder" || !s.data.workUnitId) return undefined;
+    const u = this.workUnits.get(s.data.workUnitId);
+    return u ? coveredParts(u) : [];
+  }
+
+  /** Per builder session: the verify runs one at a time (turn end and goal resolution can overlap). */
+  private readonly verifyChains = new Map<string, Promise<unknown>>();
+
+  /**
+   * The verify hook (Phase B3, §4.11): when a builder session's turn ends, and again when its goal is
+   * judged, verify every part its worktree's diff touches since the unit's base — plus every part the
+   * plan covers — in fresh SolidCraft processes (`cadwork.verifyParts`), after the daemon has measured
+   * them (`settleParts`). Not OK (a fail, a gap, an adoption pending, unverified, a touched part with no
+   * plan numbers, a part whose numbers are the agent's own, rules.json changed, or the check could not
+   * run) → the unit is `blocked` with the reason. OK → `cadVerified {at, parts}`. A builder whose
+   * worktree touches no CAD and whose plan covers none: nothing to do (undefined).
+   */
+  async verifyBuilder(sessionId: string, phase: "turn" | "goal"): Promise<CadJudgement | undefined> {
+    const prev = this.verifyChains.get(sessionId) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(() => this.verifyBuilderNow(sessionId, phase));
+    this.verifyChains.set(sessionId, run);
+    try {
+      return await run;
+    } finally {
+      if (this.verifyChains.get(sessionId) === run) this.verifyChains.delete(sessionId);
+    }
+  }
+
+  /** The goal's deterministic half: the verify result OVERRIDES the judge. Not OK → the goal is unmet. */
+  async builderGoalCheck(sessionId: string): Promise<{ met: false; reason: string } | undefined> {
+    const j = await this.verifyBuilder(sessionId, "goal").catch((e) => ({ ok: false, reason: `the CAD check failed to run: ${e instanceof Error ? e.message : String(e)}`, parts: [] }) as CadJudgement);
+    return j && !j.ok ? { met: false, reason: `CAD verify: ${j.reason}` } : undefined;
+  }
+
+  private async verifyBuilderNow(sessionId: string, phase: "turn" | "goal"): Promise<CadJudgement | undefined> {
+    const s = this.deps.getSession(sessionId);
+    if (!s || s.data.workUnitRole !== "builder" || !s.data.workUnitId) return undefined;
+    const u = this.workUnits.get(s.data.workUnitId);
+    if (!u) return undefined;
+    const planned = coveredParts(u);
+    const block = (reason: string): CadJudgement => {
+      this.blockForCad(u.id, reason, phase, sessionId);
+      return { ok: false, reason, parts: [] };
+    };
+    const worktree = gitToplevel(s.data.cwd);
+    if (!worktree) return planned.length ? block("the builder's folder is not a git worktree, so its CAD parts cannot be verified") : undefined;
+    if (!u.cadBase) return planned.length ? block("no base commit was recorded for this build, so its CAD parts cannot be verified") : undefined;
+    let changed: ReturnType<typeof changedParts>;
+    try {
+      changed = changedParts(worktree, u.cadBase);
+    } catch (e) {
+      return block(`the CAD check could not read the worktree's changes: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (!planned.length && !changed.parts.length && !changed.rulesChanged && !changed.unexpected.length) return undefined; // no CAD in this build
+    const cad = this.deps.cadwork;
+    if (!cad?.enabled) return block("this build touches cad/, but CAD (cad-work) is not enabled on this machine");
+    await cad.settleParts(worktree, [...new Set([...planned, ...changed.parts])]);
+    const r = await cad.verifyParts(worktree, { changedSince: u.cadBase, ...(planned.length ? { parts: planned } : {}) });
+    const j = judgeCadVerify(r, { covered: planned, approvalOf: (p) => cad.approvalOf(worktree, p), unexpected: changed.unexpected });
+    if (!j.ok) {
+      this.blockForCad(u.id, j.reason!, phase, sessionId);
+      return j;
+    }
+    this.passForCad(u.id, j.parts, sessionId);
+    return j;
+  }
+
+  /**
+   * Block a unit on a builder's CAD verify, with the reason on its card. The LATEST verify is what the
+   * unit shows (B3 review, item 5): `cadVerified` is cleared, and the builder's chat gets ONE notice per
+   * new reason saying how to go on. The goal precheck is unchanged — the first failing goal check ends
+   * the goal unmet (no number of further autonomous attempts can approve a design) — but the session
+   * stays live: the owner fixes the design (or re-plans its numbers) and replies in the session, and the
+   * next turn's verify puts the unit back to `building` when it passes. There is no separate "Unblock"
+   * button for autopilot units; replying in the builder's session is the way to resume.
+   */
+  private blockForCad(workUnitId: string, reason: string, phase: "turn" | "goal", sessionId: string): void {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) return;
+    const repeat = u.status === "blocked" && u.cadBlocked?.reason === reason;
+    this.workUnits.update(workUnitId, { status: "blocked", blockedReason: `CAD: ${reason}`, cadBlocked: { at: new Date().toISOString(), reason }, cadVerified: undefined });
+    console.warn(`[autopilot] “${u.title}” blocked by the CAD verify (${phase}): ${reason}`);
+    if (u.status !== "blocked") void this.tagTasks(u, "blocked");
+    if (!repeat) this.deps.notice?.(sessionId, builderBlockedNotice(reason, phase));
+    this.broadcastAutopilotPlans();
+  }
+
+  /** A builder's verify passed: stamp `cadVerified`, clear a stale `cadBlocked`, and — while the builder
+   *  is live — return a unit the CAD verify had blocked to `building` (item 5). */
+  private passForCad(workUnitId: string, parts: string[], sessionId: string): void {
+    const u = this.workUnits.get(workUnitId);
+    if (!u) return;
+    const resume = u.status === "blocked" && !!u.blockedReason?.startsWith("CAD: ") && u.sessionId === sessionId && this.liveSession(sessionId);
+    this.workUnits.update(workUnitId, {
+      cadVerified: { at: new Date().toISOString(), parts },
+      cadBlocked: undefined,
+      ...(resume ? { status: "building" as const, blockedReason: undefined } : {}),
+    });
+    if (resume) {
+      void this.tagTasks(u, "building");
+      this.deps.notice?.(sessionId, "**Autopilot:** the CAD verify passes again, so this task is back to *building*.");
+    }
+    this.broadcastAutopilotPlans();
+  }
+
+  /** The dev pipeline's CAD check (§4.11) for a unit with no CAD in its plan: undefined when its diff
+   *  does not touch cad/. */
+  private async pipelineCadCheck(worktree: string, base: string | undefined): Promise<CadJudgement | undefined> {
+    if (!base) return { ok: false, reason: "the pipeline worktree has no base commit to compare against", parts: [] };
+    let changed: ReturnType<typeof changedParts>;
+    try {
+      changed = changedParts(worktree, base);
+    } catch (e) {
+      return { ok: false, reason: `the CAD check could not read the worktree's changes: ${e instanceof Error ? e.message : String(e)}`, parts: [] };
+    }
+    if (!changed.parts.length && !changed.rulesChanged && !changed.unexpected.length) return undefined;
+    const cad = this.deps.cadwork;
+    if (!cad?.enabled) return { ok: false, reason: "the change touches cad/, but CAD (cad-work) is not enabled on this machine", parts: [] };
+    await cad.settleParts(worktree, changed.parts);
+    const r = await cad.verifyParts(worktree, { changedSince: base });
+    return judgeCadVerify(r, { approvalOf: (p) => cad.approvalOf(worktree, p), unexpected: changed.unexpected });
   }
 
   /** Resolve + validate a planning session's work unit (guards the save_plan/run_pipeline tools). */
@@ -1016,6 +1461,7 @@ export class AutopilotService {
   async startPlan(workUnitId: string, model?: Model, autonomy?: AutonomyPolicy, cid?: string): Promise<AutopilotStartedEvent> {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (this.starting.has(u.id)) throw new BadCommand("this plan is already starting");
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a running session");
     // A held unit's "plan" is just its open questions — building it would implement nothing useful. Force
     // the reviewer to answer them first, in a "Plan with Claude" session, before it can start.
@@ -1023,28 +1469,68 @@ export class AutopilotService {
     // Server-side propose-don't-run: the web hides Start for proposals, but the gate must hold for ANY
     // client — an unapproved event-triggered unit never builds without an explicit approve.
     if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
+    // Phase B3 / item 41: a plan that touches CAD starts only with owner-approved numbers (Go and auto-start).
+    const cadRefusal = cadStartRefusal(u);
+    if (cadRefusal) throw new BadCommand(`this plan ${cadRefusal}`);
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the plan's environment no longer exists");
+    const planned = coveredParts(u);
+    const cad = this.deps.cadwork;
+    if (planned.length && !cad?.enabled) throw new BadCommand("this plan builds CAD parts, but CAD (cad-work) is not enabled on this machine");
+    const cadStop = this.cadStartStop(u, env.repoRoot, env.defaultBase);
+    if (cadStop) throw new BadCommand(cadStop);
     const brief = this.autopilotBrief(u);
     // Seed the build session with a `/goal` derived from the plan so it self-verifies to completion — the
     // Stop hook keeps it going until a judge agrees the plan is actually built + the checks pass, rather
     // than stopping the instant the model claims it's done (loop-engineering: run-until-done).
     const goalCondition = buildAutopilotGoal(u);
-    const { id } = await this.deps.handoffCreate({
-      environmentId: env.id,
-      source: "fresh-worktree",
-      title: u.title,
-      model: model ?? "opus",
-      autonomy: autonomy ?? "bypass",
-      brief,
-    });
-    // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
-    this.workUnits.update(u.id, { sessionId: id, status: "building", hold: undefined, ...(goalCondition ? { goalCondition } : {}) });
-    this.clearVerificationOnBuild(u.id); // real work is starting → a stale "Likely complete" must not linger
-    if (goalCondition) this.deps.armGoal(id, goalCondition);
-    void this.tagTasks(u, "building");
-    this.broadcastAutopilotPlans();
-    return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
+    // Reserved synchronously, before the first await (everything above is synchronous): a second Go on
+    // this unit, or on another unit over the same part, is refused until this start settles.
+    this.starting.set(u.id, { title: u.title, repo: this.repoKeyOf(u.environmentId) ?? env.repoRoot, parts: planned });
+    try {
+      let cadBase: string | undefined;
+      const { id } = await this.deps.handoffCreate({
+        environmentId: env.id,
+        source: "fresh-worktree",
+        title: u.title,
+        model: model ?? "opus",
+        autonomy: autonomy ?? "bypass",
+        brief,
+        // The Go session is the unit's BUILDER (§4.11): unattended, owner cards denied, CAD verified.
+        workUnitId: u.id,
+        workUnitRole: "builder",
+        // Before the builder's first turn: record its base and write the plan's approved numbers into its
+        // NEW worktree (part.json + the declared parameters + the lock store, approvedBy "planner").
+        prepare: async ({ id: sid, cwd }) => {
+          const root = gitToplevel(cwd) ?? cwd;
+          cadBase = gitHead(root);
+          if (!planned.length) return;
+          if (!cadBase) throw new BadCommand("the build worktree has no commit, so its CAD parts could not be verified; nothing was started");
+          for (const part of planned) {
+            const r = await cad!.applyPlanExpectations(root, part, u.cadExpectations![part]!, sid);
+            if (!r.ok) throw new BadCommand(`could not apply the plan's numbers for cad/${part}: ${r.error}`);
+          }
+        },
+      });
+      // Clear any auto-start hold — a human is deliberately starting it now — and record the seeded goal.
+      this.workUnits.update(u.id, {
+        sessionId: id,
+        status: "building",
+        hold: undefined,
+        ...(goalCondition ? { goalCondition } : {}),
+        ...(cadBase ? { cadBase } : {}),
+        cadVerified: undefined,
+        cadBlocked: undefined,
+        ...(u.blockedReason?.startsWith("CAD: ") ? { blockedReason: undefined } : {}),
+      });
+      this.clearVerificationOnBuild(u.id); // real work is starting → a stale "Likely complete" must not linger
+      if (goalCondition) this.deps.armGoal(id, goalCondition);
+      void this.tagTasks(u, "building");
+      this.broadcastAutopilotPlans();
+      return { v: PROTOCOL_VERSION, type: "autopilot.started", ts: now(), ...(cid ? { cid } : {}), workUnitId: u.id, sessionId: id };
+    } finally {
+      this.starting.delete(u.id);
+    }
   }
 
   /** Link a plan to an existing session that's already doing the work, instead of spawning a new one
@@ -1053,10 +1539,19 @@ export class AutopilotService {
   linkPlan(workUnitId: string, sessionId: string, cid?: string): AutopilotStartedEvent {
     const u = this.workUnits.get(workUnitId);
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
+    if (this.starting.has(u.id)) throw new BadCommand("this plan is already starting");
     if (u.sessionId && this.deps.hasSession(u.sessionId)) throw new BadCommand("this plan already has a running session");
     if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
+    // Phase B3: the same start gate as Go (numbers approved), and then some: a CAD unit is built ONLY by
+    // the builder Go creates (its numbers applied before its first turn, its turns verified) — a linked
+    // session is never that builder, so a CAD unit cannot be linked at all (decision 182).
+    const cadRefusal = cadStartRefusal(u);
+    if (cadRefusal) throw new BadCommand(`this plan ${cadRefusal}`);
     const session = this.deps.getSession(sessionId);
     if (!session) throw new BadCommand("no such session");
+    if (needsCad(u) && !(session.data.workUnitRole === "builder" && session.data.workUnitId === u.id)) {
+      throw new BadCommand(`this plan builds CAD parts and cannot be linked: CAD units build with Go (a linked session is not the unit's builder, so its numbers would be neither applied nor verified)`);
+    }
     if (session.data.environmentId !== u.environmentId) throw new BadCommand("that session belongs to a different environment");
     // A human deliberately linking the plan to live work clears any auto-start hold (mirrors startPlan).
     this.workUnits.update(u.id, { sessionId, status: "building", hold: undefined });
@@ -1305,17 +1800,7 @@ export class AutopilotService {
           const cap = opts.maxAutoStart ?? 3;
           for (const u of autoStartable.slice(0, cap)) {
             try {
-              if (pipeline) {
-                // Long-running (all 7 gates, both models, opens a PR). Fire in the background with its own
-                // budget so one slow unit can't pin the scheduled run open; progress + status update live.
-                emit(`🔬 Pipeline “${u.title}”…`);
-                void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) })
-                  .then((o) => emit(`  “${u.title}” → ${o.status} (reached ${o.phaseReached}).`))
-                  .catch((e) => emit(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`));
-              } else {
-                await this.startPlan(u.id);
-                emit(`🚀 Started “${u.title}”.`);
-              }
+              await this.autoStartUnit(u, !!pipeline, emit);
               started++;
               startedUnitIds.add(u.id);
             } catch (e) {
@@ -1363,6 +1848,27 @@ export class AutopilotService {
   }
 
   /**
+   * Auto-start one unit (the scheduled run's auto-start): through the dev pipeline when `pipeline`, else
+   * with Go. A CAD unit never goes through the pipeline (decision 182): with the pipeline selected it falls
+   * back to Go, whose start gate (approved numbers, no other live builder on its parts) still applies — a
+   * refusal there throws, and the unit stays planned, reported like any failed start.
+   */
+  private async autoStartUnit(u: WorkUnit, pipeline: boolean, emit: (line: string) => void): Promise<void> {
+    if (pipeline && needsCad(u)) emit(`↪ “${u.title}” builds CAD parts — ${CAD_BUILDS_WITH_GO}; starting it with Go instead.`);
+    if (pipeline && !needsCad(u)) {
+      // Long-running (all 7 gates, both models, opens a PR). Fire in the background with its own
+      // budget so one slow unit can't pin the scheduled run open; progress + status update live.
+      emit(`🔬 Pipeline “${u.title}”…`);
+      void this.runDevPipeline(u.id, { signal: AbortSignal.timeout(PIPELINE_RUN_BUDGET_MS) })
+        .then((o) => emit(`  “${u.title}” → ${o.status} (reached ${o.phaseReached}).`))
+        .catch((e) => emit(`⚠ Pipeline “${u.title}” failed: ${e instanceof Error ? e.message : String(e)}`));
+      return;
+    }
+    await this.startPlan(u.id);
+    emit(`🚀 Started “${u.title}”.`);
+  }
+
+  /**
    * Run the autonomous dev pipeline (§4) for a planned work unit: intake → the tier-selected gauntlet,
    * in a fresh worktree, with the environment's validation commands as the P4 gate and the existing
    * git/gh ops opening the PR at P6. Both models run through the Agent SDK (GLM via OpenRouter's
@@ -1374,6 +1880,10 @@ export class AutopilotService {
     if (!u) throw new BadCommand(`no such work unit: ${workUnitId}`);
     if (u.status === "needs-clarification") throw new BadCommand("this plan needs clarification — open a planning session (Plan with Claude) to answer its open questions before running the pipeline");
     if (u.status === "proposed") throw new BadCommand("this plan is a proposal awaiting approval — approve it first (autopilot.approve)");
+    // Decision 182: the implementer has no CAD tools, so a unit whose plan covers any part (or says it
+    // needs CAD) is never run here, by any entry point (Run pipeline, the planner's run_pipeline, a loop's
+    // pipeline body, auto-start). It is built by Go's builder, whose numbers are applied and verified.
+    if (needsCad(u)) throw new BadCommand(`${CAD_BUILDS_WITH_GO}: this plan builds CAD parts — start it with Go`);
     const env = this.deps.envStore.get(u.environmentId);
     if (!env) throw new BadCommand("the work unit's environment no longer exists");
     if (!(process.env[OPENROUTER_KEY] ?? "").trim()) throw new BadCommand("the dev pipeline needs an OpenRouter key — set one in Settings → Models");
@@ -1388,16 +1898,41 @@ export class AutopilotService {
     this.deps.broadcastLoops();
     try {
       const glmSlug = this.deps.adversarial.models.find((m) => /glm/i.test(m));
+      // §4.11: when the diff touches cad/, the in-process CAD verify runs FIRST in the checks. It is added
+      // here in code, so the repo's EnvironmentValidation cannot remove it; a failure stops the run
+      // (through its own abort signal) and maps the outcome to `blocked` instead of looping on a design
+      // the implementer has no tools to model.
+      const cadBase = gitHead(cwd);
+      const cadAbort = new AbortController();
+      const signal = opts.signal ? AbortSignal.any([opts.signal, cadAbort.signal]) : cadAbort.signal;
+      let cadFailure: string | undefined;
+      const repoChecks = env.validation?.commands?.length ? envChecks(env.validation.commands) : undefined;
+      const checks: ChecksFn = async (root, sig) => {
+        const cadVerdict = await this.pipelineCadCheck(root, cadBase);
+        if (cadVerdict && !cadVerdict.ok) {
+          cadFailure = cadVerdict.reason;
+          log(`✗ CAD verify: ${cadVerdict.reason}`);
+          cadAbort.abort();
+          return { lintTypesBuild: "fail" };
+        }
+        return repoChecks ? repoChecks(root, sig) : {};
+      };
       const deps: PhaseDeps = {
         task: { id: u.id, text: workUnitTaskText(u) },
         repoRoot: cwd,
         ...(glmSlug ? { glmSlug } : {}),
-        agent: defaultAgent,
-        ...(env.validation?.commands?.length ? { checks: envChecks(env.validation.commands) } : {}),
-        openPr: gitPrOpener(branch),
+        agent: this.deps.devPipeline?.agent ?? defaultAgent,
+        checks,
+        openPr: (this.deps.devPipeline?.openPr ?? gitPrOpener)(branch),
         captureDiff: captureGitDiff,
       };
-      const outcome = await executeDevPipeline(deps, { metrics: this.devPipelineMetrics, log, signal: opts.signal });
+      let outcome = await executeDevPipeline(deps, { metrics: this.devPipelineMetrics, log, signal });
+      if (cadFailure) {
+        outcome = { ...outcome, status: "blocked", phaseReached: "verification", reason: `CAD verify failed: ${cadFailure}` };
+        this.workUnits.update(u.id, { cadBlocked: { at: new Date().toISOString(), reason: cadFailure }, cadVerified: undefined });
+      } else if (this.workUnits.get(u.id)?.cadBlocked) {
+        this.workUnits.update(u.id, { cadBlocked: undefined }); // the latest run's CAD check did not fail
+      }
       const mapped = pipelineStatusToUnit(outcome);
       this.workUnits.update(u.id, {
         devPipeline: { status: outcome.status, phaseReached: outcome.phaseReached, ...(outcome.reason ? { reason: outcome.reason } : {}), trace: outcome.trace },

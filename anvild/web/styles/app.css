@@ -319,6 +319,38 @@ html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
 .header-branch:hover { border-color: var(--accent); color: var(--text); }
 .header-branch .msym { font-size: 15px; color: var(--accent); }
 .header-branch .hb-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+/* MCP integrations: the session Tools chip (lit when one is on) + the Settings → Integrations rows. */
+.header-tools.on { border-color: var(--accent); color: var(--text); }
+.header-tools .hb-name { font-family: inherit; }
+.mcp-row-actions { margin-left: auto; display: inline-flex; gap: 6px; flex-shrink: 0; }
+.mcp-row .mcp-health, .mcp-row .mcp-held, .mcp-row .mcp-transport { margin-top: 6px; overflow-wrap: anywhere; }
+.mcp-row .mcp-held { display: flex; align-items: center; gap: 4px; }
+.mcp-row .mcp-held .msym { font-size: 15px; }
+.mcp-row .mcp-toggle[aria-checked="true"] .msym { color: var(--accent); }
+.mcp-server-head { margin: 10px 0 8px; }
+.mcp-row .mcp-browser-mode, .mcp-row .mcp-browser-proxy { margin-top: 6px; display: flex; align-items: center; gap: 4px; overflow-wrap: anywhere; }
+.mcp-row .mcp-browser-mode .msym, .mcp-row .mcp-browser-proxy .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-row .mcp-browser-proxy.bad { color: var(--danger); }
+.mcp-row .mcp-browser-runtime { margin-top: 6px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; overflow-wrap: anywhere; }
+.mcp-row .mcp-browser-runtime .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-row .mcp-browser-runtime.bad { color: var(--danger); }
+.mcp-runner-warning { display: flex; align-items: center; gap: 4px; color: var(--warn); margin-top: 6px; }
+.mcp-runner-warning .msym { font-size: 15px; flex-shrink: 0; }
+.mcp-runner-warning[hidden] { display: none; }
+.browser-site-row .card-main { display: flex; align-items: center; gap: 6px; }
+.browser-site-add-row { margin-top: 8px; gap: 6px; }
+.browser-site-add-row input { flex: 1; min-width: 0; }
+.browser-sites-pending { display: flex; align-items: center; gap: 4px; }
+.browser-loggedin-row .card-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.browser-loggedin-row .browser-loggedin-unlock[aria-checked="true"] { color: var(--danger); border-color: var(--danger); }
+.mcp-row .mcp-browser-open-row { margin-top: 8px; }
+.bubble.permission .perm-reason { margin-top: 8px; font-weight: 600; overflow-wrap: anywhere; }
+.bubble .perm-shot { display: block; max-width: 100%; max-height: 320px; margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; cursor: zoom-in; }
+.bubble.human-request .human-reason { margin: 6px 0; overflow-wrap: anywhere; }
+.bubble.human-request .perm-btns { display: flex; margin-top: 8px; }
+.mcp-warning { display: flex; align-items: center; gap: 6px; }
+.modal-box label[hidden] { display: none; } /* [hidden] loses to `.modal-box label { display: block }` — the Add-integration dialog swaps its Command/URL rows */
+.mcp-warning .msym { font-size: 16px; color: var(--danger); }
 @media (max-width: 700px) { .header-branch { max-width: 16ch; } }
 #header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .hbtn { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; cursor: pointer; color: var(--text); font: inherit; }
@@ -1355,8 +1387,8 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 .cad-hud { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: linear-gradient(var(--bg), transparent); pointer-events: none; z-index: 2; }
 .cad-name { font-weight: 600; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cad-units { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
-.cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: nowrap; justify-content: center; max-width: calc(100% - 24px); overflow-x: auto; scrollbar-width: none; }
+.cad-units { font-size: 11px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+.cad-tools { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); z-index: 3; flex-wrap: nowrap; justify-content: safe center; max-width: calc(100% - 24px); overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
 .cad-tools::-webkit-scrollbar { display: none; }
 .cad-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: none; background: transparent; color: var(--text); border-radius: 8px; cursor: pointer; }
 .cad-btn:hover { background: var(--tool-bg); }
@@ -1399,3 +1431,102 @@ html.is-android #conversation .att-img { -webkit-touch-callout: none; -webkit-us
 .cad-snap-item:hover { background: var(--tool-bg); }
 /* Toast */
 .cad-toast { position: absolute; bottom: 110px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 999px; font-size: 12px; z-index: 7; animation: modal-fade 0.15s ease; }
+
+/* ── CAD live mode (agent-cad-and-browser §4.9): Follow / Paused bar, parameters sheet, gate strip ── */
+.cad-live { position: absolute; top: 44px; right: 12px; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; max-width: calc(100% - 24px); z-index: 3; font-size: 12px; }
+.cad-live button, .cad-live select { min-height: 32px; padding: 4px 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text); font: inherit; cursor: pointer; }
+.cad-live-follow.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cad-live-behind { padding: 4px 9px; border-radius: 999px; background: var(--warn); color: #1a1c20; font-weight: 600; }
+.cad-live-busy { padding: 4px 9px; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
+.cad-live-busy.waiting { color: var(--text); border-color: var(--warn); }
+.cad-live-error { flex-basis: 100%; text-align: right; color: var(--danger); overflow-wrap: anywhere; }
+/* Phone first: a bottom sheet above the toolbar. Wide screens: a panel down the left side. */
+.cad-params { position: absolute; left: 0; right: 0; bottom: 0; max-height: 55%; display: none; flex-direction: column; background: var(--bg); border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; box-shadow: 0 -8px 24px rgba(0,0,0,0.25); z-index: 6; padding-bottom: env(safe-area-inset-bottom, 0); }
+.cad-shell.cad-params-open .cad-params { display: flex; }
+.cad-params-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 8px 14px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 13px; }
+.cad-params-close { width: 36px; height: 36px; border: none; background: transparent; color: var(--text); font-size: 20px; line-height: 1; border-radius: 8px; cursor: pointer; }
+.cad-params-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 14px; }
+.cad-params-empty { padding: 12px 0; color: var(--muted); font-size: 13px; }
+.cad-param { display: grid; grid-template-columns: minmax(48px, auto) minmax(0, 1fr) auto; align-items: center; column-gap: 10px; padding: 5px 0; }
+.cad-param-name { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.cad-param-input { min-width: 0; min-height: 36px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; font-size: 16px; }
+.cad-param-pending .cad-param-input { opacity: 0.6; }
+.cad-param-bad .cad-param-input { border-color: var(--danger); }
+.cad-param-value { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.cad-param-error { grid-column: 1 / -1; margin-top: 3px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
+.cad-gate { flex: 0 0 auto; max-height: 40%; overflow-y: auto; padding: 9px 14px 11px; border-top: 1px solid var(--border); border-left: 4px solid var(--warn); font-size: 13px; }
+.cad-gate.cad-pass { border-left-color: var(--ok, #2e9d57); }
+.cad-gate.cad-fail { border-left-color: var(--danger, #d04545); }
+.cad-gate-state { font-weight: 600; }
+.cad-gate-state.cad-pass { color: var(--ok, #2e9d57); }
+.cad-gate-state.cad-fail { color: var(--danger, #d04545); }
+.cad-gate-by { margin-left: 8px; font-size: 12px; color: var(--muted); }
+.cad-gate-checks, .cad-gate-advisory { margin: 6px 0 0; padding-left: 18px; }
+.cad-gate-checks li { overflow-wrap: anywhere; }
+.cad-gate-advisory { opacity: 0.8; }
+.cad-gate-note { margin-top: 6px; }
+.cad-params-newer { padding: 7px 14px; font-size: 12px; font-weight: 600; background: var(--warn); color: #1a1c20; }
+/* Phone: the sheet leaves the toolbar reachable — the toolbar floats above it, over the sheet's own
+   bottom padding (A3 review, item 6). */
+.cad-shell.cad-params-open .cad-tools { z-index: 7; }
+.cad-params { padding-bottom: calc(70px + env(safe-area-inset-bottom, 0px)); }
+@media (min-width: 900px) {
+  .cad-params { top: 0; right: auto; bottom: 0; width: 320px; max-height: none; border-top: none; border-right: 1px solid var(--border); border-radius: 0; box-shadow: none; padding-bottom: 0; }
+  .cad-shell.cad-params-open .cad-hud { left: 320px; }
+  .cad-shell.cad-params-open .cad-readout, .cad-shell.cad-params-open .cad-slider { left: 332px; }
+  /* The canvas is the visible area beside the panel, so the opening fit centres the model in it. */
+  .cad-shell.cad-params-open .cad-stage { margin-left: 320px; }
+  .cad-shell.cad-params-open .cad-tools { left: calc(50% + 160px); max-width: calc(100% - 344px); }
+}
+
+/* ── CAD cards in the chat (agent-cad-and-browser §4.9): part card, expectation change, adopt ── */
+.bubble.cad-part { align-self: stretch; max-width: 100%; border: 1px solid var(--border); border-left-width: 4px; border-radius: 12px; background: var(--panel); padding: 11px 13px; }
+.bubble.cad-part.cad-pass { border-left-color: var(--ok, #2e9d57); }
+.bubble.cad-part.cad-fail { border-left-color: var(--danger, #d04545); }
+.bubble.cad-part.cad-unverified, .bubble.cad-part.cad-concept, .bubble.cad-part.cad-gap { border-left-color: var(--warn); }
+.cad-part-head { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+.cad-part-name { font-weight: 600; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.cad-part-state { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+.cad-part-state.cad-pass { color: var(--ok, #2e9d57); }
+.cad-part-state.cad-fail { color: var(--danger, #d04545); }
+.cad-part-busy { font-size: 12px; opacity: 0.7; }
+.cad-part-thumb[hidden], .cad-part-release[hidden] { display: none; }
+.cad-part-checks, .cad-part-advisory { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+.cad-part-checks li { overflow-wrap: anywhere; }
+.cad-part-advisory { opacity: 0.8; }
+.cad-part-note { margin-top: 8px; font-size: 13px; }
+.cad-part-unconfirmed { color: var(--warn); }
+.cad-expect-note { margin: 6px 0; font-size: 13px; font-weight: 600; color: var(--warn); }
+/* Phase A4: thumbnail, Released badge, gap, dimensions card, release card. */
+.cad-part-thumb img { display: block; width: 80px; height: 60px; object-fit: contain; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); }
+.cad-part-released { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--ok, #2e9d57); color: #fff; }
+.cad-part-gap { margin-top: 8px; padding: 7px 9px; border-radius: 8px; border: 1px solid var(--warn); font-size: 13px; overflow-wrap: anywhere; }
+.cad-part-actions { flex-wrap: wrap; }
+.cad-expect-note-strong { padding: 8px 10px; border-radius: 8px; background: var(--warn); color: #1a1c20; }
+.cad-dims { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.cad-dim { display: grid; grid-template-columns: minmax(40px, auto) minmax(0, 1fr) auto; align-items: center; column-gap: 10px; }
+.cad-dim-name { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.cad-dim-input { min-width: 0; min-height: 36px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); font: inherit; font-size: 16px; }
+.cad-dim-unit { font-size: 12px; color: var(--muted); }
+.cad-dim-note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+.cad-dim-error { color: var(--danger); font-size: 13px; }
+.cad-dim-error[hidden] { display: none; }
+.cad-part-actions { display: flex; gap: 8px; margin-top: 10px; }
+.cad-part-open, .cad-part-action { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; padding: 5px 12px; cursor: pointer; }
+.cad-expect-blurb, .cad-expect-reason { margin: 6px 0; font-size: 13px; }
+.cad-expect-reason-label { font-weight: 600; }
+/* Numbers never break mid-digit: cells wrap only at spaces (between "80 × 50 × 6"'s parts, before a
+   unit), never inside a word or number (keep-all, no overflow-wrap); a table still too wide for a
+   phone scrolls inside the card instead of widening the page. */
+.cad-expect-rows { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.cad-expect-rows th, .cad-expect-rows td { text-align: left; vertical-align: top; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--border); overflow-wrap: normal; word-break: keep-all; }
+.cad-expect-rows .cad-row-old, .cad-expect-rows .cad-row-new { font-variant-numeric: tabular-nums; }
+.cad-expect-rows th { white-space: nowrap; }
+.cad-expect-rows .cad-row-changed .cad-row-new { font-weight: 600; }
+.cad-expect-rows .cad-row-changed .cad-row-old { opacity: 0.7; }
+/* Something approving this card approves that was never approved (a parameter the agent moved, a replaced reference). */
+.cad-expect-rows .cad-row-unapproved td { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.cad-expect-rows .cad-row-unapproved .cad-row-new { color: var(--danger); font-weight: 600; }
+.cad-expect-diff { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; background: var(--code-bg); padding: 8px 10px; border-radius: 8px; margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.cad-diff-add { color: var(--ok, #2e9d57); }
+.cad-diff-del { color: var(--danger, #d04545); }

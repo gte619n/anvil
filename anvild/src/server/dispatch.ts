@@ -14,6 +14,8 @@ export interface DispatchDeps {
   /** Hub-only: replicate the stored Todoist token to fleet members (defined in http.ts, where the
    *  FleetStore lives). Omitted/no-op on leaf members. */
   propagateTodoist?: (targets?: string[]) => void;
+  /** This daemon's `solidcraft.status` event. Present only with the "solidcraft-pin" feature. */
+  solidcraftStatus?: () => Promise<ServerEvent>;
   /** Hub-only: re-check every member's fleet skill library and push where it drifted (defined in
    *  http.ts, which owns the FleetStore). Resolves when the sweep finishes. */
   syncSkills?: () => Promise<void>;
@@ -180,6 +182,21 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         });
         return;
 
+      case "solidcraft.status.get":
+        // Settings → CAD: hand the requester this daemon's pin and build. Read-only.
+        if (!deps.solidcraftStatus) {
+          send(cmdError("the SolidCraft pin is not switched on for this server", cid));
+          return;
+        }
+        void deps.solidcraftStatus().then(
+          (e) => {
+            send(e);
+            if (cid) send(ack(cid));
+          },
+          (e) => send(cmdError(errMsg(e), cid)),
+        );
+        return;
+
       case "session.account.set":
         ackWhenDone(deps.supervisor.setSessionAccount(cmd.sessionId, cmd.accountId), send, cid);
         return;
@@ -244,6 +261,47 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
         if (cid) send(ack(cid));
         return;
 
+      case "cad.expectations.respond":
+        deps.supervisor.respondCadExpectations(cmd.requestId, cmd.approve === true, cmd.values);
+        if (cid) send(ack(cid));
+        return;
+
+      // Phase A4: the part card's Release button (the release still needs the card's approval) and
+      // "Clear gap". `cwd` is checked by the supervisor like every cad command.
+      case "cad.release.request":
+        ackWhenDone(deps.supervisor.requestCadRelease(cmd.cwd, cmd.part, cmd.sessionId), send, cid);
+        return;
+
+      case "cad.gap.clear":
+        ackWhenDone(deps.supervisor.clearCadGap(cmd.cwd, cmd.part), send, cid);
+        return;
+
+      // The parameters panel and the live viewer (agent-cad-and-browser spec §4.8, Phase A3). `cwd` is
+      // checked by the supervisor against the worktrees it knows; a client never names an arbitrary path.
+      case "cad.parts.list":
+        deps.supervisor
+          .cadPartsListEvent(cmd.cwd, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "cad.expectations.confirm":
+        deps.supervisor.confirmCadNumbers(cmd.cwd, cmd.part, cmd.sessionId);
+        if (cid) send(ack(cid));
+        return;
+
+      case "cad.param.set":
+        // The owner's change: straight to the part's queue. No session turn, no model query.
+        deps.supervisor
+          .setCadParam(cmd.cwd, cmd.part, cmd.name, cmd.expression, cid)
+          .then((event) => send(event))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "cad.design.refresh":
+        ackWhenDone(deps.supervisor.refreshCadDesign(cmd.cwd, cmd.part), send, cid);
+        return;
+
       case "question.respond":
         deps.supervisor.resolveQuestion(cmd.requestId, cmd.answers ?? [], Boolean(cmd.cancelled));
         if (cid) send(ack(cid));
@@ -300,6 +358,127 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
 
       case "env.remove":
         deps.supervisor.removeEnvironment(cmd.id);
+        if (cid) send(ack(cid));
+        return;
+
+      // MCP integrations (mcp-integrations spec). Client commands only — nothing inside a session can
+      // reach these. Each is refused with a command.error when the feature is off on this daemon.
+      case "mcp.integration.add":
+        deps.supervisor.mcpIntegrationAdd(cmd.integration);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.update":
+        deps.supervisor.mcpIntegrationUpdate(cmd.id, cmd.fields);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.remove":
+        deps.supervisor.mcpIntegrationRemove(cmd.id);
+        if (cid) send(ack(cid));
+        return;
+
+      case "mcp.integration.check":
+        // Re-probe now; the requester always gets the fresh list (others only on a change).
+        deps.supervisor
+          .mcpIntegrationCheck()
+          .then(() => {
+            send(deps.supervisor.mcpIntegrationsEvent());
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "session.set_mcp_integrations":
+        deps.supervisor.setSessionMcpIntegrations(cmd.sessionId, cmd.ids);
+        if (cid) send(ack(cid));
+        return;
+
+      // Agent browser allowed sites (Phase C2). Refused with a command.error unless the "browser"
+      // feature is on. Every client of this daemon gets the `browser.sites` broadcast on a change.
+      case "browser.sites.list":
+        send(deps.supervisor.browserSitesEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.site.add":
+        deps.supervisor.browserSiteAdd(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.site.remove":
+        deps.supervisor.browserSiteRemove(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.runtime.install":
+        deps.supervisor
+          .browserRuntimeInstall()
+          .then(() => {
+            send(deps.supervisor.mcpIntegrationsEvent());
+            if (cid) send(ack(cid));
+          })
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      // Agent browser logged-in sites, their unlock switches, "Open agent browser" and the
+      // request_human answer (Phase C3). Same gate: refused unless the "browser" feature is on.
+      case "browser.loggedin.list":
+        send(deps.supervisor.browserLoggedInEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.add":
+        deps.supervisor.browserLoggedInAdd(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.remove":
+        deps.supervisor.browserLoggedInRemove(cmd.site);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.set_unlocked":
+        deps.supervisor.browserLoggedInSetUnlocked(cmd.site, cmd.unlocked);
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.loggedin.reset":
+        deps.supervisor.browserLoggedInReset();
+        if (cid) send(ack(cid));
+        return;
+
+      case "browser.open_agent_browser":
+        deps.supervisor.browserOpenAgentBrowser();
+        if (cid) send(ack(cid));
+        return;
+
+      // Part sources (Phase C5). Refused with a command.error unless the "part-sources" feature is on.
+      // A key change is broadcast to every client as `parts.sources` (masked values only).
+      case "parts.sources.get":
+        send(deps.supervisor.partsEvent());
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.keys.set":
+        deps.supervisor.partsSetKeys(cmd.source, cmd.values);
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.keys.clear":
+        deps.supervisor.partsClearKeys(cmd.source);
+        if (cid) send(ack(cid));
+        return;
+
+      case "parts.test":
+        deps.supervisor
+          .partsTest(cmd.source, cid)
+          .then((r) => send(r))
+          .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "human.request.respond":
+        deps.supervisor.resolveHumanRequest(cmd.requestId);
         if (cid) send(ack(cid));
         return;
 
@@ -520,6 +699,11 @@ export function dispatch(conn: ConnState, raw: string, send: Send, deps: Dispatc
           .approveProposed(cmd.workUnitId, cmd.start ?? false, cid)
           .then((event) => send(event))
           .catch((e) => send(cmdError(errMsg(e), cid)));
+        return;
+
+      case "autopilot.cad.respond":
+        // Phase B3 / item 41: the owner approves (locks) or rejects the CAD numbers shown on a plan's card.
+        send(deps.supervisor.respondAutopilotCad(cmd.workUnitId, cmd.approve === true, cmd.sha, cid));
         return;
 
       // ── Completion verification (completion-verification spec §4.5) ──

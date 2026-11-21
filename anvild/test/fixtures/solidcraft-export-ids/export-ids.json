@@ -1,0 +1,2163 @@
+{
+ "solidcraft": "0.44.1",
+ "generatedBy": "anvild/test/fixtures/solidcraft-export-ids/generate.ts",
+ "commandIds": [
+  "component.create",
+  "component.insert_design",
+  "component.metadata.set",
+  "config.activate",
+  "config.column",
+  "config.row",
+  "document.metadata.set",
+  "document.units",
+  "joint.create",
+  "joint.limits",
+  "joint.motion_link",
+  "joint.origin",
+  "material.assign",
+  "material.create",
+  "occurrence.copy",
+  "occurrence.ground",
+  "occurrence.move",
+  "parameters.add",
+  "plastic.assign_rule",
+  "plastic.manage_rules",
+  "sheet.manage_rules",
+  "timeline.add"
+ ],
+ "ids": {
+  "component.create": {
+   "scenarios": [
+    "imported STEP reference",
+    "assembly: components, occurrences, joints of each kind",
+    "assembly: joint.create kinds and assembly constraints",
+    "assembly: coupled joints (gear, screw, rack and pinion) and library parts",
+    "mesh, point cloud and board imports"
+   ],
+   "keys": [
+    "activate",
+    "grounded",
+    "name"
+   ]
+  },
+  "component.insert_design": {
+   "scenarios": [
+    "linked design (insert_design)"
+   ],
+   "keys": [
+    "name",
+    "path"
+   ]
+  },
+  "component.metadata.set": {
+   "scenarios": [
+    "imported STEP reference",
+    "assembly: components, occurrences, joints of each kind",
+    "assembly: joint.create kinds and assembly constraints",
+    "assembly: coupled joints (gear, screw, rack and pinion) and library parts",
+    "mesh, point cloud and board imports",
+    "linked design (insert_design)"
+   ],
+   "keys": [
+    "component",
+    "properties",
+    "properties.pcb.outline",
+    "properties.pcb.thickness",
+    "values",
+    "values.bom_type",
+    "values.description",
+    "values.part_number",
+    "values.revision"
+   ]
+  },
+  "config.activate": {
+   "scenarios": [
+    "configurations"
+   ],
+   "keys": [
+    "row"
+   ]
+  },
+  "config.column": {
+   "scenarios": [
+    "configurations"
+   ],
+   "keys": [
+    "appearance",
+    "feature",
+    "material",
+    "param"
+   ]
+  },
+  "config.row": {
+   "scenarios": [
+    "configurations"
+   ],
+   "keys": [
+    "name",
+    "values",
+    "values.appearance:Body1",
+    "values.material:Body1",
+    "values.param:L",
+    "values.param:T",
+    "values.param:W",
+    "values.suppress:Holes"
+   ]
+  },
+  "document.metadata.set": {
+   "scenarios": [
+    "document settings, parameters, materials, appearances"
+   ],
+   "keys": [
+    "values",
+    "values.author",
+    "values.description",
+    "values.part_number",
+    "values.project",
+    "values.revision"
+   ]
+  },
+  "document.units": {
+   "scenarios": [
+    "document settings, parameters, materials, appearances"
+   ],
+   "keys": [
+    "units"
+   ]
+  },
+  "joint.create": {
+   "scenarios": [
+    "assembly: components, occurrences, joints of each kind",
+    "assembly: joint.create kinds and assembly constraints",
+    "assembly: coupled joints (gear, screw, rack and pinion) and library parts"
+   ],
+   "keys": [
+    "a",
+    "a.face",
+    "a.frame",
+    "a.frame.origin",
+    "a.frame.x",
+    "a.frame.z",
+    "a.occurrence",
+    "a.x",
+    "angle",
+    "b",
+    "b.face",
+    "b.frame",
+    "b.frame.origin",
+    "b.frame.x",
+    "b.frame.z",
+    "b.occurrence",
+    "b.x",
+    "flip",
+    "name",
+    "offset",
+    "type",
+    "values"
+   ]
+  },
+  "joint.limits": {
+   "scenarios": [
+    "assembly: components, occurrences, joints of each kind"
+   ],
+   "keys": [
+    "index",
+    "joint",
+    "max",
+    "min"
+   ]
+  },
+  "joint.motion_link": {
+   "scenarios": [
+    "assembly: components, occurrences, joints of each kind"
+   ],
+   "keys": [
+    "a",
+    "b",
+    "ratio"
+   ]
+  },
+  "joint.origin": {
+   "scenarios": [
+    "assembly: components, occurrences, joints of each kind"
+   ],
+   "keys": [
+    "face",
+    "name",
+    "occurrence",
+    "x"
+   ]
+  },
+  "material.assign": {
+   "scenarios": [
+    "mesh, point cloud and board imports"
+   ],
+   "keys": [
+    "bodies",
+    "material"
+   ]
+  },
+  "material.create": {
+   "scenarios": [
+    "document settings, parameters, materials, appearances",
+    "configurations",
+    "mesh, point cloud and board imports"
+   ],
+   "keys": [
+    "appearance",
+    "color",
+    "density_g_cm3",
+    "name",
+    "opacity"
+   ]
+  },
+  "occurrence.copy": {
+   "scenarios": [
+    "assembly: components, occurrences, joints of each kind"
+   ],
+   "keys": [
+    "occurrence"
+   ]
+  },
+  "occurrence.ground": {
+   "scenarios": [
+    "imported STEP reference",
+    "assembly: components, occurrences, joints of each kind",
+    "assembly: joint.create kinds and assembly constraints",
+    "assembly: coupled joints (gear, screw, rack and pinion) and library parts",
+    "mesh, point cloud and board imports",
+    "linked design (insert_design)"
+   ],
+   "keys": [
+    "grounded",
+    "occurrence"
+   ]
+  },
+  "occurrence.move": {
+   "scenarios": [
+    "imported STEP reference",
+    "assembly: components, occurrences, joints of each kind",
+    "assembly: joint.create kinds and assembly constraints",
+    "assembly: coupled joints (gear, screw, rack and pinion) and library parts",
+    "mesh, point cloud and board imports",
+    "linked design (insert_design)"
+   ],
+   "keys": [
+    "occurrence",
+    "space",
+    "to_matrix"
+   ]
+  },
+  "parameters.add": {
+   "scenarios": [
+    "plate",
+    "document settings, parameters, materials, appearances",
+    "imported STEP reference",
+    "assembly: nested components and moved bodies",
+    "configurations",
+    "sketch links: text, fonts, SVG, DXF, projection",
+    "canvas and decal",
+    "construction geometry, surfaces, sheet metal, plastic, frames, library parts",
+    "linked design (insert_design)"
+   ],
+   "keys": [
+    "comment",
+    "expression",
+    "favorite",
+    "name",
+    "unit"
+   ]
+  },
+  "plastic.assign_rule": {
+   "scenarios": [
+    "document settings, parameters, materials, appearances"
+   ],
+   "keys": [
+    "bodies",
+    "rule"
+   ]
+  },
+  "plastic.manage_rules": {
+   "scenarios": [
+    "document settings, parameters, materials, appearances"
+   ],
+   "keys": [
+    "clearance",
+    "draft",
+    "knife_edge",
+    "material",
+    "max_thickness",
+    "min_draft",
+    "min_thickness",
+    "name",
+    "nominal_radius",
+    "reveal_height",
+    "thickness",
+    "thickness_variation"
+   ]
+  },
+  "sheet.manage_rules": {
+   "scenarios": [
+    "document settings, parameters, materials, appearances"
+   ],
+   "keys": [
+    "active",
+    "bend_radius",
+    "corner_relief",
+    "corner_relief_shape",
+    "gap",
+    "hem_gap",
+    "k_factor",
+    "name",
+    "relief_depth",
+    "relief_width",
+    "thickness"
+   ]
+  },
+  "timeline.add": {
+   "scenarios": [
+    "plate",
+    "document settings, parameters, materials, appearances",
+    "imported STEP reference",
+    "assembly: components, occurrences, joints of each kind",
+    "assembly: joint.create kinds and assembly constraints",
+    "assembly: coupled joints (gear, screw, rack and pinion) and library parts",
+    "assembly: nested components and moved bodies",
+    "configurations",
+    "sketch links: text, fonts, SVG, DXF, projection",
+    "canvas and decal",
+    "mesh, point cloud and board imports",
+    "construction geometry, surfaces, sheet metal, plastic, frames, library parts",
+    "linked design (insert_design)"
+   ],
+   "keys": [
+    "feature",
+    "feature.axis",
+    "feature.base",
+    "feature.bodies",
+    "feature.body",
+    "feature.body_names",
+    "feature.center",
+    "feature.component",
+    "feature.components",
+    "feature.components[].bodies",
+    "feature.components[].items",
+    "feature.components[].name",
+    "feature.components[].transform",
+    "feature.continuous_flanks",
+    "feature.corner",
+    "feature.curves",
+    "feature.def",
+    "feature.def.a",
+    "feature.def.a.plane",
+    "feature.def.a.plane.name",
+    "feature.def.a.plane.type",
+    "feature.def.a.type",
+    "feature.def.b",
+    "feature.def.b.plane",
+    "feature.def.b.plane.name",
+    "feature.def.b.plane.type",
+    "feature.def.b.type",
+    "feature.def.c",
+    "feature.def.c.plane",
+    "feature.def.c.plane.name",
+    "feature.def.c.plane.type",
+    "feature.def.c.type",
+    "feature.def.face",
+    "feature.def.face.at",
+    "feature.def.face.type",
+    "feature.def.type",
+    "feature.diameter",
+    "feature.direction",
+    "feature.distance",
+    "feature.edge_names",
+    "feature.edge_refs",
+    "feature.edge_refs[].dir",
+    "feature.edge_refs[].max",
+    "feature.edge_refs[].min",
+    "feature.edges",
+    "feature.extent",
+    "feature.extent.convention",
+    "feature.extent.direction",
+    "feature.extent.distance",
+    "feature.face",
+    "feature.face_names",
+    "feature.faces",
+    "feature.features",
+    "feature.file",
+    "feature.height",
+    "feature.hole",
+    "feature.hole.cb_depth",
+    "feature.hole.cb_diameter",
+    "feature.hole.type",
+    "feature.id",
+    "feature.inserted",
+    "feature.length",
+    "feature.major",
+    "feature.meshes",
+    "feature.meshes[].color",
+    "feature.meshes[].name",
+    "feature.meshes[].positions",
+    "feature.meshes[].triangles",
+    "feature.minor",
+    "feature.name",
+    "feature.names",
+    "feature.names.l1",
+    "feature.names.l2",
+    "feature.operation",
+    "feature.param_names",
+    "feature.path_sketch",
+    "feature.pattern",
+    "feature.pattern.angle",
+    "feature.pattern.axis",
+    "feature.pattern.count",
+    "feature.pattern.count1",
+    "feature.pattern.count2",
+    "feature.pattern.dir1",
+    "feature.pattern.dir2",
+    "feature.pattern.origin",
+    "feature.pattern.spacing1",
+    "feature.pattern.spacing2",
+    "feature.pattern.type",
+    "feature.plane",
+    "feature.plane.angle",
+    "feature.plane.axis_dir",
+    "feature.plane.axis_origin",
+    "feature.plane.base",
+    "feature.plane.base.name",
+    "feature.plane.base.type",
+    "feature.plane.distance",
+    "feature.plane.name",
+    "feature.plane.type",
+    "feature.points",
+    "feature.points.ids",
+    "feature.points.sketch",
+    "feature.position",
+    "feature.profile",
+    "feature.profile.profile",
+    "feature.profile.profile.height",
+    "feature.profile.profile.kind",
+    "feature.profile.profile.width",
+    "feature.profile.source",
+    "feature.profiles",
+    "feature.profiles.loops",
+    "feature.profiles.type",
+    "feature.radius",
+    "feature.sketch",
+    "feature.sketch.constraints",
+    "feature.sketch.constraints[].id",
+    "feature.sketch.constraints[].l",
+    "feature.sketch.constraints[].p",
+    "feature.sketch.constraints[].param",
+    "feature.sketch.constraints[].q",
+    "feature.sketch.constraints[].type",
+    "feature.sketch.constraints[].value",
+    "feature.sketch.counters",
+    "feature.sketch.counters.a",
+    "feature.sketch.counters.c",
+    "feature.sketch.counters.j",
+    "feature.sketch.counters.k",
+    "feature.sketch.counters.l",
+    "feature.sketch.counters.n",
+    "feature.sketch.counters.p",
+    "feature.sketch.counters.s",
+    "feature.sketch.curves",
+    "feature.sketch.curves[].a",
+    "feature.sketch.curves[].apex",
+    "feature.sketch.curves[].b",
+    "feature.sketch.curves[].c",
+    "feature.sketch.curves[].construction",
+    "feature.sketch.curves[].degree",
+    "feature.sketch.curves[].id",
+    "feature.sketch.curves[].link",
+    "feature.sketch.curves[].pts",
+    "feature.sketch.curves[].r",
+    "feature.sketch.curves[].rho",
+    "feature.sketch.curves[].type",
+    "feature.sketch.links",
+    "feature.sketch.links[].edge_name",
+    "feature.sketch.links[].id",
+    "feature.sketch.links[].kind",
+    "feature.sketch.links[].source",
+    "feature.sketch.links[].source.angle",
+    "feature.sketch.links[].source.at",
+    "feature.sketch.links[].source.body",
+    "feature.sketch.links[].source.exprs",
+    "feature.sketch.links[].source.exprs.text",
+    "feature.sketch.links[].source.font",
+    "feature.sketch.links[].source.height",
+    "feature.sketch.links[].source.text",
+    "feature.sketch.links[].source.type",
+    "feature.sketch.points",
+    "feature.sketch.points[].fixed",
+    "feature.sketch.points[].id",
+    "feature.sketch.points[].link",
+    "feature.sketch.points[].pos",
+    "feature.step",
+    "feature.suppressed",
+    "feature.thickness",
+    "feature.tolerance",
+    "feature.top_radius",
+    "feature.type",
+    "feature.width",
+    "params",
+    "params[].expression",
+    "params[].name",
+    "params[].unit"
+   ]
+  }
+ },
+ "schemas": {
+  "component.create": {
+   "params": "name?, parent?: component id or name (default: the active one); parent_path?: exact parent placement; activate?: bool (default true); grounded?: bool (default: true for the design's first part, false otherwise)",
+   "properties": [
+    "activate",
+    "grounded",
+    "name",
+    "parent",
+    "parent_path"
+   ]
+  },
+  "component.insert_design": {
+   "params": "path: a .sc design → a new component linked to it, holding its solid bodies as placed in that design and a copy of its design properties; configuration?: a row name or id (null or omitted: the saved source state); name? (default: the design's name); parent?: component id or name (default: the active one); translate?: [x,y,z] in mm from the destination parent's origin (default [0,0,0], also with reuse); reuse?: bool (default false): insert a free occurrence, reusing an existing link to the same file and configuration when available",
+   "properties": [
+    "configuration",
+    "name",
+    "parent",
+    "path",
+    "reuse",
+    "translate"
+   ]
+  },
+  "component.metadata.set": {
+   "params": "component: id or name (not the root: use document.metadata.set); part_number?, description?, revision?: text (empty or null removes); bom_type?: normal|phantom|reference|purchased|inseparable (empty or null: normal); values?: {key: value} (SolidCraft's keys, as document.metadata's properties lists them, bom_type, or a reverse-DNS key holding an object); properties?: {name: text, …} (free properties; empty or null removes). All or nothing, one undo step → component, metadata, properties, changed: [keys]",
+   "properties": [
+    "bom_type",
+    "component",
+    "description",
+    "part_number",
+    "properties",
+    "revision",
+    "values"
+   ]
+  },
+  "config.activate": {
+   "params": "row: a row's name, or its id from config.table — sets its parameter values and suppressions",
+   "properties": [
+    "row"
+   ]
+  },
+  "config.column": {
+   "params": "param? | feature? | material? | appearance? (target name); delete?: bool",
+   "properties": [
+    "appearance",
+    "component_appearance",
+    "delete",
+    "face_appearance",
+    "feature",
+    "material",
+    "param"
+   ]
+  },
+  "config.row": {
+   "params": "name (a row's name, or its id from config.table); from? (row to copy, by name or id; default current values); values?: {column key: expression, suppression, material name, appearance name or Look object}; rename?; delete?: bool",
+   "properties": [
+    "delete",
+    "from",
+    "name",
+    "rename",
+    "values"
+   ]
+  },
+  "document.metadata.set": {
+   "params": "key and value, or values: {key: value, …} (all or nothing, one undo step). SolidCraft's keys, the ones document.metadata's properties lists, take text (\"\" or null removes); another tool's data goes under its reverse-DNS key such as com.example.tool (an object; null removes) → metadata, changed: [keys]",
+   "properties": [
+    "key",
+    "value",
+    "values"
+   ]
+  },
+  "document.units": {
+   "params": "units: mm|cm|m|in|ft (display and unit-less parameters; values keep their meaning)",
+   "properties": [
+    "units"
+   ]
+  },
+  "joint.create": {
+   "params": "type: rigid|revolute|slider|cylindrical|pin_slot|planar|ball, or a relation: parallel|perpendicular|angle|point_on_plane|point_on_line|line_on_plane (ties only some directions or points, made where the parts are; several between two parts add up); a, b: joint origins ({occurrence, face|circle|edge|point: [x,y,z] in world, or face|circle: \"<face name>\", plane: \"XY\"|\"o:<ids>/origin/<item>\"|\"<name>\", axis: \"Z\"|\"o:<ids>/origin/<item>\"|\"<name>\"; z? for a point, end?, x? as joint.origin} | origin name); values?: [angles in deg or expressions, distances]; limits?: [[min, max] | null…]; flip?: bool (default false: the origins are mated, b's z against a's as two faces meet - two plane or axis datums mate aligned, each part keeping its side of the datum, and flip mates them; true: b's z along a's, so two origins given at one point with the same z and x stay as they are; a point origin without x takes its x from z, so give x on both, or use joint.as_built, to keep a turned part where it is); offset_x?, offset_y?: lateral mm in a's frame (expressions evaluated once); offset?: mm or an expression; angle?: deg or an expression (an angle relation's tilt from mated; for other joints the default is",
+   "properties": [
+    "a",
+    "angle",
+    "b",
+    "flip",
+    "limits",
+    "name",
+    "offset",
+    "offset_x",
+    "offset_y",
+    "quiet",
+    "type",
+    "value",
+    "values"
+   ]
+  },
+  "joint.limits": {
+   "params": "joint; index?: value index (default 0); min?, max? (omit both to clear)",
+   "properties": [
+    "index",
+    "joint",
+    "max",
+    "min",
+    "quiet"
+   ]
+  },
+  "joint.motion_link": {
+   "params": "a, b: joints; ratio (b = ratio · a + offset): b's units per a's (mm per deg for an angle driving a distance); offset?: in b's units (deg for an angle, mm for a distance, or an expression); ia?, ib?: value indices (default 0); link?: index (put this link in place of that motion link, as the gear and cam commands do) → link: the link's index, as joint.list numbers them",
+   "properties": [
+    "a",
+    "b",
+    "ia",
+    "ib",
+    "link",
+    "offset",
+    "quiet",
+    "ratio"
+   ]
+  },
+  "joint.origin": {
+   "params": "name?, occurrence?: id|name (default: from the pick, or the named face's component), path?: [occurrence ids from the root] (the placement picked on, ending at the occurrence: a part in a sub-assembly placed more than once is then on that copy; default: the occurrence's first placement, or with no occurrence the placement nearest the pick), face: [x,y,z] | \"<name>\" (centre of a planar face) | circle: [x,y,z] | \"<name>\" (centre of a round end: a point on its wall or rim, the end's centre, or the round face's name as model.faces lists it) | edge: [x,y,z] (a point on an edge of a planar face: the edge's middle, z out of the face, y into it; on?: [x,y,z] a point on the face (default: the larger planar face beside the edge); corner?: [x,y,z] near one end: the corner there, x and y along its two edges into the face; found again by name, so it follows the face as it changes size; z?: [x,y,z] the frame's z instead of the face's normal, along the edge when it runs that way, x chosen from z: an edge or corner picked as it is, kept as a point where it can't be found by name) | point: [x,y,z], z?: [x,y,z] | plane: \"XY\"|\"XZ\"|\"YZ\"|\"o:<ids>/origin/<item>\"|\"<name>\" | axis: \"X\"|\"Y\"|\"Z\"|\"o:<ids>/orig",
+   "properties": [
+    "axis",
+    "body",
+    "circle",
+    "corner",
+    "edge",
+    "end",
+    "face",
+    "frame",
+    "name",
+    "occurrence",
+    "on",
+    "path",
+    "plane",
+    "point",
+    "x",
+    "z"
+   ]
+  },
+  "material.assign": {
+   "params": "bodies: [names]; material: name (Steel, Aluminum, ABS Plastic, …, or one made with material.create; `material.list`)",
+   "properties": [
+    "bodies",
+    "material"
+   ]
+  },
+  "material.create": {
+   "params": "name (not a built-in material's); density_g_cm3: (0, 1000]; appearance?: library name (appearance.library) | color?: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1), pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (opaque only, needs color/appearance): the default look. A named appearance keeps its preset response when pbr is omitted; pbr: null selects scalar shading. Optical edits do not change density. physical_card?: validated SI candidate record (null/omitted means unknown); card density never changes assigned density. Assign it with material.assign",
+   "properties": [
+    "appearance",
+    "color",
+    "density_g_cm3",
+    "name",
+    "opacity",
+    "pbr",
+    "physical_card"
+   ]
+  },
+  "occurrence.copy": {
+   "params": "component (or occurrence): what to place again; path?: validates selected occurrence; parent?: component (default: the same parent); translate?: [x,y,z]; in_place?: bool (default false: the selected transform within the parent; true: where the selected placement is in the world, translate in world axes; a parent placed more than once is placed by parent_path?, else the active placement, and every instance gets the copy). Copies the selected effective transform, including pending moves",
+   "properties": [
+    "component",
+    "in_place",
+    "occurrence",
+    "parent",
+    "parent_path",
+    "path",
+    "translate"
+   ]
+  },
+  "occurrence.ground": {
+   "params": "occurrence; grounded?: bool (default toggles) → grounded; transform: placement within its parent; moved: names of occurrences whose world placement changed; errors, conflicts: joint issues in the assembly solve",
+   "properties": [
+    "grounded",
+    "occurrence",
+    "path"
+   ]
+  },
+  "occurrence.move": {
+   "params": "occurrence; path?: exact placement; space?: local|world (default local); translate?: [x,y,z] (numbers or length expressions: an occurrence moved by expressions that name parameters keeps them and moves with them when the parameters change, along the axes the move was given in; other moves of it stay; a parameter they use can't be deleted, and a renamed one carries into them); axis?: [x,y,z], angle?: radians or \"30 deg\", origin?: [x,y,z] (numbers or length expressions, kept like translate's: the point the turn is about moves the part by what the turn leaves behind when a parameter in it changes); to?: {position: [x,y,z], axis?: [x,y,z], angle?} or to_matrix?: [12 or 16 numbers] (absolute placement: where it goes in space, not a move; not with translate/axis/angle/origin/matrix); matrix?: [12 or 16 numbers] (instead of translate/axis/angle/origin: a rigid move as a row-major 3x4 rotation-and-translation or 4x4 matrix, flat or as rows, its translation column (entries 4, 8 and 12) numbers or length expressions that are kept and followed like translate's; one that is a rotation only up to rounding is orthonormalised, a scale, shear or mirror is refused); tolerance?: largest accepted |Rᵀ",
+   "properties": [
+    "angle",
+    "axis",
+    "base_transform",
+    "capture",
+    "matrix",
+    "move_grounded",
+    "occurrence",
+    "origin",
+    "path",
+    "space",
+    "to",
+    "to_matrix",
+    "tolerance",
+    "translate"
+   ]
+  },
+  "parameters.add": {
+   "params": "name, expression, unit?: as parameters.change (text: a text parameter, its expression the text), comment?, favorite?: bool",
+   "properties": [
+    "comment",
+    "expression",
+    "favorite",
+    "name",
+    "unit",
+    "value"
+   ]
+  },
+  "plastic.assign_rule": {
+   "params": "bodies: [names]; rule: name (empty: no rule) — plastic features on these bodies take its draft and clearance as defaults",
+   "properties": [
+    "bodies",
+    "rule"
+   ]
+  },
+  "plastic.manage_rules": {
+   "params": "name (library or new rule; a new one starts from `from`, default ABS (1.5mm)); from?; material?; thickness?, nominal_radius?, clearance?, knife_edge?, reveal_height?, thickness_variation?, draft?, max_thickness?, min_thickness?, min_draft? (expressions; `Thickness` is the rule's); active?: bool (rule for bodies without one); delete?: bool (a design rule; a library rule goes back to the library values)",
+   "properties": [
+    "active",
+    "clearance",
+    "delete",
+    "draft",
+    "from",
+    "knife_edge",
+    "material",
+    "max_thickness",
+    "min_draft",
+    "min_thickness",
+    "name",
+    "nominal_radius",
+    "reveal_height",
+    "thickness",
+    "thickness_variation"
+   ]
+  },
+  "sheet.manage_rules": {
+   "params": "name (new or existing); thickness?, k_factor?, bend_radius?, relief_width?, relief_depth?, corner_relief?, hem_gap?, gap? (expressions; `Thickness` is the rule's; gap: between flanges that meet at a corner, whose ends are closed toward each other at any angle); corner_relief_shape?: notch|round|rectangular|tear (what is cut where two bends meet at a corner of the base: round and rectangular a relief `corner_relief` across; tear none, each bend's end is cut straight from the corner to its flange's end; default notch); angle_display?: bend|included (how the DXF bend notes read the bend angles: the bend angle, default, or the included angle left between the bend's sides, 180° less it; the bend table gives both, and a flange's `angle` is always the bend angle); active?: bool; delete?: bool",
+   "properties": [
+    "active",
+    "angle_display",
+    "bend_radius",
+    "corner_relief",
+    "corner_relief_shape",
+    "delete",
+    "gap",
+    "hem_gap",
+    "k_factor",
+    "name",
+    "relief_depth",
+    "relief_width",
+    "thickness"
+   ]
+  },
+  "timeline.add": {
+   "params": "feature: a feature as the design file and timeline.inspect hold it ({type, name?, id?, …}; the name is kept even when another feature has it, the id is kept and refused when another feature has it, so later steps can refer to them); params?: [{name, expression, unit?, comment?}] (the model parameters its sketch dimensions use); the feature goes at the marker → feature, name, error, warning",
+   "properties": [
+    "feature",
+    "params"
+   ]
+  }
+ },
+ "featureTypes": {
+  "box": [
+   "feature.body_names",
+   "feature.component",
+   "feature.corner",
+   "feature.height",
+   "feature.id",
+   "feature.length",
+   "feature.name",
+   "feature.operation",
+   "feature.param_names",
+   "feature.suppressed",
+   "feature.type",
+   "feature.width"
+  ],
+  "chamfer": [
+   "feature.body",
+   "feature.distance",
+   "feature.edge_names",
+   "feature.edge_refs",
+   "feature.edge_refs[].dir",
+   "feature.edge_refs[].max",
+   "feature.edge_refs[].min",
+   "feature.edges",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "cone": [
+   "feature.axis",
+   "feature.base",
+   "feature.body_names",
+   "feature.height",
+   "feature.id",
+   "feature.name",
+   "feature.operation",
+   "feature.param_names",
+   "feature.radius",
+   "feature.suppressed",
+   "feature.top_radius",
+   "feature.type"
+  ],
+  "construction_axis": [
+   "feature.def",
+   "feature.def.a",
+   "feature.def.a.plane",
+   "feature.def.a.plane.name",
+   "feature.def.a.plane.type",
+   "feature.def.a.type",
+   "feature.def.b",
+   "feature.def.b.plane",
+   "feature.def.b.plane.name",
+   "feature.def.b.plane.type",
+   "feature.def.b.type",
+   "feature.def.face",
+   "feature.def.face.at",
+   "feature.def.face.type",
+   "feature.def.type",
+   "feature.id",
+   "feature.name",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "construction_plane": [
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.plane",
+   "feature.plane.angle",
+   "feature.plane.axis_dir",
+   "feature.plane.axis_origin",
+   "feature.plane.base",
+   "feature.plane.base.name",
+   "feature.plane.base.type",
+   "feature.plane.distance",
+   "feature.plane.type",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "construction_point": [
+   "feature.def",
+   "feature.def.a",
+   "feature.def.a.plane",
+   "feature.def.a.plane.name",
+   "feature.def.a.plane.type",
+   "feature.def.a.type",
+   "feature.def.b",
+   "feature.def.b.plane",
+   "feature.def.b.plane.name",
+   "feature.def.b.plane.type",
+   "feature.def.b.type",
+   "feature.def.c",
+   "feature.def.c.plane",
+   "feature.def.c.plane.name",
+   "feature.def.c.plane.type",
+   "feature.def.c.type",
+   "feature.def.type",
+   "feature.id",
+   "feature.name",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "extrude": [
+   "feature.body_names",
+   "feature.component",
+   "feature.extent",
+   "feature.extent.convention",
+   "feature.extent.direction",
+   "feature.extent.distance",
+   "feature.id",
+   "feature.name",
+   "feature.operation",
+   "feature.param_names",
+   "feature.profiles",
+   "feature.profiles.loops",
+   "feature.profiles.type",
+   "feature.sketch",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "fillet": [
+   "feature.edge_names",
+   "feature.edge_refs",
+   "feature.edge_refs[].dir",
+   "feature.edge_refs[].max",
+   "feature.edge_refs[].min",
+   "feature.edges",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.radius",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "frame_member": [
+   "feature.id",
+   "feature.name",
+   "feature.names",
+   "feature.names.l1",
+   "feature.names.l2",
+   "feature.param_names",
+   "feature.path_sketch",
+   "feature.profile",
+   "feature.profile.profile",
+   "feature.profile.profile.height",
+   "feature.profile.profile.kind",
+   "feature.profile.profile.width",
+   "feature.profile.source",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "hole": [
+   "feature.diameter",
+   "feature.direction",
+   "feature.hole",
+   "feature.hole.cb_depth",
+   "feature.hole.cb_diameter",
+   "feature.hole.type",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.points",
+   "feature.points.ids",
+   "feature.points.sketch",
+   "feature.position",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "import": [
+   "feature.body_names",
+   "feature.component",
+   "feature.components",
+   "feature.components[].bodies",
+   "feature.components[].items",
+   "feature.components[].name",
+   "feature.components[].transform",
+   "feature.file",
+   "feature.id",
+   "feature.inserted",
+   "feature.name",
+   "feature.step",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "mesh_convert": [
+   "feature.body",
+   "feature.body_names",
+   "feature.component",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.suppressed",
+   "feature.tolerance",
+   "feature.type"
+  ],
+  "mesh_import": [
+   "feature.body_names",
+   "feature.component",
+   "feature.file",
+   "feature.id",
+   "feature.inserted",
+   "feature.meshes",
+   "feature.meshes[].color",
+   "feature.meshes[].name",
+   "feature.meshes[].positions",
+   "feature.meshes[].triangles",
+   "feature.name",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "mirror": [
+   "feature.bodies",
+   "feature.body_names",
+   "feature.features",
+   "feature.id",
+   "feature.name",
+   "feature.plane",
+   "feature.plane.name",
+   "feature.plane.type",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "pattern": [
+   "feature.features",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.pattern",
+   "feature.pattern.angle",
+   "feature.pattern.axis",
+   "feature.pattern.count",
+   "feature.pattern.count1",
+   "feature.pattern.count2",
+   "feature.pattern.dir1",
+   "feature.pattern.dir2",
+   "feature.pattern.origin",
+   "feature.pattern.spacing1",
+   "feature.pattern.spacing2",
+   "feature.pattern.type",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "shell": [
+   "feature.body",
+   "feature.face_names",
+   "feature.faces",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.suppressed",
+   "feature.thickness",
+   "feature.type"
+  ],
+  "sketch": [
+   "feature.component",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.plane",
+   "feature.plane.base",
+   "feature.plane.base.name",
+   "feature.plane.base.type",
+   "feature.plane.distance",
+   "feature.plane.name",
+   "feature.plane.type",
+   "feature.sketch",
+   "feature.sketch.constraints",
+   "feature.sketch.constraints[].id",
+   "feature.sketch.constraints[].l",
+   "feature.sketch.constraints[].p",
+   "feature.sketch.constraints[].param",
+   "feature.sketch.constraints[].q",
+   "feature.sketch.constraints[].type",
+   "feature.sketch.constraints[].value",
+   "feature.sketch.counters",
+   "feature.sketch.counters.a",
+   "feature.sketch.counters.c",
+   "feature.sketch.counters.j",
+   "feature.sketch.counters.k",
+   "feature.sketch.counters.l",
+   "feature.sketch.counters.n",
+   "feature.sketch.counters.p",
+   "feature.sketch.counters.s",
+   "feature.sketch.curves",
+   "feature.sketch.curves[].a",
+   "feature.sketch.curves[].apex",
+   "feature.sketch.curves[].b",
+   "feature.sketch.curves[].c",
+   "feature.sketch.curves[].construction",
+   "feature.sketch.curves[].degree",
+   "feature.sketch.curves[].id",
+   "feature.sketch.curves[].link",
+   "feature.sketch.curves[].pts",
+   "feature.sketch.curves[].r",
+   "feature.sketch.curves[].rho",
+   "feature.sketch.curves[].type",
+   "feature.sketch.links",
+   "feature.sketch.links[].edge_name",
+   "feature.sketch.links[].id",
+   "feature.sketch.links[].kind",
+   "feature.sketch.links[].source",
+   "feature.sketch.links[].source.angle",
+   "feature.sketch.links[].source.at",
+   "feature.sketch.links[].source.body",
+   "feature.sketch.links[].source.exprs",
+   "feature.sketch.links[].source.exprs.text",
+   "feature.sketch.links[].source.font",
+   "feature.sketch.links[].source.height",
+   "feature.sketch.links[].source.text",
+   "feature.sketch.links[].source.type",
+   "feature.sketch.points",
+   "feature.sketch.points[].fixed",
+   "feature.sketch.points[].id",
+   "feature.sketch.points[].link",
+   "feature.sketch.points[].pos",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "sphere": [
+   "feature.body_names",
+   "feature.center",
+   "feature.id",
+   "feature.name",
+   "feature.operation",
+   "feature.param_names",
+   "feature.radius",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "surface_extrude": [
+   "feature.body_names",
+   "feature.curves",
+   "feature.extent",
+   "feature.extent.convention",
+   "feature.extent.direction",
+   "feature.extent.distance",
+   "feature.id",
+   "feature.name",
+   "feature.param_names",
+   "feature.sketch",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "thread": [
+   "feature.continuous_flanks",
+   "feature.face",
+   "feature.face_names",
+   "feature.id",
+   "feature.name",
+   "feature.suppressed",
+   "feature.type"
+  ],
+  "torus": [
+   "feature.body_names",
+   "feature.center",
+   "feature.id",
+   "feature.major",
+   "feature.minor",
+   "feature.name",
+   "feature.operation",
+   "feature.param_names",
+   "feature.suppressed",
+   "feature.type"
+  ]
+ },
+ "suspiciousStrings": {
+  "component.insert_design path": "<dir>/plate.sc",
+  "joint.create a.occurrence": "A:1",
+  "joint.create b.occurrence": "Bracket:1",
+  "joint.origin occurrence": "A:1",
+  "occurrence.copy occurrence": "A:1",
+  "occurrence.ground occurrence": "A:1",
+  "occurrence.move occurrence": "A:1",
+  "timeline.add feature.file": "cube.step",
+  "timeline.add feature.profile.source": "library",
+  "timeline.add feature.sketch.links[].source.font": "Helvetica",
+  "timeline.add feature.step": "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('10mm cube solid'),'… (6501 chars)",
+  "timeline.add params[].expression": "L/2 - inset",
+  "timeline.add<frame_member> feature.profile.source": "library",
+  "timeline.add<import> feature.file": "cube.step",
+  "timeline.add<import> feature.step": "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('10mm cube solid'),'… (6501 chars)",
+  "timeline.add<mesh_import> feature.file": "cube.stl",
+  "timeline.add<sketch> feature.sketch.links[].source.font": "Helvetica"
+ },
+ "scenarios": [
+  {
+   "name": "plate",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    }
+   ]
+  },
+  {
+   "name": "document settings, parameters, materials, appearances",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "document.units",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "document.metadata.set",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "document.metadata.set",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "document.metadata.remove",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "parameters.comment",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "parameters.favorite",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "parameters.add",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "parameters.add",
+     "ok": true,
+     "export": "ok (13 steps)"
+    },
+    {
+     "step": "parameters.move",
+     "ok": true,
+     "export": "ok (13 steps)"
+    },
+    {
+     "step": "parameters.rename",
+     "ok": true,
+     "export": "ok (13 steps)"
+    },
+    {
+     "step": "material.create",
+     "ok": false,
+     "error": "invalid parameters for `material.create`: opaque PBR requires numeric opacity 1",
+     "export": "ok (13 steps)"
+    },
+    {
+     "step": "material.create",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "material.assign",
+     "ok": false,
+     "error": "invalid parameters for `material.assign`: unknown material `Unobtainium` (see material.list)",
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "material.edit",
+     "ok": false,
+     "error": "invalid parameters for `material.edit`: the design defines no material `Unobtainium` (built-in materials cannot be changed)",
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "appearance.assign",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces))"
+    },
+    {
+     "step": "appearance.assign",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces))"
+    },
+    {
+     "step": "body.print_face",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face))"
+    },
+    {
+     "step": "body.rename",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face))"
+    },
+    {
+     "step": "timeline.rename",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face))"
+    },
+    {
+     "step": "timeline.suppress",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face))"
+    },
+    {
+     "step": "timeline.group",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), timeline folders)"
+    },
+    {
+     "step": "note.add",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), timeline folders)"
+    },
+    {
+     "step": "view.save",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), named views, timeline folders)"
+    },
+    {
+     "step": "select.set",
+     "ok": true,
+     "export": "ok (14 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), named views, timeline folders)"
+    },
+    {
+     "step": "sheet.manage_rules",
+     "ok": true,
+     "export": "ok (15 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), named views, timeline folders)"
+    },
+    {
+     "step": "plastic.manage_rules",
+     "ok": true,
+     "export": "ok (16 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), named views, timeline folders)"
+    },
+    {
+     "step": "plastic.assign_rule",
+     "ok": true,
+     "export": "ok (17 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), named views, timeline folders)"
+    },
+    {
+     "step": "render.environment.set",
+     "ok": false,
+     "error": "invalid parameters for `render.environment.set`: unknown field `environment`, expected one of `name`, `set`, `rotation_deg`, `intensity`",
+     "export": "ok (17 steps; omitted: appearances (colours of bodies and faces), print-face assignments (body.print_face), named views, timeline folders)"
+    }
+   ]
+  },
+  {
+   "name": "imported STEP reference",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "file.insert_step",
+     "ok": true,
+     "export": "ok (16 steps)"
+    },
+    {
+     "step": "occurrence.move",
+     "ok": false,
+     "error": "invalid parameters for `occurrence.move`: ref-cube:1 is grounded: unground it first (occurrence.ground; a design's first part is grounded when it is made)",
+     "export": "ok (16 steps)"
+    }
+   ]
+  },
+  {
+   "name": "assembly: components, occurrences, joints of each kind",
+   "steps": [
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (5 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (6 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (6 steps)"
+    },
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (9 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "component.rename",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "component.metadata.set",
+     "ok": false,
+     "error": "invalid parameters for `component.metadata.set`: `vendor` is not a part property: SolidCraft's are project, part_number, revision, author, organization, description, license, bom_type; another tool's ",
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "occurrence.copy",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "occurrence.copy",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "occurrence.move",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "occurrence.move",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "component.capture_position",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "occurrence.ground",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "joint.as_built",
+     "ok": true,
+     "export": "ok (15 steps)"
+    },
+    {
+     "step": "joint.as_built",
+     "ok": true,
+     "export": "ok (16 steps)"
+    },
+    {
+     "step": "joint.as_built",
+     "ok": true,
+     "export": "ok (17 steps)"
+    },
+    {
+     "step": "joint.limits",
+     "ok": true,
+     "export": "ok (18 steps)"
+    },
+    {
+     "step": "joint.drive",
+     "ok": true,
+     "export": "ok (18 steps)"
+    },
+    {
+     "step": "joint.motion_link",
+     "ok": true,
+     "export": "ok (19 steps)"
+    },
+    {
+     "step": "joint.rigid_group",
+     "ok": true,
+     "export": "ok (20 steps)"
+    },
+    {
+     "step": "joint.origin",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "occurrence.align",
+     "ok": false,
+     "error": "invalid parameters for `occurrence.align`: `from_face` must be on a planar face",
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "component.paste_new",
+     "ok": true,
+     "export": "ok (26 steps)"
+    },
+    {
+     "step": "joint.edit",
+     "ok": true,
+     "export": "ok (26 steps)"
+    },
+    {
+     "step": "contact.create",
+     "ok": true,
+     "export": "ok (26 steps; omitted: contact sets)"
+    },
+    {
+     "step": "contact.enable_sets",
+     "ok": true,
+     "export": "ok (26 steps; omitted: contact sets)"
+    },
+    {
+     "step": "explode.create",
+     "ok": true,
+     "export": "ok (26 steps; omitted: contact sets, exploded views)"
+    },
+    {
+     "step": "motion.study",
+     "ok": true,
+     "export": "ok (26 steps; omitted: contact sets, motion studies, exploded views)"
+    },
+    {
+     "step": "component.cycle_color",
+     "ok": true,
+     "export": "ok (26 steps; omitted: identification colour of `A`, contact sets, motion studies, exploded views)"
+    },
+    {
+     "step": "component.hide_history",
+     "ok": true,
+     "export": "ok (26 steps; omitted: identification colour of `A`, contact sets, motion studies, exploded views)"
+    }
+   ]
+  },
+  {
+   "name": "assembly: joint.create kinds and assembly constraints",
+   "steps": [
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (5 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (6 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (6 steps)"
+    },
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (9 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "assembly.constraint.create",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a joint made as an assembly constraint (`Mate1`) (#886)"
+    },
+    {
+     "step": "assembly.constraint.create",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a joint made as an assembly constraint (`Mate1`) (#886)"
+    },
+    {
+     "step": "joint.gear",
+     "ok": false,
+     "error": "invalid parameters for `joint.gear`: couple two different joints",
+     "export": "refused: not supported yet: a command script of a design with a joint made as an assembly constraint (`Mate1`) (#886)"
+    }
+   ]
+  },
+  {
+   "name": "assembly: coupled joints (gear, screw, rack and pinion) and library parts",
+   "steps": [
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (5 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (6 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (6 steps)"
+    },
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (9 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "ok (13 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (15 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (16 steps)"
+    },
+    {
+     "step": "joint.gear",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a gear coupling on joints `R1` and `R2` (#886)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (15 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (16 steps)"
+    },
+    {
+     "step": "joint.rack_pinion",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a rack-and-pinion coupling on joints `R1` and `S1` (#886)"
+    },
+    {
+     "step": "joint.delete",
+     "ok": true,
+     "export": "ok (15 steps)"
+    },
+    {
+     "step": "joint.create",
+     "ok": true,
+     "export": "ok (16 steps)"
+    },
+    {
+     "step": "joint.screw",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a screw coupling on joints `C1` and `C1` (#886)"
+    },
+    {
+     "step": "joint.drive",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a screw coupling on joints `C1` and `C1` (#886)"
+    },
+    {
+     "step": "solid.cylinder",
+     "ok": false,
+     "error": "`targets` must list existing bodies",
+     "export": "refused: not supported yet: a command script of a design with a screw coupling on joints `C1` and `C1` (#886)"
+    },
+    {
+     "step": "parts.insert",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with a standard part whose rebuilt features would not keep their ids (`Hex Nut M6`) (#886)"
+    }
+   ]
+  },
+  {
+   "name": "assembly: nested components and moved bodies",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "component.from_bodies",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with bodies moved between components (#886)"
+    },
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with bodies moved between components (#886)"
+    },
+    {
+     "step": "component.create",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with nested components (#886)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with nested components (#886)"
+    },
+    {
+     "step": "component.activate",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with nested components (#886)"
+    },
+    {
+     "step": "occurrence.reparent",
+     "ok": true,
+     "export": "refused: not supported yet: a command script of a design with bodies moved between components (#886)"
+    }
+   ]
+  },
+  {
+   "name": "configurations",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "material.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "config.configure",
+     "ok": true,
+     "export": "ok (18 steps)"
+    },
+    {
+     "step": "config.row",
+     "ok": true,
+     "export": "ok (19 steps)"
+    },
+    {
+     "step": "config.row",
+     "ok": true,
+     "export": "ok (20 steps)"
+    },
+    {
+     "step": "config.column",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "config.rule",
+     "ok": false,
+     "error": "invalid parameters for `config.rule`: configuration rules: unknown condition type",
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "config.activate",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "config.row",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "config.table",
+     "ok": true,
+     "export": "ok (21 steps)"
+    }
+   ]
+  },
+  {
+   "name": "sketch links: text, fonts, SVG, DXF, projection",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "sketch.create",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.text",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.text",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.text",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.insert_svg",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.insert_dxf",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.insert_airfoil",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.project",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.include_3d",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "sketch.finish",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "solid.extrude",
+     "ok": true,
+     "export": "ok (12 steps)"
+    }
+   ]
+  },
+  {
+   "name": "canvas and decal",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "canvas.insert",
+     "ok": true,
+     "export": "ok (10 steps; omitted: canvases (reference images))"
+    },
+    {
+     "step": "canvas.decal",
+     "ok": true,
+     "export": "ok (10 steps; omitted: canvases (reference images))"
+    },
+    {
+     "step": "canvas.edit",
+     "ok": true,
+     "export": "ok (10 steps; omitted: canvases (reference images))"
+    },
+    {
+     "step": "canvas.calibrate",
+     "ok": true,
+     "export": "ok (10 steps; omitted: canvases (reference images))"
+    }
+   ]
+  },
+  {
+   "name": "mesh, point cloud and board imports",
+   "steps": [
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (1 steps)"
+    },
+    {
+     "step": "file.insert_mesh",
+     "ok": true,
+     "export": "ok (7 steps)"
+    },
+    {
+     "step": "file.insert_mesh",
+     "ok": true,
+     "export": "ok (11 steps; omitted: appearances (colours of bodies and faces))"
+    },
+    {
+     "step": "mesh.convert",
+     "ok": true,
+     "export": "ok (12 steps; omitted: appearances (colours of bodies and faces))"
+    },
+    {
+     "step": "pointcloud.insert",
+     "ok": true,
+     "export": "ok (12 steps; omitted: appearances (colours of bodies and faces), point clouds)"
+    },
+    {
+     "step": "file.insert_gerber",
+     "ok": false,
+     "error": "board.gtl: the Gerber file draws no lines or arcs, so there is no board outline in it. It only flashes apertures (pads), so it is probably not the board outline layer.",
+     "export": "ok (12 steps; omitted: appearances (colours of bodies and faces), point clouds)"
+    },
+    {
+     "step": "file.insert_gerber",
+     "ok": true,
+     "export": "ok (19 steps; omitted: appearances (colours of bodies and faces), point clouds)"
+    }
+   ]
+  },
+  {
+   "name": "construction geometry, surfaces, sheet metal, plastic, frames, library parts",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "construct.plane.offset",
+     "ok": true,
+     "export": "ok (11 steps)"
+    },
+    {
+     "step": "construct.plane.at_angle",
+     "ok": true,
+     "export": "ok (12 steps)"
+    },
+    {
+     "step": "construct.axis.two_planes",
+     "ok": true,
+     "export": "ok (13 steps)"
+    },
+    {
+     "step": "construct.axis.through_cylinder",
+     "ok": true,
+     "export": "ok (14 steps)"
+    },
+    {
+     "step": "construct.point.three_planes",
+     "ok": true,
+     "export": "ok (15 steps)"
+    },
+    {
+     "step": "solid.sphere",
+     "ok": true,
+     "export": "ok (16 steps)"
+    },
+    {
+     "step": "solid.cone",
+     "ok": true,
+     "export": "ok (17 steps)"
+    },
+    {
+     "step": "solid.torus",
+     "ok": true,
+     "export": "ok (18 steps)"
+    },
+    {
+     "step": "solid.chamfer",
+     "ok": true,
+     "export": "ok (19 steps)"
+    },
+    {
+     "step": "solid.shell",
+     "ok": true,
+     "export": "ok (20 steps)"
+    },
+    {
+     "step": "sketch.create",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "sketch.line",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "sketch.finish",
+     "ok": true,
+     "export": "ok (21 steps)"
+    },
+    {
+     "step": "surface.extrude",
+     "ok": true,
+     "export": "ok (22 steps)"
+    },
+    {
+     "step": "sheet.flange",
+     "ok": false,
+     "error": "Open has no closed profiles",
+     "export": "ok (22 steps)"
+    },
+    {
+     "step": "frame.member",
+     "ok": true,
+     "export": "ok (23 steps)"
+    },
+    {
+     "step": "plastic.boss",
+     "ok": false,
+     "error": "the plastic feature's placement is no longer on its body face",
+     "export": "ok (23 steps)"
+    },
+    {
+     "step": "solid.thread",
+     "ok": true,
+     "export": "ok (24 steps)"
+    },
+    {
+     "step": "solid.move",
+     "ok": false,
+     "error": "unknown body `Ball`",
+     "export": "ok (24 steps)"
+    },
+    {
+     "step": "solid.scale",
+     "ok": false,
+     "error": "unknown body `Ball`",
+     "export": "ok (24 steps)"
+    },
+    {
+     "step": "solid.mirror",
+     "ok": true,
+     "export": "ok (25 steps)"
+    },
+    {
+     "step": "solid.pattern.circular",
+     "ok": true,
+     "export": "ok (26 steps)"
+    }
+   ]
+  },
+  {
+   "name": "linked design (insert_design)",
+   "steps": [
+    {
+     "step": "(batch)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "(save)",
+     "ok": true,
+     "export": "ok (10 steps)"
+    },
+    {
+     "step": "(new_design)",
+     "ok": true,
+     "export": "ok (0 steps)"
+    },
+    {
+     "step": "solid.box",
+     "ok": true,
+     "export": "ok (1 steps)"
+    },
+    {
+     "step": "component.insert_design",
+     "ok": true,
+     "export": "ok (6 steps; omitted: linked design `LinkedPlate`: the file <dir>/plate.sc` must be present at replay)"
+    }
+   ]
+  }
+ ]
+}

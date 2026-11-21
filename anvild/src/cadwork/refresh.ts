@@ -1,0 +1,857 @@
+/**
+ * The refresh (agent-cad-and-browser spec §4.3 steps 2–5, §4.14 #2 #3 #7): what runs, inside the
+ * part's queue, after a change's script write — debounced during a burst, always when the queue
+ * drains, and synchronously first for `check_part` and friends (see `CadManager.setRefresh`).
+ *
+ *   2. MEASURE   design bodies only (bodies made by a `BaseFeature` — a STEP import — are left
+ *                out), the hole table, feature errors and warnings.
+ *   3. GATE      evaluate (./gate.ts), write `part.json.measured`, set the part's verdict.
+ *                Phase A4 adds, for a part with references, the integrity of every `refs/` file
+ *                against the STEP text embedded in the design and the interference check with each
+ *                reference in `noInterferenceWith` (./refs.ts), and the gap (`report_gap`). A
+ *                reference is placed once (a copy or pattern of its component fails), and the
+ *                interference check names every placement by its world name, so each is checked
+ *                where it sits. Every reference sits where its import put it — identity in the
+ *                design, grounded, read from `component.list` — and no feature names its bodies
+ *                ("reference far.step was moved from where it was imported", "…is not grounded",
+ *                "…is changed by feature Move1"). And every reference IS the solid its import is —
+ *                the lock store's record (made at import_reference) as a fast pre-check, then an exact
+ *                comparison with the TRUE import in a throwaway process, where the design bodies are
+ *                also checked for interference with it — so a feature that picks it by a face point
+ *                is caught however it reshapes it ("reference block.step does not match what was
+ *                imported (…)", "interference block.step as imported"). An approval with no record of a
+ *                reference needs the owner's card. Every DESIGN body is placed once too ("body Body1
+ *                is placed 2 times"), so the measurement, export and release describe all of it.
+ *   4. PREVIEW   export the design bodies to `.cache/preview-<rev>.glb` (metres, Y up) and keep the
+ *                newest three, plus a small `.cache/thumb-<rev>.png` for the part card (Phase A4).
+ *                An empty design has no preview. A failed export never touches the gate.
+ *   5. BROADCAST `onResult` hands the outcome to the service, which sends `cad.design`.
+ *
+ * FAIL CLOSED: anything that throws in here ends as an `unverified` gate result with the error
+ * listed, never as `pass`, and never as an exception into the manager's queue.
+ */
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
+import { ADOPTION_CHECKS, evaluateGate, failingLines, gateError, type GateCheck, type GateInput, type GateResult, type Measurement } from "./gate";
+import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
+import { repoIdentity, type LockReader, type LockStore, type RepoIdentity } from "./locks";
+import type { CadParamInfo, FeatureIssue, PartState, RefreshJob, SlotContext } from "./manager";
+import type { McpToolResult } from "./mcp-client";
+import type { PartRef } from "./partfolder";
+import { readPartFile, writeMeasured, type GapRecord, type Measured, type PartRead } from "./partfile";
+import { CACHE_DIR, DESIGN_FILE, readDesignFile } from "./poststep";
+import {
+  AS_IMPORTED,
+  embeddedReferences,
+  embeddedStepTexts,
+  interferenceCheck,
+  interferenceRequest,
+  isReferenceMeasure,
+  liveReferences,
+  readComponentList,
+  readReferenceMeasures,
+  referenceChecks,
+  referenceDifferences,
+  referenceEditChecks,
+  referenceLabel,
+  readRegularFile,
+  referenceOnDisk,
+  referencePlacementChecks,
+  REFERENCE_RESHAPED,
+  shapeDifferences,
+  type EmbeddedReference,
+  type ReferenceBodyMeasure,
+  type LiveReference,
+} from "./refs";
+import type { PartLock } from "./locks";
+import type { ExportedBody, TrueReferenceCheck, TrueReferenceResult } from "./refreplay";
+import { readRules } from "./rules";
+
+export interface RefreshOutcome {
+  ref: PartRef;
+  gate: GateResult;
+  measurement?: Measurement;
+  /** The full hole table (depths, counterbores) — richer than `measurement.holes`. */
+  holes: HoleRow[];
+  params: CadParamInfo[];
+  scriptSha?: string;
+  /** How long measuring and evaluating took (the preview export included). */
+  ms: number;
+  forced: boolean;
+  /** The revision this refresh is (`cad.design.rev`), when the service numbers them. */
+  rev?: number;
+  /** Worktree-relative path of the preview written by this refresh; absent for an empty design. */
+  preview?: string;
+  /** Why no preview was written although the design has bodies. */
+  previewError?: string;
+  /** sha256 of the preview as exported: the route serves the file only while it still matches. */
+  previewSha?: string;
+  /** Worktree-relative path of the part card's thumbnail (`.cache/thumb-<rev>.png`), Phase A4. */
+  thumbnail?: string;
+  /** sha256 of the thumbnail as written (served on the same terms as the preview). */
+  thumbnailSha?: string;
+  /** Size of `design.json` in bytes (owner item 45: shown on the card above 5 MB). */
+  scriptBytes?: number;
+  /** The design's own bodies and the imported reference bodies, as read by this refresh. */
+  designBodies?: string[];
+  referenceBodies?: string[];
+}
+
+/** How many `.cache/preview-<rev>.glb` files are kept per part (§4.3 step 4). */
+export const PREVIEWS_KEPT = 3;
+const PREVIEW_RE = /^preview-(\d+)\.glb$/;
+export const previewName = (rev: number): string => `preview-${rev}.glb`;
+/** A worktree-relative path that names a preview of `part` — the only shape the preview route serves. */
+export const PREVIEW_PATH_RE = /^cad\/([a-z0-9][a-z0-9-]{0,39})\/\.cache\/preview-(\d+)\.glb$/;
+/** The part card's thumbnail, served by the same route (Phase A4): nothing else is reachable. */
+export const THUMB_PATH_RE = /^cad\/([a-z0-9][a-z0-9-]{0,39})\/\.cache\/thumb-(\d+)\.png$/;
+const THUMB_RE = /^thumb-(\d+)\.png$/;
+export const thumbName = (rev: number): string => `thumb-${rev}.png`;
+
+/** The revisions that have a preview file in a part's cache folder, ascending. */
+export function previewRevs(partDir: string): number[] {
+  try {
+    return readdirSync(join(partDir, CACHE_DIR))
+      .map((n) => PREVIEW_RE.exec(n)?.[1])
+      .filter((n): n is string => n !== undefined)
+      .map(Number)
+      .sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+/** Keep the newest `keep` thumbnails of a part. */
+export function pruneThumbs(partDir: string, keep = PREVIEWS_KEPT): void {
+  try {
+    const revs = readdirSync(join(partDir, CACHE_DIR))
+      .map((n) => THUMB_RE.exec(n)?.[1])
+      .filter((n): n is string => n !== undefined)
+      .map(Number)
+      .sort((a, b) => a - b);
+    for (const r of revs.slice(0, Math.max(0, revs.length - keep))) rmSync(join(partDir, CACHE_DIR, thumbName(r)), { force: true });
+  } catch {
+    /* no cache folder */
+  }
+}
+
+/** Step 4b (Phase A4): a small PNG of the part for its card, in the camera the process has (so the
+ *  agent's own view is not moved). Never throws. */
+export async function exportThumbnail(call: Call, ref: PartRef, rev: number): Promise<{ path: string; sha: string } | undefined> {
+  try {
+    const path = join(ref.dir, CACHE_DIR, thumbName(rev));
+    const r = await call("screenshot", { width: 160, height: 120, path });
+    if (r.isError || !existsSync(path)) return undefined;
+    const sha = createHash("sha256").update(readFileSync(path)).digest("hex");
+    pruneThumbs(ref.dir);
+    return { path: relative(ref.worktree, path), sha };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Delete every preview older than the newest `keep`. Returns the revisions removed. */
+export function prunePreviews(partDir: string, keep = PREVIEWS_KEPT): number[] {
+  const revs = previewRevs(partDir);
+  const drop = revs.slice(0, Math.max(0, revs.length - keep));
+  for (const r of drop) rmSync(join(partDir, CACHE_DIR, previewName(r)), { force: true });
+  return drop;
+}
+
+/** The newest preview on disk for a part as `{ rev, path }` (path worktree-relative), if any. */
+export function newestPreview(ref: PartRef): { rev: number; path: string } | undefined {
+  const rev = previewRevs(ref.dir).at(-1);
+  return rev === undefined ? undefined : { rev, path: relative(ref.worktree, join(ref.dir, CACHE_DIR, previewName(rev))) };
+}
+
+/**
+ * Step 4: write `.cache/preview-<rev>.glb` through the part's own process and prune. Design bodies
+ * only — an imported reference is not the part. Never throws: the preview is a picture, not a check.
+ */
+export async function exportPreview(call: Call, ref: PartRef, rev: number, designBodies: string[]): Promise<{ preview?: string; sha?: string; error?: string }> {
+  if (designBodies.length === 0) return {}; // nothing to show yet; not an error
+  try {
+    const dir = join(ref.dir, CACHE_DIR);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, previewName(rev));
+    const r = await call("export", { path, format: "glb", bodies: designBodies });
+    if (r.isError || !existsSync(path)) return { error: r.text.slice(0, 300) || "no preview file was written" };
+    const sha = createHash("sha256").update(readFileSync(path)).digest("hex");
+    prunePreviews(ref.dir);
+    return { preview: relative(ref.worktree, path), sha };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export interface RefreshDeps {
+  locks: LockStore;
+  /** This machine's serverId: a lock found by the repo's PATH counts only when made here. */
+  machine?(): string | undefined;
+  /** The number the refresh about to be broadcast gets (`cad.design.rev`). Omitted → no preview is written. */
+  nextRev?(ref: PartRef): number;
+  /** Step 5: called once per refresh with the outcome (measurement, gate, preview). */
+  onResult(outcome: RefreshOutcome, slot: SlotContext): void | Promise<void>;
+  now?: () => string;
+  /** Test seam: replace the gate's evaluation (to prove a throwing gate fails closed). */
+  evaluateImpl?: (input: GateInput) => GateResult;
+  /** Test seam: called before measuring (to prove a throwing refresh fails closed). */
+  beforeMeasure?: (ref: PartRef) => void;
+  /** Phase A4: advisory checks the service holds for a part (a concept's picture score). */
+  advisoryFor?: (ref: PartRef) => GateCheck[];
+  /** Checks references against their true import (see `EvaluateDeps.checkReference`). */
+  checkReference?: TrueReferenceCheck;
+}
+
+type Call = (tool: string, args: Record<string, unknown>) => Promise<McpToolResult>;
+
+export interface DesignRead {
+  version: string;
+  designBodies: string[];
+  /** Bodies made by a `BaseFeature` (a STEP import): the references. */
+  referenceBodies: string[];
+  /**
+   * Every placement of every body, by its definition's name: `{far: ["far", "far (ref-far.step:2)"]}`
+   * after `occurrence.copy` of the component holding `far`. From `inspect.measure {names_only: true}`,
+   * which lists each placed body once with its WORLD name — the name `inspect.interference` takes to
+   * check that placement where it sits (real 0.44.1; a bare body name means its first placement only).
+   */
+  placements: Record<string, string[]>;
+  /** The reference components as `component.list` has them (found by their import feature, not by
+   *  name), each placement with where it is in the world. */
+  references: LiveReference[];
+  featureErrors: FeatureIssue[];
+  warnings: string[];
+  params: CadParamInfo[];
+}
+
+const need = (r: McpToolResult, what: string): any => {
+  if (r.isError || r.json === undefined) throw new Error(`${what} failed: ${r.text.slice(0, 300) || "no reply"}`);
+  return r.json;
+};
+
+/** Bodies with their creating feature, the timeline's errors and warnings, parameters, the version. */
+export async function readDesign(call: Call): Promise<DesignRead> {
+  const d = need(await call("inspect_design", { measure: false, sketches: false, timeline: "summary", bodies: true }), "inspect_design");
+  const timeline: any[] = Array.isArray(d.timeline) ? d.timeline : [];
+  const typeOf = new Map<unknown, string>(timeline.map((f) => [f?.id, String(f?.type ?? "")]));
+  const bodies: any[] = Array.isArray(d.bodies) ? d.bodies : [];
+  // §4.14 #3: a body created by a BaseFeature is an imported reference, not the part.
+  const designBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) !== "BaseFeature").map((b) => String(b.name));
+  const referenceBodies = bodies.filter((b) => b && typeof b.name === "string" && typeOf.get(b.feature) === "BaseFeature").map((b) => String(b.name));
+  const params: any[] = Array.isArray(d.params) ? d.params : [];
+  const placements = readPlacements(need(await call("execute", { command: "inspect.measure", params: { names_only: true } }), "inspect.measure names_only"));
+  // Where each reference sits; a timeline with no import (BaseFeature) has none, so nothing is asked.
+  const references = timeline.some((f) => f?.type === "BaseFeature") ? liveReferences(readComponentList(need(await call("execute", { command: "component.list", params: {} }), "component.list")), timeline, bodies) : [];
+  const version = need(await call("version", {}), "version").version;
+  return {
+    version: String(version ?? ""),
+    designBodies,
+    referenceBodies,
+    placements,
+    references,
+    featureErrors: timeline.filter((f) => f?.error).map((f) => ({ id: f.id, feature: String(f.name ?? f.id), message: String(f.error) })),
+    warnings: timeline.filter((f) => f?.warning).map((f) => `${String(f.name ?? f.id)}: ${String(f.warning)}`),
+    params: params
+      .filter((p) => p && p.model !== true)
+      .map((p) => ({ name: String(p.name), expression: String(p.expression ?? ""), value: Number(p.value), unit: String(p.unit ?? ""), ...(p.error ? { error: String(p.error) } : {}) })),
+  };
+}
+
+/** `inspect.measure {names_only: true}` → definition name → the world names of its placements. A reply
+ *  that is not that shape throws (the refresh fails closed). */
+export function readPlacements(j: any): Record<string, string[]> {
+  if (!Array.isArray(j?.bodies)) throw new Error("inspect.measure names_only answered no body list");
+  const out: Record<string, string[]> = Object.create(null);
+  for (const b of j.bodies) {
+    if (typeof b?.name !== "string" || typeof b?.definition !== "string") throw new Error(`inspect.measure names_only answered a body without a name and definition: ${JSON.stringify(b).slice(0, 120)}`);
+    (out[b.definition] ??= []).push(b.name);
+  }
+  return out;
+}
+
+/** Why a reference placed more than once fails the gate (each placement is another copy of the
+ *  thing the part must fit; only one can be the approved one). */
+export const REFERENCE_PLACED_ONCE = "a reference may be placed once";
+
+/**
+ * Every reference — each STEP import in the script, and any imported (BaseFeature) body no import
+ * accounts for — must be placed exactly once: `occurrence.copy` or a component pattern of its
+ * component adds a placement the approval never saw. Hard fail "reference <name> is placed N times".
+ */
+export function placementChecks(embedded: { file: string; bodies: string[] }[] | undefined, referenceBodies: string[], placements: Record<string, string[]>): GateCheck[] {
+  const groups = new Map<string, Set<string>>();
+  const seen = new Set<string>();
+  for (const e of embedded ?? []) {
+    const g = groups.get(e.file) ?? new Set<string>();
+    for (const b of e.bodies) {
+      g.add(b);
+      seen.add(b);
+    }
+    groups.set(e.file, g);
+  }
+  for (const b of referenceBodies) if (!seen.has(b)) groups.set(`body ${b}`, new Set([b]));
+  const checks: GateCheck[] = [];
+  for (const [name, bodies] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+    const world = [...bodies].flatMap((b) => placements[b] ?? []);
+    const n = Math.max(0, ...[...bodies].map((b) => (placements[b] ?? []).length));
+    if (n <= 1) continue;
+    checks.push({ id: `placed ${name}`, expected: "the reference is placed once", measured: `reference ${name} is placed ${n} times; ${REFERENCE_PLACED_ONCE} (${world.join(", ").slice(0, 200)})`, ok: false, hard: true });
+  }
+  return checks;
+}
+
+/** Why a design body placed more than once fails the gate: the measurement, the preview, the export
+ *  and the release name bodies by their own name, which is the FIRST placement only. */
+export const DESIGN_PLACED_ONCE = "a design body may be placed once";
+
+/** Every design body must be placed exactly once (hard fail "body Body1 is placed 2 times; a design
+ *  body may be placed once"), so what is measured, exported and released is the whole design. */
+export function designPlacementChecks(designBodies: string[], placements: Record<string, string[]>): GateCheck[] {
+  return [...new Set(designBodies)]
+    .sort()
+    .filter((b) => (placements[b]?.length ?? 0) > 1)
+    .map((b) => ({ id: `placed body ${b}`, expected: "the body is placed once", measured: `body ${b} is placed ${placements[b]!.length} times; ${DESIGN_PLACED_ONCE} (${placements[b]!.join(", ").slice(0, 200)})`, ok: false, hard: true }));
+}
+
+/** A body's placements by world name; a body the list does not have is sent by its own name, so
+ *  SolidCraft answers for it (and refuses a name that is no body: a hard fail). */
+const worldNames = (bodies: string[], placements: Record<string, string[]>): string[] => [...new Set(bodies.flatMap((b) => (placements[b]?.length ? placements[b]! : [b])))];
+
+/** Measure the design bodies: volume is their sum, the bounding box their union (then sorted). */
+export async function measureDesign(call: Call, designBodies: string[]): Promise<{ bbox: [number, number, number]; volume: number; faces: number; bodies: number; holes: HoleRow[] }> {
+  // `inspect.measure {bodies: []}` means "all", which would include references: never send it empty.
+  if (designBodies.length === 0) return { bbox: [0, 0, 0], volume: 0, faces: 0, bodies: 0, holes: [] };
+  const m = need(await call("execute", { command: "inspect.measure", params: { bodies: designBodies } }), "inspect.measure");
+  const list: any[] = Array.isArray(m.bodies) ? m.bodies : [];
+  if (list.length !== designBodies.length) throw new Error(`inspect.measure answered ${list.length} bodies; ${designBodies.length} were asked for`);
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  let volume = 0;
+  let faces = 0;
+  for (const b of list) {
+    if (b?.error) throw new Error(`body ${b.name} could not be measured: ${b.error}`);
+    if (typeof b?.volume_mm3 !== "number" || !Number.isFinite(b.volume_mm3)) throw new Error(`body ${b?.name} has no volume (is it a closed solid?)`);
+    volume += b.volume_mm3;
+    faces += Number(b.faces ?? 0);
+    for (let k = 0; k < 3; k++) {
+      min[k] = Math.min(min[k]!, Number(b.bbox?.min?.[k]));
+      max[k] = Math.max(max[k]!, Number(b.bbox?.max?.[k]));
+    }
+  }
+  const size = [0, 1, 2].map((k) => max[k]! - min[k]!);
+  if (!size.every((v) => Number.isFinite(v))) throw new Error("a body has no bounding box");
+  const tables: HoleRow[][] = [];
+  for (const body of designBodies) tables.push(await holeTable(call, body));
+  return { bbox: size.sort((a, b) => a - b) as [number, number, number], volume, faces, bodies: designBodies.length, holes: mergeHoleTables(tables) };
+}
+
+/** Everything the gate reads that is not the live process: the repo files and the lock store. An
+ *  approval is found under ANY identity of the repo (its remote, its main checkout's path). */
+export function readLocked(ref: PartRef, locks: LockReader, machine?: string): Pick<GateInput, "part" | "lock" | "rules" | "rulesLock"> & { repo: string; identity: RepoIdentity } {
+  const identity = repoIdentity(ref.worktree);
+  return { repo: identity.key, identity, part: readPartFile(ref.dir), lock: locks.findPart(identity, ref.part, machine), rules: readRules(ref.worktree), rulesLock: locks.findRules(identity, machine) };
+}
+
+/**
+ * The gap a part is blocked on: the lock store's record wins (it cannot be edited away in the file);
+ * a `gap` in `part.json` with no newer record in the store counts too (a fresh clone).
+ */
+export function gapOf(part: PartRead, store: { gap?: GapRecord; at: string } | undefined): GapRecord | undefined {
+  if (store?.gap) return store.gap;
+  const fileGap = part.kind === "ok" ? part.file.gap : undefined;
+  if (!fileGap) return undefined;
+  if (store && Date.parse(store.at) >= Date.parse(fileGap.at)) return undefined; // cleared after it was reported
+  return fileGap;
+}
+
+/**
+ * Phase A4: the reference checks for a part, inside its queue slot. Nothing is asked of SolidCraft
+ * for a part that names no reference.
+ */
+export async function referenceGate(
+  call: Call,
+  ref: PartRef,
+  part: PartRead,
+  scriptSha: string | undefined,
+  design: Pick<DesignRead, "designBodies" | "referenceBodies" | "placements" | "references">,
+): Promise<{ checks: GateCheck[]; unverified: boolean; embedded?: EmbeddedReference[]; clean?: ReadonlySet<string>; script?: DesignScriptLike }> {
+  if (part.kind !== "ok") return { checks: [], unverified: false };
+  const exp = part.file.expectations;
+  const must = exp?.noInterferenceWith ?? [];
+  const recorded = (part.file.refs ?? []).map((r) => r.name);
+  const names = [...new Set([...must, ...recorded])];
+  if (names.length === 0 && (!exp || design.referenceBodies.length === 0)) return { checks: [], unverified: false };
+  // The embedded text is read from design.json — and only when it IS the script the process runs.
+  const disk = readDesignFile(ref.dir);
+  const embedded = disk.script && scriptSha !== undefined && disk.scriptSha === scriptSha ? embeddedReferences(disk.script) : undefined;
+  const integrity = referenceChecks(names, (n) => referenceOnDisk(ref, n), embedded);
+  const checks = [...integrity.checks, ...placementChecks(embedded, design.referenceBodies, design.placements), ...referencePlacementChecks(design.references, embedded)];
+  // A feature naming a reference body changes it where no placement shows it (solid.move of `far`).
+  const refBodies = new Map<string, string>();
+  for (const r of design.references) for (const b of r.bodies) refBodies.set(b, referenceLabel(r, embedded));
+  for (const e of embedded ?? []) for (const b of e.bodies) if (!refBodies.has(b)) refBodies.set(b, e.file);
+  for (const b of design.referenceBodies) if (!refBodies.has(b)) refBodies.set(b, `body ${b}`);
+  checks.push(...referenceEditChecks(embedded ? disk.script : undefined, refBodies));
+  if (exp) checks.push(...coverageChecks(must, recorded, embedded, design.referenceBodies, integrity.clean));
+  for (const name of [...new Set(must)].sort()) {
+    // EVERY import carrying this file name is checked (a second one is also a duplicate, failed above).
+    const embs = embedded?.filter((e) => e.file === name) ?? [];
+    if (embs.length === 0) {
+      checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: `refs/${name} is not in the design, so nothing could be checked`, ok: false, hard: true });
+      continue;
+    }
+    const emb = { bodies: [...new Set(embs.flatMap((e) => e.bodies))] };
+    const missing = emb.bodies.filter((b) => !design.referenceBodies.includes(b));
+    if (embs.some((e) => e.bodies.length === 0) || missing.length) {
+      checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: `the reference's bodies (${missing.join(", ") || "none listed"}) are not in the design`, ok: false, hard: true });
+      continue;
+    }
+    if (design.designBodies.length === 0) {
+      checks.push({ id: `interference ${name}`, expected: `no overlap with refs/${name}`, measured: "no design bodies yet", ok: true, hard: true });
+      continue;
+    }
+    let reply: McpToolResult | { error: string };
+    try {
+      // EVERY placement on both sides, by world name: a copy or a moved placement is checked where it is.
+      reply = await call("execute", interferenceRequest(worldNames(design.designBodies, design.placements), worldNames(emb.bodies, design.placements)));
+    } catch (e) {
+      reply = { error: e instanceof Error ? e.message : String(e) };
+    }
+    checks.push(interferenceCheck(name, reply));
+  }
+  return { checks, unverified: integrity.unverified, ...(embedded ? { embedded, clean: integrity.clean, script: disk.script } : {}) };
+}
+
+type DesignScriptLike = Parameters<typeof embeddedStepTexts>[0];
+
+/** Why a reference fails when the lock store's record of it is for other STEP text. */
+export const REFERENCE_NOT_APPROVED = "is not the STEP that was approved";
+/** The owner card's question for a reference the approval holds no record of (item 3). */
+export const REFERENCE_NOT_RECORDED = "reference measurements not recorded; approve current reference";
+
+/** The largest STEP export of one body the gate reads back (a design body can be bigger than a
+ *  reference, which is capped at 50 MB). */
+export const STAGED_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
+
+/**
+ * The staging folder of ONE refresh's true-import check: a fresh folder (`mkdtempSync`, mode 0700,
+ * a name no other refresh or process can have) under the part's real `.cache`. `take(name)` gives
+ * the path of a file that does not exist yet; `read(path)` reads it back only when it is a regular
+ * file — not a link, not a folder, a single link to its inode — inside this very folder (still the
+ * folder that was made: same inode, not swapped for a link), through a descriptor that refuses a link
+ * (refs.ts `readRegularFile`). So what is read is exactly what the live process wrote in this refresh.
+ */
+export function makeStaging(partDir: string): { dir: string; take: (name: string) => string; read: (path: string) => Buffer; remove: () => void } {
+  const cache = join(partDir, CACHE_DIR);
+  mkdirSync(cache, { recursive: true });
+  const cst = lstatSync(cache);
+  if (cst.isSymbolicLink() || !cst.isDirectory() || realpathSync(cache) !== join(realpathSync(partDir), CACHE_DIR)) throw new Error(`${CACHE_DIR} is not a real folder of the part`);
+  const dir = mkdtempSync(join(cache, "truecheck-"));
+  const ino = lstatSync(dir).ino;
+  const taken = new Set<string>();
+  const intact = () => {
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory() || st.ino !== ino) throw new Error("the staging folder was replaced while it was in use");
+  };
+  return {
+    dir,
+    take: (name) => {
+      intact();
+      const path = join(dir, name);
+      if (taken.has(path) || existsSync(path) || isLink(path)) throw new Error(`the staging file ${name} already exists`);
+      taken.add(path);
+      return path;
+    },
+    read: (path) => {
+      if (!taken.has(path)) throw new Error("not a staging file of this refresh");
+      intact();
+      let st;
+      try {
+        st = lstatSync(path);
+      } catch {
+        throw new Error("no file was written");
+      }
+      if (st.isSymbolicLink() || !st.isFile()) throw new Error("what was written is not a regular file");
+      if (st.nlink !== 1) throw new Error("what was written is linked elsewhere");
+      const r = readRegularFile(path, st.ino, STAGED_EXPORT_MAX_BYTES);
+      if (!r.ok) throw new Error(`what was written ${r.error}`);
+      return r.bytes;
+    },
+    remove: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+const isLink = (p: string): boolean => {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * GEOMETRY — every reference (each byte-checked import, `clean`) must be the solid its import is,
+ * where its import put it, and the design must not touch the TRUE import:
+ *
+ *   1. APPROVED TEXT. The lock store's record (`PartLock.references[file]`, made at import_reference
+ *      and carried into every approval) must be for the embedded STEP text. A record for other text on
+ *      a part with expectations: unverified ("is not the STEP that was approved"). NO record of a
+ *      reference in `noInterferenceWith` (an approval made before records were kept, or one lost) is
+ *      never filled in from the current file: the part needs adoption (`lock.references`, "reference
+ *      measurements not recorded; approve current reference") and the owner's card records it.
+ *   2. FAST PRE-CHECK. The live reference measures what the record (or, with none, the true import)
+ *      says: volume, world bounding box, faces, centre of mass within 1e-6 of its size.
+ *   3. THE TRUE IMPORT (./refreplay.ts `makeTrueReferenceCheck`). The live process exports every
+ *      design body placement and each reference body to STEP at its world placement (into a staging
+ *      folder of the part's `.cache` made for this refresh alone, `makeStaging`, removed afterwards); a
+ *      throwaway sandboxed process imports the embedded text at the identity next to them (before and
+ *      after them) and runs `inspect.interference`:
+ *        - design × true bodies, for a reference in `noInterferenceWith`: the exact "no interference"
+ *          condition ("interference x.step as imported") — the live-body check stays as well;
+ *        - true × live, per body: the same solid ⇔ vol(true) = vol(live) = vol(true ∩ live) within
+ *          a 0.1 nm layer over the import's surface (refs.ts `shapeTolerance`, never a fraction of
+ *          the volume). Any shape difference with volume fails, whatever summary numbers it keeps.
+ *      Anything in that path that fails (no binary, an export, an import, a reply that is not one) is
+ *      unverified: fail closed.
+ */
+export async function referenceGeometryChecks(
+  call: Call,
+  input: {
+    embedded: readonly EmbeddedReference[];
+    clean: ReadonlySet<string>;
+    script: DesignScriptLike;
+    referenceBodies: readonly string[];
+    /** The design's own bodies and every body's world placements (the interference against the import). */
+    designBodies?: readonly string[];
+    placements?: Record<string, string[]>;
+    /** `noInterferenceWith`. */
+    must?: ReadonlySet<string>;
+    /** The folder the live process may write (its `--allow-path`): the staging folder goes in its `.cache`. */
+    exportDir?: string;
+  },
+  lock: Pick<PartLock, "references"> | undefined,
+  hasExpectations: boolean,
+  check: TrueReferenceCheck | undefined,
+): Promise<{ checks: GateCheck[]; unverified: boolean }> {
+  const checks: GateCheck[] = [];
+  let unverified = false;
+  const unrecorded: string[] = [];
+  const placements = input.placements ?? {};
+  const designBodies = input.designBodies ?? [];
+  const must = input.must ?? new Set<string>();
+  let staging: ReturnType<typeof makeStaging> | undefined;
+  let staged = 0;
+  let designExports: ExportedBody[] | undefined;
+  /** `export` of one body placement to STEP by the live process, read back from this refresh's own
+   *  staging folder (`makeStaging`). */
+  const exportBody = async (world: string): Promise<ExportedBody> => {
+    if (!input.exportDir) throw new Error("the live process has no folder to export to");
+    staging ??= makeStaging(input.exportDir);
+    const path = staging.take(`body-${staged++}.step`);
+    const r = await call("export", { path, format: "step", bodies: [world] });
+    if (r.isError) throw new Error(`${world} could not be exported to STEP: ${r.text.slice(0, 300) || "the export failed"}`);
+    try {
+      return { label: world, bytes: staging.read(path) };
+    } catch (e) {
+      throw new Error(`${world} could not be exported to STEP: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+  try {
+    for (const file of [...input.clean].sort()) {
+      const id = `geometry ${file}`;
+      const expected = `refs/${file} is the solid its import is (same volume, bounding box, faces, centre of mass, and the same shape)`;
+      const bad = (measured: string, unv: boolean) => {
+        if (unv) unverified = true;
+        checks.push({ id, expected, measured, ok: false, hard: true });
+      };
+      const checked = must.has(file);
+      const asImportedFailed = (why: string) => {
+        if (checked) checks.push(interferenceCheck(file, { error: why }, { asImported: true }));
+      };
+      const e = input.embedded.find((x) => x.file === file);
+      const text = embeddedStepTexts(input.script, file)[0];
+      if (!e || text === undefined) {
+        asImportedFailed("the design's import could not be read");
+        bad(`the design's import of refs/${file} could not be read`, true);
+        continue;
+      }
+      if (e.bodies.length === 0) {
+        asImportedFailed("its import lists no bodies");
+        bad(`reference ${file} ${REFERENCE_RESHAPED} (its import lists no bodies)`, false);
+        continue;
+      }
+      let approved: readonly ReferenceBodyMeasure[] | undefined;
+      const rec = lock?.references?.[file];
+      if (rec !== undefined && !isReferenceMeasure(rec)) {
+        asImportedFailed("the approved record of the reference cannot be read");
+        bad(`the measurement recorded for refs/${file} when it was imported cannot be read`, true);
+        continue;
+      }
+      if (rec !== undefined && rec.sha256 === e.sha256) approved = rec.bodies;
+      else if (rec !== undefined && (hasExpectations || checked)) {
+        asImportedFailed("the design's STEP is not the approved one");
+        bad(`reference ${file} ${REFERENCE_NOT_APPROVED} (approved ${rec.sha256.slice(0, 12)}, the design holds ${e.sha256.slice(0, 12)}); import it again with import_reference so the owner approves it`, true);
+        continue;
+      } else if (checked) unrecorded.push(file);
+      // (A reference no must-not-touch rule names already fails "not covered", which no record can
+      // mend: it is held to its true import below, and asks no card.)
+      const gone = e.bodies.filter((b) => !input.referenceBodies.includes(b));
+      if (gone.length) {
+        asImportedFailed(`${gone.join(", ")} not in the design`);
+        bad(`reference ${file} ${REFERENCE_RESHAPED} (${gone.join(", ")} ${gone.length === 1 ? "is" : "are"} not in the design: its import is suppressed, rolled back or deleted)`, false);
+        continue;
+      }
+      let live: ReferenceBodyMeasure[];
+      try {
+        const m = await call("execute", { command: "inspect.measure", params: { bodies: [...e.bodies] } });
+        if (m.isError) throw new Error(m.text.slice(0, 300) || "inspect.measure failed");
+        live = readReferenceMeasures(m.json, e.bodies);
+      } catch (err) {
+        asImportedFailed("the reference could not be measured");
+        bad(`reference ${file} could not be measured: ${err instanceof Error ? err.message : String(err)}`, true);
+        continue;
+      }
+      // The true import: interference of the design with it, and the exact shape of the live body.
+      let truth: TrueReferenceResult;
+      try {
+        if (!check) throw new Error("no SolidCraft process can be started here to import it alone");
+        const liveExports: ExportedBody[] = [];
+        for (const b of e.bodies) liveExports.push(await exportBody(placements[b]?.[0] ?? b));
+        const design = checked && designBodies.length ? (designExports ??= await (async () => {
+          const out: ExportedBody[] = [];
+          for (const w of worldNames([...designBodies], placements)) out.push(await exportBody(w));
+          return out;
+        })()) : [];
+        truth = await check({ file, step: text, design, live: liveExports });
+        if (truth.sha256 !== e.sha256) throw new Error(`the throwaway process imported other text (${truth.sha256.slice(0, 12)})`);
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        asImportedFailed(why);
+        bad(`refs/${file} could not be checked against its import: ${why}`, true);
+        continue;
+      }
+      if (checked) {
+        if (!designBodies.length) checks.push({ id: `interference ${file} ${AS_IMPORTED}`, expected: `no overlap with refs/${file} ${AS_IMPORTED}`, measured: "no design bodies yet", ok: true, hard: true });
+        else checks.push(interferenceCheck(file, truth.interference ?? { error: "no reply" }, { asImported: true }));
+      }
+      const diffs = [...referenceDifferences(approved ?? truth.asImported, live), ...shapeDifferences(truth.shape, truth.bodyCount)];
+      if (diffs.length) bad(`reference ${file} ${REFERENCE_RESHAPED} (${diffs.join("; ")})`, false);
+      else checks.push({ id, expected, measured: "as imported", ok: true, hard: true });
+    }
+  } finally {
+    staging?.remove();
+  }
+  if (unrecorded.length) {
+    unverified = true;
+    checks.push({
+      id: ADOPTION_CHECKS.references,
+      expected: "what each reference measured when the owner approved it",
+      measured: `${REFERENCE_NOT_RECORDED} (${unrecorded.map((f) => `refs/${f}`).join(", ")})`,
+      ok: false,
+      hard: true,
+    });
+  }
+  return { checks, unverified };
+}
+
+/** Why a reference in the design fails the gate when no must-not-touch rule names it (decision 204). */
+export const REFERENCE_NOT_COVERED = "is not covered by a must-not-touch rule";
+
+/**
+ * Fail closed (decision 204): once a part has expectations, every reference in the design — a
+ * `refs` record in part.json, a STEP import embedded in the script, or any imported (BaseFeature)
+ * body — must be named in `noInterferenceWith`, so no reference is ever in the part unchecked. An
+ * imported body counts as accounted for only when it came from a covered import that is the single,
+ * byte-checked import of its file (`clean`, from `referenceChecks`).
+ */
+export function coverageChecks(must: string[], recorded: string[], embedded: { file: string; bodies: string[] }[] | undefined, referenceBodies: string[], clean: ReadonlySet<string>): GateCheck[] {
+  const checks: GateCheck[] = [];
+  const covered = new Set(must);
+  const named = [...new Set([...recorded, ...(embedded ?? []).map((e) => e.file)])].sort();
+  for (const n of named) {
+    if (covered.has(n)) continue;
+    checks.push({ id: `covered ${n}`, expected: `refs/${n} is in noInterferenceWith`, measured: `reference ${n} ${REFERENCE_NOT_COVERED}`, ok: false, hard: true });
+  }
+  // Imported bodies no CHECKED reference accounts for: a body is known only when its import is under
+  // a rule and is the one import of that file whose bytes match refs/ (`clean`). Anything else — a
+  // second import of a covered name, an import whose bytes differ, an unreadable script — is named.
+  // (The bodies of an import whose file no rule names are left to its own "covered" line above.)
+  const known = new Set((embedded ?? []).filter((e) => covered.has(e.file) && clean.has(e.file)).flatMap((e) => e.bodies));
+  const flagged = new Set((embedded ?? []).filter((e) => !covered.has(e.file)).flatMap((e) => e.bodies));
+  const stray = referenceBodies.filter((b) => !known.has(b) && !flagged.has(b));
+  if (stray.length) checks.push({ id: "covered reference bodies", expected: "every imported body belongs to a reference in noInterferenceWith", measured: `reference ${stray.join(", ")} ${REFERENCE_NOT_COVERED}`, ok: false, hard: true });
+  return checks;
+}
+
+const paramValues = (params: CadParamInfo[]): Record<string, number> => Object.fromEntries(params.filter((p) => Number.isFinite(p.value)).map((p) => [p.name, p.value]));
+
+/** What `measureAndEvaluate` gathered: the gate's verdict and everything it was reached from. */
+export interface GateEvaluation {
+  gate: GateResult;
+  measurement?: Measurement;
+  /** The full hole table (depths, counterbores). */
+  holes: HoleRow[];
+  design: DesignRead;
+  scriptSha?: string;
+}
+
+export interface EvaluateDeps {
+  /** Read only: nothing here ever writes an approval. */
+  locks: LockReader;
+  machine?: string;
+  evaluateImpl?: (input: GateInput) => GateResult;
+  /** Advisory checks (a concept's picture score). */
+  advisory?: GateCheck[];
+  /** Checks every reference against its TRUE import in a throwaway process (./refreplay.ts).
+   *  Absent: every reference is unverified (fail closed). */
+  checkReference?: TrueReferenceCheck;
+}
+
+/**
+ * Steps 2 and 3 WITHOUT any write: measure the design bodies of the process behind `call`, read the
+ * repo files and the lock store for `ref`, and evaluate the gate. This is the ONE evaluation the live
+ * refresh and the merge guard (`verify.ts`) share, so the two can never judge a part differently.
+ * `slot` is what the manager knows about the process: the sha of the script it holds and its state
+ * (a disk conflict, a script that did not replay). Throws only when the design cannot be read at
+ * all — callers turn that into an `unverified` result (fail closed).
+ */
+export async function measureAndEvaluate(
+  call: Call,
+  ref: PartRef,
+  /** `dir`: the folder the process behind `call` may write (default the part folder). */
+  slot: { scriptSha: string | undefined; state: Pick<PartState, "conflict" | "reason" | "replayFailure">; dir?: string },
+  deps: EvaluateDeps,
+): Promise<GateEvaluation> {
+  const design = await readDesign(call);
+  const scriptSha = slot.scriptSha;
+  let measurement: Measurement | undefined;
+  let holes: HoleRow[] = [];
+  let measureError: string | undefined;
+  try {
+    const m = await measureDesign(call, design.designBodies);
+    holes = m.holes;
+    measurement = { bbox: m.bbox, volume: m.volume, faces: m.faces, bodies: m.bodies, holes: holeSummary(m.holes), scriptSha: scriptSha ?? "", solidcraft: design.version };
+  } catch (e) {
+    measureError = `could not measure: ${e instanceof Error ? e.message : String(e)}`;
+  }
+
+  // The accepted numbers were fixed when the expectations were approved. Nothing is pinned here:
+  // this only ever READS the lock store.
+  const locked = readLocked(ref, deps.locks, deps.machine);
+  const params = paramValues(design.params);
+  const state = slot.state;
+  const refs = await referenceGate(call, ref, locked.part, scriptSha, design);
+  if (refs.embedded && refs.clean && refs.clean.size) {
+    const geo = await referenceGeometryChecks(
+      call,
+      {
+        embedded: refs.embedded,
+        clean: refs.clean,
+        script: refs.script,
+        referenceBodies: design.referenceBodies,
+        designBodies: design.designBodies,
+        placements: design.placements,
+        must: new Set(locked.part.kind === "ok" ? (locked.part.file.expectations?.noInterferenceWith ?? []) : []),
+        exportDir: slot.dir ?? ref.dir,
+      },
+      locked.lock,
+      locked.part.kind === "ok" && !!locked.part.file.expectations,
+      deps.checkReference,
+    );
+    refs.checks.push(...geo.checks);
+    if (geo.unverified) refs.unverified = true;
+  }
+  const placed = designPlacementChecks(design.designBodies, design.placements);
+  const gap = gapOf(locked.part, deps.locks.findGap(locked.identity, ref.part, deps.machine));
+  const advisory = deps.advisory ?? [];
+  const gate = evaluateGate(
+    {
+      ...locked,
+      params,
+      measurement,
+      measureError,
+      scriptSha,
+      solidcraft: design.version,
+      featureErrors: design.featureErrors,
+      warnings: design.warnings,
+      designFailure: state.conflict ? state.reason : state.replayFailure ? `design.json failed to replay: ${state.replayFailure}` : undefined,
+      ...(refs.checks.length || placed.length || advisory.length ? { extraChecks: [...placed, ...refs.checks, ...advisory] } : {}),
+      ...(refs.unverified ? { extraUnverified: true } : {}),
+      ...(gap ? { gap } : {}),
+    },
+    deps.evaluateImpl,
+  );
+  return { gate, measurement, holes, design, scriptSha };
+}
+
+export function makeRefreshJob(deps: RefreshDeps): RefreshJob {
+  const now = deps.now ?? (() => new Date().toISOString());
+  return async (slot) => {
+    const t0 = performance.now();
+    const { ref } = slot;
+    const call: Call = (tool, args) => slot.call(tool, args);
+    let outcome: RefreshOutcome;
+    let designBodies: string[] | undefined;
+    try {
+      deps.beforeMeasure?.(ref);
+      const { gate, measurement, holes, design, scriptSha } = await measureAndEvaluate(call, ref, { scriptSha: slot.scriptSha(), state: slot.state() }, {
+        locks: deps.locks,
+        machine: deps.machine?.(),
+        evaluateImpl: deps.evaluateImpl,
+        advisory: deps.advisoryFor?.(ref) ?? [],
+        checkReference: deps.checkReference,
+      });
+      designBodies = design.designBodies;
+      if (measurement) {
+        const measured: Measured = { at: now(), solidcraft: measurement.solidcraft, scriptSha: measurement.scriptSha, bbox: measurement.bbox, volume: measurement.volume, faces: measurement.faces, bodies: measurement.bodies, holes: measurement.holes, warnings: design.warnings };
+        try {
+          writeMeasured(ref.dir, measured); // never over a corrupt part.json; skipped when nothing changed
+        } catch (e) {
+          gate.warnings.push(`part.json could not be updated with the measurement: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      outcome = { ref, gate, measurement, holes, params: design.params, scriptSha, ms: performance.now() - t0, forced: slot.forced, designBodies: design.designBodies, referenceBodies: design.referenceBodies };
+    } catch (e) {
+      outcome = { ref, gate: gateError(e instanceof Error ? e.message : String(e)), holes: [], params: slot.params(), scriptSha: slot.scriptSha(), ms: performance.now() - t0, forced: slot.forced };
+    }
+    const failing = failingLines(outcome.gate);
+    slot.setVerdict({
+      status: outcome.gate.state === "pass" ? "pass" : outcome.gate.state === "fail" ? "fail" : "unverified",
+      ...(outcome.gate.state === "fail" && failing.length ? { reason: `the gate fails — ${failing.join("; ")}` } : {}),
+    });
+
+    // Step 4: the preview. Its number is the revision this refresh will be broadcast as.
+    if (deps.nextRev) {
+      try {
+        outcome.rev = deps.nextRev(ref);
+        if (designBodies === undefined) designBodies = (await readDesign(call)).designBodies; // the gate half threw
+        const p = await exportPreview(call, ref, outcome.rev, designBodies);
+        if (p.preview) outcome.preview = p.preview;
+        if (p.sha) outcome.previewSha = p.sha;
+        if (p.error) outcome.previewError = p.error;
+        if (p.preview) {
+          const thumb = await exportThumbnail(call, ref, outcome.rev);
+          if (thumb) {
+            outcome.thumbnail = thumb.path;
+            outcome.thumbnailSha = thumb.sha;
+          }
+        }
+      } catch (e) {
+        outcome.previewError = e instanceof Error ? e.message : String(e);
+      }
+      outcome.ms = performance.now() - t0;
+    }
+    try {
+      outcome.scriptBytes = statSync(join(ref.dir, DESIGN_FILE)).size;
+    } catch {
+      /* no design.json yet */
+    }
+
+    try {
+      await deps.onResult(outcome, slot); // step 5: the service broadcasts `cad.design`
+    } catch {
+      /* a broadcast failure must never undo a measurement */
+    }
+  };
+}

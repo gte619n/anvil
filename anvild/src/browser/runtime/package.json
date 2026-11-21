@@ -1,0 +1,9 @@
+{
+  "name": "anvil-browser-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The pinned Playwright MCP server the Anvil daemon installs into its own state folder. Installed with `npm ci --ignore-scripts`; never run from a session's worktree.",
+  "dependencies": {
+    "@playwright/mcp": "0.0.86"
+  }
+}

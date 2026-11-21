@@ -279,7 +279,9 @@ export interface Session {
   team?: TeamPolicy; // set only on a lead: this team's integration/concurrency policy
   // ── Autopilot planning session (see docs/plans/anvil-improvement-program.md) ──
   workUnitId?: string; // set on a "Plan with Claude" session: the autopilot work unit it plans/builds
-  workUnitRole?: "planner"; // marks a session created to plan (then build) an autopilot work unit
+  // "planner": created to plan (then build) an autopilot work unit, with the owner in the chat.
+  // "builder": an unattended autopilot build session — nobody is there to answer a permission card.
+  workUnitRole?: "planner" | "builder";
   archived?: boolean; // archived = inactive (driver stopped), kept for reference; not deleted
   finished?: boolean; // user-parked in the sidebar's "Finished" group (done, e.g. pending deploy)
   order?: number; // explicit sidebar sort position (lower = higher); unset sorts newest-on-top
@@ -319,6 +321,12 @@ export interface Session {
   /** Live terminal roster for this session's chip strip (multi-terminal, design 2026-08-08).
    *  Runtime-only — cleared on daemon restart (the PTYs die with the process). Additive. */
   terminals?: TerminalInfo[];
+  /** MCP integrations switched on for this session (ids from `mcp.integrations`). Ordinary sessions
+   *  only; absent = none. Behind the "mcp-integrations" capability. Additive. */
+  mcpIntegrations?: string[];
+  /** Integration ids the owner answered "Always allow <label> this session" for. Cleared for an
+   *  integration when it is switched off for the session, updated or removed, and wholly on reset. */
+  mcpAllowed?: string[];
 }
 
 /** One live PTY of a session (multi-terminal). */
@@ -545,6 +553,132 @@ export interface EnvironmentsEvent extends Envelope {
   type: "environments";
   environments: Environment[];
 }
+
+// ── MCP integrations (agent-cad-and-browser spec, Track C) ────────────────────────────────────────
+// Third-party MCP servers installed on ONE machine that an ordinary session can switch on. Per
+// machine, not hub-synced. Everything here is behind the "mcp-integrations" capability: a daemon that
+// does not advertise it never sends `mcp.integrations` and rejects the commands.
+export type McpIntegrationKind = "browser" | "custom";
+/** How the daemon reaches the server. http is loopback only (scheme http:, no userinfo, host
+ *  127.0.0.1 / localhost / [::1]); stdio is an operator-typed command, run with a scrubbed
+ *  environment. `{cwd}` in `args` becomes the session's worktree; it is the only substitution. */
+export type McpTransport =
+  | { type: "http"; url: string }
+  | { type: "stdio"; command: string; args: string[] };
+export interface McpIntegration {
+  id: string; // "mcpi_…"
+  key: string; // server key → tool prefix mcp__<key>__ ; /^[a-z][a-z0-9]{1,23}$/ (no underscores)
+  kind: McpIntegrationKind;
+  label: string;
+  transport: McpTransport;
+  exclusive: boolean; // one session at a time on this machine
+  enabled: boolean; // operator kill switch for the machine
+}
+export type McpHealth =
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string } // port closed, command not found, failed at session start
+  | { state: "disabled" };
+export interface McpIntegrationStatus extends McpIntegration {
+  health: McpHealth;
+  heldBy?: SessionId; // the session holding the exclusive lock
+  checkedAt: number; // ms since epoch of the last health probe (0 = never probed)
+  /** Present on a `browser` integration only ("browser" capability): how the agent browser would
+   *  start on this machine, and whether its network block can run. Additive. */
+  browser?: BrowserIntegrationInfo;
+}
+export interface McpIntegrationsEvent extends Envelope {
+  type: "mcp.integrations";
+  integrations: McpIntegrationStatus[];
+}
+
+// ── Agent browser (agent-cad-and-browser spec, Phase C2). Behind the "browser" capability. ────────
+export interface BrowserIntegrationInfo {
+  /** `headed`: the installed Chrome with the dedicated profile, on the logged-in desktop.
+   *  `headless`: no desktop session (or a headed launch failed) — a throwaway profile. */
+  mode: "headed" | "headless";
+  /** Why that mode, in words fit to show. */
+  modeReason: string;
+  /** The loopback proxy that is the browser's only route out. `stopped` = the browser cannot start. */
+  proxy: { state: "ready" | "stopped"; reason?: string; sessions: number };
+  /** The pinned server runtime the daemon installs into its own state folder (never run from a
+   *  session's worktree). `missing`: the browser cannot start until `browser.runtime.install` succeeds. */
+  runtime?: { state: "installed" | "installing" | "missing"; package: string; reason?: string };
+  /** Phase C3. Whether someone is logged in at this machine's screen — "Open agent browser" is only
+   *  offered where this is true. */
+  desktop?: boolean;
+  /** Phase C3. Present while the owner has the agent browser open ("Open agent browser"): it is "in
+   *  use by owner" and no session can use it until that Chrome is closed. */
+  ownerBrowser?: { since: number };
+}
+/** One logged-in site (Phase C3, spec §4.14 items 28 and 44). While `unlocked` is false every click,
+ *  key press and form action on the site asks first; once true nothing on it asks. */
+export interface BrowserLoggedInSite {
+  site: string; // registrable domain, as BrowserSite.site
+  /** `owner`: listed by hand. `login-session`: the agent profile gained cookies for it while the
+   *  owner had "Open agent browser" open. */
+  source: "owner" | "login-session";
+  unlocked: boolean;
+  addedAt: number; // ms since epoch
+}
+/** The logged-in sites list with each site's unlock switch. Hub-authoritative and hub-synced exactly
+ *  like `browser.sites`. */
+export interface BrowserLoggedInEvent extends Envelope {
+  type: "browser.loggedin";
+  sites: BrowserLoggedInSite[];
+  pending?: number;
+  /** The list on this machine was damaged (C3 review): until the owner starts a new one
+   *  (`browser.loggedin.reset`), every site the agent profile has cookies for counts as a locked
+   *  logged-in site. Shown in Settings as an error. */
+  error?: string;
+}
+/** Part sources (agent-cad-and-browser Phase C5; "part-sources" capability): the vendor APIs the
+ *  `parts_search` / `parts_fetch` tools use. */
+export type PartSourceId = "digikey" | "mouser" | "traceparts";
+/** One key field of a part source. The value itself never leaves the daemon: only whether it is set
+ *  and a masked preview, exactly like the OpenRouter key's `auth.status`. */
+export interface PartSourceField {
+  name: string; // e.g. "DIGIKEY_CLIENT_ID" — the env-file line it is stored under
+  label: string; // "Client ID"
+  set: boolean;
+  masked?: string;
+}
+export interface PartSourceStatus {
+  id: PartSourceId;
+  label: string;
+  /** Every field this source needs is set (TraceParts: tenant uid, API key AND request email). */
+  configured: boolean;
+  fields: PartSourceField[];
+  /** What the owner must do for an unconfigured source, or a limit worth knowing. */
+  note?: string;
+}
+/** The part sources on the daemon that sends it, with which are configured. Sent on connect and
+ *  after every key change. Keys are entered on the hub and pushed to members with the fleet's
+ *  credentials (the OpenRouter key's path). */
+export interface PartSourcesEvent extends Envelope {
+  type: "parts.sources";
+  sources: PartSourceStatus[];
+}
+/** Reply to `parts.test`: the outcome of one cheap authenticated call to the source. */
+export interface PartsTestResultEvent extends Envelope, Correlated {
+  type: "parts.test.result";
+  source: PartSourceId;
+  ok: boolean;
+  message: string;
+}
+/** One site the owner allowed the agent browser to visit, fleet-wide, until removed. `site` is a
+ *  registrable domain (`example.com`), or a bare host for an IP address or a single-label name. */
+export interface BrowserSite {
+  site: string;
+  addedAt: number; // ms since epoch
+}
+/** The allowed-sites list. Hub-authoritative and hub-synced: the hub stores it and pushes it to every
+ *  member; each daemon keeps a local copy and broadcasts this to its own clients. `pending` counts
+ *  changes made on a member that the hub has not confirmed yet. */
+export interface BrowserSitesEvent extends Envelope {
+  type: "browser.sites";
+  sites: BrowserSite[];
+  pending?: number;
+}
 /**
  * A saved prompt snippet the user fires into the composer with one click (a sidebar button). Stored
  * on the daemon and broadcast to every connected client so a user's prompt library syncs across all
@@ -625,6 +759,182 @@ export interface ModelLabelsEvent extends Envelope {
   checkedAt?: string; // ISO 8601 of the hub's last catalog check (absent/"" if never)
 }
 /**
+ * Whether this machine can do CAD work right now (docs/plans/2026-11-19-agent-cad-and-browser.md §4.8).
+ * Separate from the "cad-work" CAPABILITY: a machine can advertise the capability and still be unable
+ * to run SolidCraft (no binary installed, or off the fleet pin). Sent after `server.hello` on a daemon
+ * with "cad-work" enabled and re-broadcast when it changes; the `anvil_cad` tools refuse with `reason`
+ * while `available` is false. Additive: clients without CAD UI ignore it.
+ */
+export interface CadStatusEvent extends Envelope {
+  type: "cad.status";
+  available: boolean;
+  reason?: string; // why not (only when unavailable)
+  version?: string; // the SolidCraft build this machine runs, e.g. "0.44.1"
+  pinned?: string; // the fleet-pinned version, once the hub manages the install
+}
+/** One user parameter of a part's design (agent-cad-and-browser spec §4.8). */
+export interface CadParam {
+  name: string;
+  expression: string;
+  value: number;
+  unit: string;
+  error?: string;
+}
+/** One line of the geometry gate (§4.5). `hard: false` is an advisory: shown, never blocking. */
+export interface CadGateCheck {
+  id: string;
+  expected: number | string;
+  measured: number | string;
+  ok: boolean;
+  hard: boolean;
+}
+/** The geometry gate's verdict on a part (§4.5): is it what the owner approved? */
+export interface CadGateResult {
+  state: "pass" | "fail" | "unverified" | "concept" | "gap";
+  checks: CadGateCheck[];
+  warnings: string[]; // SolidCraft feature warnings, e.g. "Boolean retry"
+  needsAdoption?: "expectations" | "rules" | "ownerParams" | "references";
+  staleBuild: boolean; // measured under a different SolidCraft version
+  /** Who approved the numbers the part is checked against, when an approval is in force.
+   *  "agent-initial": the agent recorded them and the owner has not confirmed them (the part card
+   *  offers "Confirm numbers", `cad.expectations.confirm`). */
+  approvedBy?: "agent-initial" | "owner" | "planner";
+  /** Phase A4: the part is blocked on a feature SolidCraft cannot make (`report_gap`); `state` is
+   *  then "gap" until the owner clears it ("Clear gap", `cad.gap.clear`) or approves an expectation change. */
+  gap?: { feature: string; detail: string; at: string };
+}
+/**
+ * A part was measured and checked again (§4.8). Broadcast to every client after each refresh of a
+ * part, and re-sent for every known part when a socket opens. Drives the part card in the chat (one
+ * per part touched in a turn, updated in place) and, from Phase A3, the live viewer and the
+ * parameters panel. Not session-scoped and not replayed from the event log: it is current state.
+ * Additive and capability-gated ("cad-work"); clients without CAD UI ignore it.
+ */
+export interface CadDesignEvent extends Envelope {
+  type: "cad.design";
+  cwd: string; // the worktree the part lives in
+  part: string;
+  rev: number; // increments on every refresh of this part
+  preview?: string; // worktree-relative path of the newest GLB (Phase A3)
+  params: CadParam[];
+  gate: CadGateResult;
+  busy: boolean; // a request is running or queued
+  /** The part's next request is held because every SolidCraft slot on this machine is taken (Phase A3). */
+  waiting?: boolean;
+  by: "agent" | "panel" | "reload";
+  /** Sessions that have this part open: the chat card belongs in these. */
+  sessionIds?: string[];
+  /** Phase A4: worktree-relative path of a small PNG of the part (`cad/<part>/.cache/thumb-<rev>.png`),
+   *  served by the preview route (`GET /api/cad/preview?cwd=…&path=…`). Never inline image data. */
+  thumbnail?: string;
+  /** Phase A4: size of `design.json` in bytes (references are embedded; the card shows it above 5 MB). */
+  scriptBytes?: number;
+  /** Phase A4: a release pack of the CURRENT script exists and its HMAC verifies on this machine —
+   *  the only case the card shows "Released". */
+  released?: { path: string; scriptSha: string; at: string };
+  /** Phase A4: `part.json`'s status ("concept": built from a picture, dimensions unconfirmed). */
+  status?: "concept" | "dimensioned";
+}
+/** One part of a worktree, as `cad.parts.list` answers it (Phase A3). */
+export interface CadPartInfo {
+  part: string;
+  hasDesign: boolean; // cad/<part>/design.json exists
+  live: boolean; // a SolidCraft process is up for it
+  busy: boolean;
+  rev: number; // 0 until the part has been refreshed on this machine
+  preview?: string; // worktree-relative path of the newest preview GLB, if one exists
+  gate: CadGateResult; // from the last refresh, else from the measurement stored in part.json
+}
+/** Reply to `cad.parts.list` (Phase A3): every part folder of the worktree with its gate state. */
+export interface CadPartsListResultEvent extends Envelope {
+  type: "cad.parts.list.result";
+  cid?: Cid;
+  cwd: string; // the worktree, as the daemon resolved it
+  parts: CadPartInfo[];
+}
+/**
+ * Reply to `cad.param.set` (Phase A3), to the sender only. `ok: false` carries SolidCraft's own error
+ * for a bad expression or an unknown name; nothing was changed. On success the new state arrives as
+ * a `cad.design` with `by: "panel"`.
+ */
+export interface CadParamSetResultEvent extends Envelope {
+  type: "cad.param.set.result";
+  cid?: Cid;
+  cwd: string;
+  part: string;
+  name: string;
+  ok: boolean;
+  error?: string;
+}
+/** One row of an expectations card: a labelled value before and after. */
+export interface CadExpectationsRow {
+  label: string;
+  old?: string;
+  new?: string;
+  /** The row is something the owner has NOT approved yet that approving this card approves — a
+   *  parameter the agent changed, a replaced reference. Shown highlighted (decision 153). */
+  unapproved?: boolean;
+}
+/** The largest dimension (mm) a `dimensions` card accepts; values must also be finite and above 0. */
+export const CAD_DIMENSION_MAX_MM = 1e6;
+/** One named dimension on a `dimensions` card (Phase A4): the agent's proposal, which the owner edits. */
+export interface CadDimensionRow {
+  name: string;
+  value: number;
+  unit?: string; // "mm" | "deg" | absent
+  note?: string;
+}
+/**
+ * The owner is asked to approve a change to what a part is checked against (§4.5, §4.9). Always a
+ * typed card with Approve / Deny and NO "always allow":
+ *  - `propose`            the agent asks to change locked expectations (`reason` is the agent's).
+ *  - `adopt-expectations` `part.json` does not match the lock store (a hand edit, a fresh clone).
+ *  - `adopt-ownerParams`  the owner-typed dimensions in `part.json` differ from the approved ones.
+ *  - `adopt-rules`        `cad/rules.json` changed (`rulesDiff` shows what).
+ *  - `adopt-references`   the approval holds no record of a reference the design imports (approved
+ *                         before records were kept): approving records the current `refs/` file.
+ *  - `initial`            the agent asks to record expectations for a part that ALREADY has geometry
+ *                         (or an earlier approval), so the numbers were written after it existed.
+ *  - `confirm`            the owner asked to confirm numbers the agent recorded (`cad.expectations.confirm`).
+ *  - `dimensions`         Phase A4, a concept part: the agent's proposed named dimensions in
+ *                         `dimensions`, shown as EDITABLE numbers. The owner's typed values go back in
+ *                         `cad.expectations.respond.values` and become the part's `ownerParams`.
+ *  - `release`            Phase A4: release the part (§4.7). `rows` hold expected and measured
+ *                         numbers, holes, advisories, script size and who approved the numbers;
+ *                         `note` says so when the agent set them (approving then also confirms them).
+ *  - `plan`               Phase B3: an autopilot PLANNING session's `save_cad_expectations` — the numbers
+ *                         an autopilot builder will be held to (`cwd` is the planning session's worktree,
+ *                         `part` the planned part). Approving locks exactly the rows shown onto the work
+ *                         unit; the builder's worktree gets them (approvedBy "planner") when it starts.
+ * Every card shows the evaluated numbers together with the process and status they are approved under.
+ * Answered with `cad.expectations.respond`; retired by `cad.expectations.resolved`. Broadcast to all
+ * clients (it names its session) and re-sent, with `replay`, when a socket opens.
+ */
+export interface CadExpectationsRequestEvent extends Envelope {
+  type: "cad.expectations.request";
+  requestId: RequestId;
+  sessionId: SessionId;
+  cwd: string;
+  part: string;
+  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "adopt-references" | "initial" | "confirm" | "dimensions" | "release" | "plan";
+  reason?: string;
+  /** `dimensions` cards only: the rows the owner edits. */
+  dimensions?: CadDimensionRow[];
+  /** A daemon-written caution shown on the card (e.g. "this part already has geometry…"). */
+  note?: string;
+  rows: CadExpectationsRow[];
+  rulesDiff?: { op: " " | "+" | "-"; line: string }[];
+  replay?: boolean;
+}
+/** An expectations card was answered (on any device) or superseded: retire exactly that card. */
+export interface CadExpectationsResolvedEvent extends Envelope {
+  type: "cad.expectations.resolved";
+  requestId: RequestId;
+  approved: boolean;
+  /** The files changed again before anyone answered; a newer card replaces this one. */
+  superseded?: boolean;
+}
+/**
  * The Claude Code CLI this daemon spawns sessions with (docs/plans/2026-11-10-managed-claude-cli-updates.md).
  * The CLI is bundled with the pinned agent-sdk, but can be advanced to the latest published version
  * WITHOUT an Anvil release by installing a "managed" copy under the state dir. Gated by the
@@ -641,6 +951,161 @@ export interface ClaudeCliInfo {
 export interface ClaudeCliStatusEvent extends Envelope {
   type: "claudecli.status";
   info: ClaudeCliInfo;
+}
+/**
+ * SolidCraft fleet pin (docs/plans/2026-11-19-agent-cad-and-browser.md §4.10). The hub records ONE
+ * build — a version plus the sha256 of its release zip — and every machine installs exactly that
+ * build, so no design is written by a build the rest of the fleet cannot read. Gated by the
+ * "solidcraft-pin" capability.
+ */
+export type SolidcraftSource = "env" | "managed" | "app";
+/** One exact SolidCraft build. */
+export interface SolidcraftPinRef {
+  version: string; // "0.44.1"
+  sha256: string; // sha256 of the release zip, lowercase hex
+  pinnedAt?: Iso8601; // when it became the pin
+}
+/** The fleet pin, as stored on the hub and applied verbatim by each member. */
+export interface SolidcraftPin {
+  version: string;
+  sha256: string;
+  pinnedAt: Iso8601;
+  previous?: SolidcraftPinRef; // the pin this one replaced — what "Pin back" returns to
+}
+export type SolidcraftMachineState =
+  | "unpinned" // no pin recorded; whatever build is installed is used
+  | "installing" // applying the pin
+  | "ready" // running exactly the pinned version
+  | "error"; // a pin is recorded and this machine is not on it
+/** One machine's SolidCraft build and where it stands against the pin. */
+export interface SolidcraftMachineStatus {
+  state: SolidcraftMachineState;
+  version?: string; // the build this machine would run now (absent: none found, or unreadable)
+  source?: SolidcraftSource; // env override, managed install, or the app bundle a person installed
+  pinned?: string; // the pinned version this machine last applied
+  available: boolean; // may CAD run here right now (spec §4.8)
+  reason?: string; // why not, when `available` is false
+  error?: string; // the last install failure, human-readable
+  failure?: string; // …and its typed reason ("sha-mismatch", "wrong-team", "not-notarized", …)
+}
+/** A design already rewritten by the newer build — listed as the "Pin back" warning. */
+export interface SolidcraftRewrittenDesign {
+  part: string;
+  version: string; // the SolidCraft version that last wrote it (`measured.solidcraft`)
+  environment?: string;
+  path?: string;
+  serverName?: string;
+}
+/**
+ * Replay gate (spec §4.10, §4.14 item 17). Before the pin moves to a newer build, every machine
+ * replays the designs it hosts under BOTH the pinned build and the candidate and compares the two
+ * results: body count, per-body face count, volume (1e-6 relative) and the sorted bounding box.
+ */
+export type SolidcraftReplayOutcome =
+  | "same" // both builds replay it to the same geometry
+  | "differs" // both replay it, to different geometry — holds the pin
+  | "candidate-error" // replays under the pin, fails under the candidate — holds the pin
+  | "baseline-broken" // the pinned build ran it and reported feature errors — reported, ignored for the decision
+  | "refused" // the script is not a plain design script (script-screen); never replayed — holds the pin
+  | "inconclusive"; // a build could not be run, crashed or timed out on it — holds the pin, retried
+export interface SolidcraftReplayDifference {
+  field: "body_count" | "faces" | "volume_mm3" | "bbox" | "center_of_mass";
+  body?: string; // the body it concerns (absent for body_count)
+  old: number | number[]; // under the pinned build
+  new: number | number[]; // under the candidate
+}
+/** The numbers one build produced for one design. */
+export interface SolidcraftReplayNumbers {
+  body_count: number;
+  faces: number; // summed over bodies
+  volume_mm3: number; // summed over bodies
+}
+export interface SolidcraftReplayPart {
+  part: string; // the folder name under cad/
+  environment: string; // environment name
+  path: string; // "cad/<part>/design.json"
+  ref?: string; // the git ref it was read from, e.g. "origin/main" (absent for a worktree)
+  worktree?: string; // set for an advisory entry: the session worktree it was read from
+  outcome: SolidcraftReplayOutcome;
+  differences?: SolidcraftReplayDifference[]; // when `differs`
+  old?: SolidcraftReplayNumbers; // under the pinned build, when it replayed
+  new?: SolidcraftReplayNumbers; // under the candidate, when it replayed
+  error?: string; // the candidate's failure, the pinned build's (`baseline-broken`), or why it was refused / inconclusive
+  sha?: string; // sha256 of the design file as read (so a refusal is notified once per version of the file)
+}
+/** One machine's replay of everything it hosts. */
+export interface SolidcraftReplayReport {
+  candidate: string; // candidate version
+  baseline?: string; // the version compared against; absent ⇒ no baseline build, replayed for errors only
+  hostsDesigns: boolean; // at least one cad/<part>/design.json on a default branch here
+  pass: boolean; // no part holds the pin and `errors` is empty
+  parts: SolidcraftReplayPart[]; // from each environment's default branch — these decide
+  advisory: SolidcraftReplayPart[]; // from open session worktrees — listed, never hold the pin
+  notes: string[]; // environments skipped and why, fetch problems, …
+  errors: string[]; // what could NOT be read or replayed (a git failure, time ran out) — holds the pin
+}
+export type SolidcraftGateMachineState =
+  | "pass"
+  | "fail" // a part differs or errors under the candidate — rejects the candidate
+  | "held" // a part was refused or inconclusive, or the machine compared against the wrong build — retried
+  | "no-designs" // reachable, hosts no designs
+  | "unreachable" // could not be asked; holds the pin if it hosts (or may host) designs
+  | "unsupported" // does not advertise "solidcraft-pin"; takes no part
+  | "error"; // answered, but could not install the candidate or replay
+export interface SolidcraftGateMachine {
+  serverId: string;
+  serverName: string;
+  isHub: boolean;
+  state: SolidcraftGateMachineState;
+  holds: boolean; // this machine is a reason the pin did not move
+  detail?: string;
+  report?: SolidcraftReplayReport;
+}
+export type SolidcraftEvaluationResult =
+  | "advanced" // every machine that hosts designs passed; the pin moved
+  | "rejected" // a part differs or errors under the candidate; never retried
+  | "held" // could not be decided (a machine unreachable or in error); retried on the next check
+  | "error"; // the hub could not install the candidate or move the pin
+/** One evaluation of one candidate across the fleet. */
+export interface SolidcraftEvaluation {
+  candidate: SolidcraftPinRef;
+  baseline?: string; // the pinned version it was compared against
+  startedAt: Iso8601;
+  finishedAt: Iso8601;
+  result: SolidcraftEvaluationResult;
+  detail: string; // one sentence a person can read
+  machines: SolidcraftGateMachine[];
+  advancedAnyway?: Iso8601; // the owner advanced it by hand after seeing the differences
+}
+/** A candidate the gate turned down. It is never evaluated again. */
+export interface SolidcraftRejectedCandidate {
+  version: string;
+  sha256: string;
+  rejectedAt: Iso8601;
+  reason: string;
+  failures: (SolidcraftReplayPart & { serverName: string })[]; // at most 50
+  failuresTruncated?: boolean; // there were more than are listed
+}
+/** What the last candidate check did. */
+export interface SolidcraftCandidateCheck {
+  at: Iso8601;
+  outcome:
+    | "advanced"
+    | "rejected"
+    | "held"
+    | "error"
+    | "none" // no release qualifies (too young, not newer, a prerelease, or already rejected)
+    | "rate-limited" // the pin already advanced within the last 24 h
+    | "backoff" // the candidate could not be installed on the hub recently; waiting before the next try
+    | "skipped"; // GitHub could not be read
+  detail: string;
+  version?: string; // the candidate it concerned, if any
+}
+/** This daemon's pin status: sent on connect, on change, and as the reply to `solidcraft.status.get`. */
+export interface SolidcraftStatusEvent extends Envelope {
+  type: "solidcraft.status";
+  pin?: SolidcraftPin;
+  local: SolidcraftMachineStatus;
 }
 /**
  * First frame the server sends on every WS connection (before session.list/budget/
@@ -823,8 +1288,34 @@ export interface AutopilotPlanInfo {
   // judgment surfaced as a "Likely complete" badge (verdict done) or a mismatch warning. Additive, so an
   // old client simply ignores it. Only present when the verifier has run and the overlay is live.
   verification?: AutopilotVerificationInfo;
+  // Phase B3 (agent-cad-and-browser §4.11, §4.14 item 41): the CAD numbers the plan carries, the
+  // "needs approved dimensions" state, and the builder's last verify. Additive; an old client ignores it.
+  cad?: AutopilotCadInfo;
+  blockedReason?: string; // why a `blocked` unit is blocked (e.g. the CAD verify's reason)
   createdAt: Iso8601;
   updatedAt: Iso8601;
+}
+/**
+ * A work unit's CAD state on its card (Phase B3). `needsApproval`: the unit's plan touches CAD and its
+ * numbers are not approved, so neither Go nor auto-start will start it ("needs approved dimensions").
+ * A `proposed` card shows Approve / Reject; Approve sends `autopilot.cad.respond` with `sha`, and the
+ * daemon approves only if the numbers are still exactly the ones this card shows.
+ */
+export interface AutopilotCadInfo {
+  status: "proposed" | "approved" | "rejected" | "missing"; // missing: CAD needed but no valid numbers yet
+  needsApproval: boolean;
+  sha?: string; // identity of exactly the numbers shown (planExpectationsSha)
+  /** `rows[].old` is what is APPROVED for the part now (the repo-wide approval, decision 183). `note`: approving
+   *  replaces that approval for the whole repo (the default branch's part shows unverified until merged).
+   *  `invalid`: the part's process is not in the repo's cad/rules.json (the plan cannot be approved). */
+  parts: { part: string; process: string; approved: boolean; rows: CadExpectationsRow[]; note?: string; invalid?: string }[];
+  /** The approved numbers of a part changed after this plan was approved: it must be re-approved to start. */
+  reapprove?: string;
+  source?: "planner" | "nightly";
+  approvedAt?: Iso8601;
+  note?: string; // e.g. proposed numbers that were ignored as malformed
+  verified?: { at: Iso8601; parts: string[] }; // the builder's last verify passed for these parts
+  blocked?: { at: Iso8601; reason: string }; // the last verify blocked the unit
 }
 /** Provenance of an event-triggered work unit (structurally matches integrations/event-trigger TriggerInfo). */
 export interface AutopilotTriggerInfo {
@@ -1312,6 +1803,12 @@ export interface PermissionRequestEvent extends Envelope, SessionScoped {
   tool: string;
   input: unknown;
   suggestions: PermissionSuggestion[];
+  /** Why the daemon is asking, in words fit to show above the buttons (agent browser hard stops,
+   *  Phase C3). Absent on every other prompt; an older client ignores it. */
+  reason?: string;
+  /** A picture of what the answer applies to — the page screenshot on an agent-browser hard-stop
+   *  card (Phase C3). An attachment of this session, fetched like a tool-result image. */
+  image?: ToolResultImage;
   /** [BE2-8] Set when this event is RE-SURFACED on resume (not a fresh prompt). Its `seq` is the
    *  session's current lastSeq — equal to a delta-resuming client's watermark — so a client that drops
    *  events with `seq <= watermark` would otherwise silently discard a pending permission prompt (the
@@ -1338,6 +1835,24 @@ export interface QuestionRequestEvent extends Envelope, SessionScoped {
  *  requestId (sub-agents can fan out several at once, like permissions). (§6.6) */
 export interface QuestionResolvedEvent extends Envelope, SessionScoped {
   type: "question.resolved";
+  requestId: RequestId;
+}
+/** The agent asked for a person (`request_human`, agent browser Phase C3; "browser" capability): a
+ *  bot check, a CAPTCHA or a login only the owner can clear. The turn is parked until any device
+ *  answers with `human.request.respond`. */
+export interface HumanRequestEvent extends Envelope, SessionScoped {
+  type: "human.request";
+  requestId: RequestId;
+  /** The agent's own words for what it needs. Untrusted text: shown, never acted on. */
+  reason: string;
+  /** The latest page screenshot the agent took, when there is one. */
+  image?: ToolResultImage;
+  /** Set when re-surfaced on resume — see PermissionRequestEvent.replay. Apply regardless of seq. */
+  replay?: boolean;
+}
+/** A parked `human.request` was answered or superseded — clients retire exactly that card. */
+export interface HumanResolvedEvent extends Envelope, SessionScoped {
+  type: "human.resolved";
   requestId: RequestId;
 }
 export interface StatusEvent extends Envelope, SessionScoped {
@@ -1487,10 +2002,22 @@ export type ServerEvent =
   | TeamPlanResolvedEvent
   | BudgetEvent
   | EnvironmentsEvent
+  | McpIntegrationsEvent
+  | BrowserSitesEvent
+  | BrowserLoggedInEvent
+  | PartSourcesEvent
+  | PartsTestResultEvent
   | PromptsEvent
   | SkillsEvent
   | ModelLabelsEvent
+  | CadStatusEvent
+  | CadDesignEvent
+  | CadExpectationsRequestEvent
+  | CadExpectationsResolvedEvent
+  | CadPartsListResultEvent
+  | CadParamSetResultEvent
   | ClaudeCliStatusEvent
+  | SolidcraftStatusEvent
   | TodoistStatusEvent
   | TodoistProjectsResultEvent
   | LapoStatusEvent
@@ -1535,6 +2062,8 @@ export type ServerEvent =
   | PermissionResolvedEvent
   | QuestionRequestEvent
   | QuestionResolvedEvent
+  | HumanRequestEvent
+  | HumanResolvedEvent
   | StatusEvent
   | SubAgentActivityEvent
   | SubAgentSettledEvent
@@ -1695,6 +2224,70 @@ export interface PermissionRespondCmd extends Envelope, Correlated {
   decision: PermissionDecision;
   updatedInput?: unknown; // optional edited tool input
 }
+/** Answer an expectations card (`cad.expectations.request`, §4.8) — may come from any device. */
+export interface CadExpectationsRespondCmd extends Envelope, Correlated {
+  type: "cad.expectations.respond";
+  requestId: RequestId;
+  approve: boolean;
+  /** A `dimensions` card: the owner's typed number for EVERY row, by name. Checked by the daemon
+   *  (finite numbers, exactly the card's names); a bad set is refused and the card stays open. */
+  values?: Record<string, number>;
+}
+/**
+ * "Release" on a part card (Phase A4): ask the daemon to raise the release card for the part, with
+ * no model turn. The release itself still happens only when the owner approves that card. `cwd` is
+ * checked like every cad command; the card and the file cards appear in `sessionId`.
+ */
+export interface CadReleaseRequestCmd extends Envelope, Correlated {
+  type: "cad.release.request";
+  cwd: string;
+  part: string;
+  sessionId: SessionId;
+}
+/** "Clear gap" on a part card (Phase A4): the OWNER says the reported gap no longer applies. */
+export interface CadGapClearCmd extends Envelope, Correlated {
+  type: "cad.gap.clear";
+  cwd: string;
+  part: string;
+}
+/**
+ * "Confirm numbers" on a part card: ask the daemon to raise the standard owner card (numbers, process,
+ * status) for a part whose expectations were recorded by the agent. Approving it makes the owner the
+ * approver, fleet-wide. `cwd` is checked like every cad command; the card appears in `sessionId`.
+ */
+export interface CadExpectationsConfirmCmd extends Envelope, Correlated {
+  type: "cad.expectations.confirm";
+  cwd: string;
+  part: string;
+  sessionId: SessionId;
+}
+/**
+ * The parts of a worktree with their gate state (agent-cad-and-browser spec §4.8, Phase A3). `cwd` must
+ * be the worktree of an existing session or a registered environment's repo; anything else is refused.
+ * Answered with `cad.parts.list.result`.
+ */
+export interface CadPartsListCmd extends Envelope, Correlated {
+  type: "cad.parts.list";
+  cwd: string;
+}
+/**
+ * The OWNER changes a parameter from the parameters panel. Runs in the part's queue (behind an agent
+ * call that is in flight), re-derives the expectation formulas and accepts the new numbers. No model
+ * is involved. Answered with `cad.param.set.result`, and a `cad.design` with `by: "panel"`.
+ */
+export interface CadParamSetCmd extends Envelope, Correlated {
+  type: "cad.param.set";
+  cwd: string;
+  part: string;
+  name: string;
+  expression: string;
+}
+/** Rebuild a part from `design.json` on disk (the viewer's Rebuild). The next `cad.design` has `by: "reload"`. */
+export interface CadDesignRefreshCmd extends Envelope, Correlated {
+  type: "cad.design.refresh";
+  cwd: string;
+  part: string;
+}
 /** Answer a parked AskUserQuestion (§6.6) — may come from any device. */
 export interface QuestionRespondCmd extends Envelope, Correlated {
   type: "question.respond";
@@ -1770,6 +2363,107 @@ export interface EnvUpdateCmd extends Envelope, Correlated {
 export interface EnvRemoveCmd extends Envelope, Correlated {
   type: "env.remove";
   id: string;
+}
+/** Register an MCP integration on this machine ("mcp-integrations" capability). Client command
+ *  only: nothing inside a session can add or change one. */
+export interface McpIntegrationAddCmd extends Envelope, Correlated {
+  type: "mcp.integration.add";
+  integration: Omit<McpIntegration, "id">;
+}
+export interface McpIntegrationUpdateCmd extends Envelope, Correlated {
+  type: "mcp.integration.update";
+  id: string;
+  fields: Partial<Omit<McpIntegration, "id" | "key" | "kind">>;
+}
+export interface McpIntegrationRemoveCmd extends Envelope, Correlated {
+  type: "mcp.integration.remove";
+  id: string;
+}
+/** Re-probe every integration's health now; the reply is a fresh `mcp.integrations`. */
+export interface McpIntegrationCheckCmd extends Envelope, Correlated {
+  type: "mcp.integration.check";
+}
+/** Replace the list of integrations switched on for a session (ordinary sessions only). */
+export interface SessionSetMcpIntegrationsCmd extends Envelope, Correlated {
+  type: "session.set_mcp_integrations";
+  sessionId: SessionId;
+  ids: string[];
+}
+/** Agent browser allowed sites ("browser" capability). Hub-authoritative: clients send these to the
+ *  hub; a member that receives one applies it locally and forwards it to the hub. Client commands
+ *  only — nothing inside a session can add a site (a session asks through its permission card). */
+export interface BrowserSitesListCmd extends Envelope, Correlated {
+  type: "browser.sites.list"; // reply: a fresh `browser.sites`
+}
+export interface BrowserSiteAddCmd extends Envelope, Correlated {
+  type: "browser.site.add";
+  site: string; // a hostname or URL; stored as its registrable domain
+}
+export interface BrowserSiteRemoveCmd extends Envelope, Correlated {
+  type: "browser.site.remove";
+  site: string;
+}
+/** Install the agent browser's pinned server runtime on the machine that receives this (needs the
+ *  npm registry once). Acked when it is installed; a `command.error` says why it could not be. */
+export interface BrowserRuntimeInstallCmd extends Envelope, Correlated {
+  type: "browser.runtime.install";
+}
+/** Agent browser logged-in sites and their unlock switches (Phase C3; "browser" capability).
+ *  Hub-authoritative like the allowed sites. Client commands only. */
+export interface BrowserLoggedInListCmd extends Envelope, Correlated {
+  type: "browser.loggedin.list"; // reply: a fresh `browser.loggedin`
+}
+export interface BrowserLoggedInAddCmd extends Envelope, Correlated {
+  type: "browser.loggedin.add";
+  site: string; // a hostname or URL; stored as its registrable domain, locked
+}
+export interface BrowserLoggedInRemoveCmd extends Envelope, Correlated {
+  type: "browser.loggedin.remove";
+  site: string;
+}
+/** Start a new, empty logged-in list after a damaged one (clears `BrowserLoggedInEvent.error`). */
+export interface BrowserLoggedInResetCmd extends Envelope, Correlated {
+  type: "browser.loggedin.reset";
+}
+export interface BrowserLoggedInSetUnlockedCmd extends Envelope, Correlated {
+  type: "browser.loggedin.set_unlocked";
+  site: string;
+  /** true: nothing on the site asks any more, in any session on any machine. false: lock it again. */
+  unlocked: boolean;
+}
+/** Open the agent browser's own Chrome window on the machine that receives this, so the owner can
+ *  log in to sites at the desk. Refused where nobody is logged in at the screen, and while a session
+ *  is using the browser. Sites that gain cookies while it is open become logged-in sites. */
+export interface BrowserOpenAgentBrowserCmd extends Envelope, Correlated {
+  type: "browser.open_agent_browser";
+}
+/** "I've cleared it": answer a parked `human.request` — may come from any device. */
+export interface HumanRequestRespondCmd extends Envelope, Correlated {
+  type: "human.request.respond";
+  requestId: RequestId;
+}
+
+/** Part sources (Phase C5; "part-sources" capability). Client commands only; refused with a
+ *  `command.error` on a daemon without the feature. */
+export interface PartsSourcesGetCmd extends Envelope, Correlated {
+  type: "parts.sources.get"; // reply: a fresh `parts.sources`
+}
+/** Set some or all of a source's key fields (field name → value; empty values are ignored). Stored
+ *  in the daemon's env file (mode 0600) and pushed to fleet members; acked, then `parts.sources`. */
+export interface PartsKeysSetCmd extends Envelope, Correlated {
+  type: "parts.keys.set";
+  source: PartSourceId;
+  values: Record<string, string>;
+}
+/** Remove every key field of a source on this daemon. */
+export interface PartsKeysClearCmd extends Envelope, Correlated {
+  type: "parts.keys.clear";
+  source: PartSourceId;
+}
+/** Make one cheap authenticated call to the source; reply: `parts.test.result`. */
+export interface PartsTestCmd extends Envelope, Correlated {
+  type: "parts.test";
+  source: PartSourceId;
 }
 
 // Prompt library (saved composer snippets, synced across a user's devices). Hub-authoritative.
@@ -1974,6 +2668,16 @@ export interface AutopilotApproveCmd extends Envelope, Correlated {
   workUnitId: string;
   start?: boolean; // also start a build session immediately (else it lands on the grid as `planned`)
 }
+/** Approve or reject the CAD numbers on an autopilot card (Phase B3, §4.14 item 41). `sha` is the
+ *  card's `AutopilotCadInfo.sha`: an Approve whose numbers changed since the card was drawn is refused
+ *  (command.error) and the grid is redrawn. Approval locks them exactly as an interactive
+ *  `save_cad_expectations` does. → autopilot.plan (and an autopilot.plans broadcast). */
+export interface AutopilotCadRespondCmd extends Envelope, Correlated {
+  type: "autopilot.cad.respond";
+  workUnitId: string;
+  approve: boolean;
+  sha: string;
+}
 // ── Completion verification (completion-verification spec). Gated by the "autopilot-verify" capability:
 // a client sends these only to a daemon that advertises it, and the daemon additionally rejects them when
 // the `verifyEnabled` flag is off. All five settle → autopilot.plans (the overlay rides AutopilotPlanInfo).
@@ -2103,6 +2807,13 @@ export interface ClaudeCliCheckCmd extends Envelope, Correlated {
   type: "claudecli.check";
 }
 
+// Ask this daemon for its SolidCraft pin status (Settings → CAD). Replies with a fresh
+// `solidcraft.status` on the requester's socket, then an ack. Read-only: setting the pin and pinning
+// back are REST calls on the hub. Gated by "solidcraft-pin".
+export interface SolidcraftStatusGetCmd extends Envelope, Correlated {
+  type: "solidcraft.status.get";
+}
+
 // 5d. Terminal (§7)
 
 export interface TerminalOpenCmd extends Envelope, Correlated {
@@ -2188,6 +2899,13 @@ export type ClientCommand =
   | PromptSendCmd
   | PermissionRespondCmd
   | QuestionRespondCmd
+  | CadExpectationsRespondCmd
+  | CadExpectationsConfirmCmd
+  | CadReleaseRequestCmd
+  | CadGapClearCmd
+  | CadPartsListCmd
+  | CadParamSetCmd
+  | CadDesignRefreshCmd
   | InterruptCmd
   // files
   | FsListCmd
@@ -2200,6 +2918,26 @@ export type ClientCommand =
   | EnvCloneCmd
   | EnvUpdateCmd
   | EnvRemoveCmd
+  | McpIntegrationAddCmd
+  | McpIntegrationUpdateCmd
+  | McpIntegrationRemoveCmd
+  | McpIntegrationCheckCmd
+  | SessionSetMcpIntegrationsCmd
+  | BrowserSitesListCmd
+  | BrowserSiteAddCmd
+  | BrowserSiteRemoveCmd
+  | BrowserRuntimeInstallCmd
+  | BrowserLoggedInListCmd
+  | BrowserLoggedInAddCmd
+  | BrowserLoggedInRemoveCmd
+  | BrowserLoggedInSetUnlockedCmd
+  | BrowserLoggedInResetCmd
+  | BrowserOpenAgentBrowserCmd
+  | HumanRequestRespondCmd
+  | PartsSourcesGetCmd
+  | PartsKeysSetCmd
+  | PartsKeysClearCmd
+  | PartsTestCmd
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd
@@ -2239,6 +2977,7 @@ export type ClientCommand =
   | AutopilotRunCmd
   | AutopilotTriggerCmd
   | AutopilotApproveCmd
+  | AutopilotCadRespondCmd
   | AutopilotVerifyCmd
   | AutopilotVerifyConfirmCmd
   | AutopilotVerifyDismissCmd
@@ -2266,6 +3005,7 @@ export type ClientCommand =
   | DaemonUpdateCmd
   | ModelRefreshCmd
   | ClaudeCliCheckCmd
+  | SolidcraftStatusGetCmd
   // terminal
   | TerminalOpenCmd
   | TerminalInputCmd
@@ -2615,6 +3355,131 @@ export namespace rest {
     }
   }
 
+  /**
+   * SolidCraft fleet pin (docs/plans/2026-11-19-agent-cad-and-browser.md §4.10). Per-daemon status
+   * and apply; hub-driven set / pin back with per-machine status. Same posture as `claudecli`:
+   * identity-gated, JSON content type on POSTs. Every route answers 404 unless the daemon runs with
+   * the "solidcraft-pin" feature.
+   */
+  export namespace solidcraft {
+    /** GET /api/solidcraft/status → this daemon's pin and build. */
+    export interface StatusResponse {
+      ok: boolean;
+      pin?: SolidcraftPin;
+      local: SolidcraftMachineStatus;
+      error?: string;
+    }
+    /** POST /api/solidcraft/pin/apply → install exactly this pin on THIS daemon (sent by the hub). */
+    export interface ApplyRequest {
+      pin: SolidcraftPin;
+      keep?: string[]; // extra versions to keep on disk (the candidate under evaluation)
+    }
+    export interface ApplyResponse {
+      ok: boolean; // true only when this machine ended up `ready` on the pin
+      pin?: SolidcraftPin;
+      local: SolidcraftMachineStatus;
+      error?: string;
+    }
+
+    // ── Hub ──────────────────────────────────────────────────────────────────────────────────
+    export type MemberState =
+      | "pending" // queued, not yet contacted
+      | "pending-offline" // unreachable — re-applied when it is back
+      | "unsupported" // reachable, but does not advertise "solidcraft-pin"
+      | "installing"
+      | "ready" // on the pinned version
+      | "unpinned" // no pin recorded there
+      | "error"; // not on the pin
+    export interface Member {
+      serverId: string;
+      serverName: string;
+      isHub: boolean;
+      state: MemberState;
+      version?: string;
+      source?: SolidcraftSource;
+      pinned?: string;
+      available?: boolean;
+      detail?: string; // error text, "offline", …
+    }
+    /** POST /api/fleet/solidcraft/pin → set the pin and fan it out. */
+    export interface SetPinRequest {
+      version: string;
+      sha256?: string; // omit ⇒ the hub reads it from the GitHub release (asset digest = SHA256SUMS line)
+    }
+    export interface SetPinResponse {
+      ok: boolean;
+      pin?: SolidcraftPin; // the pin now in force (unchanged when `ok` is false)
+      members: Member[];
+      error?: string;
+      failure?: string; // typed install failure on the hub, when that is why the pin was refused
+    }
+    /** GET /api/fleet/solidcraft/pin/back → what "Pin back" would do, and its warning list. */
+    export interface PinBackPreviewResponse {
+      ok: boolean;
+      current?: SolidcraftPinRef;
+      previous?: SolidcraftPinRef;
+      rewritten: SolidcraftRewrittenDesign[]; // designs the newer build already rewrote; may not open
+      listError?: string; // the list could not be built; treat it as incomplete
+      listUnavailable?: boolean; // no design store is connected: the list is unknown, NOT empty
+      error?: string;
+    }
+    /** POST /api/fleet/solidcraft/pin/back {} → pin back to `previous` and fan out. */
+    export interface PinBackResponse extends SetPinResponse {
+      rewritten: SolidcraftRewrittenDesign[];
+      listError?: string;
+      listUnavailable?: boolean;
+    }
+    // ── Replay gate (Phase B2) ───────────────────────────────────────────────────────────────
+    /** POST /api/solidcraft/replay → install the candidate BESIDE the pinned build on THIS daemon,
+     *  replay every hosted design under both, and report (sent by the hub). */
+    export interface ReplayRequest {
+      candidate: { version: string; sha256: string };
+      pin?: { version: string; sha256: string }; // the build to compare against (the hub's pin)
+    }
+    export interface ReplayResponse {
+      ok: boolean; // the replay ran (whatever it found); false ⇒ `error`
+      report?: SolidcraftReplayReport;
+      error?: string;
+    }
+    /** GET /api/fleet/solidcraft/candidate → the replay gate's state (Settings → CAD). */
+    export interface CandidateStatusResponse {
+      ok: boolean;
+      evaluating?: { version: string; startedAt: Iso8601 }; // an evaluation is running now
+      lastCheck?: SolidcraftCandidateCheck;
+      lastEvaluation?: SolidcraftEvaluation;
+      rejected: SolidcraftRejectedCandidate[];
+      lastAdvanceAt?: Iso8601; // the last pin advance through the gate (at most one per 24 h)
+      nextAdvanceAllowedAt?: Iso8601;
+      interrupted?: string; // an evaluation was cut short by a restart; it starts again on the next check
+      /** The hub could not install this candidate (a download or network failure). It is tried again,
+       *  each time after a longer wait, at most once in 24 hours. */
+      retry?: { version: string; attempts: number; nextAt: Iso8601; reason: string };
+    }
+    /** POST /api/fleet/solidcraft/candidate/check {} → "Check now": list releases, evaluate, decide. */
+    export interface CandidateCheckResponse extends CandidateStatusResponse {
+      check?: SolidcraftCandidateCheck; // what this check did
+      error?: string;
+    }
+    /** POST /api/fleet/solidcraft/candidate/advance → "Advance anyway": pin a held or rejected
+     *  candidate, after the owner has seen its differences. */
+    export interface AdvanceAnywayRequest {
+      version: string;
+    }
+    export interface AdvanceAnywayResponse extends CandidateStatusResponse {
+      pin?: SolidcraftPin;
+      error?: string;
+    }
+    /** GET /api/fleet/solidcraft/status[?refresh=1] → the pin and every machine's standing. */
+    export interface FleetStatusResponse {
+      ok: boolean;
+      active: boolean; // a fan-out is in progress
+      pin?: SolidcraftPin;
+      startedAt?: number;
+      finishedAt?: number;
+      members: Member[];
+    }
+  }
+
   // ── Joiner-side pairing on :7701 (anvil-headless-join.md §5.3) ───────────────────────────────
   // The macOS Server.app's :7702 listener only exists on a Mac, so a headless Linux box had no way to
   // be handed a fleet credential. These routes are the daemon's own equivalent, gated identically:
@@ -2661,6 +3526,9 @@ export namespace rest {
      *  (HJ-24/HJ-27). Present keys OVERWRITE; absent keys are left alone. */
     todoistToken?: string;
     openRouterKey?: string;
+    /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
+     *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
+    partKeys?: Record<string, string>;
     geminiKey?: string;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
@@ -2702,6 +3570,9 @@ export namespace rest {
     hubServerId: string;
     todoistToken?: string;
     openRouterKey?: string;
+    /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
+     *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
+    partKeys?: Record<string, string>;
     geminiKey?: string;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */

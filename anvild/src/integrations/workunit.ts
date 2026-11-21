@@ -7,6 +7,7 @@ import type { AdversarialReview } from "./adversarial";
 import type { PipelinePhase } from "../agent/model-roster";
 import type { PipelineStatus } from "../pipeline/types";
 import type { TraceRecord } from "../pipeline/trace";
+import type { PlanPartExpectations } from "../cadwork/plan-expectations";
 
 /**
  * The completion-verifier's overlay on a work unit (completion-verification spec §4.1). This is an
@@ -58,6 +59,28 @@ export interface WorkUnit {
   validation?: { passed: boolean; log?: string; at?: string }; // last validation result
   verification?: WorkUnitVerification; // completion-verifier overlay (spec §4.1) — code-aware "already built?" judgment
   blockedReason?: string; // populated when status === "blocked"
+  // ── CAD (agent-cad-and-browser §4.11, §4.14 item 41, Phase B3) ──
+  /** The expected numbers of each CAD part the plan builds (part → process, declared parameters,
+   *  expectations). Applied to the builder's worktree (part.json + lock store, approvedBy "planner")
+   *  by startPlan, and only once the owner has approved them. */
+  cadExpectations?: Record<string, PlanPartExpectations>;
+  /** proposed: the nightly planner wrote them, nobody approved them yet; approved: every part was
+   *  approved by the owner (planner card or autopilot card); rejected: the owner said no. A unit whose
+   *  plan touches CAD cannot start unless this is "approved". */
+  cadExpectationsStatus?: "proposed" | "approved" | "rejected";
+  cadExpectationsApprovedAt?: string;
+  /** Who wrote the numbers: the interactive planner session's save_cad_expectations, or the nightly run. */
+  cadExpectationsSource?: "planner" | "nightly";
+  /** The planner said the change needs CAD (with or without numbers). */
+  needsCad?: boolean;
+  /** A note shown on the card, e.g. which proposed numbers were ignored as malformed. */
+  cadNote?: string;
+  /** The builder worktree's base commit, recorded at startPlan: what the verify hook diffs against. */
+  cadBase?: string;
+  /** The last verify of the builder's worktree passed for these parts. */
+  cadVerified?: { at: string; parts: string[] };
+  /** The last verify (builder turn end / goal, or the dev pipeline) blocked the unit, and why. */
+  cadBlocked?: { at: string; reason: string };
   createdAt: string;
   updatedAt: string;
 }

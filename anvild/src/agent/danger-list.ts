@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { isUnder, realish, resolveToolPath } from "./tool-paths";
+import { CAD_READ_ONLY_TOOL_IDS } from "./cad-tool-ids";
 
 /**
  * The autonomy backstop (arch §6.6). Under `mostly-autonomous`, this is the ONLY thing
@@ -25,7 +26,14 @@ const BASH_PATTERNS: [RegExp, string][] = [
 
 const SECRET_PATH = /(^|\/)\.env(\.[a-z]+)?$|\/\.ssh\/|id_(rsa|ed25519)|(^|\/)credentials\b|\.pem$|\.p8$|\bsecrets?\b/i;
 
-const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead", "TodoWrite"]);
+const READ_ONLY_TOOLS = new Set([
+  "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "NotebookRead", "TodoWrite",
+  // The read-only SolidCraft pass-throughs (agent-cad-and-browser spec §4.4, D10). The mutating
+  // `mcp__anvil_cad__*` tools are deliberately absent: they follow the autonomy policy like `Edit`.
+  ...CAD_READ_ONLY_TOOL_IDS,
+  // `mcp__anvil_parts__parts_search`: a vendor catalog lookup that writes nothing (Phase C5).
+  "mcp__anvil_parts__parts_search",
+]);
 
 export function isReadOnly(toolName: string): boolean {
   return READ_ONLY_TOOLS.has(toolName);
@@ -47,9 +55,13 @@ export function isDangerous(toolName: string, input: Record<string, unknown>, cw
   if (SECRET_PATH.test(pathish)) return { danger: true, reason: "credential/secret path" };
 
   // writes resolving outside the session worktree
-  if (cwd && (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit")) {
-    const fp = input.file_path ?? input.notebook_path;
-    if (typeof fp === "string" && fp.startsWith("/") && !resolve(fp).startsWith(resolve(cwd))) {
+  if (cwd && (toolName === "Write" || toolName === "Edit" || toolName === "MultiEdit" || toolName === "NotebookEdit")) {
+    // Resolved the way the write will be, by the one resolver every protected rule uses: `~` / `~/`
+    // are the home folder (as the CLI expands them), `~user` is refused, a relative path is against
+    // the session's cwd, links of the nearest existing ancestor are followed, case is ignored.
+    const target = resolveToolPath(input.file_path ?? input.notebook_path, cwd);
+    if (target && !target.ok) return { danger: true, reason: target.reason };
+    if (target && !isUnder(target.abs, realish(cwd))) {
       return { danger: true, reason: "write outside the session worktree" };
     }
   }

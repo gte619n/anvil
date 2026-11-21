@@ -24,6 +24,7 @@
 // pickers; `todoistConnected`/`todoistProjectsLoaded` for the environment modal and the member
 // token-propagation check) live on `ui` in state.ts; in-place containers (`todoistProjects`,
 // `readmeLoaded`) stay `const` here.
+import { partsSectionShellHtml, refreshParts } from "./parts";
 import { apiFetch } from "./api";
 import { $, busy, byEnvName, envIcon, esc, icon } from "./dom";
 // dialogs.ts is a leaf, so the modal/toast helpers and the environment modals are direct imports —
@@ -39,6 +40,8 @@ import { stripeColor } from "./sessionColor";
 import { newCid } from "./outbox";
 import { runMermaid } from "./conversation";
 import { openScheduleModal, scheduleSettingsCardHtml } from "./autopilot";
+import { CAD_PIN_CAPABILITY, cadTabHtml, mountCadCard, type CadCardHandle } from "./settings-cad";
+import { mcpSectionShellHtml, renderMcpPanel } from "./mcp";
 import { renderSkillsPanel, showSkillEditor, showSkillImport } from "./skills";
 import {
   HUB_URL,
@@ -115,10 +118,13 @@ export function initSettings(deps: SettingsDeps): void {
 }
 
 // ── Settings & servers (first-class management area) ──────────────────────────────
-type SettingsTab = "servers" | "environments" | "integrations" | "models" | "appearance" | "prompts" | "skills";
+type SettingsTab = "servers" | "environments" | "integrations" | "models" | "cad" | "appearance" | "prompts" | "skills";
 let settingsTab: SettingsTab = "environments";
 export function openSettings(): void {
   const root = $("#settings-root");
+  // Settings → CAD exists only on a hub that runs the SolidCraft pin ("solidcraft-pin").
+  const cadOn = serverSupports(hub(), CAD_PIN_CAPABILITY);
+  if (!cadOn && settingsTab === "cad") settingsTab = "environments";
   root.innerHTML = `<div class="settings-view">
     <div class="settings-head">
       <h2>${icon("tune")} Settings &amp; Servers</h2>
@@ -129,6 +135,7 @@ export function openSettings(): void {
       <button class="stab" role="tab" data-tab="servers">${icon("dns")} Servers</button>
       <button class="stab" role="tab" data-tab="integrations">${icon("extension")} Integrations</button>
       <button class="stab" role="tab" data-tab="models">${icon("smart_toy")} Models</button>
+      ${cadTabHtml(cadOn)}
       <button class="stab" role="tab" data-tab="prompts">${icon("bookmark")} Prompts</button>
       <button class="stab" role="tab" data-tab="skills">${icon("auto_awesome")} Skills</button>
       <button class="stab" role="tab" data-tab="appearance">${icon("palette")} Appearance</button>
@@ -149,11 +156,18 @@ export function openSettings(): void {
         <div class="section-head" style="margin-top:1.75rem"><h3>Todoist</h3><button id="todoist-refresh" class="mini">${icon("refresh")} Refresh</button></div>
         <p class="small muted">Link a Todoist project to an environment, then the nightly autopilot plans &amp; builds its tasks. Set the token with <code>bun run scripts/todoist.ts set</code>.</p>
         <div id="todoist-panel"><p class="small muted">Loading…</p></div>
+        ${mcpSectionShellHtml()}
       </section>
       <section class="settings-panel" data-tab="models">
         <div class="section-head"><h3>Models</h3></div>
         <p class="small muted">The model providers Anvil drives. Set or reset the Claude subscription token and OpenRouter key here instead of editing the daemon's service file.</p>
         <div id="models-panel"><p class="small muted">Loading…</p></div>
+        ${partsSectionShellHtml()}
+      </section>
+      <section class="settings-panel" data-tab="cad">
+        <div class="section-head"><h3>CAD</h3></div>
+        <p class="small muted">The SolidCraft build the fleet does CAD with.</p>
+        <div id="cad-panel"></div>
       </section>
       <section class="settings-panel" data-tab="prompts">
         <div class="section-head"><h3>Prompts</h3><button id="set-add-prompt" class="primary">${icon("add")} Add prompt</button></div>
@@ -206,15 +220,18 @@ function selectSettingsTab(tab: SettingsTab): void {
     hub().sock.send({ type: "lapo.status", cid: newCid() }); // pull fresh connected/configured state
     renderLapoPanel();
     renderTodoistPanel();
+    renderMcpPanel(); // agent tools (MCP integrations) — hidden unless a server advertises the capability
     hub().sock.send({ type: "autopilot.schedule.get" }); // refresh the schedule card (once per tab open)
   }
   if (tab === "prompts") renderPromptsPanel();
+  if (tab === "cad") renderCadPanel();
   if (tab === "skills") {
     if (serverSupports(hub(), "fleet-skills")) hub().sock.send({ type: "skill.list", cid: newCid() }); // fresh sync state
     renderSkillsPanel();
   }
   if (tab === "models") {
     renderModelsPanel();
+    refreshParts(); // Part sources (Phase C5) — hidden unless the hub advertises "part-sources"
     if (serverSupports(hub(), "auth")) {
       hub().sock.send({ type: "auth.status" }); // claude — refresh once per tab open
       hub().sock.send({ type: "auth.status", provider: "openrouter" });
@@ -719,6 +736,34 @@ export function onModelCatalog(catalog: Partial<Record<Model, ModelTierInfo>>, c
   modelCatalog = catalog ?? {};
   modelCheckedAt = checkedAt || "";
   if (document.getElementById("models-panel")) renderModelsPanel();
+}
+
+// ── Settings → CAD: the SolidCraft fleet pin card (rendering + controls live in settings-cad.ts) ──
+let cadCard: CadCardHandle | null = null;
+const hubJson = async <T>(path: string, init?: RequestInit): Promise<T> => (await (await serverFetch(HUB_URL, path, init)).json()) as T;
+const postJson = (body: unknown): RequestInit => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+function renderCadPanel(): void {
+  const host = document.getElementById("cad-panel");
+  if (!host) return;
+  if (!serverSupports(hub(), CAD_PIN_CAPABILITY)) {
+    cadCard = null;
+    host.innerHTML = "";
+    return;
+  }
+  cadCard = mountCadCard(host, {
+    fleetStatus: (refresh) => hubJson<rest.solidcraft.FleetStatusResponse>(`/api/fleet/solidcraft/status${refresh ? "?refresh=1" : ""}`),
+    setPin: (version, sha256) => hubJson<rest.solidcraft.SetPinResponse>("/api/fleet/solidcraft/pin", postJson({ version, ...(sha256 ? { sha256 } : {}) })),
+    pinBackPreview: () => hubJson<rest.solidcraft.PinBackPreviewResponse>("/api/fleet/solidcraft/pin/back"),
+    pinBack: () => hubJson<rest.solidcraft.PinBackResponse>("/api/fleet/solidcraft/pin/back", postJson({})),
+    gate: () => hubJson<rest.solidcraft.CandidateStatusResponse>("/api/fleet/solidcraft/candidate"),
+    checkNow: () => hubJson<rest.solidcraft.CandidateCheckResponse>("/api/fleet/solidcraft/candidate/check", postJson({})),
+    advanceAnyway: (version) => hubJson<rest.solidcraft.AdvanceAnywayResponse>("/api/fleet/solidcraft/candidate/advance", postJson({ version })),
+    toast,
+  });
+}
+/** The hub's `solidcraft.status` changed (pin set, an install finished): repaint the open card. */
+export function onSolidcraftStatus(): void {
+  if (cadCard && document.getElementById("cad-card")) void cadCard.reload(false);
 }
 
 // The hub's Claude engine (CLI) status — active/bundled/latest version — forwarded from main's
