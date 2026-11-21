@@ -54,8 +54,8 @@ import {
 } from "../cadwork/partfile";
 import { exprNames } from "../cadwork/expr";
 import { gapOf, makeRefreshJob, newestPreview, previewRevs, readDesign, readLocked, PREVIEW_PATH_RE, THUMB_PATH_RE, type RefreshOutcome } from "../cadwork/refresh";
-import { embeddedReferences, importFeatureName, liveReferences, readComponentList, readReferenceMeasures, readRegularFile, referenceName, referenceOnDisk, referencePlacementChecks, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR, type ReferenceMeasure } from "../cadwork/refs";
-import { makeReferenceReplay, type ReferenceReplay } from "../cadwork/refreplay";
+import { embeddedReferences, embeddedStepTexts, importFeatureName, liveReferences, readComponentList, readReferenceMeasures, readRegularFile, referenceName, referenceOnDisk, referencePlacementChecks, resolveReferenceSource, stepSolidCount, storeReference, REFERENCE_MAX_BYTES, REFS_DIR, type ReferenceMeasure } from "../cadwork/refs";
+import { makeReferenceReplay, makeTrueReferenceCheck, type ReferenceReplay, type TrueReferenceCheck } from "../cadwork/refreplay";
 import { verifyParts, type VerifyResult } from "../cadwork/verify";
 import { canonicalBlock, checkPlanPart, keepsApproval, parseDeclared, planWrite, type ApprovedNumbers, type PlanPartExpectations } from "../cadwork/plan-expectations";
 import { releaseFolder, releaseKey, verifyRelease, writeReleasePack, type ReleaseData, type ReleaseVerdict } from "../cadwork/release";
@@ -252,8 +252,10 @@ export class CadworkService {
    * good. Never read from part.json, which the agent can write.
    */
   private readonly importedMeasures = new Map<string, Record<string, ReferenceMeasure>>();
-  /** A reference's import replayed alone, for one no approval holds a measurement of (the gate's fallback). */
+  /** A reference's import replayed alone: what the owner's "approve current reference" card records. */
   private readonly replayReference: ReferenceReplay;
+  /** The gate's check of every reference against its true import (a throwaway process per check). */
+  private readonly checkReference: TrueReferenceCheck;
 
   constructor(private readonly deps: CadworkServiceDeps) {
     this.resolveCli = deps.resolveCli ?? (() => resolveSolidcraftCli());
@@ -262,7 +264,9 @@ export class CadworkService {
     {
       // Only how processes are spawned (tests point these at the fake); never the live manager's hooks.
       const m = deps.manager ?? {};
-      this.replayReference = makeReferenceReplay({ resolveCli: this.resolveCli, manager: { ...(m.spawn ? { spawn: m.spawn } : {}), ...(m.extraEnv ? { extraEnv: m.extraEnv } : {}), ...(m.requestTimeoutMs ? { requestTimeoutMs: m.requestTimeoutMs } : {}) } });
+      const throwaway = { resolveCli: this.resolveCli, manager: { ...(m.spawn ? { spawn: m.spawn } : {}), ...(m.extraEnv ? { extraEnv: m.extraEnv } : {}), ...(m.requestTimeoutMs ? { requestTimeoutMs: m.requestTimeoutMs } : {}) } };
+      this.replayReference = makeReferenceReplay(throwaway);
+      this.checkReference = makeTrueReferenceCheck(throwaway);
     }
     // Daemon start: the SolidCraft temp roots a daemon that is gone left behind (killed, crashed, a test
     // run that never shut down) are removed — only `anvil-sc-<dead pid>-*`, only when over an hour old.
@@ -291,7 +295,7 @@ export class CadworkService {
           evaluateImpl: deps.gateImpl,
           beforeMeasure: deps.beforeMeasure,
           advisoryFor: (ref) => this.advisoryFor(ref),
-          replayReference: this.replayReference,
+          checkReference: this.checkReference,
         }),
       );
       this.manager.subscribe((e) => {
@@ -1848,7 +1852,7 @@ export class CadworkService {
       // Decision 204: a part's card is written inside the part's queue slot, after its snapshot is
       // checked again there; the answer is broadcast once that has run.
       void this.manager
-        .run(card.ref, async (slot) => (card.kind === "confirm" ? this.confirm(card, slot.params()) : this.adopt(card, slot.params())))
+        .run(card.ref, async (slot) => (card.kind === "confirm" ? this.confirm(card, slot.params()) : card.kind === "adopt-references" ? this.adoptReferences(card, slot) : this.adopt(card, slot.params())))
         .catch(() => false)
         .then((ok) => this.finishCard(card, toolCard, ok, !ok, typed));
       return true;
@@ -2031,6 +2035,17 @@ export class CadworkService {
           ...(values ? { values } : {}),
         };
       },
+      "adopt-references": () => {
+        // Only on top of an approval: with none, the expectations card comes first (and its approval
+        // carries what this daemon measured at its own imports).
+        if (!locked.lock) return undefined;
+        const pending = this.unrecordedReferences(ref, locked.lock, locked.part);
+        if (!pending.length) return undefined;
+        return {
+          sha: referencesCardSha(pending),
+          rows: pending.map((r) => ({ label: `refs/${r.file}`, old: "measurements not recorded", new: `approve current reference (sha ${r.sha256.slice(0, 12)}, ${r.bodies.length} bod${r.bodies.length === 1 ? "y" : "ies"}: ${r.bodies.join(", ")})` })),
+        };
+      },
       "adopt-rules": () => {
         if (locked.rules.kind === "missing") return undefined;
         return {
@@ -2040,11 +2055,11 @@ export class CadworkService {
         };
       },
     };
-    const kindOf = { expectations: "adopt-expectations", ownerParams: "adopt-ownerParams", rules: "adopt-rules" } as const;
+    const kindOf = { expectations: "adopt-expectations", ownerParams: "adopt-ownerParams", rules: "adopt-rules", references: "adopt-references" } as const;
     const wantedKinds = new Set([...wanted].map((w) => kindOf[w]));
     // A rules card is per repo: one is enough however many parts of the repo are open.
     const sameScope = (c: Card, kind: CardKind): boolean => c.kind === kind && (kind === "adopt-rules" ? c.ref.worktree === ref.worktree : c.ref.key === ref.key);
-    for (const kind of ["adopt-expectations", "adopt-ownerParams", "adopt-rules"] as const) {
+    for (const kind of ADOPT_KINDS) {
       const open = [...this.cards.values()].filter((c) => sameScope(c, kind));
       const next = wantedKinds.has(kind) ? build[kind]!() : undefined;
       // A card's identity is everything it shows (not just the file's hash): a card whose numbers
@@ -2103,6 +2118,52 @@ export class CadworkService {
     // shown): approved with it.
     const moved = card.values && snap.changed.length && rest.sha === lockedBlockSha(file) ? { values: card.values, declared: declaredFor(snap.current, lock, file.expectations) } : {};
     this.approve(ref, { ...rest, ...moved, ...(file.ownerParams ? { ownerParams: file.ownerParams } : {}), at });
+    return true;
+  }
+
+  /**
+   * The references the gate holds under adoption (refresh.ts `referenceGeometryChecks`): each single,
+   * byte-checked import of the design on disk that a must-not-touch rule names and whose approval
+   * holds no record of it. Sorted by file name.
+   */
+  private unrecordedReferences(ref: PartRef, lock: PartLock | undefined, part: PartRead): { file: string; sha256: string; step: string; bodies: string[] }[] {
+    const must = new Set(part.kind === "ok" ? (part.file.expectations?.noInterferenceWith ?? []) : []);
+    const disk = readDesignFile(ref.dir);
+    if (!disk.script) return [];
+    const embedded = embeddedReferences(disk.script);
+    const out: { file: string; sha256: string; step: string; bodies: string[] }[] = [];
+    for (const e of embedded) {
+      if (!must.has(e.file) || embedded.filter((x) => x.file === e.file).length !== 1 || e.bodies.length === 0 || lock?.references?.[e.file] !== undefined) continue;
+      const onDisk = referenceOnDisk(ref, e.file);
+      if (!("sha256" in onDisk) || onDisk.sha256 !== e.sha256) continue;
+      const step = embeddedStepTexts(disk.script, e.file)[0];
+      if (step !== undefined) out.push({ file: e.file, sha256: e.sha256, step, bodies: e.bodies });
+    }
+    return out.sort((a, b) => a.file.localeCompare(b.file));
+  }
+
+  /**
+   * The owner approved "approve current reference": INSIDE the part's queue slot, the design the
+   * process holds must be the one on disk and the references it imports exactly the ones the card
+   * showed (by sha); each is then measured as imported — its embedded text replayed alone in a
+   * throwaway process — and that record is added to the approval on record, nothing else changed.
+   */
+  private async adoptReferences(card: Card, slot: SlotContext): Promise<boolean> {
+    const { ref } = card;
+    const lock = this.findLock(ref);
+    if (!lock) return false;
+    const disk = readDesignFile(ref.dir);
+    if (disk.scriptSha === undefined || disk.scriptSha !== slot.scriptSha()) return false;
+    const pending = this.unrecordedReferences(ref, lock, readPartFile(ref.dir));
+    if (!pending.length || referencesCardSha(pending) !== card.sha) return false;
+    const records: Record<string, ReferenceMeasure> = {};
+    for (const r of pending) {
+      const m = await this.replayReference(r.step, r.file);
+      if (m.sha256 !== r.sha256) return false;
+      records[r.file] = m;
+    }
+    const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = lock;
+    this.approve(ref, { ...rest, references: { ...(lock.references ?? {}), ...records }, at: new Date().toISOString() });
     return true;
   }
 
@@ -2454,11 +2515,15 @@ type CardAction =
     }
   | { ok: false; error: string };
 
-const ADOPT_KINDS = ["adopt-expectations", "adopt-ownerParams", "adopt-rules"] as const;
+const ADOPT_KINDS = ["adopt-expectations", "adopt-ownerParams", "adopt-rules", "adopt-references"] as const;
 type AdoptKind = (typeof ADOPT_KINDS)[number];
 const isAdoptKind = (k: CardKind): k is AdoptKind => (ADOPT_KINDS as readonly string[]).includes(k);
 /** Where an adopt card is asked: a rules card per worktree, a part's cards per part. */
 const adoptScope = (kind: AdoptKind, ref: PartRef): string => `${kind}\0${kind === "adopt-rules" ? ref.worktree : ref.key}`;
+
+/** What an adopt-references card stands for: each reference's file name and the sha of its text. */
+const referencesCardSha = (pending: readonly { file: string; sha256: string }[]): string =>
+  createHash("sha256").update(JSON.stringify(pending.map((r) => [r.file, r.sha256]))).digest("hex");
 
 /** The part.json half of an owner card's fingerprint. */
 function partKeyOf(part: PartRead): unknown {

@@ -15,8 +15,12 @@
  *     between the design bodies and that reference's bodies must report EXACTLY "no interference":
  *     `count == 0 && unchecked == [] && !budget_exceeded && !truncated` (A0 evidence). Anything else —
  *     an overlap, or a check that did not finish — is a hard fail naming the pair and the volume.
+ *     The same check runs again against the TRUE import — the embedded text imported alone in a
+ *     throwaway process next to the design bodies' STEP exports ("interference x.step as imported",
+ *     ./refreplay.ts), so a reshaped live body cannot hide an overlap.
  *   - geometry: each reference measures, where it is, what its import measured
- *     (`referenceDifferences`; the gate's `referenceGeometryChecks` in ./refresh.ts).
+ *     (`referenceDifferences`, the fast pre-check) and IS its import's solid (`shapeDifferences`:
+ *     vol(true) = vol(live) = vol(true ∩ live)); the gate's `referenceGeometryChecks` in ./refresh.ts.
  *
  * SOURCE RULES (`resolveReferenceSource`): a path relative to the worktree root; it must stay inside
  * the worktree after resolving (no `..` out, no absolute path), be a regular file that is not a
@@ -277,9 +281,9 @@ const fmt = (v: number): string => String(Math.round(v * 1000) / 1000);
  * interference" condition of the A0 evidence; an error, an overlap, unchecked pairs, a truncated list
  * or an exhausted budget is a hard fail that says which.
  */
-export function interferenceCheck(name: string, reply: McpToolResult | { error: string }): GateCheck {
-  const id = `interference ${name}`;
-  const expected = `no overlap with refs/${name}`;
+export function interferenceCheck(name: string, reply: McpToolResult | { error: string }, opts: { asImported?: boolean } = {}): GateCheck {
+  const id = opts.asImported ? `interference ${name} ${AS_IMPORTED}` : `interference ${name}`;
+  const expected = opts.asImported ? `no overlap with refs/${name} ${AS_IMPORTED} (its STEP imported alone, next to the design bodies, in a throwaway process)` : `no overlap with refs/${name}`;
   if ("error" in reply) return { id, expected, measured: `the interference check could not run: ${reply.error}`, ok: false, hard: true };
   const j = reply.json;
   if (reply.isError || !j || typeof j !== "object") return { id, expected, measured: `the interference check could not run: ${reply.text.slice(0, 300) || "no reply"}`, ok: false, hard: true };
@@ -294,6 +298,10 @@ export function interferenceCheck(name: string, reply: McpToolResult | { error: 
   const ok = j.count === 0 && Array.isArray(j.unchecked) && j.unchecked.length === 0 && j.budget_exceeded === false && j.truncated === false;
   return { id, expected, measured: ok ? "no overlap" : problems.join("; "), ok, hard: true };
 }
+
+/** The must-not-touch check against the TRUE import (./refreplay.ts `makeTrueReferenceCheck`) is
+ *  reported as `interference <file> as imported`. */
+export const AS_IMPORTED = "as imported";
 
 /** The total overlap volume an interference check reported (for tests and the card). */
 export function overlapVolume(reply: McpToolResult): number {
@@ -569,6 +577,25 @@ export function referenceDifferences(expected: readonly ReferenceBodyMeasure[], 
     if (!near(e.bbox.min, l.bbox.min) || !near(e.bbox.max, l.bbox.max)) out.push(`${who}bounding box ${v3(e.bbox.min)}…${v3(e.bbox.max)} → ${v3(l.bbox.min)}…${v3(l.bbox.max)}`);
     if (l.faces !== e.faces) out.push(`${who}faces ${e.faces} → ${l.faces}`);
     if (e.centerOfMass && (!l.centerOfMass || !near(e.centerOfMass, l.centerOfMass))) out.push(`${who}centre of mass ${v3(e.centerOfMass)} → ${l.centerOfMass ? v3(l.centerOfMass) : "not reported"}`);
+  }
+  return out;
+}
+
+/**
+ * The EXACT shape comparison of a live reference with its true import: per body, the same solid ⇔
+ * vol(true) = vol(live) = vol(true ∩ live), within `REFERENCE_MEASURE_REL` of the import's volume
+ * (so whatever differs between them has no volume). Phrases as `referenceDifferences`; empty when
+ * every body is the same solid. Catches what volume, bounding box, faces and centre of mass cannot:
+ * two holes enlarged and two shrunk by the same material, a symmetric outline turned 90°.
+ */
+export function shapeDifferences(shape: readonly { label: string; trueVolume: number; liveVolume: number; overlap: number }[], bodyCount?: { imported: number; live: number }): string[] {
+  if (bodyCount) return [`${bodyCount.imported} bod${bodyCount.imported === 1 ? "y" : "ies"} → ${bodyCount.live}`];
+  const out: string[] = [];
+  for (const s of shape) {
+    const tol = REFERENCE_MEASURE_REL * Math.max(1, Math.abs(s.trueVolume));
+    const who = shape.length > 1 ? `${s.label}: ` : "";
+    if (Math.abs(s.liveVolume - s.trueVolume) <= tol && Math.abs(s.overlap - s.trueVolume) <= tol) continue;
+    out.push(`${who}shape is not the import's: it shares ${fmt(s.overlap)} of the import's ${fmt(s.trueVolume)} mm³ (the reference is ${fmt(s.liveVolume)} mm³)`);
   }
   return out;
 }

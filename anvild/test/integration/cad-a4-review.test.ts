@@ -27,7 +27,7 @@ import { MANIFEST, releaseKey } from "../../src/cadwork/release";
 import { dispatch } from "../../src/server/dispatch";
 import { ConnectionRegistry } from "../../src/server/registry";
 import { DIMENSIONS_CARD_OPEN, UNAPPROVED_PARAMETER } from "../../src/session/cadwork-service";
-import { REFERENCE_NOT_COVERED } from "../../src/cadwork/refresh";
+import { REFERENCE_NOT_COVERED, REFERENCE_NOT_RECORDED } from "../../src/cadwork/refresh";
 import { importFeatureName } from "../../src/cadwork/refs";
 import { Supervisor } from "../../src/session/supervisor";
 import { PLATE_EXPECTATIONS, RULES, buildPlate, callable, cleanupTemp, fakeCadSession, modelPlate, stopServices, tempRepo, until, writeRules, type ToolReply } from "../helpers/cad-work";
@@ -393,6 +393,41 @@ describe("A4 re-review: an owner card's write re-checks its snapshot inside the 
     g = await x.check();
     expect(g.state).toBe("fail");
     expect(g.failing.join("\n")).toContain(`reference pump.step ${REFERENCE_NOT_COVERED}`);
+  });
+
+  test("[A4] veto item 3: an approval with no record of a reference (made before records were kept) is never trusted from the current file — unverified, needsAdoption references, an adopt-references card 'approve current reference'; denied it stays unverified and is not asked again until the owner rebuilds, approved it records the import replayed alone and the part passes", async () => {
+    const repo = tempRepo();
+    const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
+    stepFile(repo, ".anvil-downloads/block.step", [200, 0, 0], [210, 10, 10]);
+    expect((await asOwner(x, x.tools.import_reference!({ part: "plate", file: ".anvil-downloads/block.step" }))).reply.json).toMatchObject({ imported: true });
+    const id = repoIdentity(repo);
+    const { references, ...legacy } = x.service.locks.findPart(id, "plate")!;
+    const recorded = references!["block.step"]!;
+    x.service.locks.putPart(legacy);
+    let g = await x.check();
+    expect(g.state).toBe("unverified");
+    expect(g.needsAdoption).toBe("references");
+    expect(g.failing.join("\n")).toContain(`${REFERENCE_NOT_RECORDED} (refs/block.step)`);
+    await until(() => x.openCards().some((c: any) => c.kind === "adopt-references"), "the references card");
+    let card = x.openCards().find((c: any) => c.kind === "adopt-references")!;
+    expect(card.rows).toEqual([{ label: "refs/block.step", old: "measurements not recorded", new: `approve current reference (sha ${recorded.sha256.slice(0, 12)}, 1 body: block)` }]);
+    // Denied: nothing recorded, the part stays unverified, the same card is not asked again.
+    x.service.respond(card.requestId, false);
+    g = await x.check();
+    expect(g.state).toBe("unverified");
+    expect(x.service.locks.findPart(id, "plate")!.references).toBeUndefined();
+    expect(x.openCards().some((c: any) => c.kind === "adopt-references")).toBe(false);
+    // The owner rebuilds (asks again): approved, the record is the import replayed alone.
+    await x.service.refreshDesign(repo, "plate");
+    await until(() => x.openCards().some((c: any) => c.kind === "adopt-references"), "the references card again");
+    card = x.openCards().find((c: any) => c.kind === "adopt-references")!;
+    x.service.respond(card.requestId, true);
+    await until(() => !!x.service.locks.findPart(id, "plate")!.references, "the record");
+    expect(x.service.locks.findPart(id, "plate")!.references!["block.step"]).toEqual(recorded);
+    expect(x.service.locks.findPart(id, "plate")!.sha).toBe(legacy.sha); // nothing else of the approval changed
+    g = await x.check();
+    expect(g.failing).toEqual([]);
+    expect(g.state).toBe("pass");
   });
 
   test("[A4] re-review: an adopt-ownerParams card that also approves a parameter the agent moved shows the numbers it leads to (accepted → new); approving records exactly those", async () => {

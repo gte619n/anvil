@@ -539,7 +539,7 @@ export function cadTools(deps: CadToolDeps): SdkMcpToolDefinition<any>[] {
           if (!existsSync(join(ref.dir, DESIGN_FILE)) && !deps.manager.status(ref)?.live) return fail(`cad/${ref.part} has no design yet: open_part it and build something first`);
           const gate = await deps.checkPart(ref);
           const out = ok(JSON.stringify({ part: ref.part, ...gate, failing: failingLines(gate), advisory: advisoryLines(gate) }));
-          if (gate.needsAdoption) out.content.push({ type: "text", text: `[anvil] The owner has been shown a card to adopt the ${gate.needsAdoption === "rules" ? "changed cad/rules.json" : gate.needsAdoption}; the part stays unverified until they approve it.` });
+          if (gate.needsAdoption) out.content.push({ type: "text", text: `[anvil] The owner has been shown a card to adopt the ${gate.needsAdoption === "rules" ? "changed cad/rules.json" : gate.needsAdoption === "references" ? "current reference (reference measurements not recorded)" : gate.needsAdoption}; the part stays unverified until they approve it.` });
           return out;
         }),
     ),

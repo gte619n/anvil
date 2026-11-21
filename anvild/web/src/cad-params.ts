@@ -194,7 +194,7 @@ export function createCadParams(deps: CadParamsDeps): CadParams {
       }
       gate.append(ul);
     }
-    if (g.needsAdoption) gate.append(el("div", "cad-gate-note", g.needsAdoption === "rules" ? "Waiting for you to adopt the changed cad/rules.json." : `Waiting for you to adopt the ${g.needsAdoption === "ownerParams" ? "dimensions" : "expectations"}.`));
+    if (g.needsAdoption) gate.append(el("div", "cad-gate-note", g.needsAdoption === "rules" ? "Waiting for you to adopt the changed cad/rules.json." : g.needsAdoption === "references" ? "Waiting for you to approve the current reference (its measurements were not recorded)." : `Waiting for you to adopt the ${g.needsAdoption === "ownerParams" ? "dimensions" : "expectations"}.`));
     const advisory = g.checks.filter((c) => !c.hard);
     if (advisory.length || g.warnings.length || g.staleBuild) {
       const ul = el("ul", "cad-gate-advisory");

@@ -5,7 +5,8 @@
  * `assertions="N"` per <testcase>, `<skipped />` / `<failure />` children.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   checkNamedTests,
@@ -15,6 +16,9 @@ import {
   parseGateArgs,
   parseJUnit,
   phaseProblems,
+  runStep,
+  stepTimeoutMs,
+  STEP_TIMEOUTS_MS,
   validateManifest,
   type PhaseManifest,
 } from "../tools/phase-gate-lib";
@@ -262,4 +266,62 @@ describe("gate arguments and dirty-tree rule", () => {
     expect(r.ignored).toEqual(["?? docs/plans/notes.md", " M docs/plans/spec.md", "?? scratch/"]);
     expect(classifyDirty("")).toEqual({ blocking: [], ignored: [] });
   });
+});
+
+describe("step time limits", () => {
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test("[F0] a step's limit: 45 min for the full suite, less for the rest, scaled by --timeout-scale (else ANVIL_GATE_TIMEOUT_SCALE), all set by ANVIL_GATE_TIMEOUT_MS", () => {
+    expect(STEP_TIMEOUTS_MS["full suite"]).toBe(45 * 60_000);
+    expect(stepTimeoutMs("full suite", undefined, {})).toBe(45 * 60_000);
+    expect(stepTimeoutMs("typecheck", undefined, {})).toBe(10 * 60_000);
+    expect(stepTimeoutMs("unknown step", undefined, {})).toBe(10 * 60_000);
+    expect(stepTimeoutMs("full suite", 2, {})).toBe(90 * 60_000);
+    expect(stepTimeoutMs("full suite", undefined, { ANVIL_GATE_TIMEOUT_SCALE: "0.5" })).toBe(22.5 * 60_000);
+    expect(stepTimeoutMs("full suite", 2, { ANVIL_GATE_TIMEOUT_SCALE: "0.5" })).toBe(90 * 60_000); // the flag wins
+    expect(stepTimeoutMs("full suite", undefined, { ANVIL_GATE_TIMEOUT_SCALE: "nope" })).toBe(45 * 60_000);
+    expect(stepTimeoutMs("named tests", 3, { ANVIL_GATE_TIMEOUT_MS: "1234" })).toBe(1234);
+    expect(parseGateArgs(["A4", "--timeout-scale", "1.5"]).args?.timeoutScale).toBe(1.5);
+    expect(parseGateArgs(["A4", "--timeout-scale", "0"]).error).toContain("positive number");
+    expect(parseGateArgs(["A4", "--timeout-scale"]).error).toContain("positive number");
+  });
+
+  test("[F0] runStep tees the output to its log and returns the exit code; a step over its limit has its whole process group killed (a grandchild too) and ends 'timed out' with code 124 and its output so far in the log", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "phase-gate-test-"));
+    try {
+      const ok = await runStep(["sh", "-c", "echo out; echo err >&2; exit 3"], { cwd: dir, env: process.env, timeoutMs: 10_000, log: join(dir, "ok.log") });
+      expect(ok).toMatchObject({ code: 3, timedOut: false });
+      expect(ok.out).toContain("out");
+      expect(ok.out).toContain("err");
+      expect(readFileSync(ok.log, "utf8")).toContain("out");
+      // A hang: a grandchild in the background, the leader waiting on it.
+      const pidFile = join(dir, "pid");
+      const t0 = performance.now();
+      const hung = await runStep(["sh", "-c", `echo started; sleep 60 & echo $! > ${pidFile}; wait`], { cwd: dir, env: process.env, timeoutMs: 500, log: join(dir, "hung.log"), graceMs: 500 });
+      expect(performance.now() - t0).toBeLessThan(10_000);
+      expect(hung).toMatchObject({ code: 124, timedOut: true });
+      const log = readFileSync(hung.log, "utf8");
+      expect(log).toContain("started");
+      expect(log).toContain("timed out after 1s: killing process group");
+      const grandchild = Number(readFileSync(pidFile, "utf8").trim());
+      for (let i = 0; i < 40 && alive(grandchild); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(alive(grandchild)).toBe(false);
+      // The leader exits but leaves something holding its output open: the step still ends, with the leader's code.
+      const t1 = performance.now();
+      const left = await runStep(["sh", "-c", "sleep 60 & exit 0"], { cwd: dir, env: process.env, timeoutMs: 30_000, log: join(dir, "left.log"), graceMs: 300 });
+      expect(left).toMatchObject({ code: 0, timedOut: false });
+      expect(performance.now() - t1).toBeLessThan(10_000);
+      // A command that cannot start.
+      expect((await runStep(["/nonexistent/phase-gate-cmd"], { cwd: dir, env: process.env, timeoutMs: 5_000, log: join(dir, "bad.log") })).code).not.toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

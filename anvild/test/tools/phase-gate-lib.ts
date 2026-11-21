@@ -327,9 +327,11 @@ export interface GateArgs {
   requireReal: boolean;
   allowDirty: boolean;
   spikeEvidence?: string;
+  /** `--timeout-scale <x>`: every step's time limit times x (see `stepTimeoutMs`). */
+  timeoutScale?: number;
 }
 
-export const USAGE = "usage: bun test/tools/phase-gate.ts <phase> [--require-real] [--allow-dirty] [--spike-evidence <file>]";
+export const USAGE = "usage: bun test/tools/phase-gate.ts <phase> [--require-real] [--allow-dirty] [--spike-evidence <file>] [--timeout-scale <x>]";
 
 export function parseGateArgs(argv: readonly string[]): { args?: GateArgs; error?: string } {
   let phase: string | undefined;
@@ -342,6 +344,10 @@ export function parseGateArgs(argv: readonly string[]): { args?: GateArgs; error
       const v = argv[++i];
       if (!v) return { error: "--spike-evidence needs a file path" };
       args.spikeEvidence = v;
+    } else if (a === "--timeout-scale") {
+      const v = Number(argv[++i]);
+      if (!Number.isFinite(v) || v <= 0) return { error: "--timeout-scale needs a positive number" };
+      args.timeoutScale = v;
     } else if (a.startsWith("--")) return { error: `unknown flag ${a}` };
     else if (phase) return { error: `unexpected argument ${a}` };
     else phase = a;
@@ -371,4 +377,107 @@ export function classifyDirty(porcelain: string): { blocking: string[]; ignored:
     (harmless ? ignored : blocking).push(line);
   }
   return { blocking, ignored };
+}
+
+// ── step time limits ─────────────────────────────────────────────────────────────────────────────
+
+/** How long each step may run before its process group is killed and the step fails "timed out".
+ *  The full suite takes ~10 min on the M4; the limits leave room without letting a hang block forever. */
+export const STEP_TIMEOUTS_MS: Readonly<Record<string, number>> = {
+  "named tests": 20 * 60_000,
+  "full suite": 45 * 60_000,
+  typecheck: 10 * 60_000,
+  "typecheck:web": 10 * 60_000,
+  "build:web": 10 * 60_000,
+  playwright: 30 * 60_000,
+  "real tools": 45 * 60_000,
+};
+const DEFAULT_STEP_TIMEOUT_MS = 10 * 60_000;
+
+/** A step's time limit: its default (`STEP_TIMEOUTS_MS`) times `--timeout-scale`, else times
+ *  `ANVIL_GATE_TIMEOUT_SCALE`; `ANVIL_GATE_TIMEOUT_MS` sets every step's limit outright. */
+export function stepTimeoutMs(step: string, scale: number | undefined, env: Record<string, string | undefined> = process.env): number {
+  const fixed = Number(env.ANVIL_GATE_TIMEOUT_MS);
+  if (env.ANVIL_GATE_TIMEOUT_MS && Number.isFinite(fixed) && fixed > 0) return fixed;
+  const envScale = Number(env.ANVIL_GATE_TIMEOUT_SCALE);
+  const k = scale ?? (env.ANVIL_GATE_TIMEOUT_SCALE && Number.isFinite(envScale) && envScale > 0 ? envScale : 1);
+  return Math.round((STEP_TIMEOUTS_MS[step] ?? DEFAULT_STEP_TIMEOUT_MS) * k);
+}
+
+export interface StepRun {
+  code: number;
+  out: string;
+  ms: number;
+  timedOut: boolean;
+  /** Where the step's whole output was teed. */
+  log: string;
+}
+
+/**
+ * Run one step's command in its OWN process group (detached), its stdout and stderr teed to `log`
+ * as they arrive and kept for the caller. After `timeoutMs` the whole group (the command and
+ * everything it started — bun's test workers, SolidCraft, Chrome) gets SIGTERM, then SIGKILL 5 s
+ * later, and the run ends `timedOut` with exit code 124. Never throws on the command's behalf: a
+ * command that cannot be started is exit code 127 with the reason in `out`.
+ */
+export async function runStep(cmd: string[], opts: { cwd: string; env?: Record<string, string | undefined>; timeoutMs: number; log: string; graceMs?: number }): Promise<StepRun> {
+  const { spawn } = await import("node:child_process");
+  const { createWriteStream } = await import("node:fs");
+  const t0 = performance.now();
+  const sink = createWriteStream(opts.log, { flags: "a" });
+  sink.write(`$ ${cmd.join(" ")}\n`);
+  const chunks: Buffer[] = [];
+  const done = await new Promise<{ code: number; timedOut: boolean }>((resolveRun) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(cmd[0]!, cmd.slice(1), { cwd: opts.cwd, env: opts.env as NodeJS.ProcessEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      const msg = Buffer.from(`could not start ${cmd[0]}: ${e instanceof Error ? e.message : String(e)}\n`);
+      chunks.push(msg);
+      sink.write(msg);
+      resolveRun({ code: 127, timedOut: false });
+      return;
+    }
+    const take = (b: Buffer) => {
+      chunks.push(b);
+      sink.write(b);
+    };
+    child.stdout!.on("data", take);
+    child.stderr!.on("data", take);
+    let timedOut = false;
+    let killer: ReturnType<typeof setTimeout> | undefined;
+    const group = (sig: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, sig);
+      } catch {
+        /* already gone */
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      const msg = Buffer.from(`\n[phase-gate] timed out after ${(opts.timeoutMs / 1000).toFixed(0)}s: killing process group ${child.pid}\n`);
+      chunks.push(msg);
+      sink.write(msg);
+      group("SIGTERM");
+      killer = setTimeout(() => group("SIGKILL"), opts.graceMs ?? 5_000);
+    }, opts.timeoutMs);
+    let exitCode: number | null = null;
+    let straggler: ReturnType<typeof setTimeout> | undefined;
+    child.on("error", (e) => take(Buffer.from(`could not start ${cmd[0]}: ${e.message}\n`)));
+    // The leader exited, but something it started may still hold the pipes open: give it a moment,
+    // then kill what is left of the group so the step ends with the leader's code.
+    child.on("exit", (code) => {
+      exitCode = code;
+      straggler = setTimeout(() => group("SIGKILL"), opts.graceMs ?? 5_000);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (killer) clearTimeout(killer);
+      if (straggler) clearTimeout(straggler);
+      if (timedOut) group("SIGKILL"); // whatever of the group outlived its leader
+      resolveRun({ code: timedOut ? 124 : (exitCode ?? code ?? 1), timedOut });
+    });
+  });
+  await new Promise<void>((r) => sink.end(r));
+  return { code: done.code, out: Buffer.concat(chunks).toString(), ms: performance.now() - t0, timedOut: done.timedOut, log: opts.log };
 }

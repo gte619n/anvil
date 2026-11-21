@@ -342,7 +342,11 @@ describe("Phase A4 extras", () => {
       stepFile(repo, "vendor/far.step", [500, 0, 0], [510, 10, 10], "far"); // nowhere near the plate
       await asOwner(x, x.tools.import_reference!({ part: "plate", file: "vendor/far.step" }));
       const g = await x.check();
-      expect([mode, g.state]).toEqual([mode, "fail"]);
+      // The same binary answers the true-import check the same way, so that cannot finish either: the
+      // part is unverified (the stricter verdict), and both interference lines fail.
+      expect([mode, g.state]).toEqual([mode, "unverified"]);
+      expect(g.checks.find((k: any) => k.id === "interference far.step as imported").ok).toBe(false);
+      expect(g.checks.find((k: any) => k.id === "geometry far.step")).toMatchObject({ ok: false });
       const c = g.checks.find((k: any) => k.id === "interference far.step");
       expect(c.ok).toBe(false);
       expect(c.measured).toContain(mode === "unchecked" ? "not checked" : mode === "truncated" ? "truncated" : "budget exceeded");

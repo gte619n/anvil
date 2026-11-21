@@ -3128,4 +3128,5 @@ const OWNER_CARD_ASK: Record<string, string> = {
   "adopt-expectations": "an edit to its expectations needs your approval",
   "adopt-ownerParams": "an edit to its owner parameters needs your approval",
   "adopt-rules": "an edit to cad/rules.json needs your approval",
+  "adopt-references": "its reference measurements need your approval",
 };

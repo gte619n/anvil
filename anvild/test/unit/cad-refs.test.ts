@@ -4,7 +4,7 @@
  * interference" condition — plus the manager's working folder (decision 115).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { partRef } from "../../src/cadwork/partfolder";
@@ -29,11 +29,12 @@ import {
   isReferenceMeasure,
   readReferenceMeasures,
   referenceDifferences,
+  shapeDifferences,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
-import { coverageChecks, designPlacementChecks, placementChecks, readPlacements, referenceGate, referenceGeometryChecks, DESIGN_PLACED_ONCE, REFERENCE_NOT_APPROVED, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
+import { coverageChecks, designPlacementChecks, placementChecks, readPlacements, referenceGate, referenceGeometryChecks, DESIGN_PLACED_ONCE, REFERENCE_NOT_APPROVED, REFERENCE_NOT_RECORDED, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { readDesignFile } from "../../src/cadwork/poststep";
-import { makeReferenceReplay } from "../../src/cadwork/refreplay";
+import { makeReferenceReplay, makeTrueReferenceCheck, type TrueReferenceInput, type TrueReferenceResult } from "../../src/cadwork/refreplay";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
 import { cleanupTemp, fakeManager, recordingSpawn, stopManagers, tempRepo } from "../helpers/cad-work";
 
@@ -386,63 +387,110 @@ describe("a reference measures what its import did", () => {
     for (const bad of [undefined, {}, { sha256: "x", bodies: [] }, { sha256: "x", bodies: [{ ...asImported, faces: "6" }] }, { sha256: 1, bodies: [asImported] }]) expect(isReferenceMeasure(bad)).toBe(false);
   });
 
-  test("[A4] veto: the geometry check holds each byte-checked reference to the lock store's record of its import (same STEP text), else to a replay of the import alone; reshaped, moved or gone fails; a record for other text on a part with expectations, an unreadable record, no replay, a failed replay and an unmeasurable reference are unverified", async () => {
+  test("[A4] veto: the geometry check holds each byte-checked reference to the lock store's record of its import (same STEP text) as a fast pre-check, then to the TRUE import (exact shape: vol(true) = vol(live) = vol(true ∩ live)), and checks the design bodies against the true import; reshaped, moved or gone fails; no record needs adoption ('approve current reference'); a record for other text on a part with expectations, an unreadable record, no check, a failed check and an unmeasurable reference are unverified", async () => {
     const script = { about: {}, commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "ref-block.step", file: "block.step", step: "BLOCK", body_names: ["block"] } } }] };
     const embedded = embeddedReferences(script);
-    const input = { embedded, clean: new Set(["block.step"]), script, referenceBodies: ["block"] };
-    const asked: unknown[] = [];
-    const measuring = (b: Record<string, unknown> | "error") => async (_t: string, args: any) => {
-      asked.push(args);
+    const exportDir = tempRepo("anvil-cad-geo-");
+    const input = { embedded, clean: new Set(["block.step"]), script, referenceBodies: ["block"], designBodies: ["Body1"], placements: { block: ["block"], Body1: ["Body1"] }, must: new Set(["block.step"]), exportDir };
+    const asked: any[] = [];
+    const measuring = (b: Record<string, unknown> | "error", exportFails = false) => async (tool: string, args: any) => {
+      asked.push({ tool, ...args });
+      if (tool === "export") {
+        if (exportFails) return reply({ error: "no" }, true);
+        writeFileSync(args.path, `STEP of ${args.bodies.join(",")}`);
+        return reply({ bytes: 1, format: "Step", path: args.path });
+      }
       return b === "error" ? reply({ error: "no" }, true) : reply({ bodies: [b] });
     };
     const record = { references: { "block.step": { sha256: sha("BLOCK"), bodies: [asImported] } } };
-    const replays: string[] = [];
-    const replay = async (step: string, file: string) => {
-      replays.push(`${file}:${step}`);
-      return { sha256: sha(step), bodies: [asImported] };
+    const noOverlap = reply({ count: 0, interferences: [], unchecked: [], budget_exceeded: false, truncated: false });
+    const seen: TrueReferenceInput[] = [];
+    const truth = (over: Partial<TrueReferenceResult> = {}) => async (i: TrueReferenceInput): Promise<TrueReferenceResult> => {
+      seen.push(i);
+      return { sha256: sha(i.step), asImported: [asImported], interference: noOverlap, shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000 }], ...over };
     };
     const lines = (r: { checks: { id: string; ok: boolean; measured: unknown }[] }) => r.checks.map((c) => `${c.id}: ${c.ok ? "ok" : "FAIL"} ${String(c.measured)}`);
-    // Untouched: as imported, from the record — no replay.
-    let r = await referenceGeometryChecks(measuring(block()), input, record, true, replay);
-    expect(lines(r)).toEqual(["geometry block.step: ok as imported"]);
+    // Untouched: the record matches, the true import is the same solid, no overlap with it.
+    let r = await referenceGeometryChecks(measuring(block()), input, record, true, truth());
+    expect(lines(r)).toEqual(["interference block.step as imported: ok no overlap", "geometry block.step: ok as imported"]);
     expect(r.unverified).toBe(false);
-    expect(asked).toEqual([{ command: "inspect.measure", params: { bodies: ["block"] } }]);
-    expect(replays).toEqual([]);
-    // Reshaped by a point (nothing in the script names the body): a hard fail with the numbers.
-    r = await referenceGeometryChecks(measuring(block({ volume_mm3: 100, bbox: { min: [0, 0, 7], max: [10, 10, 8] }, center_of_mass: [5, 5, 7.5] })), input, record, true, replay);
-    expect(lines(r)[0]).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (volume 1000 → 100 mm³; bounding box [0, 0, -2]…[10, 10, 8] → [0, 0, 7]…[10, 10, 8]; centre of mass [5, 5, 3] → [5, 5, 7.5])`);
+    // The live process exported the reference body and every design placement (by world name) into a
+    // staging folder of its .cache, which is gone afterwards; the check got the embedded text and those bytes.
+    expect(asked.filter((a) => a.tool === "export").map((a) => [a.bodies, a.format, a.path.startsWith(join(exportDir, ".cache", "truecheck-"))])).toEqual([[["block"], "step", true], [["Body1"], "step", true]]);
+    expect(seen[0]!.step).toBe("BLOCK");
+    expect(seen[0]!.live.map((l) => [l.label, l.bytes.toString()])).toEqual([["block", "STEP of block"]]);
+    expect(seen[0]!.design.map((l) => [l.label, l.bytes.toString()])).toEqual([["Body1", "STEP of Body1"]]);
+    expect(readdirSync(join(exportDir, ".cache"))).toEqual([]);
+    // THE VETO: the summary numbers all match, but the live body shares less than its volume with the
+    // true import (two holes enlarged, two shrunk) and the design overlaps the TRUE import.
+    const hit = reply({ count: 1, interferences: [{ a: "Pin", b: "holey (as imported)", volume_mm3: 40.8407 }], unchecked: [], budget_exceeded: false, truncated: false });
+    r = await referenceGeometryChecks(measuring(block()), input, record, true, truth({ interference: hit, shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 959.1593 }] }));
+    expect(lines(r)).toEqual([
+      "interference block.step as imported: FAIL Pin overlaps holey (as imported) by 40.841 mm³",
+      `geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (shape is not the import's: it shares 959.159 of the import's 1000 mm³ (the reference is 1000 mm³))`,
+    ]);
     expect(r.unverified).toBe(false);
+    // Within 1e-6 of its volume is the same solid; a body count that differs is named.
+    expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000 + 1e-7, overlap: 1000 - 1e-7 }] }))).at(-1)).toBe("geometry block.step: ok as imported");
+    expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ shape: [], bodyCount: { imported: 2, live: 1 } }))).at(-1)).toContain("2 bodies → 1");
+    // Reshaped by a point (the pre-check sees it): a hard fail with the numbers.
+    r = await referenceGeometryChecks(measuring(block({ volume_mm3: 100, bbox: { min: [0, 0, 7], max: [10, 10, 8] }, center_of_mass: [5, 5, 7.5] })), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 100, overlap: 100 }] }));
+    expect(lines(r).at(-1)).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (volume 1000 → 100 mm³; bounding box [0, 0, -2]…[10, 10, 8] → [0, 0, 7]…[10, 10, 8]; centre of mass [5, 5, 3] → [5, 5, 7.5]; shape is not the import's: it shares 100 of the import's 1000 mm³ (the reference is 100 mm³))`);
     // Moved (its placement), measured in world coordinates.
-    expect(lines(await referenceGeometryChecks(measuring(block({ bbox: { min: [0, 0, 98], max: [10, 10, 108] }, center_of_mass: [5, 5, 103] })), input, record, true, replay))[0]).toContain(REFERENCE_RESHAPED);
+    expect(lines(await referenceGeometryChecks(measuring(block({ bbox: { min: [0, 0, 98], max: [10, 10, 108] }, center_of_mass: [5, 5, 103] })), input, record, true, truth())).at(-1)).toContain(REFERENCE_RESHAPED);
     // Gone (suppressed, rolled back, deleted): its body is not in the design.
-    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, referenceBodies: [] }, record, true, replay))[0]).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (block is not in the design: its import is suppressed, rolled back or deleted)`);
-    // A legacy approval (no record): the import replayed alone from the embedded text.
-    r = await referenceGeometryChecks(measuring(block()), input, {}, true, replay);
-    expect(lines(r)).toEqual(["geometry block.step: ok as imported"]);
-    expect(replays).toEqual(["block.step:BLOCK"]);
-    expect(lines(await referenceGeometryChecks(measuring(block({ volume_mm3: 100 })), input, undefined, true, replay))[0]).toContain("volume 1000 → 100 mm³");
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, referenceBodies: [] }, record, true, truth())).at(-1)).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (block is not in the design: its import is suppressed, rolled back or deleted)`);
+    // No design bodies: the shape is still compared, nothing to interfere; a reference under no rule is not interference-checked.
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, designBodies: [] }, record, true, truth()))).toEqual(["interference block.step as imported: ok no design bodies yet", "geometry block.step: ok as imported"]);
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, must: new Set<string>() }, record, true, truth()))).toEqual(["geometry block.step: ok as imported"]);
+    // ITEM 3 — a legacy approval (no record): never trusted from the current file. Still checked
+    // against its import, and the part needs adoption: "approve current reference".
+    for (const legacy of [{}, undefined]) {
+      r = await referenceGeometryChecks(measuring(block()), input, legacy, true, truth());
+      expect(lines(r)).toEqual(["interference block.step as imported: ok no overlap", "geometry block.step: ok as imported", `lock.references: FAIL ${REFERENCE_NOT_RECORDED} (refs/block.step)`]);
+      expect(r.unverified).toBe(true);
+    }
+    // …and with no record, the pre-check runs against the true import's numbers.
+    expect(lines(await referenceGeometryChecks(measuring(block({ volume_mm3: 100 })), input, undefined, true, truth())).find((l) => l.startsWith("geometry"))).toContain("volume 1000 → 100 mm³");
     // A record for OTHER text: on a part with expectations the reference was swapped without the card.
     const other = { references: { "block.step": { sha256: sha("OTHER"), bodies: [asImported] } } };
-    r = await referenceGeometryChecks(measuring(block()), input, other, true, replay);
-    expect(lines(r)[0]).toContain(`reference block.step ${REFERENCE_NOT_APPROVED} (approved ${sha("OTHER").slice(0, 12)}, the design holds ${sha("BLOCK").slice(0, 12)})`);
+    r = await referenceGeometryChecks(measuring(block()), input, other, true, truth());
+    expect(lines(r)[1]).toContain(`reference block.step ${REFERENCE_NOT_APPROVED} (approved ${sha("OTHER").slice(0, 12)}, the design holds ${sha("BLOCK").slice(0, 12)})`);
     expect(r.unverified).toBe(true);
-    // …on a part with none yet (re-imported freely), the replay decides.
-    expect(lines(await referenceGeometryChecks(measuring(block()), input, other, false, replay))).toEqual(["geometry block.step: ok as imported"]);
-    // Fail closed.
-    for (const [lock, rp, call, why] of [
-      [{ references: { "block.step": { sha256: sha("BLOCK"), bodies: [] } } }, replay, measuring(block()), "cannot be read"],
-      [undefined, undefined, measuring(block()), "is not recorded, and its import could not be replayed here"],
-      [undefined, async () => { throw new Error("no SolidCraft"); }, measuring(block()), "could not be worked out: no SolidCraft"],
-      [record, replay, measuring("error"), "reference block.step could not be measured"],
+    // …on a part with none yet (re-imported freely, so no rule names it): the true import decides.
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, must: new Set<string>() }, other, false, truth()))).toEqual(["geometry block.step: ok as imported"]);
+    // A reference no rule names (it fails "not covered" anyway) asks no card when unrecorded.
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, must: new Set<string>() }, undefined, true, truth()))).toEqual(["geometry block.step: ok as imported"]);
+    // Fail closed: every failure on the path to the true import is unverified, and the
+    // as-imported interference line fails with it.
+    for (const [lock, ck, call, why] of [
+      [{ references: { "block.step": { sha256: sha("BLOCK"), bodies: [] } } }, truth(), measuring(block()), "cannot be read"],
+      [record, undefined, measuring(block()), "could not be checked against its import: no SolidCraft process can be started here"],
+      [record, async () => { throw new Error("no SolidCraft"); }, measuring(block()), "could not be checked against its import: no SolidCraft"],
+      [record, async (i: TrueReferenceInput) => ({ ...(await truth()(i)), sha256: sha("OTHER") }), measuring(block()), "imported other text"],
+      [record, truth(), measuring(block(), true), "could not be exported to STEP"],
+      [record, truth(), measuring("error"), "reference block.step could not be measured"],
     ] as [any, any, any, string][]) {
-      const f = await referenceGeometryChecks(call, input, lock, true, rp);
-      expect(lines(f)[0]).toContain(why);
+      const f = await referenceGeometryChecks(call, input, lock, true, ck);
+      expect(lines(f).join("\n")).toContain(why);
       expect(f.unverified).toBe(true);
-      expect(f.checks[0]!.ok).toBe(false);
+      expect(f.checks.find((c) => c.id === "interference block.step as imported")!.ok).toBe(false);
+      expect(f.checks.find((c) => c.id === "geometry block.step")!.ok).toBe(false);
     }
+    // A failed interference reply against the true import is a hard fail, never "no overlap".
+    expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ interference: reply({ count: 0, interferences: [], unchecked: [["a", "b"]], budget_exceeded: false, truncated: false }) })))[0]).toContain("1 pair(s) not checked");
     // An import whose script lists no bodies.
     const bare = { about: {}, commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "ref-block.step", file: "block.step", step: "BLOCK" } } }] };
-    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, embedded: embeddedReferences(bare), script: bare }, record, true, replay))[0]).toContain("its import lists no bodies");
+    expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, embedded: embeddedReferences(bare), script: bare }, record, true, truth())).find((l) => l.startsWith("geometry"))).toContain("its import lists no bodies");
+  });
+
+  test("[A4] veto: the exact shape comparison — the same solid only when vol(true) = vol(live) = vol(true ∩ live) within 1e-6 of the import's volume", () => {
+    const s = (trueVolume: number, liveVolume: number, overlap: number) => shapeDifferences([{ label: "b", trueVolume, liveVolume, overlap }]);
+    expect(s(7869.026644707676, 7869.026644707674, 7869.026644707676)).toEqual([]);
+    expect(s(7869.0266, 7869.0266, 7766.9249)).toHaveLength(1); // equal volumes, different solids (the holey veto, 90° turn)
+    expect(s(1000, 1100, 1000)).toHaveLength(1); // the live body contains the import and more
+    expect(s(1000, 1000, 0)).toHaveLength(1); // moved clear of where it was
+    expect(shapeDifferences([{ label: "a", trueVolume: 1, liveVolume: 1, overlap: 1 }, { label: "b", trueVolume: 1, liveVolume: 1, overlap: 0.5 }])).toEqual(["b: shape is not the import's: it shares 0.5 of the import's 1 mm³ (the reference is 1 mm³)"]);
   });
 
   test("[A4] veto: the replay imports ONLY the reference's STEP text, in a throwaway process allowed nothing but its own temp folder, and measures what file.insert_step made; one process per binary and text (cached); no binary is an error", async () => {
@@ -458,5 +506,38 @@ describe("a reference measures what its import did", () => {
     expect(await replay(step, "block.step")).toEqual(m); // cached: no second process
     expect(log.cmds).toHaveLength(1);
     await expect(makeReferenceReplay({ resolveCli: () => undefined })(step, "block.step")).rejects.toThrow("SolidCraft is not installed");
+  });
+
+  test("[A4] veto: the true-import check runs in a throwaway process (--allow-path its own temp folder, --require-allow-path, cwd there, no --in, PATH/HOME/TMPDIR only): the embedded text imported at the identity, the design bodies and the live reference body inserted from their STEP exports; interference design × true (names mapped back) and true × live (overlap = volume ⇔ same solid); nothing is left behind; no binary is an error", async () => {
+    const log = recordingSpawn();
+    const check = makeTrueReferenceCheck({ resolveCli: () => ({ path: FAKE_SOLIDCRAFT }), manager: { spawn: log.spawn } });
+    const fake = (bodies: object[]) => `ISO-10303-21; /* fake-solidcraft ${JSON.stringify({ bodies })} */`;
+    const blockBody = { name: "block", volume: 1000, faces: 6, min: [0, 0, -2], max: [10, 10, 8] };
+    const step = fake([blockBody]);
+    const pin = Buffer.from(fake([{ name: "Body1", volume: 400, faces: 3, min: [5, 5, 0], max: [15, 15, 4] }]));
+    const r = await check({ file: "block.step", step, design: [{ label: "Body1", bytes: pin }], live: [{ label: "block", bytes: Buffer.from(step) }] });
+    expect(r.sha256).toBe(sha(step));
+    expect(r.asImported).toEqual([{ name: "block", volume: 1000, bbox: { min: [0, 0, -2], max: [10, 10, 8] }, faces: 6 }]);
+    expect(interferenceCheck("block.step", r.interference!, { asImported: true })).toMatchObject({ id: "interference block.step as imported", ok: false, measured: "Body1 overlaps block (as imported) by 100 mm³" });
+    expect(r.shape).toEqual([{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000 }]);
+    expect(shapeDifferences(r.shape)).toEqual([]);
+    // A live body that is not the import: overlap below its volume.
+    const moved = await check({ file: "block.step", step, design: [], live: [{ label: "block", bytes: Buffer.from(fake([{ ...blockBody, min: [0, 0, 0], max: [10, 10, 10] }])) }] });
+    expect(moved.interference).toBeUndefined();
+    expect(shapeDifferences(moved.shape)[0]).toContain("shares 800 of the import's 1000 mm³");
+    expect(log.cmds).toHaveLength(2); // one throwaway process per check, never cached
+    for (const [i, cmd] of log.cmds.entries()) {
+      const allow = cmd[cmd.indexOf("--allow-path") + 1]!;
+      expect(allow).toContain("anvil-truecheck-");
+      expect(cmd).toContain("--require-allow-path");
+      expect(cmd).toContain("--headless");
+      expect(cmd).not.toContain("--in");
+      expect(log.cwds[i]).toBe(allow);
+      expect(Object.keys(log.envs[i]!).filter((k) => !k.startsWith("FAKE_SC_")).sort()).toEqual(["HOME", "PATH", "SOLIDCRAFT_GPU", "TMPDIR"]);
+      expect(existsSync(allow)).toBe(false); // the folder is gone
+    }
+    // The live body count differs from the import's: said, not compared.
+    expect((await check({ file: "block.step", step, design: [], live: [] })).bodyCount).toEqual({ imported: 1, live: 0 });
+    await expect(makeTrueReferenceCheck({ resolveCli: () => undefined })({ file: "block.step", step, design: [], live: [] })).rejects.toThrow("SolidCraft is not installed");
   });
 });

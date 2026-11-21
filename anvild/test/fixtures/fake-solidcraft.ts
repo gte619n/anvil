@@ -976,9 +976,12 @@ function interference(m: Model, p: Json): Json {
       const d = max.map((v, k) => v - min[k]!);
       if (d.some((v) => v <= 1e-9)) continue;
       const part = { component: "", path: [], path_ids: [] };
+      // Two bodies with the same solids and volume (two imports of one STEP) overlap by exactly their
+      // volume, as the real 0.44.1 reports; anything else by the overlap of their bounding boxes.
+      const same = pick[i]!.volume === pick[j]!.volume && JSON.stringify([pick[i]!.solids, pick[i]!.voids]) === JSON.stringify([pick[j]!.solids, pick[j]!.voids]);
       out.push({
         a: pick[i]!.name, a_part: part, b: pick[j]!.name, b_part: part, bbox: { max, min },
-        center: min.map((v, k) => (v + max[k]!) / 2), volume_mm3: d[0]! * d[1]! * d[2]! * VOLUME_SCALE,
+        center: min.map((v, k) => (v + max[k]!) / 2), volume_mm3: (same ? pick[i]!.volume : d[0]! * d[1]! * d[2]!) * VOLUME_SCALE,
       });
     }
   }

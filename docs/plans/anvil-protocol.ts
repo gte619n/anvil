@@ -749,7 +749,7 @@ export interface CadGateResult {
   state: "pass" | "fail" | "unverified" | "concept" | "gap";
   checks: CadGateCheck[];
   warnings: string[]; // SolidCraft feature warnings, e.g. "Boolean retry"
-  needsAdoption?: "expectations" | "rules" | "ownerParams";
+  needsAdoption?: "expectations" | "rules" | "ownerParams" | "references";
   staleBuild: boolean; // measured under a different SolidCraft version
   /** Who approved the numbers the part is checked against, when an approval is in force.
    *  "agent-initial": the agent recorded them and the owner has not confirmed them (the part card
@@ -847,6 +847,8 @@ export interface CadDimensionRow {
  *  - `adopt-expectations` `part.json` does not match the lock store (a hand edit, a fresh clone).
  *  - `adopt-ownerParams`  the owner-typed dimensions in `part.json` differ from the approved ones.
  *  - `adopt-rules`        `cad/rules.json` changed (`rulesDiff` shows what).
+ *  - `adopt-references`   the approval holds no record of a reference the design imports (approved
+ *                         before records were kept): approving records the current `refs/` file.
  *  - `initial`            the agent asks to record expectations for a part that ALREADY has geometry
  *                         (or an earlier approval), so the numbers were written after it existed.
  *  - `confirm`            the owner asked to confirm numbers the agent recorded (`cad.expectations.confirm`).
@@ -870,7 +872,7 @@ export interface CadExpectationsRequestEvent extends Envelope {
   sessionId: SessionId;
   cwd: string;
   part: string;
-  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "initial" | "confirm" | "dimensions" | "release" | "plan";
+  kind: "propose" | "adopt-expectations" | "adopt-ownerParams" | "adopt-rules" | "adopt-references" | "initial" | "confirm" | "dimensions" | "release" | "plan";
   reason?: string;
   /** `dimensions` cards only: the rows the owner edits. */
   dimensions?: CadDimensionRow[];

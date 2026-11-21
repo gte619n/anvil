@@ -60,6 +60,7 @@ const TITLE: Record<CadExpectationsRequestEvent["kind"], string> = {
   "adopt-expectations": "Adopt expectations",
   "adopt-ownerParams": "Adopt dimensions",
   "adopt-rules": "Adopt manufacturing rules",
+  "adopt-references": "Approve current reference",
   initial: "Set expectations",
   confirm: "Confirm numbers",
   dimensions: "Dimensions",
@@ -71,6 +72,7 @@ const BLURB: Record<CadExpectationsRequestEvent["kind"], string> = {
   "adopt-expectations": "This part's expectations were not approved on this fleet (a fresh clone, or the file was edited). Approve to check the part against these values.",
   "adopt-ownerParams": "The dimensions recorded in part.json differ from the ones you entered.",
   "adopt-rules": "cad/rules.json changed. Approve to check every part of this repo against the new rules.",
+  "adopt-references": "Reference measurements were not recorded when this part was approved. Approve to record the current reference and check the part against it.",
   initial: "The agent asks to set what this part is checked against.",
   confirm: "These numbers were set by the agent. Approve to make them yours.",
   dimensions: "Type the real dimensions of this part. Your numbers become what it is built to and checked against.",
@@ -174,7 +176,7 @@ export function createCadCards(deps: CadCardsDeps) {
       }
       card.append(list);
     }
-    if (gate.needsAdoption) card.append(el("div", "cad-part-note", gate.needsAdoption === "rules" ? "Waiting for you to adopt the changed cad/rules.json." : `Waiting for you to adopt the ${gate.needsAdoption === "ownerParams" ? "dimensions" : "expectations"}.`));
+    if (gate.needsAdoption) card.append(el("div", "cad-part-note", gate.needsAdoption === "rules" ? "Waiting for you to adopt the changed cad/rules.json." : gate.needsAdoption === "references" ? "Waiting for you to approve the current reference (its measurements were not recorded)." : `Waiting for you to adopt the ${gate.needsAdoption === "ownerParams" ? "dimensions" : "expectations"}.`));
     const advisory = gate.checks.filter((c) => !c.hard);
     if (advisory.length || gate.warnings.length || gate.staleBuild) {
       const list = el("ul", "cad-part-advisory");

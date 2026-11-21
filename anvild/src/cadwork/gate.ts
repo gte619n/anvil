@@ -50,7 +50,7 @@ export interface GateResult {
   checks: GateCheck[];
   /** SolidCraft feature warnings, e.g. "Boolean retry". */
   warnings: string[];
-  needsAdoption?: "expectations" | "rules" | "ownerParams";
+  needsAdoption?: AdoptionKind;
   /** Measured under a different SolidCraft version than the one running. */
   staleBuild: boolean;
   /** Who approved the numbers the part is checked against (only when an approval is in force).
@@ -103,7 +103,10 @@ export interface GateInput {
 }
 
 export const MOVED_WITHOUT_APPROVAL = "expected value moved without owner approval";
-export const ADOPTION_CHECKS = { expectations: "lock.expectations", ownerParams: "lock.ownerParams", rules: "lock.rules" } as const;
+/** What a part can wait for the owner to adopt. `references`: an approval that holds no record of a
+ *  reference the design imports (refresh.ts `referenceGeometryChecks`, "approve current reference"). */
+export type AdoptionKind = "expectations" | "rules" | "ownerParams" | "references";
+export const ADOPTION_CHECKS = { expectations: "lock.expectations", ownerParams: "lock.ownerParams", rules: "lock.rules", references: "lock.references" } as const;
 
 const fmt = (v: number): string => String(Math.round(v * 1e4) / 1e4);
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(sortKeys(a ?? null)) === JSON.stringify(sortKeys(b ?? null));
@@ -157,7 +160,7 @@ function geometryChecks(target: EvaluatedExpectations, tol: { length: number; vo
 function evaluate(input: GateInput): GateResult {
   const checks: GateCheck[] = [];
   let unverified = false;
-  const adopt = new Set<"expectations" | "ownerParams" | "rules">();
+  const adopt = new Set<AdoptionKind>();
   const m = input.measurement;
   let concept = false;
   let process: string | undefined;
@@ -290,8 +293,9 @@ function evaluate(input: GateInput): GateResult {
   }
   if (input.extraChecks) checks.push(...input.extraChecks);
   if (input.extraUnverified) unverified = true;
+  if (input.extraChecks?.some((c) => c.id === ADOPTION_CHECKS.references && !c.ok)) adopt.add("references");
 
-  const needsAdoption = adopt.has("expectations") ? "expectations" : adopt.has("ownerParams") ? "ownerParams" : adopt.has("rules") ? "rules" : undefined;
+  const needsAdoption = (["expectations", "ownerParams", "rules", "references"] as const).find((k) => adopt.has(k));
   const state: GateState = input.gap ? "gap" : unverified || needsAdoption ? "unverified" : concept ? "concept" : checks.some((c) => c.hard && !c.ok) ? "fail" : "pass";
   return {
     state,
@@ -326,8 +330,8 @@ export function gateError(message: string, warnings: string[] = []): GateResult 
 }
 
 /** Every adoption a result is waiting for (a result names only the first in `needsAdoption`). */
-export function pendingAdoptions(r: GateResult): ("expectations" | "ownerParams" | "rules")[] {
-  return (["expectations", "ownerParams", "rules"] as const).filter((k) => r.checks.some((c) => c.id === ADOPTION_CHECKS[k] && !c.ok));
+export function pendingAdoptions(r: GateResult): AdoptionKind[] {
+  return (["expectations", "ownerParams", "rules", "references"] as const).filter((k) => r.checks.some((c) => c.id === ADOPTION_CHECKS[k] && !c.ok));
 }
 
 /** The failing hard checks as plain lines ("volume: expected 23335.167, measured 23422.6"). */

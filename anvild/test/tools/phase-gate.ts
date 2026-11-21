@@ -18,6 +18,12 @@
  *      JUnit check and fails on ANY skip; without it they are reported as "not run";
  *   7. prints a summary block ending in exactly `PHASE <id>: PASS` or `PHASE <id>: FAIL`. Exit 0/1.
  *
+ * TIME LIMITS: steps 3–6 each run in their own process group with a time limit (`STEP_TIMEOUTS_MS`:
+ * 45 min for the full suite and the real tools, less for the rest; `--timeout-scale <x>` or
+ * `ANVIL_GATE_TIMEOUT_SCALE` scales them, `ANVIL_GATE_TIMEOUT_MS` sets them all). A step over its
+ * limit has its whole group killed and fails "timed out". Every step's output is teed as it runs to
+ * `<os tmp>/phase-gate-logs-XXXXXX/<step>.log`; the summary prints the folder and each step's file.
+ *
  * Every step runs even after an earlier one fails, so one run reports everything that is wrong.
  *
  * NAME MATCHING: a manifest name is the test's full path inside its file — the enclosing describe
@@ -46,6 +52,8 @@ import {
   parseGateArgs,
   parseJUnit,
   phaseProblems,
+  runStep,
+  stepTimeoutMs,
   validateManifest,
   type JUnitCase,
   type PhaseTestRef,
@@ -60,7 +68,23 @@ interface Step {
   status: "pass" | "fail" | "not run";
   detail: string;
   ms?: number;
+  /** The file the step's output was teed to. */
+  log?: string;
 }
+
+/** This run's step logs (created on first use, kept after the run). */
+let logDir: string | undefined;
+let timeoutScale: number | undefined;
+const logFor = (step: string): string => join((logDir ??= mkdtempSync(join(tmpdir(), "phase-gate-logs-"))), `${step.replace(/[^A-Za-z0-9_-]+/g, "-")}.log`);
+
+/** A step's command, in its own process group, with its time limit; output teed to its log. */
+async function stepRun(step: string, cmd: string[], env: Record<string, string> = {}) {
+  const timeoutMs = stepTimeoutMs(step, timeoutScale);
+  const r = await runStep(cmd, { cwd: ANVILD, env: { ...process.env, ...env }, timeoutMs, log: logFor(step) });
+  if (r.timedOut) console.log(`\n[${step}] TIMED OUT after ${(timeoutMs / 1000).toFixed(0)}s — process group killed; output: ${r.log}`);
+  return { ...r, timeoutMs };
+}
+const timedOutDetail = (r: { timedOut: boolean; timeoutMs: number }) => (r.timedOut ? `timed out after ${(r.timeoutMs / 1000).toFixed(0)}s; ` : "");
 
 function run(cmd: string[], env: Record<string, string> = {}): { code: number; out: string; ms: number } {
   const t0 = performance.now();
@@ -74,12 +98,13 @@ const secs = (ms?: number) => (ms === undefined ? "" : ` (${(ms / 1000).toFixed(
 const tail = (out: string, n = 40) => out.trimEnd().split("\n").slice(-n).join("\n");
 
 /** Run `bun test` with the JUnit reporter on `files` (all tests when empty) and parse the report. */
-function bunTestJUnit(files: string[], env: Record<string, string> = {}): { cases: JUnitCase[]; code: number; out: string; ms: number; error?: string } {
+async function bunTestJUnit(step: string, files: string[], env: Record<string, string> = {}): Promise<{ cases: JUnitCase[]; code: number; out: string; ms: number; timedOut: boolean; timeoutMs: number; log: string; error?: string }> {
   const dir = mkdtempSync(join(tmpdir(), "phase-gate-"));
   const report = join(dir, "junit.xml");
   try {
     // "./"-prefixed so bun treats each as that exact file, not as a name filter.
-    const r = run(["bun", "test", "--reporter=junit", `--reporter-outfile=${report}`, ...files.map((f) => `./${f}`)], env);
+    const r = await stepRun(step, ["bun", "test", "--reporter=junit", `--reporter-outfile=${report}`, ...files.map((f) => `./${f}`)], env);
+    if (r.timedOut) return { cases: [], ...r, error: `timed out after ${(r.timeoutMs / 1000).toFixed(0)}s (process group killed); output: ${r.log}` };
     if (!existsSync(report)) return { cases: [], ...r, error: "bun test wrote no JUnit report" };
     try {
       return { cases: parseJUnit(readFileSync(report, "utf8")), ...r };
@@ -92,8 +117,9 @@ function bunTestJUnit(files: string[], env: Record<string, string> = {}): { case
 }
 
 /** Steps 3 and 6: run the files, then hold the report to the named tests. */
-function namedStep(name: string, refs: PhaseTestRef[], opts: { real?: boolean } = {}): Step {
-  const r = bunTestJUnit(
+async function namedStep(name: string, refs: PhaseTestRef[], opts: { real?: boolean } = {}): Promise<Step> {
+  const r = await bunTestJUnit(
+    name,
     refs.map((t) => t.file),
     opts.real ? { ANVIL_REAL_TOOLS: "1" } : {},
   );
@@ -102,18 +128,18 @@ function namedStep(name: string, refs: PhaseTestRef[], opts: { real?: boolean } 
   const problems = [...check.problems];
   if (r.error) problems.push(r.error);
   if (r.code !== 0 && problems.length === 0) problems.push(`bun test exited ${r.code}`);
-  const detail = `${check.namedOk}/${check.named} named tests ok; ${counts.passed} passed, ${counts.failed} failed, ${counts.skipped} skipped, ${counts.assertions} assertions in ${refs.length} file(s)`;
+  const detail = `${timedOutDetail(r)}${check.namedOk}/${check.named} named tests ok; ${counts.passed} passed, ${counts.failed} failed, ${counts.skipped} skipped, ${counts.assertions} assertions in ${refs.length} file(s)`;
   if (problems.length) {
     console.log(`\n[${name}] FAILED:\n  ${problems.join("\n  ")}`);
     if (r.code !== 0) console.log(`--- bun test output (tail) ---\n${tail(r.out)}`);
   }
-  return { name, status: problems.length ? "fail" : "pass", detail, ms: r.ms };
+  return { name, status: problems.length ? "fail" : "pass", detail, ms: r.ms, log: r.log };
 }
 
-function cmdStep(name: string, cmd: string[]): Step {
-  const r = run(cmd);
+async function cmdStep(name: string, cmd: string[]): Promise<Step> {
+  const r = await stepRun(name, cmd);
   if (r.code !== 0) console.log(`\n[${name}] FAILED (exit ${r.code}):\n${tail(r.out)}`);
-  return { name, status: r.code === 0 ? "pass" : "fail", detail: cmd.join(" "), ms: r.ms };
+  return { name, status: r.code === 0 ? "pass" : "fail", detail: `${timedOutDetail(r)}${cmd.join(" ")}`, ms: r.ms, log: r.log };
 }
 
 function solidcraftVersion(): string {
@@ -122,13 +148,14 @@ function solidcraftVersion(): string {
   return r.code === 0 ? r.out.trim().split("\n")[0]! : `present, but --version exited ${r.code}`;
 }
 
-function main(): number {
+async function main(): Promise<number> {
   const parsed = parseGateArgs(process.argv.slice(2));
   if (!parsed.args) {
     console.error(`${parsed.error}\n${USAGE}`);
     return 1;
   }
   const { phase: id, requireReal, allowDirty, spikeEvidence } = parsed.args;
+  timeoutScale = parsed.args.timeoutScale;
 
   let raw: unknown;
   try {
@@ -196,28 +223,29 @@ function main(): number {
     // 3. The phase's files, held to the named tests.
     const present = phase.tests.filter((t) => existsSync(join(ANVILD, t.file)));
     if (present.length === 0) steps.push({ name: "named tests", status: "fail", detail: "no test files to run" });
-    else steps.push(namedStep("named tests", present));
+    else steps.push(await namedStep("named tests", present));
 
     // 4. Whole suite + typechecks + web build.
-    const full = bunTestJUnit([]);
+    const full = await bunTestJUnit("full suite", []);
     const fc = countCases(full.cases);
     const fullOk = full.code === 0 && !full.error && fc.failed === 0 && fc.total > 0;
     if (!fullOk) console.log(`\n[full suite] FAILED (exit ${full.code})${full.error ? `: ${full.error}` : ""}\n${tail(full.out, 60)}`);
     steps.push({
       name: "full suite",
       status: fullOk ? "pass" : "fail",
-      detail: `${fc.passed} passed, ${fc.failed} failed, ${fc.skipped} skipped, ${fc.assertions} assertions`,
+      detail: `${timedOutDetail(full)}${fc.passed} passed, ${fc.failed} failed, ${fc.skipped} skipped, ${fc.assertions} assertions`,
       ms: full.ms,
+      log: full.log,
     });
-    steps.push(cmdStep("typecheck", ["bun", "run", "typecheck"]));
-    steps.push(cmdStep("typecheck:web", ["bun", "run", "typecheck:web"]));
-    steps.push(cmdStep("build:web", ["bun", "run", "build:web"]));
+    steps.push(await cmdStep("typecheck", ["bun", "run", "typecheck"]));
+    steps.push(await cmdStep("typecheck:web", ["bun", "run", "typecheck:web"]));
+    steps.push(await cmdStep("build:web", ["bun", "run", "build:web"]));
 
     // 5. Playwright — the only place these specs gate (bun test and CI do not run them).
     if (phase.playwright?.length) {
       const config = phase.playwrightConfig ?? DEFAULT_PW_CONFIG;
-      const s = cmdStep("playwright", ["bunx", "--bun", "playwright", "test", "-c", config, ...phase.playwright]);
-      steps.push({ ...s, detail: `${phase.playwright.length} spec(s), config ${config}` });
+      const s = await cmdStep("playwright", ["bunx", "--bun", "playwright", "test", "-c", config, ...phase.playwright]);
+      steps.push({ ...s, detail: `${/^timed out[^;]*; /.exec(s.detail)?.[0] ?? ""}${phase.playwright.length} spec(s), config ${config}` });
     } else steps.push({ name: "playwright", status: "not run", detail: "none listed" });
 
     // 6. Real tools.
@@ -227,7 +255,7 @@ function main(): number {
     } else if (real.length === 0) {
       steps.push({ name: "real tools", status: "not run", detail: "none listed (--require-real had nothing to run)" });
     } else {
-      steps.push(namedStep("real tools", real.filter((t) => existsSync(join(ANVILD, t.file))), { real: true }));
+      steps.push(await namedStep("real tools", real.filter((t) => existsSync(join(ANVILD, t.file))), { real: true }));
     }
   }
 
@@ -249,9 +277,10 @@ function main(): number {
   console.log(`solidcraft:  ${solidcraftVersion()}`);
   console.log(`real tools:  ${requireReal ? "required" : "not required"}`);
   console.log(`total time:  ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-  for (const s of steps) console.log(`  ${s.name.padEnd(width)}  ${s.status.toUpperCase().padEnd(7)}  ${s.detail}${secs(s.ms)}`);
+  if (logDir) console.log(`step logs:   ${logDir}`);
+  for (const s of steps) console.log(`  ${s.name.padEnd(width)}  ${s.status.toUpperCase().padEnd(7)}  ${s.detail}${secs(s.ms)}${s.log ? `  log: ${s.log}` : ""}`);
   console.log(`PHASE ${id}: ${ok ? "PASS" : "FAIL"}`);
   return ok ? 0 : 1;
 }
 
-process.exit(main());
+process.exit(await main());

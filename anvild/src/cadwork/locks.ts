@@ -56,7 +56,9 @@ export interface PartLock {
    * sha of its STEP text and every body's volume, world bounding box, face count and centre of mass.
    * Recorded by the daemon (never read from part.json) and carried into every later approval of the
    * part; the gate holds the live reference to it (refresh.ts `referenceGeometryChecks`). Absent in an
-   * approval made before this was recorded: the gate then replays the import alone (./refreplay.ts).
+   * approval made before this was recorded: the part needs adoption ("reference measurements not
+   * recorded; approve current reference"), never filled in from the current file; the owner's
+   * adopt-references card records the import replayed alone (./refreplay.ts).
    */
   references?: Record<string, ReferenceMeasure>;
   /** ISO time of the approval — the conflict rule's clock. */
