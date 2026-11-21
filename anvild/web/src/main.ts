@@ -47,6 +47,7 @@ import {
   setSessionHash,
 } from "./overlays";
 import { initPush } from "./push";
+import { initSkills, onSkills } from "./skills";
 import { initSetupTakeover } from "./setup";
 import { applySidebar, collapseSidebarForChat, initResizers, isNarrow, toggleSidebar } from "./layout";
 // The sidebar seam (session list + team board + drag-to-reorder + favicon) lives in sidebar.ts (P7
@@ -355,6 +356,7 @@ initLoops({
 // dialogs.ts directly now.
 initMcp({ sessions, activeId: () => activeId, sendAwait });
 initParts({ sendAwait });
+initSkills({ sendAwait });
 initSettings({
   sessions,
   environments,
@@ -1602,6 +1604,7 @@ function onEvent(url: string, e: ServerEvent): void {
       if (url === HUB_URL && serverSupports(srv, "auth")) {
         srv!.sock.send({ type: "auth.status" }); // claude (default)
         srv!.sock.send({ type: "auth.status", provider: "openrouter" });
+        if (serverSupports(srv, "gemini-sessions")) srv!.sock.send({ type: "auth.status", provider: "gemini" });
       }
       renderSessions(); // group headers now know this server's name
       if (document.getElementById("mcp-panel")) renderMcpPanel(); // the capability decides whether the card shows
@@ -1658,6 +1661,10 @@ function onEvent(url: string, e: ServerEvent): void {
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
       // own prompts event so it can't clobber the hub's synced library.
       if (url === HUB_URL) onPrompts(e.prompts);
+      return;
+    case "skills":
+      // The fleet skill library is hub-authoritative (it lives on the hub, members hold replicas).
+      if (url === HUB_URL) onSkills(e);
       return;
     case "model.labels":
       // Model labels are hub-authoritative (the hub resolves them from the Models API). Ignore a
@@ -2279,15 +2286,23 @@ function updateGoalChip(s: Session | undefined): void {
 $("#btn-model").addEventListener("click", () => {
   const s = activeId ? sessions.get(activeId) : undefined;
   if (!s) return;
+  // Gemini is offered only when the session's own daemon can run it (an older one would ignore it).
+  const srv = serverOf(activeId) ?? hub();
+  const offered = MODELS.filter((m) => m.id !== "gemini" || m.id === s.model || serverSupports(srv, "gemini-sessions"));
   toggleHeaderMenu(
     $("#btn-model"),
-    MODELS.map((m) => ({
+    offered.map((m) => ({
       icon: m.id === s.model ? "check" : "smart_toy",
       label: modelLabelOf(m.id),
       title: m.id === s.model ? `${modelLabelOf(m.id)} (current)` : `Switch to ${modelLabelOf(m.id)}`,
       run: () => {
         if (m.id === s.model) return;
-        sendTo(activeId, { type: "session.set_model", sessionId: activeId, model: m.id });
+        // Awaited so a refusal (Claude ↔ Gemini mid-turn) is shown instead of silently doing nothing.
+        void sendAwait(srv, { type: "session.set_model", sessionId: activeId, model: m.id, cid: newCid() }, 15_000)
+          .then((res) => {
+            if (res.type === "command.error") toast(res.message);
+          })
+          .catch(() => {});
       },
     })),
   );

@@ -8,8 +8,8 @@
  *    CLAUDE_CODE_OAUTH_TOKEN and deliberately OMITS ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN so a
  *    metered key can never leak into the agent, even if one appears in the daemon's own environment.
  *
- *  - "glm": drives the SAME Agent SDK against OpenRouter's Anthropic-compatible endpoint (its "Anthropic
- *    Skin") with the OpenRouter key, so GLM gets the full agentic tool/worktree machinery Claude uses.
+ *  - "openrouter": drives the SAME Agent SDK against OpenRouter's Anthropic-compatible endpoint (its "Anthropic
+ *    Skin") with the OpenRouter key, so GLM/Gemini get the full agentic tool/worktree machinery Claude uses.
  *    This sets ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN in the SUBPROCESS env only. The daemon's own
  *    process.env is never touched, so the §3 startup guard (which governs the daemon, not its children)
  *    is unaffected — the guard forbids Anthropic keys in the daemon; here they live only in the child,
@@ -18,7 +18,9 @@
 
 import type { AccountStore } from "../auth/accounts";
 
-export type ModelProfile = "claude" | "glm";
+/** "claude" = the Anthropic subscription; "openrouter" = any non-Claude model (GLM, Gemini) driven through
+ *  the same Agent SDK via OpenRouter's Anthropic Skin. */
+export type ModelProfile = "claude" | "openrouter";
 
 /** OpenRouter's Anthropic-compatible base URL ("Anthropic Skin"): the Agent SDK speaks its native
  *  protocol here and OpenRouter maps the `model` slug (e.g. "z-ai/glm-5.2") to the right provider. */
@@ -55,6 +57,10 @@ export function buildAgentEnv(
      *  token from here instead of `src.CLAUDE_CODE_OAUTH_TOKEN` — see `accountId` below. Absent ⇒ the
      *  pre-roster env-var path (a dev run, or a spawn that predates the roster). */
     accounts?: AccountStore;
+    /** For the "openrouter" profile: the OpenRouter slug the session runs on. When set, Claude Code's
+     *  tier aliases (opus/sonnet/haiku — used by sub-agents and the CLI's background "small fast" calls)
+     *  are pinned to it too, so a Gemini session never silently bills Anthropic models via OpenRouter. */
+    sdkModel?: string;
     /** Which roster account to spawn under; undefined resolves the roster default. PRESENT but unknown
      *  (e.g. removed mid-flight) throws rather than silently falling back — a silent swap to another
      *  subscription is exactly what this feature exists to prevent (§5.4). */
@@ -72,13 +78,20 @@ export function buildAgentEnv(
     const v = src[k];
     if (typeof v === "string" && v.length > 0) out[k] = v;
   }
-  if (profile === "glm") {
+  if (profile === "openrouter") {
     // Point the SDK at OpenRouter with the OpenRouter key as the bearer. Note we do NOT carry the Claude
-    // subscription token into a GLM spawn — that would risk auth-precedence confusion.
+    // subscription token into an OpenRouter spawn — that would risk auth-precedence confusion.
     const key = (src.OPENROUTER_API_KEY ?? "").trim();
-    if (!key) throw new Error("GLM agent profile requires OPENROUTER_API_KEY (set it in Settings → Models)");
+    if (!key) throw new Error("this model runs via OpenRouter and needs an OpenRouter key — set one in Settings → Models");
     out.ANTHROPIC_BASE_URL = OPENROUTER_ANTHROPIC_BASE_URL;
     out.ANTHROPIC_AUTH_TOKEN = key;
+    const slug = opts.sdkModel?.trim();
+    if (slug) {
+      out.ANTHROPIC_DEFAULT_OPUS_MODEL = slug;
+      out.ANTHROPIC_DEFAULT_SONNET_MODEL = slug;
+      out.ANTHROPIC_DEFAULT_HAIKU_MODEL = slug;
+      out.ANTHROPIC_SMALL_FAST_MODEL = slug;
+    }
   } else {
     // Roster-aware resolution (§4.1). An accountId that is PRESENT but unknown throws — falling back
     // would silently bill another subscription, the exact failure this feature exists to prevent.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Model, ModelTierInfo } from "@protocol";
-import { modelFamilyPrefix, sdkModelId } from "../../src/agent/models";
+import { modelFamilyPrefix, modelProfile, sdkModelId } from "../../src/agent/models";
 
 describe("sdkModelId", () => {
   test("passes the short alias through for the auto-upgrading tiers", () => {
@@ -34,5 +34,24 @@ describe("modelFamilyPrefix", () => {
     expect(modelFamilyPrefix("sonnet")).toBe("claude-sonnet-");
     expect(modelFamilyPrefix("haiku")).toBe("claude-haiku-");
     expect(modelFamilyPrefix("fable")).toBe("claude-fable-");
+  });
+});
+
+describe("gemini", () => {
+  test("runs via the OpenRouter profile on an OpenRouter slug; Claude tiers stay on the subscription", () => {
+    expect(modelProfile("gemini")).toBe("openrouter");
+    for (const m of ["opus", "sonnet", "haiku", "fable"] as const) expect(modelProfile(m)).toBe("claude");
+    expect(sdkModelId("gemini")).toBe("google/gemini-4-neon");
+  });
+
+  test("ANVIL_GEMINI_MODEL overrides the slug (adopt a new Gemini without a build)", () => {
+    const prev = process.env.ANVIL_GEMINI_MODEL;
+    process.env.ANVIL_GEMINI_MODEL = "google/gemini-5-pro";
+    try {
+      expect(sdkModelId("gemini")).toBe("google/gemini-5-pro");
+    } finally {
+      if (prev === undefined) delete process.env.ANVIL_GEMINI_MODEL;
+      else process.env.ANVIL_GEMINI_MODEL = prev;
+    }
   });
 });

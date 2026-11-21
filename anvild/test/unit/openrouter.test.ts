@@ -118,3 +118,60 @@ test("chat() honours an already-aborted signal without touching the network", as
   await expect(client.chat("m", [{ role: "user", content: "x" }])).rejects.toMatchObject({ name: "AbortError" });
   expect(spy).not.toHaveBeenCalled();
 });
+
+// ── Direct Gemini + the panel router ──
+import { PanelClient, geminiClient, GEMINI_OPENAI_URL } from "../../src/integrations/openrouter";
+
+function captureFetch(): { calls: { url: string; body: any; headers: Record<string, string> }[] } {
+  const rec = { calls: [] as { url: string; body: any; headers: Record<string, string> }[] };
+  globalThis.fetch = mock(async (url: any, init: any) => {
+    rec.calls.push({ url: String(url), body: JSON.parse(String(init.body)), headers: init.headers });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+  }) as unknown as typeof fetch;
+  return rec;
+}
+
+test("geminiClient() hits Google's OpenAI-compatible endpoint without OpenRouter-only extras", async () => {
+  const rec = captureFetch();
+  await geminiClient("g-key").chat("gemini-4-argon", [{ role: "user", content: "hi" }]);
+  expect(rec.calls[0]!.url).toBe(GEMINI_OPENAI_URL);
+  expect(rec.calls[0]!.headers.Authorization).toBe("Bearer g-key");
+  expect(rec.calls[0]!.headers["X-Title"]).toBeUndefined();
+  expect(rec.calls[0]!.body.model).toBe("gemini-4-argon");
+  expect(rec.calls[0]!.body.provider).toBeUndefined();
+});
+
+test("PanelClient sends gemini/* straight to Google when a Gemini key is set", async () => {
+  const rec = captureFetch();
+  const c = new PanelClient({ openRouter: "or-key", gemini: "g-key" }, undefined, "deepinfra");
+  await c.chat("gemini/gemini-4-argon", [{ role: "user", content: "x" }]);
+  await c.chat("z-ai/glm-5.2", [{ role: "user", content: "x" }]);
+  expect(rec.calls[0]!.url).toBe(GEMINI_OPENAI_URL);
+  expect(rec.calls[0]!.body.model).toBe("gemini-4-argon");
+  expect(rec.calls[1]!.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+  expect(rec.calls[1]!.body.provider).toEqual({ order: ["deepinfra"], allow_fallbacks: true });
+});
+
+test("PanelClient falls back to OpenRouter's google/* slug without a Gemini key", async () => {
+  const rec = captureFetch();
+  await new PanelClient({ openRouter: "or-key" }).chat("gemini/gemini-4-argon", [{ role: "user", content: "x" }]);
+  expect(rec.calls[0]!.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+  expect(rec.calls[0]!.body.model).toBe("google/gemini-4-argon");
+});
+
+test("PanelClient with only a Gemini key: usable, but OpenRouter models fail clearly", async () => {
+  captureFetch();
+  const c = new PanelClient({ gemini: "g-key" });
+  expect(c.usable).toBe(true);
+  expect(() => c.chat("z-ai/glm-5.2", [{ role: "user", content: "x" }])).toThrow(/no OpenRouter key/);
+  expect(new PanelClient({}).usable).toBe(false);
+});
+
+test("tool calls are echoed with Gemini's thought signature intact (extra_content)", async () => {
+  const toolCall = { id: "c1", type: "function", function: { name: "read_file", arguments: "{}" }, extra_content: { google: { thought_signature: "sig" } } };
+  globalThis.fetch = mock(async () =>
+    new Response(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }), { status: 200 }),
+  ) as unknown as typeof fetch;
+  const res = await geminiClient("g").complete("gemini-4-argon", [{ role: "user", content: "x" }]);
+  expect(res.toolCalls[0]!.extra_content).toEqual({ google: { thought_signature: "sig" } });
+});

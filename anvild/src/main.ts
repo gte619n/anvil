@@ -5,6 +5,7 @@ import { loadPersistedClaudeToken } from "./auth/store";
 import { AccountStore } from "./auth/accounts";
 import { seedFromEnv } from "./auth/account-mirror";
 import { loadPersistedOpenRouterKey } from "./auth/openrouter";
+import { loadPersistedGeminiKey } from "./auth/gemini";
 import { createServer, VERSION } from "./server/http";
 import { createMarkdownRenderer } from "./render/markdown-pipeline";
 import { installTimestampedConsole, recordExit, recordStart } from "./daemon/lifecycle";
@@ -21,6 +22,7 @@ loadPersistedClaudeToken();
 // the panel is enabled on startup when a key was set from the UI. It's a different provider than
 // Anthropic, so it's irrelevant to the §3 guard below.
 loadPersistedOpenRouterKey();
+loadPersistedGeminiKey();
 
 // Config must be resolved BEFORE the guard now: the degrade marker lives in the state dir and is
 // consulted between the token load above and the guard below (headless-join §4.6). Nothing in

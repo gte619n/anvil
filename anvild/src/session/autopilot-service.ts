@@ -48,8 +48,9 @@ import { readStatus, withStatus, type AnvilStatus } from "../integrations/status
 import { planAndTagProject, planAndTagTasks, planUnit, buildTodoistPrompt, verifyUnit } from "../integrations/autopilot";
 import { autoStartDecision } from "../integrations/autostart-gate";
 import { createWorktree, removeWorktree, resolveBaseSha, createReadWorktree, removeReadWorktree, pruneReadWorktrees } from "./worktree";
-import { OpenRouterClient } from "../integrations/openrouter";
+import { PanelClient } from "../integrations/openrouter";
 import { OPENROUTER_KEY } from "../auth/openrouter";
+import { GEMINI_KEY } from "../auth/gemini";
 import { runDevPipeline as executeDevPipeline } from "../pipeline/run";
 import { defaultAgent, captureGitDiff } from "../pipeline/adapters";
 import { envChecks, gitPrOpener, workUnitTaskText, pipelineStatusToUnit, adversaryStats } from "../pipeline/daemon-adapters";
@@ -1654,14 +1655,16 @@ export class AutopilotService {
     // outside the §3 subscription-auth guard). The key is read LIVE from the environment so a key set via
     // Settings → Models applies to this run without a restart. Threaded into planning with the same
     // run-level signal so a timed-out/cancelled run tears down the OpenRouter calls too. Undefined → skipped.
+    // `gemini/*` panel models go straight to Google when a Gemini key is set (PanelClient routes them).
     const openRouterKey = (process.env[OPENROUTER_KEY] ?? "").trim();
+    const panelClient = new PanelClient(
+      { openRouter: openRouterKey, gemini: process.env[GEMINI_KEY] },
+      ac.signal,
+      this.deps.adversarial.provider,
+    );
     const adversarial =
-      openRouterKey && process.env.ANVIL_ADVERSARIAL !== "0" // key present + not killed via ANVIL_ADVERSARIAL=0
-        ? {
-            enabled: true,
-            client: new OpenRouterClient(openRouterKey, ac.signal, this.deps.adversarial.provider),
-            models: this.deps.adversarial.models,
-          }
+      panelClient.usable && process.env.ANVIL_ADVERSARIAL !== "0" // a key present + not killed via ANVIL_ADVERSARIAL=0
+        ? { enabled: true, client: panelClient, models: this.deps.adversarial.models }
         : undefined;
     const envs = this.deps.envStore
       .list()

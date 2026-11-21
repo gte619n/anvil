@@ -2,6 +2,10 @@
  * Anvil wire protocol — shared contract between `anvild` (daemon) and all clients.
  *
  * Status: 0.7-draft (2026-06-23). Companion to `anvil-native-architecture.md` (§6, §8).
+ *   0.10: fleet skill library (docs/plans/2026-11-19-fleet-skills.md) — FleetSkill + `skills` event +
+ *        skill.list/save/import/update/remove/set_headless/sync, CommandInfo.source "fleet", and the
+ *        rest.skills hub→member replica push. Hub-authoritative. Additive; PROTOCOL_VERSION unchanged.
+ *        Gated by the "fleet-skills" server capability.
  *   0.9: adversarial plan review in interactive sessions — Session.adversarialReview +
  *        SessionCreateCmd.adversarialReview + session.set_adversarial_review. When a session plans
  *        (ExitPlanMode), competing OpenRouter models critique the plan before execution and the
@@ -101,7 +105,7 @@ export interface SessionScoped {
 // 1. Domain types (§5)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type Model = "opus" | "sonnet" | "haiku" | "fable";
+export type Model = "opus" | "sonnet" | "haiku" | "fable" | "gemini";
 
 /** The models a session can run on, in picker order. `label` is the human name shown in the UI;
  *  the daemon maps each `id` to the string the Agent SDK expects (see agent/models.ts). */
@@ -110,6 +114,9 @@ export const MODELS: readonly { id: Model; label: string }[] = [
   { id: "sonnet", label: "Sonnet 4.6" },
   { id: "haiku", label: "Haiku 4.5" },
   { id: "fable", label: "Fable 5" },
+  // Not a Claude tier: Google's Gemini, run through the same Agent SDK via OpenRouter (needs an
+  // OpenRouter key; gated client-side by the "gemini-sessions" capability). See agent/models.ts.
+  { id: "gemini", label: "Gemini 4 Neon" },
 ];
 /** Human label for a session's model (falls back to the raw id for forward-compat). */
 export const modelLabel = (m: Model): string => MODELS.find((x) => x.id === m)?.label ?? m;
@@ -360,7 +367,7 @@ export interface TeamPlan {
 export interface CommandInfo {
   name: string;
   description?: string; // one-line SKILL.md summary; absent for built-ins we don't have a blurb for
-  source: "builtin" | "user" | "project";
+  source: "builtin" | "user" | "project" | "fleet"; // "fleet" = the hub-synced fleet skill library
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -689,6 +696,43 @@ export interface Prompt {
 export interface PromptsEvent extends Envelope {
   type: "prompts";
   prompts: Prompt[];
+}
+/**
+ * A skill in the fleet skill library (docs/plans/2026-11-19-fleet-skills.md): a Claude Code skill
+ * (`SKILL.md` + any supporting files) authored/imported ONCE on the hub and replicated to every fleet
+ * member, so every session on every machine can invoke it as `/fleet:<name>`. Lives under the daemon
+ * state dir — never written into a project repo.
+ */
+export type FleetSkillSource =
+  | { kind: "inline" } // authored in Settings → Skills (a pasted/edited SKILL.md)
+  | { kind: "git"; url: string; ref?: string; subdir?: string } // cloned from a git repo; "Update" re-pulls it
+  | { kind: "local"; path: string }; // copied from a directory on the hub (e.g. promoted from ~/.claude/skills)
+export interface FleetSkill {
+  name: string; // directory name == the invocable `/fleet:<name>`
+  description: string; // SKILL.md frontmatter `description:` (one line)
+  source: FleetSkillSource;
+  headless: boolean; // also load into unattended runs (autopilot planning + dev pipeline), not just sessions
+  hash: string; // content hash of the skill's files
+  files: number;
+  bytes: number;
+  updatedAt: number; // epoch ms
+}
+/** Per-member replication state of the fleet skill library, as last observed by the hub. */
+export interface FleetSkillMemberSync {
+  serverId: string;
+  serverName: string;
+  inSync: boolean; // the member's library hash == the hub's
+  error?: string; // last push/check failure (unreachable, too old, …)
+  checkedAt: number; // epoch ms
+}
+/** The fleet skill library, broadcast on change and in reply to `skill.list`. Hub-authoritative: the
+ *  client ignores a member's own copy (its `role` is "replica"). `members` is hub-only. */
+export interface SkillsEvent extends Envelope {
+  type: "skills";
+  role: "hub" | "replica";
+  hash: string; // whole-library hash (what members are compared against)
+  skills: FleetSkill[];
+  members?: FleetSkillMemberSync[];
 }
 /** The concrete model a picker tier currently resolves to, as resolved from the live Anthropic Models
  *  API. Shown in Settings → Models so the user can see the *exact* model each alias (`opus`/`sonnet`/
@@ -1134,7 +1178,7 @@ export interface LapoAuthorizeEvent extends Envelope {
 /** Model-provider auth. Only "claude" is functional today (the Agent SDK is Claude-only); the field
  *  exists so the Settings → Models UI and the daemon can grow Gemini/ChatGPT entries without a
  *  protocol change. The full secret is never sent to clients — only `masked` + the connected flag. */
-export type AuthProvider = "claude" | "openrouter";
+export type AuthProvider = "claude" | "openrouter" | "gemini";
 /** Connection state for a model provider's credential — answer to `auth.status`/`auth.set`/`auth.clear`
  *  (carries cid) and broadcast (no cid) when it changes. */
 export interface AuthStatusEvent extends Envelope {
@@ -1561,6 +1605,7 @@ export interface LoopRun {
   gate?: { openedAt?: Iso8601; sentBackNote?: string };
   reason?: string; // terminal explanation (budget, no-progress, error)
   dryRun?: boolean; // a throwaway first lap (Phase 3 intake) — report only, gate verbs refuse it
+  noop?: boolean; // the run finished but produced nothing (e.g. Todoist intake with 0 new drafts) — digest skips it
   startedAt: Iso8601;
   endedAt?: Iso8601;
 }
@@ -1963,6 +2008,7 @@ export type ServerEvent =
   | PartSourcesEvent
   | PartsTestResultEvent
   | PromptsEvent
+  | SkillsEvent
   | ModelLabelsEvent
   | CadStatusEvent
   | CadDesignEvent
@@ -2437,6 +2483,41 @@ export interface PromptRemoveCmd extends Envelope, Correlated {
   id: string;
 }
 
+// Fleet skill library (docs/plans/2026-11-19-fleet-skills.md). Hub-authoritative — the UI routes
+// every skill.* command to the hub, which replicates the library to its members.
+export interface SkillListCmd extends Envelope, Correlated {
+  type: "skill.list";
+}
+export interface SkillSaveCmd extends Envelope, Correlated {
+  type: "skill.save"; // create or replace an INLINE skill from SKILL.md text
+  name: string;
+  body: string; // the full SKILL.md (frontmatter + markdown)
+  headless?: boolean; // default true on create; unchanged on replace when omitted
+}
+export interface SkillImportCmd extends Envelope, Correlated {
+  type: "skill.import"; // import one or more skills from a git URL or a directory on the hub
+  source: string; // a git URL (https/ssh/`owner/repo` GitHub shorthand) or an absolute path on the hub
+  ref?: string; // git branch/tag
+  subdir?: string; // path inside the repo/dir to import from
+  headless?: boolean; // default true
+}
+export interface SkillUpdateCmd extends Envelope, Correlated {
+  type: "skill.update"; // re-pull git/local skills from their source; omit `name` for every updatable skill
+  name?: string;
+}
+export interface SkillRemoveCmd extends Envelope, Correlated {
+  type: "skill.remove";
+  name: string;
+}
+export interface SkillSetHeadlessCmd extends Envelope, Correlated {
+  type: "skill.set_headless";
+  name: string;
+  headless: boolean;
+}
+export interface SkillSyncCmd extends Envelope, Correlated {
+  type: "skill.sync"; // hub: re-check + push the library to every member now
+}
+
 // Todoist integration (task autopilot). The token can be set in-app (todoist.connect) or
 // out-of-band (scripts/todoist.ts); these commands drive the link UI and the planner.
 export interface TodoistStatusCmd extends Envelope, Correlated {
@@ -2860,6 +2941,13 @@ export type ClientCommand =
   | PromptListCmd
   | PromptSaveCmd
   | PromptRemoveCmd
+  | SkillListCmd
+  | SkillSaveCmd
+  | SkillImportCmd
+  | SkillUpdateCmd
+  | SkillRemoveCmd
+  | SkillSetHeadlessCmd
+  | SkillSyncCmd
   | TodoistStatusCmd
   | TodoistConnectCmd
   | TodoistDisconnectCmd
@@ -2940,6 +3028,31 @@ export type ClientCommandType = ClientCommand["type"];
 // ─────────────────────────────────────────────────────────────────────────────
 
 export namespace rest {
+  /**
+   * Fleet skill library replication (docs/plans/2026-11-19-fleet-skills.md). The hub PUSHES its whole
+   * library to each member daemon's `POST /api/skills/replica`; a member answers `GET /api/skills/replica`
+   * with its current hash so the hub's periodic sweep only re-pushes a member that drifted.
+   */
+  export namespace skills {
+    export interface File {
+      path: string; // relative to the skill dir, "/"-separated, no ".." segments
+      b64: string; // file content, base64
+      mode?: number; // 0o755 for executables; default 0o644
+    }
+    export interface Bundle {
+      hubServerId: string;
+      hash: string;
+      skills: { meta: FleetSkill; files: File[] }[];
+    }
+    export interface ReplicaState {
+      ok: boolean;
+      hash?: string; // the member's library hash after (POST) / as of (GET) this call
+      role?: "hub" | "replica";
+      serverId?: string;
+      serverName?: string;
+      error?: string;
+    }
+  }
   /** POST /api/sessions/{id}/attachments  (multipart/form-data: `file`) */
   export interface UploadAttachmentResponse {
     attachment: AttachmentRef;
@@ -3416,6 +3529,7 @@ export namespace rest {
     /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
      *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
     partKeys?: Record<string, string>;
+    geminiKey?: string;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;
@@ -3459,6 +3573,7 @@ export namespace rest {
     /** Part-source keys (Phase C5): env-file name → value, e.g. `MOUSER_API_KEY`. Present keys
      *  overwrite; absent ones are left alone. Ignored by a daemon without the feature. */
     partKeys?: Record<string, string>;
+    geminiKey?: string;
     /** Optional roster carried on a credential push (§7.3). Absent from an older hub → today's
      *  behaviour exactly; ignored by an older joiner. */
     accounts?: RosterPush;

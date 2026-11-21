@@ -228,6 +228,8 @@ const browseServer = (): Server => servers.get(browse.serverUrl) ?? hub();
 // [WEB2-8] Modal focus management: remember the element that opened the dialog, move focus into it,
 // trap Tab inside it (wrap last → first, Shift+Tab first → last), and restore focus on close.
 let modalRestoreFocus: HTMLElement | null = null;
+/** Teardown hook of the mounted modal (see showModal's onClose). */
+let modalOnClose: (() => void) | null = null;
 const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
 function trapModalFocus(el: HTMLElement, box: HTMLElement): void {
   box.tabIndex = -1; // focusable fallback so a dialog with no interactive elements still takes focus
@@ -252,7 +254,12 @@ function trapModalFocus(el: HTMLElement, box: HTMLElement): void {
 
 /** Mount a modal (replaces any current one in #modal-root) and register it on the back-stack so
  *  Back/Cancel dismisses it. Swapping one modal's contents for another reuses the same layer. */
-export function showModal(el: HTMLElement): void {
+export function showModal(el: HTMLElement, onClose?: () => void): void {
+  // The previous modal's close hook fires on an in-place swap too, not just on Back/closeModal — the
+  // CAD viewer relies on it to release its WebGL context however it's dismissed.
+  const prevOnClose = modalOnClose;
+  modalOnClose = onClose ?? null;
+  prevOnClose?.();
   // [WEB2-8] Remember the opener only for a genuinely new modal layer — an in-place content swap
   // keeps the ORIGINAL opener, so closing the swapped dialog still restores where the user was.
   if (!overlayOpen("modal")) modalRestoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -270,6 +277,9 @@ export function showModal(el: HTMLElement): void {
 /** Tear down the modal (DOM/state only). Reached via Back (popstate) or closeModal(). */
 function closeModalDom(): void {
   onDirs = null;
+  const onClose = modalOnClose;
+  modalOnClose = null;
+  onClose?.();
   destroyModalSelects(); // drop Tom Select instances (and their document listeners) before the DOM goes
   $("#modal-root").innerHTML = "";
   modalRestoreFocus?.focus(); // [WEB2-8] hand focus back to the dialog's opener (no-op if it's gone)

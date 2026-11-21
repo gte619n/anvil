@@ -11,7 +11,7 @@
  * never fail because a third-party API hiccuped.
  */
 import { extractJson } from "./json";
-import type { OpenRouterClient, OpenRouterMessage } from "./openrouter";
+import type { ChatClient, OpenRouterMessage } from "./openrouter";
 import { REPO_TOOLS, executeRepoTool } from "./repo-tools";
 
 // A critic runs at most this many tool rounds before it's asked to commit to a verdict — a backstop so a
@@ -79,7 +79,7 @@ function parseCritique(model: string, content: string): AdversarialCritique {
  * round cap forces a verdict). Without `repoRoot`, it's a single plan-only completion.
  */
 async function runCritic(
-  client: OpenRouterClient,
+  client: ChatClient,
   model: string,
   input: { title: string; rationale: string; plan: string },
   repoRoot?: string,
@@ -108,7 +108,7 @@ async function runCritic(
 /** Run one model's critique. Never throws — failures come back as a critique with `error` set. A model
  *  that can't do tool-calling falls back to reviewing the plan text alone so it still gets a vote. */
 async function critiqueOne(
-  client: OpenRouterClient,
+  client: ChatClient,
   model: string,
   input: { title: string; rationale: string; plan: string },
   repoRoot?: string,
@@ -137,7 +137,7 @@ async function critiqueOne(
  */
 export async function reviewPlan(
   input: { title: string; rationale: string; plan: string },
-  deps: { client: OpenRouterClient; models: string[] },
+  deps: { client: ChatClient; models: string[] },
   // signal is honoured inside the client (it carries the run-level abort from construction); repoRoot,
   // when present, switches critics into agentic (codebase-reading) mode.
   opts: { signal?: AbortSignal; repoRoot?: string } = {},

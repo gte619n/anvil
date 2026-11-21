@@ -1,6 +1,7 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { buildAgentEnv } from "./env";
 import { claudeCliOptions } from "./cli";
+import { headlessSkillOptions } from "./skills";
 import { makePipelineGuardHook } from "./pipeline-guard";
 import type { ModelSpec } from "./model-roster";
 import type { AccountStore } from "../auth/accounts";
@@ -55,6 +56,9 @@ export async function runAgentQuery(
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
+      // Fleet skills flagged "headless" (Settings → Skills), as a skills-only plugin — loads no on-disk
+      // settings/permission rules, so `settingSources: []` above still holds. (fleet-skills spec)
+      ...headlessSkillOptions(),
       // [SEC-H4] Unattended runs have no human to prompt, so gate EVERY tool through the danger list
       // and hard-deny anything it flags. Write phases (readonly:false) otherwise ran a third-party
       // model with Write/Edit/Bash and no backstop; readonly phases keep this too (cheap, and reads
@@ -67,17 +71,25 @@ export async function runAgentQuery(
       abortController: ac,
       // Built per-call from the model's profile so the right provider/token drives this spawn, and so a
       // key set/reset via the UI reaches the next run without a daemon restart.
-      env: buildAgentEnv({ profile: opts.model.profile, accounts: opts.accounts, accountId: opts.accountId }),
+      env: buildAgentEnv({
+        profile: opts.model.profile,
+        // Pin sub-agent/background tiers to the same non-Claude model (no stray Claude calls via OpenRouter).
+        ...(opts.model.profile === "openrouter" ? { sdkModel: opts.model.sdkModel } : {}),
+        accounts: opts.accounts,
+        accountId: opts.accountId,
+      }),
     },
   });
 
   let text = "";
+  let lastText = "";
   let plan: string | undefined;
   for await (const raw of q) {
     const msg = raw as { type?: string; message?: { content?: unknown[] }; result?: unknown };
     if (msg.type === "assistant" && Array.isArray(msg.message?.content)) {
-      for (const block of msg.message.content as { type?: string; name?: string; input?: Record<string, unknown> }[]) {
-        if (block.type === "tool_use" && block.name === "ExitPlanMode") {
+      for (const block of msg.message.content as { type?: string; name?: string; text?: string; input?: Record<string, unknown> }[]) {
+        if (block.type === "text" && block.text?.trim()) lastText = block.text;
+        else if (block.type === "tool_use" && block.name === "ExitPlanMode") {
           const p = block.input?.plan;
           if (typeof p === "string" && p.trim()) plan = p.trim();
         } else if (block.type === "tool_use" && block.name && opts.onStep) {
@@ -87,7 +99,9 @@ export async function runAgentQuery(
     }
     if (msg.type === "result" && typeof msg.result === "string") text = msg.result;
   }
-  return { text: text.trim(), ...(plan ? { plan } : {}) };
+  // Gemini (via OpenRouter) ends a turn with a thinking-only assistant message, so the SDK's `result`
+  // comes back "" even though the model answered — fall back to the last text it actually sent.
+  return { text: (text.trim() || lastText).trim(), ...(plan ? { plan } : {}) };
 }
 
 /** Best-effort one-liner for what a tool call is targeting (a path/pattern), for progress streaming. */

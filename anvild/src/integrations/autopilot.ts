@@ -2,6 +2,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { AutopilotEffort, Model } from "@protocol";
 import { buildAgentEnv } from "../agent/env";
 import { claudeCliOptions } from "../agent/cli";
+import { headlessSkillOptions } from "../agent/skills";
 import type { AccountStore } from "../auth/accounts";
 import { makePipelineGuardHook } from "../agent/pipeline-guard";
 import type { QueryLike } from "../agent/query";
@@ -16,7 +17,7 @@ import { extractJson } from "./json";
 import { parseIntakeVerdict, type IntakeVerdict } from "./autostart-gate";
 import { parseVerdict, type Verdict } from "./autopilot-plans";
 import { reviewPlan, formatReview, type AdversarialReview } from "./adversarial";
-import type { OpenRouterClient } from "./openrouter";
+import type { ChatClient } from "./openrouter";
 import type { WorkUnit, WorkUnitStore } from "./workunit";
 
 /**
@@ -47,7 +48,7 @@ export interface PlannedUnit extends ProposedUnit {
  *  entirely (the feature is inert without an OpenRouter key), so every path stays backward-compatible. */
 export interface AdversarialOpts {
   enabled: boolean;
-  client: OpenRouterClient;
+  client: ChatClient;
   models: string[];
 }
 
@@ -91,6 +92,9 @@ async function runQuery(
       // plan mode = reads/greps allowed, edits/writes blocked → safe headless inspection.
       permissionMode: opts.readonly ? "plan" : "default",
       settingSources: [], // the daemon is the authority; don't load ambient Claude Code config
+      // Fleet skills flagged "headless" (Settings → Skills), as a skills-only plugin — loads no on-disk
+      // settings/permission rules, so `settingSources: []` above still holds. (fleet-skills spec)
+      ...headlessSkillOptions(),
       // A headless run has no human to answer a permission "ask", and in plan mode the model
       // delivers its plan through an `ExitPlanMode` tool call — an approval-gated op. With no
       // PreToolUse hook (and no canUseTool), that ask has no responder and the query never reaches

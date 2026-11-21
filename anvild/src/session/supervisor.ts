@@ -14,6 +14,9 @@ import {
   type EnvironmentsEvent,
   type EnvironmentValidation,
   type PromptsEvent,
+  type SkillsEvent,
+  type FleetSkill,
+  type FleetSkillMemberSync,
   type ModelLabelsEvent,
   type ClaudeCliInfo,
   type ClaudeCliStatusEvent,
@@ -79,7 +82,8 @@ import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWork
 import { AgentDriver, type QueryFn, type TurnUsage } from "../agent/driver";
 import { setManagedCliPath } from "../agent/cli";
 import * as claudeCli from "../daemon/claude-cli";
-import { skillPlugins } from "../agent/skills";
+import { refreshHeadlessSkills, setFleetSkillsDir, skillPlugins } from "../agent/skills";
+import { FleetSkillStore } from "../skills/fleet-store";
 import type { PlanProposedHook } from "../agent/permissions";
 import { buildDefaultToolsServer, DEFAULT_MCP_SERVER_NAME, DEFAULT_TOOL_IDS, type ConciergeFleetOps } from "../agent/default-tools";
 import { repoOp, type RepoRequest, type RepoResult } from "../fleet/repo-access";
@@ -87,6 +91,7 @@ import { TEAM_MCP_SERVER_NAME, TEAM_TOOL_IDS } from "../agent/team-tools";
 import { MEMBER_MCP_SERVER_NAME, MEMBER_TOOL_IDS } from "../agent/member-tools";
 import { PLANNING_MCP_SERVER_NAME, PLANNING_TOOL_IDS } from "../agent/planning-tools";
 import { buildAgentEnv, NO_CLAUDE_TOKEN_ERROR } from "../agent/env";
+import { modelProfile, sdkModelId } from "../agent/models";
 import { fetchModelCatalog, resolveModelCatalog } from "../agent/model-catalog";
 import { ModelLabelStore } from "../models/store";
 import { CLAUDE_TOKEN_KEY } from "../auth/store";
@@ -125,7 +130,8 @@ import { claudeAuthStatus, clearClaudeToken, setClaudeToken } from "../auth/stor
 import { AccountStore, tokenFingerprint } from "../auth/accounts";
 import type { PairedHubStore } from "../server/pairing";
 import { OPENROUTER_KEY, clearOpenRouterKey, openRouterAuthStatus, setOpenRouterKey } from "../auth/openrouter";
-import { OpenRouterClient } from "../integrations/openrouter";
+import { GEMINI_KEY, clearGeminiKey, geminiAuthStatus, setGeminiKey } from "../auth/gemini";
+import { PanelClient } from "../integrations/openrouter";
 import { reviewPlan, formatReview } from "../integrations/adversarial";
 import type { PipelineOutcome } from "../pipeline/orchestrator";
 import { AttachmentStore } from "../attach/store";
@@ -211,6 +217,11 @@ export interface SupervisorConfig {
   mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number; browser?: McpIntegrationServiceDeps["browser"] };
   /** Test seams for the part sources (Phase C5; "part-sources" feature): fake fetch, base URLs, … */
   parts?: Omit<Partial<PartsServiceDeps>, "envFile" | "stateDir" | "onKeysChanged">;
+  /** Fleet skill library hooks (docs/plans/2026-11-19-fleet-skills.md), defined in http.ts where the
+   *  FleetStore lives: replicate after a hub-side change, and report each member's last-seen sync state
+   *  for the `skills` event. Omitted in unit tests / on a leaf. */
+  onSkillsChanged?: () => void;
+  skillMembers?: () => FleetSkillMemberSync[];
 }
 
 /**
@@ -256,6 +267,11 @@ export class Supervisor {
    *  daemon restart. `s` resolves the spawn's Claude account (multi-account §4.1); omitted for
    *  short-lived utility spawns (icon/branch-kind), which use the roster default. */
   private agentEnv(s?: Session, opts: { requireToken?: boolean } = {}): Record<string, string> {
+    // A Gemini session runs via OpenRouter (no Claude account involved). The terminal (requireToken:false)
+    // stays on the Claude env so a missing OpenRouter key can't take the shell away.
+    if (s && opts.requireToken !== false && modelProfile(s.data.model ?? "opus") === "openrouter") {
+      return buildAgentEnv({ profile: "openrouter", sdkModel: sdkModelId(s.data.model ?? "opus") });
+    }
     return buildAgentEnv({ accounts: this.accounts, ...(s?.data.accountId ? { accountId: s.data.accountId } : {}), ...opts });
   }
   /** Same allow-list, but tolerant of a missing Claude token — for the session TERMINAL, which must keep
@@ -292,6 +308,8 @@ export class Supervisor {
   private readonly rateLimits: RateLimitTracker;
   private readonly envStore: EnvironmentStore;
   private readonly promptStore: PromptStore;
+  /** The fleet skill library (hub-authored, replicated to members). */
+  readonly skillStore: FleetSkillStore;
   private readonly updateState: UpdateStateStore;
   /** Live model-tier labels (hub-refreshed from the Models API); empty until the first refresh lands. */
   private readonly modelLabels: ModelLabelStore;
@@ -343,6 +361,7 @@ export class Supervisor {
   readonly accounts: AccountStore;
   private readonly pairedHub?: PairedHubStore;
   private readonly onRosterChanged?: (reason: string) => void;
+  private readonly skillHooks: Pick<SupervisorConfig, "onSkillsChanged" | "skillMembers">;
   private readonly envFile?: string;
   /** Auto-degrade on credential failure (§4.6). Assigned in the constructor — `stateDir` isn't known
    *  at field-initializer time. Also the read model for "is this machine degraded?" everywhere else. */
@@ -363,6 +382,7 @@ export class Supervisor {
     this.accounts = cfg.accounts ?? new AccountStore(cfg.stateDir);
     this.pairedHub = cfg.pairedHub;
     this.onRosterChanged = cfg.onRosterChanged;
+    this.skillHooks = { onSkillsChanged: cfg.onSkillsChanged, skillMembers: cfg.skillMembers };
     this.envFile = cfg.envFile;
     this.fleetOps = cfg.fleet;
     // `(this as …)` — the field is `readonly` for every reader but must be assigned here, after
@@ -468,6 +488,9 @@ export class Supervisor {
       handoffCreate: (a) => this.handoffCreate(a),
     });
     this.promptStore = new PromptStore(cfg.stateDir);
+    this.skillStore = new FleetSkillStore(cfg.stateDir);
+    setFleetSkillsDir(this.skillStore.skillsDir);
+    this.refreshHeadless();
     this.updateState = new UpdateStateStore(cfg.stateDir);
     this.modelLabels = new ModelLabelStore(cfg.stateDir);
     this.integrations = new IntegrationStore(cfg.stateDir);
@@ -859,6 +882,87 @@ export class Supervisor {
     this.registry.toAll(this.promptsEvent());
   }
 
+  // ── Fleet skill library (docs/plans/2026-11-19-fleet-skills.md) ──────────────────────────────
+  skillsEvent(): SkillsEvent {
+    const members = this.skillHooks.skillMembers?.();
+    return {
+      v: PROTOCOL_VERSION,
+      type: "skills",
+      ts: now(),
+      role: this.skillStore.role(),
+      hash: this.skillStore.hash(),
+      skills: this.skillStore.list(),
+      ...(members && this.skillStore.role() === "hub" ? { members } : {}),
+    };
+  }
+  /** Re-broadcast the library (e.g. after a member's sync state changed). */
+  broadcastSkills(): void {
+    this.registry.toAll(this.skillsEvent());
+  }
+  saveSkill(name: string, body: string, headless?: boolean): FleetSkill {
+    return this.skillMutation(() => this.skillStore.saveInline(name.trim(), body, headless));
+  }
+  async importSkills(source: string, opts: { ref?: string; subdir?: string; headless?: boolean }): Promise<FleetSkill[]> {
+    return this.skillMutation(() => this.skillStore.import(source, opts));
+  }
+  async updateSkills(name?: string): Promise<{ changed: string[]; errors: string[] }> {
+    return this.skillMutation(() => this.skillStore.update(name));
+  }
+  removeSkill(name: string): void {
+    this.skillMutation(() => this.skillStore.remove(name));
+  }
+  setSkillHeadless(name: string, headless: boolean): void {
+    this.skillMutation(() => this.skillStore.setHeadless(name, headless));
+  }
+  /** A hub pushed its library to this member: adopt it, then refresh like any local change (minus the
+   *  re-replication — a replica has no members of its own to push to). */
+  adoptSkillReplica(bundle: Parameters<FleetSkillStore["adoptReplica"]>[0]): void {
+    const before = this.skillStore.hash();
+    this.skillStore.adoptReplica(bundle);
+    if (this.skillStore.hash() !== before) this.afterSkillsChanged(false);
+  }
+
+  /** Run a hub-side library write; a store error becomes a BadCommand (shown to the user), success
+   *  refreshes the headless plugin, broadcasts, replicates, and recycles idle drivers. */
+  private skillMutation<T>(fn: () => T): T;
+  private skillMutation<T>(fn: () => Promise<T>): Promise<T>;
+  private skillMutation<T>(fn: () => T | Promise<T>): T | Promise<T> {
+    const fail = (e: unknown): never => {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    };
+    let out: T | Promise<T>;
+    try {
+      out = fn();
+    } catch (e) {
+      return fail(e);
+    }
+    if (out instanceof Promise) {
+      return out.then(
+        (v) => {
+          this.afterSkillsChanged(true);
+          return v;
+        },
+        fail,
+      );
+    }
+    this.afterSkillsChanged(true);
+    return out;
+  }
+
+  private afterSkillsChanged(replicate: boolean): void {
+    this.refreshHeadless();
+    this.broadcastSkills();
+    if (replicate) this.skillHooks.onSkillsChanged?.();
+    // A live SDK query discovered its skills at init, so an IDLE session would otherwise keep the old
+    // set until a restart. Drop idle drivers — the next prompt resumes the same conversation with the
+    // new library (same mechanism as a credential change); sessions mid-turn pick it up next time.
+    for (const [id] of [...this.drivers]) void this.restartDriverForNewToken(id);
+  }
+
+  private refreshHeadless(): void {
+    refreshHeadlessSkills({ stateDir: this.stateDir, fleetSkillsDir: this.skillStore.skillsDir, names: this.skillStore.headlessNames() });
+  }
+
   // ── Integrations (Todoist + lapo) — delegated to IntegrationsFacade (P7 extraction) ──────────────
   todoistStatusEvent(cid?: string): TodoistStatusEvent {
     return this.integrationsFacade.todoistStatusEvent(cid);
@@ -1105,11 +1209,13 @@ export class Supervisor {
   }
 
   // ── Model-provider auth (Settings → Models) ──────────
-  // Two providers share this surface: "claude" (the subscription OAuth token driving the Agent SDK) and
-  // "openrouter" (the metered key powering the adversarial planning panel). Each has its own env-file-
+  // Three providers share this surface: "claude" (the subscription OAuth token driving the Agent SDK),
+  // "openrouter" (the metered key powering the adversarial panel + GLM/Gemini agents) and "gemini" (a
+  // Google key for calling Gemini directly from the panel). Each has its own env-file-
   // backed store; the OpenRouter key is deliberately outside the §3 metered-key guard (different provider).
   private authStatusEvent(provider: AuthProvider, cid?: string): AuthStatusEvent {
-    const status = provider === "openrouter" ? openRouterAuthStatus() : claudeAuthStatus();
+    const status =
+      provider === "openrouter" ? openRouterAuthStatus() : provider === "gemini" ? geminiAuthStatus() : claudeAuthStatus();
     return { v: PROTOCOL_VERSION, type: "auth.status", ts: now(), ...(cid ? { cid } : {}), ...status };
   }
   /** Current credential state for a provider's Models card (defaults to Claude for back-compat). */
@@ -1121,6 +1227,7 @@ export class Supervisor {
   setAuthToken(provider: AuthProvider, token: string, cid?: string): AuthStatusEvent {
     try {
       if (provider === "openrouter") setOpenRouterKey(token);
+      else if (provider === "gemini") setGeminiKey(token);
       else setClaudeToken(token);
     } catch (e) {
       throw new BadCommand(e instanceof Error ? e.message : String(e));
@@ -1131,6 +1238,7 @@ export class Supervisor {
   /** Remove a provider's token from the daemon + env file. */
   clearAuthToken(provider: AuthProvider, cid?: string): AuthStatusEvent {
     if (provider === "openrouter") clearOpenRouterKey();
+    else if (provider === "gemini") clearGeminiKey();
     else clearClaudeToken();
     this.registry.toAll(this.authStatusEvent(provider));
     return this.authStatusEvent(provider, cid);
@@ -2023,7 +2131,7 @@ export class Supervisor {
         isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser ? HUMAN_TOOL_IDS : undefined,
         this.planReviewer(s),
         this.sessionQueryFn, // queryFn — the SDK default unless a test injected one
-        skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir }),
+        skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir, fleetSkillsDir: this.skillStore.skillsDir }),
         (commands) => this.onSessionCommands(id, commands),
         (err) => this.onTurnError(err),
         (met, goal, unmet) => this.onGoalResolved(id, met, goal, unmet),
@@ -2285,12 +2393,21 @@ export class Supervisor {
     void this.apns.notify(payload);
   }
 
-  setModel(id: string, model: Model): void {
+  async setModel(id: string, model: Model): Promise<void> {
     if (!isModel(model)) return; // ignore an unknown model rather than pass junk to the SDK
     const s = this.require(id);
+    const crossProvider = modelProfile(s.data.model ?? "opus") !== modelProfile(model);
+    if (crossProvider) {
+      // Claude ↔ Gemini changes the provider + credential, which a running query() holds for life: drop
+      // the driver so the next turn respawns with the new env and RESUMES the same conversation (verified
+      // both directions). Refused mid-turn, since tearing down a live turn would lose its work.
+      if (!(await this.restartDriverForNewToken(id))) {
+        throw new BadCommand("finish or stop the current turn before switching between Claude and Gemini");
+      }
+    }
     s.data.model = model;
     s.data.lastActivityAt = now();
-    void this.drivers.get(id)?.setModel(model);
+    if (!crossProvider) void this.drivers.get(id)?.setModel(model);
     this.persist();
     this.broadcastUpdated(s.data);
   }
@@ -2339,10 +2456,13 @@ export class Supervisor {
   private planReviewer(s: Session): PlanProposedHook {
     return async (plan: string) => {
       if (!s.data.adversarialReview || !plan.trim()) return; // not opted in / nothing to review
-      const key = (process.env[OPENROUTER_KEY] ?? "").trim();
-      if (!key || process.env.ANVIL_ADVERSARIAL === "0" || !this.adversarial.models.length) return;
+      const client = new PanelClient(
+        { openRouter: process.env[OPENROUTER_KEY], gemini: process.env[GEMINI_KEY] },
+        undefined,
+        this.adversarial.provider,
+      );
+      if (!client.usable || process.env.ANVIL_ADVERSARIAL === "0" || !this.adversarial.models.length) return;
       try {
-        const client = new OpenRouterClient(key, undefined, this.adversarial.provider);
         const review = await reviewPlan(
           { title: s.data.title, rationale: "Interactive session — plan review before execution.", plan },
           { client, models: this.adversarial.models },

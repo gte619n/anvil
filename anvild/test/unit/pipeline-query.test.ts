@@ -65,3 +65,24 @@ test("an already-aborted signal is bridged to the SDK's AbortController", async 
   const ac = cap.opts().abortController as AbortController;
   expect(ac.signal.aborted).toBe(true);
 });
+
+test("an empty SDK result falls back to the model's last text (Gemini ends on a thinking-only message)", async () => {
+  process.env.OPENROUTER_API_KEY = "sk-or-x";
+  const fn: QueryLike = () => ({
+    async *[Symbol.asyncIterator]() {
+      yield { type: "assistant", message: { content: [{ type: "text", text: "value = 4127" }] } };
+      yield { type: "assistant", message: { content: [{ type: "redacted_thinking", data: "…" }] } };
+      yield { type: "result", result: "" };
+    },
+  });
+  const gemini = { id: "gemini" as const, profile: "openrouter" as const, sdkModel: "google/gemini-4-neon", label: "Gemini" };
+  expect((await runAgentQuery("x", { model: gemini, queryFn: fn })).text).toBe("value = 4127");
+});
+
+test("an OpenRouter spec pins the CLI's tier aliases to its own slug", async () => {
+  process.env.OPENROUTER_API_KEY = "sk-or-x";
+  const cap = captureQuery();
+  await runAgentQuery("x", { model: GLM, queryFn: cap.fn });
+  expect(cap.opts().env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe(GLM.sdkModel);
+  expect(cap.opts().env.ANTHROPIC_BASE_URL).toBe(OPENROUTER_ANTHROPIC_BASE_URL);
+});

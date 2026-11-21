@@ -40,16 +40,25 @@ test("an explicit CLAUDE_CODE_OAUTH_SCOPES in the daemon env overrides the defau
   expect(env.CLAUDE_CODE_OAUTH_SCOPES).toBe("user:inference");
 });
 
-test("glm profile points the SDK at OpenRouter with the OpenRouter key and drops the Claude token", () => {
-  const env = buildAgentEnv({ profile: "glm", src: DAEMON_ENV });
+test("openrouter profile points the SDK at OpenRouter with the OpenRouter key and drops the Claude token", () => {
+  const env = buildAgentEnv({ profile: "openrouter", src: DAEMON_ENV });
   expect(env.ANTHROPIC_BASE_URL).toBe(OPENROUTER_ANTHROPIC_BASE_URL);
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe("sk-or-v1-key"); // OpenRouter key as bearer, NOT a metered Anthropic key
   expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined(); // no auth-precedence confusion
   expect(env.PATH).toBe("/usr/bin");
 });
 
-test("glm profile refuses to build without an OpenRouter key", () => {
-  expect(() => buildAgentEnv({ profile: "glm", src: { PATH: "/usr/bin" } })).toThrow(/OPENROUTER_API_KEY/);
+test("openrouter profile refuses to build without an OpenRouter key", () => {
+  expect(() => buildAgentEnv({ profile: "openrouter", src: { PATH: "/usr/bin" } })).toThrow(/OpenRouter key/);
+});
+
+test("openrouter profile pins Claude Code's tier aliases to the session's slug", () => {
+  const env = buildAgentEnv({ profile: "openrouter", sdkModel: "google/gemini-4-neon", src: DAEMON_ENV });
+  for (const k of ["ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"]) {
+    expect(env[k]).toBe("google/gemini-4-neon"); // sub-agents + background calls stay on Gemini
+  }
+  // Without a slug (the pipeline's GLM spawns), nothing is pinned — unchanged behaviour.
+  expect(buildAgentEnv({ profile: "openrouter", src: DAEMON_ENV }).ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
 });
 
 test("defaults to the claude profile (backward compatible with the no-arg call)", () => {
@@ -62,7 +71,7 @@ test("building a GLM child env does not disturb the daemon's §3 auth state", ()
   // buildAgentEnv is pure — it reads `src` and returns a fresh object, mutating nothing. So the daemon's
   // own env still satisfies the guard (OAuth token present, no Anthropic key) even though the child got one.
   const before = { ...DAEMON_ENV };
-  buildAgentEnv({ profile: "glm", src: DAEMON_ENV });
+  buildAgentEnv({ profile: "openrouter", src: DAEMON_ENV });
   expect(DAEMON_ENV).toEqual(before); // src untouched
   // A daemon env with the OAuth token and no ANTHROPIC_* passes the guard; the child's ANTHROPIC_AUTH_TOKEN
   // lives only in the returned object, never in what the guard inspects.
@@ -100,7 +109,7 @@ test("no store at all falls back to the env var (dev run, pre-migration)", () =>
 test("the glm profile still carries no Claude token even with a roster", () => {
   const store = new AccountStore(mkdtempSync(join(tmpdir(), "anvil-env-")));
   store.add("work", "sk-ant-oat01-workworkwork-1111");
-  const env = buildAgentEnv({ accounts: store, profile: "glm", src: { OPENROUTER_API_KEY: "sk-or-x" } });
+  const env = buildAgentEnv({ accounts: store, profile: "openrouter", src: { OPENROUTER_API_KEY: "sk-or-x" } });
   expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   expect(env.ANTHROPIC_AUTH_TOKEN).toBe("sk-or-x");
 });
@@ -114,7 +123,7 @@ test("requireToken:false still yields a shell env on a tokenless box", () => {
 
 test("the roster is exactly two decorrelated models on one execution path", () => {
   expect(CLAUDE.profile).toBe("claude");
-  expect(GLM.profile).toBe("glm");
+  expect(GLM.profile).toBe("openrouter");
   expect(CLAUDE.id).not.toBe(GLM.id);
 });
 

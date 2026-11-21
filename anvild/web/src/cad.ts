@@ -195,6 +195,17 @@ function showError(area: HTMLElement, reason: string, downloadUrl: string, name:
   );
 }
 
+/** three throws "Error creating WebGL context." only when even a bare getContext("webgl2") is null.
+ *  That is NOT the live-context cap (Chrome evicts the oldest context and still succeeds); it means
+ *  WebGL is blocked/unavailable for the whole page process — on Android WebView typically after a GPU
+ *  reset, and it sticks until the app process restarts. Say so, with the browser's own reason. */
+function webglUnavailableMessage(reason: string, err: unknown): string {
+  const base = err instanceof Error ? err.message : String(err);
+  let msg = `3D view unavailable: ${reason || base}`;
+  if (isAndroidApp) msg += " — WebGL is blocked in this app session. Fully close and relaunch Anvil to restore it.";
+  return msg;
+}
+
 /** Toolbar + HUD wiring. All buttons are delegated off the wrap so we add one listener. */
 function wireChrome(chrome: Chrome): void {
   chrome.wrap.addEventListener("click", (e) => {
@@ -251,7 +262,11 @@ export function openCadViewer(path: string, io: CadIo): void {
 
   wireChrome(chrome);
 
-  showModal(chrome.wrap);
+  // Back-button / swapped-modal dismissals bypass closeViewer — release the GL context there too.
+  const opened = active;
+  showModal(chrome.wrap, () => {
+    if (active === opened) releaseActiveViewer();
+  });
 
   if (!kind) {
     showError(chrome.statusArea, `Unrecognised CAD format (.${extOf(path) || "?"}).`, io.fileUrl(path), name);
@@ -420,14 +435,42 @@ function toggleExplode(chrome: Chrome): void {
 
 // ── 3D setup + load ─────────────────────────────────────────────────────────────────────────────
 async function init3d(path: string, kind: CadKind, chrome: Chrome, io: CadIo): Promise<void> {
+  const mine = active;
   const THREE = await import("three");
   const { OrbitControls } = await import("three/examples/jsm/controls/OrbitControls.js");
+  // Closed or replaced while three was loading: creating a renderer now would orphan its context.
+  if (!mine || active !== mine) return;
 
   const stage = chrome.stage;
   const width = stage.clientWidth || window.innerWidth;
   const height = stage.clientHeight || window.innerHeight;
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  // Own the canvas so we can hear WHY context creation failed — three only console.logs the browser's
+  // statusMessage and throws a generic "Error creating WebGL context."
+  const canvas = document.createElement("canvas");
+  let glReason = "";
+  canvas.addEventListener("webglcontextcreationerror", (e) => {
+    glReason = (e as WebGLContextEvent).statusMessage || glReason;
+  });
+  let renderer: WebGLRenderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  } catch (err) {
+    throw new Error(webglUnavailableMessage(glReason, err));
+  }
+  // A real (GPU-reset) loss — ours from forceContextLoss fires after `active` moved on, so it's ignored.
+  canvas.addEventListener("webglcontextlost", () => {
+    if (active !== mine) return;
+    showError(
+      chrome.statusArea,
+      "The graphics context was lost (GPU reset)." + (isAndroidApp ? " If reopening fails, fully close and relaunch Anvil." : ""),
+      io.fileUrl(mine.path),
+      mine.fileName,
+    );
+  });
+  canvas.addEventListener("webglcontextrestored", () => {
+    if (active === mine) hideStatus(chrome.statusArea);
+  });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(width, height);
   renderer.setClearColor(0x1a1c20, 1);
@@ -471,6 +514,7 @@ async function init3d(path: string, kind: CadKind, chrome: Chrome, io: CadIo): P
 
   // Load the model (per kind) → an Object3D plus detected units/up-axis.
   const loaded = await loadModel(THREE, path, kind, io, budget, chrome.statusArea);
+  if (active !== mine) return; // closed/replaced mid-load; teardown already released this renderer
 
   if (loaded.tooLarge) {
     // D22: refuse to add it; offer a download instead.
@@ -496,6 +540,7 @@ async function init3d(path: string, kind: CadKind, chrome: Chrome, io: CadIo): P
 
   // Render loop (damped controls need continuous frames).
   const tick = (): void => {
+    if (active !== mine) return;
     active!.raf = requestAnimationFrame(tick);
     controls.update();
     renderer.render(scene, camera);

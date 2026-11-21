@@ -18,7 +18,7 @@ type IntakeModelFn = (
   opts: { onStep?: (step: { tool: string; detail: string }) => void; signal?: AbortSignal },
 ) => Promise<import("../../src/loops/intake-model").IntakeOverlay | undefined>;
 
-function harness(overrides?: { intakeModel?: IntakeModelFn }) {
+function harness(overrides?: { intakeModel?: IntakeModelFn; autopilotCreated?: number }) {
   const stateDir = mkdtempSync(join(tmpdir(), "anvil-loopsvc-"));
   const repo = mkdtempSync(join(tmpdir(), "anvil-loopsvc-repo-"));
   spawnSync("git", ["init", "-q"], { cwd: repo });
@@ -39,7 +39,7 @@ function harness(overrides?: { intakeModel?: IntakeModelFn }) {
     worktreeRoot: () => join(stateDir, "worktrees"),
     judgeEnv: () => ({}),
     onCatalogChange: () => {},
-    autopilotRun: async () => { autopilotCalls++; return { created: 3, summary: "3 new" }; },
+    autopilotRun: async () => { autopilotCalls++; const c = overrides?.autopilotCreated ?? 3; return { created: c, summary: `${c} new` }; },
     resolveWorkUnit: async (workUnitId, status, closeTodoist) => { resolveCalls.push({ workUnitId, status, closeTodoist }); },
     notify: (title, body, tag, hash) => notes.push({ title, body, tag, ...(hash ? { hash } : {}) }),
     ...(overrides?.intakeModel ? { intakeModel: overrides.intakeModel } : {}),
@@ -180,22 +180,76 @@ test("the scheduler ensures a Todoist-intake singleton and fires it in its windo
   }
 });
 
-test("the daily digest fires once per day (after 09:00) when a loop opts in, and deep-links to #loops", () => {
+/** A digest-eligible tick: just after real now (run endedAt uses the real clock), bumped to ≥09:00. */
+function digestTime(): Date {
+  const d = new Date(Date.now() + 60_000);
+  if (d.getHours() < 9) d.setHours(9, 30, 0, 0);
+  return d;
+}
+
+test("the daily digest fires once per day (after 09:00) when there's news, and deep-links to #loops", async () => {
   const h = harness();
   try {
     h.svc.startScheduler(); // the autopilot singleton opts into dailyDigest
     h.svc.stopScheduler();
+    h.svc.tick(new Date(2026, 7, 11, 2, 5, 0)); // fire the nightly run (3 drafts)
+    await new Promise((r) => setTimeout(r, 5));
     // Before 09:00 → no digest.
-    h.svc.tick(new Date(2026, 7, 11, 8, 0, 0));
+    const t = digestTime();
+    h.svc.tick(new Date(t.getFullYear(), t.getMonth(), t.getDate(), 8, 0, 0));
     expect(h.notes.some((n) => n.tag === "loops-digest")).toBe(false);
     // After 09:00 → one digest, deep-linking to #loops.
-    h.svc.tick(new Date(2026, 7, 11, 9, 30, 0));
+    h.svc.tick(t);
     const digest = h.notes.filter((n) => n.tag === "loops-digest");
     expect(digest.length).toBe(1);
     expect(digest[0]!.hash).toBe("#loops");
+    expect(digest[0]!.body).toContain("1 shipped");
     // Same day again → no second digest.
-    h.svc.tick(new Date(2026, 7, 11, 10, 0, 0));
+    h.svc.tick(new Date(t.getTime() + 60_000));
     expect(h.notes.filter((n) => n.tag === "loops-digest").length).toBe(1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the daily digest stays silent when nothing happened (no runs)", () => {
+  const h = harness();
+  try {
+    h.svc.startScheduler();
+    h.svc.stopScheduler();
+    h.svc.tick(digestTime());
+    expect(h.notes.some((n) => n.tag === "loops-digest")).toBe(false);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the daily digest ignores a nightly Todoist run that created 0 drafts", async () => {
+  const h = harness({ autopilotCreated: 0 });
+  try {
+    h.svc.startScheduler();
+    h.svc.stopScheduler();
+    h.svc.tick(new Date(2026, 7, 11, 2, 5, 0));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.svc.runsEvent("loop_autopilot").runs[0]?.noop).toBe(true);
+    h.svc.tick(digestTime());
+    expect(h.notes.some((n) => n.tag === "loops-digest")).toBe(false);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the daily digest doesn't re-report a run that ended more than 24h ago", async () => {
+  const h = harness();
+  try {
+    h.svc.startScheduler();
+    h.svc.stopScheduler();
+    h.svc.tick(new Date(2026, 7, 11, 2, 5, 0));
+    await new Promise((r) => setTimeout(r, 5));
+    const later = digestTime();
+    later.setDate(later.getDate() + 2);
+    h.svc.tick(later);
+    expect(h.notes.some((n) => n.tag === "loops-digest")).toBe(false);
   } finally {
     h.cleanup();
   }
