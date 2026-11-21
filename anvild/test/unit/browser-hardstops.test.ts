@@ -229,11 +229,34 @@ describe("unlock (item 44) and sites that are not logged-in", () => {
     expect(call("browser_click", { element: "Buy", target: "e1" }).kind).toBe("prompt");
   });
 
-  test("[C3] on an allowed site that is not logged-in a click, a key press and a form fill do not prompt; a site that only has cookies from agent sessions is not logged-in", () => {
+  test("[C3] on an allowed site that is not logged-in a click, a key press and a form fill do not prompt; a site that only has cookies from agent sessions is not logged-in (headless, or headed once every logged-in site is unlocked — fix-c-final)", () => {
+    // Headed: the agent profile holds the locked bank.test (fix-c-final), so every input-like call asks
+    // naming it — the page never touched it…
     land("https://plain.test/checkout");
     for (const c of EVERY_CALL) {
       land("https://plain.test/checkout");
-      expect([key(c), call(...c).kind]).toEqual([key(c), "allow"]);
+      const v = call(...c);
+      const k = key(c);
+      if (FREE.has(k) || k.startsWith("browser_tabs:") || k === "browser_navigate_back") expect([k, v.kind]).toEqual([k, "allow"]);
+      else {
+        expect([k, v.kind]).toEqual([k, "prompt"]);
+        expect(labels(v)).toEqual(HARD_STOP_LABELS("bank.test"));
+        expect(v.kind === "prompt" && v.reason).toMatch(/in the headed agent browser, whose profile holds bank\.test, a logged-in site/);
+      }
+    }
+    // …until it is unlocked;
+    loggedIn.get("bank.test")!.unlocked = true;
+    for (const c of EVERY_CALL) {
+      land("https://plain.test/checkout");
+      expect(["headed, unlocked", key(c), call(...c).kind]).toEqual(["headed, unlocked", key(c), "allow"]);
+    }
+    loggedIn.get("bank.test")!.unlocked = false;
+    // and the headless fallback (a throwaway profile) has no logged-in state at all.
+    mode = "headless";
+    gate.pageGone("s1", "headless");
+    for (const c of EVERY_CALL) {
+      land("https://plain.test/checkout");
+      expect(["headless", key(c), call(...c).kind]).toEqual(["headless", key(c), "allow"]);
     }
   });
 

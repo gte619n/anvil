@@ -11,7 +11,7 @@ import { ownHosts, systemResolver, type ProxyResolver } from "../../browser/prox
 import { ensureGitExcluded } from "../../browser/service";
 import { DigiKeySource } from "./digikey";
 import { downloadPart, type PartDownloadDeps } from "./download";
-import { redact } from "./http";
+import { redact, stripUrlQueries } from "./http";
 import { ALL_PART_KEY_NAMES, PART_SOURCE_IDS, PART_SOURCE_LABELS, PartKeyStore, isPartSourceId } from "./keys";
 import { MouserSource } from "./mouser";
 import { DailyCounter } from "./ratelimit";
@@ -106,6 +106,17 @@ export class PartsService {
   }
 
   /**
+   * THE helper for every string the part tools hand the model (and the Settings test result): every
+   * configured key and every issued token removed (raw and URL-encoded), and — unless `keepQueries`,
+   * used only for `parts_search`'s own result links, which already carry no secret and must stay
+   * exact for `parts_fetch` — every URL's query string and fragment dropped.
+   */
+  forModel(text: string, opts: { keepQueries?: boolean } = {}): string {
+    const clean = this.scrub(text);
+    return opts.keepQueries ? clean : stripUrlQueries(clean);
+  }
+
+  /**
    * A result as the model may see it: every string field scrubbed of every secret. A link that
    * carried one is dropped rather than rewritten — a scrubbed URL is not the vendor's URL, and a link
    * that embeds a credential is not one `parts_fetch` should be handed.
@@ -164,7 +175,7 @@ export class PartsService {
   /** One cheap authenticated call. Never throws; the message never carries a key. */
   async test(source: unknown, cid?: string): Promise<PartsTestResultEvent> {
     const reply = (ok: boolean, message: string): PartsTestResultEvent =>
-      ({ v: PROTOCOL_VERSION, ts: new Date().toISOString(), type: "parts.test.result", ...(cid ? { cid } : {}), source: (isPartSourceId(source) ? source : "digikey") as PartSourceId, ok, message: this.scrub(message) });
+      ({ v: PROTOCOL_VERSION, ts: new Date().toISOString(), type: "parts.test.result", ...(cid ? { cid } : {}), source: (isPartSourceId(source) ? source : "digikey") as PartSourceId, ok, message: this.forModel(message) });
     if (!isPartSourceId(source)) return reply(false, `unknown part source ${JSON.stringify(source)}`);
     const s = this.source(source);
     if (!s.configured()) return reply(false, `${s.label} is not configured: ${this.keys.status(source).fields.filter((f) => !f.set).map((f) => f.label).join(", ")} missing`);
@@ -276,9 +287,19 @@ export class PartsService {
       const outcome = quarantineFile(worktree, got.path, { maxBytes: max, exclude: (wt, entry) => void ensureGitExcluded(wt, entry) });
       if (!outcome) return { ok: false, error: "the downloaded file could not be put in quarantine" };
       if (outcome.deleted) return { ok: false, error: `the download was deleted: ${outcome.deleted}` };
-      return { ok: true, ...outcome, source: known.source, from: got.finalUrl };
+      const m = (t: string | undefined) => (t === undefined ? undefined : this.forModel(t));
+      return {
+        ok: true,
+        ...outcome,
+        name: m(outcome.name)!,
+        ...(outcome.kept !== undefined ? { kept: m(outcome.kept) } : {}),
+        ...(outcome.file !== undefined ? { file: m(outcome.file) } : {}),
+        ...(outcome.skipped !== undefined ? { skipped: m(outcome.skipped) } : {}),
+        source: known.source,
+        from: this.forModel(got.finalUrl),
+      };
     } catch (e) {
-      return { ok: false, error: this.scrub(e instanceof Error ? e.message : String(e)) };
+      return { ok: false, error: this.forModel(e instanceof Error ? e.message : String(e)) };
     } finally {
       if (madeDir) {
         try {
@@ -292,7 +313,14 @@ export class PartsService {
 
   /** Where a download named `name` is written before it is quarantined; refuses a type the quarantine would delete. */
   private destFor(outDir: string, name: string): string {
-    const clean = sanitizeDownloadName(name);
+    // The name can come from the URL or the server's Content-Disposition, so it can carry a key or a
+    // token: removed before the name is cleaned (cleaning could change or cut a secret), and again in
+    // its cleaned form, so the file on disk is never named after one.
+    const secrets = this.secrets();
+    const all = [...secrets, ...secrets.map((x) => x.normalize("NFKC").replace(/[^A-Za-z0-9._ -]+/g, "_"))];
+    let clean = sanitizeDownloadName(redact(name, all));
+    for (let i = 0; i < 4 && redact(clean, all) !== clean; i++) clean = sanitizeDownloadName(redact(clean, all));
+    if (redact(clean, all) !== clean) clean = "download.step"; // never reached in practice; never a secret
     const ext = extname(clean).slice(1).toLowerCase();
     if (!DOWNLOAD_EXTENSIONS.includes(ext)) {
       throw new PartSourceError("refused", `${ext ? `.${ext} files are` : "a file with no extension is"} not allowed (allowed: ${DOWNLOAD_EXTENSIONS.join(", ")}); nothing was saved`);

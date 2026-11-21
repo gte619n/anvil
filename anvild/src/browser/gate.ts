@@ -51,10 +51,52 @@
  * a logged-in site's widget) forces a snapshot before most inputs. Residual: a connection Chrome
  * already holds open (HTTP/2 reuse of a socket opened before the last result) is not seen again.
  *
- * Embedded logged-in sites (C3 review, item 4): while any locked logged-in site has been contacted
- * since the navigation that led to the current page (a frame or widget from it on this page), input,
- * upload, script and housekeeping calls on that page are hard-stopped as if they were on that site,
- * naming it (`BrowserActionInfo.embeddedSites`). Reads and navigations are not.
+ * Embedded logged-in sites (C3 review, item 4; made STICKY by the C3/C4 fix-round re-review, and by
+ * the review after it). Every site the browser contacts is added to one set per session
+ * (`BrowserSessionState.contacted`), across all tabs. While that set holds a locked logged-in site
+ * (looked up live, so an unlocked one — decision 44 — does not count), every input and housekeeping
+ * call is hard-stopped naming it (`BrowserActionInfo.embeddedSites`), an upload's once-prompt names it,
+ * and `browser_evaluate` is refused outright. Reads and navigations are not stopped.
+ *
+ * Nothing the page does can empty the set: not a URL change, a tab select, going back, a same-document
+ * navigation — and not `about:blank`. A frame survives `history.pushState`, a `#fragment` navigation,
+ * a tab switch and the back/forward cache without the proxy seeing a single new connection; and after
+ * about:blank a fresh `browser_navigate` back to the framing page does not re-contact the framed site
+ * either: Chrome serves the frame from its HTTP cache (`Cache-Control: max-age`), or over the HTTPS
+ * tunnel it already holds open (`no-store` too). Both were reproduced with real headless Chrome: the
+ * framed site saw no proxy traffic and took the click. So a page address, and the absence of traffic
+ * after a load, prove nothing while the same Chrome process runs. The page's own site counts too: a
+ * frame from B on A can reuse the tunnel Chrome opened while the tab was on B.
+ *
+ * The set is emptied only when the Chrome process that loaded those sites is GONE and the next one
+ * starts from nothing — which is only true of the headless fallback's throwaway profile (`--isolated`):
+ *   - a `browser_close` result, in headless mode, after the service has CONFIRMED that no process of
+ *     that browser is still running (`hooks.browserEnded`: no process holds the session's proxy port as
+ *     its `--proxy-server`). Playwright MCP's `browser_close` closes the whole browser and the next call
+ *     launches a new one with a new throwaway profile (verified: zero processes right after the result,
+ *     and the next load fetched the framed site again). Unconfirmed → the set stays;
+ *   - a rebuilt browser server whose new browser is headless (`pageGone(…, "headless")`).
+ *
+ * The headed browser's persistent agent profile is never "from nothing". Its HTTP cache is moved to a
+ * new folder per launch outside the profile (`BROWSER_DISK_CACHE_FLAG` in preset.ts), so a cached frame
+ * is fetched again by a new launch. But the profile keeps SERVICE WORKERS: with real headless Chrome on a
+ * reused profile, a frame of B controlled by B's service worker (registered in the first launch)
+ * rendered in the second launch, cache folder fresh, with ZERO proxy traffic before it was shown; the
+ * only traffic was the worker's own update check, about 2.2 s AFTER the navigation's result — after the
+ * frame was already clickable, so the set cannot key on it. And the profile is exactly where the
+ * logged-in sites keep their state. So in headed mode every locked logged-in site counts as contacted
+ * from the start of every launch, without any traffic (`hooks.profileLockedSites`, looked up live), and
+ * a `browser_close` or a rebuild there never empties the set.
+ *
+ * Accepted cost (over-prompting). HEADLESS: a browser that has loaded anything from a locked logged-in
+ * site (a frame, a widget, a script) prompts on every click, key press and form fill, on every page and
+ * in every tab, names the site in every upload prompt, and cannot run scripts, until the agent closes
+ * the browser (`browser_close`) or the owner unlocks the site; about:blank no longer helps. HEADED: while
+ * ANY logged-in site is locked, every click, key press and form fill in the headed browser prompts
+ * naming it — on every page, from the first call, whether or not the page ever touched that site — and
+ * `browser_evaluate` is refused, for the whole session; only unlocking the site (decision 44) ends it.
+ * "Allow once" per call is the owner's other way through. (A narrower rule would need to read which
+ * sites have service workers out of Chrome's internal database; rejected as unreliable.)
  *
  * The session's own test daemon (C4 review, item 1) gets NO exemption from either rule: the agent
  * wrote that page itself, so it is the least trusted page there is. The only differences are that its
@@ -62,12 +104,12 @@
  * everything else it contacts — another site it moves itself to, a frame it embeds — counts exactly as
  * on any other page (it has no "own site" whose traffic is ignored).
  *
- * A traffic log that overflowed (C4 review, item 2). The log is bounded; when entries since the
- * navigation to the current page were dropped, Anvil no longer knows what that page loaded. Then the
- * page is UNKNOWN for input (snapshot first, like any traffic since the last result), and after the
- * snapshot every input-like call on it is hard-stopped as "unknown embedded content"
- * (`TRAFFIC_LOST_SITE` in `embeddedSites`), naming that Anvil lost track, until a navigation to a page
- * whose log is complete.
+ * A traffic log that overflowed (C4 review, item 2). The log is bounded; when entries the sticky set had
+ * not absorbed yet were dropped (or the set grew past `MAX_CONTACTED_SITES`), Anvil no longer knows what
+ * the browser loaded. Then the page is UNKNOWN for input (snapshot first, like any traffic since the
+ * last result), and after the snapshot every input-like call is hard-stopped as "unknown embedded
+ * content" (`TRAFFIC_LOST_SITE` in the sticky set and in `embeddedSites`), naming that Anvil lost track,
+ * until the set is emptied (see above) like any other entry.
  *
  * Time (C4 review, item 4). Chrome can reuse an HTTPS tunnel it already holds, so a page can move
  * itself to another page on a site it is already connected to without the proxy seeing anything new.
@@ -104,6 +146,15 @@ export const FRESH_PAGE_MS = 2000;
 /** What `trafficSince` reports when the bounded log no longer reaches back that far — and the name a
  *  hard stop shows for what the page may have embedded then. Not a hostname: never on any list. */
 export const TRAFFIC_LOST_SITE = "(unknown embedded content: more connections than Anvil keeps track of)";
+/** What `profileLockedSites` reports when the logged-in list is damaged and the agent profile's cookies
+ *  cannot be read either (every site then counts as locked). Not a hostname: never on any list. */
+export const PROFILE_UNKNOWN_SITE = "(unknown logged-in sites: the list is damaged and the agent profile could not be read)";
+/** Names in the sticky set that are not sites: nothing to unlock, always counted as locked. */
+export function isMarkerSite(site: string): boolean {
+  return site === TRAFFIC_LOST_SITE || site === PROFILE_UNKNOWN_SITE;
+}
+/** More distinct contacted sites than this and the sticky set becomes "lost track" (fail closed). */
+export const MAX_CONTACTED_SITES = 5000;
 
 export interface BrowserSessionState {
   /** Sites answered "Allow once" (or allowed by `bypass`) in this session. */
@@ -120,10 +171,12 @@ export interface BrowserSessionState {
   establishedAt?: number;
   /** The proxy's traffic sequence when the last result established the page. */
   resultSeq?: number;
-  /** The traffic sequence when the navigation that led to the current page began. */
-  pageSeq?: number;
-  /** The traffic sequence when the last navigation-class call was allowed. */
-  navCallSeq?: number;
+  /** Every site (registrable domain, or `TRAFFIC_LOST_SITE`) this session's browser contacted — all
+   *  tabs together — since a throwaway-profile browser last ended for certain. STICKY: see the file
+   *  comment (about:blank does not empty it). */
+  contacted?: Set<string>;
+  /** The traffic sequence `contacted` has absorbed up to. */
+  contactedSeq?: number;
   /** The tabs as last listed by the server (only entries whose URL could be read with certainty). */
   tabs?: TabEntry[];
   /** The owner refused a page that this browser's history still holds: no going back. */
@@ -144,9 +197,13 @@ export interface BrowserActionInfo {
   currentUnknown?: boolean;
   /** For a navigation with a target: where it goes. */
   target?: { site: string; url: string };
-  /** Locked logged-in sites the browser contacted since the navigation to the current page (a frame
-   *  or widget from them on it). Input-like calls are hard-stopped as if on them. */
+  /** Locked logged-in sites this browser has contacted (sticky; all tabs) — in headed mode also every
+   *  locked logged-in site, whose data the agent profile holds. Input-like calls are hard-stopped as if
+   *  on them. */
   embeddedSites?: string[];
+  /** The entries of `embeddedSites` that are there only because the headed profile holds them (no
+   *  traffic to them was seen): for the card's wording. */
+  profileSites?: string[];
   mode: BrowserMode;
 }
 
@@ -164,6 +221,13 @@ export interface BrowserGateHooks {
   isUnlocked?: (site: string) => boolean;
   /** PHASE C3 — logged in and not unlocked (a damaged list counts every profile site; see loggedin.ts). */
   isLocked?: (site: string) => boolean;
+  /** FIX-C-FINAL — every locked logged-in site (a damaged list: every site the profile has cookies for,
+   *  or `PROFILE_UNKNOWN_SITE`). In headed mode these count as contacted from the start of every launch.
+   *  Absent → `loggedInSites` filtered by `isLocked`. */
+  profileLockedSites?: () => readonly string[];
+  /** FIX-C-FINAL — after a `browser_close` result: true only when the service has confirmed that no
+   *  process of the session's browser is still running. Absent or false → the sticky set stays. */
+  browserEnded?: (sessionId: string) => boolean;
   /**
    * PHASE C3 — per-action rules for logged-in sites (hard stops). Called for every call Phase C2 is
    * about to ALLOW (reads, inputs, housekeeping, and navigations whose site is allowed). Return a
@@ -230,18 +294,59 @@ export class BrowserGate {
     this.states.delete(sessionId);
   }
 
-  /** The session's browser process is gone (driver rebuilt): the page is gone too, the approvals stay. */
-  pageGone(sessionId: string): void {
+  /**
+   * The session's browser server is gone (driver rebuilt or dropped): the page is gone too, the
+   * approvals stay. `next` is the mode of the browser that replaces it, when known: only a new
+   * HEADLESS browser (a new throwaway profile) empties the sticky set; a headed one starts from the
+   * same persistent profile, and an unknown one may.
+   */
+  pageGone(sessionId: string, next?: BrowserMode): void {
     const st = this.states.get(sessionId);
     if (!st) return;
-    this.resetPage(st);
+    this.resetPage(st, sessionId, next === "headless");
   }
 
-  private resetPage(st: BrowserSessionState): void {
+  /** Add everything the browser contacted since the last look to the sticky set. */
+  private absorbTraffic(sessionId: string, st: BrowserSessionState): void {
+    if (!this.deps.hooks.trafficSince || !this.deps.hooks.trafficSeq) return;
+    const seq = this.deps.hooks.trafficSeq(sessionId);
+    const set = (st.contacted ??= new Set());
+    for (const s of this.deps.hooks.trafficSince(sessionId, st.contactedSeq ?? 0)) set.add(s);
+    // Bounded: past the cap Anvil no longer claims to know what was loaded (fail closed).
+    if (set.size > MAX_CONTACTED_SITES) st.contacted = new Set([TRAFFIC_LOST_SITE]);
+    st.contactedSeq = seq;
+  }
+
+  /** The Chrome process that loaded those sites ended for certain, and the next one starts from a new
+   *  throwaway profile: forget what it contacted (from the current sequence on). */
+  private clearContacted(st: BrowserSessionState, sessionId: string): void {
+    st.contacted = undefined;
+    st.contactedSeq = this.deps.hooks.trafficSeq?.(sessionId);
+  }
+
+  /** Every locked logged-in site, live (headed mode counts them all as contacted). */
+  private profileLocked(): string[] {
+    const h = this.deps.hooks;
+    if (h.profileLockedSites) return [...h.profileLockedSites()];
+    return (h.loggedInSites?.() ?? []).filter((s) => this.isLocked(s));
+  }
+
+  /** The locked logged-in sites in the sticky set — plus, in headed mode, every locked logged-in site
+   *  (the profile holds them) — markers first (they are the widest claim). `profile`: the entries no
+   *  traffic was seen for. */
+  private embeddedLocked(st: BrowserSessionState, mode: BrowserMode): { sites: string[]; profile: string[] } {
+    const seen = [...(st.contacted ?? [])].filter((s) => isMarkerSite(s) || this.isLocked(s));
+    const profile = mode === "headed" ? this.profileLocked().filter((s) => !seen.includes(s)) : [];
+    const sites = [...seen, ...profile].sort((x, y) => (isMarkerSite(x) === isMarkerSite(y) ? 0 : isMarkerSite(x) ? -1 : 1));
+    return { sites, profile };
+  }
+
+  /** The page is gone. `clearSet`: the browser that loaded the sticky set has ended for certain and the
+   *  next one starts from a new throwaway profile — otherwise the set stays. */
+  private resetPage(st: BrowserSessionState, sessionId: string, clearSet: boolean): void {
     st.currentUrl = undefined;
     st.resultSeq = undefined;
-    st.pageSeq = undefined;
-    st.navCallSeq = undefined;
+    if (clearSet) this.clearContacted(st, sessionId);
     st.establishedAt = undefined;
     st.hold = undefined;
     st.closing = undefined;
@@ -297,6 +402,7 @@ export class BrowserGate {
     if (ctx.tool === "browser_close") return { kind: "allow", reason: "browser_close is always allowed" };
 
     const st = this.state(ctx.session.id);
+    this.absorbTraffic(ctx.session.id, st);
     // CLOSING comes first: only the way out is open.
     if (st.closing) return this.closingVerdict(ctx, st);
 
@@ -335,7 +441,6 @@ export class BrowserGate {
     }
 
     if (plan.recordOnce) st.once.add(plan.recordOnce);
-    this.noteNavigationCall(ctx, st, plan.verdict);
     return plan.verdict;
   };
 
@@ -394,13 +499,6 @@ export class BrowserGate {
     return `the last result that said where the page is is ${ago === undefined ? "missing" : `${ago} s old`} (an action needs one from the last ${FRESH_PAGE_MS / 1000} s)`;
   }
 
-  /** An allowed navigation-class call: the traffic from here on belongs to the page it leads to. */
-  private noteNavigationCall(ctx: McpKindGateContext, st: BrowserSessionState, verdict: McpKindVerdict): void {
-    if (verdict?.kind !== "allow" || !this.deps.hooks.trafficSeq) return;
-    const cls = classifyBrowserTool(ctx.tool, ctx.input);
-    if ("cls" in cls && cls.cls === "navigation") st.navCallSeq = this.deps.hooks.trafficSeq(ctx.session.id);
-  }
-
   /** Whether this call is one that may run while the page's address is unknown: the calls whose
    *  result establishes it, the way out, and — after an input-class call only — any read. */
   private establishesPage(ctx: McpKindGateContext, unknown: NonNullable<BrowserSessionState["unknown"]>): boolean {
@@ -431,18 +529,35 @@ export class BrowserGate {
     // that is not a hostname in place of its site.
     const onOwn = this.isOwn(ctx.session.id, st.currentUrl);
     const shownSite = onOwn ? OWN_TEST_DAEMON_SITE : currentSite;
-    // Locked logged-in sites this page has loaded something from (a frame, a widget): input-like calls
-    // are hard-stopped as if on them — on the session's own test daemon too (C4 review, item 1). When
-    // the log lost entries since the navigation here, what the page loaded is unknown (item 2).
-    const here = onOwn ? undefined : currentSite;
-    const embedded = cls.cls === "read" || cls.cls === "navigation" ? [] : this.trafficSince(ctx.session.id, st.pageSeq).filter((s) => s === TRAFFIC_LOST_SITE || (s !== here && this.isLocked(s)));
-    const info: BrowserActionInfo = { ctx, cls: cls.cls, mode, ...(shownSite ? { currentSite: shownSite } : {}), ...(st.unknown ? { currentUnknown: true } : {}), ...(embedded.length ? { embeddedSites: embedded } : {}) };
+    // Locked logged-in sites this browser has loaded something from (a frame, a widget, the page itself
+    // — sticky, all tabs; in headed mode every locked logged-in site, see the file comment): input-like
+    // calls are hard-stopped as if on them — on the session's own test daemon too (C4 review, item 1).
+    // When the log lost entries, what was loaded is unknown (item 2), and that is sticky too.
+    const { sites: embedded, profile } = cls.cls === "read" || cls.cls === "navigation" ? { sites: [], profile: [] } : this.embeddedLocked(st, mode);
+    const info: BrowserActionInfo = {
+      ctx,
+      cls: cls.cls,
+      mode,
+      ...(shownSite ? { currentSite: shownSite } : {}),
+      ...(st.unknown ? { currentUnknown: true } : {}),
+      ...(embedded.length ? { embeddedSites: embedded } : {}),
+      ...(profile.length ? { profileSites: profile } : {}),
+    };
     const session = ctx.session;
+    const loadedText = (): string => {
+      const loaded = embedded.filter((s) => !profile.includes(s));
+      const parts = [
+        ...(loaded.length ? [`a page that has loaded ${loaded.slice(0, 3).join(", ")}${loaded.every(isMarkerSite) ? "" : " (a locked logged-in site)"}`] : []),
+        ...(profile.length ? [`the agent profile, which holds ${profile.slice(0, 3).join(", ")}${profile.every(isMarkerSite) ? "" : " (a locked logged-in site whose pages can load from the profile with no network traffic)"}`] : []),
+      ];
+      return parts.join(", and in ");
+    };
 
     if (cls.cls === "script") {
       // A script can reach into a frame (`ref` in it): never with a locked site's frame on the page.
-      if (embedded.length) return deny(`browser_evaluate is not allowed on a page that has loaded ${embedded.slice(0, 3).join(", ")}${embedded.includes(TRAFFIC_LOST_SITE) ? "" : " (a locked logged-in site)"}`);
-      if (this.deps.hooks.allowEvaluate?.(info) === true) return { verdict: { kind: "allow", reason: "script evaluation on the session's own test daemon" } };
+      const own = this.deps.hooks.allowEvaluate?.(info) === true;
+      if (embedded.length) return deny(`browser_evaluate is not allowed on ${loadedText()}${own ? "" : "; it is only allowed on this session's own throwaway test daemon"}`);
+      if (own) return { verdict: { kind: "allow", reason: "script evaluation on the session's own test daemon" } };
       return deny("browser_evaluate is only allowed on this session's own throwaway test daemon");
     }
 
@@ -454,10 +569,11 @@ export class BrowserGate {
         if (bad) return deny(`${ctx.tool}: ${bad}`);
       }
       const where = currentSite ?? "the page";
+      const framed = embedded.length ? `; this is ${loadedText()}, so a frame from it may receive the file` : "";
       return {
         verdict: {
           kind: "prompt",
-          reason: `upload ${paths.length === 1 ? paths[0] : `${paths.length} files`} to ${where}`,
+          reason: `upload ${paths.length === 1 ? paths[0] : `${paths.length} files`} to ${where}${framed}`,
           suggestions: ONCE_SUGGESTIONS, // an upload is asked every time: there is no "always"
           always: true,
           denyWhenUnattended: true,
@@ -583,9 +699,13 @@ export class BrowserGate {
   onResult(sessionId: string, result: McpToolResult, mode: BrowserMode = "headed"): { purge: boolean } {
     const st = this.state(sessionId);
     if (result.tool === "browser_close" && !result.isError) {
-      this.resetPage(st);
+      // The page is gone. The sticky set goes only with a throwaway-profile browser that is confirmed
+      // to have ended (see the file comment).
+      this.absorbTraffic(sessionId, st);
+      this.resetPage(st, sessionId, mode === "headless" && this.deps.hooks.browserEnded?.(sessionId) === true);
       return { purge: false };
     }
+    this.absorbTraffic(sessionId, st);
     const reading = readPage(result.tool, toolResultText(result.content), result.isError);
     const cls = classifyBrowserTool(result.tool, result.input);
     const changesPage = result.tool === "browser_navigate" || result.tool === "browser_navigate_back" || (result.tool === "browser_tabs" && result.input.action !== "list");
@@ -604,18 +724,17 @@ export class BrowserGate {
 
     st.unknown = undefined;
     st.establishedAt = (this.deps.clock ?? Date.now)();
-    // The traffic so far is accounted for by this result; traffic before the navigation that led here
-    // belongs to an earlier page.
+    // The traffic so far is accounted for by this result (for the "moved by itself" rule; what was
+    // embedded stays in the sticky set whatever the address says).
     const seq = this.deps.hooks.trafficSeq?.(sessionId);
-    if (seq !== undefined) {
-      if (st.currentUrl !== reading.url || st.pageSeq === undefined) st.pageSeq = changesPage ? (st.navCallSeq ?? st.resultSeq ?? 0) : (st.resultSeq ?? 0);
-      st.resultSeq = seq;
-    }
+    if (seq !== undefined) st.resultSeq = seq;
     st.currentUrl = reading.url;
     const where: UrlVerdict = reading.url === CHROME_ERROR_URL ? { ok: true, blank: true } : checkUrl(reading.url);
     if (where.ok && "blank" in where) {
       st.hold = undefined;
-      if (reading.url !== CHROME_ERROR_URL) st.closing = undefined; // only about:blank ends CLOSING
+      // Only about:blank ends CLOSING. It does NOT empty the sticky set: the same Chrome process can
+      // show the framed page again from its HTTP cache or over a tunnel it holds, with no traffic.
+      if (reading.url !== CHROME_ERROR_URL) st.closing = undefined;
       return { purge: false };
     }
     if (st.closing) return { purge: true }; // still has to leave

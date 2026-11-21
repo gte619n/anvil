@@ -38,6 +38,14 @@ afterEach(async () => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
+/** The headless fallback (a throwaway profile): the sticky set is the traffic the proxy saw, and nothing
+ *  else (in headed mode every locked logged-in site counts from the start — fix-c-final, see
+ *  browser-c3-review.test.ts). */
+async function headless(): Promise<void> {
+  await rig.cleanup();
+  rig = browserRig({ desktop: false, browser: { testDaemon: fakeTestDaemonSeams(runner, capturedTimers()) } });
+  integration = await addBrowser(rig);
+}
 const contact = (s: Session, host: string, port = 443, allowed = true): void => browserOf(rig).proxies.onSessionDecision!(s.id, { kind: "connect", host, port, allowed });
 const allow = (s: Session, ...sites: string[]): void => {
   for (const x of sites) browserOf(rig).gate.state(s.id).once.add(x);
@@ -79,7 +87,8 @@ describe("item 1: the session's own test daemon has no exemption from the traffi
     expect((await gated).decision).toBe("deny");
   });
 
-  test("[C4] review 1: an own-origin page that frames a locked logged-in site — a click is a hard stop naming it and browser_evaluate is refused; the own origin itself still needs no site prompt and a page with no such frame acts freely", async () => {
+  test("[C4] review 1: an own-origin page that frames a locked logged-in site — a click is a hard stop naming it and browser_evaluate is refused; the own origin itself still needs no site prompt and a page with no such frame acts freely (headless)", async () => {
+    await headless();
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "mostly-autonomous" });
     browserOf(rig).loggedIn.add("bank.test", "owner");
     // No site prompt for the own origin, under the default policy.
@@ -94,6 +103,7 @@ describe("item 1: the session's own test daemon has no exemption from the traffi
     expect(click).toMatchObject({ decision: "deny", reason: expect.stringMatching(/this session's test daemon.*has loaded bank\.test, a logged-in site.*browser_take_screenshot/) });
     const script = await browserHook(rig, s, "browser_evaluate", { function: "() => 1" });
     expect(script).toMatchObject({ decision: "deny", reason: expect.stringMatching(/not allowed on a page that has loaded bank\.test/) });
+    expect(browserOf(rig).gate.state(s.id).contacted?.has("bank.test")).toBe(true);
     shotResult(s);
     const gated = browserHook(rig, s, "browser_click", { target: "e1" });
     expect(await isPending(gated)).toBe(true);
@@ -104,7 +114,8 @@ describe("item 1: the session's own test daemon has no exemption from the traffi
 });
 
 describe("item 2: an overflowing traffic log", () => {
-  test("[C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to a page with a complete log clears it", async () => {
+  test("[C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; neither a navigation to another page nor about:blank clears it, a browser_close that ended the (headless) browser does", async () => {
+    await headless();
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "bypass" });
     allow(s, "shop.test", "news.test");
     browserOf(rig).loggedIn.add("bank.test", "owner");
@@ -128,7 +139,22 @@ describe("item 2: an overflowing traffic log", () => {
     rig.sup.resolvePermission(card.requestId, "deny");
     expect((await gated).decision).toBe("deny");
     expect(browserOf(rig).loggedIn.isLocked(TRAFFIC_LOST_SITE)).toBe(false);
-    // A new page whose log is complete: the click runs.
+    // Sticky (fix-round re-review): a new page does NOT clear it — the frame may still be there…
+    expect((await browserHook(rig, s, "browser_navigate", { url: "https://news.test/" })).decision).toBe("allow");
+    contact(s, "news.test");
+    feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });
+    expect(await browserHook(rig, s, "browser_click", { target: "e1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/embedded content is unknown/) });
+    // …nor does about:blank (fix-c-final: the same Chrome can show the frame again with no traffic)…
+    expect((await browserHook(rig, s, "browser_navigate", { url: "about:blank" })).decision).toBe("allow");
+    feedResult(rig, s, "browser_navigate", pageResult("about:blank"), { url: "about:blank" });
+    expect((await browserHook(rig, s, "browser_navigate", { url: "https://news.test/" })).decision).toBe("allow");
+    contact(s, "news.test");
+    feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });
+    expect(await browserHook(rig, s, "browser_click", { target: "e1" })).toMatchObject({ decision: "deny", reason: expect.stringMatching(/embedded content is unknown/) });
+    // …only browser_close, once no process of the browser is left (none is: nothing was started).
+    expect((await browserHook(rig, s, "browser_close")).decision).toBe("allow");
+    feedResult(rig, s, "browser_close", "### Result\nNo open tabs.");
+    expect(browserOf(rig).gate.state(s.id).contacted?.size ?? 0).toBe(0);
     expect((await browserHook(rig, s, "browser_navigate", { url: "https://news.test/" })).decision).toBe("allow");
     contact(s, "news.test");
     feedResult(rig, s, "browser_navigate", pageResult("https://news.test/"), { url: "https://news.test/" });

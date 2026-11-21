@@ -6,14 +6,43 @@
 import { DEFAULT_TIMEOUT_MS, PartSourceError, type ConnectorDeps } from "./types";
 import { retryAfterText, type RateLimiter } from "./ratelimit";
 
-/** Replace every secret (and its URL-encoded form) in `text` with a placeholder. */
+/** A pattern for `secret` written as is or URL-encoded in any way: each character either itself or
+ *  as its percent-escapes in either case (`%2B`/`%2b`), a space also as `+`. */
+function secretPattern(secret: string): RegExp {
+  const hex = (n: number): string => [...n.toString(16).toUpperCase().padStart(2, "0")].map((c) => (/[A-F]/.test(c) ? `[${c}${c.toLowerCase()}]` : c)).join("");
+  let p = "";
+  for (const ch of secret) {
+    const literal = ch.replace(/[\\^$.*+?()[\]{}|/-]/g, "\\$&");
+    const escaped = [...new TextEncoder().encode(ch)].map((b) => `%${hex(b)}`).join("");
+    p += `(?:${literal}|${escaped}${ch === " " ? "|\\+" : ""})`;
+  }
+  return new RegExp(p, "g");
+}
+
+/** Replace every secret — as is, or URL-encoded in any form or case — in `text` with a placeholder. */
 export function redact(text: string, secrets: readonly (string | undefined)[]): string {
   let out = text;
   for (const s of secrets) {
     if (!s || s.length < 4) continue;
-    for (const form of new Set([s, encodeURIComponent(s)])) out = out.split(form).join("•••");
+    out = out.replace(secretPattern(s), "•••");
   }
   return out;
+}
+
+/** Every http(s) URL in `text` without its query string and fragment (where vendors put keys, tenant
+ *  ids and tokens). A URL that does not parse is cut at its first `?` or `#`. */
+export function stripUrlQueries(text: string): string {
+  return text.replace(/\bhttps?:\/\/[^\s"'<>`]+/gi, (u) => {
+    try {
+      const x = new URL(u);
+      if (!x.search && !x.hash) return u;
+      x.search = "";
+      x.hash = "";
+      return x.href;
+    } catch {
+      return u.split(/[?#]/)[0]!;
+    }
+  });
 }
 
 export interface VendorReply {

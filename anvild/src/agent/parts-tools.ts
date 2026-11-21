@@ -34,11 +34,14 @@ export interface PartsSession {
 export interface PartsControl {
   search(sessionId: string, query: unknown, opts: { sources?: unknown; limit?: unknown; manufacturer?: unknown }): Promise<PartsSearchOutcome>;
   fetch(session: { id: string; cwd: string }, url: unknown): Promise<PartsFetchOutcome>;
+  /** Every configured key and issued token removed from `text`; URL query strings dropped unless
+   *  `keepQueries` (see `PartsService.forModel`). Applied to EVERY string these tools return. */
+  forModel(text: string, opts?: { keepQueries?: boolean }): string;
 }
 
-const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], ...(isError ? { isError: true } : {}) });
-
 export function partsTools(control: PartsControl, session: PartsSession): SdkMcpToolDefinition<any>[] {
+  // The tool boundary: nothing leaves these tools without passing `forModel`.
+  const text = (t: string, isError = false, keepQueries = false) => ({ content: [{ type: "text" as const, text: control.forModel(t, { keepQueries }) }], ...(isError ? { isError: true } : {}) });
   return [
     tool(
       "parts_search",
@@ -55,9 +58,11 @@ export function partsTools(control: PartsControl, session: PartsSession): SdkMcp
       async (args) => {
         try {
           const out = await control.search(session.id, args.query, { sources: args.sources, limit: args.limit, manufacturer: args.manufacturer });
-          const body = JSON.stringify({ results: out.results, notes: out.notes }, null, 1);
+          // Result links stay exact (they are parts_fetch's handles and never carry a secret — one that
+          // did was dropped); the notes lose their URL queries like every other string.
+          const body = JSON.stringify({ results: out.results, notes: out.notes.map((n) => control.forModel(n)) }, null, 1);
           const lead = out.results.length ? `${out.results.length} result(s). Show each result's attribution with it.` : "No results.";
-          return text(`${lead}\n${body}`);
+          return text(`${lead}\n${body}`, false, true);
         } catch (e) {
           return text(e instanceof Error ? e.message : String(e), true);
         }

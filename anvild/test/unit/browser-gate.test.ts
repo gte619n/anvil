@@ -525,3 +525,43 @@ describe("the current tab (review of Phase C2)", () => {
     expect(gate.state("s1").closing).toBeDefined();
   });
 });
+
+describe("what empties the sticky set (fix-c-final)", () => {
+  test("[C3] fix-c-final: only a throwaway-profile browser that has certainly ended empties the contacted set — about:blank never does; browser_close does in headless mode only when browserEnded says so; a rebuilt server does only when the new browser is headless; a dropped headed driver (no mode) never does", () => {
+    let seq = 0;
+    const traffic: { seq: number; site: string }[] = [];
+    let ended = false;
+    hooks.trafficSeq = () => seq;
+    hooks.trafficSince = (_id, since) => [...new Set(traffic.filter((t) => t.seq > since).map((t) => t.site))];
+    hooks.browserEnded = () => ended;
+    hooks.isLocked = (s) => s === "bank.test";
+    const contact = (site: string) => traffic.push({ seq: ++seq, site });
+    const has = () => gate.state("s1").contacted?.has("bank.test") ?? false;
+    const load = () => {
+      contact("bank.test");
+      result("browser_navigate", pageResult("https://a.test/embed"), false, { url: "https://a.test/embed" });
+      expect(has()).toBe(true);
+    };
+    for (const mode of ["headless", "headed"] as const) {
+      runtime = { mode, proxyRunning: true };
+      gate.pageGone("s1", "headless");
+      load();
+      result("browser_navigate", pageResult("about:blank"), false, { url: "about:blank" });
+      result("browser_tabs", `${tabsResult(["B", "about:blank", true])}\n### Page\n- Page URL: about:blank\n- Page Title: `, false, { action: "list" });
+      expect([mode, "about:blank", has()]).toEqual([mode, "about:blank", true]);
+      ended = false;
+      result("browser_close", "### Result\nNo open tabs.");
+      expect([mode, "close, still running", has()]).toEqual([mode, "close, still running", true]);
+      ended = true;
+      result("browser_close", "### Result\nNo open tabs.");
+      expect([mode, "close, ended", has()]).toEqual([mode, "close, ended", mode === "headed"]);
+      load();
+      gate.pageGone("s1"); // a dropped driver: what comes next is not known
+      expect([mode, "dropped", has()]).toEqual([mode, "dropped", true]);
+      gate.pageGone("s1", "headed");
+      expect([mode, "rebuilt headed", has()]).toEqual([mode, "rebuilt headed", true]);
+      gate.pageGone("s1", "headless");
+      expect([mode, "rebuilt headless", has()]).toEqual([mode, "rebuilt headless", false]);
+    }
+  });
+});

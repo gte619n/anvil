@@ -54,6 +54,15 @@ describe("rate limiter", () => {
     expect(redact("GET /x?apiKey=ab%2Bcd%3D&y=ab+cd= failed", ["ab+cd="])).toBe("GET /x?apiKey=•••&y=••• failed");
     expect(redact("short ab", ["ab"])).toBe("short ab"); // too short to be a key; left alone
   });
+
+  test("[C5] fix-c-final: a key is scrubbed whatever case its percent-escapes are in, and however much of it is encoded", () => {
+    const email = "me+parts@corp.example";
+    for (const form of ["me%2bparts%40corp.example", "me%2Bparts%40corp.example", "me%2bparts@corp.example", "me+parts%40corp%2eexample", "%6De%2Bparts%40corp.example"]) {
+      expect([form, redact(`GET /x?email=${form}&q=1 failed`, [email])]).toEqual([form, "GET /x?email=•••&q=1 failed"]);
+    }
+    expect(redact("token=a%20b%2fc and a+b/c", ["a b/c"])).toBe("token=••• and •••");
+    expect(redact("nothing here: me-parts@corp.example", [email])).toBe("nothing here: me-parts@corp.example");
+  });
 });
 
 describe("daily quota (UTC calendar day, persisted)", () => {
@@ -127,6 +136,31 @@ describe("daily quota (UTC calendar day, persisted)", () => {
     withDir((file) => {
       expect(existsSync(file)).toBe(false);
       expect(limiter(file, () => Date.UTC(2026, 10, 19)).take()).toEqual({ ok: true });
+    });
+  });
+
+  test("[C5] daily quota: a row dated in the future (the clock stepped back) counts as today with its count — a restart on the earlier day is still refused, another source's future row survives a write, and a corrupt read on a later day stays closed after the step back", () => {
+    withDir((file) => {
+      writeFileSync(file, JSON.stringify({ mouser: { day: "2026-11-20", count: 3 }, digikey: { day: "2026-11-20", count: 2 } }));
+      let t = Date.UTC(2026, 10, 19, 23, 0, 0); // a day earlier than the rows
+      const now = () => t;
+      expect(limiter(file, now).take().ok).toBe(false); // mouser: 3 of 3 used
+      const dk = new RateLimiter([], now, { counter: new DailyCounter(file, now), source: "digikey", limit: 3 });
+      expect(dk.take()).toEqual({ ok: true }); // 3rd of 3, kept count
+      expect(dk.take().ok).toBe(false);
+      expect(JSON.parse(readFileSync(file, "utf8")).mouser).toEqual({ day: "2026-11-20", count: 3 }); // not dropped by digikey's write
+      expect(limiter(file, now).take().ok).toBe(false); // a restart on the earlier day: still refused
+      t = Date.UTC(2026, 10, 21, 0, 0, 1); // a real new day
+      expect(limiter(file, now).take()).toEqual({ ok: true });
+    });
+    withDir((file) => {
+      writeFileSync(file, "{not json");
+      let t = Date.UTC(2026, 10, 20, 12);
+      const now = () => t;
+      const c = new DailyCounter(file, now);
+      const rl = new RateLimiter([], now, { counter: c, source: "mouser", limit: 3 });
+      t = Date.UTC(2026, 10, 19, 12); // the clock steps back after the corrupt read
+      expect(rl.take().ok).toBe(false);
     });
   });
 });

@@ -7,7 +7,8 @@
  * are on. Without it nothing here exists: the preset is not registered (so `mcp.integration.add`
  * refuses the kind), no proxy listens and nothing is written.
  */
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { BrowserIntegrationInfo, McpHealth, McpIntegration, McpTransport, ServerEvent, ToolResultImage } from "@protocol";
@@ -23,11 +24,13 @@ import { makeHardStopPolicy } from "./hardstops";
 import { BROWSER_LOGGEDIN_FILE, LoggedInSitesService, runOwnerBrowser, type AgentBrowserLauncher, type AgentBrowserProcess } from "./loggedin";
 import {
   BROWSER_COMMAND,
+  BROWSER_DISK_CACHE_PREFIX,
   BROWSER_KEY,
   BROWSER_OUTPUT_DIRNAME,
   BROWSER_STATE_DIRNAME,
   PLAYWRIGHT_MCP_PACKAGE,
   browserProfileDir,
+  browserSessionDir,
   buildBrowserLaunch,
   chooseBrowserMode,
   defaultDesktopProbe,
@@ -94,6 +97,9 @@ export interface BrowserServiceDeps {
   maxDownloadBytes?: number;
   /** The browser gate's clock for its freshness rule (default `Date.now`; a test seam). */
   pageClock?: () => number;
+  /** Every running process's command line, one per line, or undefined when it cannot be listed
+   *  (default: `/bin/ps -axww -o command=`; a test seam). */
+  processList?: () => string | undefined;
   // ── Phase C4 ──
   /** How the throwaway test daemon is built, started, probed and timed (test seams). */
   testDaemon?: Partial<TestDaemonSeams>;
@@ -153,6 +159,15 @@ export function ensureGitExcluded(worktree: string, entry: string): boolean {
 }
 
 const DESKTOP_PROBE_TTL_MS = 10_000;
+
+function defaultProcessList(): string | undefined {
+  try {
+    const r = Bun.spawnSync(["/bin/ps", "-axww", "-o", "command="], { stdout: "pipe", stderr: "ignore", timeout: 5000 });
+    return r.exitCode === 0 ? r.stdout.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 interface Runtime {
   mode: BrowserMode;
@@ -370,6 +385,8 @@ export class BrowserService {
       ...deps.testDaemon,
     });
     this.hooks.ownOrigin = (sessionId) => this.testDaemons.origin(sessionId);
+    this.hooks.profileLockedSites = () => this.loggedIn.lockedSites();
+    this.hooks.browserEnded = (sessionId) => this.browserEnded(sessionId);
     this.hooks.trafficSeq = () => this.trafficCounter;
     this.hooks.trafficSince = (sessionId, seq) => this.trafficSince(sessionId, seq);
     this.hooks.allowEvaluate = (info) => {
@@ -412,6 +429,7 @@ export class BrowserService {
       /* already gone */
     }
     this.ownerBrowser = undefined;
+    for (const sessionId of this.runtimes.keys()) this.removeDiskCaches(sessionId);
     this.runtimes.clear();
   }
 
@@ -530,6 +548,48 @@ export class BrowserService {
     if ((this.trafficDropped.get(sessionId) ?? 0) > seq) out.add(TRAFFIC_LOST_SITE);
     for (const e of this.traffic.get(sessionId) ?? []) if (e.seq > seq) out.add(e.site);
     return [...out];
+  }
+
+  /**
+   * After a `browser_close` result: whether NO process of the session's browser is still running — no
+   * process has the session's proxy as its `--proxy-server` (each session's proxy has its own port, and
+   * Playwright hands it to Chrome's main process exactly so). Playwright closes Chrome before the result
+   * returns, so this is normally true at once; it is asked a few times over about a second. False when
+   * the processes cannot be listed or the session has no proxy (fail closed: the sticky set stays).
+   */
+  browserEnded(sessionId: string): boolean {
+    const port = this.proxies.get(sessionId)?.port;
+    if (!port) return false;
+    const marker = new RegExp(`--proxy-server=http://127\\.0\\.0\\.1:${port}(?![0-9])`);
+    const list = this.deps.processList ?? defaultProcessList;
+    for (let i = 0; i < 6; i++) {
+      const ps = list();
+      if (ps === undefined) return false;
+      if (!ps.split("\n").some((line) => marker.test(line))) return true;
+      if (i < 5) Bun.sleepSync(200);
+    }
+    return false;
+  }
+
+  /** Delete the session's per-launch HTTP cache folders (headed mode), except `keep`. */
+  private removeDiskCaches(sessionId: string, keep?: string): void {
+    const dir = browserSessionDir(this.deps.stateDir, sessionId);
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      const p = join(dir, n);
+      if (n.startsWith(BROWSER_DISK_CACHE_PREFIX) && p !== keep) {
+        try {
+          rmSync(p, { recursive: true, force: true });
+        } catch (e) {
+          console.error(`[browser] could not delete an old HTTP cache folder: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
   }
 
   // ── the page screenshot (Phase C3) ──────────────────────────────────────────────────────────
@@ -736,14 +796,18 @@ export class BrowserService {
     const cliPath = browserRuntimeCli(this.deps.stateDir);
 
     const { mode } = this.mode();
-    const launch = buildBrowserLaunch({ mode, proxyPort: proxy.port, worktree, stateDir: this.deps.stateDir, sessionId, nodePath, cliPath });
+    // Headed: a new HTTP cache folder for this launch, outside the profile (preset.ts, BROWSER_DISK_CACHE_FLAG).
+    const launch = buildBrowserLaunch({ mode, proxyPort: proxy.port, worktree, stateDir: this.deps.stateDir, sessionId, nodePath, cliPath, ...(mode === "headed" ? { launchId: randomUUID() } : {}) });
     const problems = presetArgProblems(launch, cliPath);
     if (problems.length) return { skip: `the browser's launch line failed its own check (${problems[0]})` };
     try {
       mkdirSync(dirname(launch.configPath), { recursive: true });
+      // The browser this launch replaces is gone: so is the cache it filled.
+      this.removeDiskCaches(sessionId, launch.diskCacheDir);
       writeFileSync(launch.configPath, `${JSON.stringify(launch.configJson, null, 2)}\n`);
       mkdirSync(launch.outputDir, { recursive: true });
       if (launch.profileDir) mkdirSync(launch.profileDir, { recursive: true, mode: 0o700 });
+      if (launch.diskCacheDir) mkdirSync(launch.diskCacheDir, { recursive: true, mode: 0o700 });
     } catch (e) {
       return { skip: `could not prepare the browser's files: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -751,8 +815,9 @@ export class BrowserService {
     ensureGitExcluded(worktree, `${DOWNLOADS_DIRNAME}/`);
     if (!this.sweptAt.has(sessionId)) this.sweptAt.set(sessionId, Date.now());
 
-    // A new server process means a new, empty browser: the old page (and any hold on it) is gone.
-    this.gate.pageGone(sessionId);
+    // A new server process means a new browser: the old page (and any hold on it) is gone. Only a new
+    // headless one (a new throwaway profile) also starts with an empty sticky set (gate.ts).
+    this.gate.pageGone(sessionId, mode);
     this.shots.delete(sessionId);
     this.runtimes.set(sessionId, { mode, integrationId: integration.id, worktree });
     return { type: "stdio", command: launch.command, args: launch.args };
@@ -846,6 +911,7 @@ export class BrowserService {
   /** The session was reset, deleted or archived, or the browser was switched off for it. */
   forgetSession(sessionId: string): void {
     this.testDaemons.stop(sessionId, "the session was reset, deleted or lost its browser");
+    this.removeDiskCaches(sessionId);
     this.runtimes.delete(sessionId);
     this.proxies.closeSession(sessionId);
     this.gate.forget(sessionId);

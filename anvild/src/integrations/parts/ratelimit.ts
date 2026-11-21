@@ -68,10 +68,13 @@ export class DailyCounter {
     }
   }
 
+  /** A row (or a corrupt read) dated LATER than today means the clock stepped back: it counts as
+   *  today, with its count, so stepping the clock back never buys a fresh day. (Days are YYYY-MM-DD,
+   *  so they compare as strings.) */
   private used(source: string, today: string): number {
-    if (this.poisonedDay === today) return Number.POSITIVE_INFINITY;
+    if (this.poisonedDay !== undefined && this.poisonedDay >= today) return Number.POSITIVE_INFINITY;
     const e = this.counts[source];
-    return e && e.day === today ? e.count : 0;
+    return e && e.day >= today ? e.count : 0;
   }
 
   /** Whether one more call fits under `limit` today; a refused call waits for the next UTC midnight. */
@@ -85,7 +88,7 @@ export class DailyCounter {
     const today = utcDay(this.now());
     this.poisonedDay = undefined; // only reachable on a later day than the corrupt read
     this.counts[source] = { day: today, count: this.used(source, today) + 1 };
-    for (const [k, e] of Object.entries(this.counts)) if (e.day !== today) delete this.counts[k];
+    for (const [k, e] of Object.entries(this.counts)) if (e.day < today) delete this.counts[k]; // a future-dated row is today's
     if (!this.file) return;
     try {
       mkdirSync(dirname(this.file), { recursive: true });
