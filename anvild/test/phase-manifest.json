@@ -1368,7 +1368,7 @@
             "buildBrowserLaunch > [C2] a launch that is not an absolute node and the absolute runtime script fails the check: npx, a bare node, a relative script, a script outside the runtime",
             "buildBrowserLaunch > [C2] headed: the complete argument list, with the dedicated profile under the state dir",
             "buildBrowserLaunch > [C2] no desktop session: the built config is headless with a temporary profile (--isolated --headless, no --user-data-dir)",
-            "buildBrowserLaunch > [C2] the generated config carries the three Chrome arguments and nothing else — no ignoreDefaultArgs",
+            "buildBrowserLaunch > [C2] the generated config carries the three Chrome arguments and nothing else — no ignoreDefaultArgs (headed: plus the launch's own --disk-cache-dir)",
             "buildBrowserLaunch > [C2] the preset's arguments are a subset of the allow list: every flag in both modes is on it, with nothing else",
             "buildBrowserLaunch > [C2] never --proxy-bypass, --caps, --blocked-origins or --allowed-origins, in either mode",
             "buildBrowserLaunch > [C2] there is no launch line without a proxy port",
@@ -1378,7 +1378,8 @@
             "desktop detection > [C2] headed needs the daemon's own user on the console: scutil's ConsoleUser names them with kCGSSessionOnConsoleKey TRUE",
             "desktop detection > [C2] nobody logged in, the login window, another user, or a session off the console → no desktop → headless fallback",
             "desktop detection > [C2] a headed launch that failed falls back to headless even with a desktop session",
-            "git exclude > [C2] .anvil-browser/ is added once to the checkout's .git/info/exclude; a linked worktree uses the common git dir; a plain folder is left alone"
+            "git exclude > [C2] .anvil-browser/ is added once to the checkout's .git/info/exclude; a linked worktree uses the common git dir; a plain folder is left alone",
+            "the headed HTTP cache folder (fix-c-final) > [C3] fix-c-final: a headed launch puts Chrome's HTTP cache in a new folder per launch outside the profile; the check refuses a headed config without it, with two, with one inside the profile or not absolute, and a headless config with one"
           ]
         },
         {
@@ -1492,7 +1493,7 @@
             "feature flag > [C2] with `browser` absent from ANVIL_FEATURES the preset is not registered, no proxy listens, nothing is written and the commands are refused",
             "feature flag > [C2] `browser` without `mcp-integrations` is inert too; with both, the preset, gate and result hook are registered and removed again on shutdown",
             "the preset > [C2] the browser integration is key `browser`, stdio, exclusive — whatever the client sends — and update cannot change its transport or exclusivity",
-            "the preset > [C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments; the proxy port is the session's own listener",
+            "the preset > [C2] a session's launch line is the preset's, wrapped in env -i: node by absolute path running the daemon-owned runtime's script by absolute path; the config file holds exactly the three Chrome arguments (headed: plus a new --disk-cache-dir per launch, outside the profile, deleted when the browser is replaced or the session forgotten); the proxy port is the session's own listener",
             "the preset > [C2] a hand-edited store cannot add a flag: the stored transport is ignored when the launch line is built",
             "the preset > [C2] no desktop session: the session's launch line is headless with a temporary profile, and the row says why",
             "the preset > [C2] the worktree's .git/info/exclude gains .anvil-browser/ when the session folder is a checkout",
@@ -1620,7 +1621,7 @@
             "on a LOCKED logged-in site > [C3] when the page's address is unknown it is treated as a logged-in site, never as 'not logged in': only reads run",
             "unlock (item 44) and sites that are not logged-in > [C3] choosing Unlock <site> sets the site's unlock switch and lets the call through; Allow once does not unlock",
             "unlock (item 44) and sites that are not logged-in > [C3] on an UNLOCKED logged-in site nothing asks — every tool in the table, including on a checkout or payment page — and locking it again makes the next click prompt",
-            "unlock (item 44) and sites that are not logged-in > [C3] on an allowed site that is not logged-in a click, a key press and a form fill do not prompt; a site that only has cookies from agent sessions is not logged-in",
+            "unlock (item 44) and sites that are not logged-in > [C3] on an allowed site that is not logged-in a click, a key press and a form fill do not prompt; a site that only has cookies from agent sessions is not logged-in (headless, or headed once every logged-in site is unlocked — fix-c-final)",
             "unlock (item 44) and sites that are not logged-in > [C3] headless fallback: a logged-in site is refused entirely — unlocked or not — at navigation and when a page lands on it"
           ]
         },
@@ -1665,7 +1666,7 @@
           "file": "test/integration/browser-c3-loggedin.test.ts",
           "names": [
             "Phase C3 acceptance: hard stops on a logged-in site > [C3] on a LOCKED logged-in site under bypass: a snapshot, a PageDown key press and a same-site https navigation do not prompt; a click, an Enter key press and a form fill each prompt with a screenshot attached and no always-allow option",
-            "Phase C3 acceptance: hard stops on a logged-in site > [C3] on an allowed site that is not logged-in, a click, an Enter key press and a form fill do not prompt — in a bypass session and in an ordinary one",
+            "Phase C3 acceptance: hard stops on a logged-in site > [C3] on an allowed site that is not logged-in, a click, an Enter key press and a form fill do not prompt — in a bypass session and in an ordinary one (headed: only once no logged-in site is locked, fix-c-final)",
             "Phase C3 acceptance: hard stops on a logged-in site > [C3] the card shows the page as it is now: after any action the screenshot is stale, so the next action is denied until the model takes a new one; a screenshot of another page does not count",
             "Phase C3 acceptance: hard stops on a logged-in site > [C3] gamed spec: a misleading element text changes nothing — the decision uses only the tool's class and the page site the daemon tracked",
             "Phase C3 acceptance: hard stops on a logged-in site > [C3] a hard stop is denied without a card in an unattended (builder) session",
@@ -1712,7 +1713,7 @@
           "names": [
             "item 1: a page that moves by itself > [C3] review 1: after the result, traffic to a locked logged-in site makes the page unknown — a key press or a click is refused with 'take a snapshot first', under bypass; the snapshot then applies the hard stop on that site",
             "item 1: a page that moves by itself > [C3] review 1: traffic to a site not allowed in this session also makes the page unknown; traffic only to the page's own site does not, nor does traffic that came before the result",
-            "item 1: a page that moves by itself > [C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page clears it",
+            "item 1: a page that moves by itself > [C3] review 4: a locked logged-in site contacted since the navigation to the current page (a frame from it) makes input on that page a hard stop naming it; reads and navigations are not stopped; a new page does not clear it, nor does about:blank; a browser_close that ended the (headless) browser does",
             "item 1: a page that moves by itself > [C3] review 6: browser_close is allowed in every state — unknown, held, closing, and on a locked logged-in site",
             "item 2: the card's picture > [C3] review 2: a PNG planted in .anvil-browser and named in browser_find's text never becomes the card image; neither does a file a take_screenshot result links that was there before the call",
             "item 2: the card's picture > [C3] review 2: the screenshot goes stale after an input call and when the browser contacts another site after it was taken",
@@ -1724,7 +1725,11 @@
             "item 6: small gaps > [C3] review 6: an updatedInput sent with the answer to a browser prompt is ignored — the call that runs is the one the card showed",
             "item 6: small gaps > [C3] review 6: the runtime's node is what `node -p process.execPath` prints from a neutral daemon folder, so a .tool-versions planted in the worktree cannot change it",
             "item 6: small gaps > [C3] review 6: the file-offer quarantine check compares real paths — a link inside the worktree that points into .anvil-downloads gets no download card",
-            "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused"
+            "item 7: test safety > [C3] review 7: the default 'Open agent browser' launcher refuses under a test runner and for a state folder in the temp folder; a real daemon's folder outside it is not refused",
+            "fix-round re-review: the embedded locked-site set is sticky > [C3] re-review: pushState, a #fragment navigation, a new tab then select back, and going back all keep the locked frame's site — input stays a hard stop and browser_evaluate is refused; an unlocked site does not stop; about:blank does not clear it (in one tab or all), a browser_close that ended the (headless) browser does",
+            "fix-round re-review: the embedded locked-site set is sticky > [C3] fix-c-final: browser_close clears the set only when no process of the browser is left — a process still holding the session's proxy, or a process list that cannot be read, keeps it; and only in headless mode",
+            "fix-round re-review: the embedded locked-site set is sticky > [C3] fix-c-final (headed): every locked logged-in site counts as loaded from the first call of every launch, with no traffic — a click on a page that never touched it is a hard stop saying the profile holds it, and browser_evaluate is refused; about:blank, browser_close and a rebuilt browser do not end it; unlocking does",
+            "fix-round re-review: the embedded locked-site set is sticky > [C3] fix-c-final: the locked sites the headed browser starts with — the list's locked sites; with a damaged list every site the profile has cookies for, or (cookies unreadable) an unknown-sites marker, named by the gate"
           ]
         },
         {
@@ -1744,7 +1749,7 @@
         {
           "file": "test/integration/browser-c4-review.test.ts",
           "names": [
-            "item 2: an overflowing traffic log > [C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; a navigation to a page with a complete log clears it",
+            "item 2: an overflowing traffic log > [C3] review C4-2: allowed A frames locked B and then makes 2,100 same-site requests — the next click needs a snapshot, and after it the click is still a hard stop naming that Anvil lost track; neither a navigation to another page nor about:blank clears it, a browser_close that ended the (headless) browser does",
             "item 3: the card's picture cannot be chosen by the agent > [C3] review C4-3: browser_take_screenshot with any filename is denied, without one it is allowed; a file it links — even one written during the call — never becomes the card image, only its inline image does",
             "item 3: the card's picture cannot be chosen by the agent > [C3] review C4-3: the agent's Write, Edit, MultiEdit and NotebookEdit are denied inside .anvil-browser/ (also through a link into it); Read there and writes elsewhere are not",
             "item 4: time passing with the page live > [C3] review C4-4: after browser_wait_for whose result has no page block the next click needs a snapshot; a wait whose result carries the page block does not"
@@ -1756,6 +1761,12 @@
             "the freshness rule (C4 review, item 4) > [C3] review C4-4: FRESH_PAGE_MS is 2 s; an input, upload or script call more than 2 s after the last result that said where the page is is refused with 'take a snapshot first', at 2 s it is not",
             "the freshness rule (C4 review, item 4) > [C3] review C4-4: any result carrying the server's page block counts (a click's own result); one without it (a screenshot, a console read) does not refresh the clock",
             "the freshness rule (C4 review, item 4) > [C3] review C4-4: a browser_wait_for whose result has no page block makes the page unknown for input even within 2 s; one whose result carries it is fresh"
+          ]
+        },
+        {
+          "file": "test/unit/browser-gate.test.ts",
+          "names": [
+            "what empties the sticky set (fix-c-final) > [C3] fix-c-final: only a throwaway-profile browser that has certainly ended empties the contacted set — about:blank never does; browser_close does in headless mode only when browserEnded says so; a rebuilt server does only when the new browser is headless; a dropped headed driver (no mode) never does"
           ]
         }
       ],
@@ -1784,6 +1795,35 @@
           "names": [
             "real Chrome: the C4 review's bypasses > [C3] real review C4-2: allowed A frames locked B, then makes 2100 same-site fetches — after a snapshot the click is still a hard stop naming that Anvil lost track, and B records zero presses",
             "real Chrome: the C4 review's bypasses > [C3] real review C4-3: while a background loop keeps replacing every PNG in .anvil-browser/ with a planted one, browser_take_screenshot with a filename is refused and the hard-stop card shows the real server's inline image, byte for byte — never the planted file"
+          ]
+        },
+        {
+          "file": "test/real/browser-sticky-frames.test.ts",
+          "names": [
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review: setup — the real server starts headless through the real proxy; A (127.0.0.1) is allowed, B (localhost) is a locked logged-in site, and the session's test daemon (stand-in) is running",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (pushState): A frames locked B, then moves its own address with history.pushState — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (fragment): the agent navigates A/frame to A/frame#x (same document) — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (tabs): A frames locked B; a new tab, a tab list, then selecting the first tab again — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (back): A frames locked B; the agent opens A/plain, then browser_navigate_back restores A/frame (back/forward cache) — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real re-review (back after about:blank): A frames locked B; the agent sends the page to about:blank, then browser_navigate_back restores A/frame — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C3] real fix-c-final (headed: nothing clears): after about:blank and after browser_close the set still holds locked B — the headed agent profile is persistent — and a click on A's own button on a page with no frame is still a hard stop naming B"
+          ]
+        },
+        {
+          "file": "test/real/browser-sticky-headless.test.ts",
+          "names": [
+            "real Chrome, headless fallback: a fresh load after about:blank need not re-contact the framed site > [C3] real fix-c-final: setup — the service's own headless launch line (--isolated --headless) through the real proxy; A is allowed, B (http and https) is a locked logged-in site",
+            "real Chrome, headless fallback: a fresh load after about:blank need not re-contact the framed site > [C3] real fix-c-final (close): browser_close on the isolated fallback ends the Chrome process (no process holds the session's proxy any more), so it empties the set — then a click on A's own button on a page with no frame runs without a prompt",
+            "real Chrome, headless fallback: a fresh load after about:blank need not re-contact the framed site > [C3] real fix-c-final (R1, HTTP cache): A frames locked B with Cache-Control max-age; about:blank; a fresh browser_navigate to A/frame shows B's frame from Chrome's HTTP cache with NO proxy traffic to B — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome, headless fallback: a fresh load after about:blank need not re-contact the framed site > [C3] real fix-c-final (T1, HTTPS tunnel reuse): A frames locked B over HTTPS with no-store; about:blank; a fresh browser_navigate to A/frame loads B's frame over the tunnel Chrome already holds, with NO new CONNECT to B — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses"
+          ]
+        },
+        {
+          "file": "test/real/browser-sticky-profile.test.ts",
+          "names": [
+            "real Chrome on a reused profile (headed rules): a new process does not show a locked site's frame unseen > [C3] real fix-c-final (profile, launch one): session one loads A framing B (cacheable) and A framing B's page that registers B's service worker; its HTTP cache is in the launch's own folder, not in the profile",
+            "real Chrome on a reused profile (headed rules): a new process does not show a locked site's frame unseen > [C3] real fix-c-final (profile, service worker): launch two, in a second session whose set starts empty, shows B's frame from B's service worker with no request for it — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome on a reused profile (headed rules): a new process does not show a locked site's frame unseen > [C3] real fix-c-final (profile, cache folder): in launch two B's cacheable frame is fetched AGAIN through the proxy (the HTTP cache is per launch, outside the profile), the old launch's cache folder is gone — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses"
           ]
         }
       ]
@@ -1840,7 +1880,7 @@
           "names": [
             "the session's own test daemon is an allowed page > [C4] navigating to the session's test-daemon origin needs no site prompt — under prompt-all, in an unattended session and in headless mode — and a result on it holds nothing",
             "the session's own test daemon is an allowed page > [C4] only that exact origin: another loopback port, localhost, https on the same port, and another session's test daemon all get the ordinary site prompt",
-            "the session's own test daemon is an allowed page > [C4] the test daemon is never a logged-in site: with 127.0.0.1 on the logged-in list and locked, a click on the test daemon does not prompt and headless mode does not refuse it; a real logged-in site still stops",
+            "the session's own test daemon is an allowed page > [C4] the test daemon is never a logged-in site: with 127.0.0.1 on the logged-in list and locked, a click on the test daemon does not prompt (headless; headed, it asks only because the agent profile holds the locked 127.0.0.1 — fix-c-final) and headless mode does not refuse it; a real logged-in site still stops",
             "browser_evaluate > [C4] browser_evaluate is allowed when the tracked page is exactly the session's test-daemon origin, and denied everywhere else: an allowed site, another loopback port, about:blank, before any page, and for a session with no test daemon",
             "browser_evaluate > [C4] the address must be KNOWN: after an evaluate (whose result never sets the address) the next evaluate is refused until a snapshot says the page is still on the test daemon",
             "browser_evaluate > [C4] when the test daemon stops, the page that was showing it must be left (CLOSING, no owner prompt), browser_evaluate is denied at once, and its old address is an ordinary unapproved site again"
@@ -1859,7 +1899,7 @@
             "Acceptance: how it ends > [C4] Acceptance (§7): a test daemon that outlives everything else is killed by the 15-minute timer — process gone, home deleted, port closed, and the session is told",
             "Acceptance: how it ends > [C4] it is also stopped by stop_test_daemon, when the session is reset, when it is deleted, when the browser is switched off for it, and when the daemon shuts down",
             "the gate > [C4] browser_evaluate is allowed on the session's test-daemon origin and denied elsewhere — through the real permission hook, under bypass too — and denied again the moment the daemon stops",
-            "the gate > [C4] the test-daemon origin is the session's own: navigating to it asks nobody under prompt-all, a page on it is not held, and it is never treated as a logged-in site even when 127.0.0.1 is on the owner's list",
+            "the gate > [C4] the test-daemon origin is the session's own: navigating to it asks nobody under prompt-all, a page on it is not held, and it is never treated as a logged-in site even when 127.0.0.1 is on the owner's list (in headed mode its inputs still ask, because the agent profile holds that listed site — fix-c-final)",
             "permission and availability > [C4] start_test_daemon follows the session's autonomy policy as a mutating tool: prompt-all and allowlist park a card (Deny refuses it), mostly-autonomous and bypass run it; it is not in allowedTools, so the canUseTool backstop denies it",
             "permission and availability > [C4] only an ordinary session with the browser switched on gets the anvil_test server: a plain session, the concierge and a team lead do not, and with the browser feature off nothing of it exists"
           ]
@@ -1868,7 +1908,7 @@
           "file": "test/integration/browser-c4-review.test.ts",
           "names": [
             "item 1: the session's own test daemon has no exemption from the traffic rules > [C4] review 1: an own-origin page that moves itself to a locked logged-in site — the next key press, click and script are refused with 'take a snapshot first'; the snapshot then shows the site under its hard stop",
-            "item 1: the session's own test daemon has no exemption from the traffic rules > [C4] review 1: an own-origin page that frames a locked logged-in site — a click is a hard stop naming it and browser_evaluate is refused; the own origin itself still needs no site prompt and a page with no such frame acts freely"
+            "item 1: the session's own test daemon has no exemption from the traffic rules > [C4] review 1: an own-origin page that frames a locked logged-in site — a click is a hard stop naming it and browser_evaluate is refused; the own origin itself still needs no site prompt and a page with no such frame acts freely (headless)"
           ]
         }
       ],
@@ -1888,6 +1928,13 @@
             "real Chrome: the C4 review's bypasses > [C4] real review: setup — the real server starts headless through the real proxy; the session's test daemon (stand-in) is running and its origin is the session's own; A (127.0.0.1) is allowed, B (localhost) is a locked logged-in site",
             "real Chrome: the C4 review's bypasses > [C4] real review 1 (timer): after the own-origin page's own timer sends it to locked B, the next key press and click are refused, B records zero presses, and the snapshot then shows B under its hard stop",
             "real Chrome: the C4 review's bypasses > [C4] real review 1 (frame): an own-origin page that frames locked B — a key press and a click are hard stops naming B (screenshot first, then a card), browser_evaluate is refused, and B records zero presses"
+          ]
+        },
+        {
+          "file": "test/real/browser-sticky-frames.test.ts",
+          "names": [
+            "real Chrome: a locked site's frame stays a hard stop > [C4] real re-review (own pushState): the session's own test daemon frames locked B and pushes its address — a click on B's Pay now by its frame ref is a hard stop naming B, and B records zero presses",
+            "real Chrome: a locked site's frame stays a hard stop > [C4] real re-review (evaluate): on the session's own test daemon after it framed locked B and pushed its address, browser_evaluate with the frame's ref as target is refused naming B, and B records zero presses"
           ]
         }
       ]
@@ -1918,7 +1965,9 @@
             "rate limiter > [C5] keys are scrubbed from text, raw and URL-encoded",
             "daily quota (UTC calendar day, persisted) > [C5] daily quota: N calls use up the UTC day, a new limiter over the same file (a restart) still refuses, the refusal waits until UTC midnight, and the next UTC day allows again",
             "daily quota (UTC calendar day, persisted) > [C5] daily quota: a refused short window does not count against the day, and the vendor's pause leaves the day alone",
-            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a corrupt or wrong-shaped file fails closed for the rest of that UTC day, then the next day rewrites it; a missing file is a fresh day"
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a corrupt or wrong-shaped file fails closed for the rest of that UTC day, then the next day rewrites it; a missing file is a fresh day",
+            "daily quota (UTC calendar day, persisted) > [C5] daily quota: a row dated in the future (the clock stepped back) counts as today with its count — a restart on the earlier day is still refused, another source's future row survives a write, and a corrupt read on a later day stays closed after the step back",
+            "rate limiter > [C5] fix-c-final: a key is scrubbed whatever case its percent-escapes are in, and however much of it is encoded"
           ]
         },
         {
@@ -1967,7 +2016,8 @@
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] the daily quota is counted in the daemon's state dir, so a restarted daemon (a new service over the same dir) does not get a fresh day",
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] parts_fetch refuses a URL whose host is a fleet member (the FleetStore roster http.ts hands the supervisor), whatever it resolves to; nothing is fetched",
             "review fixes: results scrubbed, daily quota persisted, fleet hosts refused, no allowedTools entry > [C5] neither parts tool is in allowedTools; the autonomy policy classifies parts_search as read-only (allowed by the hook without a prompt under the default policy) and parts_fetch as a write",
-            "tools, permissions and keys > [C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not"
+            "tools, permissions and keys > [C5] an autopilot builder gets anvil_parts too (decision 184) — and still no browser, no test daemon and no MCP integration; a planner does not",
+            "fix-round re-review: parts_fetch output is scrubbed > [C5] re-review: a TraceParts cadFileUrl whose path, query and Content-Disposition file name carry every key and the issued token — the tool text, the saved file's name and the logs carry none of them (raw or URL-encoded), and the source URL is shown without its query"
           ]
         },
         {

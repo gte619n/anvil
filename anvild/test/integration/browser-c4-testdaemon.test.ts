@@ -310,7 +310,7 @@ describe("the gate", () => {
     expect(browserOf(rig).gate.state(s.id).closing?.reason).toMatch(/test daemon was stopped/);
   });
 
-  test("[C4] the test-daemon origin is the session's own: navigating to it asks nobody under prompt-all, a page on it is not held, and it is never treated as a logged-in site even when 127.0.0.1 is on the owner's list", async () => {
+  test("[C4] the test-daemon origin is the session's own: navigating to it asks nobody under prompt-all, a page on it is not held, and it is never treated as a logged-in site even when 127.0.0.1 is on the owner's list (in headed mode its inputs still ask, because the agent profile holds that listed site — fix-c-final)", async () => {
     const s = await browserSession(rig, integration, { cwd: worktree, autonomy: "prompt-all" });
     const url = await start(s);
     browserOf(rig).loggedIn.add("127.0.0.1", "owner"); // locked, as every new logged-in site is
@@ -322,7 +322,12 @@ describe("the gate", () => {
     feedResult(rig, s, "browser_navigate", pageResult(`${url}/`, "Anvil"), { url: `${url}/` });
     expect(browserOf(rig).gate.state(s.id).hold).toBeUndefined();
     for (const [tool, input] of [["browser_click", { target: "e1", element: "Settings" }], ["browser_type", { target: "e2", text: "hello" }], ["browser_press_key", { key: "Enter" }]] as const) {
-      expect([tool, (await browserHook(rig, s, tool, input)).decision]).toEqual([tool, "allow"]);
+      // Not as "on 127.0.0.1": the page is the session's own. But the headed agent profile holds the
+      // locked 127.0.0.1, whose frames can load from it with no traffic (fix-c-final), so it asks — and
+      // first wants a screenshot for the card.
+      const v = await browserHook(rig, s, tool, input);
+      expect([tool, v.decision]).toEqual([tool, "deny"]);
+      expect(v.reason).toMatch(/^\w[\w ]* on \(this session's test daemon\) in the headed agent browser, whose profile holds 127\.0\.0\.1, a logged-in site.*browser_take_screenshot first/);
       feedResult(rig, s, tool, pageResult(`${url}/`, "Anvil"), input);
     }
     expect(s.pendingPermissions.size).toBe(0);
