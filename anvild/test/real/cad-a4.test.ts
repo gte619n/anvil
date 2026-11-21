@@ -760,6 +760,8 @@ describe("real SolidCraft: a reference measures what its import did", () => {
     const card = x.openCards().find((c: any) => c.kind === "adopt-references");
     expect(card).toBeDefined();
     expect(row(card, "refs/far.step")).toMatchObject({ old: "measurements not recorded", new: expect.stringContaining(`approve current reference (sha ${approved.sha256.slice(0, 12)}, 1 body: far)`) });
+    // …and, per body, the measurements approving records (the import replayed alone, before the card was drawn).
+    expect(row(card, "refs/far.step far")).toMatchObject({ new: "volume 1000 mm³, bounding box [100, 0, 0]…[110, 10, 10], 6 faces" });
     x.service.respond(card.requestId, true);
     for (let i = 0; i < 400 && !x.service.locks.findPart(id, "plate")!.references; i++) await new Promise((r) => setTimeout(r, 25));
     // What is recorded is the import replayed alone: the same numbers import_reference measured.
@@ -901,4 +903,69 @@ describe("real SolidCraft: references are checked against their TRUE import", ()
     expect(g.checks.find((c: any) => c.id === "interference diag.step").measured).toMatch(/by 153\.938 mm³/);
     expect(g.checks.find((c: any) => c.id === "interference diag.step as imported").measured).toMatch(/by 40\.841 mm³/);
   }, 300_000);
+
+  test.skipIf(!REAL)("[A4] real: veto — big.step (600×600×10, four r=3 holes symmetric about its centre) with a r=3.006 pin 6 µm into one hole (0.453 mm³): reshaped by four hand-written offset_face features (the pin's hole and its diagonal partner grown 9 µm, the other two shrunk by the same material) the live body clears the pin and the summary numbers hold, but the shape check — a 0.1 nm depth over the import's surface (0.074 mm³ here), not 1e-6 of the volume (3.6 mm³) — fails; the true import, imported before and after the pin, still finds the 0.453 mm³; release_part writes nothing and verify-cli exits 1", async () => {
+    expect(hasSolidcraft()).toBe(true);
+    const repo = tempRepo("anvil-cad-real-");
+    const x = await buildPlate(repo, { cli: SOLIDCRAFT_CLI });
+    const holes = [[100, 100], [500, 100], [100, 500], [500, 500]];
+    await must(x.tools.open_part!({ part: "big" }));
+    await must(x.tools.record_expectations!({ part: "big", process: "fdm-0.4", parameters: {}, expectations: { bbox: [10, 600, 600], volume: 3600000 - holes.length * Math.PI * 9 * 10, bodies: 1, holes: [{ diameter: 6, count: holes.length }] } }));
+    await must(x.tools.execute!({ command: "solid.box", params: { length: 600, width: 600, height: 10, corner: [0, 0, 0], name: "Big" } }));
+    for (const [hx, hy] of holes) await must(x.tools.execute!({ command: "solid.hole", params: { position: [hx, hy, 10], diameter: "6", depth: "10" } }));
+    const step = join(repo, (await must(x.tools.export_part!({ part: "big", formats: ["step"] }))).json.exports[0].path);
+    mkdirSync(join(repo, ".anvil-downloads"), { recursive: true });
+    copyFileSync(step, join(repo, ".anvil-downloads", "big.step"));
+    await must(x.tools.open_part!({ part: "pin" }));
+    const r = 3.006;
+    await must(x.tools.record_expectations!({ part: "pin", process: "fdm-0.4", parameters: {}, expectations: { bbox: [4, 2 * r, 2 * r], volume: Math.PI * r * r * 4, bodies: 1, holes: [] } }));
+    await must(x.tools.execute!({ command: "solid.cylinder", params: { radius: String(r), height: "4", base: [100, 100, 6], name: "Pin", body_name: "Pin" } }));
+    expect((await asOwner(x, x.tools.import_reference!({ part: "pin", file: ".anvil-downloads/big.step" }))).json.imported).toBe(true);
+    const ref = partRef(repo, "pin");
+    const stateDir = x.service.locks.file.replace(/\/cadwork\/locks\.json$/, "");
+    const designPath = join(repo, "cad", "pin", "design.json");
+    const check = async () => (await must(x.tools.check_part!({ part: "pin" }))).json;
+    let g = await check();
+    // Untouched: the live check and the true import both find the 6 µm overlap; the untouched
+    // reference is the same solid as its import at the 0.1 nm depth (measured noise: exactly 0).
+    expect(g.state).toBe("fail");
+    expect(g.checks.find((c: any) => c.id === "interference big.step").measured).toMatch(/by 0\.453 mm³/);
+    expect(g.checks.find((c: any) => c.id === "interference big.step as imported").measured).toMatch(/by 0\.453 mm³/);
+    expect(g.checks.find((c: any) => c.id === "geometry big.step")).toMatchObject({ ok: true, measured: "as imported" });
+    const recorded = x.service.locks.findPart(repoIdentity(repo), "pin")!.references!["big.step"]!.bodies[0]!;
+    // The reshape: grow (100, 100) and (500, 500) to r 3.009; shrink (500, 100) and (100, 500) by the same area.
+    const grown = 3.009;
+    const b = String(3 - Math.sqrt(18 - grown * grown));
+    await handWritten(x, ref, designPath, [
+      ["solid.offset_face", { faces: [[103, 100, 5]], distance: String(3 - grown) }],
+      ["solid.offset_face", { faces: [[503, 500, 5]], distance: String(3 - grown) }],
+      ["solid.offset_face", { faces: [[503, 100, 5]], distance: b }],
+      ["solid.offset_face", { faces: [[103, 500, 5]], distance: b }],
+    ], "offset_face");
+    g = await check();
+    // The summary numbers held (the fast pre-check passes), and the live body clears the pin.
+    const live = (await x.tools.execute!({ command: "inspect.measure", params: { bodies: [recorded.name] } })).json.bodies[0];
+    expect(Math.abs(live.volume_mm3 - recorded.volume)).toBeLessThan(1e-6 * recorded.volume);
+    expect(live.faces).toBe(recorded.faces);
+    expect(g.state).toBe("fail");
+    expect(g.checks.find((c: any) => c.id === "interference big.step")).toMatchObject({ ok: true, measured: "no overlap" });
+    const geo = String(g.checks.find((c: any) => c.id === "geometry big.step").measured);
+    expect(geo).toContain(`reference big.step ${REFERENCE_RESHAPED} (shape is not the import's: it shares`);
+    expect(geo).not.toMatch(/volume \d|bounding box|faces \d|centre of mass/);
+    // The import lacks ~3.4 mm³ in the live body: under 1e-6 of its volume, over the depth allowance.
+    const shares = Number(/it shares ([\d.]+) of the import's ([\d.]+) mm³/.exec(geo)![2]) - Number(/it shares ([\d.]+)/.exec(geo)![1]);
+    expect(shares).toBeGreaterThan(3);
+    expect(shares).toBeLessThan(1e-6 * recorded.volume);
+    expect(g.failing.join("\n")).toMatch(/interference big\.step as imported: .*by 0\.453 mm³/);
+    const rel = await asOwner(x, x.tools.release_part!({ part: "pin" }));
+    expect(rel.isError).toBe(true);
+    expect(rel.text).toContain("the gate is fail");
+    expect(existsSync(join(repo, "cad", "pin", "release"))).toBe(false);
+    const v = await runVerifyCli(repo, ["--json", "--part", "pin"], { ANVIL_STATE_DIR: stateDir, ANVIL_SOLIDCRAFT_CLI: SOLIDCRAFT_CLI });
+    expect(v.code).toBe(1);
+    const p = v.json.parts.find((q: any) => q.part === "pin");
+    expect(p.state).toBe("fail");
+    expect(p.failing.join("\n")).toContain(`reference big.step ${REFERENCE_RESHAPED} (shape is not the import's`);
+    expect(p.checks.find((c: any) => c.id === "interference big.step")).toMatchObject({ ok: true });
+  }, 600_000);
 });

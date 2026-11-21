@@ -4,7 +4,7 @@
  * interference" condition — plus the manager's working folder (decision 115).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, renameSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { partRef } from "../../src/cadwork/partfolder";
@@ -30,9 +30,12 @@ import {
   readReferenceMeasures,
   referenceDifferences,
   shapeDifferences,
+  shapeTolerance,
+  REFERENCE_SHAPE_DEPTH_MM,
+  REFERENCE_SHAPE_FLOOR_MM3,
 } from "../../src/cadwork/refs";
 import { parseToolResult } from "../../src/cadwork/mcp-client";
-import { coverageChecks, designPlacementChecks, placementChecks, readPlacements, referenceGate, referenceGeometryChecks, DESIGN_PLACED_ONCE, REFERENCE_NOT_APPROVED, REFERENCE_NOT_RECORDED, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
+import { coverageChecks, designPlacementChecks, makeStaging, placementChecks, readPlacements, referenceGate, referenceGeometryChecks, DESIGN_PLACED_ONCE, REFERENCE_NOT_APPROVED, REFERENCE_NOT_RECORDED, REFERENCE_NOT_COVERED, REFERENCE_PLACED_ONCE } from "../../src/cadwork/refresh";
 import { readDesignFile } from "../../src/cadwork/poststep";
 import { makeReferenceReplay, makeTrueReferenceCheck, type TrueReferenceInput, type TrueReferenceResult } from "../../src/cadwork/refreplay";
 import { FAKE_SOLIDCRAFT } from "../helpers/fake-solidcraft";
@@ -407,7 +410,7 @@ describe("a reference measures what its import did", () => {
     const seen: TrueReferenceInput[] = [];
     const truth = (over: Partial<TrueReferenceResult> = {}) => async (i: TrueReferenceInput): Promise<TrueReferenceResult> => {
       seen.push(i);
-      return { sha256: sha(i.step), asImported: [asImported], interference: noOverlap, shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000 }], ...over };
+      return { sha256: sha(i.step), asImported: [asImported], interference: noOverlap, shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000, trueArea: 600 }], ...over };
     };
     const lines = (r: { checks: { id: string; ok: boolean; measured: unknown }[] }) => r.checks.map((c) => `${c.id}: ${c.ok ? "ok" : "FAIL"} ${String(c.measured)}`);
     // Untouched: the record matches, the true import is the same solid, no overlap with it.
@@ -424,17 +427,19 @@ describe("a reference measures what its import did", () => {
     // THE VETO: the summary numbers all match, but the live body shares less than its volume with the
     // true import (two holes enlarged, two shrunk) and the design overlaps the TRUE import.
     const hit = reply({ count: 1, interferences: [{ a: "Pin", b: "holey (as imported)", volume_mm3: 40.8407 }], unchecked: [], budget_exceeded: false, truncated: false });
-    r = await referenceGeometryChecks(measuring(block()), input, record, true, truth({ interference: hit, shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 959.1593 }] }));
+    r = await referenceGeometryChecks(measuring(block()), input, record, true, truth({ interference: hit, shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 959.1593, trueArea: 600 }] }));
     expect(lines(r)).toEqual([
       "interference block.step as imported: FAIL Pin overlaps holey (as imported) by 40.841 mm³",
       `geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (shape is not the import's: it shares 959.159 of the import's 1000 mm³ (the reference is 1000 mm³))`,
     ]);
     expect(r.unverified).toBe(false);
-    // Within 1e-6 of its volume is the same solid; a body count that differs is named.
-    expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000 + 1e-7, overlap: 1000 - 1e-7 }] }))).at(-1)).toBe("geometry block.step: ok as imported");
+    // Within a 0.1 nm layer over its surface (600 mm² → 6.1e-5 mm³) is the same solid; more is not; a
+    // body count that differs is named.
+    expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000 + 1e-7, overlap: 1000 - 1e-7, trueArea: 600 }] }))).at(-1)).toBe("geometry block.step: ok as imported");
+    expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000 - 1e-4, trueArea: 600 }] }))).at(-1)).toContain("shape is not the import's");
     expect(lines(await referenceGeometryChecks(measuring(block()), input, record, true, truth({ shape: [], bodyCount: { imported: 2, live: 1 } }))).at(-1)).toContain("2 bodies → 1");
     // Reshaped by a point (the pre-check sees it): a hard fail with the numbers.
-    r = await referenceGeometryChecks(measuring(block({ volume_mm3: 100, bbox: { min: [0, 0, 7], max: [10, 10, 8] }, center_of_mass: [5, 5, 7.5] })), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 100, overlap: 100 }] }));
+    r = await referenceGeometryChecks(measuring(block({ volume_mm3: 100, bbox: { min: [0, 0, 7], max: [10, 10, 8] }, center_of_mass: [5, 5, 7.5] })), input, record, true, truth({ shape: [{ label: "block", trueVolume: 1000, liveVolume: 100, overlap: 100, trueArea: 600 }] }));
     expect(lines(r).at(-1)).toBe(`geometry block.step: FAIL reference block.step ${REFERENCE_RESHAPED} (volume 1000 → 100 mm³; bounding box [0, 0, -2]…[10, 10, 8] → [0, 0, 7]…[10, 10, 8]; centre of mass [5, 5, 3] → [5, 5, 7.5]; shape is not the import's: it shares 100 of the import's 1000 mm³ (the reference is 100 mm³))`);
     // Moved (its placement), measured in world coordinates.
     expect(lines(await referenceGeometryChecks(measuring(block({ bbox: { min: [0, 0, 98], max: [10, 10, 108] }, center_of_mass: [5, 5, 103] })), input, record, true, truth())).at(-1)).toContain(REFERENCE_RESHAPED);
@@ -484,13 +489,100 @@ describe("a reference measures what its import did", () => {
     expect(lines(await referenceGeometryChecks(measuring(block()), { ...input, embedded: embeddedReferences(bare), script: bare }, record, true, truth())).find((l) => l.startsWith("geometry"))).toContain("its import lists no bodies");
   });
 
-  test("[A4] veto: the exact shape comparison — the same solid only when vol(true) = vol(live) = vol(true ∩ live) within 1e-6 of the import's volume", () => {
-    const s = (trueVolume: number, liveVolume: number, overlap: number) => shapeDifferences([{ label: "b", trueVolume, liveVolume, overlap }]);
+  test("[A4] veto: each refresh's true-import check stages its exports in a folder of its own (mkdtemp, 0700, under the part's real .cache) and reads back only regular, unlinked files it named in this refresh — a link, a hard link, a folder, a missing file, a file it did not name or a swapped staging folder is refused; the gate then says unverified", async () => {
+    const part = tempRepo("anvil-cad-stage-");
+    const a = makeStaging(part);
+    const b = makeStaging(part);
+    expect(a.dir).not.toBe(b.dir);
+    expect(a.dir.startsWith(join(part, ".cache", "truecheck-"))).toBe(true);
+    expect(statSync(a.dir).mode & 0o777).toBe(0o700);
+    const p0 = a.take("body-0.step");
+    expect(() => a.take("body-0.step")).toThrow("already exists");
+    writeFileSync(p0, "STEP");
+    expect(a.read(p0).toString()).toBe("STEP");
+    expect(() => a.read(join(a.dir, "other.step"))).toThrow("not a staging file of this refresh");
+    const p1 = a.take("body-1.step");
+    expect(() => a.read(p1)).toThrow("no file was written");
+    symlinkSync(p0, p1);
+    expect(() => a.read(p1)).toThrow("not a regular file");
+    const p2 = a.take("body-2.step");
+    mkdirSync(p2);
+    expect(() => a.read(p2)).toThrow("not a regular file");
+    const p3 = a.take("body-3.step");
+    writeFileSync(join(part, "elsewhere.step"), "PLANTED");
+    linkSync(join(part, "elsewhere.step"), p3);
+    expect(() => a.read(p3)).toThrow("linked elsewhere");
+    // A file already there when the check named it (planted before the export) is never taken.
+    writeFileSync(join(b.dir, "body-0.step"), "PLANTED");
+    expect(() => b.take("body-0.step")).toThrow("already exists");
+    symlinkSync(join(part, "nowhere"), join(b.dir, "body-1.step"));
+    expect(() => b.take("body-1.step")).toThrow("already exists");
+    // The staging folder swapped while in use.
+    const p4 = b.take("body-4.step");
+    writeFileSync(p4, "STEP");
+    renameSync(b.dir, `${b.dir}-moved`);
+    mkdirSync(b.dir);
+    writeFileSync(p4, "OTHER");
+    expect(() => b.read(p4)).toThrow("replaced");
+    a.remove();
+    expect(existsSync(a.dir)).toBe(false);
+    // .cache that is a link out of the part.
+    const linked = tempRepo("anvil-cad-stage-");
+    symlinkSync(part, join(linked, ".cache"));
+    expect(() => makeStaging(linked)).toThrow("is not a real folder of the part");
+    // In the gate: an export that leaves a link is unverified, never read.
+    const script = { about: {}, commands: [{ command: "timeline.add", params: { feature: { type: "import", name: "ref-block.step", file: "block.step", step: "BLOCK", body_names: ["block"] } } }] };
+    const exportDir = tempRepo("anvil-cad-geo-");
+    writeFileSync(join(exportDir, "secret.step"), "SECRET");
+    const asImported = { name: "block", volume: 1000, bbox: { min: [0, 0, -2] as [number, number, number], max: [10, 10, 8] as [number, number, number] }, faces: 6 };
+    const call = async (tool: string, args: any) => {
+      if (tool === "export") {
+        symlinkSync(join(exportDir, "secret.step"), args.path);
+        return reply({ bytes: 1, format: "Step", path: args.path });
+      }
+      return reply({ bodies: [{ name: "block", volume_mm3: 1000, bbox: asImported.bbox, faces: 6, closed: true }] });
+    };
+    let checked = false;
+    const r = await referenceGeometryChecks(call, { embedded: embeddedReferences(script), clean: new Set(["block.step"]), script, referenceBodies: ["block"], designBodies: [], placements: {}, must: new Set<string>(), exportDir }, { references: { "block.step": { sha256: sha("BLOCK"), bodies: [asImported] } } }, true, async () => {
+      checked = true;
+      throw new Error("not reached");
+    });
+    expect(checked).toBe(false);
+    expect(r.unverified).toBe(true);
+    expect(r.checks.find((c) => c.id === "geometry block.step")!.measured).toContain("block could not be exported to STEP: what was written is not a regular file");
+    expect(readdirSync(join(exportDir, ".cache"))).toEqual([]);
+  });
+
+  test("[A4] veto: the exact shape comparison — the same solid only when vol(true) = vol(live) = vol(true ∩ live) within a DEPTH over the import's surface (area × 1e-7 mm + 1e-6 mm³), never a fraction of its volume", () => {
+    const s = (trueVolume: number, liveVolume: number, overlap: number, trueArea = 3527.79) => shapeDifferences([{ label: "b", trueVolume, liveVolume, overlap, trueArea }]);
+    expect(REFERENCE_SHAPE_DEPTH_MM).toBe(1e-7);
+    expect(REFERENCE_SHAPE_FLOOR_MM3).toBe(1e-6);
+    expect(shapeTolerance(744527.7875658032)).toBeCloseTo(0.0744538, 6); // the 600×600×10 block with four r=3 holes
+    expect(shapeTolerance(NaN)).toBe(1e-6); // no area: the floor alone
+    expect(shapeTolerance(-5)).toBe(1e-6);
     expect(s(7869.026644707676, 7869.026644707674, 7869.026644707676)).toEqual([]);
     expect(s(7869.0266, 7869.0266, 7766.9249)).toHaveLength(1); // equal volumes, different solids (the holey veto, 90° turn)
     expect(s(1000, 1100, 1000)).toHaveLength(1); // the live body contains the import and more
     expect(s(1000, 1000, 0)).toHaveLength(1); // moved clear of where it was
-    expect(shapeDifferences([{ label: "a", trueVolume: 1, liveVolume: 1, overlap: 1 }, { label: "b", trueVolume: 1, liveVolume: 1, overlap: 0.5 }])).toEqual(["b: shape is not the import's: it shares 0.5 of the import's 1 mm³ (the reference is 1 mm³)"]);
+    expect(shapeDifferences([{ label: "a", trueVolume: 1, liveVolume: 1, overlap: 1, trueArea: 6 }, { label: "b", trueVolume: 1, liveVolume: 1, overlap: 0.5, trueArea: 6 }])).toEqual(["b: shape is not the import's: it shares 0.5 of the import's 1 mm³ (the reference is 1 mm³)"]);
+    // THE VETO (real 0.44.1 numbers): big.step, 600×600×10 with four r=3 holes; two holes grown by
+    // 9 µm and two shrunk by the same material. vol(live) = vol(true), but the live body lacks
+    // 2 × 1.699 mm³ of the import. 1e-6 of the volume (3.599 mm³) let it through; the depth does not.
+    const V = 3598869.026644708;
+    const A = 744527.7875658032;
+    const lost = 2 * 1.699004723224789;
+    expect(lost).toBeLessThan(1e-6 * V);
+    expect(s(V, V, V - lost, A)).toEqual([`shape is not the import's: it shares ${String(Math.round((V - lost) * 1000) / 1000)} of the import's ${String(Math.round(V * 1000) / 1000)} mm³ (the reference is ${String(Math.round(V * 1000) / 1000)} mm³)`]);
+    // One hole grown by 1 µm alone (0.189 mm³) fails; the same solid (measured: re-imports and
+    // round trips differ by exactly 0) passes; just inside and just outside the allowance.
+    expect(s(V, V - 0.18852697545662522, V - 0.18852697545662522, A)).toHaveLength(1);
+    expect(s(V, V, V, A)).toEqual([]);
+    expect(s(V, V, V - 0.074, A)).toEqual([]);
+    expect(s(V, V, V - 0.075, A)).toHaveLength(1);
+    expect(s(V, V + 0.075, V, A)).toHaveLength(1);
+    // A small reference: the floor and its surface (the 30×30×10 holey block, 3527.79 mm² → 3.5e-4 mm³).
+    expect(s(7869.026644707681, 7869.026644707681, 7869.026644707681 - 3e-4)).toEqual([]);
+    expect(s(7869.026644707681, 7869.026644707681, 7869.026644707681 - 4e-4)).toHaveLength(1);
   });
 
   test("[A4] veto: the replay imports ONLY the reference's STEP text, in a throwaway process allowed nothing but its own temp folder, and measures what file.insert_step made; one process per binary and text (cached); no binary is an error", async () => {
@@ -519,7 +611,11 @@ describe("a reference measures what its import did", () => {
     expect(r.sha256).toBe(sha(step));
     expect(r.asImported).toEqual([{ name: "block", volume: 1000, bbox: { min: [0, 0, -2], max: [10, 10, 8] }, faces: 6 }]);
     expect(interferenceCheck("block.step", r.interference!, { asImported: true })).toMatchObject({ id: "interference block.step as imported", ok: false, measured: "Body1 overlaps block (as imported) by 100 mm³" });
-    expect(r.shape).toEqual([{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000 }]);
+    // The true reference is imported twice (before and after the design bodies: each pair in both
+    // orders); the overlap found against both copies is reported once.
+    expect(r.interference!.json.count).toBe(1);
+    expect(r.interference!.json.interferences).toHaveLength(1);
+    expect(r.shape).toEqual([{ label: "block", trueVolume: 1000, liveVolume: 1000, overlap: 1000, trueArea: 600 }]);
     expect(shapeDifferences(r.shape)).toEqual([]);
     // A live body that is not the import: overlap below its volume.
     const moved = await check({ file: "block.step", step, design: [], live: [{ label: "block", bytes: Buffer.from(fake([{ ...blockBody, min: [0, 0, 0], max: [10, 10, 10] }])) }] });

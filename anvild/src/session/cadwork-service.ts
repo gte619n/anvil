@@ -254,6 +254,13 @@ export class CadworkService {
   private readonly importedMeasures = new Map<string, Record<string, ReferenceMeasure>>();
   /** A reference's import replayed alone: what the owner's "approve current reference" card records. */
   private readonly replayReference: ReferenceReplay;
+  /** Replayed imports by sha (what an adopt-references card shows and records), filled before the
+   *  card is drawn; bounded. */
+  private readonly replayed = new Map<string, ReferenceMeasure>();
+  /** Replays under way (by sha), so a card is not asked twice for one; `shutdown` waits for them. */
+  private readonly replaying = new Set<string>();
+  private readonly replayJobs = new Set<Promise<unknown>>();
+  private closed = false;
   /** The gate's check of every reference against its true import (a throwaway process per check). */
   private readonly checkReference: TrueReferenceCheck;
 
@@ -2041,9 +2048,21 @@ export class CadworkService {
         if (!locked.lock) return undefined;
         const pending = this.unrecordedReferences(ref, locked.lock, locked.part);
         if (!pending.length) return undefined;
+        // The card shows what approving records — the import replayed alone — so it is drawn only once
+        // every replay is in (started here; the card follows when they finish). A replay that fails
+        // draws no card: the part stays unverified, as the gate says.
+        const measured = pending.map((r) => this.replayed.get(r.sha256));
+        if (measured.some((m) => !m)) {
+          this.replayForCard(ref, pending.filter((_, i) => !measured[i]));
+          return undefined;
+        }
+        const records = pending.map((r, i) => ({ ...r, measure: measured[i]! }));
         return {
-          sha: referencesCardSha(pending),
-          rows: pending.map((r) => ({ label: `refs/${r.file}`, old: "measurements not recorded", new: `approve current reference (sha ${r.sha256.slice(0, 12)}, ${r.bodies.length} bod${r.bodies.length === 1 ? "y" : "ies"}: ${r.bodies.join(", ")})` })),
+          sha: referencesCardSha(records),
+          rows: records.flatMap((r) => [
+            { label: `refs/${r.file}`, old: "measurements not recorded", new: `approve current reference (sha ${r.sha256.slice(0, 12)}, ${r.bodies.length} bod${r.bodies.length === 1 ? "y" : "ies"}: ${r.bodies.join(", ")})` },
+            ...r.measure.bodies.map((b) => ({ label: `refs/${r.file} ${b.name}`, new: referenceMeasureText(b) })),
+          ]),
         };
       },
       "adopt-rules": () => {
@@ -2148,6 +2167,32 @@ export class CadworkService {
    * showed (by sha); each is then measured as imported — its embedded text replayed alone in a
    * throwaway process — and that record is added to the approval on record, nothing else changed.
    */
+  /** Replay the imports an adopt-references card needs (outside any queue: a throwaway process of
+   *  its own), then draw the card again from the part's latest refresh. */
+  private replayForCard(ref: PartRef, need: readonly { file: string; sha256: string; step: string }[]): void {
+    const todo = need.filter((r) => !this.replaying.has(r.sha256));
+    if (!todo.length) return;
+    for (const r of todo) this.replaying.add(r.sha256);
+    const job = Promise.allSettled(
+      todo.map(async (r) => {
+        try {
+          const m = await this.replayReference(r.step, r.file);
+          if (m.sha256 !== r.sha256) return;
+          if (this.replayed.size >= 64) this.replayed.delete(this.replayed.keys().next().value!);
+          this.replayed.set(r.sha256, m);
+        } finally {
+          this.replaying.delete(r.sha256);
+        }
+      }),
+    ).then(() => {
+      if (this.closed) return;
+      const snap = this.snapshots.get(ref.key);
+      if (snap && todo.some((r) => this.replayed.has(r.sha256))) this.syncAdoptCards(ref, snap.outcome.gate, snap.outcome.params);
+    });
+    this.replayJobs.add(job);
+    void job.finally(() => this.replayJobs.delete(job));
+  }
+
   private async adoptReferences(card: Card, slot: SlotContext): Promise<boolean> {
     const { ref } = card;
     const lock = this.findLock(ref);
@@ -2155,13 +2200,17 @@ export class CadworkService {
     const disk = readDesignFile(ref.dir);
     if (disk.scriptSha === undefined || disk.scriptSha !== slot.scriptSha()) return false;
     const pending = this.unrecordedReferences(ref, lock, readPartFile(ref.dir));
-    if (!pending.length || referencesCardSha(pending) !== card.sha) return false;
+    if (!pending.length) return false;
     const records: Record<string, ReferenceMeasure> = {};
+    const shown: (typeof pending[number] & { measure: ReferenceMeasure })[] = [];
     for (const r of pending) {
       const m = await this.replayReference(r.step, r.file);
       if (m.sha256 !== r.sha256) return false;
       records[r.file] = m;
+      shown.push({ ...r, measure: m });
     }
+    // Exactly what the card showed — the files, their text and the measurements it listed.
+    if (referencesCardSha(shown) !== card.sha) return false;
     const { repo: _r, part: _p, remote: _m, path: _a, ...rest } = lock;
     this.approve(ref, { ...rest, references: { ...(lock.references ?? {}), ...records }, at: new Date().toISOString() });
     return true;
@@ -2489,6 +2538,7 @@ export class CadworkService {
 
   /** Stop every SolidCraft process (daemon shutdown). */
   async shutdown(): Promise<void> {
+    this.closed = true;
     this.offProtected?.();
     for (const t of this.busyTimers.values()) this.clock.clearTimeout(t);
     for (const st of this.emitState.values()) if (st.timer !== undefined) this.clock.clearTimeout(st.timer);
@@ -2496,6 +2546,7 @@ export class CadworkService {
     for (const card of [...this.cards.values()]) card.settle?.("denied");
     this.cards.clear();
     await this.manager.shutdown();
+    await Promise.allSettled([...this.replayJobs]);
     await this.lockSync.settled();
   }
 }
@@ -2521,9 +2572,16 @@ const isAdoptKind = (k: CardKind): k is AdoptKind => (ADOPT_KINDS as readonly st
 /** Where an adopt card is asked: a rules card per worktree, a part's cards per part. */
 const adoptScope = (kind: AdoptKind, ref: PartRef): string => `${kind}\0${kind === "adopt-rules" ? ref.worktree : ref.key}`;
 
-/** What an adopt-references card stands for: each reference's file name and the sha of its text. */
-const referencesCardSha = (pending: readonly { file: string; sha256: string }[]): string =>
-  createHash("sha256").update(JSON.stringify(pending.map((r) => [r.file, r.sha256]))).digest("hex");
+/** What an adopt-references card stands for: each reference's file name, the sha of its text and
+ *  the measurements (the import replayed alone) it shows and approving records. */
+const referencesCardSha = (pending: readonly { file: string; sha256: string; measure: ReferenceMeasure }[]): string =>
+  createHash("sha256")
+    .update(JSON.stringify(pending.map((r) => [r.file, r.sha256, r.measure.bodies.map((b) => [b.name, b.volume, b.bbox.min, b.bbox.max, b.faces, b.centerOfMass ?? null])])))
+    .digest("hex");
+const refNum = (v: number): string => String(Math.round(v * 1000) / 1000);
+/** One replayed reference body as an adopt-references card row shows it. */
+export const referenceMeasureText = (b: ReferenceMeasure["bodies"][number]): string =>
+  `volume ${refNum(b.volume)} mm³, bounding box [${b.bbox.min.map(refNum).join(", ")}]…[${b.bbox.max.map(refNum).join(", ")}], ${b.faces} face${b.faces === 1 ? "" : "s"}`;
 
 /** The part.json half of an owner card's fingerprint. */
 function partKeyOf(part: PartRead): unknown {

@@ -31,7 +31,7 @@
  * listed, never as `pass`, and never as an exception into the manager's queue.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { ADOPTION_CHECKS, evaluateGate, failingLines, gateError, type GateCheck, type GateInput, type GateResult, type Measurement } from "./gate";
 import { holeSummary, holeTable, mergeHoleTables, type HoleRow } from "./holes";
@@ -55,6 +55,7 @@ import {
   referenceDifferences,
   referenceEditChecks,
   referenceLabel,
+  readRegularFile,
   referenceOnDisk,
   referencePlacementChecks,
   REFERENCE_RESHAPED,
@@ -430,7 +431,64 @@ export const REFERENCE_NOT_APPROVED = "is not the STEP that was approved";
 /** The owner card's question for a reference the approval holds no record of (item 3). */
 export const REFERENCE_NOT_RECORDED = "reference measurements not recorded; approve current reference";
 
-let stagingSeq = 0;
+/** The largest STEP export of one body the gate reads back (a design body can be bigger than a
+ *  reference, which is capped at 50 MB). */
+export const STAGED_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
+
+/**
+ * The staging folder of ONE refresh's true-import check: a fresh folder (`mkdtempSync`, mode 0700,
+ * a name no other refresh or process can have) under the part's real `.cache`. `take(name)` gives
+ * the path of a file that does not exist yet; `read(path)` reads it back only when it is a regular
+ * file — not a link, not a folder, a single link to its inode — inside this very folder (still the
+ * folder that was made: same inode, not swapped for a link), through a descriptor that refuses a link
+ * (refs.ts `readRegularFile`). So what is read is exactly what the live process wrote in this refresh.
+ */
+export function makeStaging(partDir: string): { dir: string; take: (name: string) => string; read: (path: string) => Buffer; remove: () => void } {
+  const cache = join(partDir, CACHE_DIR);
+  mkdirSync(cache, { recursive: true });
+  const cst = lstatSync(cache);
+  if (cst.isSymbolicLink() || !cst.isDirectory() || realpathSync(cache) !== join(realpathSync(partDir), CACHE_DIR)) throw new Error(`${CACHE_DIR} is not a real folder of the part`);
+  const dir = mkdtempSync(join(cache, "truecheck-"));
+  const ino = lstatSync(dir).ino;
+  const taken = new Set<string>();
+  const intact = () => {
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory() || st.ino !== ino) throw new Error("the staging folder was replaced while it was in use");
+  };
+  return {
+    dir,
+    take: (name) => {
+      intact();
+      const path = join(dir, name);
+      if (taken.has(path) || existsSync(path) || isLink(path)) throw new Error(`the staging file ${name} already exists`);
+      taken.add(path);
+      return path;
+    },
+    read: (path) => {
+      if (!taken.has(path)) throw new Error("not a staging file of this refresh");
+      intact();
+      let st;
+      try {
+        st = lstatSync(path);
+      } catch {
+        throw new Error("no file was written");
+      }
+      if (st.isSymbolicLink() || !st.isFile()) throw new Error("what was written is not a regular file");
+      if (st.nlink !== 1) throw new Error("what was written is linked elsewhere");
+      const r = readRegularFile(path, st.ino, STAGED_EXPORT_MAX_BYTES);
+      if (!r.ok) throw new Error(`what was written ${r.error}`);
+      return r.bytes;
+    },
+    remove: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+const isLink = (p: string): boolean => {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
 
 /**
  * GEOMETRY — every reference (each byte-checked import, `clean`) must be the solid its import is,
@@ -446,12 +504,14 @@ let stagingSeq = 0;
  *      says: volume, world bounding box, faces, centre of mass within 1e-6 of its size.
  *   3. THE TRUE IMPORT (./refreplay.ts `makeTrueReferenceCheck`). The live process exports every
  *      design body placement and each reference body to STEP at its world placement (into a staging
- *      folder of the part's `.cache`, removed afterwards); a throwaway sandboxed process imports the
- *      embedded text at the identity next to them and runs `inspect.interference`:
+ *      folder of the part's `.cache` made for this refresh alone, `makeStaging`, removed afterwards); a
+ *      throwaway sandboxed process imports the embedded text at the identity next to them (before and
+ *      after them) and runs `inspect.interference`:
  *        - design × true bodies, for a reference in `noInterferenceWith`: the exact "no interference"
  *          condition ("interference x.step as imported") — the live-body check stays as well;
  *        - true × live, per body: the same solid ⇔ vol(true) = vol(live) = vol(true ∩ live) within
- *          1e-6 relative. Any shape difference with volume fails, whatever summary numbers it keeps.
+ *          a 0.1 nm layer over the import's surface (refs.ts `shapeTolerance`, never a fraction of
+ *          the volume). Any shape difference with volume fails, whatever summary numbers it keeps.
  *      Anything in that path that fails (no binary, an export, an import, a reply that is not one) is
  *      unverified: fail closed.
  */
@@ -480,19 +540,22 @@ export async function referenceGeometryChecks(
   const placements = input.placements ?? {};
   const designBodies = input.designBodies ?? [];
   const must = input.must ?? new Set<string>();
-  let staging: string | undefined;
+  let staging: ReturnType<typeof makeStaging> | undefined;
+  let staged = 0;
   let designExports: ExportedBody[] | undefined;
-  /** `export` of one body placement to STEP by the live process, read back. */
+  /** `export` of one body placement to STEP by the live process, read back from this refresh's own
+   *  staging folder (`makeStaging`). */
   const exportBody = async (world: string): Promise<ExportedBody> => {
     if (!input.exportDir) throw new Error("the live process has no folder to export to");
-    if (!staging) {
-      staging = join(input.exportDir, CACHE_DIR, `truecheck-${process.pid}-${Date.now()}-${++stagingSeq}`);
-      mkdirSync(staging, { recursive: true });
-    }
-    const path = join(staging, `body-${readdirSync(staging).length}.step`);
+    staging ??= makeStaging(input.exportDir);
+    const path = staging.take(`body-${staged++}.step`);
     const r = await call("export", { path, format: "step", bodies: [world] });
-    if (r.isError || !existsSync(path)) throw new Error(`${world} could not be exported to STEP: ${r.text.slice(0, 300) || "no file was written"}`);
-    return { label: world, bytes: readFileSync(path) };
+    if (r.isError) throw new Error(`${world} could not be exported to STEP: ${r.text.slice(0, 300) || "the export failed"}`);
+    try {
+      return { label: world, bytes: staging.read(path) };
+    } catch (e) {
+      throw new Error(`${world} could not be exported to STEP: ${e instanceof Error ? e.message : String(e)}`);
+    }
   };
   try {
     for (const file of [...input.clean].sort()) {
@@ -577,7 +640,7 @@ export async function referenceGeometryChecks(
       else checks.push({ id, expected, measured: "as imported", ok: true, hard: true });
     }
   } finally {
-    if (staging) rmSync(staging, { recursive: true, force: true });
+    staging?.remove();
   }
   if (unrecorded.length) {
     unverified = true;

@@ -796,8 +796,12 @@ function measureBody(b: Body, summary: boolean): Json {
   const core = { bbox: bboxOf(b), closed: true, faces: b.faces.length, name: b.name, volume_mm3: volume };
   if (summary) return core;
   const cyl = b.faces.filter((f) => f.cylinder).length;
+  // The surface area (the real reply's `area_mm2`): the fake's is its bounding box's.
+  const bb = bboxOf(b);
+  const [dx, dy, dz] = [0, 1, 2].map((k) => bb.max[k]! - bb.min[k]!) as [number, number, number];
   return {
     ...core,
+    area_mm2: 2 * (dx * dy + dy * dz + dz * dx),
     density_g_cm3: 1.29,
     face_types: { ...(cyl ? { cylinder: cyl } : {}), plane: b.faces.length - cyl },
     mass_g: (volume * 1.29) / 1000,

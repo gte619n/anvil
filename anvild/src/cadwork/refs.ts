@@ -16,11 +16,14 @@
  *     `count == 0 && unchecked == [] && !budget_exceeded && !truncated` (A0 evidence). Anything else —
  *     an overlap, or a check that did not finish — is a hard fail naming the pair and the volume.
  *     The same check runs again against the TRUE import — the embedded text imported alone in a
- *     throwaway process next to the design bodies' STEP exports ("interference x.step as imported",
- *     ./refreplay.ts), so a reshaped live body cannot hide an overlap.
+ *     throwaway process next to the design bodies' STEP exports, once before and once after them
+ *     ("interference x.step as imported", ./refreplay.ts), so a reshaped live body cannot hide an
+ *     overlap.
  *   - geometry: each reference measures, where it is, what its import measured
  *     (`referenceDifferences`, the fast pre-check) and IS its import's solid (`shapeDifferences`:
- *     vol(true) = vol(live) = vol(true ∩ live)); the gate's `referenceGeometryChecks` in ./refresh.ts.
+ *     vol(true) = vol(live) = vol(true ∩ live) within a 0.1 nm layer over its surface —
+ *     `shapeTolerance`, with the measured residuals beside it); the gate's `referenceGeometryChecks`
+ *     in ./refresh.ts.
  *
  * SOURCE RULES (`resolveReferenceSource`): a path relative to the worktree root; it must stay inside
  * the worktree after resolving (no `..` out, no absolute path), be a regular file that is not a
@@ -581,18 +584,62 @@ export function referenceDifferences(expected: readonly ReferenceBodyMeasure[], 
   return out;
 }
 
+// ── the shape comparison's tolerance: a DEPTH, never a fraction of the volume ──────────────────────
+//
+// A volume fraction lets a large reference hide a deep local change: on a 600×600×10 block 1e-6 of
+// its volume is 3.6 mm³, enough to grow two holes by 9 µm (and shrink two) and clear a pin that
+// overlaps the true import by 0.453 mm³. So the allowance is a layer over the import's surface:
+// |vol(true) − vol(live)| and vol(true) − vol(true ∩ live) may each be at most
+// `area_mm2 × REFERENCE_SHAPE_DEPTH_MM + REFERENCE_SHAPE_FLOOR_MM3` (area from `inspect.measure`).
+//
+// MEASURED on the real 0.44.1 (planar, cylindrical, filleted, spherical and chamfered bodies, the
+// 600×600×10 block with four r=3 holes, the 30×30×10 holey block): two imports of one STEP, and a
+// body exported by one process and imported by another, are bit-identical — the volume, the area and
+// the overlap of the two differ by exactly 0. The only noise seen anywhere is a native body against
+// its own import, ≤ 6e-10 mm³ (the gate never compares those). So the depth is set by what it must
+// catch, not by noise: 1e-7 mm (0.1 nm) — 0.074 mm³ on the 600×600×10 block, below what the
+// as-imported interference can miss there (see below) — and the floor is 1e-6 mm³, over 1000× the
+// largest float difference measured.
+//
+// RESIDUALS (measured, 0.44.1):
+//   - `inspect.interference` drops an overlap smaller than about (d / 1000)³ mm³, d the bounding-box
+//     diagonal of ONE body of the pair: the one SolidCraft takes first (native bodies before imported
+//     ones, then in the order they were made). The 600×600×10 block has d = 848.6 mm, so 0.61 mm³: a
+//     r = 3.006 pin in its r = 3 hole (6 µm deep, 0.453 mm³) and a 20×20 mm pad 1.5 µm into its top
+//     face (0.60 mm³) were "no interference" with the block imported first; 0.62 / 0.64 mm³ were
+//     caught. It is a volume, not a depth: on a 30×30×10 block (d = 43.6 mm) 0.00125 mm³ (50 nm)
+//     was caught. The as-imported check (./refreplay.ts) therefore imports the true reference TWICE,
+//     before and after the design bodies, so each pair is checked in both orders: it misses only an
+//     overlap below (min(d_design, d_reference) / 1000)³ (8×10⁻⁷ mm³ for that pin). The live-body
+//     check runs in the live process, where a native design body is first: its floor is the design
+//     body's (d_design / 1000)³.
+//   - Penetrations under SolidCraft's confusion tolerance (2e-5 mm) are contact: 10 nm was missed
+//     natively, 50 nm caught.
+// Together: a passing gate means no design body overlaps the true import by (min(d_design,
+// d_reference) / 1000)³ mm³ or more (unless the overlap is under 20 nm deep), and each live reference
+// body differs from its import by at most area × 0.1 nm + 1e-6 mm³ of material.
+
+/** The shape comparison's allowance, as a depth over the import's surface (mm). */
+export const REFERENCE_SHAPE_DEPTH_MM = 1e-7;
+/** …plus this much volume (mm³) for float noise. */
+export const REFERENCE_SHAPE_FLOOR_MM3 = 1e-6;
+/** The volume (mm³) a reference of `areaMm2` surface may differ from its import by. A surface area
+ *  that is not a positive number gets the floor alone (strictest). */
+export const shapeTolerance = (areaMm2: number): number => REFERENCE_SHAPE_FLOOR_MM3 + (Number.isFinite(areaMm2) && areaMm2 > 0 ? areaMm2 * REFERENCE_SHAPE_DEPTH_MM : 0);
+
 /**
  * The EXACT shape comparison of a live reference with its true import: per body, the same solid ⇔
- * vol(true) = vol(live) = vol(true ∩ live), within `REFERENCE_MEASURE_REL` of the import's volume
- * (so whatever differs between them has no volume). Phrases as `referenceDifferences`; empty when
- * every body is the same solid. Catches what volume, bounding box, faces and centre of mass cannot:
- * two holes enlarged and two shrunk by the same material, a symmetric outline turned 90°.
+ * vol(true) = vol(live) = vol(true ∩ live), within `shapeTolerance(trueArea)` (a 0.1 nm layer over
+ * the import's surface, so whatever differs between them has no volume). Phrases as
+ * `referenceDifferences`; empty when every body is the same solid. Catches what volume, bounding box,
+ * faces and centre of mass cannot: two holes enlarged and two shrunk by the same material, a
+ * symmetric outline turned 90°.
  */
-export function shapeDifferences(shape: readonly { label: string; trueVolume: number; liveVolume: number; overlap: number }[], bodyCount?: { imported: number; live: number }): string[] {
+export function shapeDifferences(shape: readonly { label: string; trueVolume: number; liveVolume: number; overlap: number; trueArea: number }[], bodyCount?: { imported: number; live: number }): string[] {
   if (bodyCount) return [`${bodyCount.imported} bod${bodyCount.imported === 1 ? "y" : "ies"} → ${bodyCount.live}`];
   const out: string[] = [];
   for (const s of shape) {
-    const tol = REFERENCE_MEASURE_REL * Math.max(1, Math.abs(s.trueVolume));
+    const tol = shapeTolerance(s.trueArea);
     const who = shape.length > 1 ? `${s.label}: ` : "";
     if (Math.abs(s.liveVolume - s.trueVolume) <= tol && Math.abs(s.overlap - s.trueVolume) <= tol) continue;
     out.push(`${who}shape is not the import's: it shares ${fmt(s.overlap)} of the import's ${fmt(s.trueVolume)} mm³ (the reference is ${fmt(s.liveVolume)} mm³)`);

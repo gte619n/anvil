@@ -13,9 +13,11 @@
  *     bodies and the live reference body, each exported to STEP by the live process at its world
  *     placement and inserted here. `inspect.interference` between every design body and every true
  *     reference body (the must-not-touch check against what was approved, not against a live body a
- *     feature may have reshaped), and between each true body and its live counterpart: the shapes are
- *     the same solid ⇔ vol(true) = vol(live) = vol(true ∩ live) (the overlap `inspect.interference`
- *     reports). Real 0.44.1: two imports of one STEP overlap by exactly their volume; a body touching
+ *     feature may have reshaped; the reference imported before AND after the design bodies, so each
+ *     pair is checked in both orders — refs.ts RESIDUALS), and between each true body and its live
+ *     counterpart: the shapes are the same solid ⇔ vol(true) = vol(live) = vol(true ∩ live) (the
+ *     overlap `inspect.interference` reports) within a 0.1 nm layer over the import's surface
+ *     (refs.ts `shapeTolerance`). Real 0.44.1: two imports of one STEP overlap by exactly their volume; a body touching
  *     a face, or a pin filling a hole exactly, is "no interference"; an export by WORLD name is
  *     written where that placement is. Never cached: the design changes every refresh.
  *
@@ -94,9 +96,18 @@ async function insertStep(call: SlotCall, path: string, name: string, what: stri
 }
 
 async function measure(call: SlotCall, bodies: string[], what: string): Promise<ReferenceBodyMeasure[]> {
+  return (await measureWithArea(call, bodies, what)).measures;
+}
+
+/** `measure`, with each body's surface area (`area_mm2`; the shape tolerance is a depth over it).
+ *  `needArea`: a body without a positive area throws (the gate then says unverified). */
+async function measureWithArea(call: SlotCall, bodies: string[], what: string, needArea = false): Promise<{ measures: ReferenceBodyMeasure[]; areas: number[] }> {
   const m = await call("execute", { command: "inspect.measure", params: { bodies } });
   if (m.isError) throw new Error(`${what} could not be measured: ${m.text.slice(0, 300)}`);
-  return readReferenceMeasures(m.json, bodies);
+  const measures = readReferenceMeasures(m.json, bodies);
+  const areas = (m.json.bodies as any[]).map((b) => (typeof b?.area_mm2 === "number" && Number.isFinite(b.area_mm2) ? b.area_mm2 : NaN));
+  if (needArea) for (const [i, a] of areas.entries()) if (!(a > 0)) throw new Error(`${what}: body ${bodies[i]} has no surface area`);
+  return { measures, areas };
 }
 
 async function replayOnce(cli: { path: string }, step: string, file: string, sha256: string, opts: ReferenceReplayOptions): Promise<ReferenceMeasure> {
@@ -136,6 +147,8 @@ export interface ShapeComparison {
   liveVolume: number;
   /** vol(true ∩ live), from `inspect.interference` between the two. */
   overlap: number;
+  /** The true body's surface area (mm²): the shape tolerance is a depth over it. */
+  trueArea: number;
 }
 
 export interface TrueReferenceResult {
@@ -169,7 +182,7 @@ export function makeTrueReferenceCheck(opts: ReferenceReplayOptions): TrueRefere
       const truePath = join(dir, name);
       writeFileSync(truePath, input.step);
       const trueBodies = await insertStep(call, truePath, importFeatureName(name), `refs/${input.file}`, sha256);
-      const asImported = await measure(call, trueBodies, `the import of refs/${input.file}`);
+      const { measures: asImported, areas } = await measureWithArea(call, trueBodies, `the import of refs/${input.file}`, true);
       const labels = new Map<string, string>(trueBodies.map((b, i) => [b, `${asImported[i]?.name ?? b} (as imported)`]));
       const designBodies: string[] = [];
       for (const [i, d] of input.design.entries()) {
@@ -181,9 +194,27 @@ export function makeTrueReferenceCheck(opts: ReferenceReplayOptions): TrueRefere
       }
       let interference: McpToolResult | undefined;
       if (designBodies.length) {
-        const r = await call("execute", interferenceRequest(designBodies, trueBodies));
+        // Measured (refs.ts, RESIDUALS): `inspect.interference` drops an overlap below about
+        // (d / 1000)³ mm³, d the bounding-box diagonal of the body it takes first — here the one made
+        // first. So the true reference is imported a second time AFTER the design bodies, and every
+        // design body is checked against both copies: each pair in both orders, the floor the smaller
+        // body's. Every overlap with either copy is an overlap with the true import; a pair found
+        // against both is reported once, by its larger volume.
+        const again = await insertStep(call, truePath, `${importFeatureName(name)}-again`, `refs/${input.file} (second import)`, sha256);
+        if (again.length !== trueBodies.length) throw new Error(`refs/${input.file} imported as ${trueBodies.length} bodies, then as ${again.length}`);
+        again.forEach((b, i) => labels.set(b, labels.get(trueBodies[i]!)!));
+        const r = await call("execute", interferenceRequest(designBodies, [...trueBodies, ...again]));
         if (r.json && Array.isArray(r.json.interferences)) {
-          const json = { ...r.json, interferences: r.json.interferences.map((x: any) => ({ ...x, a: labels.get(String(x?.a)) ?? x?.a, b: labels.get(String(x?.b)) ?? x?.b })) };
+          const byPair = new Map<string, any>();
+          for (const x of r.json.interferences as any[]) {
+            const m = { ...x, a: labels.get(String(x?.a)) ?? x?.a, b: labels.get(String(x?.b)) ?? x?.b };
+            const key = JSON.stringify([m.a, m.b].map(String).sort());
+            const had = byPair.get(key);
+            if (!had || !(typeof had.volume_mm3 === "number" && had.volume_mm3 >= (typeof m.volume_mm3 === "number" ? m.volume_mm3 : -Infinity))) byPair.set(key, m);
+          }
+          const interferences = [...byPair.values()];
+          const unchecked = Array.isArray(r.json.unchecked) ? r.json.unchecked.map((u: any) => (u && typeof u === "object" && !Array.isArray(u) ? { ...u, a: labels.get(String(u.a)) ?? u.a, b: labels.get(String(u.b)) ?? u.b } : u)) : r.json.unchecked;
+          const json = { ...r.json, interferences, ...(typeof r.json.count === "number" && r.json.count === r.json.interferences.length ? { count: interferences.length } : {}), ...(unchecked !== undefined ? { unchecked } : {}) };
           interference = { ...r, json };
         } else interference = r;
       }
@@ -199,7 +230,7 @@ export function makeTrueReferenceCheck(opts: ReferenceReplayOptions): TrueRefere
         if (r.isError || !finished(r.json)) throw new Error(`the live reference body ${l.label} could not be compared with its import: ${r.text.slice(0, 300) || "no reply"}`);
         const overlap = (r.json.interferences as any[]).reduce((s, x) => s + (typeof x?.volume_mm3 === "number" ? x.volume_mm3 : NaN), 0);
         if (!Number.isFinite(overlap)) throw new Error(`the overlap of ${l.label} with its import has no volume`);
-        shape.push({ label: l.label, trueVolume: asImported[i]!.volume, liveVolume: lm!.volume, overlap });
+        shape.push({ label: l.label, trueVolume: asImported[i]!.volume, liveVolume: lm!.volume, overlap, trueArea: areas[i]! });
       }
       return { sha256, asImported, ...(interference ? { interference } : {}), shape };
     });

@@ -395,7 +395,7 @@ describe("A4 re-review: an owner card's write re-checks its snapshot inside the 
     expect(g.failing.join("\n")).toContain(`reference pump.step ${REFERENCE_NOT_COVERED}`);
   });
 
-  test("[A4] veto item 3: an approval with no record of a reference (made before records were kept) is never trusted from the current file — unverified, needsAdoption references, an adopt-references card 'approve current reference'; denied it stays unverified and is not asked again until the owner rebuilds, approved it records the import replayed alone and the part passes", async () => {
+  test("[A4] veto item 3: an approval with no record of a reference (made before records were kept) is never trusted from the current file — unverified, needsAdoption references, an adopt-references card 'approve current reference' showing the replayed measurements (volume, bounding box, faces per body); denied it stays unverified and is not asked again until the owner rebuilds, approved it records the import replayed alone and the part passes", async () => {
     const repo = tempRepo();
     const x = await buildPlate(repo, { cli: FAKE_SOLIDCRAFT });
     stepFile(repo, ".anvil-downloads/block.step", [200, 0, 0], [210, 10, 10]);
@@ -410,7 +410,12 @@ describe("A4 re-review: an owner card's write re-checks its snapshot inside the 
     expect(g.failing.join("\n")).toContain(`${REFERENCE_NOT_RECORDED} (refs/block.step)`);
     await until(() => x.openCards().some((c: any) => c.kind === "adopt-references"), "the references card");
     let card = x.openCards().find((c: any) => c.kind === "adopt-references")!;
-    expect(card.rows).toEqual([{ label: "refs/block.step", old: "measurements not recorded", new: `approve current reference (sha ${recorded.sha256.slice(0, 12)}, 1 body: block)` }]);
+    // The card shows what approving records — the import replayed alone, measured before it is drawn.
+    expect(card.rows).toEqual([
+      { label: "refs/block.step", old: "measurements not recorded", new: `approve current reference (sha ${recorded.sha256.slice(0, 12)}, 1 body: block)` },
+      { label: "refs/block.step block", new: "volume 1000 mm³, bounding box [200, 0, 0]…[210, 10, 10], 6 faces" },
+    ]);
+    expect(recorded.bodies).toMatchObject([{ name: "block", volume: 1000, bbox: { min: [200, 0, 0], max: [210, 10, 10] }, faces: 6 }]);
     // Denied: nothing recorded, the part stays unverified, the same card is not asked again.
     x.service.respond(card.requestId, false);
     g = await x.check();
