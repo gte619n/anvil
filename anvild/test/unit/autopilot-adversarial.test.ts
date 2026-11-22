@@ -19,8 +19,9 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
       yield { type: "result", result: "The plan is ready." } as any;
     },
   }),
-  createSdkMcpServer: () => ({ type: "sdk", name: "mock", instance: {} }),
-  tool: (name: string, _desc: unknown, _schema: unknown, handler: unknown) => ({ name, handler }),
+  createSdkMcpServer: (opts: { name: string }) => ({ type: "sdk", name: opts.name, instance: {} }),
+  // The real SDK's shape, so files that run later and inspect a tool's schema still see it.
+  tool: (name: string, description: unknown, inputSchema: unknown, handler: unknown) => ({ name, description, inputSchema, handler }),
 }));
 
 const { planUnit } = await import("../../src/integrations/autopilot");
