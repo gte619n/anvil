@@ -15,6 +15,7 @@ import {
   holeRowsByDiameter,
   releaseFolderName,
   isOsLitter,
+  mdText,
   releaseKey,
   specSheetHtml,
   specSheetMarkdown,
@@ -62,6 +63,19 @@ async function plateWithBox(repo: string) {
 }
 
 describe("release pack", () => {
+  test("[A4] a Markdown table cell escapes backslashes before pipes, so a name ending in a backslash cannot break out of its cell", () => {
+    expect(mdText("a|b")).toBe("a\\|b");
+    // "x\\|y": the backslash is doubled and the pipe still escaped, so the cell keeps one pipe-free value.
+    expect(mdText("x\\|y")).toBe("x\\\\\\|y");
+    expect(mdText("end\\")).toBe("end\\\\");
+    expect(mdText("c`d\nnext")).toBe("c\\`d next");
+    for (const hostile of ["evil\\|injected", "\\\\|", "a\\`|b"]) {
+      const cell = mdText(hostile);
+      // every pipe in the output is preceded by an odd number of backslashes (i.e. escaped)
+      for (const m of cell.matchAll(/(\\*)\|/g)) expect(m[1]!.length % 2).toBe(1);
+    }
+  });
+
   test("[A4] a pack holds exactly the §4.7 files (3MF only for FDM); the manifest hashes every file and its HMAC verifies with this machine's key (created 0600)", async () => {
     const repo = tempRepo();
     const state = tempDir();

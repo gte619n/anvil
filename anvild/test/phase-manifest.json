@@ -555,6 +555,7 @@
         {
           "file": "test/unit/cad-release.test.ts",
           "names": [
+            "release pack > [A4] a Markdown table cell escapes backslashes before pipes, so a name ending in a backslash cannot break out of its cell",
             "release pack > [A4] a pack holds exactly the §4.7 files (3MF only for FDM); the manifest hashes every file and its HMAC verifies with this machine's key (created 0600)",
             "release pack > [A4] verifyRelease refuses an edited file, an extra or missing file, a renamed folder and another machine's key",
             "release pack > [A4] re-releasing the same script replaces the folder (old moved aside, new renamed in, old removed — nothing left over); a failing export writes nothing",

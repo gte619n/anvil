@@ -161,7 +161,8 @@ export function escapeHtml(s: string): string {
 }
 /** One Markdown table cell (or inline text): no raw HTML, no pipe, no line break, no code fence. */
 export function mdText(s: string): string {
-  return escapeHtml(s).replace(/\|/g, "\\|").replace(/`/g, "\\`").replace(/[\r\n]+/g, " ");
+  // Backslashes first, so an input ending in "\" cannot turn the escape of a following "|" or "`" into a literal.
+  return escapeHtml(s).replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/`/g, "\\`").replace(/[\r\n]+/g, " ");
 }
 
 /** One row per distinct diameter (the spec's hole table): count, kinds, counterbores and centres. */

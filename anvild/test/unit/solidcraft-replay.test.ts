@@ -738,14 +738,22 @@ describe("replaying a machine's designs", () => {
     const b = builds({});
     const big = rawScript("big", [{ command: "parameters.add", params: { name: "L", expression: "80 mm", comment: "a".repeat(1024 * 1024) } }, ...asDesignSteps(box())]);
     const repo = fixtureRepo(tmp(), { "cad/big/design.json": big, "cad/plate/design.json": designJson("plate", plate()) });
-    let ticks = 0;
-    const heartbeat = setInterval(() => ticks++, 20);
+    // Measure the longest gap between heartbeats: a blocked event loop shows up as one long gap,
+    // however quickly the replay as a whole happens to finish on this machine.
     const started = Date.now();
+    let last = started;
+    let maxGap = 0;
+    const heartbeat = setInterval(() => {
+      const now = Date.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+    }, 20);
     const r = await replayMachine({ candidate: b.candidate, baseline: b.pinned, environments: ENV(repo.repoRoot) });
     clearInterval(heartbeat);
+    maxGap = Math.max(maxGap, Date.now() - last);
     expect(r.parts.map((p) => [p.part, p.outcome])).toEqual([["big", "same"], ["plate", "same"]]);
     expect(Date.now() - started).toBeLessThan(15_000);
-    expect(ticks).toBeGreaterThan(5); // the event loop kept turning throughout
+    expect(maxGap).toBeLessThan(1_000); // the event loop kept turning throughout (the old screen blocked it for 14 s)
   }, 30_000);
 
   test("[B2] a replay that outlasts the per-design timeout is stopped and counts against the candidate", async () => {
