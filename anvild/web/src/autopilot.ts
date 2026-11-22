@@ -21,6 +21,7 @@
 // fires. Cross-module state that main still reaches (`serverSchedule` in onStatus; the plan routing
 // maps live in fleet.ts) is an in-place container, so it stays an exported `const` here.
 import { $, busy, esc, icon } from "./dom";
+import { formulaHtml } from "./formula-breaks";
 // dialogs.ts is a leaf, so the modal/dialog/toast helpers are direct imports — they used to arrive
 // via initAutopilot(deps).
 import { closeModal, confirmDialog, confirmDialogWithOption, pickListDialog, showModal, toast } from "./dialogs";
@@ -361,6 +362,7 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     ${summary ? `<span class="plan-summary">${esc(summary)}</span>` : ""}
     ${hold}
     ${verifyCardChip(p)}
+    ${cadCardChip(p)}
     <span class="plan-meta">
       <span class="ap-chip">${icon("checklist")}${p.taskCount}</span>
       ${eff}
@@ -372,6 +374,93 @@ function planCardHtml(p: AutopilotPlanInfo): string {
     </span>
   </button>`;
 }
+// ── Autopilot CAD (agent-cad-and-browser §4.11, §4.14 item 41, Phase B3) ─────────────────────────
+/** The command a CAD-card button sends: approve or reject EXACTLY the numbers the card was drawn from
+ *  (`sha`). Pure, so a test asserts the payload without driving sockets. */
+export function cadRespondCommand(act: string, p: AutopilotPlanInfo): { type: "autopilot.cad.respond"; workUnitId: string; approve: boolean; sha: string } | undefined {
+  if ((act !== "approve" && act !== "reject") || !p.cad?.sha) return undefined;
+  return { type: "autopilot.cad.respond", workUnitId: p.id, approve: act === "approve", sha: p.cad.sha };
+}
+
+/** A compact grid-card chip for the CAD state: needs approved dimensions, verified, or blocked. */
+export function cadCardChip(p: AutopilotPlanInfo): string {
+  const c = p.cad;
+  if (!c) return "";
+  if (c.blocked && p.status === "blocked") return `<span class="plan-hold cad-blocked-chip" title="${esc(c.blocked.reason)}">${icon("block")} CAD blocked</span>`;
+  if (c.needsApproval) return `<span class="plan-hold cad-needs-chip" title="This plan builds CAD parts; approve their numbers before it can start">${icon("straighten")} Needs approved dimensions</span>`;
+  if (c.verified) return `<span class="ap-chip cad-verified-chip" title="CAD verified ${esc(new Date(c.verified.at).toLocaleString())}">${icon("verified")} CAD verified</span>`;
+  return "";
+}
+
+/** The plan reader's CAD section: the numbers (proposed → Approve / Reject; approved → locked), the
+ *  "needs approved dimensions" state, the verify badge or the blocking reason. PURE (plan → HTML); the
+ *  buttons carry `data-cad-act` for the one delegated handler in openPlan. "" for a non-CAD unit. */
+export function cadSectionHtml(p: AutopilotPlanInfo): string {
+  const c = p.cad;
+  if (!c) return "";
+  const status =
+    c.status === "approved" ? "Approved — locked onto the plan" : c.status === "rejected" ? "Rejected" : c.status === "missing" ? "No valid numbers yet" : c.source === "nightly" ? "Proposed by the nightly planner — not locked" : "Proposed — not locked";
+  const tables = c.parts
+    .map(
+      (part) => `<div class="cad-plan-part" data-part="${esc(part.part)}">
+        <div class="cad-plan-part-head"><b>cad/${esc(part.part)}</b> <span class="small muted">${esc(part.process)}</span>${part.approved ? ` <span class="ap-chip cad-part-approved">${icon("lock")} approved</span>` : ""}</div>
+        ${part.note ? `<div class="reader-hold cad-replace-note">${icon("warning")} <b>${esc(part.note)}</b></div>` : ""}
+        ${part.invalid ? `<div class="reader-hold cad-invalid">${icon("block")} <b>Cannot be approved:</b> ${esc(part.invalid)}</div>` : ""}
+        <table class="cad-expect-rows">${
+          part.rows.some((r) => r.old !== undefined) ? `<tr class="cad-row-head"><th></th><th>Approved now</th><th>This plan</th></tr>` : ""
+        }${part.rows
+          .map((r) => {
+            const hasOld = part.rows.some((x) => x.old !== undefined);
+            const changed = r.old !== undefined && r.old !== r.new;
+            return `<tr${changed ? ` class="cad-row-changed"` : ""}><td class="cad-row-label">${esc(r.label)}</td>${hasOld ? `<td class="cad-row-old">${formulaHtml(r.old ?? "—", esc)}</td>` : ""}<td class="cad-row-new">${formulaHtml(r.new ?? "—", esc)}</td></tr>`;
+          })
+          .join("")}</table>
+      </div>`,
+    )
+    .join("");
+  const canAnswer = (c.status === "proposed" || c.status === "rejected" || !!c.reapprove) && !!c.sha && p.status !== "building" && !c.parts.some((x) => x.invalid);
+  const buttons = canAnswer
+    ? `<div class="cad-plan-actions"><button class="mini danger" data-cad-act="reject" data-id="${esc(p.id)}">${icon("close")} Reject</button><button class="primary" data-cad-act="approve" data-id="${esc(p.id)}">${icon("lock")} Approve these numbers</button></div>`
+    : "";
+  const needs = c.needsApproval
+    ? `<div class="reader-hold cad-needs">${icon("straighten")} <b>Needs approved dimensions.</b> ${c.status === "missing" ? "The plan needs CAD but carries no valid numbers: open Plan with Claude to supply them." : c.status === "rejected" ? "The numbers were rejected: open Plan with Claude to supply new ones, or approve them." : "This plan cannot start (by Start or auto-start) until you approve its CAD numbers."}</div>`
+    : "";
+  const verified = c.verified ? `<p class="small cad-verified">${icon("verified")} <b>CAD verified</b> ${esc(new Date(c.verified.at).toLocaleString())}: ${c.verified.parts.map((x) => `cad/${esc(x)}`).join(", ")}</p>` : "";
+  const blocked = c.blocked && p.status === "blocked" ? `<div class="reader-hold cad-blocked">${icon("block")} <b>Blocked by the CAD verify:</b> ${esc(c.blocked.reason)}</div>` : "";
+  return `<section class="card cad-plan" data-cad-status="${esc(c.status)}">
+    <div class="pt-head">${icon("view_in_ar")} <b>CAD numbers</b> <span class="small muted">${esc(status)}</span></div>
+    ${needs}${c.reapprove ? `<div class="reader-hold cad-reapprove">${icon("history")} <b>Re-approve:</b> ${esc(c.reapprove)}.</div>` : ""}${blocked}${verified}
+    ${c.note ? `<p class="small cad-note">${icon("info")} ${esc(c.note)}</p>` : ""}
+    ${tables}
+    ${buttons}
+  </section>`;
+}
+
+/** Approve / Reject on the CAD section: send exactly what the card shows; a changed proposal is refused
+ *  by the daemon and the grid is redrawn with the new numbers. */
+async function runCadAction(act: string, id: string): Promise<void> {
+  const p = findPlan(id);
+  const cmd = p ? cadRespondCommand(act, p) : undefined;
+  if (!cmd) return;
+  const srv = planSock(id);
+  if (!srv?.sock.isOpen()) {
+    toast("That plan's server is offline");
+    return;
+  }
+  try {
+    const res = await sendAwait(srv, { ...cmd, cid: newCid() }, 60_000);
+    if (res.type === "command.error") {
+      toast(res.message);
+      backToGrid();
+      return;
+    }
+    toast(act === "approve" ? "CAD numbers approved — the plan can start" : "CAD numbers rejected");
+    backToGrid();
+  } catch (err) {
+    toast(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 // ── Completion-verification overlay (completion-verification spec §4.1) ───────────────────────────
 /** The verify commands a reader button dispatches. Pure map (act → command) so a test can assert the
  *  button carries the right unit id WITHOUT driving the DOM/sockets (R2 "assert the dispatched payload"). */
@@ -603,6 +692,8 @@ function openPlan(id: string): void {
   // A held (needs-clarification) unit can't be built until its questions are answered: its "plan" is just
   // the open questions. Disable Start / hide Pipeline and steer the reviewer to "Plan with Claude".
   const held = p.status === "needs-clarification";
+  // Phase B3 / item 41: a plan whose CAD numbers are not approved cannot start (the daemon refuses too).
+  const needsDims = !!p.cad?.needsApproval;
   // A unit with a live "Plan with Claude" session is owned by that session — Start/Plan/Pipeline would all
   // just error ("already has a live session"). Swap the whole action set for a jump-into-the-session button.
   const planning = p.status === "planning";
@@ -622,9 +713,9 @@ function openPlan(id: string): void {
         <button class="mini danger" id="plan-dismiss">${icon("close")} Dismiss</button>
         <button class="mini" id="plan-reassign">${icon("swap_horiz")} Reassign</button>
         <button class="mini" id="plan-link">${icon("link")} Link</button>
-        <button class="mini" id="plan-pipeline" title="Run the autonomous multi-model pipeline (Claude + GLM) end to end"${held ? " hidden" : ""}>${icon("hub")} Pipeline</button>
+        <button class="mini" id="plan-pipeline" title="Run the autonomous multi-model pipeline (Claude + GLM) end to end"${held || needsDims ? " hidden" : ""}>${icon("hub")} Pipeline</button>
         <button class="${held ? "primary" : "mini"}" id="plan-plan" title="Open an interactive session seeded with the request, the design so far, and any open questions — work the plan out with Claude, then build">${icon("auto_awesome")} Plan with Claude</button>
-        <button class="${held ? "mini" : "primary"}" id="plan-start"${held ? ` disabled title="Answer the open questions first — use Plan with Claude"` : ""}>${held ? `${icon("lock")} Needs answers` : `${icon("rocket_launch")} Start`}</button>`;
+        <button class="${held || needsDims ? "mini" : "primary"}" id="plan-start"${held ? ` disabled title="Answer the open questions first — use Plan with Claude"` : needsDims ? ` disabled title="Approve the plan's CAD numbers first"` : ""}>${held ? `${icon("lock")} Needs answers` : needsDims ? `${icon("straighten")} Needs approved dimensions` : `${icon("rocket_launch")} Start`}</button>`;
   host.innerHTML = `<div class="plan-reader" data-id="${esc(id)}">
     <div class="plan-reader-head">
       <button class="mini" id="plan-back">${icon("arrow_back")} All plans</button>
@@ -637,6 +728,8 @@ function openPlan(id: string): void {
       ${p.hold ? `<div class="reader-hold">${icon("pause_circle")} <b>Held for review:</b> ${esc(p.hold.reason)}</div>` : ""}
       ${p.goalCondition ? `<p class="small muted">${icon("target")} Stop condition once building: ${esc(p.goalCondition)}</p>` : ""}
       ${verifyOverlayHtml(p)}
+      ${p.blockedReason && !p.cad?.blocked ? `<div class="reader-hold">${icon("block")} <b>Blocked:</b> ${esc(p.blockedReason)}</div>` : ""}
+      ${cadSectionHtml(p)}
       ${p.pipeline ? renderPipelineTrace(p.pipeline) : ""}
       <article class="md plan-doc" id="plan-doc">${p.plan?.html ?? "<p class='muted'>No plan content.</p>"}</article>
     </div>
@@ -650,6 +743,9 @@ function openPlan(id: string): void {
   // regardless of which action set rendered above.
   host.querySelectorAll<HTMLElement>("[data-verify-act]").forEach((b) =>
     b.addEventListener("click", () => void runVerifyAction(b.dataset.verifyAct!, id)),
+  );
+  host.querySelectorAll<HTMLElement>("[data-cad-act]").forEach((b) =>
+    b.addEventListener("click", () => void runCadAction(b.dataset.cadAct!, id)),
   );
   // These three exist only in some action sets (not on a proposed card), so wire them null-safe.
   document.getElementById("plan-complete")?.addEventListener("click", () => void resolvePlan(id, "completed"));

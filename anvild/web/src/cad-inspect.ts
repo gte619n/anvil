@@ -43,6 +43,23 @@ export interface InspectHandle {
   setExplode(norm: number): void;
   isSectionOn(): boolean;
   isExplodeOn(): boolean;
+  /** What the user set up (section, explode, hidden / transparent parts), to carry over to the next
+   *  revision of the model when it is swapped in place (cad.ts `replaceModel`). */
+  getState(): InspectState;
+  /** The section slider position (0..1) this inspector is at. */
+  sectionPos(): number;
+}
+
+/** Inspector state that survives an in-place model swap. Parts are matched by name. */
+export interface InspectState {
+  sectionOn: boolean;
+  sectionAxis: "x" | "y" | "z";
+  /** The cut's absolute coordinate along the axis, so the plane stays where it was in space. */
+  sectionCoord: number;
+  explodeOn: boolean;
+  explodeNorm: number;
+  hidden: string[];
+  xray: string[];
 }
 
 interface InspectDeps {
@@ -55,6 +72,8 @@ interface InspectDeps {
   extrasTree?: CadNode | null;
   /** Re-frame the whole model (cad.ts fitToView). */
   fit(): void;
+  /** State of the inspector this one replaces (an in-place model swap): re-applied to the new model. */
+  restore?: InspectState;
 }
 
 /** Collect the meshes a CadNode (and its descendants) reference, from the ordered mesh list. */
@@ -345,6 +364,40 @@ export function buildInspector(deps: InspectDeps): InspectHandle {
     if (explodeOn) applyExplode();
   };
 
+  const axisRange = (): [number, number] => (sectionAxis === "x" ? [box.min.x, box.max.x] : sectionAxis === "y" ? [box.min.y, box.max.y] : [box.min.z, box.max.z]);
+  const getState = (): InspectState => {
+    const [lo, hi] = axisRange();
+    return {
+      sectionOn,
+      sectionAxis,
+      sectionCoord: lo + (hi - lo) * sectionNorm,
+      explodeOn,
+      explodeNorm,
+      hidden: parts.filter((p) => visible.get(p.id) === false).map((p) => p.name),
+      xray: parts.filter((p) => xray.get(p.id)).map((p) => p.name),
+    };
+  };
+  // Carry the previous revision's state over: same cut in space, same parts hidden, same explode.
+  const prev = deps.restore;
+  if (prev) {
+    sectionAxis = prev.sectionAxis;
+    const [lo, hi] = axisRange();
+    sectionNorm = hi > lo ? Math.max(0, Math.min(1, (prev.sectionCoord - lo) / (hi - lo))) : 0.5;
+    if (prev.sectionOn) toggleSection();
+    for (const p of parts) {
+      if (prev.hidden.includes(p.name)) applyVisible(p, false);
+      if (prev.xray.includes(p.name)) {
+        xray.set(p.id, true);
+        setPartTransparent(p.meshes, true);
+        p.row?.querySelector('[data-op="xray"]')?.classList.add("on");
+      }
+    }
+    if (prev.explodeOn) {
+      explodeNorm = prev.explodeNorm;
+      toggleExplode();
+    }
+  }
+
   const dispose = (): void => {
     panel.removeEventListener("click", onClick);
     // Restore materials (transparency + clipping) and positions.
@@ -372,6 +425,8 @@ export function buildInspector(deps: InspectDeps): InspectHandle {
     setExplode,
     isSectionOn: () => sectionOn,
     isExplodeOn: () => explodeOn,
+    getState,
+    sectionPos: () => sectionNorm,
   };
 }
 

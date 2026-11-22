@@ -6,6 +6,7 @@ import { PROTOCOL_VERSION, UPDATE_API_VERSION } from "@protocol";
 import { now } from "../util/envelope";
 import { newId } from "../util/ids";
 import { VERSION } from "../version";
+import { FEATURE_CAPABILITIES } from "../config";
 
 /**
  * This server's stable identity (anvil-multi-server.md §3). `serverId` is generated once and
@@ -61,7 +62,7 @@ export function loadServerIdentity(stateDir: string, env: Record<string, string 
 }
 
 /**
- * Coarse feature flags this build supports, advertised in `server.hello` so a newer client can skip
+ * The BASE capability list: coarse feature flags this build always supports, advertised in `server.hello` so a newer client can skip
  * commands an older member can't handle (instead of getting `unknown command type` back). Add a tag
  * here when a new command family ships; a pre-capability member simply omits the field and the client
  * treats every capability as unsupported for it. PROTOCOL_VERSION can't serve this — it's a single
@@ -135,6 +136,18 @@ export const SERVER_CAPABILITIES: readonly string[] = [
   "autopilot-verify",
 ];
 
+/**
+ * The capability list this daemon advertises: the base list plus each opt-in feature capability
+ * (`FEATURE_CAPABILITIES`: cad-work, solidcraft-pin, mcp-integrations, browser, part-sources) that `ANVIL_FEATURES`
+ * enabled (agent-cad-and-browser spec §4.8). EVERY place that advertises capabilities (`server.hello`,
+ * `/api/health`) goes through this, so the two can never disagree. Always a fresh array. The features
+ * are read at startup, so a flag changes only with a daemon restart and no live re-hello is needed.
+ * An unknown feature name is never advertised, even if a caller passes one.
+ */
+export function serverCapabilities(features: readonly string[] = []): string[] {
+  return [...SERVER_CAPABILITIES, ...FEATURE_CAPABILITIES.filter((f) => features.includes(f))];
+}
+
 /** This daemon's position in the fleet, as `serverHelloEvent` needs it to derive `role`. */
 export interface FleetPosition {
   /** `PairedHubStore.get()?.hubServerId ?? null`. */
@@ -144,7 +157,11 @@ export interface FleetPosition {
 }
 
 /** The `server.hello` frame emitted first on every WS connection (§6). */
-export function serverHelloEvent(id: ServerIdentity, pos: FleetPosition = { pairedHubId: null, memberCount: 0 }): ServerHelloEvent {
+export function serverHelloEvent(
+  id: ServerIdentity,
+  pos: FleetPosition = { pairedHubId: null, memberCount: 0 },
+  features: readonly string[] = [],
+): ServerHelloEvent {
   // `member` wins over `hub`: the client uses this to decide where roster WRITES go, and a paired
   // machine is never the writer even if it has members of its own (§7.2).
   const role = pos.pairedHubId ? "member" : pos.memberCount > 0 ? "hub" : "standalone";
@@ -157,7 +174,7 @@ export function serverHelloEvent(id: ServerIdentity, pos: FleetPosition = { pair
     version: VERSION,
     protocolVersion: PROTOCOL_VERSION,
     updateApiVersion: UPDATE_API_VERSION,
-    capabilities: [...SERVER_CAPABILITIES],
+    capabilities: serverCapabilities(features),
     role,
     ...(pos.pairedHubId ? { hubServerId: pos.pairedHubId } : {}),
   };

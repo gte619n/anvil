@@ -9,6 +9,7 @@ import type { AutopilotPlanInfo } from "@protocol";
 import type { WorkUnit, WorkUnitVerification } from "./workunit";
 import type { MarkdownRenderer } from "../render/markdown";
 import { toPipelineTraceInfo } from "../pipeline/daemon-adapters";
+import { coveredParts, toCadInfo, type CadCardContext } from "./autopilot-cad";
 
 /** Pending plans = what the Autopilot card grid shows. `liveIds` lets a unit carrying a verification
  *  overlay (likely-complete or mismatch) surface even when its base status wouldn't otherwise render it
@@ -29,6 +30,9 @@ export function selectPendingPlans(units: WorkUnit[], liveIds: ReadonlySet<strin
       // operator resolves them. Only pipeline-run units gain this visibility — a normal
       // planned→built unit has no devPipeline.
       (u.devPipeline !== undefined && (u.status === "review" || u.status === "blocked")) ||
+      // Phase B3: a CAD build's verify result (the cadVerified badge, or the reason it blocked the unit)
+      // is shown on its card while it builds and once it is blocked.
+      ((u.cadVerified !== undefined || u.cadBlocked !== undefined) && (u.status === "building" || u.status === "blocked")) ||
       // A verification overlay (likely-complete badge or mismatch warning) must always be visible, even
       // on a unit whose base status wouldn't otherwise render it (R2-S8).
       hasOverlay(u, liveIds),
@@ -70,7 +74,7 @@ export function selectCompletedUnits(
 }
 
 /** Shape a WorkUnit for the card grid + reader (env name + the rendered plan markdown). */
-export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, renderer: Pick<MarkdownRenderer, "render">): AutopilotPlanInfo {
+export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, renderer: Pick<MarkdownRenderer, "render">, cadCtx?: CadCardContext): AutopilotPlanInfo {
   const verification = toVerificationInfo(u.verification, renderer);
   return {
     id: u.id,
@@ -92,6 +96,11 @@ export function toPlanInfo(u: WorkUnit, environmentName: string | undefined, ren
     ...(u.trigger ? { trigger: { kind: u.trigger.kind, source: u.trigger.source, at: u.trigger.at } } : {}),
     ...(u.goalCondition ? { goalCondition: u.goalCondition } : {}),
     ...(verification ? { verification } : {}),
+    ...(() => {
+      const cad = toCadInfo(u, cadCtx);
+      return cad ? { cad } : {};
+    })(),
+    ...(u.status === "blocked" && u.blockedReason ? { blockedReason: u.blockedReason } : {}),
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
   };
@@ -282,6 +291,19 @@ export function buildAutopilotBrief(u: WorkUnit): string {
   const parts: string[] = [`You are implementing the autopilot work unit “${u.title}”.`];
   if (u.rationale) parts.push(`## Why\n\n${u.rationale}`);
   if (u.plan) parts.push(`## The plan\n\n${u.plan}`);
+  const cad = coveredParts(u);
+  if (cad.length) {
+    parts.push(
+      [
+        "## CAD parts",
+        "",
+        `The plan's approved numbers for ${cad.map((p) => `cad/${p}`).join(", ")} are ALREADY recorded in this worktree (part.json, the declared parameters, and the owner's approval). Do not call record_expectations for them: build each part with the anvil_cad tools (open_part, then model from the existing parameters) until check_part passes.`,
+        "- You may work only on these parts; any other part is refused.",
+        "- You cannot change the numbers, the parameters' accepted values, or cad/rules.json; no one is here to approve a change. If SolidCraft cannot make a feature, call report_gap.",
+        "- When your turn ends, the daemon verifies every CAD part this worktree touches; anything short of a pass blocks this work unit.",
+      ].join("\n"),
+    );
+  }
   parts.push(["## Your job", "", "- Implement it end to end in this worktree.", "- Then summarize what you changed."].join("\n"));
   return parts.join("\n\n");
 }

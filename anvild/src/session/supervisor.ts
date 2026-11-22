@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { mkdirSync as ensureDir } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
 import {
   PROTOCOL_VERSION,
   type AttachmentRef,
@@ -58,9 +58,19 @@ import {
   type SessionGoal,
   type ResumeWatermarksEvent,
   type TelemetrySnapshotEvent,
+  type McpIntegrationsEvent,
+  type BrowserSitesEvent,
+  type BrowserLoggedInEvent,
 } from "@protocol";
 import { GOAL_MAX_ITERATIONS, parseGoalCommand, type GoalCommand } from "../agent/goal";
 import { now } from "../util/envelope";
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { CadExpectationsRequestEvent, CadParamSetResultEvent, CadPartsListResultEvent, CadStatusEvent } from "@protocol";
+import { featureEnabled } from "../config";
+import { STATE_FEATURES, registerStateDirProtection } from "../agent/state-protected";
+import type { CadManagerOptions } from "../cadwork/manager";
+import { CadworkService, CWD_REFUSED } from "./cadwork-service";
+import { gitToplevel, partRef } from "../cadwork/partfolder";
 import { newId } from "../util/ids";
 import type { ConnectionRegistry } from "../server/registry";
 import { discoverSelfBaseUrl } from "../server/fleet";
@@ -69,7 +79,7 @@ import { SessionStore } from "./store";
 import { TerminalManager } from "./terminal-manager";
 import { FileWatchManager } from "./file-watch-manager";
 import { createWorktree, gitStatus, gitStatusAsync, recreateWorktree, removeWorktree, worktreeHealth } from "./worktree";
-import { AgentDriver, type TurnUsage } from "../agent/driver";
+import { AgentDriver, type QueryFn, type TurnUsage } from "../agent/driver";
 import { setManagedCliPath } from "../agent/cli";
 import * as claudeCli from "../daemon/claude-cli";
 import { refreshHeadlessSkills, setFleetSkillsDir, skillPlugins } from "../agent/skills";
@@ -87,6 +97,12 @@ import { ModelLabelStore } from "../models/store";
 import { CLAUDE_TOKEN_KEY } from "../auth/store";
 import { PermissionBroker } from "../agent/permissions";
 import { QuestionBroker } from "../agent/questions";
+import { HUMAN_MCP_SERVER_NAME, HUMAN_TOOL_IDS, HumanRequestService, buildHumanToolsServer } from "../agent/human-tools";
+import { TEST_MCP_SERVER_NAME, buildTestDaemonToolsServer } from "../agent/testdaemon-tools";
+import { PARTS_MCP_SERVER_NAME, buildPartsToolsServer } from "../agent/parts-tools";
+import { PartsService, type PartsServiceDeps } from "../integrations/parts/service";
+import { envFile as launcherEnvFile } from "../auth/env-file";
+import { isOrdinarySession } from "../agent/mcp-external";
 import { PassthroughRenderer, type MarkdownRenderer } from "../render/markdown";
 import { EventLog } from "../eventlog/log";
 import { RateLimitTracker } from "../budget/tracker";
@@ -96,6 +112,9 @@ import { IntegrationStore } from "../integrations/store";
 import { IntegrationsFacade } from "./integrations-facade";
 import { AccountRosterService } from "./account-roster-service";
 import { EnvironmentService } from "./environment-service";
+import { McpIntegrationService, type McpIntegrationServiceDeps } from "./mcp-integration-service";
+import type { McpProber } from "../mcp/health";
+import type { McpIntegrationFields, McpIntegrationInput } from "../mcp/store";
 import { GitProjectionService } from "./git-projection-service";
 import { CLAUDE_MD_REFLECTION_PROMPT, claudeMdReflectionEnabled, PrActivityWatcher } from "./claude-md-reflection";
 import { AutopilotService } from "./autopilot-service";
@@ -178,10 +197,26 @@ export interface SupervisorConfig {
   adversarialModels?: string[];
   /** Preferred OpenRouter provider slug for the panel (see `Config.adversarialProvider`). */
   adversarialProvider?: string;
+  /** Capability-gated features switched on by `ANVIL_FEATURES` (see `Config.features`): "cad-work",
+   *  "mcp-integrations", "browser", "part-sources" are read here. Omitted → none, so a Supervisor
+   *  built in a unit test never grows CAD or integration tools by accident. */
+  features?: readonly string[];
+  /** Test seam: options for the CAD process manager (fake clock, spawn, FAKE_SC_* env). */
+  cadManager?: CadManagerOptions;
+  /** Test seam: the SDK `query` every session driver is built with (a capturing one proves that a
+   *  code path asked no model). Omitted → the SDK's own. */
+  sessionQueryFn?: QueryFn;
   /** The concierge's reach into the fleet (anvil-fleet-concierge): member roster + REST-backed
    *  environment/repo/handoff calls. Defined in http.ts (which owns the FleetStore + identity);
    *  omitted in unit tests and the concierge degrades to this machine only. */
   fleet?: ConciergeFleetOps;
+  /** Hostnames of the fleet's member machines (the FleetStore roster's hosts and URL hostnames),
+   *  refused by `parts_fetch` whatever they resolve to. Defined in http.ts; omitted in unit tests. */
+  fleetHosts?: () => readonly string[];
+  /** Test seams for the MCP integration registry (fake prober / fake clock / no timer). */
+  mcp?: { prober?: McpProber; clock?: () => number; intervalMs?: number; browser?: McpIntegrationServiceDeps["browser"] };
+  /** Test seams for the part sources (Phase C5; "part-sources" feature): fake fetch, base URLs, … */
+  parts?: Omit<Partial<PartsServiceDeps>, "envFile" | "stateDir" | "onKeysChanged">;
   /** Fleet skill library hooks (docs/plans/2026-11-19-fleet-skills.md), defined in http.ts where the
    *  FleetStore lives: replicate after a hub-side change, and report each member's last-seen sync state
    *  for the `skills` event. Omitted in unit tests / on a leaf. */
@@ -195,6 +230,15 @@ export interface SupervisorConfig {
  * cleanup). Broadcasts global `session.*` events; session-scoped events flow through each
  * `Session`'s `emit` to attached connections.
  */
+/** A path with its symlinks resolved, or the path itself when it cannot be resolved. */
+function realpathOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 export class Supervisor {
   private readonly store: SessionStore;
   private readonly sessions = new Map<string, Session>();
@@ -279,8 +323,20 @@ export class Supervisor {
   private readonly accountRoster: AccountRosterService;
   /** Environment (project) CRUD + clone + README domain (P7 extraction). */
   private readonly environments: EnvironmentService;
+  /** MCP integration registry: store, health, exclusive lock, commands and the permission gate's
+   *  lookups (mcp-integrations spec). Inert unless the "mcp-integrations" feature is on. */
+  readonly mcp: McpIntegrationService;
+  /** `request_human` hand-offs (agent browser Phase C3). The autopilot track assigns
+   *  `human.onUnattendedHumanRequest` to mark a builder's work unit blocked. */
+  readonly human: HumanRequestService;
+  /** Part sources and their keys (Phase C5). Absent unless the "part-sources" feature is on. */
+  readonly parts?: PartsService;
+  /** Withdraws the state-dir file-tool protection (see STATE_FEATURES). */
+  private offStateProtection?: () => void;
   /** Git projection + PR-badge/sweep domain (P7 extraction). */
   private readonly gitProjection: GitProjectionService;
+  /** CAD domain — SolidCraft process manager + the `anvil_cad` tool server (agent-cad-and-browser spec). */
+  readonly cadwork: CadworkService;
   /** Team orchestration domain — plan lifecycle, member spawn/queue/drain, relay guard, integration
    *  (P7 extraction; see docs/plans/anvil-team-support.md). */
   private readonly teams: TeamCoordinator;
@@ -342,6 +398,75 @@ export class Supervisor {
       clonesDir: this.clonesDir,
       renderer: this.renderer,
     });
+    this.sessionQueryFn = cfg.sessionQueryFn;
+    this.cadwork = new CadworkService({
+      enabled: featureEnabled({ features: cfg.features }, "cad-work"),
+      getSession: (id) => this.sessions.get(id),
+      // Every owner card also reaches the owner's devices, as a notification that only OPENS the card
+      // (decision 128): it is never answered from the shade.
+      registry: {
+        toAll: (ev) => {
+          this.registry.toAll(ev);
+          if (ev.type === "cad.expectations.request" && !ev.replay) this.notifyOwnerCard(ev);
+        },
+      },
+      manager: cfg.cadManager,
+      stateDir: cfg.stateDir, // the lock store: <stateDir>/cadwork/locks.json
+      writableStateRoots: [this.store.worktreeRoot(), this.clonesDir], // the only folders under the state dir a session may edit
+    });
+    if (this.cadwork.enabled) void this.cadwork.refreshStatus(); // learn the SolidCraft version; broadcasts cad.status
+    this.mcp = new McpIntegrationService({
+      stateDir: cfg.stateDir,
+      enabled: featureEnabled(cfg, "mcp-integrations"),
+      browserEnabled: featureEnabled(cfg, "browser"),
+      browser: cfg.mcp?.browser,
+      broadcast: (event) => this.registry.toAll(event),
+      clientCount: () => this.registry.all().length,
+      sessions: () => this.sessions.values(),
+      getSession: (id) => this.sessions.get(id),
+      persist: () => this.persist(),
+      broadcastUpdated: (data) => this.broadcastUpdated(data),
+      dropIdleDriver: (id) => this.dropIdleDriver(id),
+      denyParked: (id, key) => {
+        const s = this.sessions.get(id);
+        for (const p of [...(s?.pendingPermissions.values() ?? [])]) {
+          if (p.tool.startsWith(`mcp__${key}__`)) this.resolvePermission(p.requestId, "deny");
+        }
+      },
+      notice: (id, markdown) => {
+        this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
+      },
+      saveImage: (sessionId, mediaType, dataBase64) => this.attachStore.add(sessionId, "screenshot", mediaType, dataBase64).id,
+      onConsumeExit: (id) => this.cancelHumanRequests(id), // a dead turn cannot receive "I've cleared it"
+      prober: cfg.mcp?.prober,
+      clock: cfg.mcp?.clock,
+      intervalMs: cfg.mcp?.intervalMs,
+    });
+    // Part sources (Phase C5): only with the "part-sources" feature. Keys live in the launcher env file
+    // (a test's own when it passes one); a change is broadcast and, on a hub, pushed to the members.
+    // parts_fetch refuses every fleet machine the way the browser proxy does: the roster's hosts, and
+    // what the browser's allowed-sites sync knows (on a member, the hub that paired it).
+    const partsFleetHosts = cfg.parts?.fleetHosts;
+    this.parts = featureEnabled(cfg, "part-sources")
+      ? new PartsService({
+          ...cfg.parts,
+          envFile: cfg.envFile ?? launcherEnvFile(),
+          stateDir: cfg.stateDir,
+          fleetHosts: () => [...new Set([...(cfg.fleetHosts?.() ?? []), ...(this.mcp.browser?.sites.fleetHosts() ?? []), ...(partsFleetHosts?.() ?? [])])],
+          onKeysChanged: (event, origin) => {
+            this.registry.toAll(event);
+            this.rebuildIdleDriversForParts();
+            if (origin === "local") this.onRosterChanged?.("part-source keys changed");
+          },
+        })
+      : undefined;
+    this.partsToolsOn = this.parts?.anyConfigured() ?? false;
+    this.human = new HumanRequestService({ screenshot: (sessionId) => this.mcp.browser?.screenshot(sessionId) });
+    // The state folder's file-tool protection (merge item (c)): with ANY feature that keeps state
+    // there, not only cad-work. The only folders under it a session may edit: worktrees, clones.
+    if (STATE_FEATURES.some((f) => featureEnabled(cfg, f))) {
+      this.offStateProtection = registerStateDirProtection(cfg.stateDir, [this.store.worktreeRoot(), this.clonesDir]);
+    }
     this.gitProjection = new GitProjectionService({
       require: (id) => this.require(id),
       getSession: (id) => this.sessions.get(id),
@@ -421,7 +546,19 @@ export class Supervisor {
         this.persist();
         this.broadcastUpdated(built.data);
       },
+      cadwork: this.cadwork, // Phase B3: plan numbers into builder worktrees, the verify hook, planner cards
+      notice: (id, markdown) => {
+        this.sessions.get(id)?.emit({ type: "assistant.message", blocks: [{ kind: "markdown", rendered: this.renderer.render(markdown) }] });
+      },
     });
+    // An autopilot builder works only on the parts its plan covers (Phase B3, §4.11).
+    this.cadwork.setBuilderScope((sessionId) => this.autopilot.builderParts(sessionId));
+    // A builder that hits a bot check or a CAPTCHA cannot wait for a person: its work unit is marked
+    // blocked with the reason (agent browser §4.12 "Hand-off"; C3 review, item 3).
+    this.human.onUnattendedHumanRequest = (sessionId, reason) => {
+      const unit = this.sessions.get(sessionId)?.data.workUnitId;
+      if (unit) this.autopilot.blockUnit(unit, `needs a human: ${reason}`);
+    };
     this.loops = new LoopService({
       registry: this.registry,
       stateDir: cfg.stateDir,
@@ -469,6 +606,7 @@ export class Supervisor {
       softStopFraction: cfg.softStopFraction ?? 0.95,
     });
     this.restore();
+    this.mcp.start(); // after restore: prunes stale integration ids off sessions, then the first probe
     this.autopilot.startScheduler();
     this.loops.startScheduler(); // per-loop trigger tick (schedule/chained) + the Todoist-intake singleton
     this.startPrStateSweeper();
@@ -894,6 +1032,140 @@ export class Supervisor {
     return true;
   }
 
+  /** A part source was switched on or off: idle ordinary sessions rebuild their tools on the next
+   *  turn (a busy one keeps what it has until it is idle and its driver is rebuilt). */
+  private partsToolsOn = false;
+  private rebuildIdleDriversForParts(): void {
+    const on = this.parts?.anyConfigured() ?? false;
+    if (on === this.partsToolsOn) return;
+    this.partsToolsOn = on;
+    for (const s of this.sessions.values()) if (isOrdinarySession(s.data)) this.dropIdleDriver(s.id);
+  }
+
+  // ── Part sources (Phase C5) — delegated to PartsService ─────────────────────────────────────
+  private requireParts(): PartsService {
+    if (!this.parts) throw new BadCommand("part sources are not enabled on this server");
+    return this.parts;
+  }
+  partsEvent(cid?: string): import("@protocol").PartSourcesEvent {
+    return { ...this.requireParts().event(), ...(cid ? { cid } : {}) };
+  }
+  partsSetKeys(source: unknown, values: unknown): void {
+    const p = this.requireParts();
+    try {
+      p.setKeys(source, values);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  partsClearKeys(source: unknown): void {
+    const p = this.requireParts();
+    try {
+      p.clearKeys(source);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  partsTest(source: unknown, cid?: string): Promise<import("@protocol").PartsTestResultEvent> {
+    return this.requireParts().test(source, cid);
+  }
+
+  /** Synchronous sibling of {@link restartDriverForNewToken} for the MCP registry: drop an IDLE
+   *  session's driver so its next turn rebuilds the MCP server map (`claudeSessionId` is kept, so the
+   *  conversation resumes). Returns false when the session is mid-turn and was left alone. */
+  private dropIdleDriver(id: string): boolean {
+    const status = this.sessions.get(id)?.data.status;
+    if (status && status !== "idle") return false;
+    const driver = this.drivers.get(id);
+    if (!driver) return true;
+    this.drivers.delete(id);
+    void driver.stop().catch(() => {}); // best-effort — a dead driver is already what we want
+    return true;
+  }
+
+  // ── MCP integrations — delegated to McpIntegrationService ─────────────────────────────────────
+  mcpIntegrationsEvent(): McpIntegrationsEvent {
+    return this.mcp.integrationsEvent();
+  }
+  mcpIntegrationAdd(integration: McpIntegrationInput): void {
+    this.mcp.add(integration);
+  }
+  mcpIntegrationUpdate(id: string, fields: McpIntegrationFields): void {
+    this.mcp.update(id, fields);
+  }
+  mcpIntegrationRemove(id: string): void {
+    this.mcp.remove(id);
+  }
+  mcpIntegrationCheck(): Promise<void> {
+    return this.mcp.check();
+  }
+  setSessionMcpIntegrations(sessionId: string, ids: string[]): void {
+    this.mcp.setSessionIntegrations(sessionId, ids);
+  }
+
+  // ── Agent browser allowed sites (Phase C2) — delegated to the browser's AllowedSitesService ───
+  private requireBrowser(): NonNullable<McpIntegrationService["browser"]> {
+    if (!this.mcp.browser) throw new BadCommand("the agent browser is not enabled on this server");
+    return this.mcp.browser;
+  }
+  browserSitesEvent(): BrowserSitesEvent {
+    return this.requireBrowser().sites.event();
+  }
+  browserSiteAdd(site: string): void {
+    try {
+      this.requireBrowser().sites.add(site);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  /** Install the agent browser's pinned server runtime on this machine. */
+  async browserRuntimeInstall(): Promise<void> {
+    try {
+      await this.requireBrowser().installRuntime();
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    await this.mcp.probe("change");
+  }
+  browserSiteRemove(site: string): void {
+    try {
+      this.requireBrowser().sites.remove(site);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // ── Agent browser logged-in sites, unlock switches and "Open agent browser" (Phase C3) ───────
+  private browserCommand<T>(run: (browser: NonNullable<McpIntegrationService["browser"]>) => T): T {
+    const browser = this.requireBrowser();
+    try {
+      return run(browser);
+    } catch (e) {
+      throw e instanceof BadCommand ? e : new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+  browserLoggedInEvent(): BrowserLoggedInEvent {
+    return this.requireBrowser().loggedIn.event();
+  }
+  browserLoggedInAdd(site: string): void {
+    this.browserCommand((b) => b.loggedIn.add(site, "owner"));
+  }
+  browserLoggedInRemove(site: string): void {
+    this.browserCommand((b) => b.loggedIn.remove(site));
+  }
+  browserLoggedInReset(): void {
+    this.browserCommand((b) => b.loggedIn.reset());
+  }
+  browserLoggedInSetUnlocked(site: string, unlocked: unknown): void {
+    if (typeof unlocked !== "boolean") throw new BadCommand("unlocked must be true or false");
+    this.browserCommand((b) => b.loggedIn.setUnlocked(site, unlocked));
+  }
+  /** Open the owner's Chrome window on this machine's agent profile (refused with no desktop session
+   *  or while a session is using the browser). */
+  browserOpenAgentBrowser(): void {
+    this.browserCommand((b) => b.openAgentBrowser());
+  }
+
   /**
    * A new Claude credential just landed (a pair, a rotation, a paste, or a roster mutation). Sessions
    * build their agent env per spawn, so nothing needs a restart to pick it up — but a session whose
@@ -1059,6 +1331,11 @@ export class Supervisor {
   approveProposed(workUnitId: string, start: boolean, cid?: string): Promise<AutopilotStartedEvent | AutopilotPlanResultEvent> {
     return this.autopilot.approveProposed(workUnitId, start, cid);
   }
+
+  /** `autopilot.cad.respond` (Phase B3, item 41): approve/reject the CAD numbers on a plan's card. */
+  respondAutopilotCad(workUnitId: string, approve: boolean, sha: unknown, cid?: string): AutopilotPlanResultEvent {
+    return this.autopilot.respondCad(workUnitId, approve, sha, cid);
+  }
   reassignPlan(workUnitId: string, environmentId: string, cid?: string): Promise<AutopilotPlanResultEvent> {
     return this.autopilot.reassignPlan(workUnitId, environmentId, cid);
   }
@@ -1174,6 +1451,8 @@ export class Supervisor {
     // attach would otherwise never see them and the session would look stuck. Re-surface all of them
     // (a session can hold several at once, like permissions). (arch §6.6).
     for (const pendingQuestion of s.questionRequestEvents()) events.push(pendingQuestion);
+    for (const pendingHuman of s.humanRequestEvents()) events.push(pendingHuman); // parked request_human cards
+
     // Re-surface the live sub-agent set so a client attaching MID fan-out sees the running sub-agents at
     // once (§sub-agents, D9/ID13) — the subagent.activity channel is ephemeral (no seq), so without this
     // a reconnect would show a frozen pane until the next heartbeat. Empty when no sub-agents ran this turn.
@@ -1363,9 +1642,12 @@ export class Supervisor {
     teamRole?: "lead" | "member";
     memberTask?: string;
     repoRoot?: string; // #7: spawn a fresh-worktree member off this repo when there's no environment
-    // ── Autopilot: mark a "Plan with Claude" planning session and link it to its work unit ──
+    // ── Autopilot: mark a "Plan with Claude" planning session (or a Go builder) and link it to its work unit ──
     workUnitId?: string;
-    workUnitRole?: "planner";
+    workUnitRole?: "planner" | "builder";
+    /** Phase B3: runs after the session exists and BEFORE its first turn (a builder's worktree gets the
+     *  plan's approved CAD numbers). A throw removes the session and is rethrown. */
+    prepare?: (s: { id: string; cwd: string }) => Promise<void> | void;
   }): Promise<{ id: string; title: string; cwd: string }> {
     let cmd: SessionCreateCmd;
     if (a.source === "fresh-worktree") {
@@ -1416,6 +1698,19 @@ export class Supervisor {
       session.data.workUnitId = a.workUnitId;
       session.data.workUnitRole = a.workUnitRole;
       this.persist();
+    }
+    // Phase B3: `prepare` (a builder's plan numbers) runs BEFORE the session is announced, and while it
+    // runs no prompt is accepted for it — so nothing can reach the model before the numbers are applied.
+    if (a.prepare) {
+      this.preparing.add(session.id);
+      try {
+        await a.prepare({ id: session.id, cwd: session.data.cwd });
+      } catch (e) {
+        this.preparing.delete(session.id);
+        await this.kill(session.id).catch(() => undefined); // nothing half-prepared is left running
+        throw e;
+      }
+      this.preparing.delete(session.id);
     }
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.created", ts: now(), session: session.data });
     this.teams.broadcastTeamInfo(); // a new member/lead reshapes the derived team tree
@@ -1687,9 +1982,13 @@ export class Supervisor {
     return this.attachStore.bytes(sessionId, id);
   }
 
+  /** Sessions whose handoff `prepare` is still running (Phase B3): not announced, and refuse prompts. */
+  private readonly preparing = new Set<string>();
+
   /** Send a user turn to the session's agent (arch §6.2), starting the driver lazily. */
   prompt(id: string, text: string, attachmentIds: string[] = [], cid?: string): void {
     const s = this.require(id);
+    if (this.preparing.has(id)) throw new BadCommand("this session is still being prepared (its plan's CAD numbers are being applied); try again in a moment");
     // Exactly-once (v4, spec A5): a re-flushed offline send carries the same cid. If we've already
     // applied it, record nothing new and don't run the turn again — the dispatcher re-acks it.
     if (cid && s.isPromptApplied(cid)) return;
@@ -1767,6 +2066,20 @@ export class Supervisor {
     // the client can retire its optimistic bubble instead of double-rendering (spec A5/A6).
     if (cid) s.recordPromptCid(cid);
     s.emit({ type: "message.user", rendered: this.renderer.render(text), attachments, ...(cid ? { cid } : {}) });
+    // A session with MCP integrations on gets a fresh health probe first, so the server map the driver
+    // is (re)built with is never older than this turn. A flip drops the idle driver inside the probe.
+    if (this.mcp.needsProbeBeforeTurn(s.data)) {
+      void this.mcp.probe("turn").then(() => {
+        if (this.sessions.get(id) !== s || s.isDisposed) return; // deleted while the probe ran
+        try {
+          this.ensureDriver(id).prompt(text, inline);
+        } catch (e) {
+          // No dispatcher frame is left to carry this (the command was already acked): say it in the session.
+          s.emitError(e instanceof Error ? e.message : String(e), false);
+        }
+      });
+      return;
+    }
     this.ensureDriver(id).prompt(text, inline);
   }
 
@@ -1786,6 +2099,27 @@ export class Supervisor {
       const isLead = s.data.teamRole === "lead";
       const isMember = s.data.teamRole === "member" && !!s.data.parentId;
       const isPlanner = s.data.workUnitRole === "planner" && !!s.data.workUnitId;
+      // An ordinary session with the agent browser switched on also gets `request_human` (Phase C3).
+      const hasBrowser = !!this.mcp.browser && isOrdinarySession(s.data) && this.mcp.store.list().some((i) => i.kind === "browser" && i.enabled && s.data.mcpIntegrations?.includes(i.id));
+      // …and any ordinary session gets the part-source tools while one source is configured (Phase C5).
+      // So does an autopilot BUILDER (decision 184): a lookup is read-only (a fetch lands in quarantine)
+      // and needs no owner card. Builders still get no MCP integrations and no browser (hasBrowser and
+      // mcp.serversFor are ordinary-session only), and no CLAUDE.md reflection (maybeReflectOnClaudeMd).
+      const isBuilder = s.data.workUnitRole === "builder" && !!s.data.workUnitId;
+      const hasParts = !!this.parts && (isOrdinarySession(s.data) || isBuilder) && this.parts.anyConfigured();
+      // The session's in-process servers: its role server, or for an ordinary session the capability-
+      // gated ones (anvil_cad, anvil_human/anvil_test, anvil_parts). `mcp.serversFor` passes them
+      // through unchanged (any `type: "sdk"` entry counts as in-process for the permission gate) and
+      // adds the session's ready MCP integrations (ordinary sessions only).
+      const inProcessServers: Record<string, McpSdkServerConfigWithInstance> | undefined = isDefault
+        ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
+        : isLead
+          ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
+          : isMember
+            ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
+            : isPlanner
+              ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
+              : this.ordinaryMcpServers(s, hasBrowser, hasParts);
       driver = new AgentDriver(
         s,
         this.renderer,
@@ -1793,22 +2127,14 @@ export class Supervisor {
         this.questionBroker,
         this.agentEnv(s),
         (usage) => this.onAgentResult(id, usage),
-        isDefault
-          ? { [DEFAULT_MCP_SERVER_NAME]: this.defaultToolsServer }
-          : isLead
-            ? { [TEAM_MCP_SERVER_NAME]: this.teams.buildTeamServer(id) }
-            : isMember
-              ? { [MEMBER_MCP_SERVER_NAME]: this.teams.buildMemberServer(id) }
-              : isPlanner
-                ? { [PLANNING_MCP_SERVER_NAME]: this.autopilot.buildPlanningServer(id) }
-                : undefined,
-        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : undefined,
+        this.mcp.serversFor(s, inProcessServers),
+        isDefault ? DEFAULT_TOOL_IDS : isLead ? TEAM_TOOL_IDS : isMember ? MEMBER_TOOL_IDS : isPlanner ? PLANNING_TOOL_IDS : hasBrowser ? HUMAN_TOOL_IDS : undefined,
         this.planReviewer(s),
-        undefined, // queryFn — keep the SDK default
+        this.sessionQueryFn, // queryFn — the SDK default unless a test injected one
         skillPlugins({ cwd: s.data.cwd, sessionId: id, stateDir: this.stateDir, fleetSkillsDir: this.skillStore.skillsDir }),
         (commands) => this.onSessionCommands(id, commands),
         (err) => this.onTurnError(err),
-        (met, goal) => this.onGoalResolved(id, met, goal),
+        (met, goal, unmet) => this.onGoalResolved(id, met, goal, unmet),
         () => {
           this.persist();
           this.broadcastUpdated(s.data);
@@ -1820,10 +2146,138 @@ export class Supervisor {
         // Live catalog so a fable session runs the newest `claude-fable-*` release (the SDK auto-upgrades
         // the opus/sonnet/haiku aliases itself; fable has no alias, so this is how it keeps current).
         () => this.modelLabels.catalog(),
+        this.mcp.gate,
+        // Phase B3: an autopilot builder's CAD verify runs before the goal judge and overrides it.
+        s.data.workUnitRole === "builder" ? () => this.autopilot.builderGoalCheck(id) : undefined,
       );
       this.drivers.set(id, driver);
     }
     return driver;
+  }
+
+  /**
+   * The capability-gated MCP servers an ORDINARY session gets (not the concierge, a team lead/member
+   * or a planner — those get their role server above). One map, built by the feature services; an
+   * empty result is `undefined` so the driver is constructed exactly as before. None of these tools
+   * is added to `allowedTools`: every call is decided by the PreToolUse hook.
+   */
+  private ordinaryMcpServers(s: Session, hasBrowser: boolean, hasParts: boolean): Record<string, McpSdkServerConfigWithInstance> | undefined {
+    const servers: Record<string, McpSdkServerConfigWithInstance> = {
+      ...this.cadwork.serversFor(s.data), // { anvil_cad } when "cad-work" is on and cwd is in a git repo
+      // `request_human` and the throwaway test daemon's tools (Phases C3, C4). The test tools' ids are
+      // deliberately NOT in `allowedTools`: every call goes through the permission hook.
+      ...(hasBrowser ? { [HUMAN_MCP_SERVER_NAME]: buildHumanToolsServer(this.human, s), [TEST_MCP_SERVER_NAME]: buildTestDaemonToolsServer(this.mcp.browser!.testDaemons, s) } : {}),
+      // No allowedTools entry: both go through the hook (parts_search as read-only, parts_fetch as a write).
+      ...(hasParts ? { [PARTS_MCP_SERVER_NAME]: buildPartsToolsServer(this.parts!, s) } : {}),
+    };
+    return Object.keys(servers).length > 0 ? servers : undefined;
+  }
+
+  /** Answer an expectations card (`cad.expectations.respond`, spec §4.8) — may come from any device. */
+  respondCadExpectations(requestId: string, approve: boolean, values?: unknown): void {
+    let found: boolean;
+    try {
+      found = this.cadwork.respond(requestId, approve, values);
+    } catch (e) {
+      // A dimensions card answered with bad numbers: refused, and the card stays open.
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+    if (!found) throw new BadCommand(`no pending expectations card: ${requestId}`);
+  }
+
+  /** `cad.release.request` (Phase A4): raise the release card for a part, with no model turn. */
+  async requestCadRelease(cwd: unknown, part: unknown, sessionId: unknown): Promise<void> {
+    const worktree = this.cadWorktree(cwd);
+    const session = typeof sessionId === "string" ? this.sessions.get(sessionId) : undefined;
+    if (!session || typeof sessionId !== "string") throw new BadCommand(`no such session: ${String(sessionId)}`);
+    // The card is raised in that session's chat and its pack offered there: it must be a session of
+    // THIS worktree, never an unrelated one that happens to exist.
+    const own = this.cadwork.worktreeOf(session.data);
+    if (!own || realpathOr(own) !== realpathOr(worktree)) throw new BadCommand(`session ${sessionId} does not work in ${worktree}; a release is raised in a session of the part's own worktree`);
+    try {
+      await this.cadwork.requestRelease(sessionId, partRef(worktree, part));
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** `cad.gap.clear` (Phase A4): the owner clears a part's reported gap. */
+  async clearCadGap(cwd: unknown, part: unknown): Promise<void> {
+    const worktree = this.cadWorktree(cwd);
+    try {
+      await this.cadwork.clearGap(worktree, part);
+    } catch (e) {
+      throw new BadCommand(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /**
+   * The worktree a client's CAD command may address (`cad.parts.list`, `cad.param.set`,
+   * `cad.design.refresh`, the preview route). A client sends a path; the daemon only ever acts on one
+   * it already knows: the git worktree of an existing session's cwd, or a registered environment's
+   * repo. Anything else — however plausible — is refused.
+   */
+  cadWorktree(cwd: unknown): string {
+    if (!this.cadwork.enabled) throw new BadCommand("cad-work is not enabled on this machine");
+    const refuse = (): never => {
+      throw new BadCommand(`cad: ${JSON.stringify(cwd)} ${CWD_REFUSED}`);
+    };
+    if (typeof cwd !== "string" || !isAbsolute(cwd)) return refuse();
+    let real: string;
+    try {
+      real = realpathSync(cwd);
+    } catch {
+      return refuse();
+    }
+    const top = (dir: string | undefined): string | undefined => {
+      if (!dir) return undefined;
+      const hit = this.cadTopCache.get(dir);
+      if (hit && Date.now() - hit.at < 30_000) return hit.top;
+      const t = gitToplevel(dir);
+      this.cadTopCache.set(dir, { top: t, at: Date.now() });
+      return t;
+    };
+    for (const s of this.sessions.values()) if (top(s.data.cwd) === real) return real;
+    for (const e of this.envStore.list()) if (top(e.repoRoot) === real) return real;
+    return refuse();
+  }
+  private readonly sessionQueryFn?: QueryFn;
+  private readonly cadTopCache = new Map<string, { top: string | undefined; at: number }>();
+
+  /** `cad.parts.list` (spec §4.8): the parts of a known worktree with their gate state. */
+  async cadPartsListEvent(cwd: unknown, cid?: string): Promise<CadPartsListResultEvent> {
+    const worktree = this.cadWorktree(cwd);
+    return { v: PROTOCOL_VERSION, type: "cad.parts.list.result", ts: now(), ...(cid ? { cid } : {}), cwd: worktree, parts: await this.cadwork.listParts(worktree) };
+  }
+
+  /** `cad.expectations.confirm`: the owner asks to confirm numbers the agent recorded; raises their card. */
+  confirmCadNumbers(cwd: unknown, part: unknown, sessionId: unknown): void {
+    const worktree = this.cadWorktree(cwd);
+    if (typeof sessionId !== "string" || !this.sessions.has(sessionId)) throw new BadCommand(`no such session: ${String(sessionId)}`);
+    const r = this.cadwork.confirmNumbers(sessionId, partRef(worktree, part));
+    if (!r.ok) throw new BadCommand(r.error);
+  }
+
+  /** `cad.param.set` (spec §4.8): the owner's parameter change. No model is involved. */
+  async setCadParam(cwd: unknown, part: unknown, name: unknown, expression: unknown, cid?: string): Promise<CadParamSetResultEvent> {
+    const worktree = this.cadWorktree(cwd);
+    let r: { ok: boolean; error?: string };
+    try {
+      r = await this.cadwork.setParam(worktree, part, name, expression);
+    } catch (e) {
+      r = { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    return { v: PROTOCOL_VERSION, type: "cad.param.set.result", ts: now(), ...(cid ? { cid } : {}), cwd: worktree, part: String(part), name: String(name), ok: r.ok, ...(r.error ? { error: r.error } : {}) };
+  }
+
+  /** `cad.design.refresh` (spec §4.8): rebuild a part from `design.json` on disk. */
+  async refreshCadDesign(cwd: unknown, part: unknown): Promise<void> {
+    await this.cadwork.refreshDesign(this.cadWorktree(cwd), part);
+  }
+
+  /** Whether this machine can do CAD right now (`cad.status`, spec §4.8). */
+  cadStatusEvent(): CadStatusEvent {
+    return this.cadwork.statusEvent();
   }
 
   interrupt(id: string): void {
@@ -1832,6 +2286,20 @@ export class Supervisor {
   }
 
   /** Answer a parked permission prompt (arch §6.6) — may come from any device. */
+  /**
+   * Answer from a notification's action button (`POST /api/permission/respond`). A card the owner has
+   * to see (a hard stop, anything with a screenshot or a reason) can be DENIED from there but never
+   * allowed: its push carries no buttons, and this is the second lock (decision 128).
+   */
+  resolvePermissionFromNotification(requestId: string, decision: PermissionDecision, updatedInput?: unknown): void {
+    if (decision !== "deny") {
+      const sessionId = this.broker.sessionFor(requestId);
+      const pending = sessionId ? this.sessions.get(sessionId)?.pendingPermissions.get(requestId) : undefined;
+      if (pending && mustSeeCard(pending)) throw new BadCommand("this card has to be seen to be approved: open it in Anvil");
+    }
+    this.resolvePermission(requestId, decision, updatedInput);
+  }
+
   resolvePermission(requestId: string, decision: PermissionDecision, updatedInput?: unknown): void {
     const sessionId = this.broker.sessionFor(requestId);
     if (!this.broker.resolve(requestId, decision, updatedInput)) {
@@ -1847,6 +2315,23 @@ export class Supervisor {
       // sibling is still parked would orphan that prompt (its push vanishes). (arch §6.6)
       if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion()) this.clearNotifications(sessionId);
     }
+  }
+
+  /** "I've cleared it": answer a parked `request_human` hand-off — may come from any device. */
+  resolveHumanRequest(requestId: string): void {
+    const sessionId = this.human.sessionFor(requestId);
+    if (!this.human.respond(requestId)) throw new BadCommand(`no pending request for a person: ${requestId}`);
+    const s = sessionId ? this.sessions.get(sessionId) : undefined;
+    s?.humanResolved(requestId);
+    if (s) {
+      s.setStatus(s.settleStatus("running_tool"));
+      if (sessionId && !s.hasPendingPermission() && !s.hasPendingQuestion() && !s.hasPendingHuman()) this.clearNotifications(sessionId);
+    }
+  }
+  /** Cancel a session's parked hand-offs (reset, new topic, deletion) and retire their cards. */
+  private cancelHumanRequests(sessionId: string): void {
+    this.human.cancelSession(sessionId);
+    this.sessions.get(sessionId)?.resolveAllHumans();
   }
 
   /** Answer (or cancel) a parked AskUserQuestion (arch §6.6) — may come from any device. */
@@ -2026,6 +2511,9 @@ export class Supervisor {
     this.goalPushSuppressed.delete(id);
     this.reflectedSessions.delete(id);
     this.prWatchers.delete(id);
+    this.mcp.onSessionGone(id); // free any exclusive MCP integration lock the session held
+    this.parts?.forgetSession(id); // the URLs its parts_search returned
+    this.human.cancelSession(id);
     this.persist();
     this.registry.toAll({ v: PROTOCOL_VERSION, type: "session.deleted", ts: now(), sessionId: id });
     this.teams.broadcastTeamInfo(); // deleting a lead/member reshapes the derived team tree
@@ -2075,7 +2563,10 @@ export class Supervisor {
    */
   async shutdown(): Promise<void> {
     await Promise.allSettled([...this.drivers.values()].map((d) => d.stop()));
+    this.mcp.stop();
+    this.offStateProtection?.();
     this.terminalMgr.killAll();
+    await this.cadwork.shutdown().catch(() => undefined); // stop every SolidCraft process
     await this.settle(); // let any in-flight kill finish removing its worktree/state before we exit
     this.persist();
     // The registry now holds every minted seq — tell the next boot it needn't skip ahead (see restore).
@@ -2098,7 +2589,11 @@ export class Supervisor {
     this.fileWatchMgr.clear(id);
     this.terminalMgr.kill(id);
     this.broker.resolveSession(id, "deny"); // unblock any hook parked on this session
+    this.cadwork.cancelSession(id); // …and any expectations card a CAD tool is waiting on
     this.questionBroker.resolveSession(id); // cancel any AskUserQuestion parked on this session
+    this.cancelHumanRequests(id);
+    this.mcp.onSessionReset(id); // forget "always allow <integration>" + free its exclusive locks
+    this.parts?.forgetSession(id);
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
 
@@ -2208,13 +2703,15 @@ export class Supervisor {
 
   /** A goal finished — met, or abandoned at the ceiling. Marks the transcript, persists, and sends
    *  the ONE push the whole goal is allowed (design D3/D4). */
-  private onGoalResolved(id: string, met: boolean, goal: SessionGoal): void {
+  private onGoalResolved(id: string, met: boolean, goal: SessionGoal, unmet?: string): void {
     const s = this.sessions.get(id);
     if (!s) return;
-    const label = met ? "Goal met" : `Goal abandoned after ${GOAL_MAX_ITERATIONS} turns`;
+    const label = met ? "Goal met" : unmet ? "Goal unmet" : `Goal abandoned after ${GOAL_MAX_ITERATIONS} turns`;
     const note = met
       ? `“${goal.condition}” — reached in ${goal.iterations} attempt${goal.iterations === 1 ? "" : "s"}.`
-      : `“${goal.condition}” — last blocker: ${goal.lastReason ?? "unknown"}`;
+      : unmet
+        ? `“${goal.condition}” — ${unmet}`
+        : `“${goal.condition}” — last blocker: ${goal.lastReason ?? "unknown"}`;
     this.goalDivider(s, label, note);
     this.persist();
     this.broadcastUpdated(s.data);
@@ -2251,7 +2748,9 @@ export class Supervisor {
     await this.drivers.get(id)?.stop(); // drop the live query so the next prompt starts fresh
     this.drivers.delete(id);
     this.broker.resolveSession(id, "deny"); // unblock any parked permission
+    this.cadwork.cancelSession(id); // …and any expectations card a CAD tool is waiting on
     this.questionBroker.resolveSession(id); // cancel any parked AskUserQuestion
+    this.cancelHumanRequests(id);
     s.resolveAllPermissions(); // retire every parked card on every device (fan-out: there may be several)
     s.resolveAllQuestions();
     s.data.claudeSessionId = undefined; // the key line: forget the prior topic (no resume next turn)
@@ -2330,13 +2829,35 @@ export class Supervisor {
   }
 
   /** Push a notification on the events that mean "your turn" (arch §6.7). */
+  /** An owner card (CAD expectations, dimensions, release…) as a push that only opens its session. */
+  private notifyOwnerCard(ev: CadExpectationsRequestEvent): void {
+    const data = this.sessions.get(ev.sessionId)?.data;
+    const payload: PushPayload = {
+      title: data?.title ?? "Anvil",
+      body: `${ev.part}: ${OWNER_CARD_ASK[ev.kind] ?? "needs your answer"}. Open to see the card.`,
+      dir: data?.cwd ? basename(data.cwd) : undefined,
+      sessionId: ev.sessionId,
+      tag: `cad-${ev.sessionId}`,
+      kind: "question",
+    };
+    this.notified.add(ev.sessionId);
+    void this.webpush.notify(payload);
+    void this.fcm.notify(payload);
+    void this.apns.notify(payload);
+  }
+
   private maybeNotify(sessionId: string, event: ServerEvent): void {
     const data = this.sessions.get(sessionId)?.data;
     const title = data?.title ?? "Anvil";
     // Which project — the cwd basename — so a reminder says *which* session it's for at a glance.
     const dir = data?.cwd ? basename(data.cwd) : undefined;
     let payload: PushPayload | undefined;
-    if (event.type === "permission.request") {
+    if (event.type === "permission.request" && mustSeeCard(event)) {
+      // A hard stop (or any card carrying a screenshot or a reason): the owner has to SEE it, so the
+      // push only opens the session — no requestId, no Allow/Deny in the shade (decision 128).
+      const ask = summarizeRequest(event.tool, event.input);
+      payload = { title, body: `Needs your approval — ${ask}. Open to see what it is.`, dir, sessionId, tag: `perm-${sessionId}`, kind: "question" };
+    } else if (event.type === "permission.request") {
       const ask = summarizeRequest(event.tool, event.input);
       payload = { title, body: `Needs your approval — ${ask}`, dir, sessionId, tag: `perm-${sessionId}`, kind: "permission", requestId: event.requestId, tool: event.tool, ask };
     } else if (event.type === "question.request") {
@@ -2345,6 +2866,8 @@ export class Supervisor {
       const opts = (q0?.options ?? []).slice(0, 3).map((o) => o.label).filter(Boolean).join(" · ");
       const more = event.questions.length > 1 ? ` (+${event.questions.length - 1} more)` : "";
       payload = { title, body: `${first}${more}${opts ? `\n${opts}` : ""}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
+    } else if (event.type === "human.request") {
+      payload = { title, body: `Needs you at the browser — ${event.reason}`, dir, sessionId, tag: `q-${sessionId}`, kind: "question" };
     } else if (event.type === "result") {
       // A goal in flight ends a turn on every iteration. Suppressing the "your turn" push here is
       // what makes a 10-iteration goal send ONE notification instead of ten (design D3). The
@@ -2384,6 +2907,11 @@ export class Supervisor {
     // window instead of 4-5 sync spawns blocking the event loop after every turn.
     const s = this.sessions.get(sessionId);
     if (s) this.gitProjection.scheduleRefreshGit(sessionId);
+    // Phase B3: an autopilot builder's turn ended → verify the CAD parts its worktree touches (blocks the
+    // unit, or stamps cadVerified). Background: it replays designs in fresh SolidCraft processes.
+    if (s?.data.workUnitRole === "builder") {
+      void this.autopilot.verifyBuilder(sessionId, "turn").catch((e) => console.error(`[autopilot] CAD verify after a builder turn failed: ${e instanceof Error ? e.message : e}`));
+    }
     // Teams: a member finishing a turn frees a concurrency slot — start any queued members (subject to
     // the cap + budget). Safe/idempotent: a no-op when this session isn't a member or nothing is queued.
     if (s?.data.parentId) void this.teams.drainQueuedMembers(s.data.parentId, sessionId);
@@ -2704,3 +3232,21 @@ function summarizeRequest(tool: string, input: unknown): string {
       return `Approve ${tool}`;
   }
 }
+
+/** A permission card that must be seen before it can be approved: it carries a screenshot (a hard
+ *  stop always does) or a reason of its own. Never answerable from a notification (decision 128). */
+export function mustSeeCard(card: { image?: unknown; reason?: string }): boolean {
+  return !!card.image || !!card.reason;
+}
+
+const OWNER_CARD_ASK: Record<string, string> = {
+  propose: "a change to its locked expectations needs your approval",
+  initial: "its expectations need your approval",
+  confirm: "its expectations need your confirmation",
+  dimensions: "its dimensions need typing in",
+  release: "a release needs your approval",
+  "adopt-expectations": "an edit to its expectations needs your approval",
+  "adopt-ownerParams": "an edit to its owner parameters needs your approval",
+  "adopt-rules": "an edit to cad/rules.json needs your approval",
+  "adopt-references": "its reference measurements need your approval",
+};

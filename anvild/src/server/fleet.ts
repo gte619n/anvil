@@ -274,7 +274,14 @@ export async function discoverSelfBaseUrl(opts: SelfBaseUrlOpts): Promise<string
   const runTailscale = opts.runTailscale ?? defaultRunTailscale;
   const probe = opts.probe ?? defaultProbe;
   const json = await runTailscale();
-  const dnsName = json ? parseTailscalePeers(json).find((p) => p.isSelf)?.dnsName : undefined;
+  // `tailscale` can print something that is not JSON (a login notice, a warning): that is "no name
+  // known", never an unhandled rejection in whoever asked for the URL (decision 25).
+  let dnsName: string | undefined;
+  try {
+    dnsName = json ? parseTailscalePeers(json).find((p) => p.isSelf)?.dnsName : undefined;
+  } catch {
+    dnsName = undefined;
+  }
   if (dnsName) {
     for (const base of [`https://${dnsName}`, `https://${dnsName}:${opts.port}`, `http://${dnsName}:${opts.port}`]) {
       if (await probe(base)) return base;
@@ -529,6 +536,8 @@ export async function invitePeer(opts: {
   fleetName?: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** Part-source keys (Phase C5), env-file name → value; they ride with the OpenRouter key. */
+  partKeys?: Record<string, string>;
   geminiKey?: string;
   /** The hub's account roster (multi-account §7.3), so a joiner arrives with every account rather
    *  than waiting for the next rotation. Sent only to a joiner advertising "accounts". */
@@ -557,6 +566,7 @@ export async function invitePeer(opts: {
       ...(opts.fleetName ? { fleetName: opts.fleetName } : {}),
       ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
       ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+      ...(opts.partKeys && Object.keys(opts.partKeys).length ? { partKeys: opts.partKeys } : {}),
       ...(opts.geminiKey ? { geminiKey: opts.geminiKey } : {}),
       ...(roster ? { accounts: roster } : {}),
     },
@@ -597,7 +607,7 @@ export async function ackPair(opts: {
  * HTTP request to an HTTPS server") — silently stranding the member without a token forever. Trying
  * both schemes lets propagation self-correct a stale registry entry.
  */
-function memberBases(m: { url: string; host?: string }): string[] {
+export function memberBases(m: { url: string; host?: string }): string[] {
   let host = m.host ?? "";
   let port = "7701";
   try {
@@ -771,6 +781,8 @@ export async function rotateToken(opts: {
   hubServerId: string;
   todoistToken?: string;
   openRouterKey?: string;
+  /** Part-source keys (Phase C5), env-file name → value; they ride with the OpenRouter key. */
+  partKeys?: Record<string, string>;
   /** The hub's account roster (multi-account §7.3). Sent ONLY to members advertising "accounts" — an
    *  older member would ignore the field, but not sending it keeps the wire honest and lets the caller
    *  tell "didn't get it" from "got it and is on this rev" via the returned `accountsRev`. */
@@ -822,6 +834,7 @@ export async function rotateToken(opts: {
           hubServerId: opts.hubServerId,
           ...(opts.todoistToken ? { todoistToken: opts.todoistToken } : {}),
           ...(opts.openRouterKey ? { openRouterKey: opts.openRouterKey } : {}),
+          ...(opts.partKeys && Object.keys(opts.partKeys).length ? { partKeys: opts.partKeys } : {}),
           ...(sendsRoster ? { accounts: opts.accounts } : {}),
         },
       });

@@ -1,5 +1,6 @@
-import { statSync } from "node:fs";
-import { relative } from "node:path";
+import { realpathSync, statSync } from "node:fs";
+import { DOWNLOADS_DIRNAME } from "../browser/downloads";
+import { join, relative } from "node:path";
 import type { FileOffer } from "@protocol";
 import { resolveInside } from "../fs/session-fs";
 
@@ -69,6 +70,18 @@ export function buildFileOffer(sessionId: string, cwd: string, rawPath: string):
   }
   const name = abs.split("/").pop() || "download";
   const rel = relative(cwd, abs) || name;
+  // A file in the browser's download quarantine never gets a download card (agent-cad-and-browser §4.12).
+  if (rel === DOWNLOADS_DIRNAME || rel.startsWith(`${DOWNLOADS_DIRNAME}/`)) return null;
+  // …compared by real paths too, so a link (or a worktree reached through one) cannot dodge it.
+  try {
+    const realRel = relative(realpathSync(cwd), realpathSync(abs));
+    if (realRel === DOWNLOADS_DIRNAME || realRel.startsWith(`${DOWNLOADS_DIRNAME}/`)) return null;
+    const realQ = realpathSync(join(cwd, DOWNLOADS_DIRNAME));
+    const real = realpathSync(abs);
+    if (real === realQ || real.startsWith(`${realQ}/`)) return null;
+  } catch {
+    /* no quarantine folder, or the file vanished: the checks above stand */
+  }
   return {
     name,
     path: abs,

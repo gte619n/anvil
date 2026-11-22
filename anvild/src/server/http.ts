@@ -6,7 +6,7 @@ import { newId } from "../util/ids";
 import { dispatch } from "./dispatch";
 import { ConnectionRegistry } from "./registry";
 import { isAllowedWsOrigin, configuredAllowedOrigins } from "./origin";
-import { loadServerIdentity, serverHelloEvent, SERVER_CAPABILITIES } from "./identity";
+import { loadServerIdentity, serverHelloEvent, serverCapabilities } from "./identity";
 import { ackPair, discoverFleet, fetchMemberEnvironments, invitePeer, memberHandoff, memberRepoOp, peerIPv4, planMemberUrlHeals, propagateAdbIdentity, propagateTodoist, resolveMember, rotateToken, tailnetPeers, checkMemberSkills, pushMemberSkills } from "./fleet";
 import type { ConciergeFleetOps } from "../agent/default-tools";
 import {
@@ -24,15 +24,20 @@ import { setClaudeToken } from "../auth/store";
 import { setOpenRouterKey } from "../auth/openrouter";
 import { setGeminiKey } from "../auth/gemini";
 import { FleetStore } from "../fleet/store";
+import type { SitesOpBody, SitesOpReply, SitesSyncBody, SitesSyncReply } from "../browser/sites-sync";
+import type { LoggedInOpBody, LoggedInOpReply, LoggedInSyncBody, LoggedInSyncReply } from "../browser/loggedin";
 import { PushRegistry } from "../push/registry";
 import { Supervisor } from "../session/supervisor";
 import { serveCad } from "../cad/service";
+import { LOCKS_APPROVE_PATH, LOCKS_PUSH_PATH, type LocksApproveBody, type LocksApproveReply, type LocksPushBody } from "../cadwork/locks";
 import { UpdateStateStore } from "../daemon/update-state";
 import { updateApply, updateCheck, updateStatus, settleAfterBoot, type UpdateApiDeps } from "../daemon/update-api";
 import { isManaged, scheduleRestart, webBundleOk } from "../daemon/selfupdate";
 import { FleetRolloutCoordinator, DesiredTargetStore, httpMemberUpdateClient } from "./fleet-rollout";
 import { FleetCliRolloutCoordinator, httpMemberCliClient } from "./fleet-cli-rollout";
 import { resolveLatest as resolveLatestCli } from "../daemon/claude-cli";
+import { mountSolidcraft, type SolidcraftTestHooks } from "./fleet-solidcraft";
+import { wireCadPin, type CadPinRoot, type CadPinWiring } from "../session/cadwork-pin";
 import { FleetJobs } from "./fleet-jobs";
 import { resolveTargetSha } from "../daemon/selfupdate";
 import { FileExists, FileNotFound } from "../fs/session-fs";
@@ -74,6 +79,11 @@ const CSP = [
 ].join("; ");
 
 /** This host's non-internal IPv4 addresses (so the phone can be put on the same subnet). */
+/** The daemon's CAD REST routes: no permissive CORS, and the WebSocket's Origin gate applies. */
+export function isCadApiPath(pathname: string): boolean {
+  return pathname === "/api/cad" || pathname.startsWith("/api/cad/");
+}
+
 function lanIPv4(): string[] {
   const out: string[] = [];
   for (const addrs of Object.values(networkInterfaces())) {
@@ -133,6 +143,8 @@ export interface ServerHandle {
   stop: () => void;
   /** Graceful shutdown: flush + reap drivers/terminals, then stop the HTTP server (arch §5). */
   shutdown: () => Promise<void>;
+  /** The daemon's supervisor (functional tests drive its services directly). */
+  supervisor: Supervisor;
 }
 
 export interface ServerOptions {
@@ -158,6 +170,12 @@ export interface ServerOptions {
   /** Set by the real daemon (main.ts) to refresh model labels from the Models API shortly after boot;
    *  omitted by tests so they never make a live API call. */
   refreshModelLabelsOnBoot?: boolean;
+  /** Enabled opt-in features (`Config.features`, from `ANVIL_FEATURES`). Each is advertised as a
+   *  capability via `serverCapabilities`; omitted (tests) ⇒ the base capability list only. */
+  features?: string[];
+  /** Test-only overrides for the SolidCraft pin's downloader, verifier and release lookup. Production
+   *  omits it. Ignored unless `features` lists "solidcraft-pin". */
+  solidcraft?: SolidcraftTestHooks;
   /** [BE2-15] Test-only injection of the fleet fan-out network calls (rotate/invite jobs), so the job
    *  guard tests can simulate a slow/unreachable member deterministically. Production omits it and
    *  gets the real implementations from ./fleet. */
@@ -168,6 +186,9 @@ export interface ServerOptions {
   /** [BE2-15] Test-only override of the caller-identity resolver (the real one shells out to the
    *  tailscale CLI, which makes identity-gated routes untestable hermetically). */
   resolveIdentity?: () => Promise<{ trust: PeerTrust; reject?: string }>;
+  /** Test-only override of this daemon's base URL as other machines reach it — what a hub tells its
+   *  members so they can forward allowed-site approvals (the real one shells out to `tailscale`). */
+  selfBaseUrl?: () => Promise<string | undefined>;
 }
 
 /** The fleet fan-out network surface the rotate/invite paths reach the tailnet through ([BE2-15]). */
@@ -239,6 +260,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       adversarialProvider: opts.adversarialProvider,
       refreshModelLabelsOnBoot: opts.refreshModelLabelsOnBoot,
       fleet: conciergeFleet,
+      fleetHosts: () => fleet.hosts(),
+      features: opts.features,
       // Lazy, like onRosterChanged: `syncSkills` is hoisted below and closes over `fleet`/`identity`.
       onSkillsChanged: () => void syncSkills(),
       skillMembers: () => [...skillSync.values()],
@@ -246,6 +269,15 @@ export function createServer(opts: ServerOptions): ServerHandle {
     registry,
   );
 
+  // Agent browser (Phase C2; only with the "browser" feature on): hand its allowed-sites sync the
+  // fleet — who the members are, which hub paired this machine, and where this daemon answers.
+  supervisor.mcp.browser?.setFleet({
+    selfServerId: identity.serverId,
+    members: () => fleet.list().map((m) => ({ url: m.url, host: m.host, serverId: m.serverId })),
+    pairedHubId: () => pairedHub.get()?.hubServerId ?? null,
+    selfUrl: opts.selfBaseUrl ?? (() => supervisor.selfBaseUrl()),
+    selfPort: opts.port,
+  });
   // ── Fleet skill library replication (docs/plans/2026-11-19-fleet-skills.md) ──────────────────────
   // The hub owns the library and pushes it to every member daemon. Each sweep first asks the member for
   // its library hash (cheap GET) and only POSTs the bundle to a member that drifted, so the periodic
@@ -427,6 +459,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       token: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "",
       hubServerId: identity.serverId,
       ...(payload ? { accounts: payload } : {}),
+      // Part-source keys (Phase C5) ride the same push; a key change on the hub triggers it.
+      ...(supervisor.parts?.fleetPayload() ? { partKeys: supervisor.parts.fleetPayload()! } : {}),
       port: opts.port,
     });
     for (const r of results) {
@@ -550,7 +584,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
       registry.add(ws);
       ws.send(
         JSON.stringify(
-          serverHelloEvent(identity, { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length }),
+          serverHelloEvent(
+            identity,
+            { pairedHubId: pairedHub.get()?.hubServerId ?? null, memberCount: fleet.list().length },
+            opts.features,
+          ),
         ),
       ); // who am I — first frame (fleet §3/§6)
       // Resume watermarks BEFORE session.list (v4, §6.4): the client's session.list handler drives the
@@ -560,10 +598,33 @@ export function createServer(opts: ServerOptions): ServerHandle {
       ws.send(JSON.stringify(supervisor.teamInfoEvent())); // derived team tree alongside the session list
       ws.send(JSON.stringify(supervisor.budgetEvent()));
       ws.send(JSON.stringify(supervisor.environmentsEvent()));
+      // MCP integrations (only on a daemon with the feature on — an older client ignores the event).
+      // The last known health goes out now; the probe this connect triggers broadcasts any change.
+      if (supervisor.mcp.enabled) {
+        ws.send(JSON.stringify(supervisor.mcpIntegrationsEvent()));
+        supervisor.mcp.onClientConnected();
+      }
+      // Agent browser allowed sites ("browser" feature only). A client connecting to the hub is also
+      // a cue to push the list to members and collect what they queued while unreachable.
+      if (supervisor.mcp.browser) {
+        ws.send(JSON.stringify(supervisor.browserSitesEvent()));
+        void supervisor.mcp.browser.sites.syncNow();
+        ws.send(JSON.stringify(supervisor.browserLoggedInEvent())); // Phase C3: logged-in sites + unlock switches
+        void supervisor.mcp.browser.loggedIn.syncNow();
+      }
+      if (supervisor.parts) ws.send(JSON.stringify(supervisor.partsEvent())); // Phase C5: part sources (masked)
       ws.send(JSON.stringify(supervisor.promptsEvent()));
       ws.send(JSON.stringify(supervisor.skillsEvent())); // fleet skill library (Settings → Skills)
       ws.send(JSON.stringify(supervisor.modelLabelsEvent()));
       ws.send(JSON.stringify(supervisor.claudeCliStatusEvent())); // Claude engine card in Settings → Models
+      if (supervisor.cadwork.enabled) {
+        ws.send(JSON.stringify(supervisor.cadStatusEvent())); // can this machine do CAD right now? (spec §4.8)
+        // Current part state and any expectations card still waiting: neither is replayed from a session log.
+        for (const ev of supervisor.cadwork.designEvents()) ws.send(JSON.stringify(ev));
+        for (const ev of supervisor.cadwork.pendingCardEvents()) ws.send(JSON.stringify(ev));
+      }
+      // Settings → CAD card ("solidcraft-pin" only). Async: a non-managed build is asked its version.
+      if (solidcraft) void solidcraft.statusEvent().then((e) => void ws.send(JSON.stringify(e))).catch(() => {});
       ws.send(JSON.stringify(supervisor.accountsEvent())); // roster before the new-session dialog/header render (§9)
       ws.send(JSON.stringify(supervisor.todoistStatusEvent()));
       ws.send(JSON.stringify(supervisor.lapoStatusEvent()));
@@ -582,7 +643,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     },
     message(ws: ServerWebSocket<ConnState>, message: string | Buffer) {
       const raw = typeof message === "string" ? message : message.toString("utf8");
-      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist, syncSkills });
+      dispatch(ws.data, raw, (event) => ws.send(JSON.stringify(event)), { push, supervisor, registry, propagateTodoist: pushTodoist, solidcraftStatus: solidcraft?.statusEvent, syncSkills });
     },
   };
 
@@ -612,6 +673,19 @@ export function createServer(opts: ServerOptions): ServerHandle {
           async fetch(req, srv) {
             const url = new URL(req.url);
             const isApi = url.pathname.startsWith("/api/");
+            // The CAD routes (agent-cad-and-browser A3 review, item 5) get NO permissive CORS, and a
+            // request from a foreign browser Origin is refused with the WebSocket's own gate (SEC-H3,
+            // ANVIL_ALLOWED_ORIGINS): a web page must not read a part's preview by guessing a path.
+            if (isCadApiPath(url.pathname)) {
+              const origin = req.headers.get("origin");
+              if (!isAllowedWsOrigin(origin, req.headers.get("host"), configuredAllowedOrigins())) return new Response("forbidden origin", { status: 403 });
+              // An ALLOWED cross-origin page (a fleet peer's UI) is named back exactly, never `*`.
+              const cors: Record<string, string> = origin && origin !== "null" ? { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type", Vary: "Origin" } : {};
+              if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+              const res = await handle(req, srv, url);
+              if (res) for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
+              return res;
+            }
             if (isApi && req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
             const res = await handle(req, srv, url);
             if (isApi && res) for (const [k, v] of Object.entries(CORS)) res.headers.set(k, v);
@@ -671,7 +745,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   /** Adopt a pushed credential set. Routed through `setClaudeToken` on purpose, so §8.4's
    *  metered-key rejection applies and a hub holding an `sk-ant-api…` key can't propagate it. */
-  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; geminiKey?: string; accounts?: rest.RosterPush }): string | null => {
+  const adoptCredentials = (body: { token?: string; todoistToken?: string; openRouterKey?: string; partKeys?: Record<string, string>; geminiKey?: string; accounts?: rest.RosterPush }): string | null => {
     // Snapshot BEFORE anything changes so only sessions whose own resolved token actually moved get
     // their driver restarted (Task 21). Must be taken ahead of adoptReplica for the diff to mean
     // anything.
@@ -698,6 +772,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
         setOpenRouterKey(body.openRouterKey);
       } catch (e) {
         console.warn(`[fleet] pushed OpenRouter key rejected: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    // Part-source keys (Phase C5): present keys overwrite, like the OpenRouter key. Ignored without the feature.
+    if (body.partKeys) {
+      try {
+        supervisor.parts?.adoptFleetKeys(body.partKeys);
+      } catch (e) {
+        console.warn(`[fleet] pushed part-source keys rejected: ${e instanceof Error ? e.message : "error"}`);
       }
     }
     if (body.geminiKey) {
@@ -733,7 +815,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // capability list a client normally reads off `server.hello` is mirrored here (HJ-32/§3.5).
       // Deliberately NOT included: this window's arm-state, which would broadcast an open
       // credential window to the whole tailnet (HJ-9).
-      capabilities: [...SERVER_CAPABILITIES],
+      capabilities: serverCapabilities(opts.features),
       // Frozen update API version + boot smoke result. A hub reads updateApiVersion off health
       // (discovery is REST) to route this member through the stable path; the watchdog polls
       // health and treats webBundleOk:false as NOT-healthy (spec §4.3/D14).
@@ -783,6 +865,38 @@ export function createServer(opts: ServerOptions): ServerHandle {
       return Response.json({ ok: false, info: supervisor.claudeCliInfo(), output: error, error } satisfies rest.claudecli.InstallResponse, { status: 500 });
     }
   });
+
+  // ── SolidCraft fleet pin (agent-cad-and-browser spec §4.10) ───────────────────────────────────
+  // Everything lives in ./fleet-solidcraft.ts; undefined (and no routes) unless "solidcraft-pin" is on.
+  // Track A ↔ B (merge item (b)): with cad-work on, cad.status follows the pin and the "Pin back"
+  // list is read from the part files this daemon knows (./../session/cadwork-pin.ts).
+  let cadPin: CadPinWiring | undefined;
+  const cadRoots = (): CadPinRoot[] => [
+    ...supervisor.environmentsEvent().environments.map((e) => ({ path: e.repoRoot, environment: e.name })),
+    ...supervisor.list().filter((s) => !s.archived).map((s) => ({ path: supervisor.cadwork.worktreeOf(s) ?? s.cwd })),
+  ];
+  const solidcraft = mountSolidcraft({
+    rewrittenDesigns: supervisor.cadwork.enabled ? (version) => cadPin?.rewrittenDesigns(version) ?? [] : undefined,
+    onLocalChange: () => void cadPin?.onPinChanged().catch(() => undefined),
+    stateDir: opts.stateDir,
+    features: opts.features,
+    hooks: opts.solidcraft,
+    self: { serverId: identity.serverId, serverName: identity.serverName },
+    members: () => fleet.list().map((m) => ({ serverId: m.serverId, serverName: m.serverName, url: m.url })),
+    // Replay gate (Phase B2): what this machine hosts, its open worktrees (advisory), and who checks.
+    // Worktrees: B2's default, confirmed at the merge — a fresh-worktree session's cwd IS its
+    // worktree root, which is where `cad/` lives.
+    environments: () => supervisor.environmentsEvent().environments.map((e) => ({ name: e.name, repoRoot: e.repoRoot, defaultBase: e.defaultBase })),
+    worktrees: () => supervisor.list().filter((s) => s.worktree && !s.archived).map((s) => ({ path: s.cwd, label: s.title || s.worktree!.branch })),
+    notify: (title, body, tag) => supervisor.pushSystemAlert(title, body, tag),
+    isHub: () => !pairedHub.get(),
+    broadcast: (event) => registry.toAll(event),
+    route,
+  });
+  if (solidcraft && supervisor.cadwork.enabled) {
+    cadPin = wireCadPin({ cadwork: supervisor.cadwork, pin: solidcraft.service, roots: cadRoots, serverName: identity.serverName });
+    void cadPin.onPinChanged().catch(() => undefined); // the first verdict; until then CAD fails closed
+  }
 
   // Fleet discovery (anvil-multi-server.md §4.1): enumerate Tailscale peers + probe each
   // /api/health, return the Anvil daemons found (deduped by serverId) as add-suggestions.
@@ -841,6 +955,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
         // Sibling secrets ride along: joining a fleet means adopting its config (HJ-24/HJ-27).
         ...(supervisor.todoistTokenForFleet() ? { todoistToken: supervisor.todoistTokenForFleet()! } : {}),
         ...(process.env.OPENROUTER_API_KEY ? { openRouterKey: process.env.OPENROUTER_API_KEY } : {}),
+        ...(supervisor.parts?.fleetPayload() ? { partKeys: supervisor.parts.fleetPayload()! } : {}),
         ...(process.env.GEMINI_API_KEY ? { geminiKey: process.env.GEMINI_API_KEY } : {}),
         // The whole roster rides the first join too, so a new member arrives with every account
         // instead of only the mirrored default (§7.3).
@@ -877,6 +992,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // closes, so an un-acked-but-recorded member is the safe end state, not an un-recorded one.
       void net.ackPair({ host, code, hubServerId: identity.serverId, capabilities: preflight.capabilities, port: opts.port });
       pushTodoist([member.serverId]); // hand the joiner the Todoist token too, if we have one
+      if (supervisor.cadwork.enabled) void supervisor.cadwork.lockSync.broadcast([member.serverId]); // …and the CAD approvals
       return { ok: true, member };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -1059,6 +1175,100 @@ export function createServer(opts: ServerOptions): ServerHandle {
     } catch (e) {
       return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies rest.FleetHandoffResponse, { status: 400 });
     }
+  });
+
+  // ── CAD lock store sync (agent-cad-and-browser spec §4.14 #42; cadwork/locks.ts) ─────────────────
+  // What the owner approved for a part is hub-authoritative and fleet-wide. Two routes, both with
+  // the fleet posture: tailnet-gated, a PROVEN different tailnet user is rejected, JSON only (a
+  // cross-origin "simple request" cannot set that content-type).
+  //   POST /api/fleet/cad-locks          hub → member: the hub's whole store (replaces the member's copy)
+  //   POST /api/fleet/cad-locks/approve  member → hub: approvals made on that member (merged, latest wins)
+  supervisor.cadwork.lockSync.setRole(() => {
+    const paired = pairedHub.get();
+    if (paired) return { kind: "member", serverId: identity.serverId, hubServerId: paired.hubServerId };
+    const members = fleet.list();
+    if (members.length > 0) return { kind: "hub", serverId: identity.serverId, selfUrl: () => supervisor.selfBaseUrl(), members: () => fleet.list().map((m) => ({ serverId: m.serverId, url: m.url, host: m.host })) };
+    return { kind: "standalone", serverId: identity.serverId };
+  });
+  const jsonOnly = (req: Request): Response | null =>
+    (req.headers.get("content-type") || "").toLowerCase().includes("application/json") ? null : new Response("application/json required", { status: 415 });
+  route("POST", LOCKS_PUSH_PATH, async (req, _url, _m, ctx) => {
+    if (!supervisor.cadwork.enabled) return Response.json({ ok: false, error: "cad-work is not enabled on this machine" }, { status: 404 });
+    const wrong = jsonOnly(req);
+    if (wrong) return wrong;
+    const body = await jsonBody<LocksPushBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId); // not another tailnet user, and from the hub this member is paired to
+    if (gate) return gate;
+    supervisor.cadwork.lockSync.acceptFromHub(body);
+    return Response.json({ ok: true, serverId: identity.serverId });
+  });
+  route("POST", LOCKS_APPROVE_PATH, async (req, _url, _m, ctx) => {
+    if (!supervisor.cadwork.enabled) return Response.json({ ok: false, error: "cad-work is not enabled on this machine" }, { status: 404 });
+    const wrong = jsonOnly(req);
+    if (wrong) return wrong;
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" }, { status: 403 });
+    const body = await jsonBody<LocksApproveBody>(req);
+    // Only a machine this hub has paired may add approvals to the fleet's store.
+    if (!body.serverId || !fleet.list().some((m) => m.serverId === body.serverId)) return Response.json({ ok: false, error: "unknown fleet member" }, { status: 403 });
+    return Response.json(supervisor.cadwork.lockSync.acceptFromMember(body) satisfies LocksApproveReply);
+  });
+  if (supervisor.cadwork.enabled) {
+    // Shortly after boot: a hub hands every member its store (and its address); a member sends
+    // whatever it queued while the hub was out of reach. Then a slow retry for whoever was missed.
+    const cadSyncBoot = setTimeout(() => void supervisor.cadwork.lockSync.broadcast().then(() => supervisor.cadwork.lockSync.retry()).catch(() => undefined), 5_000);
+    const cadSyncRetry = setInterval(() => void supervisor.cadwork.lockSync.retry().catch(() => undefined), 10 * 60_000);
+    (cadSyncBoot as { unref?: () => void }).unref?.();
+    (cadSyncRetry as { unref?: () => void }).unref?.();
+  }
+
+  // Agent browser allowed-sites sync (agent-cad-and-browser §4.14 item 43; src/browser/sites-sync.ts).
+  // Both routes answer 404 unless the "browser" feature is on.
+  //  - /sync: the hub pushes the authoritative list to this member. Same gate as the fleet-repo
+  //    routes: not a proven different tailnet user, and the caller names the hub that paired us.
+  //  - /op: a member forwards approvals made on it to this hub. The caller must name a member in
+  //    this hub's fleet.
+  route("POST", "/api/browser/sites/sync", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesSyncReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<SitesSyncBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    return Response.json(browser.sites.receiveSync({ hubServerId: body.hubServerId!, hubUrl: body.hubUrl, sites: body.sites ?? [], confirmed: body.confirmed }) satisfies SitesSyncReply);
+  });
+  route("POST", "/api/browser/sites/op", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies SitesOpReply, { status: 404 });
+    // A JSON content type is required, like the other fleet routes: a cross-origin "simple request"
+    // (text/plain, no preflight) must not be able to change the list.
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<SitesOpBody>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies SitesOpReply, { status: 403 });
+    if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies SitesOpReply, { status: 403 });
+    return Response.json(browser.sites.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies SitesOpReply);
+  });
+  // The logged-in sites list and its unlock switches (Phase C3, §4.14 items 28 and 44;
+  // src/browser/loggedin.ts). The same two routes with the same two gates as the allowed sites.
+  route("POST", "/api/browser/loggedin/sync", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies LoggedInSyncReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<LoggedInSyncBody>(req);
+    const gate = await fleetRepoGate(ctx, body.hubServerId);
+    if (gate) return gate;
+    return Response.json(browser.loggedIn.receiveSync({ hubServerId: body.hubServerId!, hubUrl: body.hubUrl, sites: body.sites ?? [], confirmed: body.confirmed }) satisfies LoggedInSyncReply);
+  });
+  route("POST", "/api/browser/loggedin/op", async (req, _url, _m, ctx) => {
+    const browser = supervisor.mcp.browser;
+    if (!browser) return Response.json({ ok: false, error: "not enabled" } satisfies LoggedInOpReply, { status: 404 });
+    if (!(req.headers.get("content-type") || "").toLowerCase().includes("application/json")) return new Response("application/json required", { status: 415 });
+    const body = await jsonBody<LoggedInOpBody>(req);
+    const who = await ctx.callerIdentity();
+    if (who.trust === "otherUser" && !ctx.localNoIdentityCaller) return Response.json({ ok: false, error: who.reject ?? "different tailnet user" } satisfies LoggedInOpReply, { status: 403 });
+    if (!body.from || !fleet.list().some((m) => m.serverId === body.from)) return Response.json({ ok: false, error: "unknown member" } satisfies LoggedInOpReply, { status: 403 });
+    return Response.json(browser.loggedIn.receiveOps({ from: body.from, ops: body.ops ?? [] }) satisfies LoggedInOpReply);
   });
 
   // Hub→member fleet skill replication landing point (docs/plans/2026-11-19-fleet-skills.md). GET reports
@@ -1362,7 +1572,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (!requestId || (decision !== "allow" && decision !== "deny" && decision !== "allow_always")) {
         return new Response("bad request", { status: 400 });
       }
-      supervisor.resolvePermission(requestId, decision, updatedInput);
+      // A notification button: a card that has to be seen cannot be approved from here (decision 128).
+      supervisor.resolvePermissionFromNotification(requestId, decision, updatedInput);
       return Response.json({ ok: true });
     } catch (e) {
       // BadCommand → the request was already answered or expired; treat as gone, not a server error.
@@ -1479,6 +1690,29 @@ export function createServer(opts: ServerOptions): ServerHandle {
       if (e instanceof FileExists) return new Response("a file with that name already exists", { status: 409 });
       return new Response(e instanceof Error ? e.message : "upload failed", { status: 403 });
     }
+  });
+
+  // The live CAD viewer's model (agent-cad-and-browser spec §4.3 step 4, §4.9): the preview GLB a
+  // `cad.design` event names. Not the session files route, on purpose: a part belongs to a WORKTREE
+  // (a session's cwd may be a sub-folder of it, and the parts list opens parts no session touched),
+  // and the file is git-excluded. `cwd` passes the same check as the cad.* commands, and `path` must
+  // be exactly `cad/<part>/.cache/preview-<rev>.glb` — nothing else under the worktree is reachable.
+  route("GET", "/api/cad/preview", (req, url) => {
+    let worktree: string;
+    try {
+      worktree = supervisor.cadWorktree(url.searchParams.get("cwd") ?? "");
+    } catch {
+      return new Response("forbidden", { status: 403 });
+    }
+    // Served only when the file is byte-for-byte what the daemon exported for that revision.
+    const hit = supervisor.cadwork.previewEntry(worktree, url.searchParams.get("path") ?? "");
+    if (!hit) return new Response("not found", { status: 404 });
+    // `no-cache` + an ETag of the recorded sha: revision numbers restart after a cache wipe and a
+    // daemon restart, so a name is not a version; the browser revalidates (a cheap 304) every time.
+    const etag = `"${hit.sha}"`;
+    const headers = { "content-type": hit.abs.endsWith(".png") ? "image/png" : "model/gltf-binary", "cache-control": "private, no-cache", etag };
+    if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
+    return new Response(Bun.file(hit.abs), { headers });
   });
 
   // Resolve a (possibly bare-basename) worktree path to one concrete file, or the candidates when it's
@@ -1635,11 +1869,14 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   return {
     port: server.port ?? opts.port,
+    supervisor,
     stop: () => {
+      solidcraft?.stop();
       skillTimers.forEach(clearTimeout);
       server.stop(true);
     },
     shutdown: async () => {
+      solidcraft?.stop();
       skillTimers.forEach(clearTimeout);
       await supervisor.shutdown();
       server.stop(true);

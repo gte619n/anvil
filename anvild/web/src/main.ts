@@ -1,4 +1,8 @@
 import { sameServerUrl } from "./api";
+import { createCadCards } from "./cad-cards";
+import { openCadPart } from "./cad";
+import { cadPreviewUrl, makeCadPartIo } from "./cad-io";
+import { createCadDesignStore } from "./cad-live";
 import {
   HUB_URL,
   anyOpen,
@@ -15,12 +19,14 @@ import {
   persistRouting,
   rosterServer,
   sendTo,
+  serverByUrl,
   serverOf,
   serverOfEnv,
   serverSupports,
   serverTeams,
   servers,
   sessionServer,
+  wireSessionId,
   type Server,
 } from "./fleet";
 import { $, esc, icon, sessIcon } from "./dom";
@@ -63,6 +69,7 @@ import {
   armAttachDiagnostic,
   clearAttachDiagnostic,
   clearConversation,
+  conversationCleared,
   commitAnswerRefs,
   commitAssistant,
   conversation,
@@ -105,6 +112,8 @@ import {
 // this one. Its deps are injected via initSettings(...) next to initFleet(...).
 // The Loops home (#loops) — the first-class autonomy surface (loops-circuit spec). Projection-first in
 // Phase 1: renders the shared `serverLoops` cache as circuit rows. Deps injected via initLoops(...).
+import { initParts, onPartSources } from "./parts";
+import { browserCardImageUrl, initMcp, onBrowserLoggedIn, onBrowserSites, onMcpIntegrations, openToolsMenu, permissionToolName, renderMcpPanel, updateHeaderTools } from "./mcp";
 import { initLoops, onLoopRun, onLoopRuns, onLoopsHome, onLoopsList, onLoopUpdated, openLoops, openLoopsDeepLink } from "./loops";
 import {
   closeSettings,
@@ -113,6 +122,7 @@ import {
   onAuthAccounts,
   onAuthStatus,
   onClaudeCliStatus,
+  onSolidcraftStatus,
   onLapoStatus,
   onModelCatalog,
   onPipelineMetrics,
@@ -183,6 +193,8 @@ import {
   initDialogs,
   resolvePermissionUI,
   resolveQuestionUI,
+  resolveHumanUI,
+  showHumanRequest,
   selectedIcon,
   showModal,
   showNewSession,
@@ -342,6 +354,8 @@ initLoops({
 // declarations; `activeId` is a reassigned scalar declared further down, so it's injected as a lazy
 // read. The dialog helpers + environment modals it used to receive here are imported from
 // dialogs.ts directly now.
+initMcp({ sessions, activeId: () => activeId, sendAwait });
+initParts({ sendAwait });
 initSkills({ sendAwait });
 initSettings({
   sessions,
@@ -1529,6 +1543,7 @@ function onEvent(url: string, e: ServerEvent): void {
         renderTermStrip(); // roster changes (open/exit/kill on any device) refresh the chip strip
         updateHeaderBranch(e.session); // keep the header branch chip fresh as git state changes
         updateHeaderAccount(e.session); // reflect an account switch + the idle/mid-turn tooltip
+        updateHeaderTools(e.session); // the Tools chip follows the session's integration list
         updateHeaderModel(e.session); // reflect a model switch (incl. one made on another device)
         updateContextMeter(e.session); // refresh the context-window gauge as turns/compaction change it
         updateGoalChip(e.session); // the goal's iteration count climbs on every unmet stop attempt
@@ -1592,6 +1607,7 @@ function onEvent(url: string, e: ServerEvent): void {
         if (serverSupports(srv, "gemini-sessions")) srv!.sock.send({ type: "auth.status", provider: "gemini" });
       }
       renderSessions(); // group headers now know this server's name
+      if (document.getElementById("mcp-panel")) renderMcpPanel(); // the capability decides whether the card shows
       if (document.getElementById("env-cards")) renderEnvCards();
       if (document.querySelector(".settings-view")) renderServerCards();
       // A member just (re)joined the fleet — if the hub holds a Todoist token, have the hub replicate
@@ -1613,6 +1629,34 @@ function onEvent(url: string, e: ServerEvent): void {
     case "environments":
       onEnvironments(url, e.environments);
       return;
+    case "cad.design":
+      if (serverSupports(serverByUrl(url), "cad-work")) cadDesigns.put(serverByUrl(url)?.url ?? url, e); // the live viewer and the parameters panel
+      cadCards.onDesign(serverByUrl(url)?.url ?? url, e); // part card in the chat (hidden without "cad-work")
+      return;
+    case "cad.parts.list.result":
+    case "cad.param.set.result":
+      return; // replies: taken by the sendAwait that asked
+    case "cad.expectations.request":
+      cadCards.onRequest(serverByUrl(url)?.url ?? url, e); // expectation change / adopt card
+      return;
+    case "cad.expectations.resolved":
+      cadCards.onResolved(serverByUrl(url)?.url ?? url, e);
+      return;
+    case "mcp.integrations":
+      // Per machine, never merged: each server's list is kept under its own url.
+      onMcpIntegrations(url, e.integrations);
+      return;
+    case "browser.sites":
+      // Each daemon sends its own copy of the fleet's list; Settings shows the hub's (mcp.ts).
+      onBrowserSites(url, e.sites, e.pending ?? 0);
+      return;
+    case "parts.sources":
+      onPartSources(url, e.sources); // Settings → Models → Part sources (Phase C5)
+      return;
+    case "browser.loggedin":
+      // Logged-in sites and their unlock switches (Phase C3); same hub-synced shape as the sites list.
+      onBrowserLoggedIn(url, e.sites, e.pending ?? 0, e.error);
+      return;
     case "prompts":
       // Prompts are hub-authoritative (the store lives on the hub daemon). Ignore a fleet member's
       // own prompts event so it can't clobber the hub's synced library.
@@ -1631,6 +1675,11 @@ function onEvent(url: string, e: ServerEvent): void {
       // The Claude engine card is hub-scoped (the "Update" button drives the hub's fleet fan-out), so
       // show the hub's status and ignore members' own copies.
       if (url === HUB_URL) onClaudeCliStatus(e.info);
+      return;
+    case "solidcraft.status":
+      // The Settings → CAD card reads the hub's fleet view over REST; the hub's event is the cue to
+      // re-read it. Members' own copies are ignored (the card is hub-scoped).
+      if (url === HUB_URL) onSolidcraftStatus();
       return;
     case "todoist.status":
       // Todoist is hub-scoped (the token lives on the hub daemon; the link UI routes to hub()).
@@ -1735,6 +1784,95 @@ function onEvent(url: string, e: ServerEvent): void {
   }
 }
 
+// CAD cards in the chat (agent-cad-and-browser spec §4.9): the part card, the expectation-change card
+// and the adopt card. Driven by global `cad.*` events; hidden unless the server has "cad-work".
+const cadCards = createCadCards({
+  supported: (url) => serverSupports(serverByUrl(url), "cad-work"),
+  active: () => (activeId ? { sessionId: wireSessionId(activeId), url: (serverOf(activeId) ?? hub()).url } : undefined),
+  container: () => conversation,
+  respond: (url, requestId, approve, values) => {
+    const srv = serverByUrl(url) ?? hub();
+    // A dimensions card's numbers are checked again by the daemon; a refusal comes back as an error.
+    // The card shows a refusal inline and gives its buttons back.
+    return sendAwait(srv, { type: "cad.expectations.respond", cid: newCid(), requestId, approve, ...(values ? { values } : {}) }, 30_000)
+      .then((res) => (res.type === "command.error" ? res.message : undefined))
+      .catch((e) => `not sent: ${e instanceof Error ? e.message : String(e)}`);
+  },
+  release: (url, ev) => {
+    const srv = serverByUrl(url) ?? hub();
+    void sendAwait(srv, { type: "cad.release.request", cid: newCid(), cwd: ev.cwd, part: ev.part, sessionId: activeId ? wireSessionId(activeId) : "" }, 120_000)
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch((e) => toast(`Release failed: ${e instanceof Error ? e.message : String(e)}`));
+  },
+  clearGap: (url, ev) => {
+    const srv = serverByUrl(url) ?? hub();
+    void sendAwait(srv, { type: "cad.gap.clear", cid: newCid(), cwd: ev.cwd, part: ev.part }, 60_000)
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch(() => undefined);
+  },
+  fileUrl: (url, ev, path) => cadPreviewUrl(serverByUrl(url) ?? hub(), ev.cwd, path),
+  // "Open" on a part card: the live viewer listens for this (below).
+  open: (url, ev) => void window.dispatchEvent(new CustomEvent("anvil:cad-open", { detail: { url, cwd: ev.cwd, part: ev.part, rev: ev.rev } })),
+  confirm: (url, ev) => void (serverByUrl(url) ?? hub()).sock.send({ type: "cad.expectations.confirm", cid: newCid(), cwd: ev.cwd, part: ev.part, sessionId: activeId ? wireSessionId(activeId) : "" }),
+  scrollDown: () => scrollDown(),
+});
+
+// The live CAD viewer (spec §4.9, Phase A3): opening a PART follows it — every new revision is
+// swapped into the same scene — with the parameters panel and the gate strip beside it. Driven by the
+// same global `cad.design` events as the cards; nothing here exists without "cad-work".
+const cadDesigns = createCadDesignStore();
+function openCadPartViewer(url: string, cwd: string, part: string): void {
+  const srv = serverByUrl(url);
+  if (!srv || !serverSupports(srv, "cad-work")) return;
+  const ask = async (cmd: Record<string, unknown> & { type: string }, timeoutMs = 120_000): Promise<ServerEvent> => sendAwait(srv, { ...cmd, cid: newCid() }, timeoutMs);
+  const rebuild = (): void =>
+    void ask({ type: "cad.design.refresh", cwd, part })
+      .then((res) => {
+        if (res.type === "command.error") toast(res.message);
+      })
+      .catch((e) => toast(`Rebuild failed: ${e instanceof Error ? e.message : String(e)}`));
+  openCadPart(
+    {
+      part,
+      current: () => cadDesigns.get(srv.url, cwd, part),
+      subscribe: (fn) => cadDesigns.subscribe(srv.url, cwd, part, fn),
+      setParam: async (name, expression) => {
+        try {
+          const res = await ask({ type: "cad.param.set", cwd, part, name, expression });
+          if (res.type === "cad.param.set.result") return { ok: res.ok, ...(res.error ? { error: res.error } : {}) };
+          return { ok: false, error: res.type === "command.error" ? res.message : "unexpected reply" };
+        } catch (e) {
+          return { ok: false, error: e instanceof Error && e.message === "offline" ? "Not connected to the server." : e instanceof Error ? e.message : String(e) };
+        }
+      },
+      rebuild,
+      parts: async () => {
+        // The list refreshes every part whose process is up. One that is not up has only its last
+        // known numbers (never a verdict): opening it builds it from design.json.
+        const res = await ask({ type: "cad.parts.list", cwd }, 60_000);
+        if (res.type !== "cad.parts.list.result") return [];
+        if (res.parts.some((p) => p.part === part && !p.live && p.hasDesign) && cadDesigns.get(srv.url, cwd, part)?.preview) rebuild();
+        return res.parts.map((p) => p.part);
+      },
+      openPart: (other) => openCadPartViewer(srv.url, cwd, other),
+    },
+    makeCadPartIo({ server: () => srv, cwd }),
+  );
+  // Nothing known yet, or nothing to draw (a part opened from the list, a restarted daemon): ask the
+  // daemon to build it from design.json. The `cad.design` that follows fills the viewer in.
+  if (!cadDesigns.get(srv.url, cwd, part)?.preview) rebuild();
+}
+window.addEventListener("anvil:cad-open", (e) => {
+  const d = (e as CustomEvent<{ url?: string; cwd?: string; part?: string }>).detail;
+  if (d && typeof d.url === "string" && typeof d.cwd === "string" && typeof d.part === "string") openCadPartViewer(d.url, d.cwd, d.part);
+});
+// The cards are current state, not replayed history: redraw them once a rebuilt pane has been filled.
+conversationCleared.add(() => void setTimeout(() => cadCards.restore(), 0));
+
 function handleSessionEvent(e: ServerEvent): void {
   // A turn the user cancelled (Stop): drop the in-flight churn the daemon is still draining
   // (deltas, tool results, a partial assistant message, "working" statuses) so the conversation
@@ -1799,6 +1937,7 @@ function handleSessionEvent(e: ServerEvent): void {
       saveConvoCache();
       return;
     case "message.user":
+      if (e.sessionId === activeId) cadCards.newTurn(); // the next cad.design for a part starts a new part card
       appendUser(e.rendered.html, e.attachments, e.ts, e.cid, e.rendered.source); // cid retires the matching optimistic bubble
       return;
     case "assistant.delta":
@@ -1836,7 +1975,21 @@ function handleSessionEvent(e: ServerEvent): void {
       if (panelView === "git" && e.sessionId === activeId) requestGitStatus(); // refresh the SCM buttons
       return;
     case "permission.request":
-      showPermission(e.requestId, e.tool, e.input, e.suggestions);
+      showPermission(
+        e.requestId,
+        e.tool,
+        e.input,
+        e.suggestions,
+        permissionToolName(e.tool, e.sessionId),
+        // An agent-browser hard stop says why it asks and shows the page (Phase C3).
+        e.reason || e.image ? { reason: e.reason, imageUrl: browserCardImageUrl(e.sessionId, e.image) } : undefined,
+      );
+      return;
+    case "human.request":
+      showHumanRequest(e.requestId, e.reason, browserCardImageUrl(e.sessionId, e.image));
+      return;
+    case "human.resolved":
+      resolveHumanUI(e.requestId);
       return;
     case "permission.resolved":
       // Retire EXACTLY this card (answered here, on another device, or superseded). Per-request so a
@@ -1999,6 +2152,7 @@ function setHeaderTitle(s: Session | undefined): void {
   $("#btn-new-topic").hidden = !s?.isDefault; // "New topic" only applies to the persistent concierge chat
   updateHeaderBranch(s);
   updateHeaderAccount(s);
+  updateHeaderTools(s);
   updateHeaderModel(s);
   updateContextMeter(s);
   updateGoalChip(s);
@@ -2178,6 +2332,9 @@ $("#header-account").addEventListener("click", () => {
     })),
   );
 });
+
+// The Tools chip lists this machine's MCP integrations with a switch each (mcp.ts).
+$("#header-tools").addEventListener("click", () => openToolsMenu($("#header-tools")));
 
 function onEnvironments(url: string, list: Environment[]): void {
   // Replace only THIS server's environments (others stay), and tag each with its server.

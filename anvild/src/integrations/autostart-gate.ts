@@ -1,4 +1,6 @@
 import type { AnvilStatus } from "./status";
+import { cadStartRefusal } from "./autopilot-cad";
+import type { PlanPartExpectations } from "../cadwork/plan-expectations";
 
 /**
  * Pure (SDK-free) gates that stand between a freshly-planned work unit and an unattended, bypass-permission
@@ -57,6 +59,10 @@ export interface AutoStartCandidate {
   // pre-pass (completion-verification spec §4.5). The gate reads this PLAIN field — it never calls the
   // verifier itself, so it stays sync + SDK-free. A `done` verdict means the work already exists.
   verification?: { verdict?: "done" | "partial" | "not-done" };
+  // Phase B3 / item 41: a plan that touches CAD starts only with owner-approved numbers.
+  needsCad?: boolean;
+  cadExpectations?: Record<string, PlanPartExpectations>;
+  cadExpectationsStatus?: "proposed" | "approved" | "rejected";
 }
 
 /** Decide whether the nightly run may auto-start a unit. `hold` units stay on the grid for a human; `reason`
@@ -71,6 +77,10 @@ export function autoStartDecision(u: AutoStartCandidate): { start: boolean; reas
   // Completion gate: the verifier judged this unit's work already implemented at the base — don't rebuild it.
   // A human reviews the "Likely complete" overlay and Confirms (completes) or Dismisses (lets it build).
   if (u.verification?.verdict === "done") return { start: false, reason: "already-implemented — the work looks already built; review the Likely-complete overlay" };
+  // CAD gate (agent-cad-and-browser §4.14 item 41): nightly-proposed numbers are not locked until the owner
+  // approves them on the card, and a CAD unit never builds against unapproved (or missing) numbers.
+  const cad = cadStartRefusal(u);
+  if (cad) return { start: false, reason: cad };
   // Plan-quality gate: a panel that scored the plan below the bar is a strong signal not to ship it blind.
   const score = u.adversarial?.consensusScore;
   if (typeof score === "number" && score < AUTOSTART_MIN_CONSENSUS) {
