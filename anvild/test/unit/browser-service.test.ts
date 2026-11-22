@@ -526,7 +526,9 @@ describe("protected files", () => {
     ]) {
       const out = await tool("Bash", { command });
       expect([command, out.decision]).toEqual([command, "deny"]);
-      expect(out.reason).toMatch(/off limits/);
+      // The browser's rule or the state-dir shell rule (whichever registered first; rules are
+      // process-wide, so the order depends on which test files ran before) — both deny for this reason.
+      expect(out.reason).toMatch(/off limits|`--user-data-dir` is not allowed in a session shell/);
     }
     for (const [name, input] of [
       ["Read", { file_path: join(rig.dir, "browser-profile", "Default", "Cookies") }],

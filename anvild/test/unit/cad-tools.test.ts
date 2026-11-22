@@ -371,7 +371,7 @@ describe("anvil_cad tools", () => {
     for (const id of ["component.create", "component.activate", "component.rename", "component.copy_bodies"]) expect(isAllowedCommand(id)).toBe(true);
     // Through the tools: refused before it reaches SolidCraft, in execute and inside a batch.
     const repo = tempRepo();
-    const { tools } = fakeCadSession(repo);
+    const { tools } = fake(repo); // the fake SolidCraft, so the test does not depend on a real install
     await tools.open_part!({ part: "plate" });
     expect((await tools.execute!({ command: "solid.box", params: { length: 10, width: 10, height: 10, name: "B" } })).isError).toBe(false);
     const before = readFileSync(join(repo, "cad", "plate", "design.json"), "utf8");
