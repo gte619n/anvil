@@ -198,6 +198,44 @@ async function putMeta(m: MirrorMeta): Promise<void> {
   addToIndex(m.sessionId);
 }
 
+// Per-session write queue. Every mirror mutation is a read-modify-write across several async IndexedDB
+// hops (meta read → tail/base write → meta write), and callers fire them un-awaited: main.ts applies
+// each replayed frame with `void mirror.applyEvent(...)` while the Android staged-history handoff runs
+// `applySnapshot` for the same session. Interleaved, an applyEvent that read the meta before the snapshot
+// landed wrote its event into the tail AFTER the snapshot had cleared it — the event then lived in both
+// base and tail and painted twice (the "duplicate chat" bug). Running one operation at a time per
+// session makes each one see the previous one's finished state, so the seq guards actually hold.
+const queues = new Map<string, Promise<unknown>>();
+function serial<T>(id: string, op: () => Promise<T>): Promise<T> {
+  const run = (queues.get(id) ?? Promise.resolve()).then(op, op);
+  const settled = run.catch(() => undefined);
+  queues.set(id, settled);
+  void settled.then(() => {
+    if (queues.get(id) === settled) queues.delete(id); // idle — don't retain an entry per session forever
+  });
+  return run;
+}
+
+/** Drop a session's base + tail + meta + resume watermark. NOT queued — call from inside a queued
+ *  operation (or via `mirror.delete`, which queues it). */
+async function deleteNow(id: string): Promise<void> {
+  removeFromIndex(id);
+  dropResumeWatermark(id);
+  try {
+    if (!hasIndexedDb) {
+      memMeta.delete(id);
+      memBase.delete(id);
+      memTail.delete(id);
+      return;
+    }
+    await wrap((await store(META, "readwrite")).delete(id));
+    await wrap((await store(BASE, "readwrite")).delete(id));
+    await clearTailUpTo(id, Infinity);
+  } catch {
+    /* best-effort */
+  }
+}
+
 export const mirror = {
   /** Synchronous boot hint (from the localStorage index) — is there a mirror for this session? */
   has(id: string): boolean {
@@ -225,31 +263,33 @@ export const mirror = {
     serverUrl: string,
     lastActivityAt: string,
   ): Promise<void> {
-    try {
-      if (!hasIndexedDb) {
-        memBase.set(id, snap.events);
-      } else {
-        const s = await store(BASE, "readwrite");
-        await wrap(s.put(snap.events, id));
+    return serial(id, async () => {
+      try {
+        if (!hasIndexedDb) {
+          memBase.set(id, snap.events);
+        } else {
+          const s = await store(BASE, "readwrite");
+          await wrap(s.put(snap.events, id));
+        }
+        await clearTailUpTo(id, snap.lastSeq);
+        const remainingTail = await readTailSorted(id);
+        const tailBytes = remainingTail.reduce((n, t) => n + approxBytes(t.event), 0);
+        const lastSeq = Math.max(snap.lastSeq, remainingTail.at(-1)?.seq ?? 0);
+        await putMeta({
+          sessionId: id,
+          epoch: snap.epoch,
+          baseSeq: snap.lastSeq,
+          lastSeq,
+          serverUrl,
+          lastActivityAt,
+          bytes: approxBytes(snap.events) + tailBytes,
+          completeAt: "",
+          tailCount: remainingTail.length,
+        });
+      } catch {
+        /* best-effort — a snapshot still loads from the daemon; correctness is pull-derived */
       }
-      await clearTailUpTo(id, snap.lastSeq);
-      const remainingTail = await readTailSorted(id);
-      const tailBytes = remainingTail.reduce((n, t) => n + approxBytes(t.event), 0);
-      const lastSeq = Math.max(snap.lastSeq, remainingTail.at(-1)?.seq ?? 0);
-      await putMeta({
-        sessionId: id,
-        epoch: snap.epoch,
-        baseSeq: snap.lastSeq,
-        lastSeq,
-        serverUrl,
-        lastActivityAt,
-        bytes: approxBytes(snap.events) + tailBytes,
-        completeAt: "",
-        tailCount: remainingTail.length,
-      });
-    } catch {
-      /* best-effort — a snapshot still loads from the daemon; correctness is pull-derived */
-    }
+    });
   },
 
   /** Extend an existing mirror with one durable delta event. [D1.4] A lone delta with no base is
@@ -258,40 +298,51 @@ export const mirror = {
   async applyEvent(id: string, seq: number, e: ServerEvent, epoch: Epoch, serverUrl: string, lastActivityAt: string): Promise<boolean> {
     const folded = foldEvent(e);
     if (!folded) return false; // transient — not mirrored
-    try {
-      const meta = await this.getMeta(id);
-      if (!meta || meta.baseSeq === 0) return false; // [D1.4] no base yet
-      if (meta.epoch !== epoch) {
-        await this.invalidate(id); // lineage reset — drop stale lineage, await a fresh snapshot
+    return serial(id, async () => {
+      try {
+        const meta = await this.getMeta(id);
+        if (!meta || meta.baseSeq === 0) return false; // [D1.4] no base yet
+        if (meta.epoch !== epoch) {
+          await deleteNow(id); // lineage reset — drop stale lineage, await a fresh snapshot
+          return false;
+        }
+        if (seq <= meta.lastSeq) return true; // idempotent: already applied (keyed by seq)
+        if (!hasIndexedDb) {
+          let m = memTail.get(id);
+          if (!m) memTail.set(id, (m = new Map()));
+          m.set(seq, folded);
+        } else {
+          const s = await store(TAIL, "readwrite");
+          await wrap(s.put(folded, [id, seq]));
+        }
+        await putMeta({ ...meta, lastSeq: seq, serverUrl, lastActivityAt, bytes: meta.bytes + approxBytes(folded), tailCount: meta.tailCount + 1 });
+        return true;
+      } catch {
         return false;
       }
-      if (seq <= meta.lastSeq) return true; // idempotent: already applied (keyed by seq)
-      if (!hasIndexedDb) {
-        let m = memTail.get(id);
-        if (!m) memTail.set(id, (m = new Map()));
-        m.set(seq, folded);
-      } else {
-        const s = await store(TAIL, "readwrite");
-        await wrap(s.put(folded, [id, seq]));
-      }
-      await putMeta({ ...meta, lastSeq: seq, serverUrl, lastActivityAt, bytes: meta.bytes + approxBytes(folded), tailCount: meta.tailCount + 1 });
-      return true;
-    } catch {
-      return false;
-    }
+    });
   },
 
   /** The full transcript as ConversationEvents (base ++ folded tail, seq order) for offline replay
    *  through renderSnapshotEvents. Null when there's nothing mirrored. */
   async read(id: string): Promise<ConversationEvent[] | null> {
-    try {
-      const base = !hasIndexedDb ? memBase.get(id) ?? null : (await wrap((await store(BASE, "readonly")).get(id) as IDBRequest<ConversationEvent[] | undefined>)) ?? null;
-      const tail = await readTailSorted(id);
-      if (!base && tail.length === 0) return null;
-      return [...(base ?? []), ...tail.map((t) => t.event)];
-    } catch {
-      return null;
-    }
+    // Queued behind any in-flight write, so a read never observes a half-applied snapshot (new base,
+    // tail not yet cleared).
+    return serial(id, async () => {
+      try {
+        const base = !hasIndexedDb ? memBase.get(id) ?? null : (await wrap((await store(BASE, "readonly")).get(id) as IDBRequest<ConversationEvent[] | undefined>)) ?? null;
+        // The tail is defined as (baseSeq, lastSeq]. An entry at or below baseSeq is already folded into
+        // the base — builds before the write queue could leave one behind (see `serial`), and replaying it
+        // would paint that message twice. Ignoring it here heals those devices without a migration; the
+        // next applySnapshot deletes the stale rows for real.
+        const baseSeq = (await this.getMeta(id))?.baseSeq ?? 0;
+        const tail = (await readTailSorted(id)).filter((t) => t.seq > baseSeq);
+        if (!base && tail.length === 0) return null;
+        return [...(base ?? []), ...tail.map((t) => t.event)];
+      } catch {
+        return null;
+      }
+    });
   },
 
   /** Number of tail events (compaction threshold input). */
@@ -303,11 +354,13 @@ export const mirror = {
    *  epoch (spec §2, anti-gaming guard). This is the ONLY path that sets completeAt. Returns whether
    *  the mirror is complete for that watermark. */
   async markComplete(id: string, serverEpoch: Epoch, serverLastSeq: Seq, at: string): Promise<boolean> {
-    const meta = await this.getMeta(id);
-    if (!meta) return false;
-    const complete = meta.epoch === serverEpoch && meta.lastSeq === serverLastSeq;
-    if (complete && meta.completeAt !== at) await putMeta({ ...meta, completeAt: at });
-    return complete;
+    return serial(id, async () => {
+      const meta = await this.getMeta(id);
+      if (!meta) return false;
+      const complete = meta.epoch === serverEpoch && meta.lastSeq === serverLastSeq;
+      if (complete && meta.completeAt !== at) await putMeta({ ...meta, completeAt: at });
+      return complete;
+    });
   },
 
   /** Advance the mirror's coverage watermark to `lastSeq` after a prefetch/resume has applied every
@@ -315,9 +368,11 @@ export const mirror = {
    *  deltas) that are never mirrored — without this, meta.lastSeq would forever trail the watermark by
    *  the trailing transient seqs and the mirror could never be marked complete. Epoch-guarded. */
   async setCovered(id: string, epoch: Epoch, lastSeq: Seq): Promise<void> {
-    const meta = await this.getMeta(id);
-    if (!meta || meta.epoch !== epoch || lastSeq <= meta.lastSeq) return;
-    await putMeta({ ...meta, lastSeq });
+    return serial(id, async () => {
+      const meta = await this.getMeta(id);
+      if (!meta || meta.epoch !== epoch || lastSeq <= meta.lastSeq) return;
+      await putMeta({ ...meta, lastSeq });
+    });
   },
 
   /** Lineage reset: drop base + tail + meta but keep nothing stale. Same as delete for storage; kept
@@ -329,21 +384,7 @@ export const mirror = {
   /** Forget a session's mirror entirely (killed/purged/evicted). Also drops its resume watermark
    *  [D1.2] so a later attach can't delta-resume against a mirror that no longer exists. */
   async delete(id: string): Promise<void> {
-    removeFromIndex(id);
-    dropResumeWatermark(id);
-    try {
-      if (!hasIndexedDb) {
-        memMeta.delete(id);
-        memBase.delete(id);
-        memTail.delete(id);
-        return;
-      }
-      await wrap((await store(META, "readwrite")).delete(id));
-      await wrap((await store(BASE, "readwrite")).delete(id));
-      await clearTailUpTo(id, Infinity);
-    } catch {
-      /* best-effort */
-    }
+    return serial(id, () => deleteNow(id));
   },
 
   /** Migrate an optimistic (offline-created) session's mirror to its real id once the server realizes

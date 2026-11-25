@@ -150,3 +150,29 @@ test("B: a staged history batch for the active session repaints the pane with th
   expect(r.final).toContain(RESPONSE_MSG); // the staged batch surfaced the backgrounded response
   expect(r.final).toContain(SENT_MSG);
 }, 30_000);
+
+test("C: a tail entry the base already covers is not painted twice (duplicate-chat self-heal)", () => {
+  // The aftermath of the pre-fix mirror race on Android: the staged snapshot (base, covering seq ≤ 7)
+  // and the reconnect replay (tail, seq 5) both stored the same assistant response. The reopen paints
+  // from the mirror and must show that response exactly once.
+  const meta = { sessionId: "sess_m", epoch: "ep1", baseSeq: 7, lastSeq: 7, serverUrl: ORIGIN, lastActivityAt: "2026-08-01", bytes: 100, completeAt: "", tailCount: 1 };
+  const r = runBoot({
+    idbSeed: {
+      "anvil-mirror": {
+        meta: [["sess_m", meta]],
+        base: [["sess_m", [userEvent(SENT_MSG), assistantEvent(RESPONSE_MSG)]]],
+        tail: [[["sess_m", 5], assistantEvent(RESPONSE_MSG)]],
+      },
+    },
+    seeds: {
+      "anvil.active": "sess_m",
+      "anvil.sessions": JSON.stringify([SESSION]),
+      "anvil.sessionServer": JSON.stringify([["sess_m", ORIGIN]]),
+      "anvil.mirror.index": JSON.stringify(["sess_m"]),
+      "anvil.epoch.sess_m": "ep1",
+      "anvil.seq.sess_m": "7",
+    },
+  });
+  expect(r.initErr).toBeNull();
+  expect(r.final.split(`<p>${RESPONSE_MSG}</p>`).length - 1).toBe(1);
+}, 30_000);
