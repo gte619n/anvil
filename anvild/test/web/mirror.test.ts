@@ -115,3 +115,34 @@ test("foldEvent keeps a background sub-agent's subagent.settled (mirrors the ser
   const out = foldEvent({ v: 4, type: "subagent.settled", ts: "t", sessionId: "s", seq: 9, agent } as unknown as ServerEvent);
   expect(out).toEqual({ kind: "subagent_settled", ts: "t", agent } as never);
 });
+
+// Regression: duplicated assistant messages on Android. Returning to the app fires two mirror writers
+// at once — the staged full snapshot (applySnapshot) and the reconnect replay (applyEvent per event,
+// un-awaited). applyEvent read the meta BEFORE the snapshot landed, passed its "already applied?"
+// check, and wrote into the tail AFTER the snapshot had cleared it — the same event stored in both the
+// base and the tail, painted twice on the next mirror-sourced open.
+test("a replay racing a snapshot never stores an event in both base and tail", async () => {
+  await mirror.applySnapshot("r1", snap([U("a")], 2, "ep1"), "srv", "d");
+  // Fired together, exactly as main.ts does (`void mirror.applyEvent(...)` per replayed frame).
+  const pending = [
+    mirror.applySnapshot("r1", snap([U("a"), U("LONG")], 7, "ep1"), "srv", "d"), // staged snapshot covers seq ≤ 7
+    mirror.applyEvent("r1", 5, userEvent("r1", 5, "LONG"), "ep1", "srv", "d"), // replay of the same event
+    mirror.applyEvent("r1", 8, userEvent("r1", 8, "newer"), "ep1", "srv", "d"), // genuinely beyond the snapshot
+  ];
+  await Promise.all(pending);
+  const html = (await mirror.read("r1"))?.map((e) => (e.kind === "user" ? e.rendered.html : ""));
+  expect(html).toEqual(["<p>a</p>", "<p>LONG</p>", "<p>newer</p>"]);
+  const meta = await mirror.getMeta("r1");
+  expect(meta?.baseSeq).toBe(7); // the replay's stale meta write must not roll the base back
+  expect(meta?.lastSeq).toBe(8);
+});
+
+test("the same race in the other order (replay first) also yields one copy", async () => {
+  await mirror.applySnapshot("r2", snap([U("a")], 2, "ep1"), "srv", "d");
+  const pending = [
+    mirror.applyEvent("r2", 5, userEvent("r2", 5, "LONG"), "ep1", "srv", "d"),
+    mirror.applySnapshot("r2", snap([U("a"), U("LONG")], 7, "ep1"), "srv", "d"),
+  ];
+  await Promise.all(pending);
+  expect(await mirror.read("r2")).toHaveLength(2);
+});

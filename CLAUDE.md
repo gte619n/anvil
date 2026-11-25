@@ -117,6 +117,21 @@ changing v1. See `docs/plans/2026-08-01-stable-update-service.md`.
   root-relative URL (`/draco/`, `/katex/…`, `/xterm.css`). Anything under `web/dist/` is automatically
   carried into the native apps too (`bundle-native.ts` copies `dist/` recursively), so one `cpSync`
   covers browser + Android + Apple. Skip it and the asset 404s in production.
+- **Offline mirror operations must go through the per-session queue.** `anvild/web/src/mirror.ts`
+  operations are read-modify-write across several async IndexedDB hops, and callers fire them
+  un-awaited (`void mirror.applyEvent(...)` per frame in `main.ts`, alongside prefetch and the Android
+  staged-history handoff). Any new operation that reads meta and then writes must run inside
+  `serial(id, ...)`, and code already inside the queue must call the unqueued helper (`deleteNow`), not
+  `mirror.delete`, or it deadlocks. Unqueued writes are how the same event ended up in both base and
+  tail and painted twice (PR #249).
+- **Duplicated or missing chat messages: check the daemon's log before the client.** Each session's
+  durable log is `~/.anvil/sessions/<sessionId>/events.ndjson` (titles and ids are in
+  `~/.anvil/sessions.json`). Seq gaps there are normal: transient frames such as `assistant.delta` and
+  `status` mint seqs but are not persisted. If the log holds each message once, the bug is in the
+  client's paint or resume path (HTML cache in `convoCache.ts`, event mirror in `mirror.ts`, attach
+  logic in `main.ts`). Reproduce it with the jsdom boot harness in
+  `anvild/test/web/stale-paint-regression.test.ts`, which seeds IndexedDB through
+  `test/web/fake-idb.mjs` and can drive a fake socket and the staged-history bridge.
 - **The daemon runs sessions with `settingSources: []`** (`src/agent/driver.ts`), so this `CLAUDE.md`
   is NOT auto-loaded into daemon-driven Claude Code sessions. Conventions here guide humans/agents
   editing the repo, not the running agent's context.
